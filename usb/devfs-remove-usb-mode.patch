@@ -1,0 +1,327 @@
+From foo@baz.org Sun Jun  5 14:33:21 2005
+Date: Mon, 20 Jun 2005 21:15:16 -0700
+To: Greg KH <gregkh@suse.de>
+From: Greg Kroah-Hartman <gregkh@suse.de>
+Subject: devfs: Remove the mode field from usb_class_driver as it's no longer needed
+
+Also fixes all drivers that set this field, and removes some other devfs
+specfic USB logic.
+
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+ drivers/usb/class/usblp.c           |    3 +--
+ drivers/usb/core/file.c             |   19 ++++---------------
+ drivers/usb/image/mdc800.c          |    3 +--
+ drivers/usb/input/aiptek.c          |    2 +-
+ drivers/usb/input/hiddev.c          |    3 +--
+ drivers/usb/media/dabusb.c          |    3 +--
+ drivers/usb/misc/auerswald.c        |    3 +--
+ drivers/usb/misc/idmouse.c          |    5 ++---
+ drivers/usb/misc/legousbtower.c     |    5 ++---
+ drivers/usb/misc/rio500.c           |    3 +--
+ drivers/usb/misc/sisusbvga/sisusb.c |    5 -----
+ drivers/usb/misc/usblcd.c           |    9 ++++-----
+ drivers/usb/usb-skeleton.c          |    3 +--
+ include/linux/usb.h                 |    7 ++-----
+ 14 files changed, 22 insertions(+), 51 deletions(-)
+
+Index: gregkh-2.6/include/linux/usb.h
+===================================================================
+--- gregkh-2.6.orig/include/linux/usb.h	2005-09-21 05:59:51.000000000 -0700
++++ gregkh-2.6/include/linux/usb.h	2005-09-21 05:59:52.000000000 -0700
+@@ -576,10 +576,8 @@
+ 
+ /**
+  * struct usb_class_driver - identifies a USB driver that wants to use the USB major number
+- * @name: devfs name for this driver.  Will also be used by the driver
+- *	class code to create a usb class device.
++ * @name: the usb class device name for this driver.  Will show up in sysfs.
+  * @fops: pointer to the struct file_operations of this driver.
+- * @mode: the mode for the devfs file to be created for this driver.
+  * @minor_base: the start of the minor range for this driver.
+  *
+  * This structure is used for the usb_register_dev() and
+@@ -589,8 +587,7 @@
+ struct usb_class_driver {
+ 	char *name;
+ 	struct file_operations *fops;
+-	mode_t mode;
+-	int minor_base;	
++	int minor_base;
+ };
+ 
+ /*
+Index: gregkh-2.6/drivers/usb/class/usblp.c
+===================================================================
+--- gregkh-2.6.orig/drivers/usb/class/usblp.c	2005-09-21 05:59:14.000000000 -0700
++++ gregkh-2.6/drivers/usb/class/usblp.c	2005-09-21 05:59:52.000000000 -0700
+@@ -844,9 +844,8 @@
+ };
+ 
+ static struct usb_class_driver usblp_class = {
+-	.name =		"usb/lp%d",
++	.name =		"lp%d",
+ 	.fops =		&usblp_fops,
+-	.mode =		S_IFCHR | S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP,
+ 	.minor_base =	USBLP_MINOR_BASE,
+ };
+ 
+Index: gregkh-2.6/drivers/usb/core/file.c
+===================================================================
+--- gregkh-2.6.orig/drivers/usb/core/file.c	2005-09-21 05:59:14.000000000 -0700
++++ gregkh-2.6/drivers/usb/core/file.c	2005-09-21 05:59:52.000000000 -0700
+@@ -17,7 +17,6 @@
+ 
+ #include <linux/config.h>
+ #include <linux/module.h>
+-#include <linux/devfs_fs_kernel.h>
+ #include <linux/spinlock.h>
+ #include <linux/errno.h>
+ 
+@@ -88,8 +87,6 @@
+ 		goto out;
+ 	}
+ 
+-	devfs_mk_dir("usb");
+-
+ out:
+ 	return error;
+ }
+@@ -97,7 +94,6 @@
+ void usb_major_cleanup(void)
+ {
+ 	class_destroy(usb_class);
+-	devfs_remove("usb");
+ 	unregister_chrdev(USB_MAJOR, "usb");
+ }
+ 
+@@ -112,8 +108,7 @@
+  * enabled, the minor number will be based on the next available free minor,
+  * starting at the class_driver->minor_base.
+  *
+- * This function also creates the devfs file for the usb device, if devfs
+- * is enabled, and creates a usb class device in the sysfs tree.
++ * This function also creates a usb class device in the sysfs tree.
+  *
+  * usb_deregister_dev() must be called when the driver is done with
+  * the minor numbers given out by this function.
+@@ -162,11 +157,8 @@
+ 
+ 	intf->minor = minor;
+ 
+-	/* handle the devfs registration */
+-	snprintf(name, BUS_ID_SIZE, class_driver->name, minor - minor_base);
+-	devfs_mk_cdev(MKDEV(USB_MAJOR, minor), class_driver->mode, name);
+-
+ 	/* create a usb class device for this usb interface */
++	snprintf(name, BUS_ID_SIZE, class_driver->name, minor - minor_base);
+ 	temp = strrchr(name, '/');
+ 	if (temp && (temp[1] != 0x00))
+ 		++temp;
+@@ -177,7 +169,6 @@
+ 		spin_lock (&minor_lock);
+ 		usb_minors[intf->minor] = NULL;
+ 		spin_unlock (&minor_lock);
+-		devfs_remove (name);
+ 		retval = PTR_ERR(intf->class_dev);
+ 	}
+ exit:
+@@ -195,9 +186,8 @@
+  * call to usb_register_dev() (usually when the device is disconnected
+  * from the system.)
+  *
+- * This function also cleans up the devfs file for the usb device, if devfs
+- * is enabled, and removes the usb class device from the sysfs tree.
+- * 
++ * This function also removes the usb class device from the sysfs tree.
++ *
+  * This should be called by all drivers that use the USB major number.
+  */
+ void usb_deregister_dev(struct usb_interface *intf,
+@@ -220,7 +210,6 @@
+ 	spin_unlock (&minor_lock);
+ 
+ 	snprintf(name, BUS_ID_SIZE, class_driver->name, intf->minor - minor_base);
+-	devfs_remove (name);
+ 	class_device_destroy(usb_class, MKDEV(USB_MAJOR, intf->minor));
+ 	intf->class_dev = NULL;
+ 	intf->minor = -1;
+Index: gregkh-2.6/drivers/usb/image/mdc800.c
+===================================================================
+--- gregkh-2.6.orig/drivers/usb/image/mdc800.c	2005-09-21 05:59:14.000000000 -0700
++++ gregkh-2.6/drivers/usb/image/mdc800.c	2005-09-21 05:59:52.000000000 -0700
+@@ -425,9 +425,8 @@
+ static struct usb_driver mdc800_usb_driver;
+ static struct file_operations mdc800_device_ops;
+ static struct usb_class_driver mdc800_class = {
+-	.name =		"usb/mdc800%d",
++	.name =		"mdc800%d",
+ 	.fops =		&mdc800_device_ops,
+-	.mode =		S_IFCHR | S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP,
+ 	.minor_base =	MDC800_DEVICE_MINOR_BASE,
+ };
+ 
+Index: gregkh-2.6/drivers/usb/input/hiddev.c
+===================================================================
+--- gregkh-2.6.orig/drivers/usb/input/hiddev.c	2005-09-21 05:59:14.000000000 -0700
++++ gregkh-2.6/drivers/usb/input/hiddev.c	2005-09-21 05:59:52.000000000 -0700
+@@ -732,9 +732,8 @@
+ };
+ 
+ static struct usb_class_driver hiddev_class = {
+-	.name =		"usb/hid/hiddev%d",
++	.name =		"hiddev%d",
+ 	.fops =		&hiddev_fops,
+-	.mode =		S_IFCHR | S_IRUGO | S_IWUSR,
+ 	.minor_base =	HIDDEV_MINOR_BASE,
+ };
+ 
+Index: gregkh-2.6/drivers/usb/media/dabusb.c
+===================================================================
+--- gregkh-2.6.orig/drivers/usb/media/dabusb.c	2005-09-21 05:59:14.000000000 -0700
++++ gregkh-2.6/drivers/usb/media/dabusb.c	2005-09-21 05:59:52.000000000 -0700
+@@ -707,9 +707,8 @@
+ };
+ 
+ static struct usb_class_driver dabusb_class = {
+-	.name =		"usb/dabusb%d",
++	.name =		"dabusb%d",
+ 	.fops =		&dabusb_fops,
+-	.mode =		S_IFCHR | S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP,
+ 	.minor_base =	DABUSB_MINOR,
+ };
+ 
+Index: gregkh-2.6/drivers/usb/misc/auerswald.c
+===================================================================
+--- gregkh-2.6.orig/drivers/usb/misc/auerswald.c	2005-09-21 05:59:14.000000000 -0700
++++ gregkh-2.6/drivers/usb/misc/auerswald.c	2005-09-21 05:59:52.000000000 -0700
+@@ -1873,9 +1873,8 @@
+ };
+ 
+ static struct usb_class_driver auerswald_class = {
+-	.name =		"usb/auer%d",
++	.name =		"auer%d",
+ 	.fops =		&auerswald_fops,
+-	.mode =		S_IFCHR | S_IRUGO | S_IWUGO,
+ 	.minor_base =	AUER_MINOR_BASE,
+ };
+ 
+Index: gregkh-2.6/drivers/usb/misc/idmouse.c
+===================================================================
+--- gregkh-2.6.orig/drivers/usb/misc/idmouse.c	2005-09-21 05:59:14.000000000 -0700
++++ gregkh-2.6/drivers/usb/misc/idmouse.c	2005-09-21 05:59:52.000000000 -0700
+@@ -105,11 +105,10 @@
+ 	.release = idmouse_release,
+ };
+ 
+-/* class driver information for devfs */
++/* class driver information */
+ static struct usb_class_driver idmouse_class = {
+-	.name = "usb/idmouse%d",
++	.name = "idmouse%d",
+ 	.fops = &idmouse_fops,
+-	.mode = S_IFCHR | S_IRUSR | S_IRGRP | S_IROTH, /* filemode (char, 444) */
+ 	.minor_base = USB_IDMOUSE_MINOR_BASE,
+ };
+ 
+Index: gregkh-2.6/drivers/usb/misc/legousbtower.c
+===================================================================
+--- gregkh-2.6.orig/drivers/usb/misc/legousbtower.c	2005-09-21 05:59:14.000000000 -0700
++++ gregkh-2.6/drivers/usb/misc/legousbtower.c	2005-09-21 05:59:52.000000000 -0700
+@@ -271,12 +271,11 @@
+ 
+ /*
+  * usb class driver info in order to get a minor number from the usb core,
+- * and to have the device registered with devfs and the driver core
++ * and to have the device registered with the driver core
+  */
+ static struct usb_class_driver tower_class = {
+-	.name =		"usb/legousbtower%d",
++	.name =		"legousbtower%d",
+ 	.fops =		&tower_fops,
+-	.mode =		S_IFCHR | S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH,
+ 	.minor_base =	LEGO_USB_TOWER_MINOR_BASE,
+ };
+ 
+Index: gregkh-2.6/drivers/usb/misc/rio500.c
+===================================================================
+--- gregkh-2.6.orig/drivers/usb/misc/rio500.c	2005-09-21 05:59:14.000000000 -0700
++++ gregkh-2.6/drivers/usb/misc/rio500.c	2005-09-21 05:59:52.000000000 -0700
+@@ -443,9 +443,8 @@
+ };
+ 
+ static struct usb_class_driver usb_rio_class = {
+-	.name =		"usb/rio500%d",
++	.name =		"rio500%d",
+ 	.fops =		&usb_rio_fops,
+-	.mode =		S_IFCHR | S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP,
+ 	.minor_base =	RIO_MINOR,
+ };
+ 
+Index: gregkh-2.6/drivers/usb/misc/usblcd.c
+===================================================================
+--- gregkh-2.6.orig/drivers/usb/misc/usblcd.c	2005-09-21 05:59:14.000000000 -0700
++++ gregkh-2.6/drivers/usb/misc/usblcd.c	2005-09-21 05:59:52.000000000 -0700
+@@ -251,13 +251,12 @@
+ };
+ 
+ /*
+- *  * usb class driver info in order to get a minor number from the usb core,
+- *   * and to have the device registered with devfs and the driver core
+- *    */
++ * usb class driver info in order to get a minor number from the usb core,
++ * and to have the device registered with the driver core
++ */
+ static struct usb_class_driver lcd_class = {
+-        .name =         "usb/lcd%d",
++        .name =         "lcd%d",
+         .fops =         &lcd_fops,
+-        .mode =         S_IFCHR | S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH,
+         .minor_base =   USBLCD_MINOR,
+ };
+ 
+Index: gregkh-2.6/drivers/usb/usb-skeleton.c
+===================================================================
+--- gregkh-2.6.orig/drivers/usb/usb-skeleton.c	2005-09-21 05:59:14.000000000 -0700
++++ gregkh-2.6/drivers/usb/usb-skeleton.c	2005-09-21 05:59:52.000000000 -0700
+@@ -223,9 +223,8 @@
+  * and to have the device registered with devfs and the driver core
+  */
+ static struct usb_class_driver skel_class = {
+-	.name =		"usb/skel%d",
++	.name =		"skel%d",
+ 	.fops =		&skel_fops,
+-	.mode =		S_IFCHR | S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH,
+ 	.minor_base =	USB_SKEL_MINOR_BASE,
+ };
+ 
+Index: gregkh-2.6/drivers/usb/misc/sisusbvga/sisusb.c
+===================================================================
+--- gregkh-2.6.orig/drivers/usb/misc/sisusbvga/sisusb.c	2005-09-21 05:59:14.000000000 -0700
++++ gregkh-2.6/drivers/usb/misc/sisusbvga/sisusb.c	2005-09-21 05:59:52.000000000 -0700
+@@ -3239,12 +3239,7 @@
+ };
+ 
+ static struct usb_class_driver usb_sisusb_class = {
+-#if LINUX_VERSION_CODE <= KERNEL_VERSION(2,6,13)
+-	.name =		"usb/sisusbvga%d",
+-	.mode =		S_IFCHR | S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP,
+-#else
+ 	.name =		"sisusbvga%d",
+-#endif
+ 	.fops =		&usb_sisusb_fops,
+ 	.minor_base =	SISUSB_MINOR
+ };
+Index: gregkh-2.6/drivers/usb/input/aiptek.c
+===================================================================
+--- gregkh-2.6.orig/drivers/usb/input/aiptek.c	2005-09-21 05:59:14.000000000 -0700
++++ gregkh-2.6/drivers/usb/input/aiptek.c	2005-09-21 05:59:52.000000000 -0700
+@@ -2159,7 +2159,7 @@
+ 	 * input_handles associated with this input device.
+ 	 * What identifies an evdev input_handler is that it begins
+ 	 * with 'event', continues with a digit, and that in turn
+-	 * is mapped to /{devfs}/input/eventN.
++	 * is mapped to input/eventN.
+ 	 */
+ 	inputdev = &aiptek->inputdev;
+ 	list_for_each_safe(node, next, &inputdev->h_list) {

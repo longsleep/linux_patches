@@ -1,0 +1,222 @@
+From david-b@pacbell.net Tue Sep 13 20:02:33 2005
+From: David Brownell <david-b@pacbell.net>
+Subject: [patch 2.6.14-rc1, 3/5] remove usb_suspend_device() parameter
+Date: Tue, 13 Sep 2005 19:57:27 -0700
+Cc: Greg KH <greg@kroah.com>
+Message-Id: <200509131957.27382.david-b@pacbell.net>
+
+
+This patch removes the extra usb_suspend_device() parameter.  The original
+reason to pass that parameter was so that this routine could suspend any
+active children.  A previous patch removed that functionality ... leaving
+no reason to pass the parameter.  A close analogy is pci_set_power_state,
+which doesn't need a pm_message_t either.
+
+On the internal code path that comes through the driver model, the parameter
+is now used to distinguish cases where USB devices need to "freeze" but not
+suspend.   It also checks for an error case that's accessible through sysfs:
+attempting to suspend a device before its interfaces (or for hubs, ports).
+
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/hub.c         |   34 +++++++++++++++++++++-------------
+ drivers/usb/core/usb.c         |   23 +++++++++++++++++++++--
+ drivers/usb/host/ehci-hcd.c    |    2 +-
+ drivers/usb/host/isp116x-hcd.c |    2 +-
+ drivers/usb/host/ohci-pci.c    |    2 +-
+ include/linux/usb.h            |    2 +-
+ 6 files changed, 46 insertions(+), 19 deletions(-)
+
+--- gregkh-2.6.orig/include/linux/usb.h	2005-09-16 16:26:47.000000000 -0700
++++ gregkh-2.6/include/linux/usb.h	2005-09-16 17:34:35.000000000 -0700
+@@ -976,7 +976,7 @@ extern int usb_bulk_msg(struct usb_devic
+ 	int timeout);
+ 
+ /* selective suspend/resume */
+-extern int usb_suspend_device(struct usb_device *dev, pm_message_t message);
++extern int usb_suspend_device(struct usb_device *dev);
+ extern int usb_resume_device(struct usb_device *dev);
+ 
+ 
+--- gregkh-2.6.orig/drivers/usb/core/usb.c	2005-09-16 17:34:33.000000000 -0700
++++ gregkh-2.6/drivers/usb/core/usb.c	2005-09-16 17:34:35.000000000 -0700
+@@ -1414,14 +1414,33 @@ void usb_buffer_unmap_sg (struct usb_dev
+ 			usb_pipein (pipe) ? DMA_FROM_DEVICE : DMA_TO_DEVICE);
+ }
+ 
++static int verify_suspended(struct device *dev, void *unused)
++{
++	return (dev->power.power_state.event == PM_EVENT_ON) ? -EBUSY : 0;
++}
++
+ static int usb_generic_suspend(struct device *dev, pm_message_t message)
+ {
+ 	struct usb_interface	*intf;
+ 	struct usb_driver	*driver;
+ 	int			status;
+ 
+-	if (dev->driver == &usb_generic_driver)
+-		return usb_suspend_device (to_usb_device(dev), message);
++	/* USB devices enter SUSPEND state through their hubs, but can be
++	 * marked for FREEZE as soon as their children are already idled.
++	 */
++	if (dev->driver == &usb_generic_driver) {
++		if (dev->power.power_state.event == message.event)
++			return 0;
++		/* we need to rule out bogus requests through sysfs */
++		status = device_for_each_child(dev, NULL, verify_suspended);
++		if (status)
++			return status;
++		if (message.event == PM_EVENT_FREEZE) {
++			dev->power.power_state = message;
++			return 0;
++		}
++ 		return usb_suspend_device (to_usb_device(dev));
++	}
+ 
+ 	if ((dev->driver == NULL) ||
+ 	    (dev->driver_data == &usb_generic_driver_data))
+--- gregkh-2.6.orig/drivers/usb/core/hub.c	2005-09-16 17:34:34.000000000 -0700
++++ gregkh-2.6/drivers/usb/core/hub.c	2005-09-16 17:34:35.000000000 -0700
+@@ -1323,11 +1323,9 @@ int usb_new_device(struct usb_device *ud
+ 		 * (Includes HNP test device.)
+ 		 */
+ 		if (udev->bus->b_hnp_enable || udev->bus->is_b_host) {
+-			static int __usb_suspend_device (struct usb_device *,
+-						int port1, pm_message_t state);
+-			err = __usb_suspend_device(udev,
+-					udev->bus->otg_port,
+-					PMSG_SUSPEND);
++			static int __usb_suspend_device(struct usb_device *,
++						int port1);
++			err = __usb_suspend_device(udev, udev->bus->otg_port);
+ 			if (err < 0)
+ 				dev_dbg(&udev->dev, "HNP fail, %d\n", err);
+ 		}
+@@ -1517,7 +1515,7 @@ static void hub_port_logical_disconnect(
+ 	/* FIXME let caller ask to power down the port:
+ 	 *  - some devices won't enumerate without a VBUS power cycle
+ 	 *  - SRP saves power that way
+-	 *  - usb_suspend_device(dev, PMSG_SUSPEND)
++	 *  - ... new call, TBD ...
+ 	 * That's easy if this hub can switch power per-port, and
+ 	 * khubd reactivates the port later (timer, SRP, etc).
+ 	 * Powerdown must be optional, because of reset/DFU.
+@@ -1599,9 +1597,12 @@ static int hub_port_suspend(struct usb_h
+  * Other than re-initializing the hub (plug/unplug, except for root hubs),
+  * Linux (2.6) currently has NO mechanisms to initiate that:  no khubd
+  * timer, no SRP, no requests through sysfs.
++ *
++ * If CONFIG_USB_SUSPEND isn't enabled, devices only really suspend when
++ * the root hub for their bus goes into global suspend ... so we don't
++ * (falsely) update the device power state to say it suspended.
+  */
+-static int __usb_suspend_device (struct usb_device *udev, int port1,
+-				 pm_message_t state)
++static int __usb_suspend_device (struct usb_device *udev, int port1)
+ {
+ 	int	status;
+ 
+@@ -1648,14 +1649,13 @@ static int __usb_suspend_device (struct 
+ 				udev);
+ 
+ 	if (status == 0)
+-		udev->dev.power.power_state = state;
++		udev->dev.power.power_state = PMSG_SUSPEND;
+ 	return status;
+ }
+ 
+ /**
+  * usb_suspend_device - suspend a usb device
+  * @udev: device that's no longer in active use
+- * @state: PMSG_SUSPEND to suspend
+  * Context: must be able to sleep; device not locked
+  *
+  * Suspends a USB device that isn't in active use, conserving power.
+@@ -1664,13 +1664,16 @@ static int __usb_suspend_device (struct 
+  * suspend by the host, using usb_resume_device().  It's also routine
+  * to disconnect devices while they are suspended.
+  *
++ * This only affects the USB hardware for a device; its interfaces
++ * (and, for hubs, child devices) must already have been suspended.
++ *
+  * Suspending OTG devices may trigger HNP, if that's been enabled
+  * between a pair of dual-role devices.  That will change roles, such
+  * as from A-Host to A-Peripheral or from B-Host back to B-Peripheral.
+  *
+  * Returns 0 on success, else negative errno.
+  */
+-int usb_suspend_device(struct usb_device *udev, pm_message_t state)
++int usb_suspend_device(struct usb_device *udev)
+ {
+ 	int	port1, status;
+ 
+@@ -1678,12 +1681,15 @@ int usb_suspend_device(struct usb_device
+ 	if (port1 < 0)
+ 		return port1;
+ 
+-	status = __usb_suspend_device(udev, port1, state);
++	status = __usb_suspend_device(udev, port1);
+ 	usb_unlock_device(udev);
+ 	return status;
+ }
+ 
+ /*
++ * If the USB "suspend" state is in use (rather than "global suspend"),
++ * many devices will be individually taken out of suspend state using
++ * special" resume" signaling.  These routines kick in shortly after
+  * hardware resume signaling is finished, either because of selective
+  * resume (by host) or remote wakeup (by device) ... now see what changed
+  * in the tree that's rooted at this device.
+@@ -1986,13 +1992,15 @@ void usb_resume_root_hub(struct usb_devi
+ 
+ #else	/* !CONFIG_USB_SUSPEND */
+ 
+-int usb_suspend_device(struct usb_device *udev, pm_message_t state)
++int usb_suspend_device(struct usb_device *udev)
+ {
++	/* state does NOT lie by saying it's USB_STATE_SUSPENDED! */
+ 	return 0;
+ }
+ 
+ int usb_resume_device(struct usb_device *udev)
+ {
++	udev->dev.power_state.event = PM_EVENT_ON;
+ 	return 0;
+ }
+ 
+--- gregkh-2.6.orig/drivers/usb/host/ehci-hcd.c	2005-09-12 23:05:05.000000000 -0700
++++ gregkh-2.6/drivers/usb/host/ehci-hcd.c	2005-09-16 17:34:35.000000000 -0700
+@@ -751,7 +751,7 @@ static int ehci_suspend (struct usb_hcd 
+ 		msleep (100);
+ 
+ #ifdef	CONFIG_USB_SUSPEND
+-	(void) usb_suspend_device (hcd->self.root_hub, message);
++	(void) usb_suspend_device (hcd->self.root_hub);
+ #else
+ 	usb_lock_device (hcd->self.root_hub);
+ 	(void) ehci_hub_suspend (hcd);
+--- gregkh-2.6.orig/drivers/usb/host/isp116x-hcd.c	2005-09-12 23:05:05.000000000 -0700
++++ gregkh-2.6/drivers/usb/host/isp116x-hcd.c	2005-09-16 17:34:35.000000000 -0700
+@@ -1783,7 +1783,7 @@ static int isp116x_suspend(struct device
+ 	if (phase != SUSPEND_DISABLE && phase != SUSPEND_POWER_DOWN)
+ 		return 0;
+ 
+-	ret = usb_suspend_device(hcd->self.root_hub, state);
++	ret = usb_suspend_device(hcd->self.root_hub);
+ 	if (!ret) {
+ 		dev->power.power_state = state;
+ 		INFO("%s suspended\n", hcd_name);
+--- gregkh-2.6.orig/drivers/usb/host/ohci-pci.c	2005-08-28 16:41:01.000000000 -0700
++++ gregkh-2.6/drivers/usb/host/ohci-pci.c	2005-09-16 17:34:35.000000000 -0700
+@@ -119,7 +119,7 @@ static int ohci_pci_suspend (struct usb_
+ 		msleep (100);
+ 
+ #ifdef	CONFIG_USB_SUSPEND
+-	(void) usb_suspend_device (hcd->self.root_hub, message);
++	(void) usb_suspend_device (hcd->self.root_hub);
+ #else
+ 	usb_lock_device (hcd->self.root_hub);
+ 	(void) ohci_hub_suspend (hcd);

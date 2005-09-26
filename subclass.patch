@@ -1,0 +1,754 @@
+ drivers/base/Makefile   |    2 
+ drivers/base/base.h     |    2 
+ drivers/base/class.c    |    3 
+ drivers/base/subclass.c |  569 ++++++++++++++++++++++++++++++++++++++++++++++++
+ drivers/usb/gregkh.c    |   20 +
+ include/linux/device.h  |   66 +++++
+ 6 files changed, 659 insertions(+), 3 deletions(-)
+
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ gregkh-2.6/drivers/base/subclass.c	2005-09-21 09:33:02.000000000 -0700
+@@ -0,0 +1,569 @@
++/*
++ * subclass.c - subclass crap
++ *
++ * Portions based on drivers/base/class.c, which is:
++ *		Copyright (c) 2002-3 Patrick Mochel
++ *		Copyright (c) 2002-3 Open Source Development Labs
++ *		Copyright (c) 2003-2004 Greg Kroah-Hartman
++ *		Copyright (c) 2003-2004 IBM Corp.
++ *
++ * Copyright (c) 2005 Greg Kroah-Hartman
++ * Copyright (c) 2005 Novell, Inc.
++ *
++ * This file is released under the GPLv2
++ */
++
++#include <linux/config.h>
++#include <linux/device.h>
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/string.h>
++#include <linux/kdev_t.h>
++#include <linux/err.h>
++#include <linux/ndevfs.h>
++#include "base.h"
++
++#define to_subclass_attr(_attr) container_of(_attr, struct subclass_attribute, attr)
++#define to_class(obj) container_of(obj, struct class, subsys.kset.kobj)
++
++
++int subclass_device_create_file(struct subclass_device *dev,
++				const struct subclass_device_attribute *attr)
++{
++	int error = -EINVAL;
++	if (dev)
++		error = sysfs_create_file(&dev->kobj, &attr->attr);
++	return error;
++}
++EXPORT_SYMBOL_GPL(subclass_device_create_file);
++
++void subclass_device_remove_file(struct subclass_device *dev,
++				 const struct subclass_device_attribute *attr)
++{
++	if (dev)
++		sysfs_remove_file(&dev->kobj, &attr->attr);
++}
++EXPORT_SYMBOL_GPL(subclass_device_remove_file);
++
++int subclass_device_create_bin_file(struct subclass_device *dev,
++				    struct bin_attribute *attr)
++{
++	int error = -EINVAL;
++	if (dev)
++		error = sysfs_create_bin_file(&dev->kobj, attr);
++	return error;
++}
++
++void subclass_device_remove_bin_file(struct subclass_device *dev,
++				     struct bin_attribute *attr)
++{
++	if (dev)
++		sysfs_remove_bin_file(&dev->kobj, attr);
++}
++
++static inline struct subclass_device *to_subclass_dev(struct kobject *obj)
++{
++	return container_of(obj, struct subclass_device, kobj);
++}
++
++static inline struct subclass_device_attribute *to_subclass_dev_attr(struct attribute *_attr)
++{
++	return container_of(_attr, struct subclass_device_attribute, attr);
++}
++
++
++static ssize_t subclass_device_attr_show(struct kobject *kobj, struct attribute *attr,
++					 char * buf)
++{
++	struct subclass_device_attribute *dev_attr = to_subclass_dev_attr(attr);
++	struct subclass_device *dev = to_subclass_dev(kobj);
++	ssize_t ret = 0;
++
++	if (dev_attr->show)
++		ret = dev_attr->show(dev, dev_attr, buf);
++	return ret;
++}
++
++static ssize_t subclass_device_attr_store(struct kobject *kobj, struct attribute *attr,
++					  const char *buf, size_t count)
++{
++	struct subclass_device_attribute *dev_attr = to_subclass_dev_attr(attr);
++	struct subclass_device *dev = to_subclass_dev(kobj);
++	ssize_t ret = 0;
++
++	if (dev_attr->store)
++		ret = dev_attr->store(dev, dev_attr, buf, count);
++	return ret;
++}
++
++static struct sysfs_ops subclass_dev_sysfs_ops = {
++	.show	= subclass_device_attr_show,
++	.store	= subclass_device_attr_store,
++};
++
++static void subclass_dev_release(struct kobject *kobj)
++{
++	struct subclass_device *sd = to_subclass_dev(kobj);
++	struct class_device *class_dev = sd->parent;
++
++	pr_debug("subclass device '%s': release.\n", kobject_name(&sd->kobj));
++
++	kfree(sd->devt_attr);
++	sd->devt_attr = NULL;
++
++	if (class_dev->release)
++		class_dev->release(sd);
++	else {
++		printk(KERN_ERR "Class Device '%s' does not have a release() function, "
++			"it is broken and must be fixed.\n",
++			class_dev->class_id);
++		WARN_ON(1);
++	}
++}
++
++static struct kobj_type ktype_subclass_device = {
++	.sysfs_ops	= &subclass_dev_sysfs_ops,
++	.release	= subclass_dev_release,
++};
++
++static int subclass_hotplug_filter(struct kset *kset, struct kobject *kobj)
++{
++	struct kobj_type *ktype = get_ktype(kobj);
++
++	if (ktype == &ktype_subclass_device) {
++		struct subclass_device *dev = to_subclass_dev(kobj);
++		if (dev->parent)
++			return 1;
++	}
++	return 0;
++}
++
++static const char *subclass_hotplug_name(struct kset *kset, struct kobject *kobj)
++{
++	struct subclass_device *dev = to_subclass_dev(kobj);
++
++	return dev->parent->class->name;
++}
++
++static int subclass_hotplug(struct kset *kset, struct kobject *kobj, char **envp,
++			    int num_envp, char *buffer, int buffer_size)
++{
++	struct subclass_device *sd = to_subclass_dev(kobj);
++	int i = 0;
++	int length = 0;
++	int retval = 0;
++
++	pr_debug("%s - name = %s\n", __FUNCTION__, kobject_name(&sd->kobj));
++
++	if (sd->dev) {
++		/* add physical device, backing this device  */
++		struct device *dev = sd->dev;
++		char *path = kobject_get_path(&dev->kobj, GFP_KERNEL);
++
++		add_hotplug_env_var(envp, num_envp, &i, buffer, buffer_size,
++				    &length, "PHYSDEVPATH=%s", path);
++		kfree(path);
++
++		if (dev->bus)
++			add_hotplug_env_var(envp, num_envp, &i,
++					    buffer, buffer_size, &length,
++					    "PHYSDEVBUS=%s", dev->bus->name);
++
++		if (dev->driver)
++			add_hotplug_env_var(envp, num_envp, &i,
++					    buffer, buffer_size, &length,
++					    "PHYSDEVDRIVER=%s", dev->driver->name);
++	}
++
++	if (MAJOR(sd->devt)) {
++		add_hotplug_env_var(envp, num_envp, &i,
++				    buffer, buffer_size, &length,
++				    "MAJOR=%u", MAJOR(sd->devt));
++
++		add_hotplug_env_var(envp, num_envp, &i,
++				    buffer, buffer_size, &length,
++				    "MINOR=%u", MINOR(sd->devt));
++	}
++
++	/* terminate, set to next free slot, shrink available space */
++	envp[i] = NULL;
++	envp = &envp[i];
++	num_envp -= i;
++	buffer = &buffer[length];
++	buffer_size -= length;
++
++	if (sd->parent->class->hotplug) {
++		/* have the bus specific function add its stuff */
++		retval = sd->parent->class->hotplug(sd->parent, envp, num_envp,
++						    buffer, buffer_size);
++		if (retval) {
++			pr_debug ("%s - hotplug() returned %d\n",
++				  __FUNCTION__, retval);
++		}
++	}
++
++	return retval;
++}
++
++static struct kset_hotplug_ops subclass_hotplug_ops = {
++	.filter =	subclass_hotplug_filter,
++	.name =		subclass_hotplug_name,
++	.hotplug =	subclass_hotplug,
++};
++
++static decl_subsys(subclass_obj, &ktype_subclass_device, &subclass_hotplug_ops);
++
++
++static int subclass_device_add_attrs(struct subclass_device *sd)
++{
++	int i;
++	int error = 0;
++	struct class *class = sd->parent->class;
++
++	if (class->subclass_dev_attrs) {
++		for (i = 0; attr_name(class->subclass_dev_attrs[i]); i++) {
++			error = subclass_device_create_file(sd,
++							    &class->subclass_dev_attrs[i]);
++			if (error)
++				goto error;
++		}
++	}
++done:
++	return error;
++error:
++	while (--i >= 0)
++		subclass_device_remove_file(sd, &class->subclass_dev_attrs[i]);
++	goto done;
++}
++
++static void subclass_device_remove_attrs(struct subclass_device *sd)
++{
++	int i;
++	struct class *class = sd->parent->class;
++
++	if (class->subclass_dev_attrs) {
++		for (i = 0; attr_name(class->subclass_dev_attrs[i]); i++)
++			subclass_device_remove_file(sd, &class->subclass_dev_attrs[i]);
++	}
++}
++
++static ssize_t show_dev(struct subclass_device *sd,
++			struct subclass_device_attribute *attr, char *buf)
++{
++	return print_dev_t(buf, sd->devt);
++}
++
++static ssize_t show_sample(struct subclass_device *sd,
++			   struct subclass_device_attribute *attr, char *buf)
++{
++	return sprintf(buf, "#!/bin/sh\nmknod /dev/%s c %d %d\n",
++			kobject_name(&sd->kobj),
++			MAJOR(sd->devt), MINOR(sd->devt));
++}
++
++void subclass_device_initialize(struct subclass_device *sd)
++{
++	kobj_set_kset_s(sd, subclass_obj_subsys);
++	kobject_init(&sd->kobj);
++	INIT_LIST_HEAD(&sd->node);
++}
++
++static char *make_class_name(struct subclass_device *sd)
++{
++	char *name;
++	int size;
++
++	size = strlen(sd->parent->class->name) +
++		strlen(kobject_name(&sd->kobj)) + 2;
++
++	name = kmalloc(size, GFP_KERNEL);
++	if (!name)
++		return ERR_PTR(-ENOMEM);
++
++	strcpy(name, sd->parent->class->name);
++	strcat(name, ":");
++	strcat(name, kobject_name(&sd->kobj));
++	return name;
++}
++
++int subclass_device_add(struct subclass_device *sd)
++{
++	struct class_device *parent = NULL;
++	struct class_interface * class_intf;
++	char *class_name = NULL;
++	int error;
++
++	sd = subclass_device_get(sd);
++	if (!sd)
++		return -EINVAL;
++
++	if (!strlen(sd->class_id)) {
++		error = -EINVAL;
++		goto register_done;
++	}
++
++	parent = class_device_get(sd->parent);
++	if (!parent) {
++		error = -EINVAL;
++		goto register_done;
++	}
++
++	pr_debug("SUBCLASS: registering subclass device: '%s'\n", sd->class_id);
++
++	/* first, register with generic layer. */
++	kobject_set_name(&sd->kobj, "%s", sd->class_id);
++	if (parent)
++		sd->kobj.parent = &parent->kobj;
++
++	error = kobject_add(&sd->kobj);
++	if (error)
++		goto register_done;
++
++	/* add the needed attributes to this device */
++	if (MAJOR(sd->devt)) {
++		struct subclass_device_attribute *attr;
++		attr = kzalloc(sizeof(*attr), GFP_KERNEL);
++		if (!attr) {
++			error = -ENOMEM;
++			kobject_del(&sd->kobj);
++			goto register_done;
++		}
++
++		attr->attr.name = "dev";
++		attr->attr.mode = S_IRUGO;
++		attr->attr.owner = parent->class->owner;
++		attr->show = show_dev;
++		attr->store = NULL;
++		subclass_device_create_file(sd, attr);
++		sd->devt_attr = attr;
++
++		attr = kzalloc(sizeof(*attr), GFP_KERNEL);
++		if (!attr) {
++			error = -ENOMEM;
++			kobject_del(&sd->kobj);
++			goto register_done;
++		}
++		attr->attr.name = "sample.sh";
++		attr->attr.mode = S_IRUSR | S_IXUSR | S_IRUGO;
++		attr->attr.owner = parent->class->owner;
++		attr->show = show_sample;
++		attr->store = NULL;
++		subclass_device_create_file(sd, attr);
++		sd->sample_attr = attr;
++
++		ndevfs_create(kobject_name(&sd->kobj), sd->devt, 1);
++	}
++
++	subclass_device_add_attrs(sd);
++	if (sd->dev) {
++		class_name = make_class_name(sd);
++		sysfs_create_link(&sd->kobj, &sd->dev->kobj, "device");
++		sysfs_create_link(&sd->dev->kobj, &sd->kobj, class_name);
++	}
++
++	/* notify any interfaces this device is now here */
++	if (parent) {
++		down(&parent->sem);
++		list_add_tail(&sd->node, &parent->subdevs);
++//		list_for_each_entry(class_intf, &parent->interfaces, node)
++//			if (class_intf->add)
++//				class_intf->add(class_dev);
++		up(&parent->sem);
++	}
++
++	kobject_hotplug(&sd->kobj, KOBJ_ADD);
++
++ register_done:
++	if (error && parent)
++		class_device_put(parent);
++	subclass_device_put(sd);
++	kfree(class_name);
++	return error;
++}
++
++int subclass_device_register(struct subclass_device *sd)
++{
++	subclass_device_initialize(sd);
++	return subclass_device_add(sd);
++}
++
++/**
++ * class_device_create - creates a class device and registers it with sysfs
++ * @cs: pointer to the struct class that this device should be registered to.
++ * @dev: the dev_t for the char device to be added.
++ * @device: a pointer to a struct device that is assiociated with this class device.
++ * @fmt: string for the class device's name
++ *
++ * This function can be used by char device classes.  A struct
++ * class_device will be created in sysfs, registered to the specified
++ * class.  A "dev" file will be created, showing the dev_t for the
++ * device.  The pointer to the struct class_device will be returned from
++ * the call.  Any further sysfs files that might be required can be
++ * created using this pointer.
++ *
++ * Note: the struct class passed to this function must have previously
++ * been created with a call to class_create().
++ */
++struct subclass_device *subclass_device_create(struct class_device *class_dev,
++					       dev_t devt, struct device *device,
++					       char *fmt, ...)
++{
++	va_list args;
++	struct subclass_device *sd = NULL;
++	int retval = -ENODEV;
++
++	if (class_dev == NULL || IS_ERR(class_dev))
++		goto error;
++
++	sd = kzalloc(sizeof(struct subclass_device), GFP_KERNEL);
++	if (!sd) {
++		retval = -ENOMEM;
++		goto error;
++	}
++
++	sd->devt = devt;
++	sd->dev = device;
++	sd->parent = class_dev;
++	sd->kobj.parent = &class_dev->kobj;
++
++	va_start(args, fmt);
++	vsnprintf(sd->class_id, BUS_ID_SIZE, fmt, args);
++	va_end(args);
++	retval = subclass_device_register(sd);
++	if (retval)
++		goto error;
++
++	return sd;
++
++error:
++	kfree(sd);
++	return ERR_PTR(retval);
++}
++EXPORT_SYMBOL_GPL(subclass_device_create);
++
++void subclass_device_del(struct subclass_device *sd)
++{
++	struct class_device *parent = sd->parent;
++	struct class_interface * class_intf;
++	char *class_name = NULL;
++
++	if (parent) {
++		down(&parent->sem);
++		list_del_init(&sd->node);
++//		list_for_each_entry(class_intf, &parent->interfaces, node)
++//			if (class_intf->remove)
++//				class_intf->remove(class_dev);
++		up(&parent->sem);
++	}
++
++	if (sd->dev) {
++		class_name = make_class_name(sd);
++		sysfs_remove_link(&sd->kobj, "device");
++		sysfs_remove_link(&sd->dev->kobj, class_name);
++	}
++	if (sd->devt_attr) {
++		subclass_device_remove_file(sd, sd->devt_attr);
++		subclass_device_remove_file(sd, sd->sample_attr);
++		ndevfs_remove(kobject_name(&sd->kobj));
++  	}
++	subclass_device_remove_attrs(sd);
++
++	kobject_hotplug(&sd->kobj, KOBJ_REMOVE);
++	kobject_del(&sd->kobj);
++
++	if (parent)
++		class_device_put(parent);
++	kfree(class_name);
++}
++
++void subclass_device_unregister(struct subclass_device *sd)
++{
++	pr_debug("SUBCLASS: Unregistering subclass device. ID = '%s'\n",
++		 kobject_name(&sd->kobj));
++	subclass_device_del(sd);
++	subclass_device_put(sd);
++}
++
++/**
++ * subclass_device_destroy - removes a class device that was created with class_device_create()
++ * @cls: the pointer to the struct class that this device was registered * with.
++ * @dev: the dev_t of the device that was previously registered.
++ *
++ * This call unregisters and cleans up a class device that was created with a
++ * call to class_device_create()
++ */
++void subclass_device_destroy(struct class_device *class_dev, dev_t devt)
++{
++	struct subclass_device *sd = NULL;
++	struct subclass_device *sd_tmp;
++
++	down(&class_dev->sem);
++	list_for_each_entry(sd_tmp, &class_dev->subdevs, node) {
++		if (sd_tmp->devt == devt) {
++			sd = sd_tmp;
++			break;
++		}
++	}
++	up(&class_dev->sem);
++
++	if (sd)
++		subclass_device_unregister(sd);
++}
++EXPORT_SYMBOL_GPL(subclass_device_destroy);
++
++int subclass_device_rename(struct subclass_device *sd, char *new_name)
++{
++	int error = 0;
++	char *old_class_name = NULL, *new_class_name = NULL;
++
++	sd = subclass_device_get(sd);
++	if (!sd)
++		return -EINVAL;
++
++	pr_debug("SUBCLASS: renaming '%s' to '%s'\n", sd->class_id,
++		 new_name);
++
++	if (sd->dev)
++		old_class_name = make_class_name(sd);
++
++	strlcpy(sd->class_id, new_name, KOBJ_NAME_LEN);
++
++	error = kobject_rename(&sd->kobj, new_name);
++
++	if (sd->dev) {
++		new_class_name = make_class_name(sd);
++		sysfs_create_link(&sd->dev->kobj, &sd->kobj, new_class_name);
++		sysfs_remove_link(&sd->dev->kobj, old_class_name);
++	}
++	subclass_device_put(sd);
++
++	kfree(old_class_name);
++	kfree(new_class_name);
++
++	return error;
++}
++
++struct subclass_device *subclass_device_get(struct subclass_device *sd)
++{
++	if (sd)
++		return to_subclass_dev(kobject_get(&sd->kobj));
++	return NULL;
++}
++EXPORT_SYMBOL_GPL(subclass_device_get);
++
++void subclass_device_put(struct subclass_device *sd)
++{
++	kobject_put(&sd->kobj);
++}
++EXPORT_SYMBOL_GPL(subclass_device_put);
++
++void __init subclass_init(void)
++{
++	/* ick, this is ugly, the things we go through to keep from showing up
++	 * in sysfs... */
++	subsystem_init(&subclass_obj_subsys);
++	if (!subclass_obj_subsys.kset.subsys)
++			subclass_obj_subsys.kset.subsys = &subclass_obj_subsys;
++}
++
++
+--- gregkh-2.6.orig/drivers/base/Makefile	2005-09-21 05:53:54.000000000 -0700
++++ gregkh-2.6/drivers/base/Makefile	2005-09-21 06:21:10.000000000 -0700
+@@ -1,7 +1,7 @@
+ # Makefile for the Linux device tree
+ 
+ obj-y			:= core.o sys.o bus.o dd.o \
+-			   driver.o class.o platform.o \
++			   driver.o class.o subclass.o platform.o \
+ 			   cpu.o firmware.o init.o map.o dmapool.o \
+ 			   attribute_container.o transport_class.o
+ obj-y			+= power/
+--- gregkh-2.6.orig/include/linux/device.h	2005-09-21 06:12:17.000000000 -0700
++++ gregkh-2.6/include/linux/device.h	2005-09-21 06:21:10.000000000 -0700
+@@ -45,6 +45,7 @@
+ struct device_driver;
+ struct class;
+ struct class_device;
++struct subclass_device;
+ 
+ struct bus_type {
+ 	const char		* name;
+@@ -163,6 +164,7 @@
+ 
+ 	struct class_attribute		* class_attrs;
+ 	struct class_device_attribute	* class_dev_attrs;
++	struct subclass_device_attribute* subclass_dev_attrs;
+ 
+ 	int	(*hotplug)(struct class_device *dev, char **envp, 
+ 			   int num_envp, char *buffer, int buffer_size);
+@@ -201,7 +203,10 @@
+ 	struct class_device_attribute *sample_attr;
+ 	struct device		* dev;		/* not necessary, but nice to have */
+ 	void			* class_data;	/* class-specific data */
++	struct list_head	subdevs;
++	struct semaphore	sem;	/* locks the subdevs list */
+ 
++	void	(*release)(struct subclass_device *dev);
+ 	char	class_id[BUS_ID_SIZE];	/* unique to this class */
+ };
+ 
+@@ -266,6 +271,67 @@
+ 					__attribute__((format(printf,4,5)));
+ extern void class_device_destroy(struct class *cls, dev_t devt);
+ 
++struct subclass_device {
++	struct list_head	node;
++
++	struct kobject		kobj;
++	struct class_device	*parent;	/* required */
++	struct device		*dev;		/* not necessary, but nice to have */
++	dev_t			devt;		/* dev_t, creates the sysfs "dev" */
++	struct subclass_device_attribute *devt_attr;
++	struct subclass_device_attribute *sample_attr;
++	char			class_id[BUS_ID_SIZE];	/* unique to this class device */
++	void			*data;	/* class-specific data */
++};
++
++static inline void *subclass_get_devdata(struct subclass_device *dev)
++{
++	return dev->data;
++}
++
++static inline void subclass_set_devdata(struct subclass_device *dev, void *data)
++{
++	dev->data = data;
++}
++
++extern int subclass_device_register(struct subclass_device *);
++extern void subclass_device_unregister(struct subclass_device *);
++extern void subclass_device_initialize(struct subclass_device *);
++extern int subclass_device_add(struct subclass_device *);
++extern void subclass_device_del(struct subclass_device *);
++
++extern struct subclass_device *subclass_device_get(struct subclass_device *);
++extern void subclass_device_put(struct subclass_device *);
++
++struct subclass_device_attribute {
++	struct attribute	attr;
++	ssize_t (*show)(struct subclass_device *,
++			struct subclass_device_attribute *attr, char *buf);
++	ssize_t (*store)(struct subclass_device *,
++			struct subclass_device_attribute *attr,
++			const char *buf, size_t count);
++};
++
++#define SUBCLASS_DEVICE_ATTR(_name,_mode,_show,_store)		\
++struct subclass_device_attribute class_device_attr_##_name = 	\
++	__ATTR(_name,_mode,_show,_store)
++
++extern int subclass_device_create_file(struct subclass_device *,
++				       const struct subclass_device_attribute *);
++extern void subclass_device_remove_file(struct subclass_device *,
++					const struct subclass_device_attribute *);
++extern int subclass_device_create_bin_file(struct subclass_device *,
++					   struct bin_attribute *);
++extern void subclass_device_remove_bin_file(struct subclass_device *,
++					    struct bin_attribute *);
++
++extern struct subclass_device *subclass_device_create(struct class_device *class_dev,
++						      dev_t devt, struct device *device,
++						      char *fmt, ...)
++				__attribute__((format(printf,4,5)));
++extern void subclass_device_destroy(struct class_device *class_dev, dev_t devt);
++
++
+ 
+ struct device {
+ 	struct klist		klist_children;
+--- gregkh-2.6.orig/drivers/base/class.c	2005-09-21 06:21:10.000000000 -0700
++++ gregkh-2.6/drivers/base/class.c	2005-09-21 08:29:25.000000000 -0700
+@@ -455,6 +455,8 @@
+ 	kobj_set_kset_s(class_dev, class_obj_subsys);
+ 	kobject_init(&class_dev->kobj);
+ 	INIT_LIST_HEAD(&class_dev->node);
++	INIT_LIST_HEAD(&class_dev->subdevs);
++	init_MUTEX(&class_dev->sem);
+ }
+ 
+ static char *make_class_name(struct class_device *class_dev)
+@@ -797,6 +799,7 @@
+ 	subsystem_init(&class_obj_subsys);
+ 	if (!class_obj_subsys.kset.subsys)
+ 			class_obj_subsys.kset.subsys = &class_obj_subsys;
++	subclass_init();
+ 	return 0;
+ }
+ 
+--- gregkh-2.6.orig/drivers/usb/gregkh.c	2005-09-21 06:12:16.000000000 -0700
++++ gregkh-2.6/drivers/usb/gregkh.c	2005-09-21 09:52:28.000000000 -0700
+@@ -208,17 +208,35 @@
+ 
+ static struct class *greg_class;
+ 
++
++ssize_t sg_show(struct subclass_device *sd, struct subclass_device_attribute *attr, char *buf)
++{
++	return sprintf(buf, "this is device %s\n", kobject_name(&sd->kobj));
++}
++static SUBCLASS_DEVICE_ATTR(name, 0444, sg_show, NULL);
++
++
++
+ static void greg_class_init(void)
+ {
++	struct class_device *g2;
++	struct subclass_device *sg;
++
+ 	greg_class = class_create(THIS_MODULE, "gregkh");
+ 
+ 	class_device_create(greg_class, MKDEV(42, 0), NULL, "greg1");
+-	class_device_create(greg_class, MKDEV(42, 1), NULL, "greg2");
++	g2 = class_device_create(greg_class, MKDEV(42, 1), NULL, "greg2");
+ 	class_device_create(greg_class, MKDEV(42, 2), NULL, "greg3");
+ 
+ 	printk("GREG: create a dupe name\n");
+ 	class_device_create(greg_class, MKDEV(42, 3), NULL, "greg1");
+ 	printk("GREG: dup name created\n");
++
++	subclass_device_create(g2, MKDEV(42,4), NULL, "greg2.4");
++	subclass_device_create(g2, 0, NULL, "greg2.%s", "null");
++	sg = subclass_device_create(g2, MKDEV(42,5), NULL, "greg%d.%d", 2, 5);
++	subclass_device_create_file(sg, &class_device_attr_name);
++
+ }
+ 
+ 
+--- gregkh-2.6.orig/drivers/base/base.h	2005-08-28 16:41:01.000000000 -0700
++++ gregkh-2.6/drivers/base/base.h	2005-09-21 08:29:33.000000000 -0700
+@@ -18,4 +18,4 @@
+ 	return container_of(_attr, struct class_device_attribute, attr);
+ }
+ 
+-
++extern void subclass_init(void);
