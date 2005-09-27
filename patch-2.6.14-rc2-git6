@@ -88,6 +88,21 @@ new file mode 100644
 +brw-------  1 root root 254, 13 29 ago 18:15 /dev/mapper/volumeGroup-snap
 +brw-------  1 root root 254, 10 29 ago 18:14 /dev/mapper/volumeGroup-base
 +
+diff --git a/Documentation/sparse.txt b/Documentation/sparse.txt
+--- a/Documentation/sparse.txt
++++ b/Documentation/sparse.txt
+@@ -51,9 +51,9 @@ or you don't get any checking at all.
+ Where to get sparse
+ ~~~~~~~~~~~~~~~~~~~
+ 
+-With BK, you can just get it from
++With git, you can just get it from
+ 
+-        bk://sparse.bkbits.net/sparse
++        rsync://rsync.kernel.org/pub/scm/devel/sparse/sparse.git
+ 
+ and DaveJ has tar-balls at
+ 
 diff --git a/Documentation/usb/URB.txt b/Documentation/usb/URB.txt
 --- a/Documentation/usb/URB.txt
 +++ b/Documentation/usb/URB.txt
@@ -273,7 +288,7 @@ diff --git a/Makefile b/Makefile
  PATCHLEVEL = 6
  SUBLEVEL = 14
 -EXTRAVERSION =-rc2
-+EXTRAVERSION = -rc2-git3
++EXTRAVERSION = -rc2-git6
  NAME=Affluent Albatross
  
  # *DOCUMENTATION*
@@ -334,6 +349,48 @@ diff --git a/arch/arm/boot/compressed/ofw-shark.c b/arch/arm/boot/compressed/ofw
 -	(unsigned char) pointer[32] = ((unsigned char *) buffer)[mem_len-2];
 +	* ((unsigned char *) &pointer[32]) = ((unsigned char *) buffer)[mem_len-2];
  }
+diff --git a/arch/arm/kernel/entry-armv.S b/arch/arm/kernel/entry-armv.S
+--- a/arch/arm/kernel/entry-armv.S
++++ b/arch/arm/kernel/entry-armv.S
+@@ -537,7 +537,7 @@ ENTRY(__switch_to)
+ #ifdef CONFIG_CPU_MPCORE
+ 	clrex
+ #else
+-	strex	r3, r4, [ip]			@ Clear exclusive monitor
++	strex	r5, r4, [ip]			@ Clear exclusive monitor
+ #endif
+ #endif
+ #if defined(CONFIG_CPU_XSCALE) && !defined(CONFIG_IWMMXT)
+diff --git a/arch/arm/kernel/io.c b/arch/arm/kernel/io.c
+--- a/arch/arm/kernel/io.c
++++ b/arch/arm/kernel/io.c
+@@ -7,7 +7,7 @@
+  * Copy data from IO memory space to "real" memory space.
+  * This needs to be optimized.
+  */
+-void _memcpy_fromio(void *to, void __iomem *from, size_t count)
++void _memcpy_fromio(void *to, const volatile void __iomem *from, size_t count)
+ {
+ 	unsigned char *t = to;
+ 	while (count) {
+@@ -22,7 +22,7 @@ void _memcpy_fromio(void *to, void __iom
+  * Copy data from "real" memory space to IO memory space.
+  * This needs to be optimized.
+  */
+-void _memcpy_toio(void __iomem *to, const void *from, size_t count)
++void _memcpy_toio(volatile void __iomem *to, const void *from, size_t count)
+ {
+ 	const unsigned char *f = from;
+ 	while (count) {
+@@ -37,7 +37,7 @@ void _memcpy_toio(void __iomem *to, cons
+  * "memset" on IO memory space.
+  * This needs to be optimized.
+  */
+-void _memset_io(void __iomem *dst, int c, size_t count)
++void _memset_io(volatile void __iomem *dst, int c, size_t count)
+ {
+ 	while (count) {
+ 		count--;
 diff --git a/arch/arm/kernel/traps.c b/arch/arm/kernel/traps.c
 --- a/arch/arm/kernel/traps.c
 +++ b/arch/arm/kernel/traps.c
@@ -1596,6 +1653,47 @@ diff --git a/arch/ppc64/kernel/ptrace.c b/arch/ppc64/kernel/ptrace.c
  
  	case PTRACE_DETACH:
  		ret = ptrace_detach(child, data);
+diff --git a/arch/ppc64/mm/hash_native.c b/arch/ppc64/mm/hash_native.c
+--- a/arch/ppc64/mm/hash_native.c
++++ b/arch/ppc64/mm/hash_native.c
+@@ -343,9 +343,7 @@ static void native_flush_hash_range(unsi
+ 	hpte_t *hptep;
+ 	unsigned long hpte_v;
+ 	struct ppc64_tlb_batch *batch = &__get_cpu_var(ppc64_tlb_batch);
+-
+-	/* XXX fix for large ptes */
+-	unsigned long large = 0;
++	unsigned long large;
+ 
+ 	local_irq_save(flags);
+ 
+@@ -358,6 +356,7 @@ static void native_flush_hash_range(unsi
+ 
+ 		va = (vsid << 28) | (batch->addr[i] & 0x0fffffff);
+ 		batch->vaddr[j] = va;
++		large = pte_huge(batch->pte[i]);
+ 		if (large)
+ 			vpn = va >> HPAGE_SHIFT;
+ 		else
+diff --git a/arch/ppc64/mm/hugetlbpage.c b/arch/ppc64/mm/hugetlbpage.c
+--- a/arch/ppc64/mm/hugetlbpage.c
++++ b/arch/ppc64/mm/hugetlbpage.c
+@@ -710,10 +710,13 @@ repeat:
+ 			hpte_group = ((~hash & htab_hash_mask) *
+ 				      HPTES_PER_GROUP) & ~0x7UL; 
+ 			slot = ppc_md.hpte_insert(hpte_group, va, prpn,
+-						  HPTE_V_LARGE, rflags);
++						  HPTE_V_LARGE |
++						  HPTE_V_SECONDARY,
++						  rflags);
+ 			if (slot == -1) {
+ 				if (mftb() & 0x1)
+-					hpte_group = ((hash & htab_hash_mask) * HPTES_PER_GROUP) & ~0x7UL;
++					hpte_group = ((hash & htab_hash_mask) *
++						      HPTES_PER_GROUP)&~0x7UL;
+ 
+ 				ppc_md.hpte_remove(hpte_group);
+ 				goto repeat;
 diff --git a/arch/sparc64/kernel/entry.S b/arch/sparc64/kernel/entry.S
 --- a/arch/sparc64/kernel/entry.S
 +++ b/arch/sparc64/kernel/entry.S
@@ -2831,6 +2929,30 @@ diff --git a/drivers/char/hpet.c b/drivers/char/hpet.c
  
  	if (io_remap_pfn_range(vma, vma->vm_start, addr >> PAGE_SHIFT,
  					PAGE_SIZE, vma->vm_page_prot)) {
+diff --git a/drivers/char/ipmi/ipmi_msghandler.c b/drivers/char/ipmi/ipmi_msghandler.c
+--- a/drivers/char/ipmi/ipmi_msghandler.c
++++ b/drivers/char/ipmi/ipmi_msghandler.c
+@@ -2620,7 +2620,7 @@ void ipmi_smi_msg_received(ipmi_smi_t   
+ 	spin_lock_irqsave(&(intf->waiting_msgs_lock), flags);
+ 	if (!list_empty(&(intf->waiting_msgs))) {
+ 		list_add_tail(&(msg->link), &(intf->waiting_msgs));
+-		spin_unlock(&(intf->waiting_msgs_lock));
++		spin_unlock_irqrestore(&(intf->waiting_msgs_lock), flags);
+ 		goto out_unlock;
+ 	}
+ 	spin_unlock_irqrestore(&(intf->waiting_msgs_lock), flags);
+@@ -2629,9 +2629,9 @@ void ipmi_smi_msg_received(ipmi_smi_t   
+ 	if (rv > 0) {
+ 		/* Could not handle the message now, just add it to a
+                    list to handle later. */
+-		spin_lock(&(intf->waiting_msgs_lock));
++		spin_lock_irqsave(&(intf->waiting_msgs_lock), flags);
+ 		list_add_tail(&(msg->link), &(intf->waiting_msgs));
+-		spin_unlock(&(intf->waiting_msgs_lock));
++		spin_unlock_irqrestore(&(intf->waiting_msgs_lock), flags);
+ 	} else if (rv == 0) {
+ 		ipmi_free_smi_msg(msg);
+ 	}
 diff --git a/drivers/hwmon/Kconfig b/drivers/hwmon/Kconfig
 --- a/drivers/hwmon/Kconfig
 +++ b/drivers/hwmon/Kconfig
@@ -3681,6 +3803,43 @@ diff --git a/drivers/infiniband/ulp/ipoib/ipoib_multicast.c b/drivers/infiniband
  
  	spin_lock_irqsave(&priv->lock, flags);
  
+diff --git a/drivers/input/input.c b/drivers/input/input.c
+--- a/drivers/input/input.c
++++ b/drivers/input/input.c
+@@ -308,6 +308,7 @@ static struct input_device_id *input_mat
+ 		MATCH_BIT(ledbit, LED_MAX);
+ 		MATCH_BIT(sndbit, SND_MAX);
+ 		MATCH_BIT(ffbit,  FF_MAX);
++		MATCH_BIT(swbit,  SW_MAX);
+ 
+ 		return id;
+ 	}
+diff --git a/drivers/isdn/hisax/st5481_b.c b/drivers/isdn/hisax/st5481_b.c
+--- a/drivers/isdn/hisax/st5481_b.c
++++ b/drivers/isdn/hisax/st5481_b.c
+@@ -209,9 +209,7 @@ static void st5481B_mode(struct st5481_b
+ 	bcs->mode = mode;
+ 
+ 	// Cancel all USB transfers on this B channel
+-	b_out->urb[0]->transfer_flags |= URB_ASYNC_UNLINK;
+ 	usb_unlink_urb(b_out->urb[0]);
+-	b_out->urb[1]->transfer_flags |= URB_ASYNC_UNLINK;
+ 	usb_unlink_urb(b_out->urb[1]);
+ 	b_out->busy = 0;
+ 
+diff --git a/drivers/isdn/hisax/st5481_usb.c b/drivers/isdn/hisax/st5481_usb.c
+--- a/drivers/isdn/hisax/st5481_usb.c
++++ b/drivers/isdn/hisax/st5481_usb.c
+@@ -645,9 +645,7 @@ void st5481_in_mode(struct st5481_in *in
+ 
+ 	in->mode = mode;
+ 
+-	in->urb[0]->transfer_flags |= URB_ASYNC_UNLINK;
+ 	usb_unlink_urb(in->urb[0]);
+-	in->urb[1]->transfer_flags |= URB_ASYNC_UNLINK;
+ 	usb_unlink_urb(in->urb[1]);
+ 
+ 	if (in->mode != L1_MODE_NULL) {
 diff --git a/drivers/macintosh/smu.c b/drivers/macintosh/smu.c
 --- a/drivers/macintosh/smu.c
 +++ b/drivers/macintosh/smu.c
@@ -8788,6 +8947,20 @@ diff --git a/drivers/message/i2o/config-osm.c b/drivers/message/i2o/config-osm.c
  #endif
  
  	return 0;
+diff --git a/drivers/mfd/ucb1x00-ts.c b/drivers/mfd/ucb1x00-ts.c
+--- a/drivers/mfd/ucb1x00-ts.c
++++ b/drivers/mfd/ucb1x00-ts.c
+@@ -48,8 +48,8 @@ struct ucb1x00_ts {
+ 	u16			x_res;
+ 	u16			y_res;
+ 
+-	int			restart:1;
+-	int			adcsync:1;
++	unsigned int		restart:1;
++	unsigned int		adcsync:1;
+ };
+ 
+ static int adcsync;
 diff --git a/drivers/mtd/devices/docecc.c b/drivers/mtd/devices/docecc.c
 --- a/drivers/mtd/devices/docecc.c
 +++ b/drivers/mtd/devices/docecc.c
@@ -8827,6 +9000,18 @@ diff --git a/drivers/mtd/devices/docecc.c b/drivers/mtd/devices/docecc.c
        printf("\n ERROR: denominator = 0\n");
  #endif
        /* Convert to dual- basis */
+diff --git a/drivers/net/8390.c b/drivers/net/8390.c
+--- a/drivers/net/8390.c
++++ b/drivers/net/8390.c
+@@ -1094,7 +1094,7 @@ static void NS8390_trigger_send(struct n
+    
+ 	outb_p(E8390_NODMA+E8390_PAGE0, e8390_base+E8390_CMD);
+     
+-	if (inb_p(e8390_base) & E8390_TRANS) 
++	if (inb_p(e8390_base + E8390_CMD) & E8390_TRANS) 
+ 	{
+ 		printk(KERN_WARNING "%s: trigger_send() called with the transmitter busy.\n",
+ 			dev->name);
 diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
 --- a/drivers/net/bonding/bond_main.c
 +++ b/drivers/net/bonding/bond_main.c
@@ -8958,7 +9143,44 @@ diff --git a/drivers/net/skge.c b/drivers/net/skge.c
  	} while ( (e = e->next) != ring->start);
  
  	ring->to_clean = ring->start;
-@@ -2442,6 +2419,14 @@ static void yukon_set_multicast(struct n
+@@ -1666,6 +1643,22 @@ static void yukon_reset(struct skge_hw *
+ 			 | GM_RXCR_UCF_ENA | GM_RXCR_MCF_ENA);
+ }
+ 
++/* Apparently, early versions of Yukon-Lite had wrong chip_id? */
++static int is_yukon_lite_a0(struct skge_hw *hw)
++{
++	u32 reg;
++	int ret;
++
++	if (hw->chip_id != CHIP_ID_YUKON)
++		return 0;
++
++	reg = skge_read32(hw, B2_FAR);
++	skge_write8(hw, B2_FAR + 3, 0xff);
++	ret = (skge_read8(hw, B2_FAR + 3) != 0);
++	skge_write32(hw, B2_FAR, reg);
++	return ret;
++}
++
+ static void yukon_mac_init(struct skge_hw *hw, int port)
+ {
+ 	struct skge_port *skge = netdev_priv(hw->dev[port]);
+@@ -1781,9 +1774,11 @@ static void yukon_mac_init(struct skge_h
+ 	/* Configure Rx MAC FIFO */
+ 	skge_write16(hw, SK_REG(port, RX_GMF_FL_MSK), RX_FF_FL_DEF_MSK);
+ 	reg = GMF_OPER_ON | GMF_RX_F_FL_ON;
+-	if (hw->chip_id == CHIP_ID_YUKON_LITE &&
+-	    hw->chip_rev >= CHIP_REV_YU_LITE_A3)
++
++	/* disable Rx GMAC FIFO Flush for YUKON-Lite Rev. A0 only */
++	if (is_yukon_lite_a0(hw))
+ 		reg &= ~GMF_RX_F_FL_ON;
++
+ 	skge_write8(hw, SK_REG(port, RX_GMF_CTRL_T), GMF_RST_CLR);
+ 	skge_write16(hw, SK_REG(port, RX_GMF_CTRL_T), reg);
+ 	/*
+@@ -2442,6 +2437,14 @@ static void yukon_set_multicast(struct n
  	gma_write16(hw, port, GM_RX_CTRL, reg);
  }
  
@@ -8973,7 +9195,7 @@ diff --git a/drivers/net/skge.c b/drivers/net/skge.c
  static inline int bad_phy_status(const struct skge_hw *hw, u32 status)
  {
  	if (hw->chip_id == CHIP_ID_GENESIS)
-@@ -2451,80 +2436,99 @@ static inline int bad_phy_status(const s
+@@ -2451,80 +2454,99 @@ static inline int bad_phy_status(const s
  			(status & GMR_FS_RX_OK) == 0;
  }
  
@@ -9121,7 +9343,7 @@ diff --git a/drivers/net/skge.c b/drivers/net/skge.c
  }
  
  
-@@ -2540,32 +2544,16 @@ static int skge_poll(struct net_device *
+@@ -2540,32 +2562,16 @@ static int skge_poll(struct net_device *
  	for (e = ring->to_clean; work_done < to_do; e = e->next) {
  		struct skge_rx_desc *rd = e->desc;
  		struct sk_buff *skb;
@@ -9281,6 +9503,39 @@ diff --git a/drivers/pci/probe.c b/drivers/pci/probe.c
  			if (sz) {
  				res->flags = (l & IORESOURCE_ROM_ENABLE) |
  				  IORESOURCE_MEM | IORESOURCE_PREFETCH |
+@@ -402,6 +402,12 @@ static void pci_enable_crs(struct pci_de
+ static void __devinit pci_fixup_parent_subordinate_busnr(struct pci_bus *child, int max)
+ {
+ 	struct pci_bus *parent = child->parent;
++
++	/* Attempts to fix that up are really dangerous unless
++	   we're going to re-assign all bus numbers. */
++	if (!pcibios_assign_all_busses())
++		return;
++
+ 	while (parent->parent && parent->subordinate < max) {
+ 		parent->subordinate = max;
+ 		pci_write_config_byte(parent->self, PCI_SUBORDINATE_BUS, max);
+@@ -478,8 +484,18 @@ int __devinit pci_scan_bridge(struct pci
+ 		 * We need to assign a number to this bus which we always
+ 		 * do in the second pass.
+ 		 */
+-		if (!pass)
++		if (!pass) {
++			if (pcibios_assign_all_busses())
++				/* Temporarily disable forwarding of the
++				   configuration cycles on all bridges in
++				   this bus segment to avoid possible
++				   conflicts in the second pass between two
++				   bridges programmed with overlapping
++				   bus ranges. */
++				pci_write_config_dword(dev, PCI_PRIMARY_BUS,
++						       buses & ~0xffffff);
+ 			return max;
++		}
+ 
+ 		/* Clear errors */
+ 		pci_write_config_word(dev, PCI_STATUS, 0xffff);
 diff --git a/drivers/s390/cio/ccwgroup.c b/drivers/s390/cio/ccwgroup.c
 --- a/drivers/s390/cio/ccwgroup.c
 +++ b/drivers/s390/cio/ccwgroup.c
@@ -13658,6 +13913,17 @@ diff --git a/drivers/scsi/aic7xxx/aic7xxx_osm_pci.c b/drivers/scsi/aic7xxx/aic7x
  			printk(KERN_WARNING "aic7xxx: No suitable DMA available.\n");
                  	return (-ENODEV);
  		}
+diff --git a/drivers/scsi/ata_piix.c b/drivers/scsi/ata_piix.c
+--- a/drivers/scsi/ata_piix.c
++++ b/drivers/scsi/ata_piix.c
+@@ -442,7 +442,6 @@ static void piix_sata_phy_reset(struct a
+  *	piix_set_piomode - Initialize host controller PATA PIO timings
+  *	@ap: Port whose timings we are configuring
+  *	@adev: um
+- *	@pio: PIO mode, 0 - 4
+  *
+  *	Set PIO mode for device, in host controller PCI config space.
+  *
 diff --git a/drivers/scsi/atp870u.c b/drivers/scsi/atp870u.c
 --- a/drivers/scsi/atp870u.c
 +++ b/drivers/scsi/atp870u.c
@@ -13819,6 +14085,112 @@ diff --git a/drivers/scsi/ibmvscsi/ibmvscsi.c b/drivers/scsi/ibmvscsi/ibmvscsi.c
  	}
  }
  
+diff --git a/drivers/scsi/libata-core.c b/drivers/scsi/libata-core.c
+--- a/drivers/scsi/libata-core.c
++++ b/drivers/scsi/libata-core.c
+@@ -4132,6 +4132,53 @@ err_out:
+ }
+ 
+ /**
++ *	ata_host_set_remove - PCI layer callback for device removal
++ *	@host_set: ATA host set that was removed
++ *
++ *	Unregister all objects associated with this host set. Free those 
++ *	objects.
++ *
++ *	LOCKING:
++ *	Inherited from calling layer (may sleep).
++ */
++
++
++void ata_host_set_remove(struct ata_host_set *host_set)
++{
++	struct ata_port *ap;
++	unsigned int i;
++
++	for (i = 0; i < host_set->n_ports; i++) {
++		ap = host_set->ports[i];
++		scsi_remove_host(ap->host);
++	}
++
++	free_irq(host_set->irq, host_set);
++
++	for (i = 0; i < host_set->n_ports; i++) {
++		ap = host_set->ports[i];
++
++		ata_scsi_release(ap->host);
++
++		if ((ap->flags & ATA_FLAG_NO_LEGACY) == 0) {
++			struct ata_ioports *ioaddr = &ap->ioaddr;
++
++			if (ioaddr->cmd_addr == 0x1f0)
++				release_region(0x1f0, 8);
++			else if (ioaddr->cmd_addr == 0x170)
++				release_region(0x170, 8);
++		}
++
++		scsi_host_put(ap->host);
++	}
++
++	if (host_set->ops->host_stop)
++		host_set->ops->host_stop(host_set);
++
++	kfree(host_set);
++}
++
++/**
+  *	ata_scsi_release - SCSI layer callback hook for host unload
+  *	@host: libata host to be unloaded
+  *
+@@ -4471,39 +4518,8 @@ void ata_pci_remove_one (struct pci_dev 
+ {
+ 	struct device *dev = pci_dev_to_dev(pdev);
+ 	struct ata_host_set *host_set = dev_get_drvdata(dev);
+-	struct ata_port *ap;
+-	unsigned int i;
+-
+-	for (i = 0; i < host_set->n_ports; i++) {
+-		ap = host_set->ports[i];
+-
+-		scsi_remove_host(ap->host);
+-	}
+-
+-	free_irq(host_set->irq, host_set);
+-
+-	for (i = 0; i < host_set->n_ports; i++) {
+-		ap = host_set->ports[i];
+-
+-		ata_scsi_release(ap->host);
+-
+-		if ((ap->flags & ATA_FLAG_NO_LEGACY) == 0) {
+-			struct ata_ioports *ioaddr = &ap->ioaddr;
+-
+-			if (ioaddr->cmd_addr == 0x1f0)
+-				release_region(0x1f0, 8);
+-			else if (ioaddr->cmd_addr == 0x170)
+-				release_region(0x170, 8);
+-		}
+-
+-		scsi_host_put(ap->host);
+-	}
+-
+-	if (host_set->ops->host_stop)
+-		host_set->ops->host_stop(host_set);
+-
+-	kfree(host_set);
+ 
++	ata_host_set_remove(host_set);
+ 	pci_release_regions(pdev);
+ 	pci_disable_device(pdev);
+ 	dev_set_drvdata(dev, NULL);
+@@ -4573,6 +4589,7 @@ module_exit(ata_exit);
+ EXPORT_SYMBOL_GPL(ata_std_bios_param);
+ EXPORT_SYMBOL_GPL(ata_std_ports);
+ EXPORT_SYMBOL_GPL(ata_device_add);
++EXPORT_SYMBOL_GPL(ata_host_set_remove);
+ EXPORT_SYMBOL_GPL(ata_sg_init);
+ EXPORT_SYMBOL_GPL(ata_sg_init_one);
+ EXPORT_SYMBOL_GPL(ata_qc_complete);
 diff --git a/drivers/scsi/mesh.c b/drivers/scsi/mesh.c
 --- a/drivers/scsi/mesh.c
 +++ b/drivers/scsi/mesh.c
@@ -13874,6 +14246,18 @@ diff --git a/drivers/scsi/mesh.c b/drivers/scsi/mesh.c
  
  	/* Release memory resources */
  	macio_release_resources(mdev);
+diff --git a/drivers/scsi/sata_nv.c b/drivers/scsi/sata_nv.c
+--- a/drivers/scsi/sata_nv.c
++++ b/drivers/scsi/sata_nv.c
+@@ -158,6 +158,8 @@ static struct pci_device_id nv_pci_tbl[]
+ 		PCI_ANY_ID, PCI_ANY_ID, 0, 0, MCP51 },
+ 	{ PCI_VENDOR_ID_NVIDIA, PCI_DEVICE_ID_NVIDIA_NFORCE_MCP55_SATA,
+ 		PCI_ANY_ID, PCI_ANY_ID, 0, 0, MCP55 },
++	{ PCI_VENDOR_ID_NVIDIA, PCI_DEVICE_ID_NVIDIA_NFORCE_MCP55_SATA2,
++		PCI_ANY_ID, PCI_ANY_ID, 0, 0, MCP55 },
+ 	{ PCI_VENDOR_ID_NVIDIA, PCI_ANY_ID,
+ 		PCI_ANY_ID, PCI_ANY_ID,
+ 		PCI_CLASS_STORAGE_IDE<<8, 0xffff00, GENERIC },
 diff --git a/drivers/scsi/scsi.c b/drivers/scsi/scsi.c
 --- a/drivers/scsi/scsi.c
 +++ b/drivers/scsi/scsi.c
@@ -14273,6 +14657,18 @@ diff --git a/drivers/scsi/st.c b/drivers/scsi/st.c
  
  	if (rq_data_dir(rq) == WRITE)
  		SCpnt->sc_data_direction = DMA_TO_DEVICE;
+diff --git a/drivers/serial/clps711x.c b/drivers/serial/clps711x.c
+--- a/drivers/serial/clps711x.c
++++ b/drivers/serial/clps711x.c
+@@ -98,7 +98,7 @@ static irqreturn_t clps711xuart_int_rx(i
+ {
+ 	struct uart_port *port = dev_id;
+ 	struct tty_struct *tty = port->info->tty;
+-	unsigned int status, ch, flg, ignored = 0;
++	unsigned int status, ch, flg;
+ 
+ 	status = clps_readl(SYSFLG(port));
+ 	while (!(status & SYSFLG_URXFE)) {
 diff --git a/drivers/usb/core/message.c b/drivers/usb/core/message.c
 --- a/drivers/usb/core/message.c
 +++ b/drivers/usb/core/message.c
@@ -14557,14 +14953,18 @@ diff --git a/drivers/video/aty/xlinit.c b/drivers/video/aty/xlinit.c
  	u32 temp;
  	
  	aty_st_8(CONFIG_STAT0, 0x85, par);
-@@ -252,9 +252,12 @@ int atyfb_xl_init(struct fb_info *info)
+@@ -252,9 +252,14 @@ int atyfb_xl_init(struct fb_info *info)
  	aty_st_le32(0xEC, 0x00000000, par);
  	aty_st_le32(0xFC, 0x00000000, par);
  
+-	for (i=0; i<sizeof(lcd_tbl)/sizeof(lcd_tbl_t); i++) {
+-		aty_st_lcd(lcd_tbl[i].lcd_reg, lcd_tbl[i].val, par);
 +#if defined (CONFIG_FB_ATY_GENERIC_LCD)
-+	int i;
- 	for (i=0; i<sizeof(lcd_tbl)/sizeof(lcd_tbl_t); i++) {
- 		aty_st_lcd(lcd_tbl[i].lcd_reg, lcd_tbl[i].val, par);
++	{
++		int i;
++
++		for (i = 0; i < ARRAY_SIZE(lcd_tbl); i++)
++			aty_st_lcd(lcd_tbl[i].lcd_reg, lcd_tbl[i].val, par);
  	}
 +#endif
  
@@ -14983,6 +15383,30 @@ diff --git a/fs/9p/vfs_super.c b/fs/9p/vfs_super.c
  	return ERR_PTR(retval);
  }
  
+diff --git a/fs/cifs/cifsfs.c b/fs/cifs/cifsfs.c
+--- a/fs/cifs/cifsfs.c
++++ b/fs/cifs/cifsfs.c
+@@ -781,6 +781,8 @@ static int cifs_oplock_thread(void * dum
+ 
+ 	oplockThread = current;
+ 	do {
++		if (try_to_freeze()) 
++			continue;
+ 		set_current_state(TASK_INTERRUPTIBLE);
+ 		
+ 		schedule_timeout(1*HZ);  
+diff --git a/fs/cifs/connect.c b/fs/cifs/connect.c
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@ -344,6 +344,8 @@ cifs_demultiplex_thread(struct TCP_Serve
+ 	}
+ 
+ 	while (server->tcpStatus != CifsExiting) {
++		if (try_to_freeze())
++			continue;
+ 		if (bigbuf == NULL) {
+ 			bigbuf = cifs_buf_get();
+ 			if(bigbuf == NULL) {
 diff --git a/fs/ext3/balloc.c b/fs/ext3/balloc.c
 --- a/fs/ext3/balloc.c
 +++ b/fs/ext3/balloc.c
@@ -15098,6 +15522,102 @@ diff --git a/fs/fat/inode.c b/fs/fat/inode.c
  		raw_entry->ctime_cs = (inode->i_ctime.tv_sec & 1) * 100 +
  			inode->i_ctime.tv_nsec / 10000000;
  	}
+diff --git a/fs/jfs/inode.c b/fs/jfs/inode.c
+--- a/fs/jfs/inode.c
++++ b/fs/jfs/inode.c
+@@ -129,8 +129,7 @@ void jfs_delete_inode(struct inode *inod
+ 	jfs_info("In jfs_delete_inode, inode = 0x%p", inode);
+ 
+ 	if (!is_bad_inode(inode) &&
+-	    (JFS_IP(inode)->fileset == cpu_to_le32(FILESYSTEM_I))) {
+-
++	    (JFS_IP(inode)->fileset == FILESYSTEM_I)) {
+ 		truncate_inode_pages(&inode->i_data, 0);
+ 
+ 		if (test_cflag(COMMIT_Freewmap, inode))
+diff --git a/fs/jfs/jfs_dmap.c b/fs/jfs/jfs_dmap.c
+--- a/fs/jfs/jfs_dmap.c
++++ b/fs/jfs/jfs_dmap.c
+@@ -3055,7 +3055,7 @@ static int cntlz(u32 value)
+  * RETURN VALUES:
+  *      log2 number of blocks
+  */
+-int blkstol2(s64 nb)
++static int blkstol2(s64 nb)
+ {
+ 	int l2nb;
+ 	s64 mask;		/* meant to be signed */
+diff --git a/fs/jfs/jfs_txnmgr.c b/fs/jfs/jfs_txnmgr.c
+--- a/fs/jfs/jfs_txnmgr.c
++++ b/fs/jfs/jfs_txnmgr.c
+@@ -725,6 +725,9 @@ struct tlock *txLock(tid_t tid, struct i
+ 	else
+ 		tlck->flag = tlckINODELOCK;
+ 
++	if (S_ISDIR(ip->i_mode))
++		tlck->flag |= tlckDIRECTORY;
++
+ 	tlck->type = 0;
+ 
+ 	/* bind the tlock and the page */
+@@ -1009,6 +1012,8 @@ struct tlock *txMaplock(tid_t tid, struc
+ 
+ 	/* bind the tlock and the object */
+ 	tlck->flag = tlckINODELOCK;
++	if (S_ISDIR(ip->i_mode))
++		tlck->flag |= tlckDIRECTORY;
+ 	tlck->ip = ip;
+ 	tlck->mp = NULL;
+ 
+@@ -1077,6 +1082,8 @@ struct linelock *txLinelock(struct linel
+ 	linelock->flag = tlckLINELOCK;
+ 	linelock->maxcnt = TLOCKLONG;
+ 	linelock->index = 0;
++	if (tlck->flag & tlckDIRECTORY)
++		linelock->flag |= tlckDIRECTORY;
+ 
+ 	/* append linelock after tlock */
+ 	linelock->next = tlock->next;
+@@ -2070,8 +2077,8 @@ static void xtLog(struct jfs_log * log, 
+  *
+  * function:    log from maplock of freed data extents;
+  */
+-void mapLog(struct jfs_log * log, struct tblock * tblk, struct lrd * lrd,
+-	    struct tlock * tlck)
++static void mapLog(struct jfs_log * log, struct tblock * tblk, struct lrd * lrd,
++		   struct tlock * tlck)
+ {
+ 	struct pxd_lock *pxdlock;
+ 	int i, nlock;
+@@ -2209,7 +2216,7 @@ void txEA(tid_t tid, struct inode *ip, d
+  * function: synchronously write pages locked by transaction
+  *              after txLog() but before txUpdateMap();
+  */
+-void txForce(struct tblock * tblk)
++static void txForce(struct tblock * tblk)
+ {
+ 	struct tlock *tlck;
+ 	lid_t lid, next;
+@@ -2358,7 +2365,7 @@ static void txUpdateMap(struct tblock * 
+ 			 */
+ 			else {	/* (maplock->flag & mlckFREE) */
+ 
+-				if (S_ISDIR(tlck->ip->i_mode))
++				if (tlck->flag & tlckDIRECTORY)
+ 					txFreeMap(ipimap, maplock,
+ 						  tblk, COMMIT_PWMAP);
+ 				else
+diff --git a/fs/jfs/jfs_txnmgr.h b/fs/jfs/jfs_txnmgr.h
+--- a/fs/jfs/jfs_txnmgr.h
++++ b/fs/jfs/jfs_txnmgr.h
+@@ -122,6 +122,7 @@ extern struct tlock *TxLock;	/* transact
+ #define tlckLOG			0x0800
+ /* updateMap state */
+ #define	tlckUPDATEMAP		0x0080
++#define	tlckDIRECTORY		0x0040
+ /* freeLock state */
+ #define tlckFREELOCK		0x0008
+ #define tlckWRITEPAGE		0x0004
 diff --git a/fs/nfs/read.c b/fs/nfs/read.c
 --- a/fs/nfs/read.c
 +++ b/fs/nfs/read.c
@@ -15381,6 +15901,22 @@ diff --git a/include/asm-alpha/futex.h b/include/asm-alpha/futex.h
 +	int oldval = 0, ret;
  	if (encoded_op & (FUTEX_OP_OPARG_SHIFT << 28))
  		oparg = 1 << oparg;
+ 
+diff --git a/include/asm-arm/io.h b/include/asm-arm/io.h
+--- a/include/asm-arm/io.h
++++ b/include/asm-arm/io.h
+@@ -136,9 +136,9 @@ extern void __readwrite_bug(const char *
+ /*
+  * String version of IO memory access ops:
+  */
+-extern void _memcpy_fromio(void *, void __iomem *, size_t);
+-extern void _memcpy_toio(void __iomem *, const void *, size_t);
+-extern void _memset_io(void __iomem *, int, size_t);
++extern void _memcpy_fromio(void *, const volatile void __iomem *, size_t);
++extern void _memcpy_toio(volatile void __iomem *, const void *, size_t);
++extern void _memset_io(volatile void __iomem *, int, size_t);
+ 
+ #define mmiowb()
  
 diff --git a/include/asm-arm/mach/arch.h b/include/asm-arm/mach/arch.h
 --- a/include/asm-arm/mach/arch.h
@@ -16417,6 +16953,17 @@ diff --git a/include/linux/device.h b/include/linux/device.h
  /*
   * High level routines for use by the bus drivers
   */
+diff --git a/include/linux/libata.h b/include/linux/libata.h
+--- a/include/linux/libata.h
++++ b/include/linux/libata.h
+@@ -393,6 +393,7 @@ extern int ata_pci_init_one (struct pci_
+ extern void ata_pci_remove_one (struct pci_dev *pdev);
+ #endif /* CONFIG_PCI */
+ extern int ata_device_add(struct ata_probe_ent *ent);
++extern void ata_host_set_remove(struct ata_host_set *host_set);
+ extern int ata_scsi_detect(Scsi_Host_Template *sht);
+ extern int ata_scsi_ioctl(struct scsi_device *dev, int cmd, void __user *arg);
+ extern int ata_scsi_queuecmd(struct scsi_cmnd *cmd, void (*done)(struct scsi_cmnd *));
 diff --git a/include/linux/mm.h b/include/linux/mm.h
 --- a/include/linux/mm.h
 +++ b/include/linux/mm.h
@@ -16451,6 +16998,312 @@ diff --git a/include/linux/mm.h b/include/linux/mm.h
   *
   * There is also a per-mapping radix tree mapping index to the page
   * in memory if present. The tree is rooted at mapping->root.  
+diff --git a/include/linux/netfilter_ipv4/ip_conntrack.h b/include/linux/netfilter_ipv4/ip_conntrack.h
+--- a/include/linux/netfilter_ipv4/ip_conntrack.h
++++ b/include/linux/netfilter_ipv4/ip_conntrack.h
+@@ -332,11 +332,28 @@ extern void need_ip_conntrack(void);
+ extern int invert_tuplepr(struct ip_conntrack_tuple *inverse,
+ 			  const struct ip_conntrack_tuple *orig);
+ 
++extern void __ip_ct_refresh_acct(struct ip_conntrack *ct,
++			         enum ip_conntrack_info ctinfo,
++			         const struct sk_buff *skb,
++			         unsigned long extra_jiffies,
++				 int do_acct);
++
++/* Refresh conntrack for this many jiffies and do accounting */
++static inline void ip_ct_refresh_acct(struct ip_conntrack *ct, 
++				      enum ip_conntrack_info ctinfo,
++				      const struct sk_buff *skb,
++				      unsigned long extra_jiffies)
++{
++	__ip_ct_refresh_acct(ct, ctinfo, skb, extra_jiffies, 1);
++}
++
+ /* Refresh conntrack for this many jiffies */
+-extern void ip_ct_refresh_acct(struct ip_conntrack *ct,
+-			       enum ip_conntrack_info ctinfo,
+-			       const struct sk_buff *skb,
+-			       unsigned long extra_jiffies);
++static inline void ip_ct_refresh(struct ip_conntrack *ct,
++				 const struct sk_buff *skb,
++				 unsigned long extra_jiffies)
++{
++	__ip_ct_refresh_acct(ct, 0, skb, extra_jiffies, 0);
++}
+ 
+ /* These are for NAT.  Icky. */
+ /* Update TCP window tracking data when NAT mangles the packet */
+diff --git a/include/linux/netfilter_ipv4/ip_conntrack_pptp.h b/include/linux/netfilter_ipv4/ip_conntrack_pptp.h
+--- a/include/linux/netfilter_ipv4/ip_conntrack_pptp.h
++++ b/include/linux/netfilter_ipv4/ip_conntrack_pptp.h
+@@ -60,8 +60,8 @@ struct ip_ct_pptp_expect {
+ 
+ struct pptp_pkt_hdr {
+ 	__u16	packetLength;
+-	__u16	packetType;
+-	__u32	magicCookie;
++	__be16	packetType;
++	__be32	magicCookie;
+ };
+ 
+ /* PptpControlMessageType values */
+@@ -93,7 +93,7 @@ struct pptp_pkt_hdr {
+ #define PPTP_REMOVE_DEVICE_ERROR	6
+ 
+ struct PptpControlHeader {
+-	__u16	messageType;
++	__be16	messageType;
+ 	__u16	reserved;
+ };
+ 
+@@ -106,13 +106,13 @@ struct PptpControlHeader {
+ #define PPTP_BEARER_CAP_DIGITAL		0x2
+ 
+ struct PptpStartSessionRequest {
+-	__u16	protocolVersion;
++	__be16	protocolVersion;
+ 	__u8	reserved1;
+ 	__u8	reserved2;
+-	__u32	framingCapability;
+-	__u32	bearerCapability;
+-	__u16	maxChannels;
+-	__u16	firmwareRevision;
++	__be32	framingCapability;
++	__be32	bearerCapability;
++	__be16	maxChannels;
++	__be16	firmwareRevision;
+ 	__u8	hostName[64];
+ 	__u8	vendorString[64];
+ };
+@@ -125,13 +125,13 @@ struct PptpStartSessionRequest {
+ #define PPTP_START_UNKNOWN_PROTOCOL	5
+ 
+ struct PptpStartSessionReply {
+-	__u16	protocolVersion;
++	__be16	protocolVersion;
+ 	__u8	resultCode;
+ 	__u8	generalErrorCode;
+-	__u32	framingCapability;
+-	__u32	bearerCapability;
+-	__u16	maxChannels;
+-	__u16	firmwareRevision;
++	__be32	framingCapability;
++	__be32	bearerCapability;
++	__be16	maxChannels;
++	__be16	firmwareRevision;
+ 	__u8	hostName[64];
+ 	__u8	vendorString[64];
+ };
+@@ -155,7 +155,7 @@ struct PptpStopSessionReply {
+ };
+ 
+ struct PptpEchoRequest {
+-	__u32 identNumber;
++	__be32 identNumber;
+ };
+ 
+ /* PptpEchoReplyResultCode */
+@@ -163,7 +163,7 @@ struct PptpEchoRequest {
+ #define PPTP_ECHO_GENERAL_ERROR		2
+ 
+ struct PptpEchoReply {
+-	__u32	identNumber;
++	__be32	identNumber;
+ 	__u8	resultCode;
+ 	__u8	generalErrorCode;
+ 	__u16	reserved;
+@@ -180,16 +180,16 @@ struct PptpEchoReply {
+ #define PPTP_DONT_CARE_BEARER_TYPE	3
+ 
+ struct PptpOutCallRequest {
+-	__u16	callID;
+-	__u16	callSerialNumber;
+-	__u32	minBPS;
+-	__u32	maxBPS;
+-	__u32	bearerType;
+-	__u32	framingType;
+-	__u16	packetWindow;
+-	__u16	packetProcDelay;
++	__be16	callID;
++	__be16	callSerialNumber;
++	__be32	minBPS;
++	__be32	maxBPS;
++	__be32	bearerType;
++	__be32	framingType;
++	__be16	packetWindow;
++	__be16	packetProcDelay;
+ 	__u16	reserved1;
+-	__u16	phoneNumberLength;
++	__be16	phoneNumberLength;
+ 	__u16	reserved2;
+ 	__u8	phoneNumber[64];
+ 	__u8	subAddress[64];
+@@ -205,24 +205,24 @@ struct PptpOutCallRequest {
+ #define PPTP_OUTCALL_DONT_ACCEPT	7
+ 
+ struct PptpOutCallReply {
+-	__u16	callID;
+-	__u16	peersCallID;
++	__be16	callID;
++	__be16	peersCallID;
+ 	__u8	resultCode;
+ 	__u8	generalErrorCode;
+-	__u16	causeCode;
+-	__u32	connectSpeed;
+-	__u16	packetWindow;
+-	__u16	packetProcDelay;
+-	__u32	physChannelID;
++	__be16	causeCode;
++	__be32	connectSpeed;
++	__be16	packetWindow;
++	__be16	packetProcDelay;
++	__be32	physChannelID;
+ };
+ 
+ struct PptpInCallRequest {
+-	__u16	callID;
+-	__u16	callSerialNumber;
+-	__u32	callBearerType;
+-	__u32	physChannelID;
+-	__u16	dialedNumberLength;
+-	__u16	dialingNumberLength;
++	__be16	callID;
++	__be16	callSerialNumber;
++	__be32	callBearerType;
++	__be32	physChannelID;
++	__be16	dialedNumberLength;
++	__be16	dialingNumberLength;
+ 	__u8	dialedNumber[64];
+ 	__u8	dialingNumber[64];
+ 	__u8	subAddress[64];
+@@ -234,61 +234,54 @@ struct PptpInCallRequest {
+ #define PPTP_INCALL_DONT_ACCEPT		3
+ 
+ struct PptpInCallReply {
+-	__u16	callID;
+-	__u16	peersCallID;
++	__be16	callID;
++	__be16	peersCallID;
+ 	__u8	resultCode;
+ 	__u8	generalErrorCode;
+-	__u16	packetWindow;
+-	__u16	packetProcDelay;
++	__be16	packetWindow;
++	__be16	packetProcDelay;
+ 	__u16	reserved;
+ };
+ 
+ struct PptpInCallConnected {
+-	__u16	peersCallID;
++	__be16	peersCallID;
+ 	__u16	reserved;
+-	__u32	connectSpeed;
+-	__u16	packetWindow;
+-	__u16	packetProcDelay;
+-	__u32	callFramingType;
++	__be32	connectSpeed;
++	__be16	packetWindow;
++	__be16	packetProcDelay;
++	__be32	callFramingType;
+ };
+ 
+ struct PptpClearCallRequest {
+-	__u16	callID;
++	__be16	callID;
+ 	__u16	reserved;
+ };
+ 
+ struct PptpCallDisconnectNotify {
+-	__u16	callID;
++	__be16	callID;
+ 	__u8	resultCode;
+ 	__u8	generalErrorCode;
+-	__u16	causeCode;
++	__be16	causeCode;
+ 	__u16	reserved;
+ 	__u8	callStatistics[128];
+ };
+ 
+ struct PptpWanErrorNotify {
+-	__u16	peersCallID;
++	__be16	peersCallID;
+ 	__u16	reserved;
+-	__u32	crcErrors;
+-	__u32	framingErrors;
+-	__u32	hardwareOverRuns;
+-	__u32	bufferOverRuns;
+-	__u32	timeoutErrors;
+-	__u32	alignmentErrors;
++	__be32	crcErrors;
++	__be32	framingErrors;
++	__be32	hardwareOverRuns;
++	__be32	bufferOverRuns;
++	__be32	timeoutErrors;
++	__be32	alignmentErrors;
+ };
+ 
+ struct PptpSetLinkInfo {
+-	__u16	peersCallID;
++	__be16	peersCallID;
+ 	__u16	reserved;
+-	__u32	sendAccm;
+-	__u32	recvAccm;
+-};
+-
+-
+-struct pptp_priv_data {
+-	__u16	call_id;
+-	__u16	mcall_id;
+-	__u16	pcall_id;
++	__be32	sendAccm;
++	__be32	recvAccm;
+ };
+ 
+ union pptp_ctrl_union {
+diff --git a/include/linux/netfilter_ipv4/ip_conntrack_tuple.h b/include/linux/netfilter_ipv4/ip_conntrack_tuple.h
+--- a/include/linux/netfilter_ipv4/ip_conntrack_tuple.h
++++ b/include/linux/netfilter_ipv4/ip_conntrack_tuple.h
+@@ -17,7 +17,7 @@ union ip_conntrack_manip_proto
+ 	u_int16_t all;
+ 
+ 	struct {
+-		u_int16_t port;
++		__be16 port;
+ 	} tcp;
+ 	struct {
+ 		u_int16_t port;
+@@ -29,7 +29,7 @@ union ip_conntrack_manip_proto
+ 		u_int16_t port;
+ 	} sctp;
+ 	struct {
+-		u_int16_t key;	/* key is 32bit, pptp only uses 16 */
++		__be16 key;	/* key is 32bit, pptp only uses 16 */
+ 	} gre;
+ };
+ 
+@@ -65,7 +65,7 @@ struct ip_conntrack_tuple
+ 				u_int16_t port;
+ 			} sctp;
+ 			struct {
+-				u_int16_t key;	/* key is 32bit, 
++				__be16 key;	/* key is 32bit, 
+ 						 * pptp only uses 16 */
+ 			} gre;
+ 		} u;
+diff --git a/include/linux/pci_ids.h b/include/linux/pci_ids.h
+--- a/include/linux/pci_ids.h
++++ b/include/linux/pci_ids.h
+@@ -1268,7 +1268,8 @@
+ #define PCI_DEVICE_ID_NVIDIA_NFORCE_MCP51_SATA	0x0266
+ #define PCI_DEVICE_ID_NVIDIA_NFORCE_MCP51_SATA2	0x0267
+ #define PCI_DEVICE_ID_NVIDIA_NFORCE_MCP55_IDE	0x036E
+-#define PCI_DEVICE_ID_NVIDIA_NFORCE_MCP55_SATA	0x036F
++#define PCI_DEVICE_ID_NVIDIA_NFORCE_MCP55_SATA	0x037E
++#define PCI_DEVICE_ID_NVIDIA_NFORCE_MCP55_SATA2	0x037F
+ #define PCI_DEVICE_ID_NVIDIA_NVENET_12		0x0268
+ #define PCI_DEVICE_ID_NVIDIA_NVENET_13		0x0269
+ #define PCI_DEVICE_ID_NVIDIA_MCP51_AUDIO	0x026B
 diff --git a/include/linux/reboot.h b/include/linux/reboot.h
 --- a/include/linux/reboot.h
 +++ b/include/linux/reboot.h
@@ -16705,6 +17558,66 @@ diff --git a/kernel/printk.c b/kernel/printk.c
  				nanosec_rem = do_div(t, 1000000000);
  				tlen = sprintf(tbuf,
  						"<%c>[%5lu.%06lu] ",
+diff --git a/kernel/signal.c b/kernel/signal.c
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -936,34 +936,31 @@ force_sig_specific(int sig, struct task_
+  * as soon as they're available, so putting the signal on the shared queue
+  * will be equivalent to sending it to one such thread.
+  */
+-#define wants_signal(sig, p, mask) 			\
+-	(!sigismember(&(p)->blocked, sig)		\
+-	 && !((p)->state & mask)			\
+-	 && !((p)->flags & PF_EXITING)			\
+-	 && (task_curr(p) || !signal_pending(p)))
+-
++static inline int wants_signal(int sig, struct task_struct *p)
++{
++	if (sigismember(&p->blocked, sig))
++		return 0;
++	if (p->flags & PF_EXITING)
++		return 0;
++	if (sig == SIGKILL)
++		return 1;
++	if (p->state & (TASK_STOPPED | TASK_TRACED))
++		return 0;
++	return task_curr(p) || !signal_pending(p);
++}
+ 
+ static void
+ __group_complete_signal(int sig, struct task_struct *p)
+ {
+-	unsigned int mask;
+ 	struct task_struct *t;
+ 
+ 	/*
+-	 * Don't bother traced and stopped tasks (but
+-	 * SIGKILL will punch through that).
+-	 */
+-	mask = TASK_STOPPED | TASK_TRACED;
+-	if (sig == SIGKILL)
+-		mask = 0;
+-
+-	/*
+ 	 * Now find a thread we can wake up to take the signal off the queue.
+ 	 *
+ 	 * If the main thread wants the signal, it gets first crack.
+ 	 * Probably the least surprising to the average bear.
+ 	 */
+-	if (wants_signal(sig, p, mask))
++	if (wants_signal(sig, p))
+ 		t = p;
+ 	else if (thread_group_empty(p))
+ 		/*
+@@ -981,7 +978,7 @@ __group_complete_signal(int sig, struct 
+ 			t = p->signal->curr_target = p;
+ 		BUG_ON(t->tgid != p->tgid);
+ 
+-		while (!wants_signal(sig, t, mask)) {
++		while (!wants_signal(sig, t)) {
+ 			t = next_thread(t);
+ 			if (t == p->signal->curr_target)
+ 				/*
 diff --git a/kernel/sys.c b/kernel/sys.c
 --- a/kernel/sys.c
 +++ b/kernel/sys.c
@@ -16986,17 +17899,7 @@ diff --git a/mm/slab.c b/mm/slab.c
  		return __cache_alloc(cachep, flags);
  
  	if (unlikely(!cachep->nodelists[nodeid])) {
-@@ -2906,8 +2907,7 @@ void *__kmalloc(size_t size, unsigned in
- 	 * functions.
- 	 */
- 	cachep = __find_general_cachep(size, flags);
--	if (unlikely(cachep == NULL))
--		return NULL;
-+	BUG_ON(!cachep);		/* Allocation size too large for kmalloc */
- 	return __cache_alloc(cachep, flags);
- }
- EXPORT_SYMBOL(__kmalloc);
-@@ -3079,7 +3079,7 @@ static int alloc_kmemlist(kmem_cache_t *
+@@ -3079,7 +3080,7 @@ static int alloc_kmemlist(kmem_cache_t *
  
  			if ((nc = cachep->nodelists[node]->shared))
  				free_block(cachep, nc->entry,
@@ -17005,7 +17908,7 @@ diff --git a/mm/slab.c b/mm/slab.c
  
  			l3->shared = new;
  			if (!cachep->nodelists[node]->alien) {
-@@ -3160,7 +3160,7 @@ static int do_tune_cpucache(kmem_cache_t
+@@ -3160,7 +3161,7 @@ static int do_tune_cpucache(kmem_cache_t
  		if (!ccold)
  			continue;
  		spin_lock_irq(&cachep->nodelists[cpu_to_node(i)]->list_lock);
@@ -17014,7 +17917,7 @@ diff --git a/mm/slab.c b/mm/slab.c
  		spin_unlock_irq(&cachep->nodelists[cpu_to_node(i)]->list_lock);
  		kfree(ccold);
  	}
-@@ -3240,7 +3240,7 @@ static void drain_array_locked(kmem_cach
+@@ -3240,7 +3241,7 @@ static void drain_array_locked(kmem_cach
  		if (tofree > ac->avail) {
  			tofree = (ac->avail+1)/2;
  		}
@@ -17034,6 +17937,32 @@ diff --git a/mm/swapfile.c b/mm/swapfile.c
  			goto bad_swap;
  		}
  		p->old_block_size = block_size(bdev);
+diff --git a/net/bridge/br_forward.c b/net/bridge/br_forward.c
+--- a/net/bridge/br_forward.c
++++ b/net/bridge/br_forward.c
+@@ -31,7 +31,8 @@ static inline int should_deliver(const s
+ 
+ int br_dev_queue_push_xmit(struct sk_buff *skb)
+ {
+-	if (skb->len > skb->dev->mtu) 
++	/* drop mtu oversized packets except tso */
++	if (skb->len > skb->dev->mtu && !skb_shinfo(skb)->tso_size)
+ 		kfree_skb(skb);
+ 	else {
+ #ifdef CONFIG_BRIDGE_NETFILTER
+diff --git a/net/core/neighbour.c b/net/core/neighbour.c
+--- a/net/core/neighbour.c
++++ b/net/core/neighbour.c
+@@ -61,7 +61,9 @@ static int pneigh_ifdown(struct neigh_ta
+ void neigh_changeaddr(struct neigh_table *tbl, struct net_device *dev);
+ 
+ static struct neigh_table *neigh_tables;
++#ifdef CONFIG_PROC_FS
+ static struct file_operations neigh_stat_seq_fops;
++#endif
+ 
+ /*
+    Neighbour hash table buckets are protected with rwlock tbl->lock.
 diff --git a/net/ipv4/fib_trie.c b/net/ipv4/fib_trie.c
 --- a/net/ipv4/fib_trie.c
 +++ b/net/ipv4/fib_trie.c
@@ -17073,6 +18002,257 @@ diff --git a/net/ipv4/fib_trie.c b/net/ipv4/fib_trie.c
  
  	return tb;
  }
+diff --git a/net/ipv4/netfilter/Kconfig b/net/ipv4/netfilter/Kconfig
+--- a/net/ipv4/netfilter/Kconfig
++++ b/net/ipv4/netfilter/Kconfig
+@@ -537,6 +537,17 @@ config IP_NF_TARGET_TCPMSS
+ 
+ 	  To compile it as a module, choose M here.  If unsure, say N.
+ 
++config IP_NF_TARGET_NFQUEUE
++	tristate "NFQUEUE Target Support"
++	depends on IP_NF_IPTABLES
++	help
++	  This Target replaced the old obsolete QUEUE target.
++
++	  As opposed to QUEUE, it supports 65535 different queues,
++	  not just one.
++
++	  To compile it as a module, choose M here.  If unsure, say N.
++
+ # NAT + specific targets
+ config IP_NF_NAT
+ 	tristate "Full NAT"
+diff --git a/net/ipv4/netfilter/Makefile b/net/ipv4/netfilter/Makefile
+--- a/net/ipv4/netfilter/Makefile
++++ b/net/ipv4/netfilter/Makefile
+@@ -92,6 +92,7 @@ obj-$(CONFIG_IP_NF_TARGET_TCPMSS) += ipt
+ obj-$(CONFIG_IP_NF_TARGET_NOTRACK) += ipt_NOTRACK.o
+ obj-$(CONFIG_IP_NF_TARGET_CLUSTERIP) += ipt_CLUSTERIP.o
+ obj-$(CONFIG_IP_NF_TARGET_TTL) += ipt_TTL.o
++obj-$(CONFIG_IP_NF_TARGET_NFQUEUE) += ipt_NFQUEUE.o
+ 
+ # generic ARP tables
+ obj-$(CONFIG_IP_NF_ARPTABLES) += arp_tables.o
+@@ -101,4 +102,3 @@ obj-$(CONFIG_IP_NF_ARP_MANGLE) += arpt_m
+ obj-$(CONFIG_IP_NF_ARPFILTER) += arptable_filter.o
+ 
+ obj-$(CONFIG_IP_NF_QUEUE) += ip_queue.o
+-obj-$(CONFIG_NETFILTER_NETLINK_QUEUE) += ipt_NFQUEUE.o
+diff --git a/net/ipv4/netfilter/ip_conntrack_amanda.c b/net/ipv4/netfilter/ip_conntrack_amanda.c
+--- a/net/ipv4/netfilter/ip_conntrack_amanda.c
++++ b/net/ipv4/netfilter/ip_conntrack_amanda.c
+@@ -65,7 +65,7 @@ static int help(struct sk_buff **pskb,
+ 
+ 	/* increase the UDP timeout of the master connection as replies from
+ 	 * Amanda clients to the server can be quite delayed */
+-	ip_ct_refresh_acct(ct, ctinfo, NULL, master_timeout * HZ);
++	ip_ct_refresh(ct, *pskb, master_timeout * HZ);
+ 
+ 	/* No data? */
+ 	dataoff = (*pskb)->nh.iph->ihl*4 + sizeof(struct udphdr);
+diff --git a/net/ipv4/netfilter/ip_conntrack_core.c b/net/ipv4/netfilter/ip_conntrack_core.c
+--- a/net/ipv4/netfilter/ip_conntrack_core.c
++++ b/net/ipv4/netfilter/ip_conntrack_core.c
+@@ -1112,45 +1112,46 @@ void ip_conntrack_helper_unregister(stru
+ 	synchronize_net();
+ }
+ 
+-static inline void ct_add_counters(struct ip_conntrack *ct,
+-				   enum ip_conntrack_info ctinfo,
+-				   const struct sk_buff *skb)
+-{
+-#ifdef CONFIG_IP_NF_CT_ACCT
+-	if (skb) {
+-		ct->counters[CTINFO2DIR(ctinfo)].packets++;
+-		ct->counters[CTINFO2DIR(ctinfo)].bytes += 
+-					ntohs(skb->nh.iph->tot_len);
+-	}
+-#endif
+-}
+-
+-/* Refresh conntrack for this many jiffies and do accounting (if skb != NULL) */
+-void ip_ct_refresh_acct(struct ip_conntrack *ct, 
++/* Refresh conntrack for this many jiffies and do accounting if do_acct is 1 */
++void __ip_ct_refresh_acct(struct ip_conntrack *ct, 
+ 		        enum ip_conntrack_info ctinfo,
+ 			const struct sk_buff *skb,
+-			unsigned long extra_jiffies)
++			unsigned long extra_jiffies,
++			int do_acct)
+ {
++	int do_event = 0;
++
+ 	IP_NF_ASSERT(ct->timeout.data == (unsigned long)ct);
++	IP_NF_ASSERT(skb);
++
++	write_lock_bh(&ip_conntrack_lock);
+ 
+ 	/* If not in hash table, timer will not be active yet */
+ 	if (!is_confirmed(ct)) {
+ 		ct->timeout.expires = extra_jiffies;
+-		ct_add_counters(ct, ctinfo, skb);
++		do_event = 1;
+ 	} else {
+-		write_lock_bh(&ip_conntrack_lock);
+ 		/* Need del_timer for race avoidance (may already be dying). */
+ 		if (del_timer(&ct->timeout)) {
+ 			ct->timeout.expires = jiffies + extra_jiffies;
+ 			add_timer(&ct->timeout);
+-			/* FIXME: We loose some REFRESH events if this function
+-			 * is called without an skb.  I'll fix this later -HW */
+-			if (skb)
+-				ip_conntrack_event_cache(IPCT_REFRESH, skb);
++			do_event = 1;
+ 		}
+-		ct_add_counters(ct, ctinfo, skb);
+-		write_unlock_bh(&ip_conntrack_lock);
+ 	}
++
++#ifdef CONFIG_IP_NF_CT_ACCT
++	if (do_acct) {
++		ct->counters[CTINFO2DIR(ctinfo)].packets++;
++		ct->counters[CTINFO2DIR(ctinfo)].bytes += 
++						ntohs(skb->nh.iph->tot_len);
++	}
++#endif
++
++	write_unlock_bh(&ip_conntrack_lock);
++
++	/* must be unlocked when calling event cache */
++	if (do_event)
++		ip_conntrack_event_cache(IPCT_REFRESH, skb);
+ }
+ 
+ #if defined(CONFIG_IP_NF_CONNTRACK_NETLINK) || \
+diff --git a/net/ipv4/netfilter/ip_conntrack_helper_pptp.c b/net/ipv4/netfilter/ip_conntrack_helper_pptp.c
+--- a/net/ipv4/netfilter/ip_conntrack_helper_pptp.c
++++ b/net/ipv4/netfilter/ip_conntrack_helper_pptp.c
+@@ -172,7 +172,6 @@ static int destroy_sibling_or_exp(const 
+ 		DEBUGP("setting timeout of conntrack %p to 0\n", sibling);
+ 		sibling->proto.gre.timeout = 0;
+ 		sibling->proto.gre.stream_timeout = 0;
+-		/* refresh_acct will not modify counters if skb == NULL */
+ 		if (del_timer(&sibling->timeout))
+ 			sibling->timeout.function((unsigned long)sibling);
+ 		ip_conntrack_put(sibling);
+@@ -223,8 +222,8 @@ static void pptp_destroy_siblings(struct
+ static inline int
+ exp_gre(struct ip_conntrack *master,
+ 	u_int32_t seq,
+-	u_int16_t callid,
+-	u_int16_t peer_callid)
++	__be16 callid,
++	__be16 peer_callid)
+ {
+ 	struct ip_conntrack_tuple inv_tuple;
+ 	struct ip_conntrack_tuple exp_tuples[] = {
+@@ -263,7 +262,7 @@ exp_gre(struct ip_conntrack *master,
+ 	exp_orig->mask.src.ip = 0xffffffff;
+ 	exp_orig->mask.src.u.all = 0;
+ 	exp_orig->mask.dst.u.all = 0;
+-	exp_orig->mask.dst.u.gre.key = 0xffff;
++	exp_orig->mask.dst.u.gre.key = htons(0xffff);
+ 	exp_orig->mask.dst.ip = 0xffffffff;
+ 	exp_orig->mask.dst.protonum = 0xff;
+ 		
+@@ -340,7 +339,8 @@ pptp_inbound_pkt(struct sk_buff **pskb,
+ 	unsigned int reqlen;
+ 	union pptp_ctrl_union _pptpReq, *pptpReq;
+ 	struct ip_ct_pptp_master *info = &ct->help.ct_pptp_info;
+-	u_int16_t msg, *cid, *pcid;
++	u_int16_t msg;
++	__be16 *cid, *pcid;
+ 	u_int32_t seq;	
+ 
+ 	ctlh = skb_header_pointer(*pskb, nexthdr_off, sizeof(_ctlh), &_ctlh);
+@@ -485,7 +485,7 @@ pptp_inbound_pkt(struct sk_buff **pskb,
+ 
+ 		if (info->pns_call_id != ntohs(*pcid)) {
+ 			DEBUGP("%s for unknown CallID %u\n", 
+-				pptp_msg_name[msg], ntohs(*cid));
++				pptp_msg_name[msg], ntohs(*pcid));
+ 			break;
+ 		}
+ 
+@@ -551,7 +551,8 @@ pptp_outbound_pkt(struct sk_buff **pskb,
+ 	unsigned int reqlen;
+ 	union pptp_ctrl_union _pptpReq, *pptpReq;
+ 	struct ip_ct_pptp_master *info = &ct->help.ct_pptp_info;
+-	u_int16_t msg, *cid, *pcid;
++	u_int16_t msg;
++	__be16 *cid, *pcid;
+ 
+ 	ctlh = skb_header_pointer(*pskb, nexthdr_off, sizeof(_ctlh), &_ctlh);
+ 	if (!ctlh)
+@@ -755,7 +756,7 @@ static struct ip_conntrack_helper pptp =
+ 			  } 
+ 		 },
+ 	.mask = { .src = { .ip = 0, 
+-			   .u = { .tcp = { .port = 0xffff } } 
++			   .u = { .tcp = { .port = __constant_htons(0xffff) } } 
+ 			 }, 
+ 		  .dst = { .ip = 0, 
+ 			   .u = { .all = 0 },
+diff --git a/net/ipv4/netfilter/ip_conntrack_netbios_ns.c b/net/ipv4/netfilter/ip_conntrack_netbios_ns.c
+--- a/net/ipv4/netfilter/ip_conntrack_netbios_ns.c
++++ b/net/ipv4/netfilter/ip_conntrack_netbios_ns.c
+@@ -91,7 +91,7 @@ static int help(struct sk_buff **pskb,
+ 	ip_conntrack_expect_related(exp);
+ 	ip_conntrack_expect_put(exp);
+ 
+-	ip_ct_refresh_acct(ct, ctinfo, NULL, timeout * HZ);
++	ip_ct_refresh(ct, *pskb, timeout * HZ);
+ out:
+ 	return NF_ACCEPT;
+ }
+diff --git a/net/ipv4/netfilter/ip_conntrack_proto_gre.c b/net/ipv4/netfilter/ip_conntrack_proto_gre.c
+--- a/net/ipv4/netfilter/ip_conntrack_proto_gre.c
++++ b/net/ipv4/netfilter/ip_conntrack_proto_gre.c
+@@ -247,6 +247,7 @@ static int gre_packet(struct ip_conntrac
+ 				   ct->proto.gre.stream_timeout);
+ 		/* Also, more likely to be important, and not a probe. */
+ 		set_bit(IPS_ASSURED_BIT, &ct->status);
++		ip_conntrack_event_cache(IPCT_STATUS, skb);
+ 	} else
+ 		ip_ct_refresh_acct(ct, conntrackinfo, skb,
+ 				   ct->proto.gre.timeout);
+diff --git a/net/ipv4/netfilter/ip_conntrack_proto_sctp.c b/net/ipv4/netfilter/ip_conntrack_proto_sctp.c
+--- a/net/ipv4/netfilter/ip_conntrack_proto_sctp.c
++++ b/net/ipv4/netfilter/ip_conntrack_proto_sctp.c
+@@ -416,6 +416,7 @@ static int sctp_packet(struct ip_conntra
+ 		&& newconntrack == SCTP_CONNTRACK_ESTABLISHED) {
+ 		DEBUGP("Setting assured bit\n");
+ 		set_bit(IPS_ASSURED_BIT, &conntrack->status);
++		ip_conntrack_event_cache(IPCT_STATUS, skb);
+ 	}
+ 
+ 	return NF_ACCEPT;
+diff --git a/net/ipv4/netfilter/ip_conntrack_proto_tcp.c b/net/ipv4/netfilter/ip_conntrack_proto_tcp.c
+--- a/net/ipv4/netfilter/ip_conntrack_proto_tcp.c
++++ b/net/ipv4/netfilter/ip_conntrack_proto_tcp.c
+@@ -1014,7 +1014,8 @@ static int tcp_packet(struct ip_conntrac
+ 		/* Set ASSURED if we see see valid ack in ESTABLISHED 
+ 		   after SYN_RECV or a valid answer for a picked up 
+ 		   connection. */
+-			set_bit(IPS_ASSURED_BIT, &conntrack->status);
++		set_bit(IPS_ASSURED_BIT, &conntrack->status);
++		ip_conntrack_event_cache(IPCT_STATUS, skb);
+ 	}
+ 	ip_ct_refresh_acct(conntrack, ctinfo, skb, timeout);
+ 
+diff --git a/net/ipv4/netfilter/ip_conntrack_standalone.c b/net/ipv4/netfilter/ip_conntrack_standalone.c
+--- a/net/ipv4/netfilter/ip_conntrack_standalone.c
++++ b/net/ipv4/netfilter/ip_conntrack_standalone.c
+@@ -989,7 +989,7 @@ EXPORT_SYMBOL(need_ip_conntrack);
+ EXPORT_SYMBOL(ip_conntrack_helper_register);
+ EXPORT_SYMBOL(ip_conntrack_helper_unregister);
+ EXPORT_SYMBOL(ip_ct_iterate_cleanup);
+-EXPORT_SYMBOL(ip_ct_refresh_acct);
++EXPORT_SYMBOL(__ip_ct_refresh_acct);
+ 
+ EXPORT_SYMBOL(ip_conntrack_expect_alloc);
+ EXPORT_SYMBOL(ip_conntrack_expect_put);
 diff --git a/net/ipv4/tcp_minisocks.c b/net/ipv4/tcp_minisocks.c
 --- a/net/ipv4/tcp_minisocks.c
 +++ b/net/ipv4/tcp_minisocks.c
@@ -17085,6 +18265,122 @@ diff --git a/net/ipv4/tcp_minisocks.c b/net/ipv4/tcp_minisocks.c
  
  		tcp_set_ca_state(newsk, TCP_CA_Open);
  		tcp_init_xmit_timers(newsk);
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -509,7 +509,16 @@ int tcp_fragment(struct sock *sk, struct
+ 			tp->lost_out -= diff;
+ 			tp->left_out -= diff;
+ 		}
++
+ 		if (diff > 0) {
++			/* Adjust Reno SACK estimate. */
++			if (!tp->rx_opt.sack_ok) {
++				tp->sacked_out -= diff;
++				if ((int)tp->sacked_out < 0)
++					tp->sacked_out = 0;
++				tcp_sync_left_out(tp);
++			}
++
+ 			tp->fackets_out -= diff;
+ 			if ((int)tp->fackets_out < 0)
+ 				tp->fackets_out = 0;
+diff --git a/net/ipv6/netfilter/Kconfig b/net/ipv6/netfilter/Kconfig
+--- a/net/ipv6/netfilter/Kconfig
++++ b/net/ipv6/netfilter/Kconfig
+@@ -209,6 +209,17 @@ config IP6_NF_TARGET_REJECT
+ 
+ 	  To compile it as a module, choose M here.  If unsure, say N.
+ 
++config IP6_NF_TARGET_NFQUEUE
++	tristate "NFQUEUE Target Support"
++	depends on IP_NF_IPTABLES
++	help
++	  This Target replaced the old obsolete QUEUE target.
++
++	  As opposed to QUEUE, it supports 65535 different queues,
++	  not just one.
++
++	  To compile it as a module, choose M here.  If unsure, say N.
++
+ #  if [ "$CONFIG_IP6_NF_FILTER" != "n" ]; then
+ #    dep_tristate '    REJECT target support' CONFIG_IP6_NF_TARGET_REJECT $CONFIG_IP6_NF_FILTER
+ #    if [ "$CONFIG_EXPERIMENTAL" = "y" ]; then
+diff --git a/net/ipv6/netfilter/Makefile b/net/ipv6/netfilter/Makefile
+--- a/net/ipv6/netfilter/Makefile
++++ b/net/ipv6/netfilter/Makefile
+@@ -21,9 +21,9 @@ obj-$(CONFIG_IP6_NF_FILTER) += ip6table_
+ obj-$(CONFIG_IP6_NF_MANGLE) += ip6table_mangle.o
+ obj-$(CONFIG_IP6_NF_TARGET_MARK) += ip6t_MARK.o
+ obj-$(CONFIG_IP6_NF_TARGET_HL) += ip6t_HL.o
++obj-$(CONFIG_IP6_NF_TARGET_NFQUEUE) += ip6t_NFQUEUE.o
+ obj-$(CONFIG_IP6_NF_QUEUE) += ip6_queue.o
+ obj-$(CONFIG_IP6_NF_TARGET_LOG) += ip6t_LOG.o
+ obj-$(CONFIG_IP6_NF_RAW) += ip6table_raw.o
+ obj-$(CONFIG_IP6_NF_MATCH_HL) += ip6t_hl.o
+ obj-$(CONFIG_IP6_NF_TARGET_REJECT) += ip6t_REJECT.o
+-obj-$(CONFIG_NETFILTER_NETLINK_QUEUE) += ip6t_NFQUEUE.o
+diff --git a/net/irda/irttp.c b/net/irda/irttp.c
+--- a/net/irda/irttp.c
++++ b/net/irda/irttp.c
+@@ -38,7 +38,7 @@
+ #include <net/irda/parameters.h>
+ #include <net/irda/irttp.h>
+ 
+-static struct irttp_cb *irttp = NULL;
++static struct irttp_cb *irttp;
+ 
+ static void __irttp_close_tsap(struct tsap_cb *self);
+ 
+@@ -86,12 +86,9 @@ static pi_param_info_t param_info = { pi
+  */
+ int __init irttp_init(void)
+ {
+-	/* Initialize the irttp structure. */
+-	if (irttp == NULL) {
+-		irttp = kmalloc(sizeof(struct irttp_cb), GFP_KERNEL);
+-		if (irttp == NULL)
+-			return -ENOMEM;
+-	}
++	irttp = kmalloc(sizeof(struct irttp_cb), GFP_KERNEL);
++	if (irttp == NULL)
++		return -ENOMEM;
+ 	memset(irttp, 0, sizeof(struct irttp_cb));
+ 
+ 	irttp->magic = TTP_MAGIC;
+@@ -100,6 +97,7 @@ int __init irttp_init(void)
+ 	if (!irttp->tsaps) {
+ 		IRDA_ERROR("%s: can't allocate IrTTP hashbin!\n",
+ 			   __FUNCTION__);
++		kfree(irttp);
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -115,7 +113,6 @@ int __init irttp_init(void)
+ void __exit irttp_cleanup(void) 
+ {
+ 	/* Check for main structure */
+-	IRDA_ASSERT(irttp != NULL, return;);
+ 	IRDA_ASSERT(irttp->magic == TTP_MAGIC, return;);
+ 
+ 	/*
+@@ -382,7 +379,6 @@ struct tsap_cb *irttp_open_tsap(__u8 sts
+ 	struct lsap_cb *lsap;
+ 	notify_t ttp_notify;
+ 
+-	IRDA_ASSERT(irttp != NULL, return NULL;);
+ 	IRDA_ASSERT(irttp->magic == TTP_MAGIC, return NULL;);
+ 
+ 	/* The IrLMP spec (IrLMP 1.1 p10) says that we have the right to
+@@ -1880,8 +1876,6 @@ static int irttp_seq_open(struct inode *
+ 	struct seq_file *seq;
+ 	int rc = -ENOMEM;
+ 	struct irttp_iter_state *s;
+-       
+-	IRDA_ASSERT(irttp != NULL, return -EINVAL;);
+ 
+ 	s = kmalloc(sizeof(*s), GFP_KERNEL);
+ 	if (!s)
 diff --git a/net/packet/af_packet.c b/net/packet/af_packet.c
 --- a/net/packet/af_packet.c
 +++ b/net/packet/af_packet.c
@@ -17232,6 +18528,45 @@ diff --git a/net/packet/af_packet.c b/net/packet/af_packet.c
  		if (optname == PACKET_ADD_MEMBERSHIP)
  			ret = packet_mc_add(sk, &mreq);
  		else
+diff --git a/net/sctp/sm_statefuns.c b/net/sctp/sm_statefuns.c
+--- a/net/sctp/sm_statefuns.c
++++ b/net/sctp/sm_statefuns.c
+@@ -2414,6 +2414,17 @@ sctp_disposition_t sctp_sf_do_9_2_shutdo
+ 	skb_pull(chunk->skb, sizeof(sctp_shutdownhdr_t));
+ 	chunk->subh.shutdown_hdr = sdh;
+ 
++	/* API 5.3.1.5 SCTP_SHUTDOWN_EVENT
++	 * When a peer sends a SHUTDOWN, SCTP delivers this notification to
++	 * inform the application that it should cease sending data.
++	 */
++	ev = sctp_ulpevent_make_shutdown_event(asoc, 0, GFP_ATOMIC);
++	if (!ev) {
++		disposition = SCTP_DISPOSITION_NOMEM;
++		goto out;	
++	}
++	sctp_add_cmd_sf(commands, SCTP_CMD_EVENT_ULP, SCTP_ULPEVENT(ev));
++
+ 	/* Upon the reception of the SHUTDOWN, the peer endpoint shall
+ 	 *  - enter the SHUTDOWN-RECEIVED state,
+ 	 *  - stop accepting new data from its SCTP user
+@@ -2439,17 +2450,6 @@ sctp_disposition_t sctp_sf_do_9_2_shutdo
+ 	sctp_add_cmd_sf(commands, SCTP_CMD_PROCESS_CTSN,
+ 			SCTP_U32(chunk->subh.shutdown_hdr->cum_tsn_ack));
+ 
+-	/* API 5.3.1.5 SCTP_SHUTDOWN_EVENT
+-	 * When a peer sends a SHUTDOWN, SCTP delivers this notification to
+-	 * inform the application that it should cease sending data.
+-	 */
+-	ev = sctp_ulpevent_make_shutdown_event(asoc, 0, GFP_ATOMIC);
+-	if (!ev) {
+-		disposition = SCTP_DISPOSITION_NOMEM;
+-		goto out;	
+-	}
+-	sctp_add_cmd_sf(commands, SCTP_CMD_EVENT_ULP, SCTP_ULPEVENT(ev));
+-
+ out:
+ 	return disposition;
+ }
 diff --git a/sound/oss/au1000.c b/sound/oss/au1000.c
 --- a/sound/oss/au1000.c
 +++ b/sound/oss/au1000.c
