@@ -1,0 +1,144 @@
+From khali@linux-fr.org Fri Sep 23 00:04:35 2005
+Date: Thu, 22 Sep 2005 21:58:41 +0200
+From: Jean Delvare <khali@linux-fr.org>
+To: Greg KH <greg@kroah.com>
+Subject: [PATCH] (3/7) i2c-viapro: Implement I2C Block transactions
+Message-Id: <20050922215841.424507df.khali@linux-fr.org>
+
+Implement the I2C block transactions on VIA chips which support them:
+VT82C686B, VT8233, VT8233A, VT8235 and VT8237R. This speeds up EEPROM
+accesses by a factor 10 or so.
+
+I would like to thank Antonino A. Daplas, Hinko Kocevar, Salah Coronya
+and Andreas Henriksson for their help in testing this new feature.
+
+Signed-off-by: Jean Delvare <khali@linux-fr.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+ Documentation/i2c/busses/i2c-viapro |    7 +++++-
+ drivers/i2c/busses/i2c-viapro.c     |   39 +++++++++++++++++++++++++++++++++---
+ 2 files changed, 42 insertions(+), 4 deletions(-)
+
+--- gregkh-2.6.orig/drivers/i2c/busses/i2c-viapro.c	2005-09-28 15:54:07.000000000 -0700
++++ gregkh-2.6/drivers/i2c/busses/i2c-viapro.c	2005-09-28 15:54:08.000000000 -0700
+@@ -4,6 +4,7 @@
+     Copyright (c) 1998 - 2002  Frodo Looijaard <frodol@dds.nl>,
+     Philip Edelbrock <phil@netroedge.com>, Kyösti Mälkki <kmalkki@cc.hut.fi>,
+     Mark D. Studebaker <mdsxyz123@yahoo.com>
++    Copyright (C) 2005  Jean Delvare <khali@linux-fr.org>
+ 
+     This program is free software; you can redistribute it and/or modify
+     it under the terms of the GNU General Public License as published by
+@@ -88,6 +89,7 @@
+ #define VT596_BYTE_DATA		0x08
+ #define VT596_WORD_DATA		0x0C
+ #define VT596_BLOCK_DATA	0x14
++#define VT596_I2C_BLOCK_DATA	0x34
+ 
+ 
+ /* If force is set to anything different from 0, we forcibly enable the
+@@ -107,6 +109,9 @@
+ 
+ static struct i2c_adapter vt596_adapter;
+ 
++#define FEATURE_I2CBLOCK	(1<<0)
++static unsigned int vt596_features;
++
+ /* Another internally used function */
+ static int vt596_transaction(void)
+ {
+@@ -225,6 +230,12 @@
+ 		}
+ 		size = VT596_WORD_DATA;
+ 		break;
++	case I2C_SMBUS_I2C_BLOCK_DATA:
++		if (!(vt596_features & FEATURE_I2CBLOCK))
++			return -1;
++		if (read_write == I2C_SMBUS_READ)
++			outb_p(I2C_SMBUS_BLOCK_MAX, SMBHSTDAT0);
++		/* Fall through */
+ 	case I2C_SMBUS_BLOCK_DATA:
+ 		outb_p(((addr & 0x7f) << 1) | (read_write & 0x01),
+ 		       SMBHSTADD);
+@@ -240,11 +251,12 @@
+ 			for (i = 1; i <= len; i++)
+ 				outb_p(data->block[i], SMBBLKDAT);
+ 		}
+-		size = VT596_BLOCK_DATA;
++		size = (size == I2C_SMBUS_I2C_BLOCK_DATA) ?
++		       VT596_I2C_BLOCK_DATA : VT596_BLOCK_DATA;
+ 		break;
+ 	}
+ 
+-	outb_p((size & 0x1C) + (ENABLE_INT9 & 1), SMBHSTCNT);
++	outb_p((size & 0x3C) + (ENABLE_INT9 & 1), SMBHSTCNT);
+ 
+ 	if (vt596_transaction()) /* Error in transaction */
+ 		return -1;
+@@ -266,6 +278,7 @@
+ 	case VT596_WORD_DATA:
+ 		data->word = inb_p(SMBHSTDAT0) + (inb_p(SMBHSTDAT1) << 8);
+ 		break;
++	case VT596_I2C_BLOCK_DATA:
+ 	case VT596_BLOCK_DATA:
+ 		data->block[0] = inb_p(SMBHSTDAT0);
+ 		if (data->block[0] > I2C_SMBUS_BLOCK_MAX)
+@@ -280,9 +293,13 @@
+ 
+ static u32 vt596_func(struct i2c_adapter *adapter)
+ {
+-	return I2C_FUNC_SMBUS_QUICK | I2C_FUNC_SMBUS_BYTE |
++	u32 func = I2C_FUNC_SMBUS_QUICK | I2C_FUNC_SMBUS_BYTE |
+ 	    I2C_FUNC_SMBUS_BYTE_DATA | I2C_FUNC_SMBUS_WORD_DATA |
+ 	    I2C_FUNC_SMBUS_BLOCK_DATA;
++
++	if (vt596_features & FEATURE_I2CBLOCK)
++		func |= I2C_FUNC_SMBUS_I2C_BLOCK;
++	return func;
+ }
+ 
+ static struct i2c_algorithm smbus_algorithm = {
+@@ -379,6 +396,22 @@
+ 	dev_dbg(&pdev->dev, "SMBREV = 0x%X\n", temp);
+ 	dev_dbg(&pdev->dev, "VT596_smba = 0x%X\n", vt596_smba);
+ 
++	switch (pdev->device) {
++	case PCI_DEVICE_ID_VIA_8237:
++	case PCI_DEVICE_ID_VIA_8235:
++	case PCI_DEVICE_ID_VIA_8233A:
++	case PCI_DEVICE_ID_VIA_8233_0:
++		vt596_features |= FEATURE_I2CBLOCK;
++		break;
++	case PCI_DEVICE_ID_VIA_82C686_4:
++		/* The VT82C686B (rev 0x40) does support I2C block
++		   transactions, but the VT82C686A (rev 0x30) doesn't */
++		if (!pci_read_config_byte(pdev, PCI_REVISION_ID, &temp)
++		 && temp >= 0x40)
++			vt596_features |= FEATURE_I2CBLOCK;
++		break;
++	}
++
+ 	vt596_adapter.dev.parent = &pdev->dev;
+ 	snprintf(vt596_adapter.name, I2C_NAME_SIZE,
+ 		 "SMBus Via Pro adapter at %04x", vt596_smba);
+--- gregkh-2.6.orig/Documentation/i2c/busses/i2c-viapro	2005-09-28 15:54:07.000000000 -0700
++++ gregkh-2.6/Documentation/i2c/busses/i2c-viapro	2005-09-28 15:54:08.000000000 -0700
+@@ -14,7 +14,8 @@
+ 	Frodo Looijaard <frodol@dds.nl>,
+ 	Philip Edelbrock <phil@netroedge.com>,
+ 	Kyösti Mälkki <kmalkki@cc.hut.fi>,
+-	Mark D. Studebaker <mdsxyz123@yahoo.com>
++	Mark D. Studebaker <mdsxyz123@yahoo.com>,
++	Jean Delvare <khali@linux-fr.org>
+ 
+ Module Parameters
+ -----------------
+@@ -43,3 +44,7 @@
+ 
+ If none of these show up, you should look in the BIOS for settings like
+ enable ACPI / SMBus or even USB.
++
++Except for the oldest chips (VT82C596A/B, VT82C686A and most probably
++VT8231), this driver supports I2C block transactions. Such transactions
++are mainly useful to read from and write to EEPROMs.
