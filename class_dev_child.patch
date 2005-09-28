@@ -1,10 +1,10 @@
- drivers/base/class.c   |  104 +++++++++++++++++++++++++++++++++++--------------
- drivers/usb/gregkh.c   |   20 ++++++++-
- include/linux/device.h |    6 ++
- 3 files changed, 100 insertions(+), 30 deletions(-)
+ drivers/base/class.c   |   86 +++++++++++++++++++++++++++++--------------------
+ drivers/usb/gregkh.c   |   26 ++++++++++++--
+ include/linux/device.h |   10 +++--
+ 3 files changed, 81 insertions(+), 41 deletions(-)
 
 --- gregkh-2.6.orig/drivers/base/class.c	2005-09-27 03:06:14.000000000 -0700
-+++ gregkh-2.6/drivers/base/class.c	2005-09-27 17:04:45.000000000 -0700
++++ gregkh-2.6/drivers/base/class.c	2005-09-28 12:26:32.000000000 -0700
 @@ -100,7 +100,8 @@
  
  void class_put(struct class * cls)
@@ -108,46 +108,50 @@
  	class_device_put(class_dev);
  	kfree(class_name);
  	return error;
-@@ -626,19 +634,56 @@
- 	return ERR_PTR(retval);
- }
- 
-+struct class_device *class_device_create_child(struct class *cls, struct class_device *parent, dev_t devt,
-+					 struct device *device, char *fmt, ...)
-+{
-+	va_list args;
-+	struct class_device *class_dev = NULL;
-+	int retval = -ENODEV;
-+
-+	if (cls == NULL || IS_ERR(cls))
-+		goto error;
-+
-+	class_dev = kzalloc(sizeof(*class_dev), GFP_KERNEL);
-+	if (!class_dev) {
-+		retval = -ENOMEM;
-+		goto error;
-+	}
-+
-+	class_dev->devt = devt;
-+	class_dev->dev = device;
-+	class_dev->class = cls;
+@@ -578,21 +586,28 @@
+ /**
+  * class_device_create - creates a class device and registers it with sysfs
+  * @cs: pointer to the struct class that this device should be registered to.
++ * @parent: pointer to the parent struct class_device of this new device, if any.
+  * @dev: the dev_t for the char device to be added.
+  * @device: a pointer to a struct device that is assiociated with this class device.
+  * @fmt: string for the class device's name
+  *
+  * This function can be used by char device classes.  A struct
+  * class_device will be created in sysfs, registered to the specified
+- * class.  A "dev" file will be created, showing the dev_t for the
+- * device.  The pointer to the struct class_device will be returned from
+- * the call.  Any further sysfs files that might be required can be
+- * created using this pointer.
++ * class.
++ * A "dev" file will be created, showing the dev_t for the device, if
++ * the dev_t is not 0,0.
++ * If a pointer to a parent struct class_device is passed in, the newly
++ * created struct class_device will be a child of that device in sysfs.
++ * The pointer to the struct class_device will be returned from the
++ * call.  Any further sysfs files that might be required can be created
++ * using this pointer.
+  *
+  * Note: the struct class passed to this function must have previously
+  * been created with a call to class_create().
+  */
+-struct class_device *class_device_create(struct class *cls, dev_t devt,
++struct class_device *class_device_create(struct class *cls,
++					 struct class_device *parent,
++					 dev_t devt,
+ 					 struct device *device, char *fmt, ...)
+ {
+ 	va_list args;
+@@ -611,6 +626,7 @@
+ 	class_dev->devt = devt;
+ 	class_dev->dev = device;
+ 	class_dev->class = cls;
 +	class_dev->parent = parent;
-+
-+	va_start(args, fmt);
-+	vsnprintf(class_dev->class_id, BUS_ID_SIZE, fmt, args);
-+	va_end(args);
-+	retval = class_device_register(class_dev);
-+	if (retval)
-+		goto error;
-+
-+	return class_dev;
-+
-+error:
-+	kfree(class_dev);
-+	return ERR_PTR(retval);
-+}
-+EXPORT_SYMBOL_GPL(class_device_create_child);
-+
+ 
+ 	va_start(args, fmt);
+ 	vsnprintf(class_dev->class_id, BUS_ID_SIZE, fmt, args);
+@@ -628,17 +644,18 @@
+ 
  void class_device_del(struct class_device *class_dev)
  {
 -	struct class * parent = class_dev->class;
@@ -171,7 +175,7 @@
  	}
  
  	if (class_dev->dev) {
-@@ -655,8 +700,8 @@
+@@ -655,8 +672,8 @@
  	kobject_hotplug(&class_dev->kobj, KOBJ_REMOVE);
  	kobject_del(&class_dev->kobj);
  
@@ -182,7 +186,7 @@
  	kfree(class_name);
  }
  
-@@ -736,7 +781,8 @@
+@@ -736,7 +753,8 @@
  
  void class_device_put(struct class_device *class_dev)
  {
@@ -193,7 +197,7 @@
  
  
 --- gregkh-2.6.orig/drivers/usb/gregkh.c	2005-09-27 03:06:14.000000000 -0700
-+++ gregkh-2.6/drivers/usb/gregkh.c	2005-09-27 07:39:32.000000000 -0700
++++ gregkh-2.6/drivers/usb/gregkh.c	2005-09-28 12:40:17.000000000 -0700
 @@ -208,17 +208,35 @@
  
  static struct class *greg_class;
@@ -214,25 +218,28 @@
 +
  	greg_class = class_create(THIS_MODULE, "gregkh");
  
- 	class_device_create(greg_class, MKDEV(42, 0), NULL, "greg1");
+-	class_device_create(greg_class, MKDEV(42, 0), NULL, "greg1");
 -	class_device_create(greg_class, MKDEV(42, 1), NULL, "greg2");
-+	g2 = class_device_create(greg_class, MKDEV(42, 1), NULL, "greg2");
- 	class_device_create(greg_class, MKDEV(42, 2), NULL, "greg3");
+-	class_device_create(greg_class, MKDEV(42, 2), NULL, "greg3");
++	class_device_create(greg_class, NULL, MKDEV(42, 0), NULL, "greg1");
++	g2 = class_device_create(greg_class, NULL, MKDEV(42, 1), NULL, "greg2");
++	class_device_create(greg_class, NULL, MKDEV(42, 2), NULL, "greg3");
  
  	printk("GREG: create a dupe name\n");
- 	class_device_create(greg_class, MKDEV(42, 3), NULL, "greg1");
+-	class_device_create(greg_class, MKDEV(42, 3), NULL, "greg1");
++	class_device_create(greg_class, NULL, MKDEV(42, 3), NULL, "greg1");
  	printk("GREG: dup name created\n");
 +
-+	class_device_create_child(greg_class, g2, MKDEV(42,4), NULL, "greg2.4");
-+	class_device_create_child(greg_class, g2, 0, NULL, "greg2.%s", "null");
-+	cd = class_device_create_child(greg_class, g2, MKDEV(42,5), NULL, "greg%d.%d", 2, 5);
++	class_device_create(greg_class, g2, MKDEV(42,4), NULL, "greg2.4");
++	class_device_create(greg_class, g2, 0, NULL, "greg2.%s", "null");
++	cd = class_device_create(greg_class, g2, MKDEV(42,5), NULL, "greg%d.%d", 2, 5);
 +	class_device_create_file(cd, &class_device_attr_name);
 +
  }
  
  
 --- gregkh-2.6.orig/include/linux/device.h	2005-09-27 03:06:14.000000000 -0700
-+++ gregkh-2.6/include/linux/device.h	2005-09-27 16:24:45.000000000 -0700
++++ gregkh-2.6/include/linux/device.h	2005-09-28 12:28:15.000000000 -0700
 @@ -201,6 +201,7 @@
  	struct class_device_attribute *sample_attr;
  	struct device		* dev;		/* not necessary, but nice to have */
@@ -241,13 +248,17 @@
  
  	char	class_id[BUS_ID_SIZE];	/* unique to this class */
  };
-@@ -264,6 +265,11 @@
- extern struct class_device *class_device_create(struct class *cls, dev_t devt,
- 						struct device *device, char *fmt, ...)
- 					__attribute__((format(printf,4,5)));
-+extern struct class_device *class_device_create_child(struct class *cls,
+@@ -261,9 +262,12 @@
+ 
+ extern struct class *class_create(struct module *owner, char *name);
+ extern void class_destroy(struct class *cls);
+-extern struct class_device *class_device_create(struct class *cls, dev_t devt,
+-						struct device *device, char *fmt, ...)
+-					__attribute__((format(printf,4,5)));
++extern struct class_device *class_device_create(struct class *cls,
 +						struct class_device *parent,
-+						dev_t devt, struct device *device,
++						dev_t devt,
++						struct device *device,
 +						char *fmt, ...)
 +					__attribute__((format(printf,5,6)));
  extern void class_device_destroy(struct class *cls, dev_t devt);
