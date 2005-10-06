@@ -1,0 +1,78 @@
+From stern@rowland.harvard.edu Thu Oct  6 13:41:23 2005
+Date: Thu, 6 Oct 2005 16:38:45 -0400 (EDT)
+From: Alan Stern <stern@rowland.harvard.edu>
+To: Greg KH <greg@kroah.com>
+Subject: [PATCH] g_file_storage: fix obscure race condition
+Message-ID: <Pine.LNX.4.44L0.0510061635110.4516-100000@iolanthe.rowland.org>
+
+This patch (as575) fixes an unlikely race in the g_file_storage driver.
+The problem can occur only when the driver is unbound before its
+initialization routine has finished.
+
+I also took the opportunity to replace kmalloc/memset with kzalloc.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/gadget/file_storage.c |   21 +++++++++------------
+ 1 file changed, 9 insertions(+), 12 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/gadget/file_storage.c
++++ gregkh-2.6/drivers/usb/gadget/file_storage.c
+@@ -3823,12 +3823,11 @@ static int __init fsg_bind(struct usb_ga
+ 
+ 	/* Create the LUNs, open their backing files, and register the
+ 	 * LUN devices in sysfs. */
+-	fsg->luns = kmalloc(i * sizeof(struct lun), GFP_KERNEL);
++	fsg->luns = kzalloc(i * sizeof(struct lun), GFP_KERNEL);
+ 	if (!fsg->luns) {
+ 		rc = -ENOMEM;
+ 		goto out;
+ 	}
+-	memset(fsg->luns, 0, i * sizeof(struct lun));
+ 	fsg->nluns = i;
+ 
+ 	for (i = 0; i < fsg->nluns; ++i) {
+@@ -3989,6 +3988,11 @@ static int __init fsg_bind(struct usb_ga
+ 			mod_data.removable, mod_data.can_stall,
+ 			mod_data.buflen);
+ 	DBG(fsg, "I/O thread pid: %d\n", fsg->thread_task->pid);
++
++	set_bit(REGISTERED, &fsg->atomic_bitflags);
++
++	/* Tell the thread to start working */
++	wake_up_process(fsg->thread_task);
+ 	return 0;
+ 
+ autoconf_fail:
+@@ -4051,10 +4055,9 @@ static int __init fsg_alloc(void)
+ {
+ 	struct fsg_dev		*fsg;
+ 
+-	fsg = kmalloc(sizeof *fsg, GFP_KERNEL);
++	fsg = kzalloc(sizeof *fsg, GFP_KERNEL);
+ 	if (!fsg)
+ 		return -ENOMEM;
+-	memset(fsg, 0, sizeof *fsg);
+ 	spin_lock_init(&fsg->lock);
+ 	init_rwsem(&fsg->filesem);
+ 	init_waitqueue_head(&fsg->thread_wqh);
+@@ -4080,15 +4083,9 @@ static int __init fsg_init(void)
+ 	if ((rc = fsg_alloc()) != 0)
+ 		return rc;
+ 	fsg = the_fsg;
+-	if ((rc = usb_gadget_register_driver(&fsg_driver)) != 0) {
++	if ((rc = usb_gadget_register_driver(&fsg_driver)) != 0)
+ 		fsg_free(fsg);
+-		return rc;
+-	}
+-	set_bit(REGISTERED, &fsg->atomic_bitflags);
+-
+-	/* Tell the thread to start working */
+-	wake_up_process(fsg->thread_task);
+-	return 0;
++	return rc;
+ }
+ module_init(fsg_init);
+ 
