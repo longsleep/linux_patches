@@ -18,9 +18,9 @@ moving /sys/block into /sys/class.  The main hindrance is that pesky
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
- drivers/base/class.c   |   86 +++++++++++++++++++++++++++++--------------------
- include/linux/device.h |   10 +++--
- 2 files changed, 59 insertions(+), 37 deletions(-)
+ drivers/base/class.c   |  125 +++++++++++++++++++++++++++++++------------------
+ include/linux/device.h |   13 +++--
+ 2 files changed, 91 insertions(+), 47 deletions(-)
 
 --- gregkh-2.6.orig/drivers/base/class.c
 +++ gregkh-2.6/drivers/base/class.c
@@ -34,7 +34,75 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  }
  
  
-@@ -476,37 +477,42 @@ static char *make_class_name(struct clas
+@@ -165,14 +166,25 @@ void class_unregister(struct class * cls
+ 
+ static void class_create_release(struct class *cls)
+ {
++	pr_debug("%s called for %s\n", __FUNCTION__, cls->name);
+ 	kfree(cls);
+ }
+ 
+ static void class_device_create_release(struct class_device *class_dev)
+ {
++	pr_debug("%s called for %s\n", __FUNCTION__, class_dev->class_id);
+ 	kfree(class_dev);
+ }
+ 
++/* needed to allow these devices to have parent class devices */
++static int class_device_create_hotplug(struct class_device *class_dev,
++				       char **envp, int num_envp,
++				       char *buffer, int buffer_size)
++{
++	pr_debug("%s called for %s\n", __FUNCTION__, class_dev->class_id);
++	return 0;
++}
++
+ /**
+  * class_create - create a struct class structure
+  * @owner: pointer to the module that is to "own" this struct class
+@@ -301,10 +313,12 @@ static void class_dev_release(struct kob
+ 	kfree(cd->devt_attr);
+ 	cd->devt_attr = NULL;
+ 
+-	if (cls->release)
++	if (cd->release)
++		cd->release(cd);
++	else if (cls->release)
+ 		cls->release(cd);
+ 	else {
+-		printk(KERN_ERR "Device class '%s' does not have a release() function, "
++		printk(KERN_ERR "Class Device '%s' does not have a release() function, "
+ 			"it is broken and must be fixed.\n",
+ 			cd->class_id);
+ 		WARN_ON(1);
+@@ -382,14 +396,18 @@ static int class_hotplug(struct kset *ks
+ 	buffer = &buffer[length];
+ 	buffer_size -= length;
+ 
+-	if (class_dev->class->hotplug) {
+-		/* have the bus specific function add its stuff */
+-		retval = class_dev->class->hotplug (class_dev, envp, num_envp,
+-						    buffer, buffer_size);
+-			if (retval) {
+-			pr_debug ("%s - hotplug() returned %d\n",
+-				  __FUNCTION__, retval);
+-		}
++	if (class_dev->hotplug) {
++		/* have the class device specific function add its stuff */
++		retval = class_dev->hotplug(class_dev, envp, num_envp,
++					    buffer, buffer_size);
++		if (retval)
++			pr_debug("class_dev->hotplug() returned %d\n", retval);
++	} else if (class_dev->class->hotplug) {
++		/* have the class specific function add its stuff */
++		retval = class_dev->class->hotplug(class_dev, envp, num_envp,
++						   buffer, buffer_size);
++		if (retval)
++			pr_debug("class->hotplug() returned %d\n", retval);
+ 	}
+ 
+ 	return retval;
+@@ -476,37 +494,42 @@ static char *make_class_name(struct clas
  
  int class_device_add(struct class_device *class_dev)
  {
@@ -88,7 +156,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	class_dev->uevent_attr.store = store_uevent;
  	class_device_create_file(class_dev, &class_dev->uevent_attr);
  
-@@ -520,7 +526,7 @@ int class_device_add(struct class_device
+@@ -520,7 +543,7 @@ int class_device_add(struct class_device
  		}
  		attr->attr.name = "dev";
  		attr->attr.mode = S_IRUGO;
@@ -97,7 +165,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		attr->show = show_dev;
  		class_device_create_file(class_dev, attr);
  		class_dev->devt_attr = attr;
-@@ -538,18 +544,20 @@ int class_device_add(struct class_device
+@@ -538,18 +561,20 @@ int class_device_add(struct class_device
  	kobject_hotplug(&class_dev->kobj, KOBJ_ADD);
  
  	/* notify any interfaces this device is now here */
@@ -125,7 +193,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	class_device_put(class_dev);
  	kfree(class_name);
  	return error;
-@@ -564,21 +572,28 @@ int class_device_register(struct class_d
+@@ -564,21 +589,28 @@ int class_device_register(struct class_d
  /**
   * class_device_create - creates a class device and registers it with sysfs
   * @cs: pointer to the struct class that this device should be registered to.
@@ -159,15 +227,17 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  					 struct device *device, char *fmt, ...)
  {
  	va_list args;
-@@ -597,6 +612,7 @@ struct class_device *class_device_create
+@@ -597,6 +629,9 @@ struct class_device *class_device_create
  	class_dev->devt = devt;
  	class_dev->dev = device;
  	class_dev->class = cls;
 +	class_dev->parent = parent;
++	class_dev->release = class_device_create_release;
++	class_dev->hotplug = class_device_create_hotplug;
  
  	va_start(args, fmt);
  	vsnprintf(class_dev->class_id, BUS_ID_SIZE, fmt, args);
-@@ -614,17 +630,18 @@ error:
+@@ -614,17 +649,18 @@ error:
  
  void class_device_del(struct class_device *class_dev)
  {
@@ -192,7 +262,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	}
  
  	if (class_dev->dev) {
-@@ -640,8 +657,8 @@ void class_device_del(struct class_devic
+@@ -640,8 +676,8 @@ void class_device_del(struct class_devic
  	kobject_hotplug(&class_dev->kobj, KOBJ_REMOVE);
  	kobject_del(&class_dev->kobj);
  
@@ -203,7 +273,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	kfree(class_name);
  }
  
-@@ -721,7 +738,8 @@ struct class_device * class_device_get(s
+@@ -721,7 +757,8 @@ struct class_device * class_device_get(s
  
  void class_device_put(struct class_device *class_dev)
  {
@@ -215,15 +285,19 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
 --- gregkh-2.6.orig/include/linux/device.h
 +++ gregkh-2.6/include/linux/device.h
-@@ -213,6 +213,7 @@ struct class_device {
+@@ -213,7 +213,11 @@ struct class_device {
  	struct class_device_attribute uevent_attr;
  	struct device		* dev;		/* not necessary, but nice to have */
  	void			* class_data;	/* class-specific data */
 +	struct class_device	*parent;	/* parent of this child device, if there is one */
  
++	void	(*release)(struct class_device *dev);
++	int	(*hotplug)(struct class_device *dev, char **envp,
++			   int num_envp, char *buffer, int buffer_size);
  	char	class_id[BUS_ID_SIZE];	/* unique to this class */
  };
-@@ -261,9 +262,12 @@ extern void class_interface_unregister(s
+ 
+@@ -261,9 +265,12 @@ extern void class_interface_unregister(s
  
  extern struct class *class_create(struct module *owner, char *name);
  extern void class_destroy(struct class *cls);
