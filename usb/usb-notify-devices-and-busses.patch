@@ -1,0 +1,168 @@
+From: Greg Kroah-Hartman <gregkh@suse.de>
+Subject: USB: add notifier functions to the USB core for devices and busses
+
+This should let us get rid of all of the different hooks in the USB core for
+when something has changed.
+
+Also, some other parts of the kernel have wanted to know this kind of
+information at times.
+
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/Makefile |    2 -
+ drivers/usb/core/hcd.c    |    2 +
+ drivers/usb/core/hub.c    |    3 ++
+ drivers/usb/core/notify.c |   68 ++++++++++++++++++++++++++++++++++++++++++++++
+ drivers/usb/core/usb.h    |    6 ++++
+ include/linux/usb.h       |    8 +++++
+ 6 files changed, 88 insertions(+), 1 deletion(-)
+
+--- gregkh-2.6.orig/include/linux/usb.h
++++ gregkh-2.6/include/linux/usb.h
+@@ -1135,6 +1135,14 @@ usb_maxpacket(struct usb_device *udev, i
+ 
+ /* -------------------------------------------------------------------------- */
+ 
++/* Events from the usb core */
++#define USB_DEVICE_ADD		0x0001
++#define USB_DEVICE_REMOVE	0x0002
++#define USB_BUS_ADD		0x0003
++#define USB_BUS_REMOVE		0x0004
++extern int usb_register_notify(struct notifier_block *nb);
++extern int usb_unregister_notify(struct notifier_block *nb);
++
+ #ifdef DEBUG
+ #define dbg(format, arg...) printk(KERN_DEBUG "%s: " format "\n" , __FILE__ , ## arg)
+ #else
+--- gregkh-2.6.orig/drivers/usb/core/Makefile
++++ gregkh-2.6/drivers/usb/core/Makefile
+@@ -3,7 +3,7 @@
+ #
+ 
+ usbcore-objs	:= usb.o hub.o hcd.o urb.o message.o \
+-			config.o file.o buffer.o sysfs.o devio.o
++			config.o file.o buffer.o sysfs.o devio.o notify.o
+ 
+ ifeq ($(CONFIG_PCI),y)
+ 	usbcore-objs	+= hcd-pci.o
+--- /dev/null
++++ gregkh-2.6/drivers/usb/core/notify.c
+@@ -0,0 +1,68 @@
++/*
++ * All the USB notify logic
++ *
++ * (C) Copyright 2005 Greg Kroah-Hartman <gregkh@suse.de>
++ *
++ */
++
++
++#include <linux/config.h>
++#include <linux/kernel.h>
++#include <linux/notifier.h>
++#ifdef CONFIG_USB_DEBUG
++	#define DEBUG
++#else
++	#undef DEBUG
++#endif
++#include <linux/usb.h>
++
++#include "usb.h"
++
++
++static struct notifier_block *usb_notifier_list;
++
++/**
++ * usb_register_notify - register a notifier callback whenever a usb change happens
++ * @nb: pointer to the notifier block for the callback events.
++ *
++ * These changes are either USB devices or busses being added or removed.
++ */
++int usb_register_notify(struct notifier_block *nb)
++{
++	return notifier_chain_register(&usb_notifier_list, nb);
++}
++EXPORT_SYMBOL_GPL(usb_register_notify);
++
++/**
++ * usb_unregister_notify - unregister a notifier callback
++ * @nb: pointer to the notifier block for the callback events.
++ *
++ * usb_register_notifier() must have been previously called for this function
++ * to work properly.
++ */
++int usb_unregister_notify(struct notifier_block *nb)
++{
++	return notifier_chain_unregister(&usb_notifier_list, nb);
++}
++EXPORT_SYMBOL_GPL(usb_unregister_notify);
++
++
++void usb_notify_add_device(struct usb_device *udev)
++{
++	notifier_call_chain(&usb_notifier_list, USB_DEVICE_ADD, udev);
++}
++
++void usb_notify_remove_device(struct usb_device *udev)
++{
++	notifier_call_chain(&usb_notifier_list, USB_DEVICE_REMOVE, udev);
++}
++
++void usb_notify_add_bus(struct usb_bus *ubus)
++{
++	notifier_call_chain(&usb_notifier_list, USB_BUS_ADD, ubus);
++}
++
++void usb_notify_remove_bus(struct usb_bus *ubus)
++{
++	notifier_call_chain(&usb_notifier_list, USB_BUS_REMOVE, ubus);
++}
+--- gregkh-2.6.orig/drivers/usb/core/usb.h
++++ gregkh-2.6/drivers/usb/core/usb.h
+@@ -80,3 +80,9 @@ struct dev_state {
+ 	unsigned long ifclaimed;
+ };
+ 
++/* internal notify stuff */
++extern void usb_notify_add_device(struct usb_device *udev);
++extern void usb_notify_remove_device(struct usb_device *udev);
++extern void usb_notify_add_bus(struct usb_bus *ubus);
++extern void usb_notify_remove_bus(struct usb_bus *ubus);
++
+--- gregkh-2.6.orig/drivers/usb/core/hub.c
++++ gregkh-2.6/drivers/usb/core/hub.c
+@@ -1128,6 +1128,8 @@ void usb_disconnect(struct usb_device **
+ 	 */
+ 	usb_disable_device(udev, 0);
+ 
++	usb_notify_remove_device(udev);
++
+ 	/* Free the device number, remove the /proc/bus/usb entry and
+ 	 * the sysfs attributes, and delete the parent's children[]
+ 	 * (or root_hub) pointer.
+@@ -1371,6 +1373,7 @@ int usb_new_device(struct usb_device *ud
+ 	}
+ 
+ 	/* USB device state == configured ... usable */
++	usb_notify_add_device(udev);
+ 
+ 	/* add a /proc/bus/usb entry */
+ 	usbdev_add(udev);
+--- gregkh-2.6.orig/drivers/usb/core/hcd.c
++++ gregkh-2.6/drivers/usb/core/hcd.c
+@@ -792,6 +792,7 @@ static int usb_register_bus(struct usb_b
+ 	list_add (&bus->bus_list, &usb_bus_list);
+ 	up (&usb_bus_list_lock);
+ 
++	usb_notify_add_bus(bus);
+ 	usbfs_add_bus (bus);
+ 	usbmon_notify_bus_add (bus);
+ 
+@@ -820,6 +821,7 @@ static void usb_deregister_bus (struct u
+ 	list_del (&bus->bus_list);
+ 	up (&usb_bus_list_lock);
+ 
++	usb_notify_remove_bus(bus);
+ 	usbmon_notify_bus_remove (bus);
+ 	usbfs_remove_bus (bus);
+ 
