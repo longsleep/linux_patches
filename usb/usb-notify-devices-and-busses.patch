@@ -10,13 +10,13 @@ information at times.
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
- drivers/usb/core/Makefile |    2 -
- drivers/usb/core/hcd.c    |    2 +
- drivers/usb/core/hub.c    |    3 ++
- drivers/usb/core/notify.c |   68 ++++++++++++++++++++++++++++++++++++++++++++++
- drivers/usb/core/usb.h    |    6 ++++
- include/linux/usb.h       |    8 +++++
- 6 files changed, 88 insertions(+), 1 deletion(-)
+ drivers/usb/core/Makefile |    2 
+ drivers/usb/core/hcd.c    |    2 
+ drivers/usb/core/hub.c    |    3 +
+ drivers/usb/core/notify.c |  120 ++++++++++++++++++++++++++++++++++++++++++++++
+ drivers/usb/core/usb.h    |    6 ++
+ include/linux/usb.h       |    8 +++
+ 6 files changed, 140 insertions(+), 1 deletion(-)
 
 --- gregkh-2.6.orig/include/linux/usb.h
 +++ gregkh-2.6/include/linux/usb.h
@@ -29,8 +29,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#define USB_DEVICE_REMOVE	0x0002
 +#define USB_BUS_ADD		0x0003
 +#define USB_BUS_REMOVE		0x0004
-+extern int usb_register_notify(struct notifier_block *nb);
-+extern int usb_unregister_notify(struct notifier_block *nb);
++extern void usb_register_notify(struct notifier_block *nb);
++extern void usb_unregister_notify(struct notifier_block *nb);
 +
  #ifdef DEBUG
  #define dbg(format, arg...) printk(KERN_DEBUG "%s: " format "\n" , __FILE__ , ## arg)
@@ -48,11 +48,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	usbcore-objs	+= hcd-pci.o
 --- /dev/null
 +++ gregkh-2.6/drivers/usb/core/notify.c
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,120 @@
 +/*
 + * All the USB notify logic
 + *
 + * (C) Copyright 2005 Greg Kroah-Hartman <gregkh@suse.de>
++ *
++ * notifier functions originally based on those in kernel/sys.c
++ * but fixed up to not be so broken.
 + *
 + */
 +
@@ -71,6 +74,55 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +
 +static struct notifier_block *usb_notifier_list;
++static DECLARE_MUTEX(usb_notifier_lock);
++
++static void usb_notifier_chain_register(struct notifier_block **list,
++					struct notifier_block *n)
++{
++	down(&usb_notifier_lock);
++	while (*list) {
++		if (n->priority > (*list)->priority)
++			break;
++		list = &((*list)->next);
++	}
++	n->next = *list;
++	*list = n;
++	up(&usb_notifier_lock);
++}
++
++static void usb_notifier_chain_unregister(struct notifier_block **nl,
++				   struct notifier_block *n)
++{
++	down(&usb_notifier_lock);
++	while ((*nl)!=NULL) {
++		if ((*nl)==n) {
++			*nl = n->next;
++			goto exit;
++		}
++		nl=&((*nl)->next);
++	}
++exit:
++	up(&usb_notifier_lock);
++}
++
++static int usb_notifier_call_chain(struct notifier_block **n,
++				   unsigned long val, void *v)
++{
++	int ret=NOTIFY_DONE;
++	struct notifier_block *nb = *n;
++
++	down(&usb_notifier_lock);
++	while (nb) {
++		ret = nb->notifier_call(nb,val,v);
++		if (ret&NOTIFY_STOP_MASK) {
++			goto exit;
++		}
++		nb = nb->next;
++	}
++exit:
++	up(&usb_notifier_lock);
++	return ret;
++}
 +
 +/**
 + * usb_register_notify - register a notifier callback whenever a usb change happens
@@ -78,9 +130,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + *
 + * These changes are either USB devices or busses being added or removed.
 + */
-+int usb_register_notify(struct notifier_block *nb)
++void usb_register_notify(struct notifier_block *nb)
 +{
-+	return notifier_chain_register(&usb_notifier_list, nb);
++	usb_notifier_chain_register(&usb_notifier_list, nb);
 +}
 +EXPORT_SYMBOL_GPL(usb_register_notify);
 +
@@ -91,31 +143,31 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + * usb_register_notifier() must have been previously called for this function
 + * to work properly.
 + */
-+int usb_unregister_notify(struct notifier_block *nb)
++void usb_unregister_notify(struct notifier_block *nb)
 +{
-+	return notifier_chain_unregister(&usb_notifier_list, nb);
++	usb_notifier_chain_unregister(&usb_notifier_list, nb);
 +}
 +EXPORT_SYMBOL_GPL(usb_unregister_notify);
 +
 +
 +void usb_notify_add_device(struct usb_device *udev)
 +{
-+	notifier_call_chain(&usb_notifier_list, USB_DEVICE_ADD, udev);
++	usb_notifier_call_chain(&usb_notifier_list, USB_DEVICE_ADD, udev);
 +}
 +
 +void usb_notify_remove_device(struct usb_device *udev)
 +{
-+	notifier_call_chain(&usb_notifier_list, USB_DEVICE_REMOVE, udev);
++	usb_notifier_call_chain(&usb_notifier_list, USB_DEVICE_REMOVE, udev);
 +}
 +
 +void usb_notify_add_bus(struct usb_bus *ubus)
 +{
-+	notifier_call_chain(&usb_notifier_list, USB_BUS_ADD, ubus);
++	usb_notifier_call_chain(&usb_notifier_list, USB_BUS_ADD, ubus);
 +}
 +
 +void usb_notify_remove_bus(struct usb_bus *ubus)
 +{
-+	notifier_call_chain(&usb_notifier_list, USB_BUS_REMOVE, ubus);
++	usb_notifier_call_chain(&usb_notifier_list, USB_BUS_REMOVE, ubus);
 +}
 --- gregkh-2.6.orig/drivers/usb/core/usb.h
 +++ gregkh-2.6/drivers/usb/core/usb.h
