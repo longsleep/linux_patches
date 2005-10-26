@@ -1,0 +1,94 @@
+From mdharm@multivac.one-eyed-alien.net Sun Oct 23 19:41:09 2005
+Date: Sun, 23 Oct 2005 19:40:22 -0700
+From: Matthew Dharm <mdharm-usb@one-eyed-alien.net>
+To: Greg KH <greg@kroah.com>
+Subject: PATCH: usb-storage: allocate separate sense buffer
+Message-ID: <20051024024022.GB5592@one-eyed-alien.net>
+Content-Disposition: inline
+
+From: Alan Stern <stern@rowland.harvard.edu>
+
+This patch is from Alan Stern (as560).  It has been rediffed against a
+current tree.
+
+This patch allocates a separate buffer for usb-storage to use when
+auto-sensing.  Up to now we have been using the sense buffer embedded in a
+scsi_cmnd struct, which is dangerous on hosts that (a) don't do
+cache-coherent DMA or (b) have DMA alignment restrictions.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Matthew Dharm <mdharm-usb@one-eyed-alien.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/storage/transport.c |    5 +++--
+ drivers/usb/storage/usb.c       |    8 ++++++++
+ drivers/usb/storage/usb.h       |    2 ++
+ 3 files changed, 13 insertions(+), 2 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/storage/usb.h
++++ gregkh-2.6/drivers/usb/storage/usb.h
+@@ -88,6 +88,7 @@ struct us_unusual_dev {
+  */
+ 
+ #define US_IOBUF_SIZE		64	/* Size of the DMA-mapped I/O buffer */
++#define US_SENSE_SIZE		18	/* Size of the autosense data buffer */
+ 
+ typedef int (*trans_cmnd)(struct scsi_cmnd *, struct us_data*);
+ typedef int (*trans_reset)(struct us_data*);
+@@ -139,6 +140,7 @@ struct us_data {
+ 	struct usb_ctrlrequest	*cr;		 /* control requests	 */
+ 	struct usb_sg_request	current_sg;	 /* scatter-gather req.  */
+ 	unsigned char		*iobuf;		 /* I/O buffer		 */
++	unsigned char		*sensebuf;	 /* sense data buffer	 */
+ 	dma_addr_t		cr_dma;		 /* buffer DMA addresses */
+ 	dma_addr_t		iobuf_dma;
+ 
+--- gregkh-2.6.orig/drivers/usb/storage/transport.c
++++ gregkh-2.6/drivers/usb/storage/transport.c
+@@ -636,11 +636,11 @@ void usb_stor_invoke_transport(struct sc
+ 
+ 		/* use the new buffer we have */
+ 		old_request_buffer = srb->request_buffer;
+-		srb->request_buffer = srb->sense_buffer;
++		srb->request_buffer = us->sensebuf;
+ 
+ 		/* set the buffer length for transfer */
+ 		old_request_bufflen = srb->request_bufflen;
+-		srb->request_bufflen = 18;
++		srb->request_bufflen = US_SENSE_SIZE;
+ 
+ 		/* set up for no scatter-gather use */
+ 		old_sg = srb->use_sg;
+@@ -652,6 +652,7 @@ void usb_stor_invoke_transport(struct sc
+ 		temp_result = us->transport(us->srb, us);
+ 
+ 		/* let's clean up right away */
++		memcpy(srb->sense_buffer, us->sensebuf, US_SENSE_SIZE);
+ 		srb->resid = old_resid;
+ 		srb->request_buffer = old_request_buffer;
+ 		srb->request_bufflen = old_request_bufflen;
+--- gregkh-2.6.orig/drivers/usb/storage/usb.c
++++ gregkh-2.6/drivers/usb/storage/usb.c
+@@ -415,6 +415,12 @@ static int associate_dev(struct us_data 
+ 		US_DEBUGP("I/O buffer allocation failed\n");
+ 		return -ENOMEM;
+ 	}
++
++	us->sensebuf = kmalloc(US_SENSE_SIZE, GFP_KERNEL);
++	if (!us->sensebuf) {
++		US_DEBUGP("Sense buffer allocation failed\n");
++		return -ENOMEM;
++	}
+ 	return 0;
+ }
+ 
+@@ -754,6 +760,8 @@ static void dissociate_dev(struct us_dat
+ {
+ 	US_DEBUGP("-- %s\n", __FUNCTION__);
+ 
++	kfree(us->sensebuf);
++
+ 	/* Free the device-related DMA-mapped buffers */
+ 	if (us->cr)
+ 		usb_buffer_free(us->pusb_dev, sizeof(*us->cr), us->cr,
