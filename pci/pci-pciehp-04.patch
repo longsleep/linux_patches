@@ -1,0 +1,487 @@
+From owner-linux-pci@atrey.karlin.mff.cuni.cz Mon Oct 31 16:31:25 2005
+Message-Id: <20051101002123.615058591@csdlinux-2.jf.intel.com>
+Date: Mon, 31 Oct 2005 16:20:09 -0800
+From: rajesh.shah@intel.com
+To: kristen.c.accardi@intel.com, gregkh@suse.de
+Cc: akpm@osdl.org, rajesh.shah@intel.com
+Subject: [patch 4/8] pciehp: miscellaneous cleanups
+Content-Disposition: inline; filename=pciehp-misc-cleanups
+
+Remove un-necessary header includes, remove dead code, remove
+some hardcoded constants...
+
+Signed-off-by: Rajesh Shah <rajesh.shah@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+ drivers/pci/hotplug/pciehp.h           |   44 ++++++++++++-------------
+ drivers/pci/hotplug/pciehp_core.c      |   14 --------
+ drivers/pci/hotplug/pciehp_ctrl.c      |   56 +++++++--------------------------
+ drivers/pci/hotplug/pciehp_hpc.c       |   38 ++--------------------
+ drivers/pci/hotplug/pciehp_pci.c       |    4 --
+ drivers/pci/hotplug/pciehprm_acpi.c    |    6 ---
+ drivers/pci/hotplug/pciehprm_nonacpi.c |   12 -------
+ 7 files changed, 41 insertions(+), 133 deletions(-)
+
+--- gregkh-2.6.orig/drivers/pci/hotplug/pciehp.h	2005-11-02 10:57:13.000000000 -0800
++++ gregkh-2.6/drivers/pci/hotplug/pciehp.h	2005-11-02 10:57:16.000000000 -0800
+@@ -32,8 +32,6 @@
+ #include <linux/types.h>
+ #include <linux/pci.h>
+ #include <linux/delay.h>
+-#include <asm/semaphore.h>
+-#include <asm/io.h>		
+ #include <linux/pcieport_if.h>
+ #include "pci_hotplug.h"
+ 
+@@ -62,13 +60,7 @@
+ 	u8 device;
+ 	u16 status;
+ 	u32 number;
+-	u8 is_a_board;
+-	u8 configured;
+ 	u8 state;
+-	u8 switch_save;
+-	u8 presence_save;
+-	u32 capabilities;
+-	u16 reserved2;
+ 	struct timer_list task_event;
+ 	u8 hp_slot;
+ 	struct controller *ctrl;
+@@ -82,27 +74,42 @@
+ 	u8 hp_slot;
+ };
+ 
++typedef u8(*php_intr_callback_t) (u8 hp_slot, void *instance_id);
++
++struct php_ctlr_state_s {
++	struct php_ctlr_state_s *pnext;
++	struct pci_dev *pci_dev;
++	unsigned int irq;
++	unsigned long flags;				/* spinlock's */
++	u32 slot_device_offset;
++	u32 num_slots;
++    	struct timer_list	int_poll_timer;		/* Added for poll event */
++	php_intr_callback_t 	attention_button_callback;
++	php_intr_callback_t 	switch_change_callback;
++	php_intr_callback_t 	presence_change_callback;
++	php_intr_callback_t 	power_fault_callback;
++	void 			*callback_instance_id;
++	struct ctrl_reg 	*creg;				/* Ptr to controller register space */
++};
++
++#define MAX_EVENTS		10
+ struct controller {
+ 	struct controller *next;
+ 	struct semaphore crit_sect;	/* critical section semaphore */
+-	void *hpc_ctlr_handle;		/* HPC controller handle */
++	struct php_ctlr_state_s *hpc_ctlr_handle; /* HPC controller handle */
+ 	int num_slots;			/* Number of slots on ctlr */
+ 	int slot_num_inc;		/* 1 or -1 */
+ 	struct pci_dev *pci_dev;
+ 	struct pci_bus *pci_bus;
+-	struct event_info event_queue[10];
++	struct event_info event_queue[MAX_EVENTS];
+ 	struct slot *slot;
+ 	struct hpc_ops *hpc_ops;
+ 	wait_queue_head_t queue;	/* sleep & wake process */
+ 	u8 next_event;
+-	u8 seg;
+ 	u8 bus;
+ 	u8 device;
+ 	u8 function;
+-	u8 rev;
+ 	u8 slot_device_offset;
+-	u8 add_support;
+-	enum pci_bus_speed speed;
+ 	u32 first_slot;		/* First physical slot number */  /* PCIE only has 1 slot */
+ 	u8 slot_bus;		/* Bus where the slots handled by this controller sit */
+ 	u8 ctrlcap;
+@@ -250,14 +257,7 @@
+ 	ACPI
+ };
+ 
+-typedef u8(*php_intr_callback_t) (unsigned int change_id, void *instance_id);
+-
+-int pcie_init(struct controller *ctrl, struct pcie_device *dev,
+-		php_intr_callback_t attention_button_callback,
+-		php_intr_callback_t switch_change_callback,
+-		php_intr_callback_t presence_change_callback,
+-		php_intr_callback_t power_fault_callback);
+-
++int pcie_init(struct controller *ctrl, struct pcie_device *dev);
+ 
+ /* This has no meaning for PCI Express, as there is only 1 slot per port */
+ int pcie_get_ctlr_slot_config(struct controller *ctrl,
+--- gregkh-2.6.orig/drivers/pci/hotplug/pciehp_core.c	2005-11-02 10:57:13.000000000 -0800
++++ gregkh-2.6/drivers/pci/hotplug/pciehp_core.c	2005-11-02 10:57:16.000000000 -0800
+@@ -27,17 +27,11 @@
+  *
+  */
+ 
+-#include <linux/config.h>
+ #include <linux/module.h>
+ #include <linux/moduleparam.h>
+ #include <linux/kernel.h>
+ #include <linux/types.h>
+-#include <linux/proc_fs.h>
+-#include <linux/slab.h>
+-#include <linux/workqueue.h>
+ #include <linux/pci.h>
+-#include <linux/init.h>
+-#include <asm/uaccess.h>
+ #include "pciehp.h"
+ #include <linux/interrupt.h>
+ 
+@@ -381,11 +375,7 @@
+ 	pdev = dev->port;
+ 	ctrl->pci_dev = pdev;
+ 
+-	rc = pcie_init(ctrl, dev,
+-		(php_intr_callback_t) pciehp_handle_attention_button,
+-		(php_intr_callback_t) pciehp_handle_switch_change,
+-		(php_intr_callback_t) pciehp_handle_presence_change,
+-		(php_intr_callback_t) pciehp_handle_power_fault);
++	rc = pcie_init(ctrl, dev);
+ 	if (rc) {
+ 		dbg("%s: controller initialization failed\n", PCIE_MODULE_NAME);
+ 		goto err_out_free_ctrl;
+@@ -421,8 +411,6 @@
+ 	first_device_num = ctrl->slot_device_offset;
+ 	num_ctlr_slots = ctrl->num_slots; 
+ 
+-	ctrl->add_support = 1;
+-	
+ 	/* Setup the slot information structures */
+ 	rc = init_slots(ctrl);
+ 	if (rc) {
+--- gregkh-2.6.orig/drivers/pci/hotplug/pciehp_ctrl.c	2005-11-02 10:57:13.000000000 -0800
++++ gregkh-2.6/drivers/pci/hotplug/pciehp_ctrl.c	2005-11-02 10:57:16.000000000 -0800
+@@ -27,15 +27,9 @@
+  *
+  */
+ 
+-#include <linux/config.h>
+ #include <linux/module.h>
+ #include <linux/kernel.h>
+ #include <linux/types.h>
+-#include <linux/slab.h>
+-#include <linux/workqueue.h>
+-#include <linux/interrupt.h>
+-#include <linux/delay.h>
+-#include <linux/wait.h>
+ #include <linux/smp_lock.h>
+ #include <linux/pci.h>
+ #include "../pci.h"
+@@ -64,10 +58,9 @@
+ 	taskInfo = &(ctrl->event_queue[ctrl->next_event]);
+ 	p_slot = pciehp_find_slot(ctrl, hp_slot + ctrl->slot_device_offset);
+ 
+-	p_slot->hpc_ops->get_adapter_status(p_slot, &(p_slot->presence_save));
+ 	p_slot->hpc_ops->get_latch_status(p_slot, &getstatus);
+ 	
+-	ctrl->next_event = (ctrl->next_event + 1) % 10;
++	ctrl->next_event = (ctrl->next_event + 1) % MAX_EVENTS;
+ 	taskInfo->hp_slot = hp_slot;
+ 
+ 	rc++;
+@@ -118,12 +111,11 @@
+ 	 * what to do
+ 	 */
+ 	taskInfo = &(ctrl->event_queue[ctrl->next_event]);
+-	ctrl->next_event = (ctrl->next_event + 1) % 10;
++	ctrl->next_event = (ctrl->next_event + 1) % MAX_EVENTS;
+ 	taskInfo->hp_slot = hp_slot;
+ 
+ 	rc++;
+ 	p_slot = pciehp_find_slot(ctrl, hp_slot + ctrl->slot_device_offset);
+-	p_slot->hpc_ops->get_adapter_status(p_slot, &(p_slot->presence_save));
+ 	p_slot->hpc_ops->get_latch_status(p_slot, &getstatus);
+ 
+ 	if (getstatus) {
+@@ -131,14 +123,12 @@
+ 		 * Switch opened
+ 		 */
+ 		info("Latch open on Slot(%d)\n", ctrl->first_slot + hp_slot);
+-		p_slot->switch_save = 0;
+ 		taskInfo->event_type = INT_SWITCH_OPEN;
+ 	} else {
+ 		/*
+ 		 *  Switch closed
+ 		 */
+ 		info("Latch close on Slot(%d)\n", ctrl->first_slot + hp_slot);
+-		p_slot->switch_save = 0x10;
+ 		taskInfo->event_type = INT_SWITCH_CLOSE;
+ 	}
+ 
+@@ -152,7 +142,7 @@
+ {
+ 	struct controller *ctrl = (struct controller *) inst_id;
+ 	struct slot *p_slot;
+-	u8 rc = 0;
++	u8 presence_save, rc = 0;
+ 	struct event_info *taskInfo;
+ 
+ 	/* Presence Change */
+@@ -162,7 +152,7 @@
+ 	 * what to do
+ 	 */
+ 	taskInfo = &(ctrl->event_queue[ctrl->next_event]);
+-	ctrl->next_event = (ctrl->next_event + 1) % 10;
++	ctrl->next_event = (ctrl->next_event + 1) % MAX_EVENTS;
+ 	taskInfo->hp_slot = hp_slot;
+ 
+ 	rc++;
+@@ -171,8 +161,8 @@
+ 	/* Switch is open, assume a presence change
+ 	 * Save the presence state
+ 	 */
+-	p_slot->hpc_ops->get_adapter_status(p_slot, &(p_slot->presence_save));
+-	if (p_slot->presence_save) {
++	p_slot->hpc_ops->get_adapter_status(p_slot, &presence_save);
++	if (presence_save) {
+ 		/*
+ 		 * Card Present
+ 		 */
+@@ -206,7 +196,7 @@
+ 	 * what to do
+ 	 */
+ 	taskInfo = &(ctrl->event_queue[ctrl->next_event]);
+-	ctrl->next_event = (ctrl->next_event + 1) % 10;
++	ctrl->next_event = (ctrl->next_event + 1) % MAX_EVENTS;
+ 	taskInfo->hp_slot = hp_slot;
+ 
+ 	rc++;
+@@ -279,11 +269,10 @@
+  * Configures board
+  *
+  */
+-static u32 board_added(struct slot *p_slot)
++static int board_added(struct slot *p_slot)
+ {
+ 	u8 hp_slot;
+-	u32 temp_register = 0xFFFFFFFF;
+-	u32 rc = 0;
++	int rc = 0;
+ 	struct controller *ctrl = p_slot->ctrl;
+ 
+ 	hp_slot = p_slot->device - ctrl->slot_device_offset;
+@@ -333,8 +322,6 @@
+ 	/* Check for a power fault */
+ 	if (p_slot->status == 0xFF) {
+ 		/* power fault occurred, but it was benign */
+-		temp_register = 0xFFFFFFFF;
+-		dbg("%s: temp register set to %x by power fault\n", __FUNCTION__, temp_register);
+ 		rc = POWER_FAILURE;
+ 		p_slot->status = 0;
+ 		goto err_exit;
+@@ -348,8 +335,6 @@
+ 	}
+ 
+ 	p_slot->status = 0;
+-	p_slot->switch_save = 0x10;
+-	p_slot->is_a_board = 0x01;
+ 
+ 	/*
+ 	 * Some PCI Express root ports require fixup after hot-plug operation.
+@@ -380,11 +365,11 @@
+  * remove_board - Turns off slot and LED's
+  *
+  */
+-static u32 remove_board(struct slot *p_slot)
++static int remove_board(struct slot *p_slot)
+ {
+ 	u8 device;
+ 	u8 hp_slot;
+-	u32 rc;
++	int rc;
+ 	struct controller *ctrl = p_slot->ctrl;
+ 
+ 	if (pciehp_unconfigure_device(p_slot))
+@@ -398,9 +383,7 @@
+ 	dbg("In %s, hp_slot = %d\n", __FUNCTION__, hp_slot);
+ 
+ 	/* Change status to shutdown */
+-	if (p_slot->is_a_board)
+-		p_slot->status = 0x01;
+-	p_slot->configured = 0;
++	p_slot->status = 0x01;
+ 
+ 	/* Wait for exclusive access to hardware */
+ 	down(&ctrl->crit_sect);
+@@ -428,9 +411,6 @@
+ 	/* Done with exclusive hardware access */
+ 	up(&ctrl->crit_sect);
+ 
+-	p_slot->switch_save = 0x10;
+-	p_slot->is_a_board = 0;
+-
+ 	return 0;
+ }
+ 
+@@ -633,7 +613,7 @@
+ 	while (change) {
+ 		change = 0;
+ 
+-		for (loop = 0; loop < 10; loop++) {
++		for (loop = 0; loop < MAX_EVENTS; loop++) {
+ 			if (ctrl->event_queue[loop].event_type != 0) {
+ 				hp_slot = ctrl->event_queue[loop].hp_slot;
+ 
+@@ -816,21 +796,11 @@
+ 	}
+ 	up(&p_slot->ctrl->crit_sect);
+ 
+-	p_slot->configured = 0;
+-	p_slot->is_a_board = 1;
+-
+-	/* We have to save the presence info for these slots */
+-	p_slot->hpc_ops->get_adapter_status(p_slot, &(p_slot->presence_save));
+ 	p_slot->hpc_ops->get_latch_status(p_slot, &getstatus);
+-	p_slot->switch_save = !getstatus? 0x10:0;
+ 
+ 	rc = board_added(p_slot);
+ 	if (rc) {
+-		/* We have to save the presence info for these slots */
+-		p_slot->hpc_ops->get_adapter_status(p_slot,
+-				&(p_slot->presence_save));
+ 		p_slot->hpc_ops->get_latch_status(p_slot, &getstatus);
+-		p_slot->switch_save = !getstatus? 0x10:0;
+ 	}
+ 
+ 	if (p_slot)
+--- gregkh-2.6.orig/drivers/pci/hotplug/pciehp_hpc.c	2005-11-02 10:57:10.000000000 -0800
++++ gregkh-2.6/drivers/pci/hotplug/pciehp_hpc.c	2005-11-02 10:57:16.000000000 -0800
+@@ -27,16 +27,10 @@
+  *
+  */
+ 
+-#include <linux/config.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/types.h>
+-#include <linux/slab.h>
+-#include <linux/vmalloc.h>
+-#include <linux/interrupt.h>
+-#include <linux/spinlock.h>
+ #include <linux/pci.h>
+-#include <asm/system.h>
+ #include "../pci.h"
+ #include "pciehp.h"
+ 
+@@ -217,23 +211,6 @@
+ #define MRL_STATE		0x0020
+ #define PRSN_STATE		0x0040
+ 
+-struct php_ctlr_state_s {
+-	struct php_ctlr_state_s *pnext;
+-	struct pci_dev *pci_dev;
+-	unsigned int irq;
+-	unsigned long flags;				/* spinlock's */
+-	u32 slot_device_offset;
+-	u32 num_slots;
+-    	struct timer_list	int_poll_timer;		/* Added for poll event */
+-	php_intr_callback_t 	attention_button_callback;
+-	php_intr_callback_t 	switch_change_callback;
+-	php_intr_callback_t 	presence_change_callback;
+-	php_intr_callback_t 	power_fault_callback;
+-	void 			*callback_instance_id;
+-	struct ctrl_reg 	*creg;				/* Ptr to controller register space */
+-};
+-
+-
+ static spinlock_t hpc_event_lock;
+ 
+ DEFINE_DBG_BUFFER		/* Debug string buffer for entire HPC defined here */
+@@ -1248,12 +1225,7 @@
+ 	.check_lnk_status		= hpc_check_lnk_status,
+ };
+ 
+-int pcie_init(struct controller * ctrl,
+-	struct pcie_device *dev,
+-	php_intr_callback_t attention_button_callback,
+-	php_intr_callback_t switch_change_callback,
+-	php_intr_callback_t presence_change_callback,
+-	php_intr_callback_t power_fault_callback)
++int pcie_init(struct controller * ctrl, struct pcie_device *dev)
+ {
+ 	struct php_ctlr_state_s *php_ctlr, *p;
+ 	void *instance_id = ctrl;
+@@ -1362,10 +1334,10 @@
+ 	dbg("HPC interrupt = %d\n", php_ctlr->irq);
+ 
+ 	/* Save interrupt callback info */
+-	php_ctlr->attention_button_callback = attention_button_callback;
+-	php_ctlr->switch_change_callback = switch_change_callback;
+-	php_ctlr->presence_change_callback = presence_change_callback;
+-	php_ctlr->power_fault_callback = power_fault_callback;
++	php_ctlr->attention_button_callback = pciehp_handle_attention_button;
++	php_ctlr->switch_change_callback = pciehp_handle_switch_change;
++	php_ctlr->presence_change_callback = pciehp_handle_presence_change;
++	php_ctlr->power_fault_callback = pciehp_handle_power_fault;
+ 	php_ctlr->callback_instance_id = instance_id;
+ 
+ 	/* return PCI Controller Info */
+--- gregkh-2.6.orig/drivers/pci/hotplug/pciehp_pci.c	2005-11-02 10:57:13.000000000 -0800
++++ gregkh-2.6/drivers/pci/hotplug/pciehp_pci.c	2005-11-02 10:57:16.000000000 -0800
+@@ -27,13 +27,9 @@
+  *
+  */
+ 
+-#include <linux/config.h>
+ #include <linux/module.h>
+ #include <linux/kernel.h>
+ #include <linux/types.h>
+-#include <linux/slab.h>
+-#include <linux/workqueue.h>
+-#include <linux/proc_fs.h>
+ #include <linux/pci.h>
+ #include "../pci.h"
+ #include "pciehp.h"
+--- gregkh-2.6.orig/drivers/pci/hotplug/pciehprm_acpi.c	2005-11-02 10:57:10.000000000 -0800
++++ gregkh-2.6/drivers/pci/hotplug/pciehprm_acpi.c	2005-11-02 10:57:16.000000000 -0800
+@@ -24,18 +24,12 @@
+  *
+  */
+ 
+-#include <linux/config.h>
+ #include <linux/module.h>
+ #include <linux/kernel.h>
+ #include <linux/types.h>
+ #include <linux/pci.h>
+-#include <linux/init.h>
+ #include <linux/acpi.h>
+-#include <linux/efi.h>
+ #include <linux/pci-acpi.h>
+-#include <asm/uaccess.h>
+-#include <asm/system.h>
+-#include <acpi/acpi.h>
+ #include <acpi/acpi_bus.h>
+ #include <acpi/actypes.h>
+ #include "pciehp.h"
+--- gregkh-2.6.orig/drivers/pci/hotplug/pciehprm_nonacpi.c	2005-11-02 10:57:10.000000000 -0800
++++ gregkh-2.6/drivers/pci/hotplug/pciehprm_nonacpi.c	2005-11-02 10:58:13.000000000 -0800
+@@ -27,24 +27,12 @@
+  *
+  */
+ 
+-#include <linux/config.h>
+ #include <linux/module.h>
+ #include <linux/kernel.h>
+ #include <linux/types.h>
+ #include <linux/pci.h>
+-#include <linux/init.h>
+ #include <linux/slab.h>
+-#include <asm/uaccess.h>
+ #include "pciehp.h"
+-#include "pciehprm_nonacpi.h"
+-
+-
+-int pciehprm_get_physical_slot_number(struct controller *ctrl, u32 *sun, u8 busnum, u8 devnum)
+-{
+-
+-	*sun = (u8) (ctrl->first_slot);
+-	return 0;
+-}
+ 
+ void get_hp_params_from_firmware(struct pci_dev *dev,
+ 		struct hotplug_params *hpp)
