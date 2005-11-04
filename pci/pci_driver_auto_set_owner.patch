@@ -1,0 +1,148 @@
+From laurent.riffard@free.fr Thu Oct 27 15:43:36 2005
+Message-Id: <20051027211253.457180000@antares.localdomain>
+Date: Thu, 27 Oct 2005 23:12:54 +0200
+From: Laurent riffard <laurent.riffard@free.fr>
+To: Al Viro <viro@ftp.linux.org.uk>, Greg KH <greg@kroah.com>
+Subject: PCI: automatically set device_driver.owner
+Content-Disposition: inline; filename=pci_driver_auto_set_owner.patch
+
+A nice feature of sysfs is that it can create the symlink from the
+driver to the module that is contained in it.
+
+It requires that the device_driver.owner is set, what is not the
+case for many PCI drivers.
+
+This patch allows pci_register_driver to set automatically the
+device_driver.owner for any PCI driver.
+
+Credits to Al Viro who suggested the method.
+
+Signed-off-by: Laurent Riffard <laurent.riffard@free.fr>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+--
+
+ drivers/ide/setup-pci.c  |   12 +++++++-----
+ drivers/pci/pci-driver.c |    9 +++++----
+ include/linux/ide.h      |    3 ++-
+ include/linux/pci.h      |   10 ++++++++--
+ 4 files changed, 22 insertions(+), 12 deletions(-)
+
+---
+--- gregkh-2.6.orig/include/linux/pci.h
++++ gregkh-2.6/include/linux/pci.h
+@@ -433,8 +433,13 @@ int pci_bus_alloc_resource(struct pci_bu
+ 			   void *alignf_data);
+ void pci_enable_bridges(struct pci_bus *bus);
+ 
+-/* New-style probing supporting hot-pluggable devices */
+-int pci_register_driver(struct pci_driver *);
++/* Proper probing supporting hot-pluggable devices */
++int __pci_register_driver(struct pci_driver *, struct module *);
++static inline int pci_register_driver(struct pci_driver *driver)
++{
++	return __pci_register_driver(driver, THIS_MODULE);
++}
++
+ void pci_unregister_driver(struct pci_driver *);
+ void pci_remove_behind_bridge(struct pci_dev *);
+ struct pci_driver *pci_dev_driver(const struct pci_dev *);
+@@ -548,6 +553,7 @@ static inline int pci_enable_device(stru
+ static inline void pci_disable_device(struct pci_dev *dev) { }
+ static inline int pci_set_dma_mask(struct pci_dev *dev, u64 mask) { return -EIO; }
+ static inline int pci_assign_resource(struct pci_dev *dev, int i) { return -EBUSY;}
++static inline int __pci_register_driver(struct pci_driver *drv, struct module *owner) { return 0;}
+ static inline int pci_register_driver(struct pci_driver *drv) { return 0;}
+ static inline void pci_unregister_driver(struct pci_driver *drv) { }
+ static inline int pci_find_capability (struct pci_dev *dev, int cap) {return 0; }
+--- gregkh-2.6.orig/drivers/pci/pci-driver.c
++++ gregkh-2.6/drivers/pci/pci-driver.c
+@@ -363,15 +363,16 @@ static struct kobj_type pci_driver_kobj_
+ };
+ 
+ /**
+- * pci_register_driver - register a new pci driver
++ * __pci_register_driver - register a new pci driver
+  * @drv: the driver structure to register
++ * @owner: owner module of drv
+  * 
+  * Adds the driver structure to the list of registered drivers.
+  * Returns a negative value on error, otherwise 0. 
+  * If no error occurred, the driver remains registered even if 
+  * no device was claimed during registration.
+  */
+-int pci_register_driver(struct pci_driver *drv)
++int __pci_register_driver(struct pci_driver *drv, struct module *owner)
+ {
+ 	int error;
+ 
+@@ -388,7 +389,7 @@ int pci_register_driver(struct pci_drive
+ 		printk(KERN_WARNING "Warning: PCI driver %s has a struct "
+ 			"device_driver shutdown method, please update!\n",
+ 			drv->name);
+-	drv->driver.owner = drv->owner;
++	drv->driver.owner = owner;
+ 	drv->driver.kobj.ktype = &pci_driver_kobj_type;
+ 
+ 	spin_lock_init(&drv->dynids.lock);
+@@ -525,7 +526,7 @@ postcore_initcall(pci_driver_init);
+ 
+ EXPORT_SYMBOL(pci_match_id);
+ EXPORT_SYMBOL(pci_match_device);
+-EXPORT_SYMBOL(pci_register_driver);
++EXPORT_SYMBOL(__pci_register_driver);
+ EXPORT_SYMBOL(pci_unregister_driver);
+ EXPORT_SYMBOL(pci_dev_driver);
+ EXPORT_SYMBOL(pci_bus_type);
+--- gregkh-2.6.orig/drivers/ide/setup-pci.c
++++ gregkh-2.6/drivers/ide/setup-pci.c
+@@ -787,8 +787,9 @@ static int pre_init = 1;		/* Before firs
+ static LIST_HEAD(ide_pci_drivers);
+ 
+ /*
+- *	ide_register_pci_driver		-	attach IDE driver
++ *	__ide_register_pci_driver	-	attach IDE driver
+  *	@driver: pci driver
++ *	@module: owner module of the driver
+  *
+  *	Registers a driver with the IDE layer. The IDE layer arranges that
+  *	boot time setup is done in the expected device order and then 
+@@ -801,15 +802,16 @@ static LIST_HEAD(ide_pci_drivers);
+  *	Returns are the same as for pci_register_driver
+  */
+ 
+-int ide_pci_register_driver(struct pci_driver *driver)
++int __ide_pci_register_driver(struct pci_driver *driver, struct module *module)
+ {
+ 	if(!pre_init)
+-		return pci_module_init(driver);
++		return __pci_register_driver(driver, module);
++	driver->driver.owner = module;
+ 	list_add_tail(&driver->node, &ide_pci_drivers);
+ 	return 0;
+ }
+ 
+-EXPORT_SYMBOL_GPL(ide_pci_register_driver);
++EXPORT_SYMBOL_GPL(__ide_pci_register_driver);
+ 
+ /**
+  *	ide_unregister_pci_driver	-	unregister an IDE driver
+@@ -897,6 +899,6 @@ void __init ide_scan_pcibus (int scan_di
+ 	{
+ 		list_del(l);
+ 		d = list_entry(l, struct pci_driver, node);
+-		pci_register_driver(d);
++		__pci_register_driver(d, d->driver.owner);
+ 	}
+ }
+--- gregkh-2.6.orig/include/linux/ide.h
++++ gregkh-2.6/include/linux/ide.h
+@@ -1323,7 +1323,8 @@ void ide_init_disk(struct gendisk *, ide
+ extern int ideprobe_init(void);
+ 
+ extern void ide_scan_pcibus(int scan_direction) __init;
+-extern int ide_pci_register_driver(struct pci_driver *driver);
++extern int __ide_pci_register_driver(struct pci_driver *driver, struct module *owner);
++#define ide_pci_register_driver(d) __ide_pci_register_driver(d, THIS_MODULE)
+ extern void ide_pci_unregister_driver(struct pci_driver *driver);
+ void ide_pci_setup_ports(struct pci_dev *, struct ide_pci_device_s *, int, ata_index_t *);
+ extern void ide_setup_pci_noise (struct pci_dev *dev, struct ide_pci_device_s *d);
