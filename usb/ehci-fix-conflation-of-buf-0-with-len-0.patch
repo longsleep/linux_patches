@@ -1,0 +1,63 @@
+From linux-usb-devel-admin@lists.sourceforge.net Thu Nov  3 08:50:40 2005
+From: Alan Stern <stern@rowland.harvard.edu>
+To: David Brownell <david-b@pacbell.net>
+Message-ID: <Pine.LNX.4.44L0.0511031054300.5056-100000@iolanthe.rowland.org>
+Subject: EHCI: fix conflation of buf == 0 with len == 0
+Date: Thu, 3 Nov 2005 11:44:49 -0500 (EST)
+
+When the ehci-hcd driver prepares a control URB, it tests for a
+zero-length data stage by looking at the transfer_dma value instead of
+the transfer_buffer_length.  (In fact it does this even for non-control
+URBs, which is an additional aspect of the same bug.)
+
+However, under certain circumstances it's possible for transfer_dma to
+be 0 while transfer_buffer_length is non-zero.  This can happen when a
+freshly allocated page (mapped to address 0 and marked Copy-On-Write,
+but never written to) is used as the source buffer for an OUT transfer.
+This patch (as598) fixes the problem.
+
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/ehci-q.c |   14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/host/ehci-q.c
++++ gregkh-2.6/drivers/usb/host/ehci-q.c
+@@ -514,18 +514,18 @@ qh_urb_transaction (
+ 		qtd->urb = urb;
+ 		qtd_prev->hw_next = QTD_NEXT (qtd->qtd_dma);
+ 		list_add_tail (&qtd->qtd_list, head);
++
++		/* for zero length DATA stages, STATUS is always IN */
++		if (len == 0)
++			token |= (1 /* "in" */ << 8);
+ 	} 
+ 
+ 	/*
+ 	 * data transfer stage:  buffer setup
+ 	 */
+-	if (likely (len > 0))
+-		buf = urb->transfer_dma;
+-	else
+-		buf = 0;
++	buf = urb->transfer_dma;
+ 
+-	/* for zero length DATA stages, STATUS is always IN */
+-	if (!buf || is_input)
++	if (is_input)
+ 		token |= (1 /* "in" */ << 8);
+ 	/* else it's already initted to "out" pid (0 << 8) */
+ 
+@@ -572,7 +572,7 @@ qh_urb_transaction (
+ 	 * control requests may need a terminating data "status" ack;
+ 	 * bulk ones may need a terminating short packet (zero length).
+ 	 */
+-	if (likely (buf != 0)) {
++	if (likely (urb->transfer_buffer_length != 0)) {
+ 		int	one_more = 0;
+ 
+ 		if (usb_pipecontrol (urb->pipe)) {
