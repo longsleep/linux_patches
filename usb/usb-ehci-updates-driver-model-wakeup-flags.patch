@@ -1,0 +1,74 @@
+From david-b@pacbell.net Mon Nov  7 15:26:37 2005
+Message-ID: <20051107232446.79146.qmail@web80724.mail.yahoo.com>
+Date: Mon, 7 Nov 2005 15:24:46 -0800 (PST)
+From: David Brownell <david-b@pacbell.net>
+Subject: USB: EHCI updates (4/4) driver model wakeup flags
+To: greg@kroah.com
+
+
+This teaches the EHCI driver to use the new driver model wakeup flags,
+replacing the similar ones in the HCD glue.  It also adds a workaround
+for the current glitch whereby PCI init doesn't init the wakeup flags
+from the PCI PM capabilities.  (EHCI controllers don't worry about
+legacy mode; the PCI PM capability would always do the job.)
+
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/ehci-hcd.c |    2 +-
+ drivers/usb/host/ehci-hub.c |    4 ++--
+ drivers/usb/host/ehci-pci.c |   11 ++++++++++-
+ 3 files changed, 13 insertions(+), 4 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/host/ehci-hcd.c
++++ gregkh-2.6/drivers/usb/host/ehci-hcd.c
+@@ -624,7 +624,7 @@ static irqreturn_t ehci_irq (struct usb_
+ 	}
+ 
+ 	/* remote wakeup [4.3.1] */
+-	if ((status & STS_PCD) && hcd->remote_wakeup) {
++	if ((status & STS_PCD) && device_may_wakeup(&hcd->self.root_hub->dev)) {
+ 		unsigned	i = HCS_N_PORTS (ehci->hcs_params);
+ 
+ 		/* resume root hub? */
+--- gregkh-2.6.orig/drivers/usb/host/ehci-hub.c
++++ gregkh-2.6/drivers/usb/host/ehci-hub.c
+@@ -59,7 +59,7 @@ static int ehci_bus_suspend (struct usb_
+ 
+ 		if ((t1 & PORT_PE) && !(t1 & PORT_OWNER))
+ 			t2 |= PORT_SUSPEND;
+-		if (hcd->remote_wakeup)
++		if (device_may_wakeup(&hcd->self.root_hub->dev))
+ 			t2 |= PORT_WKOC_E|PORT_WKDISC_E|PORT_WKCONN_E;
+ 		else
+ 			t2 &= ~(PORT_WKOC_E|PORT_WKDISC_E|PORT_WKCONN_E);
+@@ -517,7 +517,7 @@ static int ehci_hub_control (
+ 			if ((temp & PORT_PE) == 0
+ 					|| (temp & PORT_RESET) != 0)
+ 				goto error;
+-			if (hcd->remote_wakeup)
++			if (device_may_wakeup(&hcd->self.root_hub->dev))
+ 				temp |= PORT_WAKE_BITS;
+ 			writel (temp | PORT_SUSPEND,
+ 				&ehci->regs->port_status [wIndex]);
+--- gregkh-2.6.orig/drivers/usb/host/ehci-pci.c
++++ gregkh-2.6/drivers/usb/host/ehci-pci.c
+@@ -204,7 +204,16 @@ static int ehci_pci_reset(struct usb_hcd
+ 	/* Serial Bus Release Number is at PCI 0x60 offset */
+ 	pci_read_config_byte(pdev, 0x60, &ehci->sbrn);
+ 
+-	/* REVISIT:  per-port wake capability (PCI 0x62) currently unused */
++	/* Workaround current PCI init glitch:  wakeup bits aren't
++	 * being set from PCI PM capability.
++	 */
++	if (!device_can_wakeup(&pdev->dev)) {
++		u16	port_wake;
++
++		pci_read_config_word(pdev, 0x62, &port_wake);
++		if (port_wake & 0x0001)
++			device_init_wakeup(&pdev->dev, 1);
++	}
+ 
+ 	retval = ehci_pci_reinit(ehci, pdev);
+ 
