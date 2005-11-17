@@ -1,13 +1,34 @@
+From foo@baz.org Wed Nov 16 13:31:19 2005
+Date: Wed, 16 Nov 2005 13:41:28 -0800
+From: Greg Kroah-Hartman <gregkh@suse.de>
+Subject: USB: add dynamic id functionality to USB core
+
+Echo the usb vendor and product id to the "new_id" file in the driver's
+sysfs directory, and then that driver will be able to bind to a device
+with those ids if it is present.
+
+
+Example:
+	echo 0557 2008 > /sys/bus/usb/drivers/foo_driver/new_id
+adds the hex values 0557 and 2008 to the device id table for the foo_driver.
+
+
+Note, usb-serial drivers do not currently work with this capability yet.
+usb-storage also might have some oddities.
+
+
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
 ---
- drivers/usb/core/driver.c |  149 ++++++++++++++++++++++++++++++----------------
- drivers/usb/core/usb.c    |    2 
- include/linux/usb.h       |    8 ++
- 3 files changed, 108 insertions(+), 51 deletions(-)
+ drivers/usb/core/driver.c |  218 +++++++++++++++++++++++++++++++++++-----------
+ include/linux/usb.h       |    8 +
+ 2 files changed, 176 insertions(+), 50 deletions(-)
 
 --- gregkh-2.6.orig/drivers/usb/core/driver.c
 +++ gregkh-2.6/drivers/usb/core/driver.c
-@@ -26,6 +26,15 @@
- #include <linux/usb.h>
+@@ -27,6 +27,15 @@
+ #include "hcd.h"
  #include "usb.h"
  
 +static int usb_match_one_id(struct usb_interface *interface,
@@ -19,14 +40,86 @@
 +};
 +
 +
- static int generic_probe (struct device *dev)
+ static int generic_probe(struct device *dev)
  {
  	return 0;
-@@ -57,6 +66,31 @@ struct device_driver usb_generic_driver 
+@@ -58,6 +67,96 @@ struct device_driver usb_generic_driver 
   * usb device or a usb interface. */
  int usb_generic_driver_data;
  
 +#ifdef CONFIG_HOTPLUG
++
++/*
++ * Adds a new dynamic USBdevice ID to this driver,
++ * and cause the driver to probe for all devices again.
++ */
++static ssize_t store_new_id(struct device_driver *driver,
++			    const char *buf, size_t count)
++{
++	struct usb_driver *usb_drv = to_usb_driver(driver);
++	struct usb_dynid *dynid;
++	u32 idVendor = 0;
++	u32 idProduct = 0;
++	int fields = 0;
++
++	fields = sscanf(buf, "%x %x", &idVendor, &idProduct);
++	if (fields < 0)
++		return -EINVAL;
++
++	dynid = kzalloc(sizeof(*dynid), GFP_KERNEL);
++	if (!dynid)
++		return -ENOMEM;
++
++	INIT_LIST_HEAD(&dynid->node);
++	dynid->id.idVendor = idVendor;
++	dynid->id.idProduct = idProduct;
++	dynid->id.match_flags = USB_DEVICE_ID_MATCH_DEVICE;
++
++	spin_lock(&usb_drv->dynids.lock);
++	list_add_tail(&usb_drv->dynids.list, &dynid->node);
++	spin_unlock(&usb_drv->dynids.lock);
++
++	if (get_driver(&usb_drv->driver)) {
++		driver_attach(&usb_drv->driver);
++		put_driver(&usb_drv->driver);
++	}
++
++	return count;
++}
++static DRIVER_ATTR(new_id, S_IWUSR, NULL, store_new_id);
++
++static int usb_create_newid_file(struct usb_driver *usb_drv)
++{
++	int error = 0;
++
++	if (usb_drv->probe != NULL)
++		error = sysfs_create_file(&usb_drv->driver.kobj,
++					  &driver_attr_new_id.attr);
++	return error;
++}
++
++static void usb_free_dynids(struct usb_driver *usb_drv)
++{
++	struct usb_dynid *dynid, *n;
++
++	spin_lock(&usb_drv->dynids.lock);
++	list_for_each_entry_safe(dynid, n, &usb_drv->dynids.list, node) {
++		list_del(&dynid->node);
++		kfree(dynid);
++	}
++	spin_unlock(&usb_drv->dynids.lock);
++}
++#else
++static inline int usb_create_newid_file(struct usb_driver *usb_drv)
++{
++	return 0;
++}
++
++static inline void usb_free_dynids(struct usb_driver *usb_drv)
++{
++}
++#endif
++
 +static const struct usb_device_id *usb_match_dynamic_id(struct usb_interface *intf,
 +							struct usb_driver *drv)
 +{
@@ -42,19 +135,21 @@
 +	spin_unlock(&drv->dynids.lock);
 +	return NULL;
 +}
-+#else
-+static const struct usb_device_id *usb_match_dynamic_id(struct usb_interface *intf,
-+							struct usb_driver *drv)
-+{
-+	return NULL;
-+}
-+#endif
 +
 +
  /* called from driver core with usb_bus_type.subsys writelock */
- int usb_probe_interface(struct device *dev)
+ static int usb_probe_interface(struct device *dev)
  {
-@@ -119,6 +153,64 @@ int usb_unbind_interface(struct device *
+@@ -75,6 +174,8 @@ static int usb_probe_interface(struct de
+ 		return -EHOSTUNREACH;
+ 
+ 	id = usb_match_id(intf, driver->id_table);
++	if (!id)
++		id = usb_match_dynamic_id(intf, driver);
+ 	if (id) {
+ 		dev_dbg(dev, "%s - got id\n", __FUNCTION__);
+ 
+@@ -120,6 +221,64 @@ static int usb_unbind_interface(struct d
  	return 0;
  }
  
@@ -119,7 +214,7 @@
  /**
   * usb_match_id - find first usb_device_id matching device or interface
   * @interface: the interface of interest
-@@ -183,16 +275,10 @@ int usb_unbind_interface(struct device *
+@@ -184,16 +343,10 @@ static int usb_unbind_interface(struct d
  const struct usb_device_id *usb_match_id(struct usb_interface *interface,
  					 const struct usb_device_id *id)
  {
@@ -136,7 +231,7 @@
  	/* It is important to check that id->driver_info is nonzero,
  	   since an entry that is all zeroes except for a nonzero
  	   id->driver_info is the way to create an entry that
-@@ -200,55 +286,13 @@ const struct usb_device_id *usb_match_id
+@@ -201,50 +354,8 @@ const struct usb_device_id *usb_match_id
  	   device and interface. */
  	for (; id->idVendor || id->bDeviceClass || id->bInterfaceClass ||
  	       id->driver_info; id++) {
@@ -189,13 +284,7 @@
  	}
  
  	return NULL;
- }
--EXPORT_SYMBOL(usb_match_id);
-+EXPORT_SYMBOL_GPL(usb_match_id);
- 
- int usb_device_match (struct device *dev, struct device_driver *drv)
- {
-@@ -267,6 +311,9 @@ int usb_device_match (struct device *dev
+@@ -268,6 +379,9 @@ int usb_device_match(struct device *dev,
  	if (id)
  		return 1;
  
@@ -205,9 +294,7 @@
  	return 0;
  }
  
---- gregkh-2.6.orig/drivers/usb/core/usb.c
-+++ gregkh-2.6/drivers/usb/core/usb.c
-@@ -77,6 +77,8 @@ int usb_register(struct usb_driver *new_
+@@ -296,6 +410,8 @@ int usb_register(struct usb_driver *new_
  	new_driver->driver.probe = usb_probe_interface;
  	new_driver->driver.remove = usb_unbind_interface;
  	new_driver->driver.owner = new_driver->owner;
@@ -216,6 +303,22 @@
  
  	usb_lock_all_devices();
  	retval = driver_register(&new_driver->driver);
+@@ -305,6 +421,7 @@ int usb_register(struct usb_driver *new_
+ 		pr_info("%s: registered new driver %s\n",
+ 			usbcore_name, new_driver->name);
+ 		usbfs_update_special();
++		usb_create_newid_file(new_driver);
+ 	} else {
+ 		printk(KERN_ERR "%s: error %d registering driver %s\n",
+ 			usbcore_name, retval, new_driver->name);
+@@ -330,6 +447,7 @@ void usb_deregister(struct usb_driver *d
+ 	pr_info("%s: deregistering driver %s\n", usbcore_name, driver->name);
+ 
+ 	usb_lock_all_devices();
++	usb_free_dynids(driver);
+ 	driver_unregister(&driver->driver);
+ 	usb_unlock_all_devices();
+ 
 --- gregkh-2.6.orig/include/linux/usb.h
 +++ gregkh-2.6/include/linux/usb.h
 @@ -528,6 +528,11 @@ static inline int usb_make_path (struct 

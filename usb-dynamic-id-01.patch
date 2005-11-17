@@ -14,14 +14,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 ---
  Documentation/DocBook/usb.tmpl |    1 
  drivers/usb/core/Makefile      |    2 
- drivers/usb/core/driver.c      |  272 +++++++++++++++++++++++++++++++++++++++++
- drivers/usb/core/usb.c         |  244 ------------------------------------
- drivers/usb/core/usb.h         |    5 
- 5 files changed, 279 insertions(+), 245 deletions(-)
+ drivers/usb/core/driver.c      |  338 +++++++++++++++++++++++++++++++++++++++++
+ drivers/usb/core/usb.c         |  310 -------------------------------------
+ drivers/usb/core/usb.h         |    3 
+ 5 files changed, 343 insertions(+), 311 deletions(-)
 
 --- gregkh-2.6.orig/drivers/usb/core/usb.c
 +++ gregkh-2.6/drivers/usb/core/usb.c
-@@ -52,97 +52,6 @@ static int nousb;	/* Disable USB when bu
+@@ -52,161 +52,6 @@ static int nousb;	/* Disable USB when bu
  static DECLARE_RWSEM(usb_all_devices_rwsem);
  
  
@@ -116,10 +116,74 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -	return 0;
 -}
 -
+-/**
+- * usb_register - register a USB driver
+- * @new_driver: USB operations for the driver
+- *
+- * Registers a USB driver with the USB core.  The list of unattached
+- * interfaces will be rescanned whenever a new driver is added, allowing
+- * the new driver to attach to any recognized devices.
+- * Returns a negative error code on failure and 0 on success.
+- * 
+- * NOTE: if you want your driver to use the USB major number, you must call
+- * usb_register_dev() to enable that functionality.  This function no longer
+- * takes care of that.
+- */
+-int usb_register(struct usb_driver *new_driver)
+-{
+-	int retval = 0;
+-
+-	if (nousb)
+-		return -ENODEV;
+-
+-	new_driver->driver.name = (char *)new_driver->name;
+-	new_driver->driver.bus = &usb_bus_type;
+-	new_driver->driver.probe = usb_probe_interface;
+-	new_driver->driver.remove = usb_unbind_interface;
+-	new_driver->driver.owner = new_driver->owner;
+-
+-	usb_lock_all_devices();
+-	retval = driver_register(&new_driver->driver);
+-	usb_unlock_all_devices();
+-
+-	if (!retval) {
+-		pr_info("%s: registered new driver %s\n",
+-			usbcore_name, new_driver->name);
+-		usbfs_update_special();
+-	} else {
+-		printk(KERN_ERR "%s: error %d registering driver %s\n",
+-			usbcore_name, retval, new_driver->name);
+-	}
+-
+-	return retval;
+-}
+-
+-/**
+- * usb_deregister - unregister a USB driver
+- * @driver: USB operations of the driver to unregister
+- * Context: must be able to sleep
+- *
+- * Unlinks the specified driver from the internal USB driver list.
+- * 
+- * NOTE: If you called usb_register_dev(), you still need to call
+- * usb_deregister_dev() to clean up your driver's allocated minor numbers,
+- * this * call will no longer do it for you.
+- */
+-void usb_deregister(struct usb_driver *driver)
+-{
+-	pr_info("%s: deregistering driver %s\n", usbcore_name, driver->name);
+-
+-	usb_lock_all_devices();
+-	driver_unregister (&driver->driver);
+-	usb_unlock_all_devices();
+-
+-	usbfs_update_special();
+-}
+-
  /**
-  * usb_register - register a USB driver
-  * @new_driver: USB operations for the driver
-@@ -352,137 +261,6 @@ void usb_driver_release_interface(struct
+  * usb_ifnum_to_if - get the interface object with a given interface number
+  * @dev: the device whose current configuration is considered
+@@ -352,137 +197,6 @@ void usb_driver_release_interface(struct
  	mark_quiesced(iface);
  }
  
@@ -257,7 +321,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  static int __find_interface(struct device * dev, void * data)
  {
  	struct usb_interface ** ret = (struct usb_interface **)data;
-@@ -520,27 +298,6 @@ struct usb_interface *usb_find_interface
+@@ -520,27 +234,6 @@ struct usb_interface *usb_find_interface
  	return ret ? intf : NULL;
  }
  
@@ -285,7 +349,16 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  #ifdef	CONFIG_HOTPLUG
  
  /*
-@@ -1610,7 +1367,6 @@ EXPORT_SYMBOL(usb_unlock_device);
+@@ -1591,8 +1284,6 @@ module_exit(usb_exit);
+  * driver modules to use.
+  */
+ 
+-EXPORT_SYMBOL(usb_register);
+-EXPORT_SYMBOL(usb_deregister);
+ EXPORT_SYMBOL(usb_disabled);
+ 
+ EXPORT_SYMBOL_GPL(usb_get_intf);
+@@ -1610,7 +1301,6 @@ EXPORT_SYMBOL(usb_unlock_device);
  
  EXPORT_SYMBOL(usb_driver_claim_interface);
  EXPORT_SYMBOL(usb_driver_release_interface);
@@ -306,7 +379,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  ifeq ($(CONFIG_PCI),y)
 --- /dev/null
 +++ gregkh-2.6/drivers/usb/core/driver.c
-@@ -0,0 +1,272 @@
+@@ -0,0 +1,338 @@
 +/*
 + * drivers/usb/driver.c - most of the driver model stuff for usb
 + *
@@ -333,13 +406,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#include <linux/config.h>
 +#include <linux/device.h>
 +#include <linux/usb.h>
++#include "hcd.h"
 +#include "usb.h"
 +
-+static int generic_probe (struct device *dev)
++static int generic_probe(struct device *dev)
 +{
 +	return 0;
 +}
-+static int generic_remove (struct device *dev)
++static int generic_remove(struct device *dev)
 +{
 +	struct usb_device *udev = to_usb_device(dev);
 +
@@ -367,7 +441,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +int usb_generic_driver_data;
 +
 +/* called from driver core with usb_bus_type.subsys writelock */
-+int usb_probe_interface(struct device *dev)
++static int usb_probe_interface(struct device *dev)
 +{
 +	struct usb_interface * intf = to_usb_interface(dev);
 +	struct usb_driver * driver = to_usb_driver(dev->driver);
@@ -384,7 +458,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	id = usb_match_id(intf, driver->id_table);
 +	if (id) {
-+		dev_dbg (dev, "%s - got id\n", __FUNCTION__);
++		dev_dbg(dev, "%s - got id\n", __FUNCTION__);
 +
 +		/* Interface "power state" doesn't correspond to any hardware
 +		 * state whatsoever.  We use it to record when it's bound to
@@ -392,7 +466,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		 */
 +		mark_active(intf);
 +		intf->condition = USB_INTERFACE_BINDING;
-+		error = driver->probe (intf, id);
++		error = driver->probe(intf, id);
 +		if (error) {
 +			mark_quiesced(intf);
 +			intf->condition = USB_INTERFACE_UNBOUND;
@@ -404,7 +478,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +}
 +
 +/* called from driver core with usb_bus_type.subsys writelock */
-+int usb_unbind_interface(struct device *dev)
++static int usb_unbind_interface(struct device *dev)
 +{
 +	struct usb_interface *intf = to_usb_interface(dev);
 +	struct usb_driver *driver = to_usb_driver(intf->dev.driver);
@@ -559,7 +633,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +}
 +EXPORT_SYMBOL(usb_match_id);
 +
-+int usb_device_match (struct device *dev, struct device_driver *drv)
++int usb_device_match(struct device *dev, struct device_driver *drv)
 +{
 +	struct usb_interface *intf;
 +	struct usb_driver *usb_drv;
@@ -579,17 +653,80 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return 0;
 +}
 +
++/**
++ * usb_register - register a USB driver
++ * @new_driver: USB operations for the driver
++ *
++ * Registers a USB driver with the USB core.  The list of unattached
++ * interfaces will be rescanned whenever a new driver is added, allowing
++ * the new driver to attach to any recognized devices.
++ * Returns a negative error code on failure and 0 on success.
++ *
++ * NOTE: if you want your driver to use the USB major number, you must call
++ * usb_register_dev() to enable that functionality.  This function no longer
++ * takes care of that.
++ */
++int usb_register(struct usb_driver *new_driver)
++{
++	int retval = 0;
++
++	if (usb_disabled())
++		return -ENODEV;
++
++	new_driver->driver.name = (char *)new_driver->name;
++	new_driver->driver.bus = &usb_bus_type;
++	new_driver->driver.probe = usb_probe_interface;
++	new_driver->driver.remove = usb_unbind_interface;
++	new_driver->driver.owner = new_driver->owner;
++
++	usb_lock_all_devices();
++	retval = driver_register(&new_driver->driver);
++	usb_unlock_all_devices();
++
++	if (!retval) {
++		pr_info("%s: registered new driver %s\n",
++			usbcore_name, new_driver->name);
++		usbfs_update_special();
++	} else {
++		printk(KERN_ERR "%s: error %d registering driver %s\n",
++			usbcore_name, retval, new_driver->name);
++	}
++
++	return retval;
++}
++EXPORT_SYMBOL(usb_register);
++
++/**
++ * usb_deregister - unregister a USB driver
++ * @driver: USB operations of the driver to unregister
++ * Context: must be able to sleep
++ *
++ * Unlinks the specified driver from the internal USB driver list.
++ *
++ * NOTE: If you called usb_register_dev(), you still need to call
++ * usb_deregister_dev() to clean up your driver's allocated minor numbers,
++ * this * call will no longer do it for you.
++ */
++void usb_deregister(struct usb_driver *driver)
++{
++	pr_info("%s: deregistering driver %s\n", usbcore_name, driver->name);
++
++	usb_lock_all_devices();
++	driver_unregister(&driver->driver);
++	usb_unlock_all_devices();
++
++	usbfs_update_special();
++}
++EXPORT_SYMBOL(usb_deregister);
 --- gregkh-2.6.orig/drivers/usb/core/usb.h
 +++ gregkh-2.6/drivers/usb/core/usb.h
-@@ -33,6 +33,11 @@ extern void usb_host_cleanup(void);
+@@ -33,6 +33,9 @@ extern void usb_host_cleanup(void);
  extern int usb_suspend_device(struct usb_device *dev);
  extern int usb_resume_device(struct usb_device *dev);
  
 +extern struct device_driver usb_generic_driver;
 +extern int usb_generic_driver_data;
-+extern int usb_probe_interface(struct device *dev);
-+extern int usb_unbind_interface(struct device *dev);
-+extern int usb_device_match (struct device *dev, struct device_driver *drv);
++extern int usb_device_match(struct device *dev, struct device_driver *drv);
  
  /* Interfaces and their "power state" are owned by usbcore */
  
