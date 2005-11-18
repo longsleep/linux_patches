@@ -1,0 +1,507 @@
+From stern@rowland.harvard.edu Thu Nov 17 14:00:29 2005
+Date: Thu, 17 Nov 2005 17:10:32 -0500 (EST)
+From: Alan Stern <stern@rowland.harvard.edu>
+To: Greg KH <greg@kroah.com>
+Subject: Remove USB private semaphore
+Message-ID: <Pine.LNX.4.44L0.0511171655590.4465-100000@iolanthe.rowland.org>
+
+This patch (as605) removes the private udev->serialize semaphore,
+relying instead on the locking provided by the embedded struct device's
+semaphore.  The changes are confined to the core, except that the
+usb_trylock_device routine now uses the return convention of
+down_trylock rather than down_read_trylock (they return opposite values
+for no good reason).
+
+A couple of other associated changes are included as well:
+
+	Now that we aren't concerned about HCDs that avoid using the
+	hcd glue layer, usb_disconnect no longer needs to acquire the
+	usb_bus_lock -- that can be done by usb_remove_hcd where it
+	belongs.
+
+	Devices aren't locked over the same scope of code in
+	usb_new_device and hub_port_connect_change as they used to be.
+	This shouldn't cause any trouble.
+
+Along with the preceding driver core patch, this needs a lot of testing.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/devices.c  |    4 -
+ drivers/usb/core/devio.c    |    2 
+ drivers/usb/core/driver.c   |    4 -
+ drivers/usb/core/hcd.c      |    5 +
+ drivers/usb/core/hub.c      |   48 ++++++------------
+ drivers/usb/core/usb.c      |  114 +++-----------------------------------------
+ drivers/usb/core/usb.h      |    3 -
+ drivers/usb/host/ohci-hub.c |    2 
+ include/linux/usb.h         |    9 +--
+ 9 files changed, 37 insertions(+), 154 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/core/devio.c
++++ gregkh-2.6/drivers/usb/core/devio.c
+@@ -1350,9 +1350,7 @@ static int proc_ioctl(struct dev_state *
+ 	/* let kernel drivers try to (re)bind to the interface */
+ 	case USBDEVFS_CONNECT:
+ 		usb_unlock_device(ps->dev);
+-		usb_lock_all_devices();
+ 		bus_rescan_devices(intf->dev.bus);
+-		usb_unlock_all_devices();
+ 		usb_lock_device(ps->dev);
+ 		break;
+ 
+--- gregkh-2.6.orig/drivers/usb/core/usb.h
++++ gregkh-2.6/drivers/usb/core/usb.h
+@@ -16,9 +16,6 @@ extern int usb_get_device_descriptor(str
+ extern char *usb_cache_string(struct usb_device *udev, int index);
+ extern int usb_set_configuration(struct usb_device *dev, int configuration);
+ 
+-extern void usb_lock_all_devices(void);
+-extern void usb_unlock_all_devices(void);
+-
+ extern void usb_kick_khubd(struct usb_device *dev);
+ extern void usb_suspend_root_hub(struct usb_device *hdev);
+ extern void usb_resume_root_hub(struct usb_device *dev);
+--- gregkh-2.6.orig/drivers/usb/core/hub.c
++++ gregkh-2.6/drivers/usb/core/hub.c
+@@ -32,7 +32,7 @@
+ #include "hub.h"
+ 
+ /* Protect struct usb_device->state and ->children members
+- * Note: Both are also protected by ->serialize, except that ->state can
++ * Note: Both are also protected by ->dev.sem, except that ->state can
+  * change to USB_STATE_NOTATTACHED even when the semaphore isn't held. */
+ static DEFINE_SPINLOCK(device_state_lock);
+ 
+@@ -975,8 +975,8 @@ static int locktree(struct usb_device *u
+ 			/* when everyone grabs locks top->bottom,
+ 			 * non-overlapping work may be concurrent
+ 			 */
+-			down(&udev->serialize);
+-			up(&hdev->serialize);
++			usb_lock_device(udev);
++			usb_unlock_device(hdev);
+ 			return t + 1;
+ 		}
+ 	}
+@@ -1132,16 +1132,10 @@ void usb_disconnect(struct usb_device **
+ 	 * this quiesces everyting except pending urbs.
+ 	 */
+ 	usb_set_device_state(udev, USB_STATE_NOTATTACHED);
+-
+-	/* lock the bus list on behalf of HCDs unregistering their root hubs */
+-	if (!udev->parent) {
+-		down(&usb_bus_list_lock);
+-		usb_lock_device(udev);
+-	} else
+-		down(&udev->serialize);
+-
+ 	dev_info (&udev->dev, "USB disconnect, address %d\n", udev->devnum);
+ 
++	usb_lock_device(udev);
++
+ 	/* Free up all the children before we remove this device */
+ 	for (i = 0; i < USB_MAXCHILDREN; i++) {
+ 		if (udev->children[i])
+@@ -1169,11 +1163,7 @@ void usb_disconnect(struct usb_device **
+ 	*pdev = NULL;
+ 	spin_unlock_irq(&device_state_lock);
+ 
+-	if (!udev->parent) {
+-		usb_unlock_device(udev);
+-		up(&usb_bus_list_lock);
+-	} else
+-		up(&udev->serialize);
++	usb_unlock_device(udev);
+ 
+ 	device_unregister(&udev->dev);
+ }
+@@ -1243,8 +1233,8 @@ static inline void show_string(struct us
+  *
+  * This is called with devices which have been enumerated, but not yet
+  * configured.  The device descriptor is available, but not descriptors
+- * for any device configuration.  The caller must have locked udev and
+- * either the parent hub (if udev is a normal device) or else the
++ * for any device configuration.  The caller must have locked either
++ * the parent hub (if udev is a normal device) or else the
+  * usb_bus_list_lock (if udev is a root hub).  The parent's pointer to
+  * udev has already been installed, but udev is not yet visible through
+  * sysfs or other filesystem code.
+@@ -1254,8 +1244,7 @@ static inline void show_string(struct us
+  *
+  * This call is synchronous, and may not be used in an interrupt context.
+  *
+- * Only the hub driver should ever call this; root hub registration
+- * uses it indirectly.
++ * Only the hub driver or root-hub registrar should ever call this.
+  */
+ int usb_new_device(struct usb_device *udev)
+ {
+@@ -1364,6 +1353,8 @@ int usb_new_device(struct usb_device *ud
+ 	}
+ 	usb_create_sysfs_dev_files (udev);
+ 
++	usb_lock_device(udev);
++
+ 	/* choose and set the configuration. that registers the interfaces
+ 	 * with the driver core, and lets usb device drivers bind to them.
+ 	 */
+@@ -1385,6 +1376,8 @@ int usb_new_device(struct usb_device *ud
+ 	/* USB device state == configured ... usable */
+ 	usb_notify_add_device(udev);
+ 
++	usb_unlock_device(udev);
++
+ 	return 0;
+ 
+ fail:
+@@ -1872,11 +1865,8 @@ int usb_resume_device(struct usb_device 
+ 	usb_unlock_device(udev);
+ 
+ 	/* rebind drivers that had no suspend() */
+-	if (status == 0) {
+-		usb_lock_all_devices();
++	if (status == 0)
+ 		bus_rescan_devices(&usb_bus_type);
+-		usb_unlock_all_devices();
+-	}
+ 	return status;
+ }
+ 
+@@ -1889,14 +1879,14 @@ static int remote_wakeup(struct usb_devi
+ 	/* don't repeat RESUME sequence if this device
+ 	 * was already woken up by some other task
+ 	 */
+-	down(&udev->serialize);
++	usb_lock_device(udev);
+ 	if (udev->state == USB_STATE_SUSPENDED) {
+ 		dev_dbg(&udev->dev, "RESUME (wakeup)\n");
+ 		/* TRSMRCY = 10 msec */
+ 		msleep(10);
+ 		status = finish_device_resume(udev);
+ 	}
+-	up(&udev->serialize);
++	usb_unlock_device(udev);
+ #endif
+ 	return status;
+ }
+@@ -1997,7 +1987,7 @@ static int hub_resume(struct usb_interfa
+ 
+ 		if (!udev || status < 0)
+ 			continue;
+-		down (&udev->serialize);
++		usb_lock_device(udev);
+ 		if (portstat & USB_PORT_STAT_SUSPEND)
+ 			status = hub_port_resume(hub, port1, udev);
+ 		else {
+@@ -2008,7 +1998,7 @@ static int hub_resume(struct usb_interfa
+ 				hub_port_logical_disconnect(hub, port1);
+ 			}
+ 		}
+-		up(&udev->serialize);
++		usb_unlock_device(udev);
+ 	}
+ 	}
+ #endif
+@@ -2573,7 +2563,6 @@ static void hub_port_connect_change(stru
+ 		 * udev becomes globally accessible, although presumably
+ 		 * no one will look at it until hdev is unlocked.
+ 		 */
+-		down (&udev->serialize);
+ 		status = 0;
+ 
+ 		/* We mustn't add new devices if the parent hub has
+@@ -2597,7 +2586,6 @@ static void hub_port_connect_change(stru
+ 			}
+ 		}
+ 
+-		up (&udev->serialize);
+ 		if (status)
+ 			goto loop_disable;
+ 
+--- gregkh-2.6.orig/drivers/usb/core/hcd.c
++++ gregkh-2.6/drivers/usb/core/hcd.c
+@@ -857,9 +857,7 @@ static int register_root_hub (struct usb
+ 		return (retval < 0) ? retval : -EMSGSIZE;
+ 	}
+ 
+-	usb_lock_device (usb_dev);
+ 	retval = usb_new_device (usb_dev);
+-	usb_unlock_device (usb_dev);
+ 	if (retval) {
+ 		usb_dev->bus->root_hub = NULL;
+ 		dev_err (parent_dev, "can't register root hub for %s, %d\n",
+@@ -1886,7 +1884,10 @@ void usb_remove_hcd(struct usb_hcd *hcd)
+ 	spin_lock_irq (&hcd_root_hub_lock);
+ 	hcd->rh_registered = 0;
+ 	spin_unlock_irq (&hcd_root_hub_lock);
++
++	down(&usb_bus_list_lock);
+ 	usb_disconnect(&hcd->self.root_hub);
++	up(&usb_bus_list_lock);
+ 
+ 	hcd->poll_rh = 0;
+ 	del_timer_sync(&hcd->rh_timer);
+--- gregkh-2.6.orig/include/linux/usb.h
++++ gregkh-2.6/include/linux/usb.h
+@@ -328,8 +328,6 @@ struct usb_device {
+ 	struct usb_tt	*tt; 		/* low/full speed dev, highspeed hub */
+ 	int		ttport;		/* device port on that tt hub */
+ 
+-	struct semaphore serialize;
+-
+ 	unsigned int toggle[2];		/* one bit for each endpoint
+ 					 * ([0] = IN, [1] = OUT) */
+ 
+@@ -376,11 +374,12 @@ struct usb_device {
+ extern struct usb_device *usb_get_dev(struct usb_device *dev);
+ extern void usb_put_dev(struct usb_device *dev);
+ 
+-extern void usb_lock_device(struct usb_device *udev);
+-extern int usb_trylock_device(struct usb_device *udev);
++/* USB device locking */
++#define usb_lock_device(udev)		down(&(udev)->dev.sem)
++#define usb_unlock_device(udev)		up(&(udev)->dev.sem)
++#define usb_trylock_device(udev)	down_trylock(&(udev)->dev.sem)
+ extern int usb_lock_device_for_reset(struct usb_device *udev,
+ 		struct usb_interface *iface);
+-extern void usb_unlock_device(struct usb_device *udev);
+ 
+ /* USB port reset for device reinitialization */
+ extern int usb_reset_device(struct usb_device *dev);
+--- gregkh-2.6.orig/drivers/usb/core/driver.c
++++ gregkh-2.6/drivers/usb/core/driver.c
+@@ -431,9 +431,7 @@ int usb_register(struct usb_driver *new_
+ 	spin_lock_init(&new_driver->dynids.lock);
+ 	INIT_LIST_HEAD(&new_driver->dynids.list);
+ 
+-	usb_lock_all_devices();
+ 	retval = driver_register(&new_driver->driver);
+-	usb_unlock_all_devices();
+ 
+ 	if (!retval) {
+ 		pr_info("%s: registered new driver %s\n",
+@@ -464,11 +462,9 @@ void usb_deregister(struct usb_driver *d
+ {
+ 	pr_info("%s: deregistering driver %s\n", usbcore_name, driver->name);
+ 
+-	usb_lock_all_devices();
+ 	usb_remove_newid_file(driver);
+ 	usb_free_dynids(driver);
+ 	driver_unregister(&driver->driver);
+-	usb_unlock_all_devices();
+ 
+ 	usbfs_update_special();
+ }
+--- gregkh-2.6.orig/drivers/usb/host/ohci-hub.c
++++ gregkh-2.6/drivers/usb/host/ohci-hub.c
+@@ -359,7 +359,7 @@ done:
+ 					& ohci->hc_control)
+ 				== OHCI_USB_OPER
+ 			&& time_after (jiffies, ohci->next_statechange)
+-			&& usb_trylock_device (hcd->self.root_hub)
++			&& usb_trylock_device (hcd->self.root_hub) == 0
+ 			) {
+ 		ohci_vdbg (ohci, "autosuspend\n");
+ 		(void) ohci_bus_suspend (hcd);
+--- gregkh-2.6.orig/drivers/usb/core/usb.c
++++ gregkh-2.6/drivers/usb/core/usb.c
+@@ -32,7 +32,6 @@
+ #include <linux/spinlock.h>
+ #include <linux/errno.h>
+ #include <linux/smp_lock.h>
+-#include <linux/rwsem.h>
+ #include <linux/usb.h>
+ 
+ #include <asm/io.h>
+@@ -49,8 +48,6 @@ const char *usbcore_name = "usbcore";
+ static int nousb;	/* Disable USB when built into kernel image */
+ 			/* Not honored on modular build */
+ 
+-static DECLARE_RWSEM(usb_all_devices_rwsem);
+-
+ 
+ /**
+  * usb_ifnum_to_if - get the interface object with a given interface number
+@@ -443,8 +440,6 @@ usb_alloc_dev(struct usb_device *parent,
+ 	dev->parent = parent;
+ 	INIT_LIST_HEAD(&dev->filelist);
+ 
+-	init_MUTEX(&dev->serialize);
+-
+ 	return dev;
+ }
+ 
+@@ -517,76 +512,21 @@ void usb_put_intf(struct usb_interface *
+ 
+ /*			USB device locking
+  *
+- * Although locking USB devices should be straightforward, it is
+- * complicated by the way the driver-model core works.  When a new USB
+- * driver is registered or unregistered, the core will automatically
+- * probe or disconnect all matching interfaces on all USB devices while
+- * holding the USB subsystem writelock.  There's no good way for us to
+- * tell which devices will be used or to lock them beforehand; our only
+- * option is to effectively lock all the USB devices.
+- *
+- * We do that by using a private rw-semaphore, usb_all_devices_rwsem.
+- * When locking an individual device you must first acquire the rwsem's
+- * readlock.  When a driver is registered or unregistered the writelock
+- * must be held.  These actions are encapsulated in the subroutines
+- * below, so all a driver needs to do is call usb_lock_device() and
+- * usb_unlock_device().
++ * USB devices and interfaces are locked using the semaphore in their
++ * embedded struct device.  The hub driver guarantees that whenever a
++ * device is connected or disconnected, drivers are called with the
++ * USB device locked as well as their particular interface.
+  *
+  * Complications arise when several devices are to be locked at the same
+  * time.  Only hub-aware drivers that are part of usbcore ever have to
+- * do this; nobody else needs to worry about it.  The problem is that
+- * usb_lock_device() must not be called to lock a second device since it
+- * would acquire the rwsem's readlock reentrantly, leading to deadlock if
+- * another thread was waiting for the writelock.  The solution is simple:
+- *
+- *	When locking more than one device, call usb_lock_device()
+- *	to lock the first one.  Lock the others by calling
+- *	down(&udev->serialize) directly.
+- *
+- *	When unlocking multiple devices, use up(&udev->serialize)
+- *	to unlock all but the last one.  Unlock the last one by
+- *	calling usb_unlock_device().
++ * do this; nobody else needs to worry about it.  The rule for locking
++ * is simple:
+  *
+  *	When locking both a device and its parent, always lock the
+  *	the parent first.
+  */
+ 
+ /**
+- * usb_lock_device - acquire the lock for a usb device structure
+- * @udev: device that's being locked
+- *
+- * Use this routine when you don't hold any other device locks;
+- * to acquire nested inner locks call down(&udev->serialize) directly.
+- * This is necessary for proper interaction with usb_lock_all_devices().
+- */
+-void usb_lock_device(struct usb_device *udev)
+-{
+-	down_read(&usb_all_devices_rwsem);
+-	down(&udev->serialize);
+-}
+-
+-/**
+- * usb_trylock_device - attempt to acquire the lock for a usb device structure
+- * @udev: device that's being locked
+- *
+- * Don't use this routine if you already hold a device lock;
+- * use down_trylock(&udev->serialize) instead.
+- * This is necessary for proper interaction with usb_lock_all_devices().
+- *
+- * Returns 1 if successful, 0 if contention.
+- */
+-int usb_trylock_device(struct usb_device *udev)
+-{
+-	if (!down_read_trylock(&usb_all_devices_rwsem))
+-		return 0;
+-	if (down_trylock(&udev->serialize)) {
+-		up_read(&usb_all_devices_rwsem);
+-		return 0;
+-	}
+-	return 1;
+-}
+-
+-/**
+  * usb_lock_device_for_reset - cautiously acquire the lock for a
+  *	usb device structure
+  * @udev: device that's being locked
+@@ -624,7 +564,7 @@ int usb_lock_device_for_reset(struct usb
+ 		}
+ 	}
+ 
+-	while (!usb_trylock_device(udev)) {
++	while (usb_trylock_device(udev) != 0) {
+ 
+ 		/* If we can't acquire the lock after waiting one second,
+ 		 * we're probably deadlocked */
+@@ -642,39 +582,6 @@ int usb_lock_device_for_reset(struct usb
+ 	return 1;
+ }
+ 
+-/**
+- * usb_unlock_device - release the lock for a usb device structure
+- * @udev: device that's being unlocked
+- *
+- * Use this routine when releasing the only device lock you hold;
+- * to release inner nested locks call up(&udev->serialize) directly.
+- * This is necessary for proper interaction with usb_lock_all_devices().
+- */
+-void usb_unlock_device(struct usb_device *udev)
+-{
+-	up(&udev->serialize);
+-	up_read(&usb_all_devices_rwsem);
+-}
+-
+-/**
+- * usb_lock_all_devices - acquire the lock for all usb device structures
+- *
+- * This is necessary when registering a new driver or probing a bus,
+- * since the driver-model core may try to use any usb_device.
+- */
+-void usb_lock_all_devices(void)
+-{
+-	down_write(&usb_all_devices_rwsem);
+-}
+-
+-/**
+- * usb_unlock_all_devices - release the lock for all usb device structures
+- */
+-void usb_unlock_all_devices(void)
+-{
+-	up_write(&usb_all_devices_rwsem);
+-}
+-
+ 
+ static struct usb_device *match_device(struct usb_device *dev,
+ 				       u16 vendor_id, u16 product_id)
+@@ -697,10 +604,10 @@ static struct usb_device *match_device(s
+ 	/* look through all of the children of this device */
+ 	for (child = 0; child < dev->maxchild; ++child) {
+ 		if (dev->children[child]) {
+-			down(&dev->children[child]->serialize);
++			usb_lock_device(dev->children[child]);
+ 			ret_dev = match_device(dev->children[child],
+ 					       vendor_id, product_id);
+-			up(&dev->children[child]->serialize);
++			usb_unlock_device(dev->children[child]);
+ 			if (ret_dev)
+ 				goto exit;
+ 		}
+@@ -1294,10 +1201,7 @@ EXPORT_SYMBOL(usb_put_dev);
+ EXPORT_SYMBOL(usb_get_dev);
+ EXPORT_SYMBOL(usb_hub_tt_clear_buffer);
+ 
+-EXPORT_SYMBOL(usb_lock_device);
+-EXPORT_SYMBOL(usb_trylock_device);
+ EXPORT_SYMBOL(usb_lock_device_for_reset);
+-EXPORT_SYMBOL(usb_unlock_device);
+ 
+ EXPORT_SYMBOL(usb_driver_claim_interface);
+ EXPORT_SYMBOL(usb_driver_release_interface);
+--- gregkh-2.6.orig/drivers/usb/core/devices.c
++++ gregkh-2.6/drivers/usb/core/devices.c
+@@ -545,10 +545,10 @@ static ssize_t usb_device_dump(char __us
+ 		struct usb_device *childdev = usbdev->children[chix];
+ 
+ 		if (childdev) {
+-			down(&childdev->serialize);
++			usb_lock_device(childdev);
+ 			ret = usb_device_dump(buffer, nbytes, skip_bytes, file_offset, childdev,
+ 					bus, level + 1, chix, ++cnt);
+-			up(&childdev->serialize);
++			usb_unlock_device(childdev);
+ 			if (ret == -EFAULT)
+ 				return total_written;
+ 			total_written += ret;
