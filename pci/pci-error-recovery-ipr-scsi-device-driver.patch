@@ -1,0 +1,135 @@
+From linas@austin.ibm.com Fri Nov 18 14:09:18 2005
+Date: Fri, 18 Nov 2005 16:22:38 -0600
+From: linas <linas@austin.ibm.com>
+To: greg@kroah.com
+Subject: PCI Error Recovery: IPR SCSI device driver
+Message-ID: <20051118222238.GA12645@austin.ibm.com>
+Content-Disposition: inline
+
+Various PCI bus errors can be signaled by newer PCI controllers.  This
+patch adds the PCI error recovery callbacks to the IPR SCSI device driver.
+The patch has been tested, and appears to work well.
+
+Signed-off-by: Linas Vepstas <linas@linas.org>
+Signed-off-by: Brian King <brking@us.ibm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+--
+---
+ drivers/scsi/ipr.c |   92 +++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 92 insertions(+)
+
+--- gregkh-2.6.orig/drivers/scsi/ipr.c
++++ gregkh-2.6/drivers/scsi/ipr.c
+@@ -5868,6 +5868,92 @@ static void ipr_initiate_ioa_reset(struc
+ 				shutdown_type);
+ }
+ 
++/* --------------- PCI Error Recovery infrastructure ----------- */
++/** If the PCI slot is frozen, hold off all i/o
++ *  activity; then, as soon as the slot is available again,
++ *  initiate an adapter reset.
++ */
++static int ipr_reset_freeze(struct ipr_cmnd *ipr_cmd)
++{
++	/* Disallow new interrupts, avoid loop */
++	ipr_cmd->ioa_cfg->allow_interrupts = 0;
++	list_add_tail(&ipr_cmd->queue, &ipr_cmd->ioa_cfg->pending_q);
++	ipr_cmd->done = ipr_reset_ioa_job;
++	return IPR_RC_JOB_RETURN;
++}
++
++/** ipr_eeh_frozen -- called when slot has experience PCI bus error.
++ *  This routine is called to tell us that the PCI bus is down.
++ *  Can't do anything here, except put the device driver into a
++ *  holding pattern, waiting for the PCI bus to come back.
++ */
++static void ipr_eeh_frozen (struct pci_dev *pdev)
++{
++	unsigned long flags = 0;
++	struct ipr_ioa_cfg *ioa_cfg = pci_get_drvdata(pdev);
++
++	spin_lock_irqsave(ioa_cfg->host->host_lock, flags);
++	_ipr_initiate_ioa_reset(ioa_cfg, ipr_reset_freeze, IPR_SHUTDOWN_NONE);
++	spin_unlock_irqrestore(ioa_cfg->host->host_lock, flags);
++}
++
++/** ipr_eeh_slot_reset - called when pci slot has been reset.
++ *
++ * This routine is called by the pci error recovery recovery
++ * code after the PCI slot has been reset, just before we
++ * should resume normal operations.
++ */
++static pci_ers_result_t ipr_eeh_slot_reset(struct pci_dev *pdev)
++{
++	unsigned long flags = 0;
++	struct ipr_ioa_cfg *ioa_cfg = pci_get_drvdata(pdev);
++
++	spin_lock_irqsave(ioa_cfg->host->host_lock, flags);
++	_ipr_initiate_ioa_reset(ioa_cfg, ipr_reset_restore_cfg_space,
++	                                 IPR_SHUTDOWN_NONE);
++	spin_unlock_irqrestore(ioa_cfg->host->host_lock, flags);
++
++	return PCI_ERS_RESULT_RECOVERED;
++}
++
++/** This routine is called when the PCI bus has permanently
++ *  failed.  This routine should purge all pending I/O and
++ *  shut down the device driver (close and unload).
++ */
++static void ipr_eeh_perm_failure(struct pci_dev *pdev)
++{
++	unsigned long flags = 0;
++	struct ipr_ioa_cfg *ioa_cfg = pci_get_drvdata(pdev);
++
++	spin_lock_irqsave(ioa_cfg->host->host_lock, flags);
++	if (ioa_cfg->sdt_state == WAIT_FOR_DUMP)
++		ioa_cfg->sdt_state = ABORT_DUMP;
++	ioa_cfg->reset_retries = IPR_NUM_RESET_RELOAD_RETRIES;
++	ioa_cfg->in_ioa_bringdown = 1;
++	ipr_initiate_ioa_reset(ioa_cfg, IPR_SHUTDOWN_NONE);
++	spin_unlock_irqrestore(ioa_cfg->host->host_lock, flags);
++}
++
++static pci_ers_result_t ipr_eeh_error_detected(struct pci_dev *pdev,
++                                pci_channel_state_t state)
++{
++	switch (state) {
++		case pci_channel_io_frozen:
++			ipr_eeh_frozen (pdev);
++			return PCI_ERS_RESULT_NEED_RESET;
++
++		case pci_channel_io_perm_failure:
++			ipr_eeh_perm_failure (pdev);
++			return PCI_ERS_RESULT_DISCONNECT;
++			break;
++		default:
++			break;
++	}
++	return PCI_ERS_RESULT_NEED_RESET;
++}
++
++/* ------------- end of PCI Error Recovery suport ----------- */
++
+ /**
+  * ipr_probe_ioa_part2 - Initializes IOAs found in ipr_probe_ioa(..)
+  * @ioa_cfg:	ioa cfg struct
+@@ -6625,12 +6711,18 @@ static struct pci_device_id ipr_pci_tabl
+ };
+ MODULE_DEVICE_TABLE(pci, ipr_pci_table);
+ 
++static struct pci_error_handlers ipr_err_handler = {
++	.error_detected = ipr_eeh_error_detected,
++	.slot_reset = ipr_eeh_slot_reset,
++};
++
+ static struct pci_driver ipr_driver = {
+ 	.name = IPR_NAME,
+ 	.id_table = ipr_pci_table,
+ 	.probe = ipr_probe,
+ 	.remove = ipr_remove,
+ 	.shutdown = ipr_shutdown,
++	.err_handler = &ipr_err_handler,
+ };
+ 
+ /**
