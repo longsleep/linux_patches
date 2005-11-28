@@ -1,30 +1,24 @@
-From benh@kernel.crashing.org Tue Nov 22 22:47:24 2005
-Subject: USB: Fix USB suspend/resume crasher
+From benh@kernel.crashing.org Thu Nov 24 15:05:54 2005
+Subject: [PATCH] USB: Fix USB suspend/resume crasher (#2)
 From: Benjamin Herrenschmidt <benh@kernel.crashing.org>
-To: David Brownell <david-b@pacbell.net>
-Cc: Paul Mackerras <paulus@samba.org>, Andrew Morton <akpm@osdl.org>, Greg KH <greg@kroah.com>, Alan Stern <stern@rowland.harvard.edu>
-Date: Wed, 23 Nov 2005 14:08:07 +1100
-Message-Id: <1132715288.26560.262.camel@gaston>
+To: Greg KH <greg@kroah.com>
+Cc: Alan Stern <stern@rowland.harvard.edu>, David Brownell <david-b@pacbell.net>, Andrew Morton <akpm@osdl.org>
+Date: Fri, 25 Nov 2005 09:59:46 +1100
+Message-Id: <1132873186.26560.487.camel@gaston>
 
-This is my latest patch against current linus -git, it closes the IRQ
-race and makes various other OHCI & EHCI code path safer vs.
-suspend/resume. I've been able to (finally !) successfully suspend and
-resume various Mac models, with or without USB mouse plugged, or
-plugging while asleep, or unplugging while asleep etc... all without a
-crash. There are still some races here or there in the USB code, but at
-least the main cause of crash is now fixes by this patch (access to a
-controller that has been suspended, due to either shared interrupts or
-other code path).
+This patch closes the IRQ race and makes various other OHCI & EHCI code
+path safer vs. suspend/resume.
+I've been able to (finally !) successfully suspend and resume various
+Mac models, with or without USB mouse plugged, or plugging while asleep,
+or unplugging while asleep etc... all without a crash.
 
-I haven't fixed UHCI as I don't have any HW to test, though I hope I
-haven't broken it neither. Alan, I would appreciate if you could have a
-look.
+Alan, please verify the UHCI bit I did, I only verified that it builds.
+It's very simple so I wouldn't expect any issue there. If you aren't
+confident, then just drop the hunks that change uhci-hcd.c
 
-This patch applies on top of the patch that moves the PowerMac specific
-code out of ohci-pci.c to hcd-pci.c where it belongs. This patch isn't
-upstream yet for reasons I don't fully understand (why does USB stuffs
-has such a high latency for going upstream ?), I'm sending it as a reply
-to this email for completeness.
+I also made the patch a little bit more "safer" by making sure the store
+to the interrupt register that disables interrupts is not posted before
+I set the flag and drop the spinlock.
 
 Without this patch, you cannot reliably sleep/wakeup any recent Mac, and
 I suspect PCs have some more sneaky issues too (they don't frankly crash
@@ -34,17 +28,19 @@ situations, but the USB code may still misbehave).
 
 Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 ---
  drivers/usb/core/hcd-pci.c    |    3 ++-
  drivers/usb/core/hcd.c        |   15 ++++++++++-----
  drivers/usb/core/hcd.h        |    7 ++++++-
- drivers/usb/host/ehci-pci.c   |   24 +++++++++++++++++++++++-
+ drivers/usb/host/ehci-pci.c   |   27 ++++++++++++++++++++++++++-
  drivers/usb/host/ehci-q.c     |   24 ++++++++++++++++--------
  drivers/usb/host/ehci-sched.c |   18 ++++++++++++++++--
  drivers/usb/host/ohci-hcd.c   |    6 +++++-
  drivers/usb/host/ohci-hub.c   |   24 ++++++++++++++++++++----
- drivers/usb/host/ohci-pci.c   |   26 ++++++++++++++++++++++++--
- 9 files changed, 122 insertions(+), 25 deletions(-)
+ drivers/usb/host/ohci-pci.c   |   27 +++++++++++++++++++++++++--
+ drivers/usb/host/uhci-hcd.c   |    6 ++++++
+ 10 files changed, 132 insertions(+), 25 deletions(-)
 
 --- gregkh-2.6.orig/drivers/usb/core/hcd-pci.c
 +++ gregkh-2.6/drivers/usb/core/hcd-pci.c
@@ -128,7 +124,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	unsigned		rh_registered:1;/* is root hub registered? */
 --- gregkh-2.6.orig/drivers/usb/host/ehci-pci.c
 +++ gregkh-2.6/drivers/usb/host/ehci-pci.c
-@@ -228,14 +228,34 @@ static int ehci_pci_reset(struct usb_hcd
+@@ -228,14 +228,36 @@ static int ehci_pci_reset(struct usb_hcd
  static int ehci_pci_suspend(struct usb_hcd *hcd, pm_message_t message)
  {
  	struct ehci_hcd		*ehci = hcd_to_ehci(hcd);
@@ -152,6 +148,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		goto bail;
 +	}
 +	writel (0, &ehci->regs->intr_enable);
++	(void)readl(&ehci->regs->intr_enable);
++
 +	clear_bit(HCD_FLAG_HW_ACCESSIBLE, &hcd->flags);
 + bail:
 +	spin_unlock_irqrestore (&ehci->lock, flags);
@@ -164,15 +162,16 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  }
  
  static int ehci_pci_resume(struct usb_hcd *hcd)
-@@ -255,6 +275,8 @@ static int ehci_pci_resume(struct usb_hc
- 	if (readl(&ehci->regs->configured_flag) != FLAG_CF)
- 		goto restart;
+@@ -251,6 +273,9 @@ static int ehci_pci_resume(struct usb_hc
+ 	if (time_before(jiffies, ehci->next_statechange))
+ 		msleep(100);
  
++	/* Mark hardware accessible again as we are out of D3 state by now */
 +	set_bit(HCD_FLAG_HW_ACCESSIBLE, &hcd->flags);
 +
- 	/* If any port is suspended (or owned by the companion),
- 	 * we know we can/must resume the HC (and mustn't reset it).
- 	 * We just defer that to the root hub code.
+ 	/* If CF is clear, we lost PCI Vaux power and need to restart.  */
+ 	if (readl(&ehci->regs->configured_flag) != FLAG_CF)
+ 		goto restart;
 --- gregkh-2.6.orig/drivers/usb/host/ehci-q.c
 +++ gregkh-2.6/drivers/usb/host/ehci-q.c
 @@ -912,6 +912,7 @@ submit_async (
@@ -350,7 +349,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		switch (wValue) {
 --- gregkh-2.6.orig/drivers/usb/host/ohci-pci.c
 +++ gregkh-2.6/drivers/usb/host/ohci-pci.c
-@@ -105,13 +105,35 @@ ohci_pci_start (struct usb_hcd *hcd)
+@@ -105,13 +105,36 @@ ohci_pci_start (struct usb_hcd *hcd)
  
  static int ohci_pci_suspend (struct usb_hcd *hcd, pm_message_t message)
  {
@@ -374,6 +373,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		goto bail;
 +	}
 +	ohci_writel(ohci, OHCI_INTR_MIE, &ohci->regs->intrdisable);
++	(void)ohci_readl(ohci, &ohci->regs->intrdisable);
 +	clear_bit(HCD_FLAG_HW_ACCESSIBLE, &hcd->flags);
 + bail:
 +	spin_unlock_irqrestore (&ohci->lock, flags);
@@ -388,3 +388,25 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	usb_hcd_resume_root_hub(hcd);
  	return 0;
  }
+--- gregkh-2.6.orig/drivers/usb/host/uhci-hcd.c
++++ gregkh-2.6/drivers/usb/host/uhci-hcd.c
+@@ -717,6 +717,7 @@ static int uhci_suspend(struct usb_hcd *
+ 	 * at the source, so we must turn off PIRQ.
+ 	 */
+ 	pci_write_config_word(to_pci_dev(uhci_dev(uhci)), USBLEGSUP, 0);
++	clear_bit(HCD_FLAG_HW_ACCESSIBLE, &hcd->flags);
+ 	uhci->hc_inaccessible = 1;
+ 	hcd->poll_rh = 0;
+ 
+@@ -733,6 +734,11 @@ static int uhci_resume(struct usb_hcd *h
+ 
+ 	dev_dbg(uhci_dev(uhci), "%s\n", __FUNCTION__);
+ 
++	/* We aren't in D3 state anymore, we do that even if dead as I
++	 * really don't want to keep a stale HCD_FLAG_HW_ACCESSIBLE=0
++	 */
++	set_bit(HCD_FLAG_HW_ACCESSIBLE, &hcd->flags);
++
+ 	if (uhci->rh_state == UHCI_RH_RESET)	/* Dead */
+ 		return 0;
+ 	spin_lock_irq(&uhci->lock);
