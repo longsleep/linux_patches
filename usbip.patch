@@ -1,0 +1,4650 @@
+ drivers/usb/usbib/Makefile       |   13 
+ drivers/usb/usbib/stub.h         |   92 +++
+ drivers/usb/usbib/stub_dev.c     |  417 +++++++++++++++
+ drivers/usb/usbib/stub_main.c    |  317 +++++++++++
+ drivers/usb/usbib/stub_rx.c      |  346 +++++++++++++
+ drivers/usb/usbib/stub_tx.c      |  227 ++++++++
+ drivers/usb/usbib/usbip_common.c |  883 +++++++++++++++++++++++++++++++++
+ drivers/usb/usbib/usbip_common.h |  400 +++++++++++++++
+ drivers/usb/usbib/usbip_event.c  |  147 +++++
+ drivers/usb/usbib/vhci.h         |  125 ++++
+ drivers/usb/usbib/vhci_hcd.c     | 1032 +++++++++++++++++++++++++++++++++++++++
+ drivers/usb/usbib/vhci_rx.c      |  150 +++++
+ drivers/usb/usbib/vhci_sysfs.c   |  265 ++++++++++
+ drivers/usb/usbib/vhci_tx.c      |  178 ++++++
+ 14 files changed, 4592 insertions(+)
+
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ gregkh-2.6/drivers/usb/usbib/Makefile	2005-12-01 15:23:17.000000000 -0800
+@@ -0,0 +1,13 @@
++# Makefile for the USB/IP driver
++
++obj-m += stub.o
++stub-objs :=  usbip_common.o usbip_event.o stub_dev.o stub_main.o stub_rx.o stub_tx.o
++
++obj-m += vhci.o
++vhci-objs :=  usbip_common.o usbip_event.o vhci_sysfs.o vhci_tx.o vhci_rx.o vhci_hcd.o
++
++
++ifeq ($(DEBUG),y)
++	EXTRA_CFLAGS += -DCONFIG_USBIP_DEBUG
++endif
++
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ gregkh-2.6/drivers/usb/usbib/stub.h	2005-12-01 15:24:14.000000000 -0800
+@@ -0,0 +1,92 @@
++/*
++ * $Id: stub.h 265 2005-09-01 09:24:10Z taka-hir $
++ *
++ * Copyright (C) 2003-2005 Takahiro Hirofuchi <taka-hir@is.naist.jp>
++ *
++ *
++ * This is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307,
++ * USA.
++ */
++
++
++#include "usbip_common.h"
++
++struct stub_device {
++	struct usb_interface *interface;
++	struct list_head list;
++
++	struct usbip_device ud;
++
++	/*
++	 * stub_priv preserves private data of each urb.
++	 * It is allocated as StubPrivCache and assigned to urb->context.
++	 *
++	 * stub_priv is always linked to any one of 3 lists;
++	 * 	priv_init: linked to this until the comletion of a urb.
++	 * 	priv_tx  : linked to this after the completion of a urb.
++	 * 	priv_free: linked to this after the sending of the result.
++	 *
++	 * Any of these list operations should be locked by priv_lock.
++	 */
++	spinlock_t priv_lock;
++	struct list_head priv_init;
++	struct list_head priv_tx;
++	struct list_head priv_free;
++
++};
++
++struct stub_priv {
++	unsigned long seqnum;
++	struct list_head list;
++	struct stub_device *sdev;
++	struct urb *urb;
++
++	/*
++	 * This flag is true between usb_submit_urb() and urb->complete()
++	 * to show a urb needs usb_unlink_urb().
++	 */
++	atomic_t in_submit;
++};
++
++extern kmem_cache_t *StubPrivCache;
++
++#if 0
++enum stub_priv_list_operation {
++	CLEAR_BY_SEQNUM,
++	CLEAR_BY_SDEV,
++	DUMP_ALL
++} ;
++
++int stub_priv_list_data(struct stub_device *, enum stub_priv_list_operation operation, void *arg);
++#endif
++void stub_device_cleanup_urbs(struct stub_device *sdev);
++
++/*
++ * prototype declarations
++ */
++
++
++/* stub_tx.c */
++void stub_complete(struct urb*, struct pt_regs *);
++void stub_tx_loop(struct usbip_task *);
++
++/* stub_dev.c */
++extern struct usb_driver stub_driver;
++
++/* stub_rx.c */
++void stub_rx_loop(struct usbip_task *);
++
++
++//void stub_shutdown_connection(struct usbip_device *sdev);
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ gregkh-2.6/drivers/usb/usbib/stub_dev.c	2005-12-01 15:27:02.000000000 -0800
+@@ -0,0 +1,417 @@
++/*
++ * $Id: stub_dev.c 265 2005-09-01 09:24:10Z taka-hir $
++ *
++ * Copyright (C) 2003-2005 Takahiro Hirofuchi <taka-hir@is.naist.jp>
++ *
++ *
++ * This is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307,
++ * USA.
++ */
++
++#include "stub.h"
++
++
++static int stub_probe(struct usb_interface *interface,  const struct usb_device_id *id);
++static void stub_disconnect(struct usb_interface *interface);
++
++
++/* Now all devices except USB Hub are claimed. */
++static struct usb_device_id stub_table [] = {
++#if 0
++	{ USB_DEVICE(0x05ac, 0x0301) },   /* Mac 1 button mouse */
++	{ USB_DEVICE(0x0430, 0x0009) },   /* Plat Home Keyboard */
++	{ USB_DEVICE(0x059b, 0x0001) },   /* Iomega USB Zip 100 */
++	{ USB_DEVICE(0x04b3, 0x4427) },   /* IBM USB CD-ROM */
++	{ USB_DEVICE(0x05a9, 0xa511) },   /* LifeView USB cam */
++	{ USB_DEVICE(0x55aa, 0x0201) },   /* Imation card reader */
++	{ USB_DEVICE(0x046d, 0x0870) },   /* Qcam Express(QV-30) */
++	{ USB_DEVICE(0x04bb, 0x0101) },   /* IO-DATA HD 120GB */
++	{ USB_DEVICE(0x04bb, 0x0904) },   /* IO-DATA USB-ET/TX */
++	{ USB_DEVICE(0x04bb, 0x0201) },   /* IO-DATA USB-ET/TX */
++	{ USB_DEVICE(0x08bb, 0x2702) },   /* ONKYO USB Speaker */
++	{ USB_DEVICE(0x046d, 0x08b2) },   /* Logicool Qcam 4000 Pro */
++#endif
++	{ .driver_info = 1 },
++	{ }                                     /* Terminating entry */
++};
++
++#include <linux/module.h>
++MODULE_DEVICE_TABLE (usb, stub_table);
++
++/* usb specific object needed to register this driver with the usb subsystem */
++struct usb_driver stub_driver = {
++		.name  =	"usbip_stub",
++		.probe =	stub_probe,
++		.disconnect =	stub_disconnect,
++		/* If id_table is null and any other driver claimed,
++		 * probe() is always called . */
++		.id_table =    stub_table,
++};
++
++
++
++
++
++/* ------------------------------------------------------------ */
++/* ------------------------------------------------------------ */
++/* ------------------------------------------------------------ */
++
++
++static ssize_t show_status(struct device *dev, struct device_attribute *attr,
++			   char *buf)
++{
++	struct stub_device *sdev = dev_get_drvdata(dev);
++	int status;
++
++	if (!sdev) {
++		VHCI_ERROR("sdev is null\n");
++		return -ENODEV;
++	}
++
++	spin_lock(&sdev->ud.lock);
++	status = sdev->ud.status;
++	spin_unlock(&sdev->ud.lock);
++
++	return snprintf(buf, PAGE_SIZE, "%d\n", status);
++}
++static DEVICE_ATTR(usbip_status, S_IRUGO, show_status, NULL);
++
++static ssize_t store_sockfd(struct device *dev, struct device_attribute *attr,
++			    const char *buf, size_t count)
++{
++	struct stub_device *sdev = dev_get_drvdata(dev);
++	int sockfd = 0;
++	struct socket *socket;
++
++	if (!sdev) {
++		VHCI_ERROR("sdev is null\n");
++		return -ENODEV;
++	}
++
++	sscanf(buf, "%u", &sockfd);
++
++	if (sockfd != 0) {
++		VHCI_INFO("stub up\n");
++
++		spin_lock(&sdev->ud.lock);
++
++		if (sdev->ud.status != SDEV_ST_AVAILABLE) {
++			VHCI_ERROR("not ready\n");
++			spin_unlock(&sdev->ud.lock);
++			return -EINVAL;
++		}
++
++		socket = sockfd_to_socket(sockfd);
++		if (!socket) {
++			spin_unlock(&sdev->ud.lock);
++			return -EINVAL;
++		}
++
++		setnodelay(socket);
++		setkeepalive(socket);
++		setreuse(socket);
++
++		sdev->ud.tcp_socket = socket;
++
++		spin_unlock(&sdev->ud.lock);
++
++		usbip_start_threads(&sdev->ud);
++
++		spin_lock(&sdev->ud.lock);
++		sdev->ud.status = SDEV_ST_USED;
++		spin_unlock(&sdev->ud.lock);
++
++
++	} else {
++		VHCI_INFO("stub down\n");
++
++		spin_lock(&sdev->ud.lock);
++		if (sdev->ud.status != SDEV_ST_USED) {
++			spin_unlock(&sdev->ud.lock);
++			return -EINVAL;
++		}
++		spin_unlock(&sdev->ud.lock);
++
++		usbip_event_add(&sdev->ud, SDEV_EVENT_DOWN);
++	}
++
++	return count;
++}
++
++static ssize_t show_sockfd(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct stub_device *sdev = dev_get_drvdata(dev);
++
++	if (!sdev) {
++		VHCI_ERROR("sdev is null\n");
++		return -ENODEV;
++	}
++
++	return snprintf(buf, PAGE_SIZE, "%d\n", 0);
++}
++static DEVICE_ATTR(usbip_sockfd, S_IWUGO | S_IRUGO, show_sockfd, store_sockfd);
++
++static void stub_add_files(struct device *dev)
++{
++	device_create_file(dev, &dev_attr_usbip_status);
++	device_create_file(dev, &dev_attr_usbip_sockfd);
++	device_create_file(dev, &dev_attr_usbip_debug);
++}
++
++static void stub_remove_files(struct device *dev)
++{
++	device_remove_file(dev, &dev_attr_usbip_status);
++	device_remove_file(dev, &dev_attr_usbip_sockfd);
++	device_remove_file(dev, &dev_attr_usbip_debug);
++}
++
++
++
++/* ------------------------------------------------------------ */
++/* ------------------------------------------------------------ */
++/* ------------------------------------------------------------ */
++
++static void stub_shutdown_connection(struct usbip_device *ud)
++{
++	struct stub_device *sdev = container_of(ud, struct stub_device, ud);
++
++	/* 1. stop threads */
++	usbip_stop_threads(ud);
++
++	/* 2. close the socket */
++	/*
++	 * tcp_socket is freed after threads are killed.
++	 * So usbip_xmit do not touch NULL socket.
++	 */
++	if(ud->tcp_socket != NULL) {
++		sock_release(ud->tcp_socket);
++		ud->tcp_socket = NULL;
++	}
++
++	/* 3. free used data */
++	//stub_priv_list_data(sdev, CLEAR_BY_SDEV, NULL);
++	stub_device_cleanup_urbs(sdev);
++}
++
++
++static void stub_device_reset(struct usbip_device *ud)
++{
++	struct stub_device *sdev = container_of(ud, struct stub_device, ud);
++	struct usb_device *udev = interface_to_usbdev(sdev->interface);
++	int ret;
++
++	ret = usb_lock_device_for_reset(udev, sdev->interface);
++	if(ret < 0) {
++		VHCI_ERROR("lock for reset\n");
++
++		spin_lock(&ud->lock);
++		ud->status = SDEV_ST_ERROR;
++		spin_unlock(&ud->lock);
++
++		return;
++	}
++
++	/* try to reset the device */
++	ret = usb_reset_device(udev);
++
++	usb_unlock_device(udev);
++
++	spin_lock(&ud->lock);
++	if(ret) {
++		VHCI_ERROR("device reset\n");
++		ud->status = SDEV_ST_ERROR;
++
++	} else {
++		VHCI_INFO("device reset\n");
++		ud->status = SDEV_ST_AVAILABLE;
++
++	}
++	spin_unlock(&ud->lock);
++
++	return;
++}
++
++static void stub_device_unusable(struct usbip_device *ud)
++{
++	spin_lock(&ud->lock);
++	ud->status = SDEV_ST_ERROR;
++	spin_unlock(&ud->lock);
++}
++
++
++/* ------------------------------------------------------------ */
++/* ------------------------------------------------------------ */
++/* ------------------------------------------------------------ */
++
++/**
++ * stub_device_alloc - allocate a new stub_device struct
++ * @interface: usb_interface of a new device
++ *
++ * Allocates and initializes a new stub_devce struct.
++ */
++struct stub_device * stub_device_alloc(struct usb_interface *interface)
++{
++	struct stub_device *sdev;
++
++
++	/* yes, it's a new device */
++	sdev = (struct stub_device *) kmalloc(sizeof(struct stub_device), GFP_KERNEL);
++	if(!sdev) {
++		VHCI_ERROR("no memory for stub_device\n");
++		return NULL;
++	}
++
++	memset(sdev, 0, sizeof(struct stub_device));
++
++	sdev->interface = interface;
++
++
++	usbip_task_init(&sdev->ud.tcp_rx, "stub_rx", stub_rx_loop);
++	usbip_task_init(&sdev->ud.tcp_tx, "stub_tx", stub_tx_loop);
++
++	sdev->ud.side = USBIP_STUB;
++	sdev->ud.status = SDEV_ST_AVAILABLE;
++	sdev->ud.lock = SPIN_LOCK_UNLOCKED;
++	sdev->ud.tcp_socket = NULL;
++
++	INIT_LIST_HEAD(&sdev->priv_init);
++	INIT_LIST_HEAD(&sdev->priv_tx);
++	INIT_LIST_HEAD(&sdev->priv_free);
++	sdev->priv_lock = SPIN_LOCK_UNLOCKED;
++
++	sdev->ud.eh_ops.shutdown = stub_shutdown_connection;
++	sdev->ud.eh_ops.reset    = stub_device_reset;
++	sdev->ud.eh_ops.unusable = stub_device_unusable;
++
++	usbip_start_eh(&sdev->ud);
++
++	VHCI_DEBUG("register new interface\n");
++	return sdev;
++}
++
++int stub_device_free(struct stub_device *sdev)
++{
++	if( !sdev ) return -EINVAL;
++
++	kfree(sdev);
++	VHCI_DEBUG("kfree udev ok\n");
++
++	return 0;
++}
++
++static int stub_probe(struct usb_interface *interface, const struct usb_device_id *id)
++{
++	struct usb_device *udev = interface_to_usbdev(interface);
++	struct stub_device *sdev = NULL;
++
++	VHCI_DEBUG("Enter\n");
++
++	/* We do not claim HUB device */
++	if(udev->descriptor.bDeviceClass ==  USB_CLASS_HUB) {
++		VHCI_DEBUG("HUB device, we do no claim\n");
++		return -ENOMEM;
++	}
++
++#include <linux/string.h>
++	if(strcmp(udev->bus->bus_name, "VHCI") == 0) {
++		VHCI_DEBUG("dev's bus is VHCI, so do not go anymore!\n");
++		return -ENOMEM;
++	}
++
++
++	if((sdev = stub_device_alloc(interface)) != NULL) {
++		struct usb_device *udev = interface_to_usbdev(interface);
++
++		VHCI_INFO("USB/IP Stub: new inteface register, bus %u dev %u ifn %u\n",
++				udev->bus->busnum, udev->devnum, interface->cur_altsetting->desc.bInterfaceNumber);
++	} else {
++		VHCI_ERROR("error \n"); return -ENOMEM;
++	}
++
++
++	/* init MUTEX LOCKED here? */
++
++
++	{
++		int i;
++		for(i=0; i< interface->num_altsetting; i++) {
++			VHCI_INFO("alt %u ", interface->altsetting[i].desc.bAlternateSetting);
++			printk("NrEp %u ", interface->altsetting[i].desc.bNumEndpoints);
++			printk("Cls %x ", interface->altsetting[i].desc.bInterfaceClass);
++			printk("SCls %x ", interface->altsetting[i].desc.bInterfaceSubClass);
++			printk("Pro %x ", interface->altsetting[i].desc.bInterfaceProtocol);
++			printk("\n");
++		}
++	}
++
++
++#if 0
++	/* set dummy configuration value for being called stub_disconnect */
++	/* Most devices have just one configration. */
++	if(usb_set_configuration (udev, 0) < 0) {
++		VHCI_ERROR("set_configuration failed\n");
++		return -ENODEV;
++	}
++#endif
++
++	/* set private data to usb_interface */
++	usb_set_intfdata(interface, sdev);
++
++
++	stub_add_files(&interface->dev);
++
++	return 0;
++}
++
++
++
++
++/* called in usb_disconnect() or usb_deregister()
++ * but only if actconfig(active configuration) exists */
++static void stub_disconnect(struct usb_interface *interface)
++{
++	struct stub_device *sdev = usb_get_intfdata(interface);
++	//struct usb_device *udev = interface_to_usbdev(interface);
++
++	VHCI_DEBUG("Enter\n");
++
++	/* get stub_device */
++	if(!sdev) BUG();
++
++	usb_set_intfdata(interface, NULL);
++
++
++	/*
++	 * NOTE:
++	 * In future, rx/tx threads are invoked for each usb_device.
++	 * And, the Stub driver probes each usb_interface.
++	 *
++	 * But, a usb device driver is responsible for *a* usb_interace.
++	 * It's not a good solution.
++	 */
++	stub_remove_files(&interface->dev);
++
++	/* 1. shutdown the current connection */
++	usbip_event_add(&sdev->ud, SDEV_EVENT_REMOVED);
++
++	/* 2. wait for the stop of the event handler */
++	usbip_stop_eh(&sdev->ud);
++
++	/* 3. free sdev */
++	stub_device_free(sdev);
++
++
++	VHCI_DEBUG("bye\n");
++}
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ gregkh-2.6/drivers/usb/usbib/stub_main.c	2005-12-01 15:21:50.000000000 -0800
+@@ -0,0 +1,317 @@
++/*
++ * $Id: stub_main.c 265 2005-09-01 09:24:10Z taka-hir $
++ *
++ * Copyright (C) 2003-2005 Takahiro Hirofuchi <taka-hir@is.naist.jp>
++ *
++ *
++ * This is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307,
++ * USA.
++ */
++
++
++#include "stub.h"
++
++/* Version Information */
++#define DRIVER_VERSION "$Id: stub_main.c 265 2005-09-01 09:24:10Z taka-hir $"
++#define DRIVER_AUTHOR "Takahiro Hirofuchi <taka-hir@is.naist.jp>"
++#define DRIVER_DESC "Stub Driver for USB/IP"
++
++
++
++/* stub_priv is allocated from StubPrivCache */
++kmem_cache_t *StubPrivCache = NULL;
++
++
++static int __init usb_stub_init(void)
++{
++	int ret;
++
++	StubPrivCache = kmem_cache_create("stub_priv", sizeof(struct stub_priv),
++			0, SLAB_HWCACHE_ALIGN, NULL, NULL);
++	if( !StubPrivCache ) {
++		VHCI_ERROR("create stub_priv_cache\n");
++		return -ENOMEM;
++	}
++
++	ret = usb_register(&stub_driver);
++	if(ret) {
++		VHCI_ERROR("usb_register failed %d\n", ret);
++		return ret;
++	}
++
++
++	info(DRIVER_DESC "" DRIVER_VERSION);
++	return ret;
++}
++
++
++#if 0
++static void free_priv_data(struct stub_priv *priv)
++{
++	int ret;
++	struct urb *urb = priv->urb;
++	VHCI_DEBUG("priv %p urb %p seq %lu\n", priv, urb, priv->seqnum);
++
++	/* A urb in HCD is unlinked asynchronously. */
++	if(atomic_read(&priv->in_submit)) {
++		/* this needs to be synchronous.
++		 * because it may free urb and etc before stub_complete is called.
++		 * stub_complete may touch a nulled urb.
++		 */
++		ret = usb_unlink_urb(urb);
++		if(ret != -EINPROGRESS) {
++			uerr("usb_unlink_urb error, ret %d\n", ret);
++		}
++	}
++
++	/* free priv, buffers and the urb */
++	list_del(&priv->list);
++	kmem_cache_free(StubPrivCache, priv);
++	if(urb->transfer_buffer != NULL)
++		kfree(urb->transfer_buffer);
++	if(urb->setup_packet != NULL)
++		kfree(urb->setup_packet);
++	usb_free_urb(urb);
++}
++
++
++static void free_list_data(struct list_head *listhead)
++{
++	struct stub_priv *priv, *tmp;
++
++	list_for_each_entry_safe(priv, tmp, listhead, list) {
++		free_priv_data(priv);
++	}
++}
++
++static void free_list_data_by_seqnum(struct list_head *listhead, __u32 seqnum)
++{
++	struct stub_priv *priv, *tmp;
++
++	list_for_each_entry_safe(priv, tmp, listhead, list) {
++		if(priv->seqnum == seqnum)
++			free_priv_data(priv);
++	}
++}
++
++
++static int dump_priv_data(struct list_head *listhead, char *out)
++{
++	struct list_head *ptr;
++	struct stub_priv *priv;
++	char *s = out;
++
++
++	for(ptr = listhead->next; ptr != listhead; ptr = ptr->next) {
++		priv = list_entry(ptr, struct stub_priv, list);
++
++		out += sprintf(out, "Sub ");
++		out += sprintf(out, "%10lu ", priv->seqnum);
++
++		switch (usb_pipetype(priv->urb->pipe)) {
++			case PIPE_CONTROL:
++				out += sprintf(out, "%s ", "CTL");
++				break;
++			case PIPE_BULK:
++				out += sprintf(out, "%s ", "BLK");
++				break;
++			case PIPE_INTERRUPT:
++				out += sprintf(out, "%s ", "INT");
++				break;
++			case PIPE_ISOCHRONOUS:
++				out += sprintf(out, "%s ", "ISO");
++				break;
++		}
++
++		if( usb_pipein(priv->urb->pipe) ) {
++			out += sprintf(out, "%s ", "IN ");
++		} else {
++			out += sprintf(out, "%s ", "OUT");
++		}
++
++		out += sprintf(out, "\n");
++	}
++
++	return out - s;
++}
++#endif
++
++static struct stub_priv *stub_priv_pop_from_listhead(struct list_head *listhead)
++{
++	struct stub_priv *priv, *tmp;
++
++	list_for_each_entry_safe(priv, tmp, listhead, list) {
++		list_del(&priv->list);
++		return priv;
++	}
++
++	return NULL;
++}
++
++static struct stub_priv *stub_priv_pop(struct stub_device *sdev)
++{
++	unsigned long flags;
++	struct stub_priv *priv;
++
++	spin_lock_irqsave(&sdev->priv_lock, flags);
++
++	priv = stub_priv_pop_from_listhead(&sdev->priv_init);
++	if(priv) {
++		spin_unlock_irqrestore(&sdev->priv_lock, flags);
++		return priv;
++	}
++
++	priv = stub_priv_pop_from_listhead(&sdev->priv_tx);
++	if(priv) {
++		spin_unlock_irqrestore(&sdev->priv_lock, flags);
++		return priv;
++	}
++
++	priv = stub_priv_pop_from_listhead(&sdev->priv_free);
++	if(priv) {
++		spin_unlock_irqrestore(&sdev->priv_lock, flags);
++		return priv;
++	}
++
++	spin_unlock_irqrestore(&sdev->priv_lock, flags);
++	return NULL;
++}
++
++void stub_device_cleanup_urbs(struct stub_device *sdev)
++{
++	struct stub_priv *priv;
++
++	udbg("free sdev %p\n", sdev);
++	while((priv = stub_priv_pop(sdev))){
++		struct urb *urb = priv->urb;
++		udbg("   free urb %p\n", urb);
++
++		usb_kill_urb(urb);
++		kmem_cache_free(StubPrivCache, priv);
++		if(urb->transfer_buffer != NULL)
++			kfree(urb->transfer_buffer);
++		if(urb->setup_packet != NULL)
++			kfree(urb->setup_packet);
++		usb_free_urb(urb);
++
++	}
++}
++
++#if 0
++static void free_priv_data(struct stub_priv *priv)
++{
++	int ret;
++	struct urb *urb = priv->urb;
++	VHCI_DEBUG("priv %p urb %p seq %lu\n", priv, urb, priv->seqnum);
++
++	/* A urb in HCD is unlinked asynchronously. */
++	if(atomic_read(&priv->in_submit)) {
++		/* this needs to be synchronous.
++		 * because it may free urb and etc before stub_complete is called.
++		 * stub_complete may touch a nulled urb.
++		 */
++		ret = usb_unlink_urb(urb);
++		if(ret != -EINPROGRESS) {
++			uerr("usb_unlink_urb error, ret %d\n", ret);
++		}
++	}
++
++	/* free priv, buffers and the urb */
++	list_del(&priv->list);
++	kmem_cache_free(StubPrivCache, priv);
++	if(urb->transfer_buffer != NULL)
++		kfree(urb->transfer_buffer);
++	if(urb->setup_packet != NULL)
++		kfree(urb->setup_packet);
++	usb_free_urb(urb);
++}
++
++int stub_priv_list_data(struct stub_device *sdev, enum stub_priv_list_operation operation, void *arg)
++{
++	unsigned long flags;
++	int ret = 0;
++	__u32 seqnum;
++	char *out, *s;
++
++	spin_lock_irqsave(&sdev->priv_lock, flags);
++
++	switch(operation) {
++		case CLEAR_BY_SDEV:
++			free_list_data(&sdev->priv_init);
++			free_list_data(&sdev->priv_tx);
++			free_list_data(&sdev->priv_free);
++			break;
++
++		case CLEAR_BY_SEQNUM:
++			seqnum =  *((__u32 *) arg);
++			free_list_data_by_seqnum(&sdev->priv_init, seqnum);
++			free_list_data_by_seqnum(&sdev->priv_tx, seqnum);
++			free_list_data_by_seqnum(&sdev->priv_free, seqnum);
++			break;
++
++		case DUMP_ALL:
++			out = (char *) arg;
++			s = out;
++			out += sprintf(out, "priv_init\n");
++			out += dump_priv_data(&sdev->priv_init, out);
++			out += sprintf(out+ret, "priv_tx\n");
++			out += dump_priv_data(&sdev->priv_init, out);
++			out += sprintf(out+ret, "priv_free\n");
++			out += dump_priv_data(&sdev->priv_init, out);
++			ret = out -s;
++			break;
++
++		default:
++			/* NOTREACHED */
++			VHCI_ERROR("BUG\n");
++	}
++
++	spin_unlock_irqrestore(&sdev->priv_lock, flags);
++
++	return ret;
++}
++#endif
++
++
++static void __exit usb_stub_exit(void)
++{
++	int ret;
++
++	VHCI_DEBUG("enter\n");
++
++
++	/* deregister() calls stub_disconnect() for all devices. Device
++	 * specific data is cleared in stub_disconnect(). */
++	usb_deregister(&stub_driver);
++
++
++	ret = kmem_cache_destroy(StubPrivCache);
++	if (ret != 0) {
++		VHCI_ERROR("memory leak of stub_priv, %d\n", ret);
++	}
++
++
++	VHCI_DEBUG("bye\n");
++}
++
++
++
++
++module_init (usb_stub_init);
++module_exit (usb_stub_exit);
++
++MODULE_AUTHOR(DRIVER_AUTHOR);
++MODULE_DESCRIPTION(DRIVER_DESC);
++MODULE_LICENSE("GPL");
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ gregkh-2.6/drivers/usb/usbib/stub_rx.c	2005-12-01 15:21:50.000000000 -0800
+@@ -0,0 +1,346 @@
++/*
++ * $Id: stub_rx.c 276 2005-11-22 08:06:10Z taka-hir $
++ *
++ * Copyright (C) 2003-2005 Takahiro Hirofuchi <taka-hir@is.naist.jp>
++ *
++ *
++ * This is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307,
++ * USA.
++ */
++
++#include "stub.h"
++
++
++
++static void check_clear_halt(struct urb *urb)
++{
++	struct usb_ctrlrequest *req;
++
++	if(usb_pipetype(urb->pipe) != PIPE_CONTROL) {
++		dbg_stub_rx("not clear halt command\n");
++		return;
++	}
++
++	if(!urb->setup_packet) {
++		dbg_stub_rx("no need for check clear halt\n");
++		return;
++	}
++
++	req = (struct usb_ctrlrequest *) urb->setup_packet;
++
++	if(req->bRequest == USB_REQ_CLEAR_FEATURE
++			&& req->bRequestType == USB_RECIP_ENDPOINT
++			&& req->wValue == USB_ENDPOINT_HALT) {
++		/* CLEAR HALT command */
++		/* the next line is wrong.
++		 * because we must clear halt of stalled endpoint. */
++		//int endp = usb_pipeendpoint(urb->pipe);
++
++		/* wIndex is 2bytes and it has target endpoint number. */
++		int endp = (req->wIndex & 0x000f );
++		int in = (req->wIndex & 0x0080 );   /* include USB_DIR_IN bit */
++		//int target_pipe = usb_rcvctrlpipe(urb->dev, endp);
++		int target_pipe ;
++		int ret;
++
++		if(in) {
++			dbg_stub_rx("in\n");
++			target_pipe = usb_rcvctrlpipe(urb->dev, endp);
++		} else {
++			dbg_stub_rx("out\n");
++			target_pipe = usb_sndctrlpipe(urb->dev, endp);
++		}
++
++
++
++		dbg_stub_rx("CLEAR HALT command, devnum %d endp %d\n", urb->dev->devnum, endp);
++		ret = usb_clear_halt(urb->dev, target_pipe);
++		if(ret == 0) {
++			VHCI_INFO("clear halt ep %d ok\n",endp);
++		} else {
++			VHCI_INFO("clear halt ep %d failed, ret %d\n", endp, ret);
++		}
++
++
++	} else if(req->bRequest == USB_REQ_SET_INTERFACE
++			&& req->bRequestType == USB_RECIP_INTERFACE) {
++		/* SET INTERFACE command */
++		__u16 alternate = req->wValue;
++		__u16 interface = req->wIndex;
++
++		dbg_stub_rx("SET INTERFACE command, interface %u alternate %u\n", interface, alternate);
++
++		usb_set_interface(urb->dev,   interface,  alternate);
++
++	} else {
++		dbg_stub_rx("not a clear halt command\n");
++	}
++}
++
++
++
++
++
++
++static int stub_recv_unlink(struct stub_device *sdev, struct usbip_header *pdu)
++{
++	__u32 seqnum = pdu->unlink.seqnum;
++	struct list_head *listhead = &sdev->priv_init;
++	struct list_head *ptr;
++	struct stub_priv *priv;
++	struct urb *urb = NULL;
++	int ret;
++
++	uinfo("recv_unlink: %d\n", seqnum);
++
++	spin_lock(&sdev->priv_lock);
++
++	for(ptr = listhead->next; ptr != listhead; ptr = ptr->next) {
++		priv = list_entry(ptr, struct stub_priv, list);
++		if(priv->seqnum == seqnum) {
++			spin_unlock(&sdev->priv_lock);
++			urb =  priv->urb;
++			break;
++		}
++	}
++
++	if(!urb){
++		uinfo("An unlinking urb is already completed.\n");
++		uinfo("Or, to begin with, stub did not recieve the urb\n");
++		spin_unlock(&sdev->priv_lock);
++		return 0;
++	}
++
++	ret = usb_unlink_urb(urb);
++	if(ret != -EINPROGRESS)
++		uerr("faild to unlink a urb %p, ret %d\n", urb, ret);
++
++	spin_unlock(&sdev->priv_lock);
++
++	return 0;
++}
++
++
++static int valid_request(struct stub_device *sdev, struct usbip_header *pdu)
++{
++	struct usbip_device *ud = &sdev->ud;
++
++	int bus = interface_to_busnum(sdev->interface);
++	int dev = interface_to_devnum(sdev->interface);
++
++	if( pdu->base.busnum == bus && pdu->base.devnum == dev ) {
++
++		spin_lock(&ud->lock);
++		if(ud->status == SDEV_ST_USED) {
++			/* A request is valid. */
++			spin_unlock(&ud->lock);
++			return 1;
++		}
++
++		spin_unlock(&ud->lock);
++	}
++
++	return 0;
++}
++
++
++
++
++
++static void stub_recv_submit(struct stub_device *sdev, struct usbip_header *pdu)
++{
++	int ret;
++	struct stub_priv *priv = NULL;
++	struct usbip_device *ud = &sdev->ud;
++
++
++	/*
++	 * After a stub_priv is linked to a list_head,
++	 * the error handler can free allocated data.
++	 */
++	{
++		unsigned long flag;
++
++		spin_lock_irqsave(&sdev->priv_lock, flag);
++
++		priv = kmem_cache_alloc(StubPrivCache, GFP_ATOMIC);
++		if( !priv ) {
++			VHCI_ERROR("malloc stub_priv\n");
++			spin_unlock_irqrestore(&sdev->priv_lock, flag);
++			usbip_event_add(ud, SDEV_EVENT_ERROR_MALLOC);
++			return ;
++		}
++		memset(priv, 0, sizeof(struct stub_priv));
++
++		priv->seqnum = pdu->base.seqnum;
++		priv->sdev = sdev;
++
++
++		list_add_tail(&priv->list, &sdev->priv_init);
++		spin_unlock_irqrestore(&sdev->priv_lock, flag);
++	}
++
++
++
++	/*
++	 * setup a urb
++	 */
++
++	if(usb_pipeisoc(pdu->base.pipe)) {
++		priv->urb = usb_alloc_urb(pdu->submit.number_of_packets, GFP_KERNEL);
++	} else {
++		priv->urb = usb_alloc_urb(0, GFP_KERNEL);
++	}
++	if(!priv->urb) {
++		VHCI_ERROR("malloc urb\n");
++		usbip_event_add(ud, SDEV_EVENT_ERROR_MALLOC);
++		return;
++	}
++
++
++	/* set priv->urb->transfer_buffer */
++	if(pdu->submit.transfer_buffer_length > 0) {
++		priv->urb->transfer_buffer = kmalloc(pdu->submit.transfer_buffer_length, GFP_KERNEL);
++		if(!priv->urb->transfer_buffer) {
++			VHCI_ERROR("malloc x_buff\n");
++			usbip_event_add(ud, SDEV_EVENT_ERROR_MALLOC);
++			return;
++		}
++		memset(priv->urb->transfer_buffer, 0, pdu->submit.transfer_buffer_length);
++	}
++
++	/* set priv->urb->setup_packet */
++	{
++		priv->urb->setup_packet = kmalloc(8, GFP_KERNEL);
++		if(!priv->urb->setup_packet) {
++			VHCI_ERROR("allocate setup_packet\n");
++			usbip_event_add(ud, SDEV_EVENT_ERROR_MALLOC);
++			return;
++		}
++		memset(priv->urb->setup_packet, 0, 8);
++		memcpy(priv->urb->setup_packet, &pdu->submit.setup, 8);
++	}
++
++	priv->urb->context                = (void *) priv;
++	priv->urb->dev                    = interface_to_usbdev(sdev->interface);
++	priv->urb->pipe                   = pdu->base.pipe;
++	priv->urb->complete               = stub_complete;
++
++	usbip_pack_pdu(pdu, priv->urb, VHC_C_SUBMIT, 0);
++
++
++	if( usbip_recv_xbuff(ud, priv->urb) < 0 ) return;
++
++	if( usbip_recv_iso(ud, priv->urb) < 0 ) return;
++
++
++
++	check_clear_halt(priv->urb);
++
++	/*
++	 * stub_recv_unlink() unlinks the URB by a call to usb_unlink_urb().
++	 * By unlinking the urb asynchronously, stub_rx can continuously
++	 * process comming urbs.  Even if the urb is unlinked, its completion
++	 * handler will be called and stub_tx will send a return pdu.
++	 */
++
++	atomic_set(&priv->in_submit, 1);
++
++	ret = usb_submit_urb(priv->urb, GFP_KERNEL);
++
++	if(ret == 0) {
++		dbg_stub_rx("submit urb ok, seqnum %u\n", pdu->base.seqnum);
++	} else {
++		VHCI_ERROR("submit_urb error, %d\n", ret);
++
++		/*
++		 * Pessimistic.
++		 * This connection will be discared.
++		 */
++		usbip_event_add(ud, SDEV_EVENT_ERROR_SUBMIT);
++	}
++
++
++	dbg_stub_rx("Leave\n");
++	return;
++
++}
++
++
++/* recv a pdu */
++static void stub_rx_pdu(struct usbip_device *ud)
++{
++	int ret;
++	struct usbip_header pdu;
++	struct stub_device *sdev = container_of(ud, struct stub_device, ud);
++
++
++	dbg_stub_rx("Enter\n");
++
++	memset(&pdu, 0, sizeof(pdu));
++
++
++	/* 1. recieve a pdu header */
++	ret = usbip_xmit(0, ud->tcp_socket, (char *) &pdu, sizeof(pdu),0);
++	if(ret != sizeof(pdu)) {
++		VHCI_ERROR("recv a header, %d\n", ret);
++		usbip_event_add(ud, SDEV_EVENT_ERROR_TCP);
++		return;
++	}
++
++	if(dbg_flag_stub_rx)
++		usbip_dump_header(&pdu);
++
++	if(!valid_request(sdev, &pdu)) {
++		VHCI_ERROR("recv invalid request\n");
++		usbip_event_add(ud, SDEV_EVENT_ERROR_TCP);
++		return;
++	}
++
++	switch(pdu.base.command) {
++		case VHC_C_UNLINK:
++			stub_recv_unlink(sdev, &pdu);
++			break;
++
++		case VHC_C_SUBMIT:
++			stub_recv_submit(sdev, &pdu);
++			break;
++
++		default:
++			/* NOTREACHED */
++			VHCI_ERROR("unknown pdu\n");
++			usbip_event_add(ud, SDEV_EVENT_ERROR_TCP);
++			return;
++	}
++
++}
++
++
++void stub_rx_loop(struct usbip_task *ut) {
++	struct usbip_device *ud = container_of(ut, struct usbip_device, tcp_rx);
++
++	while(1) {
++		if(signal_pending(current)) {
++			dbg_stub_rx("signal catched!\n");
++			break;
++		}
++
++
++		if( usbip_event_happend(ud) ) break;
++
++		stub_rx_pdu(ud);
++	}
++}
++
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ gregkh-2.6/drivers/usb/usbib/stub_tx.c	2005-12-01 15:21:50.000000000 -0800
+@@ -0,0 +1,227 @@
++/*
++ * $Id: stub_tx.c 265 2005-09-01 09:24:10Z taka-hir $
++ *
++ * Copyright (C) 2003-2005 Takahiro Hirofuchi <taka-hir@is.naist.jp>
++ *
++ *
++ * This is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307,
++ * USA.
++ */
++
++#include "stub.h"
++
++
++
++static DECLARE_WAIT_QUEUE_HEAD(waitq);
++
++
++
++/**
++ * stub_complete - completion handler of a usbip urb
++ * @urb: pointer to the urb completed
++ * @regs:
++ *
++ * When a urb has completed, the USB core driver calls this function in the
++ * interrupt context. To return the result of a urb, the completed urb is
++ * linked to the pending list of returning.
++ *
++ */
++void stub_complete(struct urb *urb, struct pt_regs *regs)
++{
++	struct stub_priv *priv = (struct stub_priv *) urb->context;
++	struct stub_device *sdev = priv->sdev;
++
++	dbg_stub_tx("complete! status %d\n", urb->status);
++
++
++	switch (urb->status) {
++		case 0:
++			/* OK */
++			break;
++		case -ENOENT:
++			uinfo("stopped by a call to usb_kill_urb()\n");
++			uinfo("because of cleaning up a virtual connection\n");
++			return;
++		case -ECONNRESET:
++			uinfo("unlinked by a call to usb_unlink_urb()\n");
++			break;
++		case -EPIPE:
++			uinfo("endpoint is stalled\n");
++			break;
++		default:
++			VHCI_ERROR("NOT YET: completion with non-zero status %d\n", urb->status);
++	}
++
++
++	/* link a urb to the queue of tx. */
++	{
++		unsigned long flags;
++
++		atomic_set(&priv->in_submit, 0);
++
++		spin_lock_irqsave(&sdev->priv_lock, flags);
++		list_move_tail(&priv->list, &sdev->priv_tx);
++		spin_unlock_irqrestore(&sdev->priv_lock, flags);
++	}
++
++
++	/* wake up tx_thread */
++	wake_up(&waitq);
++}
++
++
++
++
++
++static void setup_pdu(struct usbip_header *rpdu, struct urb *urb)
++{
++	struct stub_priv *priv = (struct stub_priv *) urb->context;
++
++
++	rpdu->base.command = VHC_C_RETURN;
++	rpdu->base.pipe = urb->pipe;
++	rpdu->base.seqnum = priv->seqnum;
++
++	usbip_pack_pdu(rpdu, urb, VHC_C_RETURN, 1);
++}
++
++
++#define MAX_SUBMIT_QUEUE_DEPTH	100
++static struct usbip_header ReturnPDU[MAX_SUBMIT_QUEUE_DEPTH];
++
++
++
++/* create msghdr to tx from the StubPrivListPendingTX queue */
++static int stub_send_txdata(struct stub_device *sdev)
++{
++	unsigned long flags;
++	struct stub_priv *priv, *tmp;
++	size_t txsize = 0;
++	int count = 0;
++
++	struct msghdr msg;
++	struct iovec iov[MAX_SUBMIT_QUEUE_DEPTH];
++
++	memset(iov, 0, sizeof(iov));
++	memset(&msg, 0, sizeof(msg));
++	msg.msg_iov = iov;
++	msg.msg_iovlen = 0;
++
++	memset(&ReturnPDU, 0, sizeof(struct usbip_header) * MAX_SUBMIT_QUEUE_DEPTH);
++
++
++	spin_lock_irqsave(&sdev->priv_lock, flags);
++
++	list_for_each_entry_safe(priv, tmp, &sdev->priv_tx, list) {
++		struct urb *urb = priv->urb;
++
++		dbg_stub_tx("setup txdata for urb %p\n", urb);
++
++		/* 1. setup usbip_header */
++		setup_pdu(&ReturnPDU[count], urb);
++
++		iov[msg.msg_iovlen].iov_base = (void *) &ReturnPDU[count];
++		iov[msg.msg_iovlen].iov_len  = sizeof(struct usbip_header);
++		msg.msg_iovlen++;
++		txsize += sizeof(struct usbip_header);
++
++		/* 2. setup transfer buffer */
++		if(usb_pipein(urb->pipe) && urb->transfer_buffer != NULL && urb->actual_length > 0) {
++			iov[msg.msg_iovlen].iov_base = urb->transfer_buffer;
++			iov[msg.msg_iovlen].iov_len  = urb->actual_length;
++			msg.msg_iovlen++;
++			txsize += urb->actual_length;
++		}
++
++		/* 3. setup iso_packet_descriptor */
++		if(usb_pipetype(urb->pipe) == PIPE_ISOCHRONOUS) {
++			iov[msg.msg_iovlen].iov_base = &urb->iso_frame_desc[0];
++			iov[msg.msg_iovlen].iov_len  = urb->number_of_packets * sizeof(struct usb_iso_packet_descriptor);
++			msg.msg_iovlen++;
++			txsize += urb->number_of_packets * sizeof(struct usb_iso_packet_descriptor);
++		}
++
++		list_move_tail(&priv->list, &sdev->priv_free);
++
++
++		count++;
++		if(count == MAX_SUBMIT_QUEUE_DEPTH) {
++			uinfo("max urbs are processed, %d\n", MAX_SUBMIT_QUEUE_DEPTH);
++			break;
++		}
++
++	}
++
++	spin_unlock_irqrestore(&sdev->priv_lock, flags);
++
++	if(txsize > 0) {
++		int ret;
++		ret = usbip_sendmsg(sdev->ud.tcp_socket, &msg, txsize);
++		if (ret != txsize) {
++			VHCI_ERROR("vhci_sendmsg failed!, retval %d for %d\n", ret, txsize);
++			usbip_event_add(&sdev->ud, SDEV_EVENT_ERROR_TCP);
++			return -1;
++		}
++
++		dbg_stub_tx("send txdata \n");
++	}
++
++
++	spin_lock_irqsave(&sdev->priv_lock, flags);
++
++	list_for_each_entry_safe(priv, tmp, &sdev->priv_free, list) {
++		struct urb *urb = priv->urb;
++
++		dbg_stub_tx("setup txdata for urb %p\n", urb);
++
++		/*  free transfer buffer */
++		if(urb->transfer_buffer != NULL) {
++			kfree(urb->transfer_buffer);
++		}
++
++		list_del(&priv->list);
++		kmem_cache_free(StubPrivCache, priv);
++
++		usb_free_urb(urb);
++	}
++
++
++	spin_unlock_irqrestore(&sdev->priv_lock, flags);
++
++	return txsize;
++}
++
++
++
++void stub_tx_loop(struct usbip_task *ut)
++{
++	struct usbip_device *ud = container_of(ut, struct usbip_device, tcp_tx);
++	struct stub_device *sdev = container_of(ud, struct stub_device, ud);
++
++	while(1) {
++		if(signal_pending(current)) {
++			dbg_stub_tx("signal catched\n");
++			break;
++		}
++
++		if( usbip_event_happend(ud) ) break;
++
++
++		if (stub_send_txdata(sdev) < 0 ) break;
++
++		wait_event_interruptible(waitq, !list_empty(&sdev->priv_tx));
++
++	}
++}
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ gregkh-2.6/drivers/usb/usbib/usbip_common.c	2005-12-01 15:21:50.000000000 -0800
+@@ -0,0 +1,883 @@
++/*
++ * $Id: usbip_common.c 265 2005-09-01 09:24:10Z taka-hir $
++ *
++ * Copyright (C) 2003-2005 Takahiro Hirofuchi <taka-hir@is.naist.jp>
++ *
++ *
++ * This is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307,
++ * USA.
++ */
++
++
++#include "usbip_common.h"
++
++
++
++/*
++ *  Send or receive packet.
++ *  I refer drivers/block/nbd.c
++ */
++int usbip_xmit(int send, struct socket *sock, char *buf, int size, int msg_flags)
++{
++	int result;
++	struct msghdr msg;
++	struct kvec iov;
++	int total = 0;
++
++	/* for blocks of if(dbg_flag_xmit) */
++	char *bp = buf;
++	int osize= size;
++
++	dbg_xmit("enter\n");
++
++	if(!sock || !buf || !size ) {
++		VHCI_ERROR("usbip_xmit: invalid arg, sock %p buff %p size %d\n",
++				sock, buf, size);
++		return -EINVAL;
++	}
++
++
++	if(dbg_flag_xmit) {
++		if(send) {
++			if(!in_interrupt())
++				printk("%-10s:", current->comm);
++			else
++				printk("interupt  :");
++
++			printk("usbip_xmit: sending... , sock %p, buf %p, size %d, msg_flags %d\n",
++					sock, buf, size, msg_flags);
++			dump_buffer(buf, size);
++		}
++	}
++
++
++	do{
++		sock->sk->sk_allocation = GFP_NOIO;
++		iov.iov_base    = buf;
++		iov.iov_len     = size;
++		msg.msg_name    = NULL;
++		msg.msg_namelen = 0;
++		msg.msg_control = NULL;
++		msg.msg_controllen = 0;
++		msg.msg_namelen    = 0;
++		msg.msg_flags      = msg_flags | MSG_NOSIGNAL;
++
++		if(send)
++			result = kernel_sendmsg(sock, &msg, &iov, 1, size);
++		else
++			result = kernel_recvmsg(sock, &msg, &iov, 1, size, MSG_WAITALL);
++
++		if (result <= 0) {
++			VHCI_DEBUG("usbip_xmit: %s sock %p buf %p size %u ret %d total %d\n",
++					send ? "send" : "receive", sock, buf, size, result, total);
++			goto err;
++		}
++
++		size -= result;
++		buf += result;
++		total += result;
++
++	} while (size > 0);
++
++
++
++	if(dbg_flag_xmit) {
++		if(!send) {
++			if(!in_interrupt())
++				printk("%-10s:", current->comm);
++			else
++				printk("interupt  :");
++
++			printk("usbip_xmit: receiving....\n");
++			dump_buffer(bp, osize);
++			printk("usbip_xmit: received, osize %d ret %d size %d total %d\n",
++					osize, result, size, total);
++		}
++
++		if(send) {
++			printk("usbip_xmit: send, total %d\n", total);
++		}
++	}
++
++	return total;
++
++err:
++
++	return result;
++}
++
++
++int usbip_sendmsg( struct socket *socket, struct msghdr *msg, int len )
++{
++	int rc = 0;
++	mm_segment_t oldfs;
++
++	dbg_xmit("enter\n");
++
++	if(dbg_flag_xmit) {
++		int i;
++		for(i = 0; i < msg->msg_iovlen; i++) {
++			dump_buffer(msg->msg_iov[i].iov_base,
++					msg->msg_iov[i].iov_len);
++		}
++	}
++
++	if (socket) {
++		oldfs = get_fs();
++		set_fs( get_ds() );
++
++		/* Try to avoid resource acquisition deadlocks by using GFP_ATOMIC. */
++		socket->sk->sk_allocation = GFP_ATOMIC;
++		//socket->sk->sk_allocation = GFP_NOIO;
++
++		/* FIXME: ought to loop handling short writes, unless a signal occurs */
++		rc = sock_sendmsg(socket, msg, len);
++
++		set_fs( oldfs );
++	}
++
++	return rc;
++}
++
++
++#if 0
++static int usbip_recvmsg( struct socket *socket, struct msghdr *msg, int len )
++{
++	int rc = 0;
++	mm_segment_t oldfs;
++
++	VHCI_DEBUG("Enter\n");
++
++	if (socket) {
++		oldfs = get_fs();
++		set_fs( get_ds() );
++
++		/* Try to avoid resource acquisition deadlocks by using GFP_ATOMIC. */
++		socket->sk->allocation = GFP_ATOMIC;
++
++		/* FIXME: ought to loop handling short writes, unless a signal occurs */
++		rc = sock_recvmsg(socket, msg, len);
++
++		set_fs( oldfs );
++	}
++
++#ifdef CONFIG_USBIP_DEBUG
++	{
++		int i;
++		for(i = 0; i < msg->msg_iovlen; i++) {
++			dump_buffer(msg->msg_iov[i].iov_base,
++					msg->msg_iov[i].iov_len);
++		}
++	}
++#endif
++
++	return rc;
++}
++#endif
++
++
++
++
++
++void dump_buffer(char *buff, int bufflen)
++{
++	int i;
++
++	if (bufflen > 128) {
++		for(i = 0; i< 128; i++) {
++			if(i%24 == 0) printk("   ");
++			printk("%02x ", (unsigned char ) buff[i]);
++			if(i%4 == 3) printk("| ");
++			if(i%24 == 23) printk("\n");
++		}
++		printk("... (%d byte)\n", bufflen);
++		return;
++	}
++
++	for(i = 0; i< bufflen; i++) {
++		if(i%24 == 0) printk("   ");
++		printk("%02x ", (unsigned char ) buff[i]);
++		if(i%4 == 3) printk("| ");
++		if(i%24 == 23) printk("\n");
++	}
++	printk("\n");
++
++}
++
++
++void dump_pipe(unsigned int p)
++{
++	unsigned char type = usb_pipetype(p);
++	unsigned char ep = usb_pipeendpoint(p);
++	unsigned char dev = usb_pipedevice(p);
++	unsigned char dir = usb_pipein(p);
++
++	printk("dev(%d) ", dev);
++	printk("ep(%d) ",  ep);
++	printk("%s ", dir ? "IN" : "OUT");
++/*
++	printk("DT%d ", data ? 1 : 0);
++	printk("%s ", speed ? "LOW" : "FULL");
++*/
++	switch(type) {
++		case PIPE_ISOCHRONOUS :
++			printk("%s ", "ISO");
++			break;
++		case PIPE_INTERRUPT :
++			printk("%s ", "INT");
++			break;
++		case PIPE_CONTROL :
++			printk("%s ", "CTL");
++			break;
++		case PIPE_BULK :
++			printk("%s ", "BLK");
++			break;
++		default :
++			printk("ERR");
++	}
++
++	printk("\n");
++
++}
++
++
++void dump_usb_device(struct usb_device *dev)
++{
++	if(dev == NULL) {
++		printk("      dump usb dev: null pointer!!\n");
++		return;
++	}
++
++	printk("       devnum(%d) devpath(%s)", dev->devnum, dev->devpath);
++
++	switch(dev->speed) {
++		case USB_SPEED_HIGH :
++			printk(" SPD_HIGH");
++			break;
++		case USB_SPEED_FULL :
++			printk(" SPD_FULL");
++			break;
++		case USB_SPEED_LOW :
++			printk(" SPD_LOW");
++			break;
++		case USB_SPEED_UNKNOWN :
++			printk(" SPD_UNKNOWN");
++			break;
++		default :
++			printk(" SPD_ERROR");
++	}
++
++	printk(" tt %p, ttport %d", dev->tt, dev->ttport);
++	//printk(" refcnt %d",  dev->refcnt.counter);
++	printk("\n");
++
++	printk("                    ");
++	{
++		int i;
++		for(i = 0; i < 16; i++) {
++			printk(" %2u", i);
++		}
++	}
++	printk("\n");
++
++	printk("       toggle0(IN) :");
++	{
++		int i;
++		for(i = 0; i< 16; i++){
++			printk(" %2u", ( dev->toggle[0] & (1 << i) ) ? 1 : 0);
++		}
++	}
++	printk("\n");
++
++	printk("       toggle1(OUT):");
++	{
++		int i;
++		for(i = 0; i< 16; i++){
++			printk(" %2u", ( dev->toggle[1] & (1 << i) ) ? 1 : 0);
++		}
++	}
++	printk("\n");
++
++
++	{
++		int i;
++	printk("       epmaxp_in   :");
++		for(i = 0; i < 16; i++) {
++			printk(" %2u",  dev->ep_in[i]->desc.wMaxPacketSize);
++		}
++		printk("\n");
++
++	printk("       epmaxp_out  :");
++		for(i = 0; i < 16; i++) {
++			printk(" %2u",  dev->ep_out[i]->desc.wMaxPacketSize);
++		}
++	}
++
++	printk("\n       ");
++
++	printk("parent %p, bus %p", dev->parent, dev->bus);
++	printk("\n       ");
++
++	printk("descriptor %p, config %p, actconfig %p, rawdescriptors %p",
++			&dev->descriptor, dev->config, dev->actconfig, dev->rawdescriptors);
++	printk("\n       ");
++
++	printk("have_langid %d, string_langid %d", dev->have_langid, dev->string_langid);
++	printk("\n       ");
++
++	printk("maxchild %d, children %p", dev->maxchild, dev->children);
++
++	printk("\n");
++}
++
++void dump_urb (struct urb *purb)
++{
++	if(!purb) {
++		printk("   dump urb: null pointer!!\n");
++		return;
++	}
++
++	printk("   urb                   :%p\n", purb);
++	//printk("   next                  :%p\n", purb->next);
++	printk("   dev                   :%p\n", purb->dev);
++	dump_usb_device(purb->dev);
++	printk("   pipe                  :%08x ", purb->pipe);
++	dump_pipe(purb->pipe);
++	printk("   status                :%d\n", purb->status);
++	printk("   transfer_flags        :%08X\n", purb->transfer_flags);
++	printk("   transfer_buffer       :%p\n", purb->transfer_buffer);
++	printk("   transfer_buffer_length:%d\n", purb->transfer_buffer_length);
++	printk("   actual_length         :%d\n", purb->actual_length);
++	printk("   bandwidth             :%d\n", purb->actual_length);
++	printk("   setup_packet          :%p\n", purb->setup_packet);
++	if(purb->setup_packet != NULL && usb_pipetype(purb->pipe) == PIPE_CONTROL) {
++		dump_usb_ctrlrequest((struct usb_ctrlrequest *) purb->setup_packet);
++	}
++	printk("   start_frame           :%d\n", purb->start_frame);
++	printk("   number_of_packets     :%d\n", purb->number_of_packets);
++	printk("   interval              :%d\n", purb->interval);
++	printk("   error_count           :%d\n", purb->error_count);
++	printk("   context               :%p\n", purb->context);
++	printk("   complete              :%p\n", purb->complete);
++}
++
++static void dump_request_type(__u8 rt)
++{
++	switch(rt & USB_RECIP_MASK) {
++		case USB_RECIP_DEVICE:
++			printk("DEVICE");
++			break;
++		case USB_RECIP_INTERFACE:
++			printk("INTERF");
++			break;
++		case USB_RECIP_ENDPOINT:
++			printk("ENDPOI");
++			break;
++		case USB_RECIP_OTHER:
++			printk("OTHER ");
++			break;
++		default:
++			printk("------");
++	}
++}
++
++void dump_usb_ctrlrequest(struct usb_ctrlrequest *cmd)
++{
++	if(cmd == NULL) {
++		printk("      dump_usb_ctrlrequest : null pointer\n");
++		return;
++	}
++
++	printk("       ");
++	printk("bRequestType(%02X) ", cmd->bRequestType);
++	printk("bRequest(%02X) " , cmd->bRequest);
++	printk("wValue(%04X) ", cmd->wValue);
++	printk("wIndex(%04X) ", cmd->wIndex);
++	printk("wLength(%04X) ", cmd->wLength);
++
++	printk("\n       ");
++
++	if((cmd->bRequestType & USB_TYPE_MASK) == USB_TYPE_STANDARD) {
++		printk("STANDARD ");
++		switch(cmd->bRequest){
++			case USB_REQ_GET_STATUS:
++				printk("GET_STATUS");
++				break;
++			case USB_REQ_CLEAR_FEATURE:
++				printk("CLEAR_FEAT");
++				break;
++			case USB_REQ_SET_FEATURE:
++				printk("SET_FEAT  ");
++				break;
++			case USB_REQ_SET_ADDRESS:
++				printk("SET_ADDRRS");
++				break;
++			case USB_REQ_GET_DESCRIPTOR:
++				printk("GET_DESCRI");
++				break;
++			case USB_REQ_SET_DESCRIPTOR:
++				printk("SET_DESCRI");
++				break;
++			case USB_REQ_GET_CONFIGURATION:
++				printk("GET_CONFIG");
++				break;
++			case USB_REQ_SET_CONFIGURATION:
++				printk("SET_CONFIG");
++				break;
++			case USB_REQ_GET_INTERFACE:
++				printk("GET_INTERF");
++				break;
++			case USB_REQ_SET_INTERFACE:
++				printk("SET_INTERF");
++				break;
++			case USB_REQ_SYNCH_FRAME:
++				printk("SYNC_FRAME");
++				break;
++			default:
++				printk("REQ(%02X) ", cmd->bRequest);
++		}
++
++		printk(" ");
++		dump_request_type(cmd->bRequestType);
++
++	}
++	else if((cmd->bRequestType & USB_TYPE_MASK) == USB_TYPE_CLASS) {
++		printk("CLASS   ");
++	}
++	else if((cmd->bRequestType & USB_TYPE_MASK) == USB_TYPE_VENDOR) {
++		printk("VENDOR  ");
++	}
++	else if((cmd->bRequestType & USB_TYPE_MASK) == USB_TYPE_RESERVED) {
++		printk("RESERVED");
++	}
++
++
++
++	printk("\n");
++}
++
++
++int interface_to_busnum(struct usb_interface *interface) {
++	struct usb_device *udev = interface_to_usbdev(interface);
++	return udev->bus->busnum;
++}
++
++int interface_to_devnum(struct usb_interface *interface) {
++	struct usb_device *udev = interface_to_usbdev(interface);
++	return udev->devnum;
++}
++
++int interface_to_infnum(struct usb_interface *interface) {
++	return interface->cur_altsetting->desc.bInterfaceNumber;
++}
++
++#include <linux/tcp.h>
++
++void setquickack(struct socket *socket)
++{
++	mm_segment_t oldfs;
++	int ret = 1;
++
++	oldfs = get_fs(); set_fs(get_ds());
++	ret = socket->ops->setsockopt(socket, SOL_TCP, TCP_QUICKACK, (char *) &ret, sizeof(ret));
++	set_fs(oldfs);
++}
++
++void setnodelay(struct socket *socket)
++{
++	mm_segment_t oldfs;
++	int ret = 1;
++
++	oldfs = get_fs(); set_fs(get_ds());
++	ret = socket->ops->setsockopt(socket, SOL_TCP, TCP_NODELAY, (char *) &ret, sizeof(ret));
++	set_fs(oldfs);
++}
++
++void setkeepalive(struct socket *socket)
++{
++	mm_segment_t oldfs;
++	int ret = 1;
++
++	oldfs = get_fs(); set_fs(get_ds());
++	ret = socket->ops->setsockopt(socket, SOL_SOCKET, SO_KEEPALIVE, (char *) &ret, sizeof(ret));
++	set_fs(oldfs);
++}
++
++void setreuse(struct socket *socket)
++{
++	socket->sk->sk_reuse = 1;
++}
++
++struct socket *sockfd_to_socket(unsigned int sockfd)
++{
++	struct socket *socket;
++	struct file *file;
++	struct inode *inode;
++
++	file = fget(sockfd);
++	if(!file) {
++		VHCI_ERROR("invalid sockfd\n");
++		return NULL;
++	}
++
++	inode = file->f_dentry->d_inode;
++
++	if( !inode || !S_ISSOCK(inode->i_mode) ) return NULL;
++
++	socket = SOCKET_I(inode);
++
++	return socket;
++}
++
++int set_sockaddr(struct socket *socket, struct sockaddr_storage *ss)
++{
++	int  addrlen;
++	int  ret;
++
++	ret = socket->ops->getname(socket, (struct sockaddr *) ss, &addrlen, 1);
++	if(ret) {
++		VHCI_ERROR("getname failed, socket %p\n", socket);
++		return ret;
++	}
++	return ret;
++}
++
++#if 0
++int sprintf_sockaddr(char *buf, struct sockaddr_storage *ss)
++{
++	int ret;
++
++	if(ss->ss_family == AF_INET) {
++		struct sockaddr_in *v4addr = (struct sockaddr_in *) ss;
++		ret = sprintf(buf, "%u.%u.%u.%u(%u)", NIPQUAD(v4addr->sin_addr),
++				v4addr->sin_port);
++
++	} else if(ss->ss_family == AF_INET6) {
++		struct sockaddr_in6 *v6addr = (struct sockaddr_in6 *) ss;
++		ret = sprintf(buf, "%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x(%d)",
++				NIP6(v6addr->sin6_addr), v6addr->sin6_port);
++
++	} else {
++		VHCI_ERROR("unknown sa_family %d", ss->ss_family);
++		ret = -1;
++	}
++
++	return ret;
++}
++#endif
++
++
++
++ssize_t socket_to_addrstr(struct socket *socket, char *buf)
++{
++	struct sockaddr uaddr;
++	int uaddrlen;
++	int ret;
++
++	ret = socket->ops->getname(socket, &uaddr, &uaddrlen, 1);
++	if(ret) {
++		VHCI_ERROR("getname failed, socket %p\n", socket);
++		return ret;
++	}
++
++	if(uaddr.sa_family == AF_INET) {
++		struct sockaddr_in *v4addr = (struct sockaddr_in *) &uaddr;
++		ret =  sprintf(buf, "%u.%u.%u.%u", NIPQUAD(v4addr->sin_addr.s_addr));
++	} else if(uaddr.sa_family == AF_INET6) {
++		struct sockaddr_in6 *v6addr = (struct sockaddr_in6 *) &uaddr;
++		ret =  sprintf(buf, "%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x",
++				NIP6(v6addr->sin6_addr));
++	} else {
++		VHCI_ERROR("unknown sa_family %d\n", uaddr.sa_family);
++		ret = -1;
++	}
++
++	return ret;
++}
++
++
++
++
++
++void usbip_dump_header(struct usbip_header *pdu)
++{
++
++	VHCI_DEBUG("BASE: cmd %u bus %u dev %u seq %u pipe %04x\n",
++			pdu->base.command,
++			pdu->base.busnum,
++			pdu->base.devnum,
++			pdu->base.seqnum,
++			pdu->base.pipe);
++
++#ifdef CONFIG_USBIP_DEBUG
++	dump_pipe(pdu->base.pipe);
++#endif
++
++	switch(pdu->base.command) {
++		case VHC_C_SUBMIT:
++			VHCI_DEBUG("SUBMIT: x_flags %u x_len %u bw %u sf %u #p %u iv %u\n",
++					pdu->submit.transfer_flags,
++					pdu->submit.transfer_buffer_length,
++					pdu->submit.bandwidth,
++					pdu->submit.start_frame,
++					pdu->submit.number_of_packets,
++					pdu->submit.interval);
++					break;
++		case VHC_C_UNLINK:
++			VHCI_DEBUG("UNLINK: seq %u\n", pdu->unlink.seqnum);
++			break;
++		case VHC_C_RETURN:
++			VHCI_DEBUG("RETURN: st %d x_flags %u al %u bw %u sf %d ec %d\n",
++					pdu->ret.status, pdu->ret.transfer_flags, pdu->ret.actual_length,
++					pdu->ret.bandwidth, pdu->ret.start_frame, pdu->ret.error_count);
++
++			break;
++		default:
++			/* NOT REACHED */
++			VHCI_DEBUG("UNKNOWN\n");
++	}
++}
++
++int usbip_thread(void *param)
++{
++	struct usbip_task *ut = (struct usbip_task *) param;
++
++	VHCI_DEBUG("Enter\n");
++
++	if(!ut) return -EINVAL;
++
++	lock_kernel();
++	daemonize(ut->name);
++	allow_signal(SIGKILL);
++	ut->thread = current;
++	unlock_kernel();
++
++	/* srv.rb must wait for rx_thread starting */
++	complete(&ut->thread_done);
++
++	/* start of while loop */
++	ut->loop_ops(ut);
++
++
++	/* end of loop */
++	ut->thread = NULL;
++
++	VHCI_DEBUG("bye\n");
++
++	complete_and_exit(&ut->thread_done, 0);
++}
++
++void usbip_start_threads(struct usbip_device *ud)
++{
++	/*
++	 * threads are invoked per one device (per one connection).
++	 */
++	kernel_thread((int(*)(void *)) usbip_thread, (void *) &ud->tcp_rx, 0);
++	kernel_thread((int(*)(void *)) usbip_thread, (void *) &ud->tcp_tx, 0);
++
++	/* confirm threads are starting */
++	wait_for_completion(&ud->tcp_rx.thread_done);
++	wait_for_completion(&ud->tcp_tx.thread_done);
++}
++
++
++void usbip_stop_threads(struct usbip_device *ud)
++{
++        /* kill threads related to this sdev, if v.c. exists */
++	if(ud->tcp_rx.thread != NULL) {
++		send_sig(SIGKILL, ud->tcp_rx.thread, 1);
++		wait_for_completion(&ud->tcp_rx.thread_done);
++		VHCI_DEBUG("rx_thread for ud %p has finished\n", ud);
++	}
++	if(ud->tcp_tx.thread != NULL) {
++		send_sig(SIGKILL, ud->tcp_tx.thread, 1);
++		wait_for_completion(&ud->tcp_tx.thread_done);
++		VHCI_DEBUG("tx_thread for ud %p has finished\n", ud);
++	}
++}
++
++
++void usbip_task_init(struct usbip_task *ut, char *name, void (*loop_ops)(struct usbip_task *))
++{
++	ut->thread = NULL;
++	init_completion(&ut->thread_done);
++	ut->name = name;
++	ut->loop_ops = loop_ops;
++}
++
++
++static void usbip_pack_submit_pdu(struct usbip_header *pdu, struct urb *urb, int pack)
++{
++	if(pack) {
++		/* vhci_tx.c */
++		pdu->submit.transfer_flags		 = urb->transfer_flags & ~URB_NO_TRANSFER_DMA_MAP & ~URB_NO_SETUP_DMA_MAP;
++		pdu->submit.transfer_buffer_length	 = urb->transfer_buffer_length;
++		pdu->submit.bandwidth			 = urb->bandwidth;
++		pdu->submit.start_frame			 = urb->start_frame;
++		pdu->submit.number_of_packets		 = urb->number_of_packets;
++		pdu->submit.interval			 = urb->interval;
++	} else  {
++		/* stub_rx.c */
++		urb->transfer_flags         = pdu->submit.transfer_flags;
++		urb->transfer_buffer_length = pdu->submit.transfer_buffer_length;
++		urb->bandwidth              = pdu->submit.bandwidth;
++		urb->start_frame            = pdu->submit.start_frame;
++		urb->number_of_packets      = pdu->submit.number_of_packets;
++		urb->interval               = pdu->submit.interval;
++	}
++}
++
++
++static void usbip_pack_return_pdu(struct usbip_header *pdu, struct urb *urb, int pack)
++{
++	if(pack) {
++		/* stub_tx.c */
++		pdu->ret.transfer_flags		 = urb->transfer_flags;
++		pdu->ret.status			 = urb->status;
++		pdu->ret.actual_length		 = urb->actual_length;
++		pdu->ret.bandwidth		 = urb->bandwidth;
++		pdu->ret.start_frame		 = urb->start_frame;
++
++		pdu->ret.number_of_packets	 = urb->number_of_packets;
++	} else {
++		/* vhci_rx.c */
++		urb->transfer_flags		 = pdu->ret.transfer_flags;
++		urb->status			 = pdu->ret.status;
++		urb->actual_length		 = pdu->ret.actual_length;
++		urb->bandwidth			 = pdu->ret.bandwidth;
++		urb->start_frame		 = pdu->ret.start_frame;
++
++		urb->error_count		 = pdu->ret.error_count;
++	}
++}
++
++void usbip_pack_pdu(struct usbip_header *pdu, struct urb *urb, int cmd, int pack)
++{
++	switch(cmd) {
++		case VHC_C_SUBMIT:
++			usbip_pack_submit_pdu(pdu, urb, pack);
++			break;
++		case VHC_C_RETURN:
++			usbip_pack_return_pdu(pdu, urb, pack);
++			break;
++		default:
++			/* NOTREACHED */
++			BUG();
++	}
++}
++
++
++
++/* some members of urb must be substituted before. */
++int usbip_recv_iso(struct usbip_device *ud, struct urb *urb)
++{
++	int ret;
++	char *iso_frame_desc = (char *) &urb->iso_frame_desc[0];
++	int np = urb->number_of_packets;
++	int size = np * sizeof(struct usb_iso_packet_descriptor);
++
++	if( !usb_pipeisoc(urb->pipe) ) return 0;
++
++	ret = usbip_xmit(0, ud->tcp_socket, iso_frame_desc, size, 0);
++	if (ret != size ) {
++		VHCI_ERROR("recv iso_frame_descriptor, %d\n", ret);
++		if(ud->side == USBIP_STUB) {
++			usbip_event_add(ud, SDEV_EVENT_ERROR_TCP);
++		} else {
++			usbip_event_add(ud, VDEV_EVENT_ERROR_TCP);
++		}
++		return -EPIPE;
++	}
++
++	return ret;
++}
++
++int usbip_event_happend(struct usbip_device *ud)
++{
++	int happend = 0;
++
++	spin_lock(&ud->lock);
++
++	if(ud->event != 0)
++		happend = 1;
++
++	spin_unlock(&ud->lock);
++
++	return happend;
++}
++
++
++/* some members of urb must be substituted before. */
++int usbip_recv_xbuff(struct usbip_device *ud, struct urb *urb)
++{
++	int ret;
++	int size;
++
++
++	if(ud->side == USBIP_STUB) {
++		/* stub_rx.c */
++		/* the direction of urb must be OUT. */
++		if(usb_pipein(urb->pipe)) return 0;
++
++		size = urb->transfer_buffer_length;
++	} else {
++		/* vhci_rx.c */
++		/* the direction of urb must be IN. */
++		if(usb_pipeout(urb->pipe)) return 0;
++
++		size = urb->actual_length;
++	}
++
++	/* no need to recv xbuff */
++	if( !(size > 0) ) return 0;
++
++	ret = usbip_xmit(0, ud->tcp_socket, (char *) urb->transfer_buffer, size, 0);
++	if(ret != size) {
++		VHCI_ERROR("recv xbuf, %d\n", ret);
++		if(ud->side == USBIP_STUB) {
++			usbip_event_add(ud, SDEV_EVENT_ERROR_TCP);
++		} else {
++			usbip_event_add(ud, VDEV_EVENT_ERROR_TCP);
++			return -EPIPE;
++		}
++	}
++
++	return ret;
++}
++
++
++
++#ifdef CONFIG_USBIP_DEBUG
++unsigned long usbip_debug_flag = 0xffff;
++#else
++unsigned long usbip_debug_flag = 0;
++#endif
++
++static ssize_t show_flag(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	return sprintf(buf, "%lx", usbip_debug_flag);
++}
++
++static ssize_t store_flag(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
++{
++	unsigned long flag;
++
++	sscanf(buf, "%lx", &flag);
++	usbip_debug_flag = flag;
++
++	return count;
++}
++
++DEVICE_ATTR(usbip_debug, (S_IRUGO | S_IWUSR), show_flag, store_flag);
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ gregkh-2.6/drivers/usb/usbib/usbip_common.h	2005-12-01 15:21:50.000000000 -0800
+@@ -0,0 +1,400 @@
++/*
++ * $Id: usbip_common.h 265 2005-09-01 09:24:10Z taka-hir $
++ *
++ * Copyright (C) 2003-2005 Takahiro Hirofuchi <taka-hir@is.naist.jp>
++ *
++ *
++ * This is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307,
++ * USA.
++ */
++
++#ifndef  __VHCI_COMMON_H
++#define  __VHCI_COMMON_H
++
++#include <asm/byteorder.h>
++#include <linux/socket.h>
++#include <net/sock.h>
++#include <linux/in.h>
++#include <linux/in6.h>
++#include <linux/usb.h>
++#include <asm-i386/hardirq.h>
++#include <linux/module.h>
++
++#include <asm/uaccess.h>
++/* copy_from_user() */
++
++#include <linux/smp_lock.h>
++/* lock_kernel() */
++
++
++#include <linux/file.h>
++
++#include <linux/kernel.h>
++/* KERN_INFO */
++
++#include <linux/version.h>
++
++#include <linux/sched.h>
++#include <linux/signal.h>
++#include <asm/semaphore.h>
++
++/*-------------------------------------------------------------------------*/
++
++/*
++ * define macros to print messages
++ */
++
++/**
++ * VHCI_DEBUG - print debug messages if CONFIG_USBIP_DEBUG is defined
++ * @fmt:
++ * @args:
++ */
++
++#ifdef CONFIG_USBIP_DEBUG
++
++#define udbg(fmt, args...)						\
++	do{								\
++		printk(KERN_DEBUG "%-10s:(%s,%d) %s: " fmt,		\
++			(in_interrupt() ? "interrupt" : (current)->comm),\
++			__FILE__, __LINE__, __FUNCTION__, ##args);	\
++	}while(0)
++
++#define VHCI_DEBUG(fmt, args...)	udbg(fmt, ##args)
++
++#else  /* CONFIG_USBIP_DEBUG */
++
++#define udbg(fmt, args...)		do{ }while(0)
++#define VHCI_DEBUG(fmt, args...)	do{ }while(0)
++
++#endif /* CONFIG_VHCI_DEBUG */
++
++
++enum {
++	usbip_debug_xmit	= (1 << 0),
++	usbip_debug_sysfs	= (1 << 1),
++	usbip_debug_urb		= (1 << 2),
++	usbip_debug_eh		= (1 << 3),
++
++	usbip_debug_stub_cmp	= (1 << 8),
++	usbip_debug_stub_dev	= (1 << 9),
++	usbip_debug_stub_rx	= (1 << 10),
++	usbip_debug_stub_tx	= (1 << 11),
++
++	usbip_debug_vhci_rh	= (1 << 8),
++	usbip_debug_vhci_hc	= (1 << 9),
++	usbip_debug_vhci_rx	= (1 << 10),
++	usbip_debug_vhci_tx	= (1 << 11),
++	usbip_debug_vhci_sysfs  = (1 << 12)
++};
++
++#define dbg_flag_xmit		(usbip_debug_flag & usbip_debug_xmit)
++#define dbg_flag_vhci_rh	(usbip_debug_flag & usbip_debug_vhci_rh)
++#define dbg_flag_vhci_hc	(usbip_debug_flag & usbip_debug_vhci_hc)
++#define dbg_flag_vhci_rx	(usbip_debug_flag & usbip_debug_vhci_rx)
++#define dbg_flag_vhci_tx	(usbip_debug_flag & usbip_debug_vhci_tx)
++#define dbg_flag_vhci_sysfs	(usbip_debug_flag & usbip_debug_vhci_sysfs)
++#define dbg_flag_stub_rx	(usbip_debug_flag & usbip_debug_stub_rx)
++#define dbg_flag_stub_tx	(usbip_debug_flag & usbip_debug_stub_tx)
++
++extern unsigned long usbip_debug_flag;
++extern struct device_attribute dev_attr_usbip_debug;
++
++#define dbg_with_flag(flag, fmt, args...)		\
++	do {						\
++		if(flag & usbip_debug_flag) 		\
++			udbg(fmt, ##args);		\
++	} while(0)
++
++#define dbg_sysfs(fmt, args...)	dbg_with_flag(usbip_debug_sysfs, fmt, ##args)
++#define dbg_xmit(fmt, args...)	dbg_with_flag(usbip_debug_xmit,  fmt, ##args)
++#define dbg_urb(fmt, args...)	dbg_with_flag(usbip_debug_urb,   fmt, ##args)
++#define dbg_eh(fmt, args...)	dbg_with_flag(usbip_debug_eh,   fmt, ##args)
++
++#define dbg_vhci_rh(fmt, args...) dbg_with_flag(usbip_debug_vhci_rh, fmt, ##args)
++#define dbg_vhci_hc(fmt, args...) dbg_with_flag(usbip_debug_vhci_hc, fmt, ##args)
++#define dbg_vhci_rx(fmt, args...) dbg_with_flag(usbip_debug_vhci_rx, fmt, ##args)
++#define dbg_vhci_tx(fmt, args...) dbg_with_flag(usbip_debug_vhci_tx, fmt, ##args)
++#define dbg_vhci_sysfs(fmt, args...) dbg_with_flag(usbip_debug_vhci_sysfs, fmt, ##args)
++
++#define dbg_stub_cmp(fmt, args...) dbg_with_flag(usbip_debug_stub_cmp, fmt, ##args)
++#define dbg_stub_rx(fmt, args...) dbg_with_flag(usbip_debug_stub_rx, fmt, ##args)
++#define dbg_stub_tx(fmt, args...) dbg_with_flag(usbip_debug_stub_tx, fmt, ##args)
++
++
++/**
++ * VHCI_ERROR - print error messages
++ * @fmt:
++ * @args:
++ */
++#define uerr(fmt, args...)						\
++	do{								\
++		printk(KERN_ERR "%-10s: ***ERROR*** (%s,%d) %s: " fmt,	\
++			(in_interrupt() ? "interrupt" : (current)->comm),\
++			__FILE__, __LINE__, __FUNCTION__, ##args);	\
++	}while(0)
++
++#define VHCI_ERROR(fmt, args...)	uerr(fmt, ##args)
++
++#if 0
++#define VHCI_ERROR(fmt, args...) \
++	do{ \
++		if(!in_interrupt()) { \
++			printk(KERN_ERR "%-10s:", current->comm); \
++		} else { \
++			printk(KERN_ERR "interrupt :"); \
++		} \
++		printk("usbip: ***ERROR*** (%s, %d, %s)",  __FILE__, __LINE__, __FUNCTION__); \
++		printk("usbip: " fmt, ## args); \
++	}while(0)
++#endif
++
++/**
++ * VHCI_INFO - print information messages
++ * @fmt:
++ * @args:
++ */
++
++#define uinfo(fmt, args...)					\
++	do{							\
++		printk(KERN_INFO "usbip: " fmt, ## args);	\
++	}while(0)
++
++#define VHCI_INFO(fmt, args...)					\
++	do{							\
++		printk(KERN_INFO "usbip: " fmt, ## args);	\
++	}while(0)
++
++
++
++/*-------------------------------------------------------------------------*/
++
++/*
++ * USB/IP packet headers.
++ * At now, we define 3 packet types:
++ *
++ *  - SUBMIT transfers a USB request. This is corresponding to usb_submit_urb().
++ *
++ *  - RETURN transfers a result of a USB request.
++ *
++ *  - UNLINK transfers an unlink request of a pending USB request.
++ *    This is corresponding to usb_unlink_urb() but not yet implemented.
++ *
++ * TODO:
++ *
++ *  - big endian or little endian, aligenment.
++ *  - inter-operability between other OSs
++ *  - UNLINK and other operations
++ */
++
++/*
++ * A basic header followed by other additional headers.
++ */
++struct usbip_header_basic {
++
++#define VHC_C_SUBMIT	0x0001
++#define VHC_C_RETURN	0x0002
++#define VHC_C_UNLINK	0x0004
++	__u32 command;
++
++	__u32 busnum;
++	__u32 devnum;
++	__u32 seqnum; /* seaquencial number which identifies URBs */
++	__u32 pipe;
++};
++
++/*
++ * An additional header for a SUBMIT packet.
++ */
++struct usbip_header_submit {
++	__u32 transfer_flags;
++	__u32 transfer_buffer_length;
++	__u32 bandwidth;
++	__u32 start_frame;
++	__u32 number_of_packets;
++	__u32 interval;
++	unsigned char setup[8]; /* CTRL only */
++};
++
++/*
++ * An additional header for a RETURN packet.
++ */
++struct usbip_header_return {
++	__u32 status;
++	__u32 transfer_flags;
++	__u32 actual_length; /* returned data length */
++	__u32 bandwidth;
++	__u32 start_frame; /* ISO and INT */
++	__u32 number_of_packets;  /* ISO only */
++	__u32 error_count; /* ISO only */
++};
++
++/*
++ * An additional header for a UNLINK packet.
++ */
++struct usbip_header_unlink {
++	__u32 seqnum; /* URB's seqnum which will be unlinked */
++};
++
++
++/*
++ * All usbip packets use a common header to keep code simple.
++ */
++struct usbip_header {
++	struct usbip_header_basic base;
++
++	union {
++		struct usbip_header_submit submit;
++		struct usbip_header_return ret;
++		struct usbip_header_unlink unlink;
++	};
++};
++
++
++
++
++/*-------------------------------------------------------------------------*/
++
++
++int usbip_xmit(int , struct socket *, char *, int , int );
++int usbip_sendmsg(struct socket *, struct msghdr *, int );
++
++
++void dump_buffer(char *, int size);
++void dump_urb(struct urb *);
++void dump_usb_device(struct usb_device *);
++void dump_pipe(unsigned int);
++void dump_usb_ctrlrequest(struct usb_ctrlrequest *);
++
++
++int interface_to_busnum(struct usb_interface *interface);
++int interface_to_devnum(struct usb_interface *interface);
++int interface_to_infnum(struct usb_interface *interface);
++
++void setnodelay(struct socket *);
++void setquickack(struct socket *);
++void setkeepalive(struct socket *socket);
++void setreuse(struct socket *);
++struct socket *sockfd_to_socket(unsigned int);
++int set_sockaddr(struct socket *socket, struct sockaddr_storage *ss);
++#define ss_v6_addr(x)	(((struct sockaddr_in6 *) &(x))->sin6_addr)
++#define ss_v6_port(x)	(((struct sockaddr_in6 *) &(x))->sin6_port)
++#define ss_v4_addr(x)	(((struct sockaddr_in  *) &(x))->sin_addr)
++#define ss_v4_port(x)	(((struct sockaddr_in  *) &(x))->sin_port)
++//int sprintf_sockaddr(char *buf, struct sockaddr_storage *ss);
++
++void usbip_dump_header(struct usbip_header *pdu);
++
++
++
++
++struct usbip_device ;
++
++struct usbip_task {
++	struct task_struct *thread;
++	struct completion thread_done;
++	char *name;
++	void (*loop_ops)(struct usbip_task *);
++};
++
++enum usbip_side {
++	USBIP_VHCI,
++	USBIP_STUB,
++};
++
++/* a common structure for stub_device and vhci_device */
++struct usbip_device{
++	enum usbip_side side;
++
++	enum {
++		/* sdev is available. */
++		SDEV_ST_AVAILABLE = 0x01,
++		/* sdev is now used. */
++		SDEV_ST_USED,
++		/* sdev is unusable because of a fatal error. */
++		SDEV_ST_ERROR,
++
++		/* vdev does not connect a remote device. */
++		VDEV_ST_NULL,
++		/* vdev is used, but the USB address is not assigned yet */
++		VDEV_ST_NOTASSIGNED,
++		VDEV_ST_USED,
++		VDEV_ST_ERROR
++	} status;
++
++
++	/* lock for status */
++	spinlock_t lock;
++
++	struct socket *tcp_socket;
++	struct sockaddr_storage tcp_ss;
++
++
++	struct usbip_task tcp_rx;
++	struct usbip_task tcp_tx;
++
++
++
++	/* event handler */
++
++#define USBIP_EH_SHUTDOWN	(1 << 0)
++#define USBIP_EH_BYE		(1 << 1)
++#define USBIP_EH_RESET		(1 << 2)
++#define USBIP_EH_UNUSABLE	(1 << 3)
++
++#define SDEV_EVENT_REMOVED     		( USBIP_EH_SHUTDOWN | USBIP_EH_RESET | USBIP_EH_BYE )
++#define	SDEV_EVENT_DOWN	       		( USBIP_EH_SHUTDOWN | USBIP_EH_RESET )
++#define	SDEV_EVENT_ERROR_TCP   		( USBIP_EH_SHUTDOWN | USBIP_EH_RESET )
++#define	SDEV_EVENT_ERROR_SUBMIT		( USBIP_EH_SHUTDOWN | USBIP_EH_RESET )
++#define	SDEV_EVENT_ERROR_MALLOC		( USBIP_EH_SHUTDOWN | USBIP_EH_UNUSABLE )
++
++#define	VDEV_EVENT_REMOVED     		( USBIP_EH_SHUTDOWN | USBIP_EH_BYE )
++#define	VDEV_EVENT_DOWN	       		( USBIP_EH_SHUTDOWN | USBIP_EH_RESET )
++#define	VDEV_EVENT_ERROR_TCP   		( USBIP_EH_SHUTDOWN | USBIP_EH_RESET )
++#define	VDEV_EVENT_ERROR_MALLOC		( USBIP_EH_SHUTDOWN | USBIP_EH_UNUSABLE)
++
++	unsigned long event;
++	struct usbip_task eh;
++	wait_queue_head_t eh_waitq;
++
++	struct eh_ops {
++		void (*shutdown)(struct usbip_device *);
++		void (*reset)(struct usbip_device *);
++		void (*unusable)(struct usbip_device *);
++	} eh_ops;
++};
++
++
++void usbip_task_init(struct usbip_task *ut, char *, void (*loop_ops)(struct usbip_task *));
++
++void usbip_start_threads(struct usbip_device *ud);
++void usbip_stop_threads(struct usbip_device *ud);
++int usbip_thread(void *param);
++
++void usbip_pack_pdu(struct usbip_header *pdu, struct urb *urb, int cmd, int pack);
++/* some members of urb must be substituted before. */
++int usbip_recv_xbuff(struct usbip_device *ud, struct urb *urb);
++/* some members of urb must be substituted before. */
++int usbip_recv_iso(struct usbip_device *ud, struct urb *urb);
++
++
++/* usbip_event.c */
++void usbip_start_eh(struct usbip_device *ud);
++void usbip_stop_eh(struct usbip_device *ud);
++void usbip_event_add(struct usbip_device *ud, unsigned long event);
++int usbip_event_happend(struct usbip_device *ud);
++
++
++
++#endif
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ gregkh-2.6/drivers/usb/usbib/usbip_event.c	2005-12-01 15:21:50.000000000 -0800
+@@ -0,0 +1,147 @@
++/*
++ * $Id: usbip_event.c 261 2005-08-30 10:49:17Z taka-hir $
++ *
++ * Copyright (C) 2003-2005 Takahiro Hirofuchi <taka-hir@is.naist.jp>
++ *
++ *
++ * This is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307,
++ * USA.
++ */
++
++#include "usbip_common.h"
++
++
++
++
++static void event_handler_loop(struct usbip_task *eh);
++
++void usbip_start_eh(struct usbip_device *ud)
++{
++	struct usbip_task *eh = &ud->eh;
++
++	init_waitqueue_head(&ud->eh_waitq);
++	ud->event = 0;
++
++	usbip_task_init(eh, "usbip_eh", event_handler_loop);
++
++	kernel_thread((int(*)(void *)) usbip_thread, (void *) eh, 0);
++
++	wait_for_completion(&eh->thread_done);
++}
++
++void usbip_stop_eh(struct usbip_device *ud)
++{
++	struct usbip_task *eh = &ud->eh;
++
++//	if(eh->thread != NULL) {
++//		send_sig(SIGKILL, eh->thread, 1);
++		wait_for_completion(&eh->thread_done);
++		dbg_eh("usbip_eh has finished\n");
++//	}
++
++	dbg_eh("bye\n");
++}
++
++
++void usbip_event_add(struct usbip_device *ud, unsigned long event)
++{
++	spin_lock(&ud->lock);
++
++	ud->event |= event;
++
++	wake_up(&ud->eh_waitq);
++
++	spin_unlock(&ud->lock);
++}
++
++
++
++static int event_handler(struct usbip_device *ud)
++{
++
++	dbg_eh("enter\n");
++
++
++	/*
++	 * Events are handled by only this thread.
++	 */
++	while( usbip_event_happend(ud) ) {
++		dbg_eh("pending event %lx\n", ud->event);
++
++		/*
++		 * NOTE: shutdown must come first.
++		 * Shutdown the device.
++		 */
++		if(ud->event & USBIP_EH_SHUTDOWN) {
++			ud->eh_ops.shutdown(ud);
++
++			ud->event &= ~USBIP_EH_SHUTDOWN;
++
++			break;
++		}
++
++		/* Stop the error handler. */
++		if(ud->event & USBIP_EH_BYE) {
++
++			return -1;
++		}
++
++		/* Reset the device. */
++		if(ud->event & USBIP_EH_RESET) {
++			ud->eh_ops.reset(ud);
++
++			ud->event &= ~USBIP_EH_RESET;
++
++			break;
++		}
++
++		/* Mark the device as unusable. */
++		if(ud->event & USBIP_EH_UNUSABLE) {
++			ud->eh_ops.unusable(ud);
++
++			ud->event &= ~USBIP_EH_UNUSABLE;
++
++			break;
++		}
++
++		/* NOTREACHED */
++		VHCI_ERROR("unknown event\n");
++		return -1;
++	}
++
++	return 0;
++}
++
++
++
++
++static void event_handler_loop(struct usbip_task *ut)
++{
++	struct usbip_device *ud = container_of(ut, struct usbip_device, eh);
++
++	while(1) {
++		if(signal_pending(current)) {
++			dbg_eh("signal catched!\n");
++			break;
++		}
++
++		if( event_handler(ud) < 0)
++			break;
++
++		wait_event_interruptible(ud->eh_waitq, usbip_event_happend(ud));
++		dbg_eh("wakeup\n");
++	}
++}
++
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ gregkh-2.6/drivers/usb/usbib/vhci.h	2005-12-01 15:21:50.000000000 -0800
+@@ -0,0 +1,125 @@
++/*
++ * $Id: vhci.h 249 2005-08-10 12:15:26Z taka-hir $
++ *
++ * Copyright (C) 2003-2005 Takahiro Hirofuchi <taka-hir@is.naist.jp>
++ *
++ *
++ * This is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307,
++ * USA.
++ */
++
++
++#include "usbip_common.h"
++
++/*
++ * A USB Host Controller Driver needs to include "hcd.h" in drivers/usb/core/.
++ */
++
++/* HCD_HEADER is defined in Makefile */
++#include HCD_HEADER
++
++
++#define VHCI_DEVICE_INFO_SIZE 80
++
++struct vhci_device {
++	struct usb_device *udev;
++
++	__u32 busnum; /* remote bus num */
++	__u32 devnum; /* remote dev num */
++	__u32 infnum;
++
++	enum usb_device_speed speed;
++
++	char info[VHCI_DEVICE_INFO_SIZE];
++
++	__u32 rhport; /* root hub port number */
++
++
++	struct usbip_device ud;
++
++
++	/* vhci_priv is linked to any one of these lists. */
++	spinlock_t priv_lock;
++	struct list_head priv_tx;
++	struct list_head priv_rx;
++
++	wait_queue_head_t waitq;
++};
++
++
++/* urb->hcpriv, use container_of() */
++struct vhci_priv {
++	unsigned long seqnum;
++	struct list_head list;
++
++	struct vhci_device *vdev;
++	struct urb *urb;
++};
++
++
++/*
++ * The number of ports is less than 16 ?
++ * USB_MAXCHILDREN is statically defined to 16 in usb.h.  Its maximum value
++ * would be 31 because the event_bits[1] of struct usb_hub is defined as
++ * unsigned long in hub.h
++ */
++#define VHCI_NPORTS 2
++
++/* for usb_bus.hcpriv */
++struct vhci_hcd {
++	struct usb_hcd hcd;  /* must come first! */
++	spinlock_t	lock;
++
++	struct platform_device pdev;
++
++	u32	port_status[VHCI_NPORTS];
++	int started;
++	struct completion released;
++	unsigned	resuming:1;
++	unsigned long	re_timeout;
++
++
++
++	atomic_t seqnum;
++
++	/*
++	 * NOTE:
++	 * wIndex shows the port number and begins from 1.
++	 * But, the index of this array begins from 0.
++	 */
++	struct vhci_device vdev[VHCI_NPORTS];
++
++	/* vhci_device which has not been assiged its address yet */
++	int pending_port;
++};
++
++
++
++/* vhci_hcd.c */
++void rh_port_connect(int rhport, enum usb_device_speed speed);
++void rh_port_disconnect(int rhport);
++extern struct vhci_hcd *the_controller;
++#define hardware        (&the_controller->pdev.dev)
++
++
++
++struct vhci_device *port_to_vdev(__u32 port);
++
++void vhci_rx_loop(struct usbip_task *ut);
++void vhci_tx_loop(struct usbip_task *ut);
++
++
++/* vhci_sysfs.c */
++extern struct attribute_group dev_attr_group;
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ gregkh-2.6/drivers/usb/usbib/vhci_hcd.c	2005-12-01 15:21:50.000000000 -0800
+@@ -0,0 +1,1032 @@
++/*
++ * $Id: vhci_hcd.c 267 2005-09-02 17:21:42Z taka-hir $
++ *
++ * Copyright (C) 2003-2005 Takahiro Hirofuchi <taka-hir@is.naist.jp>
++ *
++ *
++ * This is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307,
++ * USA.
++ */
++
++
++#include "vhci.h"
++
++#define DRIVER_VERSION " $Id: vhci_hcd.c 267 2005-09-02 17:21:42Z taka-hir $ "
++#define DRIVER_AUTHOR "HIROFUCHI Takahiro <taka-hir@is.naist.jp>"
++#define DRIVER_DESC "Virtual Host Controller Interface Driver for USB/IP"
++#define DRIVER_LICENCE "GPL"
++MODULE_AUTHOR(DRIVER_AUTHOR);
++MODULE_DESCRIPTION(DRIVER_DESC);
++MODULE_LICENSE(DRIVER_LICENCE);
++
++
++
++
++/* See usb gadget dummy hcd */
++
++
++
++
++static inline struct vhci_hcd *hcd_to_vhci(struct usb_hcd *hcd)
++{
++	return (struct vhci_hcd *) (hcd->hcd_priv);
++}
++
++static int vhci_hub_status (struct usb_hcd *hcd, char *buff);
++static int vhci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue, u16 wIndex, char *buff, u16 wLength);
++static int vhci_urb_enqueue (struct usb_hcd *hcd, struct usb_host_endpoint *ep, struct urb *urb, unsigned mem_flags);
++static int vhci_urb_dequeue( struct usb_hcd *hcd, struct urb *urb);
++static int vhci_start(struct usb_hcd *vhci_hcd);
++static void vhci_stop(struct usb_hcd *hcd);
++static int vhci_get_frame_number(struct usb_hcd *hcd);
++
++static const char	driver_name[] = "vhci_hcd";
++static const char	driver_desc[] = "USB/IP Virtual Host Contoroller";
++
++
++
++
++struct vhci_hcd *the_controller = NULL;
++
++
++void rh_port_connect(int rhport, enum usb_device_speed speed)
++{
++	unsigned long	flags;
++
++	dbg_vhci_rh("rh_port_connect %d\n", rhport);
++
++	spin_lock_irqsave (&the_controller->lock, flags);
++
++	the_controller->port_status[rhport] |= USB_PORT_STAT_CONNECTION
++		| (1 << USB_PORT_FEAT_C_CONNECTION);
++
++	switch (speed) {
++		case USB_SPEED_HIGH:
++			the_controller->port_status[rhport] |= USB_PORT_STAT_HIGH_SPEED;
++			break;
++		case USB_SPEED_LOW:
++			the_controller->port_status[rhport] |= USB_PORT_STAT_LOW_SPEED;
++			break;
++		default:
++			break;
++	}
++
++	//spin_lock(&the_controller->vdev[rhport].ud.lock);
++	//the_controller->vdev[rhport].ud.status = VDEV_CONNECT;
++	//spin_unlock(&the_controller->vdev[rhport].ud.lock);
++
++	the_controller->pending_port = rhport;
++
++	spin_unlock_irqrestore (&the_controller->lock, flags);
++
++}
++
++void rh_port_disconnect(int rhport)
++{
++	unsigned long flags;
++
++	dbg_vhci_rh("rh_port_disconnect %d\n", rhport);
++
++	spin_lock_irqsave (&the_controller->lock, flags);
++	//stop_activity (dum, driver);
++	the_controller->port_status[rhport] &= ~USB_PORT_STAT_CONNECTION;
++	the_controller->port_status[rhport] |= (1 << USB_PORT_FEAT_C_CONNECTION);
++
++
++	/* not yet complete the disconnection */
++	//spin_lock(&vdev->ud.lock);
++	//vdev->ud.status = VHC_ST_DISCONNECT;
++	//spin_unlock(&vdev->ud.lock);
++
++	spin_unlock_irqrestore (&the_controller->lock, flags);
++}
++
++
++
++
++
++
++/* See hub_configure in hub.c */
++static inline void hub_descriptor (struct usb_hub_descriptor *desc)
++{
++	memset (desc, 0, sizeof *desc);
++	desc->bDescriptorType = 0x29;
++	desc->bDescLength = 9;
++	desc->wHubCharacteristics = __constant_cpu_to_le16 (0x0001);
++	desc->bNbrPorts = VHCI_NPORTS;
++	desc->bitmap [0] = 0xff;
++	desc->bitmap [1] = 0xff;
++}
++
++
++static int vhci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue, u16 wIndex, char *buf, u16 wLength)
++{
++	struct vhci_hcd	*dum;
++	int             retval = 0;
++	unsigned long   flags;
++	int		rhport;
++
++	/*
++	 * NOTE:
++	 * wIndex shows the port number and begins from 1.
++	 */
++	dbg_vhci_rh("typeReq %x wValue %x wIndex %x\n", typeReq, wValue, wIndex);
++	if( wIndex > VHCI_NPORTS )
++		VHCI_ERROR("invalid port number %d\n", wIndex);
++	rhport = ((__u8 ) (wIndex & 0x00ff)) -1;
++
++	//dum = container_of (hcd, struct vhci_hcd, hcd);
++	dum = hcd_to_vhci(hcd);
++	spin_lock_irqsave (&dum->lock, flags);
++	switch (typeReq) {
++		case ClearHubFeature:
++			dbg_vhci_rh("ClearHubFeature\n");
++			break;
++		case ClearPortFeature:
++			switch (wValue) {
++				case USB_PORT_FEAT_SUSPEND:
++					if (dum->port_status[rhport] & (1 << USB_PORT_FEAT_SUSPEND)) {
++						/* 20msec signaling */
++						dum->resuming = 1;
++						dum->re_timeout = jiffies + msecs_to_jiffies(20);
++					}
++					break;
++				case USB_PORT_FEAT_POWER:
++					dbg_vhci_rh("ClearPortFeature: USB_PORT_FEAT_POWER\n");
++					dum->port_status[rhport] = 0;
++					//dum->address = 0;
++					//dum->hdev = 0;
++					dum->resuming = 0;
++					break;
++				default:
++					dbg_vhci_rh("ClearPortFeature: default %x\n", wValue);
++					dum->port_status[rhport] &= ~(1 << wValue);
++			}
++			break;
++		case GetHubDescriptor:
++			dbg_vhci_rh("GetHubDescriptor\n");
++			hub_descriptor ((struct usb_hub_descriptor *) buf);
++			break;
++		case GetHubStatus:
++			dbg_vhci_rh("GetHubStatus\n");
++			*(u32 *) buf = __constant_cpu_to_le32 (0);
++			break;
++		case GetPortStatus:
++			dbg_vhci_rh("GetPortStatus port %x\n", wIndex);
++			if( wIndex > VHCI_NPORTS || wIndex < 1 ) {
++				VHCI_ERROR("invalid port number %d\n", wIndex);
++				retval = -EPIPE;
++			}
++
++			/* we do no care of resume. */
++
++			/* whoever resets or resumes must GetPortStatus to
++			 * complete it!!
++			 *                                   */
++			if (dum->resuming && time_after (jiffies, dum->re_timeout)) {
++				VHCI_ERROR("not yet\n");
++				dum->port_status[rhport] |= (1 << USB_PORT_FEAT_C_SUSPEND);
++				dum->port_status[rhport] &= ~(1 << USB_PORT_FEAT_SUSPEND);
++				dum->resuming = 0;
++				dum->re_timeout = 0;
++				//if (dum->driver && dum->driver->resume) {
++				//	spin_unlock (&dum->lock);
++				//	dum->driver->resume (&dum->gadget);
++				//	spin_lock (&dum->lock);
++				//}
++			}
++
++			if ((dum->port_status[rhport] & (1 << USB_PORT_FEAT_RESET)) != 0
++					&& time_after (jiffies, dum->re_timeout)) {
++				dum->port_status[rhport] |= (1 << USB_PORT_FEAT_C_RESET);
++				dum->port_status[rhport] &= ~(1 << USB_PORT_FEAT_RESET);
++				dum->re_timeout = 0;
++
++				if (dum->vdev[rhport].ud.status == VDEV_ST_NOTASSIGNED) {
++					dbg_vhci_rh("enable rhport %d (status %u)\n", rhport, dum->vdev[rhport].ud.status);
++					dum->port_status[rhport] |= USB_PORT_STAT_ENABLE;
++				}
++#if 0
++				if (dum->driver) {
++
++					dum->port_status[rhport] |= USB_PORT_STAT_ENABLE;
++					/* give it the best speed we agree on */
++					dum->gadget.speed = dum->driver->speed;
++					dum->gadget.ep0->maxpacket = 64;
++					switch (dum->gadget.speed) {
++						case USB_SPEED_HIGH:
++							dum->port_status[rhport] |=
++								USB_PORT_STAT_HIGH_SPEED;
++							break;
++						case USB_SPEED_LOW:
++							dum->gadget.ep0->maxpacket = 8;
++							dum->port_status[rhport] |=
++								USB_PORT_STAT_LOW_SPEED;
++							break;
++						default:
++							dum->gadget.speed = USB_SPEED_FULL;
++							break;
++					}
++				}
++#endif
++
++			}
++			((u16 *) buf)[0] = cpu_to_le16 (dum->port_status[rhport]);
++			((u16 *) buf)[1] = cpu_to_le16 (dum->port_status[rhport] >> 16);
++
++			dbg_vhci_rh("GetPortStatus bye %x %x\n", ((u16 *)buf)[0], ((u16 *)buf)[1] );
++			break;
++		case SetHubFeature:
++			dbg_vhci_rh("SetHubFeature\n");
++			retval = -EPIPE;
++			break;
++		case SetPortFeature:
++			switch (wValue) {
++				case USB_PORT_FEAT_SUSPEND:
++					dbg_vhci_rh("SetPortFeature: USB_PORT_FEAT_SUSPEND\n");
++					VHCI_ERROR("not yet\n");
++#if 0
++					dum->port_status[rhport] |= (1 << USB_PORT_FEAT_SUSPEND);
++					if (dum->driver->suspend) {
++						spin_unlock (&dum->lock);
++						dum->driver->suspend (&dum->gadget);
++						spin_lock (&dum->lock);
++					}
++#endif
++					break;
++				case USB_PORT_FEAT_RESET:
++					dbg_vhci_rh("SetPortFeature: USB_PORT_FEAT_RESET\n");
++					/* if it's already running, disconnect first */
++					if (dum->port_status[rhport] & USB_PORT_STAT_ENABLE) {
++						dum->port_status[rhport] &= ~(USB_PORT_STAT_ENABLE
++								| USB_PORT_STAT_LOW_SPEED
++								| USB_PORT_STAT_HIGH_SPEED);
++#if 0
++						if (dum->driver) {
++							dev_dbg (hardware, "disconnect\n");
++							stop_activity (dum, dum->driver);
++						}
++#endif
++
++						/* FIXME test that code path! */
++					}
++					/* 50msec reset signaling */
++					dum->re_timeout = jiffies + msecs_to_jiffies(50);
++
++					/* FALLTHROUGH */
++				default:
++					dbg_vhci_rh("SetPortFeature: default %d\n", wValue);
++					dum->port_status[rhport] |= (1 << wValue);
++			}
++			break;
++
++		default:
++			VHCI_ERROR("default: no such request\n");
++			dev_dbg (hardware,
++					"hub control req%04x v%04x i%04x l%d\n",
++					typeReq, wValue, wIndex, wLength);
++
++			/* "protocol stall" on error */
++			retval = -EPIPE;
++	}
++
++	spin_unlock_irqrestore (&dum->lock, flags);
++
++	dbg_vhci_rh("bye\n");
++	return retval;
++}
++
++
++
++
++#define PORT_C_MASK \
++	         ((1 << USB_PORT_FEAT_C_CONNECTION) \
++		          | (1 << USB_PORT_FEAT_C_ENABLE) \
++		          | (1 << USB_PORT_FEAT_C_SUSPEND) \
++		          | (1 << USB_PORT_FEAT_C_OVER_CURRENT) \
++		          | (1 << USB_PORT_FEAT_C_RESET))
++
++/*
++ * @buf: a bitmap to show which port status has been changed.
++ * bit 0: reserved or used for another purpose?
++ * bit 1: the status of port 0 has been changed.
++ * bit 2: the status of port 1 has been changed.
++ * ...
++ * bit 7: the status of port 6 has been changed.
++ * bit 8: the status of port 7 has been changed.
++ * ...
++ * bit 15: the status of port 14 has been changed.
++ *
++ * So, the maximum number of ports is 31 ( port 0 to port 30) ?
++ *
++ * The return value is the actual transfered length in byte.
++ * If nothing has changed, return 0.
++ * If the number of ports is less than or equal to 6, return 1.
++ */
++static int vhci_hub_status (struct usb_hcd *hcd, char *buf)
++{
++	struct vhci_hcd            *dum;
++	unsigned long           flags;
++	int                     retval;
++
++	/* the enough buffer is allocated according to USB_MAXCHILDREN */
++	unsigned long *event_bits = (unsigned long *) buf;
++	int rhport;
++	int changed = 0;
++
++
++	*event_bits = 0;
++	//dbg_vhci_rh("enter\n");
++
++	//dum = container_of (hcd, struct vhci_hcd, hcd);
++	dum = hcd_to_vhci(hcd);
++
++	spin_lock_irqsave (&dum->lock, flags);
++
++	for(rhport = 0; rhport < VHCI_NPORTS; rhport++) {
++
++		if (!(dum->port_status[rhport] & PORT_C_MASK)) {
++			/* The status of a port has not been changed, */
++			//retval = 0;
++		} else {
++			/* The status of a port has been changed, */
++			dbg_vhci_rh("port %d is changed\n", rhport);
++
++			*event_bits |= 1 << ( rhport + 1);
++			//*buf = (1 << 1);
++			dev_dbg (hardware, "port %d status 0x%08x has changes\n",  rhport, dum->port_status[rhport]);
++			//retval = 1;
++			//
++			changed = 1;
++		}
++#if 0
++		if (!(dum->port_status[rhport] & PORT_C_MASK))
++			/* The status of a port has not been changed, */
++			retval = 0;
++		else {
++			/* The status of a port has been changed, */
++			*buf = (1 << 1);
++			dev_dbg (hardware, "port status 0x%08x has changes\n", dum->port_status[rhport]);
++			retval = 1;
++		}
++#endif
++	}
++
++	if(changed)
++		retval = 1 + (VHCI_NPORTS / 8);
++	else
++		retval = 0;
++
++	spin_unlock_irqrestore (&dum->lock, flags);
++
++	//dbg_vhci_rh("event_bits %lx\n", *event_bits);
++
++	//dbg_vhci_rh("bye\n");
++	return retval;
++
++}
++
++#if 0
++int devnum_to_port(int devnum)
++{
++	int i;
++	for(i=0; i< VHCI_NPORTS; i++ ) {
++		if(the_controller->vdev[i].dev != NULL)
++			if(the_controller->vdev[i].dev->devnum == devnum)
++				return i;
++	}
++
++	return -1;
++}
++
++static void maybe_set_status (struct urb *urb, int status)
++{
++	spin_lock (&urb->lock);
++	if (urb->status == -EINPROGRESS)
++		urb->status = status;
++	spin_unlock (&urb->lock);
++}
++#endif
++
++
++static struct vhci_device *get_vdev(struct usb_device *udev)
++{
++	int i;
++
++	if(!udev)
++		return NULL;
++
++
++	for(i=0; i < VHCI_NPORTS; i++) {
++		if(the_controller->vdev[i].udev == udev) {
++			return port_to_vdev(i);
++		}
++	}
++
++	return NULL;
++}
++
++
++static void vhci_tx_urb(struct urb *urb)
++{
++	struct vhci_device *vdev = get_vdev(urb->dev);
++	struct vhci_priv *priv;
++	unsigned long flag;
++
++	if(!vdev) BUG();
++
++	spin_lock_irqsave(&vdev->priv_lock, flag);
++
++	priv = kmalloc(sizeof(struct vhci_priv), GFP_ATOMIC);
++	if(!priv) {
++		uerr("malloc vhci_priv\n");
++		spin_unlock_irqrestore(&vdev->priv_lock, flag);
++		usbip_event_add(&vdev->ud, VDEV_EVENT_ERROR_MALLOC);
++		return;
++	}
++	memset(priv, 0, sizeof(struct vhci_priv));
++
++	priv->seqnum = atomic_read(&the_controller->seqnum);
++	atomic_inc(&the_controller->seqnum);
++	if(priv->seqnum == 0xffff)
++		uinfo("seqnum max\n");
++
++	priv->vdev = vdev;
++	priv->urb = urb;
++
++	urb->hcpriv = (void *) priv;
++
++
++	list_add_tail(&priv->list, &vdev->priv_tx);
++
++	wake_up(&vdev->waitq);
++	spin_unlock_irqrestore(&vdev->priv_lock, flag);
++}
++
++static int vhci_urb_enqueue(struct usb_hcd *hcd, struct usb_host_endpoint *ep, struct urb *urb, unsigned mem_flags)
++{
++	int ret = 0;
++	unsigned long flags;
++
++	dbg_vhci_hc("enter, usb_hcd %p urb %p mem_flags %d\n", hcd, urb, mem_flags);
++
++
++
++	/* patch to usb_sg_init() is in 2.5.60 */
++	BUG_ON (!urb->transfer_buffer && urb->transfer_buffer_length);
++
++	spin_lock_irqsave (&the_controller->lock, flags);
++
++	/* check HC is active or not */
++	if(!HC_IS_RUNNING(hcd->state)) {
++		uerr("HC is not running\n");
++		spin_unlock_irqrestore(&the_controller->lock, flags);
++		return  -ENODEV;
++	}
++
++	if(urb->status != -EINPROGRESS) {
++		uerr("URB already unlinked!, status %d\n", urb->status);
++		spin_unlock_irqrestore(&the_controller->lock, flags);
++		return urb->status;
++	}
++
++
++	/*
++	 * The enumelation process is as follows;
++	 *
++	 *  1. Get_Descriptor request to DevAddrs(0) EndPoint(0)
++	 *     to get max packet length of default pipe
++	 *
++	 *  2. Set_Address request to DevAddr(0) EndPoint(0)
++	 *
++	 */
++
++	if(usb_pipedevice(urb->pipe) == 0) {
++		__u8 type = usb_pipetype(urb->pipe);
++		struct usb_ctrlrequest *ctrlreq = (struct usb_ctrlrequest *) urb->setup_packet;
++		struct vhci_device *vdev = port_to_vdev(the_controller->pending_port);
++
++		if(type != PIPE_CONTROL || !ctrlreq ) {
++			VHCI_ERROR("invalid request to devnum 0\n");
++			ret = EINVAL;
++			goto no_need_xmit;
++		}
++
++		switch (ctrlreq->bRequest) {
++
++			case USB_REQ_SET_ADDRESS:
++				vdev->udev = urb->dev;
++				dbg_vhci_hc("SetAddress Request (%d) to port %d\n",
++						ctrlreq->wValue, vdev->rhport);
++
++				spin_lock(&vdev->ud.lock);
++				vdev->ud.status = VDEV_ST_USED;
++				spin_unlock(&vdev->ud.lock);
++
++				spin_lock (&urb->lock);
++				if (urb->status == -EINPROGRESS) {
++					/* This request is successfully completed. */
++					/* If not -EINPROGRESS, possibly unlinked. */
++					urb->status = 0;
++				}
++				spin_unlock (&urb->lock);
++
++				goto no_need_xmit;
++
++			case USB_REQ_GET_DESCRIPTOR:
++				if(ctrlreq->wValue == (USB_DT_DEVICE << 8)) {
++					dbg_vhci_hc("Not yet?: Get_Descriptor to device 0( get max pipe size )\n");
++				}
++				vdev->udev = urb->dev;
++				goto out;
++
++			default:
++				/* NOT REACHED */
++				VHCI_ERROR("invalid request to devnum 0 bRequest %u, wValue %u\n",
++						ctrlreq->bRequest, ctrlreq->wValue);
++				ret =  -EINVAL;
++				goto no_need_xmit;
++		}
++
++	}
++
++out:
++
++
++	vhci_tx_urb(urb);
++
++
++	spin_unlock_irqrestore (&the_controller->lock, flags);
++
++	return 0;
++
++
++no_need_xmit:
++	//urb->hcpriv = NULL;
++
++	spin_unlock_irqrestore(&the_controller->lock, flags);
++	usb_hcd_giveback_urb(&the_controller->hcd, urb, 0);
++
++	return 0;
++}
++
++
++/*
++ * vhci_rx gives back the urb after recieving the reply of the urb.  If an
++ * unlink pdu is sent or not, vhci_rx recieves a normal return pdu and gives
++ * back its urb. For the driver unlinking the urb, the content of the urb is
++ * not important, but the calling to its completion handler is important; the
++ * completion of unlinking is notified by the completion handler.
++ */
++static int vhci_urb_dequeue(struct usb_hcd *hcd, struct urb *urb)
++{
++	unsigned long flags;
++	struct vhci_priv *priv;
++	struct vhci_device *vdev;
++
++	uinfo("vhci_hcd: dequeue a urb %p\n", urb);
++
++	spin_lock_irqsave (&the_controller->lock, flags);
++
++	priv = urb->hcpriv;
++	if(!priv) {
++		/* URB was never linked! or will be soon given back by vhci_rx. */
++		spin_unlock_irqrestore(&the_controller->lock, flags);
++		return 0;
++	}
++
++	 // send unlink request here?
++	vdev = priv->vdev;
++
++	if(!vdev->ud.tcp_socket) {
++		unsigned long flags2;
++		spin_lock_irqsave(&vdev->priv_lock, flags2);
++		uinfo("vhci_hcd: device %p seems to be disconnected\n", vdev);
++
++		list_del(&priv->list);
++		kfree(priv);
++		urb->hcpriv = NULL;
++
++		spin_unlock_irqrestore(&vdev->priv_lock, flags2);
++	}
++
++	if(!vdev->ud.tcp_socket) {
++		spin_unlock_irqrestore(&the_controller->lock, flags);
++
++		uinfo("vhci_hcd: vhci_urb_dequeue() gives back urb %p\n", urb);
++		usb_hcd_giveback_urb(&the_controller->hcd, urb, 0);
++	} else {
++		spin_unlock_irqrestore(&the_controller->lock, flags);
++	}
++
++	dbg_vhci_hc("leave\n");
++	return 0;
++}
++
++
++static void vhci_device_unlink_all_urb(struct vhci_device *vdev)
++{
++	struct vhci_priv *priv, *tmp;
++	struct urb *urb;
++
++	spin_lock(&vdev->priv_lock);
++
++	list_for_each_entry_safe(priv, tmp, &vdev->priv_tx, list) {
++		urb = priv->urb;
++		list_del(&priv->list);
++		kfree(priv);
++
++		urb->hcpriv = NULL;
++
++		/* FIXME:
++		 * Should i give back a urb to usbcore ?
++		 */
++		spin_unlock(&vdev->priv_lock);
++		usb_hcd_giveback_urb(&the_controller->hcd, urb, 0);
++		spin_lock(&vdev->priv_lock);
++	}
++
++	list_for_each_entry_safe(priv, tmp, &vdev->priv_rx, list) {
++		urb = priv->urb;
++		list_del(&priv->list);
++		kfree(priv);
++
++		urb->hcpriv = NULL;
++
++		/* FIXME:
++		 * Should i give back a urb to usbcore ?
++		 */
++		spin_unlock(&vdev->priv_lock);
++		usb_hcd_giveback_urb(&the_controller->hcd, urb, 0);
++		spin_lock(&vdev->priv_lock);
++	}
++
++	spin_unlock(&vdev->priv_lock);
++}
++
++/*
++ * The important thing is that only one context begins cleanup.
++ * This is why error handling and cleanup become simple.
++ * We do not want to consider race condition as possible.
++ */
++static void vhci_shutdown_connection(struct usbip_device *ud)
++{
++	struct vhci_device *vdev = container_of(ud, struct vhci_device, ud);
++
++
++	usbip_stop_threads(&vdev->ud);
++	uinfo("stop threads\n");
++
++	/* active connection is closed */
++	if(vdev->ud.tcp_socket != NULL) {
++		sock_release(vdev->ud.tcp_socket);
++		vdev->ud.tcp_socket = NULL;
++	}
++	uinfo("release socket\n");
++
++	/*
++	 * rh_port_disconnect() is a trigger of ...
++	 *   usb_disable_device():
++	 * 	disable all the endpoints for a USB device.
++	 *   usb_disable_endpoint():
++	 * 	disable endpoints. pending urbs are unlinked(dequeued).
++	 *
++	 * NOTE: After calling rh_port_disconnect(), the USB device driver of a
++	 * deteched device should release used urbs in a cleanup function(i.e.
++	 * xxx_disconnect()). Therefore, vhci_hcd does not need to release
++	 * pushed urbs and their private data in this function.
++	 *
++	 * NOTE: vhci_dequeue() must be considered carefully. When shutdowning
++	 * a connection, vhci_shutdown_connection() expects vhci_dequeue()
++	 * gives back pushed urbs and frees their private data by request of
++	 * the cleanup function of a USB driver. When unlinking a urb with an
++	 * active connection, vhci_dequeue() does not give back the urb which
++	 * is actually given back by vhci_rx after recieving its return pdu.
++	 *
++	 */
++	rh_port_disconnect(vdev->rhport);
++
++	/* Comment out. See the upper NOTE */
++#if 0
++	/* the priv lists are freed */
++	vhci_device_unlink_all_urb(vdev);
++	uinfo("unlink all urbs\n");
++#endif
++
++	uinfo("disconnect device\n");
++
++}
++
++
++static void vhci_device_reset(struct usbip_device *ud)
++{
++	struct vhci_device *vdev = container_of(ud, struct vhci_device, ud);
++
++	spin_lock(&ud->lock);
++
++	vdev->busnum = 0;
++	vdev->devnum = 0;
++	vdev->speed  = 0;
++
++	ud->tcp_socket = NULL;
++
++	//usbip_stop_threads(ud);
++
++	ud->status = VDEV_ST_NULL;
++
++	spin_unlock(&ud->lock);
++
++}
++
++static void vhci_device_unusable(struct usbip_device* ud)
++{
++	spin_lock(&ud->lock);
++
++	ud->status = VDEV_ST_ERROR;
++
++	spin_unlock(&ud->lock);
++}
++
++static void vhci_device_init(struct vhci_device *vdev)
++{
++	memset(vdev, 0, sizeof(*vdev));
++
++	usbip_task_init(&vdev->ud.tcp_rx, "vhci_rx", vhci_rx_loop);
++	usbip_task_init(&vdev->ud.tcp_tx, "vhci_tx", vhci_tx_loop);
++
++	vdev->ud.side   = USBIP_VHCI;
++	vdev->ud.status = VDEV_ST_NULL;
++	vdev->ud.lock   = SPIN_LOCK_UNLOCKED;
++
++	INIT_LIST_HEAD(&vdev->priv_rx);
++	INIT_LIST_HEAD(&vdev->priv_tx);
++	vdev->priv_lock = SPIN_LOCK_UNLOCKED;
++
++	init_waitqueue_head(&vdev->waitq);
++
++	vdev->ud.eh_ops.shutdown = vhci_shutdown_connection;
++	vdev->ud.eh_ops.reset = vhci_device_reset;
++	vdev->ud.eh_ops.unusable= vhci_device_unusable;
++
++	usbip_start_eh(&vdev->ud);
++}
++
++
++/*----------------------------------------------------------------------*/
++
++static int vhci_start(struct usb_hcd *hcd)
++{
++	//struct vhci_hcd *vhci = hcd_to_vhci(hcd);
++
++	dbg_vhci_hc("enter vhci_start\n");
++
++	hcd->state  = HC_STATE_RUNNING;
++
++	return 0;
++}
++
++static void vhci_stop(struct usb_hcd *hcd)
++{
++	struct vhci_hcd *vhci = hcd_to_vhci(hcd);
++
++	dbg_vhci_hc("stop VHCI controller\n");
++
++	{
++		__u32 rhport = 0;
++		struct vhci_device *vdev;
++
++		for( rhport = 0 ; rhport < VHCI_NPORTS; rhport++) {
++			vdev = &vhci->vdev[rhport];
++
++			usbip_event_add(&vdev->ud, VDEV_EVENT_REMOVED);
++			usbip_stop_eh(&vdev->ud);
++		}
++	}
++
++	uinfo("vhci_stop done\n");
++}
++
++/*----------------------------------------------------------------------*/
++
++static int vhci_get_frame_number(struct usb_hcd *hcd)
++{
++	uerr("Not yet implemented\n");
++	return 0;
++}
++
++static struct hc_driver vhci_hc_driver = {
++	.description	= driver_name,
++	.product_desc	= driver_desc,
++	.hcd_priv_size	= sizeof(struct vhci_hcd),
++
++	.flags		= HCD_USB2,
++
++	.start		= vhci_start,
++	.stop 		= vhci_stop,
++
++	.urb_enqueue	= vhci_urb_enqueue,
++	.urb_dequeue	= vhci_urb_dequeue,
++
++	.get_frame_number = vhci_get_frame_number,
++
++	.hub_status_data = vhci_hub_status,
++	.hub_control    = vhci_hub_control,
++	//.hub_suspend	= vhci_hub_suspend,
++	//.hub_resume	= vhci_hub_resume,
++};
++
++static int vhci_hcd_probe(struct device *dev)
++{
++	struct usb_hcd		*hcd;
++	struct platform_device	*pdev;
++	struct vhci_hcd		*vhci;
++	int			ret;
++
++	uinfo("proving...\n");
++
++
++	pdev = container_of(dev, struct platform_device, dev);
++	dbg_vhci_hc("name %s id %d\n", pdev->name, pdev->id);
++
++
++	/*
++	 * Allocate and initialize hcd.
++	 * Our private data is also allocated automatically.
++	 */
++	hcd = usb_create_hcd(&vhci_hc_driver, dev, dev->bus_id);
++	if(!hcd)
++		return -ENOMEM;
++
++
++	the_controller = vhci = hcd_to_vhci(hcd);
++	{
++		int port;
++		for(port=0; port < VHCI_NPORTS; port++) {
++			struct vhci_device *vdev = &vhci->vdev[port];
++			vhci_device_init( vdev );
++			vdev->rhport = port;
++		}
++	}
++	atomic_set(&vhci->seqnum, 1);
++	spin_lock_init(&vhci->lock);
++
++
++
++	hcd->product_desc = "USB/IP VHCI driver";
++
++
++	/*
++	 * Finish generic HCD structure initialization and register.
++	 * Call the driver's reset() and start() routines.
++	 */
++	ret = usb_add_hcd(hcd, 0, 0);
++	if(ret != 0) {
++		usb_put_hcd(hcd);
++		return ret;
++	}
++
++	sysfs_create_group(&hcd->self.controller->kobj, &dev_attr_group);
++
++	dbg_vhci_hc("bye\n");
++	return 0;
++}
++
++
++static int vhci_hcd_remove(struct device *dev)
++{
++	struct usb_hcd	*hcd;
++
++	hcd = dev_get_drvdata(dev);
++
++	/*
++	 * Disconnects the root hub,
++	 * then reverses the effects of usb_add_hcd(),
++	 * invoking the HCD's stop() methods.
++	 */
++	usb_remove_hcd(hcd);
++	usb_put_hcd(hcd);
++	the_controller = NULL;
++
++	sysfs_remove_group(&hcd->self.controller->kobj, &dev_attr_group);
++
++	return 0;
++}
++
++static int vhci_hcd_suspend(struct device *dev, pm_message_t state, u32 level)
++{
++	struct usb_hcd	*hcd;
++
++	if(level != SUSPEND_DISABLE)
++		return 0;
++
++	dev_dbg(dev, "%s=n", __FUNCTION__);
++	hcd = dev_get_drvdata(dev);
++
++#ifndef CONFIG_USB_SUSPEND
++	uerr("Not yet supported!\n");
++#endif
++
++	hcd->state = HC_STATE_SUSPENDED;
++	return 0;
++}
++
++static int vhci_hcd_resume(struct device *dev, u32 level)
++{
++	struct usb_hcd	*hcd;
++
++	if(level != RESUME_ENABLE)
++		return 0;
++
++	dev_dbg(dev, "%s=n", __FUNCTION__);
++	hcd = dev_get_drvdata(dev);
++	hcd->state = HC_STATE_RUNNING;
++
++#ifndef CONFIG_USB_SUSPEND
++	uerr("Not yet supported!\n");
++#endif
++
++	usb_hcd_poll_rh_status(hcd);
++	return 0;
++}
++
++static struct device_driver vhci_driver = {
++	.name	 = (char *) driver_name,
++	.bus	 = &platform_bus_type,
++	.probe	 = vhci_hcd_probe,
++	.remove  = vhci_hcd_remove,
++	.suspend = vhci_hcd_suspend,
++	.resume  = vhci_hcd_resume,
++};
++
++/*----------------------------------------------------------------------*/
++
++/* The VHCI 'device' is 'virtual';
++ * it has no hardware and automatic detection.
++ * We need to add this virtual device as a platform device arbitrarily:
++ * 	1. platform_device_register()
++ * 	2. vhci_driver.probe()
++ */
++void the_pdev_release(struct device *dev){
++	return;
++}
++
++static struct platform_device the_pdev = {
++	.name = "hc",
++	.dev.driver = &vhci_driver,
++	.dev.release = the_pdev_release
++};
++
++static int __init vhci_init(void)
++{
++	int ret;
++
++	dbg_vhci_hc("enter\n");
++	if(usb_disabled())
++		return -ENODEV;
++
++	info("driver %s, %s\n", driver_name, DRIVER_VERSION);
++	ret = driver_register(&vhci_driver);
++	if(ret < 0)
++		return ret;
++
++	ret = platform_device_register(&the_pdev);
++	if(ret < 0) {
++		driver_unregister(&vhci_driver);
++		return ret;
++	}
++
++	ret = vhci_driver.probe(&the_pdev.dev);
++	if(ret < 0) {
++		platform_device_unregister(&the_pdev);
++		driver_unregister(&vhci_driver);
++	}
++
++	dbg_vhci_hc("bye\n");
++	return ret;
++}
++module_init(vhci_init);
++
++
++static void __exit vhci_cleanup(void)
++{
++	dbg_vhci_hc("enter\n");
++
++	/* device_unregister will call vhci_driver.remove() */
++	platform_device_unregister(&the_pdev);
++	driver_unregister(&vhci_driver);
++
++	dbg_vhci_hc("bye\n");
++}
++module_exit(vhci_cleanup);
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ gregkh-2.6/drivers/usb/usbib/vhci_rx.c	2005-12-01 15:21:50.000000000 -0800
+@@ -0,0 +1,150 @@
++/*
++ * $Id: vhci_rx.c 265 2005-09-01 09:24:10Z taka-hir $
++ *
++ * Copyright (C) 2003-2005 Takahiro Hirofuchi <taka-hir@is.naist.jp>
++ *
++ *
++ * This is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307,
++ * USA.
++ */
++
++#include "vhci.h"
++
++
++
++
++/* get URB from transmitted queue */
++static struct urb *pickup_urb_and_free_priv(struct vhci_device *vdev, __u32 seqnum)
++{
++	struct vhci_priv *priv, *tmp;
++	struct urb *urb = NULL;
++
++	spin_lock(&vdev->priv_lock);
++
++	list_for_each_entry_safe(priv, tmp, &vdev->priv_rx, list) {
++		if(priv->seqnum == seqnum) {
++			urb = priv->urb;
++			dbg_vhci_rx("find urb %p vurb %p seqnum %u\n", urb, priv, seqnum);
++
++			if(urb->status != -EINPROGRESS) {
++				 if (urb->status == -ENOENT || urb->status == -ECONNRESET) {
++					 uinfo("urb %p was unlinked %ssynchronuously.\n",
++							 urb, urb->status == -ENOENT ? "" : "a");
++				 } else {
++					 uinfo("urb %p may be in a error, status %d\n",
++							 urb, urb->status);
++				 }
++			}
++
++			list_del(&priv->list);
++			kfree(priv);
++			urb->hcpriv = NULL;
++
++			break;
++		}
++	}
++
++	spin_unlock(&vdev->priv_lock);
++
++
++	return urb;
++}
++
++static void vhci_recv_return(struct vhci_device *vdev, struct usbip_header *pdu)
++{
++	struct usbip_device *ud = &vdev->ud;
++	struct urb *urb = pickup_urb_and_free_priv(vdev, pdu->base.seqnum);
++
++
++	if(!urb) {
++		VHCI_ERROR("cannot find a urb of seqnum %u\n", pdu->base.seqnum);
++		usbip_event_add(ud, VDEV_EVENT_ERROR_TCP);
++		return;
++	}
++
++
++	/* unpack the pdu to a urb */
++	usbip_pack_pdu(pdu, urb, VHC_C_RETURN, 0);
++
++	/* recv transfer buffer */
++	if( usbip_recv_xbuff(ud, urb) < 0) return;
++
++	/* recv iso_packet_descriptor */
++	if( usbip_recv_iso(ud, urb) < 0 ) return;
++
++
++	dbg_vhci_rx("now giveback urb %p\n", urb);
++
++	usb_hcd_giveback_urb(&the_controller->hcd, urb, 0);
++
++	dbg_vhci_rx("Leave\n");
++
++	return;
++}
++
++
++/* recv a pdu */
++static void vhci_rx_pdu(struct usbip_device *ud)
++{
++	int ret;
++	struct usbip_header pdu;
++	struct vhci_device *vdev = container_of(ud, struct vhci_device, ud);
++
++
++	dbg_vhci_rx("Enter\n");
++
++	memset(&pdu, 0, sizeof(pdu));
++
++
++	/* 1. recieve a pdu header */
++	ret = usbip_xmit(0, ud->tcp_socket, (char *) &pdu, sizeof(pdu),0);
++	if(ret != sizeof(pdu)) {
++		VHCI_ERROR("recv a header, %d\n", ret);
++		usbip_event_add(ud, VDEV_EVENT_ERROR_TCP);
++		return;
++	}
++
++	if(dbg_flag_vhci_rx)
++		usbip_dump_header(&pdu);
++
++	switch(pdu.base.command) {
++		case VHC_C_RETURN:
++			vhci_recv_return(vdev, &pdu);
++			break;
++		default:
++			/* NOTREACHED */
++			VHCI_ERROR("unknown pdu\n");
++			usbip_event_add(ud, VDEV_EVENT_ERROR_TCP);
++	}
++}
++
++void vhci_rx_loop(struct usbip_task *ut)
++{
++	struct usbip_device *ud = container_of(ut, struct usbip_device, tcp_rx);
++
++
++	while (1) {
++		if(signal_pending(current)){
++			dbg_vhci_rx("signal catched!\n");
++			break;
++		}
++
++
++		if( usbip_event_happend(ud) ) break;
++
++		vhci_rx_pdu(ud);
++	}
++}
++
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ gregkh-2.6/drivers/usb/usbib/vhci_sysfs.c	2005-12-01 15:21:50.000000000 -0800
+@@ -0,0 +1,265 @@
++/*
++ * $Id: vhci_sysfs.c 260 2005-08-30 10:35:16Z taka-hir $
++ *
++ * Copyright (C) 2003-2005 Takahiro Hirofuchi <taka-hir@is.naist.jp>
++ *
++ *
++ * This is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307,
++ * USA.
++ */
++
++#include "vhci.h"
++
++
++
++
++struct vhci_device *port_to_vdev(__u32 port)
++{
++	return &the_controller->vdev[port];
++}
++
++
++int vhci_proc_vcdown(__u32 rhport)
++{
++	struct vhci_device *vdev = port_to_vdev(rhport);
++
++	dbg_vhci_sysfs("enter\n");
++
++	spin_lock(&vdev->priv_lock);
++
++	if (vdev->ud.status == VDEV_ST_NULL) {
++		VHCI_ERROR("not connected %d\n", vdev->ud.status);
++		spin_unlock(&vdev->priv_lock);
++		return -EINVAL;
++	}
++
++	spin_unlock(&vdev->priv_lock);
++
++	usbip_event_add(&vdev->ud, VDEV_EVENT_DOWN);
++
++	return 0;
++}
++
++
++
++int vhci_proc_status(char *out)
++{
++
++	char *s = out;
++	int i = 0;
++
++
++	/*
++	 * prt sta bus dev ipaddr                                  port   busid
++	 * 000 004 000 000 xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx xxxxxx xxxxxxxxx...
++	 * 001 004 000 000 xxx.xxx.xxx.xxx                         xxxxxx xxxxxxxxx...
++	 */
++
++	out += sprintf(out, "prt sta spd bus dev ipaddr                                  port   busid\n");
++
++
++	if(!the_controller) { VHCI_ERROR("the_controller is NULL\n"); return 0; }
++
++
++	for(i=0; i < VHCI_NPORTS; i++) {
++		struct vhci_device *vdev = port_to_vdev(i);
++
++		spin_lock(&vdev->ud.lock);
++
++		out += sprintf(out, "%03u %03u ", i, vdev->ud.status);
++
++		if(vdev->ud.status == VDEV_ST_USED) {
++			out += sprintf(out, "%03u %03u %03u ", vdev->speed, vdev->busnum, vdev->devnum);
++
++			if(vdev->ud.tcp_ss.ss_family == AF_INET) {
++				out += sprintf(out, "%03u.%03u.%03u.%03u                         ",
++						NIPQUAD(ss_v4_addr(vdev->ud.tcp_ss)));
++				out += sprintf(out, "%06d ", ss_v4_port(vdev->ud.tcp_ss));
++
++			} else if(vdev->ud.tcp_ss.ss_family == AF_INET6) {
++				out += sprintf(out, "%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x ",
++						NIP6(ss_v6_addr(vdev->ud.tcp_ss)));
++				out += sprintf(out, "%06d ", ss_v6_port(vdev->ud.tcp_ss));
++
++			} else {
++				VHCI_ERROR("unknown ss_family %d\n", vdev->ud.tcp_ss.ss_family);
++			}
++
++			out += sprintf(out, "%s", vdev->info);
++
++		} else {
++			out += sprintf(out, "000 000 000 0000:0000:0000:0000:0000:0000:0000:0000 000000 xxx");
++		}
++
++
++		out += sprintf(out, "\n");
++
++		spin_unlock(&vdev->ud.lock);
++	}
++
++
++	return out - s ;
++}
++
++
++
++
++
++
++static int valid_args(__u32 rhport, __u32 busnum, __u32 devnum, enum usb_device_speed speed)
++{
++
++	/* check rhport */
++	if( (rhport < 0) || (rhport >= VHCI_NPORTS) ) {
++		VHCI_ERROR("invalid port %u\n", rhport);
++		return -EINVAL;
++	}
++
++	/* check busnum & devnum */
++	if( (busnum<=0) || (busnum>=128) || (devnum<=0) || (devnum>=128) ) {
++		VHCI_ERROR("invalid busnum or portnum\n");
++		return -EINVAL;
++	}
++
++	/* check speed */
++	switch(speed) {
++		case USB_SPEED_LOW:
++		case USB_SPEED_FULL:
++		case USB_SPEED_HIGH:
++			break;
++
++		default:
++			VHCI_ERROR("invalid speed\n");
++			return -EINVAL;
++	}
++
++	return 0;
++}
++
++
++
++/* -------------------------------------------- */
++
++static ssize_t show_status(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	return vhci_proc_status(buf);
++}
++static DEVICE_ATTR(status, S_IRUGO, show_status, NULL);
++
++static ssize_t store_detach(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
++{
++	int err;
++	__u32 rhport = 0;
++
++	sscanf(buf, "%u", &rhport);
++
++	/* check rhport */
++	if( (rhport < 0) || (rhport >= VHCI_NPORTS) ) {
++		VHCI_ERROR("invalid port %u\n", rhport);
++		return -EINVAL;
++	}
++
++	err = vhci_proc_vcdown(rhport);
++	if(err < 0) {
++		return -EINVAL;
++	}
++
++	dbg_vhci_sysfs("Leave\n");
++	return count;
++}
++static DEVICE_ATTR(detach, S_IWUSR, NULL, store_detach);
++
++static ssize_t store_attach(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
++{
++	struct socket *socket;
++	char info[VHCI_DEVICE_INFO_SIZE];
++	__u32 rhport=0, sockfd=0, busnum=0, devnum=0, speed=0;
++	struct vhci_device *vdev;
++
++	memset(info, 0, VHCI_DEVICE_INFO_SIZE);
++	sscanf(buf, "%u %u %u %u %u %s", &rhport, &sockfd, &busnum, &devnum, &speed, info);
++
++	dbg_vhci_sysfs("rhport(%u) sockfd(%u) busnum(%u) devnum(%u) speed(%u)\n",
++			rhport, sockfd, busnum, devnum, speed);
++
++	if( valid_args(rhport, busnum, devnum, speed) < 0 ) {
++		return -EINVAL;
++	}
++
++	/* check sockfd */
++	socket = sockfd_to_socket(sockfd);
++	if(!socket) {
++		return  -EINVAL;
++	}
++
++	setnodelay(socket);
++
++	vdev = port_to_vdev(rhport);
++
++	/* begin a lock */
++	spin_lock(&vdev->ud.lock);
++
++	if(vdev->ud.status != VDEV_ST_NULL) {
++		spin_unlock(&vdev->ud.lock);
++		VHCI_ERROR("port %d already used\n", rhport);
++		return -EINVAL;
++	}
++
++	VHCI_INFO("rhport(%u) sockfd(%u) busnum(%u) devnum(%u) speed(%u)\n",
++			rhport, sockfd, busnum, devnum, speed);
++	VHCI_INFO("   info: %s\n", info);
++
++	vdev->busnum        = busnum;
++	vdev->devnum        = devnum;
++	vdev->speed         = speed;
++	vdev->ud.tcp_socket = socket;
++	set_sockaddr(socket, &vdev->ud.tcp_ss);
++	vdev->ud.status     = VDEV_ST_NOTASSIGNED;
++	memcpy(vdev->info, info, VHCI_DEVICE_INFO_SIZE);
++
++	spin_unlock(&vdev->ud.lock);
++	/* end the lock */
++
++	if(vdev->ud.tcp_ss.ss_family == AF_INET)
++		VHCI_INFO("connected to %u.%u.%u.%u(%d)\n",
++				NIPQUAD(ss_v4_addr(vdev->ud.tcp_ss)), ss_v4_port(vdev->ud.tcp_ss));
++	else if(vdev->ud.tcp_ss.ss_family == AF_INET6)
++		VHCI_INFO("connected to %04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x(%d)",
++				NIP6(ss_v6_addr(vdev->ud.tcp_ss)), ss_v6_port(vdev->ud.tcp_ss));
++	else
++		VHCI_ERROR("unknown ss_family %d\n", vdev->ud.tcp_ss.ss_family);
++
++
++
++	usbip_start_threads(&vdev->ud);
++	rh_port_connect(rhport, speed);
++
++	return count;
++}
++static DEVICE_ATTR(attach, S_IWUSR, NULL, store_attach);
++
++static struct attribute *dev_attrs[] = {
++	&dev_attr_status.attr,
++	&dev_attr_detach.attr,
++	&dev_attr_attach.attr,
++	&dev_attr_usbip_debug.attr,
++	NULL,
++};
++
++struct attribute_group dev_attr_group = {
++	//.name  = "usbip",
++	.attrs = dev_attrs,
++};
++
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ gregkh-2.6/drivers/usb/usbib/vhci_tx.c	2005-12-01 15:21:50.000000000 -0800
+@@ -0,0 +1,178 @@
++/*
++ * $Id: vhci_tx.c 260 2005-08-30 10:35:16Z taka-hir $
++ *
++ * Copyright (C) 2003-2005 Takahiro Hirofuchi <taka-hir@is.naist.jp>
++ *
++ *
++ * This is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307,
++ * USA.
++ */
++
++#include "vhci.h"
++
++
++/* @p: pipe whose dev number modified
++ * @pdev: new devive number */
++unsigned long vhci_change_pipe_devnum(__u32 p, __u8 pdev)
++{
++	__u32 oldp;
++	oldp = p;
++
++	if(pdev > 0x7f)
++		VHCI_ERROR("invalid devnum %u\n", pdev);
++	pdev &= 0x7f;    // 0XXX XXXX  confirm MSB be 0
++
++	p &= 0xffff80ff; /* clear p's devnum */
++
++
++	p |= (pdev << 8);
++
++	dbg_vhci_tx("return new pipe, devnum %u -> %u \n", usb_pipedevice(oldp), usb_pipedevice(p));
++	dbg_vhci_tx("           pipe %08x -> %08x\n", oldp, p);
++	return p;
++}
++
++
++
++static void setup_pdu(struct usbip_header *pdup,  struct urb *urb)
++{
++	struct vhci_priv    *priv = ((struct vhci_priv *) urb->hcpriv);
++	struct vhci_device *vdev = priv->vdev;
++
++	dbg_vhci_tx("URB, local devnum(%u), busnum(%u) devnum(%u)\n",
++			usb_pipedevice(urb->pipe), vdev->busnum, vdev->devnum);
++
++	{
++		pdup->base.command	= VHC_C_SUBMIT;
++		pdup->base.busnum		= vdev->busnum;
++		pdup->base.devnum		= vdev->devnum;
++		pdup->base.seqnum		= priv->seqnum;
++		pdup->base.pipe		= vhci_change_pipe_devnum(urb->pipe, vdev->devnum);
++
++		usbip_pack_pdu(pdup, urb, VHC_C_SUBMIT, 1);
++
++		if(urb->setup_packet != NULL) {
++			memcpy(pdup->submit.setup, urb->setup_packet, 8);
++		}
++	}
++}
++
++
++#define MAX_SUBMIT_QUEUE_DEPTH 100
++static struct usbip_header SubmitPDU[MAX_SUBMIT_QUEUE_DEPTH];
++
++static int vhci_send_txdata(struct vhci_device *vdev)
++{
++	unsigned long flags;
++	struct vhci_priv *priv, *tmp;
++	size_t txsize = 0;
++	int    count = 0;  /* the number of queued pdu */
++
++	struct msghdr msg;
++	struct iovec  iov[MAX_SUBMIT_QUEUE_DEPTH];
++
++	memset(iov, 0, sizeof(iov));
++	memset(&msg, 0, sizeof(msg));
++	msg.msg_iov = iov;
++	msg.msg_iovlen = 0;
++
++	memset(&SubmitPDU, 0, sizeof(struct usbip_header)*MAX_SUBMIT_QUEUE_DEPTH);
++
++
++	spin_lock_irqsave(&vdev->priv_lock, flags);
++
++	/* setup txdata to msghdr from queued urbs */
++	list_for_each_entry_safe(priv, tmp, &vdev->priv_tx, list) {
++		struct urb *urb = priv->urb;
++
++		dbg_vhci_tx("setup txdata %d for urb %p\n", count, urb);
++
++		/* 1. setup usbip_header */
++		setup_pdu(&SubmitPDU[count], urb);
++
++		iov[msg.msg_iovlen].iov_base = (void *) &SubmitPDU[count];
++		iov[msg.msg_iovlen].iov_len  = sizeof(struct usbip_header);
++		msg.msg_iovlen ++;
++		txsize += sizeof(struct usbip_header);
++
++		/* 2. setup transfer buffer */
++		if(!usb_pipein(urb->pipe) && urb->transfer_buffer != NULL && urb->transfer_buffer_length > 0) {
++			iov[msg.msg_iovlen].iov_base = urb->transfer_buffer;
++			iov[msg.msg_iovlen].iov_len  = urb->transfer_buffer_length;
++			msg.msg_iovlen++;
++			txsize += urb->transfer_buffer_length;
++		}
++
++		/* 3. setup iso_packet_descriptor */
++		if(usb_pipetype(urb->pipe) == PIPE_ISOCHRONOUS) {
++			iov[msg.msg_iovlen].iov_base = &urb->iso_frame_desc[0];
++			iov[msg.msg_iovlen].iov_len  = urb->number_of_packets * sizeof(struct usb_iso_packet_descriptor);
++			msg.msg_iovlen++;
++			txsize += urb->number_of_packets * sizeof(struct usb_iso_packet_descriptor);
++		}
++
++
++		list_move_tail(&priv->list, &vdev->priv_rx);
++
++		count++;
++		if(count == MAX_SUBMIT_QUEUE_DEPTH) {
++			dbg_vhci_tx("max urbs are processed, %d\n", MAX_SUBMIT_QUEUE_DEPTH);
++			break;
++		}
++
++	}
++
++	spin_unlock_irqrestore(&vdev->priv_lock,flags);
++
++	if(txsize > 0) {
++		int ret;
++		ret = usbip_sendmsg(vdev->ud.tcp_socket, &msg, txsize);
++		if (ret != txsize) {
++			VHCI_ERROR("vhci_sendmsg failed!, retval %d for %d\n", ret, txsize);
++			usbip_event_add(&vdev->ud, VDEV_EVENT_ERROR_TCP);
++			return -1;
++		}
++
++		dbg_vhci_tx("send txdata \n");
++	}
++
++	return txsize;
++}
++
++
++void vhci_tx_loop(struct usbip_task *ut)
++{
++	struct usbip_device *ud = container_of(ut, struct usbip_device, tcp_tx);
++	struct vhci_device *vdev = container_of(ud, struct vhci_device, ud);
++
++	while(1) {
++		if(signal_pending(current)) {
++			VHCI_INFO("vhci_tx signal catched\n");
++			break;
++		}
++
++		if( vhci_send_txdata(vdev) < 0)
++			break;
++
++
++
++		wait_event_interruptible(vdev->waitq, !list_empty(&vdev->priv_tx));
++
++		dbg_vhci_tx("pending urbs ?, now wake up\n");
++
++	}
++}
++
++
