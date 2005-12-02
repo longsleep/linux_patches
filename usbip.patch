@@ -1,38 +1,88 @@
- drivers/usb/usbib/Makefile       |   13 
- drivers/usb/usbib/stub.h         |   92 +++
- drivers/usb/usbib/stub_dev.c     |  417 +++++++++++++++
- drivers/usb/usbib/stub_main.c    |  317 +++++++++++
- drivers/usb/usbib/stub_rx.c      |  346 +++++++++++++
- drivers/usb/usbib/stub_tx.c      |  227 ++++++++
- drivers/usb/usbib/usbip_common.c |  883 +++++++++++++++++++++++++++++++++
- drivers/usb/usbib/usbip_common.h |  400 +++++++++++++++
- drivers/usb/usbib/usbip_event.c  |  147 +++++
- drivers/usb/usbib/vhci.h         |  125 ++++
- drivers/usb/usbib/vhci_hcd.c     | 1032 +++++++++++++++++++++++++++++++++++++++
- drivers/usb/usbib/vhci_rx.c      |  150 +++++
- drivers/usb/usbib/vhci_sysfs.c   |  265 ++++++++++
- drivers/usb/usbib/vhci_tx.c      |  178 ++++++
- 14 files changed, 4592 insertions(+)
+Subject: USB: add USB IP host and client driver
+From: Takahiro Hirofuchi <taka-hir@is.naist.jp>
 
---- /dev/null	1970-01-01 00:00:00.000000000 +0000
-+++ gregkh-2.6/drivers/usb/usbib/Makefile	2005-12-01 15:23:17.000000000 -0800
+Implementes a USB over IP host driver and client device.  Still a bit
+rough around the edges, but a great first implementation.
+
+See http://usbip.naist.jp/ for more information about this project, and
+a link to the userspace tools needed to get this to work.
+
+---
+ drivers/usb/Kconfig              |    2 
+ drivers/usb/Makefile             |    2 
+ drivers/usb/usbip/Kconfig        |   12 
+ drivers/usb/usbip/Makefile       |   13 
+ drivers/usb/usbip/stub.h         |   93 +++
+ drivers/usb/usbip/stub_dev.c     |  419 +++++++++++++++
+ drivers/usb/usbip/stub_main.c    |  319 ++++++++++++
+ drivers/usb/usbip/stub_rx.c      |  345 +++++++++++++
+ drivers/usb/usbip/stub_tx.c      |  205 +++++++
+ drivers/usb/usbip/usbip_common.c |  891 +++++++++++++++++++++++++++++++++
+ drivers/usb/usbip/usbip_common.h |  388 ++++++++++++++
+ drivers/usb/usbip/usbip_event.c  |  147 +++++
+ drivers/usb/usbip/vhci.h         |  116 ++++
+ drivers/usb/usbip/vhci_hcd.c     | 1026 +++++++++++++++++++++++++++++++++++++++
+ drivers/usb/usbip/vhci_rx.c      |  149 +++++
+ drivers/usb/usbip/vhci_sysfs.c   |  268 ++++++++++
+ drivers/usb/usbip/vhci_tx.c      |  165 ++++++
+ 17 files changed, 4560 insertions(+)
+
+--- gregkh-2.6.orig/drivers/usb/Kconfig
++++ gregkh-2.6/drivers/usb/Kconfig
+@@ -70,6 +70,8 @@ source "drivers/usb/core/Kconfig"
+ 
+ source "drivers/usb/host/Kconfig"
+ 
++source "drivers/usb/usbip/Kconfig"
++
+ source "drivers/usb/class/Kconfig"
+ 
+ source "drivers/usb/storage/Kconfig"
+--- /dev/null
++++ gregkh-2.6/drivers/usb/usbip/Kconfig
+@@ -0,0 +1,12 @@
++config USB_IP
++	bool "USB IP support"
++	depends on USB
++	default N
++
++config USB_IP_VHCI
++	tristate "USB IP Host controller driver"
++	depends on USB_IP
++
++config USB_IP_STUB
++	tristate "USB IP stub driver"
++	depends on USB_IP
+--- gregkh-2.6.orig/drivers/usb/Makefile
++++ gregkh-2.6/drivers/usb/Makefile
+@@ -16,6 +16,8 @@ obj-$(CONFIG_USB_UHCI_HCD)	+= host/
+ obj-$(CONFIG_USB_SL811_HCD)	+= host/
+ obj-$(CONFIG_ETRAX_USB_HOST)	+= host/
+ 
++obj-$(CONFIG_USB_IP)		+= usbip/
++
+ obj-$(CONFIG_USB_ACM)		+= class/
+ obj-$(CONFIG_USB_PRINTER)	+= class/
+ 
+--- /dev/null
++++ gregkh-2.6/drivers/usb/usbip/Makefile
 @@ -0,0 +1,13 @@
 +# Makefile for the USB/IP driver
 +
-+obj-m += stub.o
-+stub-objs :=  usbip_common.o usbip_event.o stub_dev.o stub_main.o stub_rx.o stub_tx.o
-+
-+obj-m += vhci.o
++obj-$(CONFIG_USB_IP_VHCI) += vhci.o
 +vhci-objs :=  usbip_common.o usbip_event.o vhci_sysfs.o vhci_tx.o vhci_rx.o vhci_hcd.o
 +
++obj-$(CONFIG_USB_IP_STUB) += stub.o
++stub-objs :=  usbip_common.o usbip_event.o stub_dev.o stub_main.o stub_rx.o stub_tx.o
 +
-+ifeq ($(DEBUG),y)
++
++ifeq ($(CONFIG_USB_DEBUG),y)
 +	EXTRA_CFLAGS += -DCONFIG_USBIP_DEBUG
 +endif
 +
---- /dev/null	1970-01-01 00:00:00.000000000 +0000
-+++ gregkh-2.6/drivers/usb/usbib/stub.h	2005-12-01 15:24:14.000000000 -0800
-@@ -0,0 +1,92 @@
+--- /dev/null
++++ gregkh-2.6/drivers/usb/usbip/stub.h
+@@ -0,0 +1,93 @@
 +/*
 + * $Id: stub.h 265 2005-09-01 09:24:10Z taka-hir $
 + *
@@ -55,8 +105,9 @@
 + * USA.
 + */
 +
-+
-+#include "usbip_common.h"
++#include <linux/list.h>
++#include <linux/spinlock.h>
++#include <linux/slab.h>
 +
 +struct stub_device {
 +	struct usb_interface *interface;
@@ -125,9 +176,9 @@
 +
 +
 +//void stub_shutdown_connection(struct usbip_device *sdev);
---- /dev/null	1970-01-01 00:00:00.000000000 +0000
-+++ gregkh-2.6/drivers/usb/usbib/stub_dev.c	2005-12-01 15:27:02.000000000 -0800
-@@ -0,0 +1,417 @@
+--- /dev/null
++++ gregkh-2.6/drivers/usb/usbip/stub_dev.c
+@@ -0,0 +1,419 @@
 +/*
 + * $Id: stub_dev.c 265 2005-09-01 09:24:10Z taka-hir $
 + *
@@ -150,6 +201,8 @@
 + * USA.
 + */
 +
++#include <linux/kernel.h>
++#include "usbip_common.h"
 +#include "stub.h"
 +
 +
@@ -545,9 +598,9 @@
 +
 +	VHCI_DEBUG("bye\n");
 +}
---- /dev/null	1970-01-01 00:00:00.000000000 +0000
-+++ gregkh-2.6/drivers/usb/usbib/stub_main.c	2005-12-01 15:21:50.000000000 -0800
-@@ -0,0 +1,317 @@
+--- /dev/null
++++ gregkh-2.6/drivers/usb/usbip/stub_main.c
+@@ -0,0 +1,319 @@
 +/*
 + * $Id: stub_main.c 265 2005-09-01 09:24:10Z taka-hir $
 + *
@@ -571,6 +624,8 @@
 + */
 +
 +
++#include <linux/kernel.h>
++#include "usbip_common.h"
 +#include "stub.h"
 +
 +/* Version Information */
@@ -865,9 +920,9 @@
 +MODULE_AUTHOR(DRIVER_AUTHOR);
 +MODULE_DESCRIPTION(DRIVER_DESC);
 +MODULE_LICENSE("GPL");
---- /dev/null	1970-01-01 00:00:00.000000000 +0000
-+++ gregkh-2.6/drivers/usb/usbib/stub_rx.c	2005-12-01 15:21:50.000000000 -0800
-@@ -0,0 +1,346 @@
+--- /dev/null
++++ gregkh-2.6/drivers/usb/usbip/stub_rx.c
+@@ -0,0 +1,345 @@
 +/*
 + * $Id: stub_rx.c 276 2005-11-22 08:06:10Z taka-hir $
 + *
@@ -890,9 +945,8 @@
 + * USA.
 + */
 +
++#include "usbip_common.h"
 +#include "stub.h"
-+
-+
 +
 +static void check_clear_halt(struct urb *urb)
 +{
@@ -1214,9 +1268,9 @@
 +	}
 +}
 +
---- /dev/null	1970-01-01 00:00:00.000000000 +0000
-+++ gregkh-2.6/drivers/usb/usbib/stub_tx.c	2005-12-01 15:21:50.000000000 -0800
-@@ -0,0 +1,227 @@
+--- /dev/null
++++ gregkh-2.6/drivers/usb/usbip/stub_tx.c
+@@ -0,0 +1,205 @@
 +/*
 + * $Id: stub_tx.c 265 2005-09-01 09:24:10Z taka-hir $
 + *
@@ -1239,13 +1293,10 @@
 + * USA.
 + */
 +
++#include "usbip_common.h"
 +#include "stub.h"
 +
-+
-+
 +static DECLARE_WAIT_QUEUE_HEAD(waitq);
-+
-+
 +
 +/**
 + * stub_complete - completion handler of a usbip urb
@@ -1283,7 +1334,6 @@
 +			VHCI_ERROR("NOT YET: completion with non-zero status %d\n", urb->status);
 +	}
 +
-+
 +	/* link a urb to the queue of tx. */
 +	{
 +		unsigned long flags;
@@ -1295,19 +1345,13 @@
 +		spin_unlock_irqrestore(&sdev->priv_lock, flags);
 +	}
 +
-+
 +	/* wake up tx_thread */
 +	wake_up(&waitq);
 +}
 +
-+
-+
-+
-+
 +static void setup_pdu(struct usbip_header *rpdu, struct urb *urb)
 +{
 +	struct stub_priv *priv = (struct stub_priv *) urb->context;
-+
 +
 +	rpdu->base.command = VHC_C_RETURN;
 +	rpdu->base.pipe = urb->pipe;
@@ -1316,11 +1360,8 @@
 +	usbip_pack_pdu(rpdu, urb, VHC_C_RETURN, 1);
 +}
 +
-+
 +#define MAX_SUBMIT_QUEUE_DEPTH	100
 +static struct usbip_header ReturnPDU[MAX_SUBMIT_QUEUE_DEPTH];
-+
-+
 +
 +/* create msghdr to tx from the StubPrivListPendingTX queue */
 +static int stub_send_txdata(struct stub_device *sdev)
@@ -1340,7 +1381,6 @@
 +
 +	memset(&ReturnPDU, 0, sizeof(struct usbip_header) * MAX_SUBMIT_QUEUE_DEPTH);
 +
-+
 +	spin_lock_irqsave(&sdev->priv_lock, flags);
 +
 +	list_for_each_entry_safe(priv, tmp, &sdev->priv_tx, list) {
@@ -1357,7 +1397,7 @@
 +		txsize += sizeof(struct usbip_header);
 +
 +		/* 2. setup transfer buffer */
-+		if(usb_pipein(urb->pipe) && urb->transfer_buffer != NULL && urb->actual_length > 0) {
++		if (usb_pipein(urb->pipe) && urb->transfer_buffer != NULL && urb->actual_length > 0) {
 +			iov[msg.msg_iovlen].iov_base = urb->transfer_buffer;
 +			iov[msg.msg_iovlen].iov_len  = urb->actual_length;
 +			msg.msg_iovlen++;
@@ -1365,7 +1405,7 @@
 +		}
 +
 +		/* 3. setup iso_packet_descriptor */
-+		if(usb_pipetype(urb->pipe) == PIPE_ISOCHRONOUS) {
++		if (usb_pipetype(urb->pipe) == PIPE_ISOCHRONOUS) {
 +			iov[msg.msg_iovlen].iov_base = &urb->iso_frame_desc[0];
 +			iov[msg.msg_iovlen].iov_len  = urb->number_of_packets * sizeof(struct usb_iso_packet_descriptor);
 +			msg.msg_iovlen++;
@@ -1376,16 +1416,15 @@
 +
 +
 +		count++;
-+		if(count == MAX_SUBMIT_QUEUE_DEPTH) {
++		if (count == MAX_SUBMIT_QUEUE_DEPTH) {
 +			uinfo("max urbs are processed, %d\n", MAX_SUBMIT_QUEUE_DEPTH);
 +			break;
 +		}
-+
 +	}
 +
 +	spin_unlock_irqrestore(&sdev->priv_lock, flags);
 +
-+	if(txsize > 0) {
++	if (txsize > 0) {
 +		int ret;
 +		ret = usbip_sendmsg(sdev->ud.tcp_socket, &msg, txsize);
 +		if (ret != txsize) {
@@ -1405,24 +1444,17 @@
 +
 +		dbg_stub_tx("setup txdata for urb %p\n", urb);
 +
-+		/*  free transfer buffer */
-+		if(urb->transfer_buffer != NULL) {
-+			kfree(urb->transfer_buffer);
-+		}
-+
++		kfree(urb->transfer_buffer);
 +		list_del(&priv->list);
 +		kmem_cache_free(StubPrivCache, priv);
 +
 +		usb_free_urb(urb);
 +	}
 +
-+
 +	spin_unlock_irqrestore(&sdev->priv_lock, flags);
 +
 +	return txsize;
 +}
-+
-+
 +
 +void stub_tx_loop(struct usbip_task *ut)
 +{
@@ -1430,23 +1462,23 @@
 +	struct stub_device *sdev = container_of(ud, struct stub_device, ud);
 +
 +	while(1) {
-+		if(signal_pending(current)) {
++		if (signal_pending(current)) {
 +			dbg_stub_tx("signal catched\n");
 +			break;
 +		}
 +
-+		if( usbip_event_happend(ud) ) break;
++		if (usbip_event_happend(ud))
++			break;
 +
-+
-+		if (stub_send_txdata(sdev) < 0 ) break;
++		if (stub_send_txdata(sdev) < 0)
++			break;
 +
 +		wait_event_interruptible(waitq, !list_empty(&sdev->priv_tx));
-+
 +	}
 +}
---- /dev/null	1970-01-01 00:00:00.000000000 +0000
-+++ gregkh-2.6/drivers/usb/usbib/usbip_common.c	2005-12-01 15:21:50.000000000 -0800
-@@ -0,0 +1,883 @@
+--- /dev/null
++++ gregkh-2.6/drivers/usb/usbip/usbip_common.c
+@@ -0,0 +1,891 @@
 +/*
 + * $Id: usbip_common.c 265 2005-09-01 09:24:10Z taka-hir $
 + *
@@ -1469,10 +1501,9 @@
 + * USA.
 + */
 +
-+
++#include <linux/kernel.h>
++#include <linux/file.h>
 +#include "usbip_common.h"
-+
-+
 +
 +/*
 + *  Send or receive packet.
@@ -1485,22 +1516,22 @@
 +	struct kvec iov;
 +	int total = 0;
 +
-+	/* for blocks of if(dbg_flag_xmit) */
++	/* for blocks of if (dbg_flag_xmit) */
 +	char *bp = buf;
 +	int osize= size;
 +
 +	dbg_xmit("enter\n");
 +
-+	if(!sock || !buf || !size ) {
++	if (!sock || !buf || !size) {
 +		VHCI_ERROR("usbip_xmit: invalid arg, sock %p buff %p size %d\n",
 +				sock, buf, size);
 +		return -EINVAL;
 +	}
 +
 +
-+	if(dbg_flag_xmit) {
-+		if(send) {
-+			if(!in_interrupt())
++	if (dbg_flag_xmit) {
++		if (send) {
++			if (!in_interrupt())
 +				printk("%-10s:", current->comm);
 +			else
 +				printk("interupt  :");
@@ -1512,7 +1543,7 @@
 +	}
 +
 +
-+	do{
++	do {
 +		sock->sk->sk_allocation = GFP_NOIO;
 +		iov.iov_base    = buf;
 +		iov.iov_len     = size;
@@ -1523,7 +1554,7 @@
 +		msg.msg_namelen    = 0;
 +		msg.msg_flags      = msg_flags | MSG_NOSIGNAL;
 +
-+		if(send)
++		if (send)
 +			result = kernel_sendmsg(sock, &msg, &iov, 1, size);
 +		else
 +			result = kernel_recvmsg(sock, &msg, &iov, 1, size, MSG_WAITALL);
@@ -1542,9 +1573,9 @@
 +
 +
 +
-+	if(dbg_flag_xmit) {
-+		if(!send) {
-+			if(!in_interrupt())
++	if (dbg_flag_xmit) {
++		if (!send) {
++			if (!in_interrupt())
 +				printk("%-10s:", current->comm);
 +			else
 +				printk("interupt  :");
@@ -1555,7 +1586,7 @@
 +					osize, result, size, total);
 +		}
 +
-+		if(send) {
++		if (send) {
 +			printk("usbip_xmit: send, total %d\n", total);
 +		}
 +	}
@@ -1575,7 +1606,7 @@
 +
 +	dbg_xmit("enter\n");
 +
-+	if(dbg_flag_xmit) {
++	if (dbg_flag_xmit) {
 +		int i;
 +		for(i = 0; i < msg->msg_iovlen; i++) {
 +			dump_buffer(msg->msg_iov[i].iov_base,
@@ -1646,20 +1677,24 @@
 +
 +	if (bufflen > 128) {
 +		for(i = 0; i< 128; i++) {
-+			if(i%24 == 0) printk("   ");
++			if (i%24 == 0)
++				printk("   ");
 +			printk("%02x ", (unsigned char ) buff[i]);
-+			if(i%4 == 3) printk("| ");
-+			if(i%24 == 23) printk("\n");
++			if (i%4 == 3) printk("| ");
++			if (i%24 == 23) printk("\n");
 +		}
 +		printk("... (%d byte)\n", bufflen);
 +		return;
 +	}
 +
 +	for(i = 0; i< bufflen; i++) {
-+		if(i%24 == 0) printk("   ");
++		if (i%24 == 0)
++			printk("   ");
 +		printk("%02x ", (unsigned char ) buff[i]);
-+		if(i%4 == 3) printk("| ");
-+		if(i%24 == 23) printk("\n");
++		if (i%4 == 3)
++			printk("| ");
++		if (i%24 == 23)
++			printk("\n");
 +	}
 +	printk("\n");
 +
@@ -1704,7 +1739,7 @@
 +
 +void dump_usb_device(struct usb_device *dev)
 +{
-+	if(dev == NULL) {
++	if (dev == NULL) {
 +		printk("      dump usb dev: null pointer!!\n");
 +		return;
 +	}
@@ -1793,7 +1828,7 @@
 +
 +void dump_urb (struct urb *purb)
 +{
-+	if(!purb) {
++	if (!purb) {
 +		printk("   dump urb: null pointer!!\n");
 +		return;
 +	}
@@ -1811,7 +1846,7 @@
 +	printk("   actual_length         :%d\n", purb->actual_length);
 +	printk("   bandwidth             :%d\n", purb->actual_length);
 +	printk("   setup_packet          :%p\n", purb->setup_packet);
-+	if(purb->setup_packet != NULL && usb_pipetype(purb->pipe) == PIPE_CONTROL) {
++	if (purb->setup_packet != NULL && usb_pipetype(purb->pipe) == PIPE_CONTROL) {
 +		dump_usb_ctrlrequest((struct usb_ctrlrequest *) purb->setup_packet);
 +	}
 +	printk("   start_frame           :%d\n", purb->start_frame);
@@ -1844,7 +1879,7 @@
 +
 +void dump_usb_ctrlrequest(struct usb_ctrlrequest *cmd)
 +{
-+	if(cmd == NULL) {
++	if (cmd == NULL) {
 +		printk("      dump_usb_ctrlrequest : null pointer\n");
 +		return;
 +	}
@@ -1858,7 +1893,7 @@
 +
 +	printk("\n       ");
 +
-+	if((cmd->bRequestType & USB_TYPE_MASK) == USB_TYPE_STANDARD) {
++	if ((cmd->bRequestType & USB_TYPE_MASK) == USB_TYPE_STANDARD) {
 +		printk("STANDARD ");
 +		switch(cmd->bRequest){
 +			case USB_REQ_GET_STATUS:
@@ -1902,13 +1937,13 @@
 +		dump_request_type(cmd->bRequestType);
 +
 +	}
-+	else if((cmd->bRequestType & USB_TYPE_MASK) == USB_TYPE_CLASS) {
++	else if ((cmd->bRequestType & USB_TYPE_MASK) == USB_TYPE_CLASS) {
 +		printk("CLASS   ");
 +	}
-+	else if((cmd->bRequestType & USB_TYPE_MASK) == USB_TYPE_VENDOR) {
++	else if ((cmd->bRequestType & USB_TYPE_MASK) == USB_TYPE_VENDOR) {
 +		printk("VENDOR  ");
 +	}
-+	else if((cmd->bRequestType & USB_TYPE_MASK) == USB_TYPE_RESERVED) {
++	else if ((cmd->bRequestType & USB_TYPE_MASK) == USB_TYPE_RESERVED) {
 +		printk("RESERVED");
 +	}
 +
@@ -1976,14 +2011,15 @@
 +	struct inode *inode;
 +
 +	file = fget(sockfd);
-+	if(!file) {
++	if (!file) {
 +		VHCI_ERROR("invalid sockfd\n");
 +		return NULL;
 +	}
 +
 +	inode = file->f_dentry->d_inode;
 +
-+	if( !inode || !S_ISSOCK(inode->i_mode) ) return NULL;
++	if (!inode || !S_ISSOCK(inode->i_mode))
++		return NULL;
 +
 +	socket = SOCKET_I(inode);
 +
@@ -1996,7 +2032,7 @@
 +	int  ret;
 +
 +	ret = socket->ops->getname(socket, (struct sockaddr *) ss, &addrlen, 1);
-+	if(ret) {
++	if (ret) {
 +		VHCI_ERROR("getname failed, socket %p\n", socket);
 +		return ret;
 +	}
@@ -2008,12 +2044,12 @@
 +{
 +	int ret;
 +
-+	if(ss->ss_family == AF_INET) {
++	if (ss->ss_family == AF_INET) {
 +		struct sockaddr_in *v4addr = (struct sockaddr_in *) ss;
 +		ret = sprintf(buf, "%u.%u.%u.%u(%u)", NIPQUAD(v4addr->sin_addr),
 +				v4addr->sin_port);
 +
-+	} else if(ss->ss_family == AF_INET6) {
++	} else if (ss->ss_family == AF_INET6) {
 +		struct sockaddr_in6 *v6addr = (struct sockaddr_in6 *) ss;
 +		ret = sprintf(buf, "%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x(%d)",
 +				NIP6(v6addr->sin6_addr), v6addr->sin6_port);
@@ -2036,15 +2072,15 @@
 +	int ret;
 +
 +	ret = socket->ops->getname(socket, &uaddr, &uaddrlen, 1);
-+	if(ret) {
++	if (ret) {
 +		VHCI_ERROR("getname failed, socket %p\n", socket);
 +		return ret;
 +	}
 +
-+	if(uaddr.sa_family == AF_INET) {
++	if (uaddr.sa_family == AF_INET) {
 +		struct sockaddr_in *v4addr = (struct sockaddr_in *) &uaddr;
 +		ret =  sprintf(buf, "%u.%u.%u.%u", NIPQUAD(v4addr->sin_addr.s_addr));
-+	} else if(uaddr.sa_family == AF_INET6) {
++	} else if (uaddr.sa_family == AF_INET6) {
 +		struct sockaddr_in6 *v6addr = (struct sockaddr_in6 *) &uaddr;
 +		ret =  sprintf(buf, "%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x",
 +				NIP6(v6addr->sin6_addr));
@@ -2105,7 +2141,8 @@
 +
 +	VHCI_DEBUG("Enter\n");
 +
-+	if(!ut) return -EINVAL;
++	if (!ut)
++		return -EINVAL;
 +
 +	lock_kernel();
 +	daemonize(ut->name);
@@ -2145,12 +2182,12 @@
 +void usbip_stop_threads(struct usbip_device *ud)
 +{
 +        /* kill threads related to this sdev, if v.c. exists */
-+	if(ud->tcp_rx.thread != NULL) {
++	if (ud->tcp_rx.thread != NULL) {
 +		send_sig(SIGKILL, ud->tcp_rx.thread, 1);
 +		wait_for_completion(&ud->tcp_rx.thread_done);
 +		VHCI_DEBUG("rx_thread for ud %p has finished\n", ud);
 +	}
-+	if(ud->tcp_tx.thread != NULL) {
++	if (ud->tcp_tx.thread != NULL) {
 +		send_sig(SIGKILL, ud->tcp_tx.thread, 1);
 +		wait_for_completion(&ud->tcp_tx.thread_done);
 +		VHCI_DEBUG("tx_thread for ud %p has finished\n", ud);
@@ -2169,7 +2206,7 @@
 +
 +static void usbip_pack_submit_pdu(struct usbip_header *pdu, struct urb *urb, int pack)
 +{
-+	if(pack) {
++	if (pack) {
 +		/* vhci_tx.c */
 +		pdu->submit.transfer_flags		 = urb->transfer_flags & ~URB_NO_TRANSFER_DMA_MAP & ~URB_NO_SETUP_DMA_MAP;
 +		pdu->submit.transfer_buffer_length	 = urb->transfer_buffer_length;
@@ -2191,7 +2228,7 @@
 +
 +static void usbip_pack_return_pdu(struct usbip_header *pdu, struct urb *urb, int pack)
 +{
-+	if(pack) {
++	if (pack) {
 +		/* stub_tx.c */
 +		pdu->ret.transfer_flags		 = urb->transfer_flags;
 +		pdu->ret.status			 = urb->status;
@@ -2237,12 +2274,13 @@
 +	int np = urb->number_of_packets;
 +	int size = np * sizeof(struct usb_iso_packet_descriptor);
 +
-+	if( !usb_pipeisoc(urb->pipe) ) return 0;
++	if (!usb_pipeisoc(urb->pipe))
++		return 0;
 +
 +	ret = usbip_xmit(0, ud->tcp_socket, iso_frame_desc, size, 0);
 +	if (ret != size ) {
 +		VHCI_ERROR("recv iso_frame_descriptor, %d\n", ret);
-+		if(ud->side == USBIP_STUB) {
++		if (ud->side == USBIP_STUB) {
 +			usbip_event_add(ud, SDEV_EVENT_ERROR_TCP);
 +		} else {
 +			usbip_event_add(ud, VDEV_EVENT_ERROR_TCP);
@@ -2259,7 +2297,7 @@
 +
 +	spin_lock(&ud->lock);
 +
-+	if(ud->event != 0)
++	if (ud->event != 0)
 +		happend = 1;
 +
 +	spin_unlock(&ud->lock);
@@ -2275,27 +2313,30 @@
 +	int size;
 +
 +
-+	if(ud->side == USBIP_STUB) {
++	if (ud->side == USBIP_STUB) {
 +		/* stub_rx.c */
 +		/* the direction of urb must be OUT. */
-+		if(usb_pipein(urb->pipe)) return 0;
++		if (usb_pipein(urb->pipe))
++			return 0;
 +
 +		size = urb->transfer_buffer_length;
 +	} else {
 +		/* vhci_rx.c */
 +		/* the direction of urb must be IN. */
-+		if(usb_pipeout(urb->pipe)) return 0;
++		if (usb_pipeout(urb->pipe))
++			return 0;
 +
 +		size = urb->actual_length;
 +	}
 +
 +	/* no need to recv xbuff */
-+	if( !(size > 0) ) return 0;
++	if (!(size > 0))
++		return 0;
 +
 +	ret = usbip_xmit(0, ud->tcp_socket, (char *) urb->transfer_buffer, size, 0);
-+	if(ret != size) {
++	if (ret != size) {
 +		VHCI_ERROR("recv xbuf, %d\n", ret);
-+		if(ud->side == USBIP_STUB) {
++		if (ud->side == USBIP_STUB) {
 +			usbip_event_add(ud, SDEV_EVENT_ERROR_TCP);
 +		} else {
 +			usbip_event_add(ud, VDEV_EVENT_ERROR_TCP);
@@ -2328,11 +2369,10 @@
 +
 +	return count;
 +}
-+
 +DEVICE_ATTR(usbip_debug, (S_IRUGO | S_IWUSR), show_flag, store_flag);
---- /dev/null	1970-01-01 00:00:00.000000000 +0000
-+++ gregkh-2.6/drivers/usb/usbib/usbip_common.h	2005-12-01 15:21:50.000000000 -0800
-@@ -0,0 +1,400 @@
+--- /dev/null
++++ gregkh-2.6/drivers/usb/usbip/usbip_common.h
+@@ -0,0 +1,388 @@
 +/*
 + * $Id: usbip_common.h 265 2005-09-01 09:24:10Z taka-hir $
 + *
@@ -2358,32 +2398,27 @@
 +#ifndef  __VHCI_COMMON_H
 +#define  __VHCI_COMMON_H
 +
-+#include <asm/byteorder.h>
-+#include <linux/socket.h>
-+#include <net/sock.h>
++#if 0
++#include <linux/file.h>
 +#include <linux/in.h>
 +#include <linux/in6.h>
-+#include <linux/usb.h>
-+#include <asm-i386/hardirq.h>
-+#include <linux/module.h>
-+
-+#include <asm/uaccess.h>
-+/* copy_from_user() */
-+
-+#include <linux/smp_lock.h>
-+/* lock_kernel() */
-+
-+
-+#include <linux/file.h>
-+
 +#include <linux/kernel.h>
-+/* KERN_INFO */
-+
-+#include <linux/version.h>
-+
++#include <linux/module.h>
 +#include <linux/sched.h>
 +#include <linux/signal.h>
++#include <linux/smp_lock.h>
++#include <linux/socket.h>
++#include <linux/usb.h>
++#include <net/sock.h>
++#include <asm-i386/hardirq.h>
++#include <asm/byteorder.h>
 +#include <asm/semaphore.h>
++#include <asm/uaccess.h>
++
++#endif
++
++#include <linux/usb.h>
++#include <net/sock.h>
 +
 +/*-------------------------------------------------------------------------*/
 +
@@ -2392,12 +2427,12 @@
 + */
 +
 +/**
-+ * VHCI_DEBUG - print debug messages if CONFIG_USBIP_DEBUG is defined
++ * VHCI_DEBUG - print debug messages if CONFIG_USB_DEBUG is defined
 + * @fmt:
 + * @args:
 + */
 +
-+#ifdef CONFIG_USBIP_DEBUG
++#ifdef CONFIG_USB_DEBUG
 +
 +#define udbg(fmt, args...)						\
 +	do{								\
@@ -2408,12 +2443,12 @@
 +
 +#define VHCI_DEBUG(fmt, args...)	udbg(fmt, ##args)
 +
-+#else  /* CONFIG_USBIP_DEBUG */
++#else  /* CONFIG_USB_DEBUG */
 +
 +#define udbg(fmt, args...)		do{ }while(0)
 +#define VHCI_DEBUG(fmt, args...)	do{ }while(0)
 +
-+#endif /* CONFIG_VHCI_DEBUG */
++#endif /* CONFIG_USB_DEBUG */
 +
 +
 +enum {
@@ -2474,11 +2509,11 @@
 + * @args:
 + */
 +#define uerr(fmt, args...)						\
-+	do{								\
++	do {								\
 +		printk(KERN_ERR "%-10s: ***ERROR*** (%s,%d) %s: " fmt,	\
 +			(in_interrupt() ? "interrupt" : (current)->comm),\
 +			__FILE__, __LINE__, __FUNCTION__, ##args);	\
-+	}while(0)
++	} while(0)
 +
 +#define VHCI_ERROR(fmt, args...)	uerr(fmt, ##args)
 +
@@ -2502,14 +2537,14 @@
 + */
 +
 +#define uinfo(fmt, args...)					\
-+	do{							\
++	do {							\
 +		printk(KERN_INFO "usbip: " fmt, ## args);	\
-+	}while(0)
++	} while(0)
 +
 +#define VHCI_INFO(fmt, args...)					\
-+	do{							\
++	do {							\
 +		printk(KERN_INFO "usbip: " fmt, ## args);	\
-+	}while(0)
++	} while(0)
 +
 +
 +
@@ -2537,7 +2572,6 @@
 + * A basic header followed by other additional headers.
 + */
 +struct usbip_header_basic {
-+
 +#define VHC_C_SUBMIT	0x0001
 +#define VHC_C_RETURN	0x0002
 +#define VHC_C_UNLINK	0x0004
@@ -2668,21 +2702,16 @@
 +		VDEV_ST_ERROR
 +	} status;
 +
-+
 +	/* lock for status */
 +	spinlock_t lock;
 +
 +	struct socket *tcp_socket;
 +	struct sockaddr_storage tcp_ss;
 +
-+
 +	struct usbip_task tcp_rx;
 +	struct usbip_task tcp_tx;
 +
-+
-+
 +	/* event handler */
-+
 +#define USBIP_EH_SHUTDOWN	(1 << 0)
 +#define USBIP_EH_BYE		(1 << 1)
 +#define USBIP_EH_RESET		(1 << 2)
@@ -2731,10 +2760,9 @@
 +int usbip_event_happend(struct usbip_device *ud);
 +
 +
-+
 +#endif
---- /dev/null	1970-01-01 00:00:00.000000000 +0000
-+++ gregkh-2.6/drivers/usb/usbib/usbip_event.c	2005-12-01 15:21:50.000000000 -0800
+--- /dev/null
++++ gregkh-2.6/drivers/usb/usbip/usbip_event.c
 @@ -0,0 +1,147 @@
 +/*
 + * $Id: usbip_event.c 261 2005-08-30 10:49:17Z taka-hir $
@@ -2883,9 +2911,9 @@
 +	}
 +}
 +
---- /dev/null	1970-01-01 00:00:00.000000000 +0000
-+++ gregkh-2.6/drivers/usb/usbib/vhci.h	2005-12-01 15:21:50.000000000 -0800
-@@ -0,0 +1,125 @@
+--- /dev/null
++++ gregkh-2.6/drivers/usb/usbip/vhci.h
+@@ -0,0 +1,116 @@
 +/*
 + * $Id: vhci.h 249 2005-08-10 12:15:26Z taka-hir $
 + *
@@ -2908,16 +2936,7 @@
 + * USA.
 + */
 +
-+
-+#include "usbip_common.h"
-+
-+/*
-+ * A USB Host Controller Driver needs to include "hcd.h" in drivers/usb/core/.
-+ */
-+
-+/* HCD_HEADER is defined in Makefile */
-+#include HCD_HEADER
-+
++#include <linux/platform_device.h>
 +
 +#define VHCI_DEVICE_INFO_SIZE 80
 +
@@ -3011,9 +3030,9 @@
 +
 +/* vhci_sysfs.c */
 +extern struct attribute_group dev_attr_group;
---- /dev/null	1970-01-01 00:00:00.000000000 +0000
-+++ gregkh-2.6/drivers/usb/usbib/vhci_hcd.c	2005-12-01 15:21:50.000000000 -0800
-@@ -0,0 +1,1032 @@
+--- /dev/null
++++ gregkh-2.6/drivers/usb/usbip/vhci_hcd.c
+@@ -0,0 +1,1026 @@
 +/*
 + * $Id: vhci_hcd.c 267 2005-09-02 17:21:42Z taka-hir $
 + *
@@ -3037,6 +3056,8 @@
 + */
 +
 +
++#include "usbip_common.h"
++#include "../core/hcd.h"
 +#include "vhci.h"
 +
 +#define DRIVER_VERSION " $Id: vhci_hcd.c 267 2005-09-02 17:21:42Z taka-hir $ "
@@ -3062,7 +3083,7 @@
 +
 +static int vhci_hub_status (struct usb_hcd *hcd, char *buff);
 +static int vhci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue, u16 wIndex, char *buff, u16 wLength);
-+static int vhci_urb_enqueue (struct usb_hcd *hcd, struct usb_host_endpoint *ep, struct urb *urb, unsigned mem_flags);
++static int vhci_urb_enqueue (struct usb_hcd *hcd, struct usb_host_endpoint *ep, struct urb *urb, gfp_t mem_flags);
 +static int vhci_urb_dequeue( struct usb_hcd *hcd, struct urb *urb);
 +static int vhci_start(struct usb_hcd *vhci_hcd);
 +static void vhci_stop(struct usb_hcd *hcd);
@@ -3159,7 +3180,7 @@
 +	 * wIndex shows the port number and begins from 1.
 +	 */
 +	dbg_vhci_rh("typeReq %x wValue %x wIndex %x\n", typeReq, wValue, wIndex);
-+	if( wIndex > VHCI_NPORTS )
++	if (wIndex > VHCI_NPORTS)
 +		VHCI_ERROR("invalid port number %d\n", wIndex);
 +	rhport = ((__u8 ) (wIndex & 0x00ff)) -1;
 +
@@ -3201,7 +3222,7 @@
 +			break;
 +		case GetPortStatus:
 +			dbg_vhci_rh("GetPortStatus port %x\n", wIndex);
-+			if( wIndex > VHCI_NPORTS || wIndex < 1 ) {
++			if (wIndex > VHCI_NPORTS || wIndex < 1) {
 +				VHCI_ERROR("invalid port number %d\n", wIndex);
 +				retval = -EPIPE;
 +			}
@@ -3400,7 +3421,7 @@
 +#endif
 +	}
 +
-+	if(changed)
++	if (changed)
 +		retval = 1 + (VHCI_NPORTS / 8);
 +	else
 +		retval = 0;
@@ -3419,8 +3440,8 @@
 +{
 +	int i;
 +	for(i=0; i< VHCI_NPORTS; i++ ) {
-+		if(the_controller->vdev[i].dev != NULL)
-+			if(the_controller->vdev[i].dev->devnum == devnum)
++		if (the_controller->vdev[i].dev != NULL)
++			if (the_controller->vdev[i].dev->devnum == devnum)
 +				return i;
 +	}
 +
@@ -3441,15 +3462,12 @@
 +{
 +	int i;
 +
-+	if(!udev)
++	if (!udev)
 +		return NULL;
 +
-+
-+	for(i=0; i < VHCI_NPORTS; i++) {
-+		if(the_controller->vdev[i].udev == udev) {
++	for (i=0; i < VHCI_NPORTS; i++)
++		if (the_controller->vdev[i].udev == udev)
 +			return port_to_vdev(i);
-+		}
-+	}
 +
 +	return NULL;
 +}
@@ -3461,22 +3479,22 @@
 +	struct vhci_priv *priv;
 +	unsigned long flag;
 +
-+	if(!vdev) BUG();
++	if (!vdev)
++		BUG();
 +
 +	spin_lock_irqsave(&vdev->priv_lock, flag);
 +
-+	priv = kmalloc(sizeof(struct vhci_priv), GFP_ATOMIC);
-+	if(!priv) {
++	priv = kzalloc(sizeof(struct vhci_priv), GFP_ATOMIC);
++	if (!priv) {
 +		uerr("malloc vhci_priv\n");
 +		spin_unlock_irqrestore(&vdev->priv_lock, flag);
 +		usbip_event_add(&vdev->ud, VDEV_EVENT_ERROR_MALLOC);
 +		return;
 +	}
-+	memset(priv, 0, sizeof(struct vhci_priv));
 +
 +	priv->seqnum = atomic_read(&the_controller->seqnum);
 +	atomic_inc(&the_controller->seqnum);
-+	if(priv->seqnum == 0xffff)
++	if (priv->seqnum == 0xffff)
 +		uinfo("seqnum max\n");
 +
 +	priv->vdev = vdev;
@@ -3491,7 +3509,7 @@
 +	spin_unlock_irqrestore(&vdev->priv_lock, flag);
 +}
 +
-+static int vhci_urb_enqueue(struct usb_hcd *hcd, struct usb_host_endpoint *ep, struct urb *urb, unsigned mem_flags)
++static int vhci_urb_enqueue(struct usb_hcd *hcd, struct usb_host_endpoint *ep, struct urb *urb, gfp_t mem_flags)
 +{
 +	int ret = 0;
 +	unsigned long flags;
@@ -3506,13 +3524,13 @@
 +	spin_lock_irqsave (&the_controller->lock, flags);
 +
 +	/* check HC is active or not */
-+	if(!HC_IS_RUNNING(hcd->state)) {
++	if (!HC_IS_RUNNING(hcd->state)) {
 +		uerr("HC is not running\n");
 +		spin_unlock_irqrestore(&the_controller->lock, flags);
 +		return  -ENODEV;
 +	}
 +
-+	if(urb->status != -EINPROGRESS) {
++	if (urb->status != -EINPROGRESS) {
 +		uerr("URB already unlinked!, status %d\n", urb->status);
 +		spin_unlock_irqrestore(&the_controller->lock, flags);
 +		return urb->status;
@@ -3529,12 +3547,12 @@
 +	 *
 +	 */
 +
-+	if(usb_pipedevice(urb->pipe) == 0) {
++	if (usb_pipedevice(urb->pipe) == 0) {
 +		__u8 type = usb_pipetype(urb->pipe);
 +		struct usb_ctrlrequest *ctrlreq = (struct usb_ctrlrequest *) urb->setup_packet;
 +		struct vhci_device *vdev = port_to_vdev(the_controller->pending_port);
 +
-+		if(type != PIPE_CONTROL || !ctrlreq ) {
++		if (type != PIPE_CONTROL || !ctrlreq ) {
 +			VHCI_ERROR("invalid request to devnum 0\n");
 +			ret = EINVAL;
 +			goto no_need_xmit;
@@ -3562,7 +3580,7 @@
 +				goto no_need_xmit;
 +
 +			case USB_REQ_GET_DESCRIPTOR:
-+				if(ctrlreq->wValue == (USB_DT_DEVICE << 8)) {
++				if (ctrlreq->wValue == (USB_DT_DEVICE << 8)) {
 +					dbg_vhci_hc("Not yet?: Get_Descriptor to device 0( get max pipe size )\n");
 +				}
 +				vdev->udev = urb->dev;
@@ -3593,7 +3611,7 @@
 +	//urb->hcpriv = NULL;
 +
 +	spin_unlock_irqrestore(&the_controller->lock, flags);
-+	usb_hcd_giveback_urb(&the_controller->hcd, urb, 0);
++	usb_hcd_giveback_urb(&the_controller->hcd, urb, NULL);
 +
 +	return 0;
 +}
@@ -3617,7 +3635,7 @@
 +	spin_lock_irqsave (&the_controller->lock, flags);
 +
 +	priv = urb->hcpriv;
-+	if(!priv) {
++	if (!priv) {
 +		/* URB was never linked! or will be soon given back by vhci_rx. */
 +		spin_unlock_irqrestore(&the_controller->lock, flags);
 +		return 0;
@@ -3626,7 +3644,7 @@
 +	 // send unlink request here?
 +	vdev = priv->vdev;
 +
-+	if(!vdev->ud.tcp_socket) {
++	if (!vdev->ud.tcp_socket) {
 +		unsigned long flags2;
 +		spin_lock_irqsave(&vdev->priv_lock, flags2);
 +		uinfo("vhci_hcd: device %p seems to be disconnected\n", vdev);
@@ -3638,11 +3656,11 @@
 +		spin_unlock_irqrestore(&vdev->priv_lock, flags2);
 +	}
 +
-+	if(!vdev->ud.tcp_socket) {
++	if (!vdev->ud.tcp_socket) {
 +		spin_unlock_irqrestore(&the_controller->lock, flags);
 +
 +		uinfo("vhci_hcd: vhci_urb_dequeue() gives back urb %p\n", urb);
-+		usb_hcd_giveback_urb(&the_controller->hcd, urb, 0);
++		usb_hcd_giveback_urb(&the_controller->hcd, urb, NULL);
 +	} else {
 +		spin_unlock_irqrestore(&the_controller->lock, flags);
 +	}
@@ -3670,7 +3688,7 @@
 +		 * Should i give back a urb to usbcore ?
 +		 */
 +		spin_unlock(&vdev->priv_lock);
-+		usb_hcd_giveback_urb(&the_controller->hcd, urb, 0);
++		usb_hcd_giveback_urb(&the_controller->hcd, urb, NULL);
 +		spin_lock(&vdev->priv_lock);
 +	}
 +
@@ -3685,7 +3703,7 @@
 +		 * Should i give back a urb to usbcore ?
 +		 */
 +		spin_unlock(&vdev->priv_lock);
-+		usb_hcd_giveback_urb(&the_controller->hcd, urb, 0);
++		usb_hcd_giveback_urb(&the_controller->hcd, urb, NULL);
 +		spin_lock(&vdev->priv_lock);
 +	}
 +
@@ -3706,7 +3724,7 @@
 +	uinfo("stop threads\n");
 +
 +	/* active connection is closed */
-+	if(vdev->ud.tcp_socket != NULL) {
++	if (vdev->ud.tcp_socket != NULL) {
 +		sock_release(vdev->ud.tcp_socket);
 +		vdev->ud.tcp_socket = NULL;
 +	}
@@ -3882,7 +3900,7 @@
 +	 * Our private data is also allocated automatically.
 +	 */
 +	hcd = usb_create_hcd(&vhci_hc_driver, dev, dev->bus_id);
-+	if(!hcd)
++	if (!hcd)
 +		return -ENOMEM;
 +
 +
@@ -3908,7 +3926,7 @@
 +	 * Call the driver's reset() and start() routines.
 +	 */
 +	ret = usb_add_hcd(hcd, 0, 0);
-+	if(ret != 0) {
++	if (ret != 0) {
 +		usb_put_hcd(hcd);
 +		return ret;
 +	}
@@ -3940,12 +3958,9 @@
 +	return 0;
 +}
 +
-+static int vhci_hcd_suspend(struct device *dev, pm_message_t state, u32 level)
++static int vhci_hcd_suspend(struct device *dev, pm_message_t state)
 +{
 +	struct usb_hcd	*hcd;
-+
-+	if(level != SUSPEND_DISABLE)
-+		return 0;
 +
 +	dev_dbg(dev, "%s=n", __FUNCTION__);
 +	hcd = dev_get_drvdata(dev);
@@ -3958,12 +3973,9 @@
 +	return 0;
 +}
 +
-+static int vhci_hcd_resume(struct device *dev, u32 level)
++static int vhci_hcd_resume(struct device *dev)
 +{
 +	struct usb_hcd	*hcd;
-+
-+	if(level != RESUME_ENABLE)
-+		return 0;
 +
 +	dev_dbg(dev, "%s=n", __FUNCTION__);
 +	hcd = dev_get_drvdata(dev);
@@ -3994,7 +4006,8 @@
 + * 	1. platform_device_register()
 + * 	2. vhci_driver.probe()
 + */
-+void the_pdev_release(struct device *dev){
++static void the_pdev_release(struct device *dev)
++{
 +	return;
 +}
 +
@@ -4009,22 +4022,22 @@
 +	int ret;
 +
 +	dbg_vhci_hc("enter\n");
-+	if(usb_disabled())
++	if (usb_disabled())
 +		return -ENODEV;
 +
 +	info("driver %s, %s\n", driver_name, DRIVER_VERSION);
 +	ret = driver_register(&vhci_driver);
-+	if(ret < 0)
++	if (ret < 0)
 +		return ret;
 +
 +	ret = platform_device_register(&the_pdev);
-+	if(ret < 0) {
++	if (ret < 0) {
 +		driver_unregister(&vhci_driver);
 +		return ret;
 +	}
 +
 +	ret = vhci_driver.probe(&the_pdev.dev);
-+	if(ret < 0) {
++	if (ret < 0) {
 +		platform_device_unregister(&the_pdev);
 +		driver_unregister(&vhci_driver);
 +	}
@@ -4046,9 +4059,9 @@
 +	dbg_vhci_hc("bye\n");
 +}
 +module_exit(vhci_cleanup);
---- /dev/null	1970-01-01 00:00:00.000000000 +0000
-+++ gregkh-2.6/drivers/usb/usbib/vhci_rx.c	2005-12-01 15:21:50.000000000 -0800
-@@ -0,0 +1,150 @@
+--- /dev/null
++++ gregkh-2.6/drivers/usb/usbip/vhci_rx.c
+@@ -0,0 +1,149 @@
 +/*
 + * $Id: vhci_rx.c 265 2005-09-01 09:24:10Z taka-hir $
 + *
@@ -4071,10 +4084,9 @@
 + * USA.
 + */
 +
++#include "usbip_common.h"
++#include "../core/hcd.h"
 +#include "vhci.h"
-+
-+
-+
 +
 +/* get URB from transmitted queue */
 +static struct urb *pickup_urb_and_free_priv(struct vhci_device *vdev, __u32 seqnum)
@@ -4085,11 +4097,11 @@
 +	spin_lock(&vdev->priv_lock);
 +
 +	list_for_each_entry_safe(priv, tmp, &vdev->priv_rx, list) {
-+		if(priv->seqnum == seqnum) {
++		if (priv->seqnum == seqnum) {
 +			urb = priv->urb;
 +			dbg_vhci_rx("find urb %p vurb %p seqnum %u\n", urb, priv, seqnum);
 +
-+			if(urb->status != -EINPROGRESS) {
++			if (urb->status != -EINPROGRESS) {
 +				 if (urb->status == -ENOENT || urb->status == -ECONNRESET) {
 +					 uinfo("urb %p was unlinked %ssynchronuously.\n",
 +							 urb, urb->status == -ENOENT ? "" : "a");
@@ -4118,8 +4130,7 @@
 +	struct usbip_device *ud = &vdev->ud;
 +	struct urb *urb = pickup_urb_and_free_priv(vdev, pdu->base.seqnum);
 +
-+
-+	if(!urb) {
++	if (!urb) {
 +		VHCI_ERROR("cannot find a urb of seqnum %u\n", pdu->base.seqnum);
 +		usbip_event_add(ud, VDEV_EVENT_ERROR_TCP);
 +		return;
@@ -4130,15 +4141,16 @@
 +	usbip_pack_pdu(pdu, urb, VHC_C_RETURN, 0);
 +
 +	/* recv transfer buffer */
-+	if( usbip_recv_xbuff(ud, urb) < 0) return;
++	if (usbip_recv_xbuff(ud, urb) < 0)
++		return;
 +
 +	/* recv iso_packet_descriptor */
-+	if( usbip_recv_iso(ud, urb) < 0 ) return;
-+
++	if (usbip_recv_iso(ud, urb) < 0)
++		return;
 +
 +	dbg_vhci_rx("now giveback urb %p\n", urb);
 +
-+	usb_hcd_giveback_urb(&the_controller->hcd, urb, 0);
++	usb_hcd_giveback_urb(&the_controller->hcd, urb, NULL);
 +
 +	dbg_vhci_rx("Leave\n");
 +
@@ -4161,13 +4173,13 @@
 +
 +	/* 1. recieve a pdu header */
 +	ret = usbip_xmit(0, ud->tcp_socket, (char *) &pdu, sizeof(pdu),0);
-+	if(ret != sizeof(pdu)) {
++	if (ret != sizeof(pdu)) {
 +		VHCI_ERROR("recv a header, %d\n", ret);
 +		usbip_event_add(ud, VDEV_EVENT_ERROR_TCP);
 +		return;
 +	}
 +
-+	if(dbg_flag_vhci_rx)
++	if (dbg_flag_vhci_rx)
 +		usbip_dump_header(&pdu);
 +
 +	switch(pdu.base.command) {
@@ -4187,21 +4199,21 @@
 +
 +
 +	while (1) {
-+		if(signal_pending(current)){
++		if (signal_pending(current)){
 +			dbg_vhci_rx("signal catched!\n");
 +			break;
 +		}
 +
 +
-+		if( usbip_event_happend(ud) ) break;
++		if (usbip_event_happend(ud)) break;
 +
 +		vhci_rx_pdu(ud);
 +	}
 +}
 +
---- /dev/null	1970-01-01 00:00:00.000000000 +0000
-+++ gregkh-2.6/drivers/usb/usbib/vhci_sysfs.c	2005-12-01 15:21:50.000000000 -0800
-@@ -0,0 +1,265 @@
+--- /dev/null
++++ gregkh-2.6/drivers/usb/usbip/vhci_sysfs.c
+@@ -0,0 +1,268 @@
 +/*
 + * $Id: vhci_sysfs.c 260 2005-08-30 10:35:16Z taka-hir $
 + *
@@ -4224,9 +4236,11 @@
 + * USA.
 + */
 +
++#include <linux/in.h>
++#include <linux/in6.h>
++#include "usbip_common.h"
++#include "../core/hcd.h"
 +#include "vhci.h"
-+
-+
 +
 +
 +struct vhci_device *port_to_vdev(__u32 port)
@@ -4235,7 +4249,7 @@
 +}
 +
 +
-+int vhci_proc_vcdown(__u32 rhport)
++static int vhci_proc_vcdown(__u32 rhport)
 +{
 +	struct vhci_device *vdev = port_to_vdev(rhport);
 +
@@ -4256,9 +4270,7 @@
 +	return 0;
 +}
 +
-+
-+
-+int vhci_proc_status(char *out)
++static int vhci_proc_status(char *out)
 +{
 +
 +	char *s = out;
@@ -4274,25 +4286,28 @@
 +	out += sprintf(out, "prt sta spd bus dev ipaddr                                  port   busid\n");
 +
 +
-+	if(!the_controller) { VHCI_ERROR("the_controller is NULL\n"); return 0; }
++	if (!the_controller) {
++		VHCI_ERROR("the_controller is NULL\n");
++		return 0;
++		}
 +
 +
-+	for(i=0; i < VHCI_NPORTS; i++) {
++	for (i=0; i < VHCI_NPORTS; i++) {
 +		struct vhci_device *vdev = port_to_vdev(i);
 +
 +		spin_lock(&vdev->ud.lock);
 +
 +		out += sprintf(out, "%03u %03u ", i, vdev->ud.status);
 +
-+		if(vdev->ud.status == VDEV_ST_USED) {
++		if (vdev->ud.status == VDEV_ST_USED) {
 +			out += sprintf(out, "%03u %03u %03u ", vdev->speed, vdev->busnum, vdev->devnum);
 +
-+			if(vdev->ud.tcp_ss.ss_family == AF_INET) {
++			if (vdev->ud.tcp_ss.ss_family == AF_INET) {
 +				out += sprintf(out, "%03u.%03u.%03u.%03u                         ",
 +						NIPQUAD(ss_v4_addr(vdev->ud.tcp_ss)));
 +				out += sprintf(out, "%06d ", ss_v4_port(vdev->ud.tcp_ss));
 +
-+			} else if(vdev->ud.tcp_ss.ss_family == AF_INET6) {
++			} else if (vdev->ud.tcp_ss.ss_family == AF_INET6) {
 +				out += sprintf(out, "%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x ",
 +						NIP6(ss_v6_addr(vdev->ud.tcp_ss)));
 +				out += sprintf(out, "%06d ", ss_v6_port(vdev->ud.tcp_ss));
@@ -4326,13 +4341,13 @@
 +{
 +
 +	/* check rhport */
-+	if( (rhport < 0) || (rhport >= VHCI_NPORTS) ) {
++	if ((rhport < 0) || (rhport >= VHCI_NPORTS)) {
 +		VHCI_ERROR("invalid port %u\n", rhport);
 +		return -EINVAL;
 +	}
 +
 +	/* check busnum & devnum */
-+	if( (busnum<=0) || (busnum>=128) || (devnum<=0) || (devnum>=128) ) {
++	if ((busnum<=0) || (busnum>=128) || (devnum<=0) || (devnum>=128)) {
 +		VHCI_ERROR("invalid busnum or portnum\n");
 +		return -EINVAL;
 +	}
@@ -4370,13 +4385,13 @@
 +	sscanf(buf, "%u", &rhport);
 +
 +	/* check rhport */
-+	if( (rhport < 0) || (rhport >= VHCI_NPORTS) ) {
++	if ((rhport < 0) || (rhport >= VHCI_NPORTS)) {
 +		VHCI_ERROR("invalid port %u\n", rhport);
 +		return -EINVAL;
 +	}
 +
 +	err = vhci_proc_vcdown(rhport);
-+	if(err < 0) {
++	if (err < 0) {
 +		return -EINVAL;
 +	}
 +
@@ -4398,13 +4413,13 @@
 +	dbg_vhci_sysfs("rhport(%u) sockfd(%u) busnum(%u) devnum(%u) speed(%u)\n",
 +			rhport, sockfd, busnum, devnum, speed);
 +
-+	if( valid_args(rhport, busnum, devnum, speed) < 0 ) {
++	if (valid_args(rhport, busnum, devnum, speed) < 0) {
 +		return -EINVAL;
 +	}
 +
 +	/* check sockfd */
 +	socket = sockfd_to_socket(sockfd);
-+	if(!socket) {
++	if (!socket) {
 +		return  -EINVAL;
 +	}
 +
@@ -4415,7 +4430,7 @@
 +	/* begin a lock */
 +	spin_lock(&vdev->ud.lock);
 +
-+	if(vdev->ud.status != VDEV_ST_NULL) {
++	if (vdev->ud.status != VDEV_ST_NULL) {
 +		spin_unlock(&vdev->ud.lock);
 +		VHCI_ERROR("port %d already used\n", rhport);
 +		return -EINVAL;
@@ -4436,10 +4451,10 @@
 +	spin_unlock(&vdev->ud.lock);
 +	/* end the lock */
 +
-+	if(vdev->ud.tcp_ss.ss_family == AF_INET)
++	if (vdev->ud.tcp_ss.ss_family == AF_INET)
 +		VHCI_INFO("connected to %u.%u.%u.%u(%d)\n",
 +				NIPQUAD(ss_v4_addr(vdev->ud.tcp_ss)), ss_v4_port(vdev->ud.tcp_ss));
-+	else if(vdev->ud.tcp_ss.ss_family == AF_INET6)
++	else if (vdev->ud.tcp_ss.ss_family == AF_INET6)
 +		VHCI_INFO("connected to %04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x(%d)",
 +				NIP6(ss_v6_addr(vdev->ud.tcp_ss)), ss_v6_port(vdev->ud.tcp_ss));
 +	else
@@ -4467,9 +4482,9 @@
 +	.attrs = dev_attrs,
 +};
 +
---- /dev/null	1970-01-01 00:00:00.000000000 +0000
-+++ gregkh-2.6/drivers/usb/usbib/vhci_tx.c	2005-12-01 15:21:50.000000000 -0800
-@@ -0,0 +1,178 @@
+--- /dev/null
++++ gregkh-2.6/drivers/usb/usbip/vhci_tx.c
+@@ -0,0 +1,165 @@
 +/*
 + * $Id: vhci_tx.c 260 2005-08-30 10:35:16Z taka-hir $
 + *
@@ -4492,6 +4507,8 @@
 + * USA.
 + */
 +
++#include "usbip_common.h"
++#include "../core/hcd.h"
 +#include "vhci.h"
 +
 +
@@ -4502,45 +4519,38 @@
 +	__u32 oldp;
 +	oldp = p;
 +
-+	if(pdev > 0x7f)
++	if (pdev > 0x7f)
 +		VHCI_ERROR("invalid devnum %u\n", pdev);
 +	pdev &= 0x7f;    // 0XXX XXXX  confirm MSB be 0
 +
 +	p &= 0xffff80ff; /* clear p's devnum */
 +
-+
 +	p |= (pdev << 8);
 +
-+	dbg_vhci_tx("return new pipe, devnum %u -> %u \n", usb_pipedevice(oldp), usb_pipedevice(p));
++	dbg_vhci_tx("return new pipe, devnum %u -> %u \n",
++		    usb_pipedevice(oldp), usb_pipedevice(p));
 +	dbg_vhci_tx("           pipe %08x -> %08x\n", oldp, p);
 +	return p;
 +}
 +
-+
-+
 +static void setup_pdu(struct usbip_header *pdup,  struct urb *urb)
 +{
-+	struct vhci_priv    *priv = ((struct vhci_priv *) urb->hcpriv);
++	struct vhci_priv *priv = ((struct vhci_priv *)urb->hcpriv);
 +	struct vhci_device *vdev = priv->vdev;
 +
 +	dbg_vhci_tx("URB, local devnum(%u), busnum(%u) devnum(%u)\n",
-+			usb_pipedevice(urb->pipe), vdev->busnum, vdev->devnum);
++	            usb_pipedevice(urb->pipe), vdev->busnum, vdev->devnum);
 +
-+	{
-+		pdup->base.command	= VHC_C_SUBMIT;
-+		pdup->base.busnum		= vdev->busnum;
-+		pdup->base.devnum		= vdev->devnum;
-+		pdup->base.seqnum		= priv->seqnum;
-+		pdup->base.pipe		= vhci_change_pipe_devnum(urb->pipe, vdev->devnum);
++	pdup->base.command = VHC_C_SUBMIT;
++	pdup->base.busnum = vdev->busnum;
++	pdup->base.devnum = vdev->devnum;
++	pdup->base.seqnum = priv->seqnum;
++	pdup->base.pipe	= vhci_change_pipe_devnum(urb->pipe, vdev->devnum);
++	usbip_pack_pdu(pdup, urb, VHC_C_SUBMIT, 1);
 +
-+		usbip_pack_pdu(pdup, urb, VHC_C_SUBMIT, 1);
-+
-+		if(urb->setup_packet != NULL) {
-+			memcpy(pdup->submit.setup, urb->setup_packet, 8);
-+		}
-+	}
++	if (urb->setup_packet != NULL)
++		memcpy(pdup->submit.setup, urb->setup_packet, 8);
 +}
-+
 +
 +#define MAX_SUBMIT_QUEUE_DEPTH 100
 +static struct usbip_header SubmitPDU[MAX_SUBMIT_QUEUE_DEPTH];
@@ -4553,7 +4563,7 @@
 +	int    count = 0;  /* the number of queued pdu */
 +
 +	struct msghdr msg;
-+	struct iovec  iov[MAX_SUBMIT_QUEUE_DEPTH];
++	struct iovec iov[MAX_SUBMIT_QUEUE_DEPTH];
 +
 +	memset(iov, 0, sizeof(iov));
 +	memset(&msg, 0, sizeof(msg));
@@ -4561,7 +4571,6 @@
 +	msg.msg_iovlen = 0;
 +
 +	memset(&SubmitPDU, 0, sizeof(struct usbip_header)*MAX_SUBMIT_QUEUE_DEPTH);
-+
 +
 +	spin_lock_irqsave(&vdev->priv_lock, flags);
 +
@@ -4574,13 +4583,15 @@
 +		/* 1. setup usbip_header */
 +		setup_pdu(&SubmitPDU[count], urb);
 +
-+		iov[msg.msg_iovlen].iov_base = (void *) &SubmitPDU[count];
++		iov[msg.msg_iovlen].iov_base = (void *)&SubmitPDU[count];
 +		iov[msg.msg_iovlen].iov_len  = sizeof(struct usbip_header);
 +		msg.msg_iovlen ++;
 +		txsize += sizeof(struct usbip_header);
 +
 +		/* 2. setup transfer buffer */
-+		if(!usb_pipein(urb->pipe) && urb->transfer_buffer != NULL && urb->transfer_buffer_length > 0) {
++		if (!usb_pipein(urb->pipe) &&
++		    urb->transfer_buffer != NULL &&
++		    urb->transfer_buffer_length > 0) {
 +			iov[msg.msg_iovlen].iov_base = urb->transfer_buffer;
 +			iov[msg.msg_iovlen].iov_len  = urb->transfer_buffer_length;
 +			msg.msg_iovlen++;
@@ -4588,27 +4599,25 @@
 +		}
 +
 +		/* 3. setup iso_packet_descriptor */
-+		if(usb_pipetype(urb->pipe) == PIPE_ISOCHRONOUS) {
++		if (usb_pipetype(urb->pipe) == PIPE_ISOCHRONOUS) {
 +			iov[msg.msg_iovlen].iov_base = &urb->iso_frame_desc[0];
 +			iov[msg.msg_iovlen].iov_len  = urb->number_of_packets * sizeof(struct usb_iso_packet_descriptor);
 +			msg.msg_iovlen++;
 +			txsize += urb->number_of_packets * sizeof(struct usb_iso_packet_descriptor);
 +		}
 +
-+
 +		list_move_tail(&priv->list, &vdev->priv_rx);
 +
 +		count++;
-+		if(count == MAX_SUBMIT_QUEUE_DEPTH) {
++		if (count == MAX_SUBMIT_QUEUE_DEPTH) {
 +			dbg_vhci_tx("max urbs are processed, %d\n", MAX_SUBMIT_QUEUE_DEPTH);
 +			break;
 +		}
-+
 +	}
 +
 +	spin_unlock_irqrestore(&vdev->priv_lock,flags);
 +
-+	if(txsize > 0) {
++	if (txsize > 0) {
 +		int ret;
 +		ret = usbip_sendmsg(vdev->ud.tcp_socket, &msg, txsize);
 +		if (ret != txsize) {
@@ -4623,28 +4632,21 @@
 +	return txsize;
 +}
 +
-+
 +void vhci_tx_loop(struct usbip_task *ut)
 +{
 +	struct usbip_device *ud = container_of(ut, struct usbip_device, tcp_tx);
 +	struct vhci_device *vdev = container_of(ud, struct vhci_device, ud);
 +
 +	while(1) {
-+		if(signal_pending(current)) {
++		if (signal_pending(current)) {
 +			VHCI_INFO("vhci_tx signal catched\n");
 +			break;
 +		}
 +
-+		if( vhci_send_txdata(vdev) < 0)
++		if (vhci_send_txdata(vdev) < 0)
 +			break;
 +
-+
-+
 +		wait_event_interruptible(vdev->waitq, !list_empty(&vdev->priv_tx));
-+
 +		dbg_vhci_tx("pending urbs ?, now wake up\n");
-+
 +	}
 +}
-+
-+
