@@ -10,22 +10,22 @@ a link to the userspace tools needed to get this to work.
 ---
  drivers/usb/Kconfig           |    2 
  drivers/usb/Makefile          |    2 
- drivers/usb/ip/Kconfig        |   12 
+ drivers/usb/ip/Kconfig        |   32 +
  drivers/usb/ip/Makefile       |   13 
  drivers/usb/ip/stub.h         |   93 +++
  drivers/usb/ip/stub_dev.c     |  419 +++++++++++++++++
  drivers/usb/ip/stub_main.c    |  319 +++++++++++++
- drivers/usb/ip/stub_rx.c      |  345 ++++++++++++++
+ drivers/usb/ip/stub_rx.c      |  320 +++++++++++++
  drivers/usb/ip/stub_tx.c      |  205 ++++++++
- drivers/usb/ip/usbip_common.c |  891 ++++++++++++++++++++++++++++++++++++
- drivers/usb/ip/usbip_common.h |  388 +++++++++++++++
+ drivers/usb/ip/usbip_common.c |  857 +++++++++++++++++++++++++++++++++++
+ drivers/usb/ip/usbip_common.h |  392 ++++++++++++++++
  drivers/usb/ip/usbip_event.c  |  147 ++++++
- drivers/usb/ip/vhci.h         |  116 ++++
+ drivers/usb/ip/vhci.h         |  110 ++++
  drivers/usb/ip/vhci_hcd.c     | 1026 ++++++++++++++++++++++++++++++++++++++++++
  drivers/usb/ip/vhci_rx.c      |  149 ++++++
- drivers/usb/ip/vhci_sysfs.c   |  268 ++++++++++
+ drivers/usb/ip/vhci_sysfs.c   |  265 ++++++++++
  drivers/usb/ip/vhci_tx.c      |  165 ++++++
- 17 files changed, 4560 insertions(+)
+ 17 files changed, 4516 insertions(+)
 
 --- gregkh-2.6.orig/drivers/usb/Kconfig
 +++ gregkh-2.6/drivers/usb/Kconfig
@@ -40,19 +40,39 @@ a link to the userspace tools needed to get this to work.
  source "drivers/usb/storage/Kconfig"
 --- /dev/null
 +++ gregkh-2.6/drivers/usb/ip/Kconfig
-@@ -0,0 +1,12 @@
+@@ -0,0 +1,32 @@
 +config USB_IP
-+	bool "USB IP support"
-+	depends on USB
++	bool "USB IP support (EXPERIMENTAL)"
++	depends on USB && EXPERIMENTAL
 +	default N
++	---help---
++	  This enables pushing USB packets over IP to allow remote
++	  machines access to USB devices directly.  For more details,
++	  and links to the userspace utility programs to let this work
++	  properly, see http://usbip.naist.jp/
++
++	  If unsure, say N.
 +
 +config USB_IP_VHCI
 +	tristate "USB IP Host controller driver"
 +	depends on USB_IP
++	---help---
++	  This enables the USB IP host controller driver which will
++	  run on the client machine.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called vhci-hcd.
 +
 +config USB_IP_STUB
 +	tristate "USB IP stub driver"
 +	depends on USB_IP
++	---help---
++	  This enables the USB IP device driver which will run on the
++	  host machine.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called stub.
++
 --- gregkh-2.6.orig/drivers/usb/Makefile
 +++ gregkh-2.6/drivers/usb/Makefile
 @@ -16,6 +16,8 @@ obj-$(CONFIG_USB_UHCI_HCD)	+= host/
@@ -77,7 +97,7 @@ a link to the userspace tools needed to get this to work.
 +
 +
 +ifeq ($(CONFIG_USB_DEBUG),y)
-+	EXTRA_CFLAGS += -DCONFIG_USBIP_DEBUG
++	EXTRA_CFLAGS += -DDEBUG
 +endif
 +
 --- /dev/null
@@ -922,7 +942,7 @@ a link to the userspace tools needed to get this to work.
 +MODULE_LICENSE("GPL");
 --- /dev/null
 +++ gregkh-2.6/drivers/usb/ip/stub_rx.c
-@@ -0,0 +1,345 @@
+@@ -0,0 +1,320 @@
 +/*
 + * $Id: stub_rx.c 276 2005-11-22 08:06:10Z taka-hir $
 + *
@@ -952,21 +972,21 @@ a link to the userspace tools needed to get this to work.
 +{
 +	struct usb_ctrlrequest *req;
 +
-+	if(usb_pipetype(urb->pipe) != PIPE_CONTROL) {
++	if (usb_pipetype(urb->pipe) != PIPE_CONTROL) {
 +		dbg_stub_rx("not clear halt command\n");
 +		return;
 +	}
 +
-+	if(!urb->setup_packet) {
++	if (!urb->setup_packet) {
 +		dbg_stub_rx("no need for check clear halt\n");
 +		return;
 +	}
 +
-+	req = (struct usb_ctrlrequest *) urb->setup_packet;
++	req = (struct usb_ctrlrequest *)urb->setup_packet;
 +
-+	if(req->bRequest == USB_REQ_CLEAR_FEATURE
-+			&& req->bRequestType == USB_RECIP_ENDPOINT
-+			&& req->wValue == USB_ENDPOINT_HALT) {
++	if (req->bRequest == USB_REQ_CLEAR_FEATURE &&
++	    req->bRequestType == USB_RECIP_ENDPOINT &&
++	    req->wValue == USB_ENDPOINT_HALT) {
 +		/* CLEAR HALT command */
 +		/* the next line is wrong.
 +		 * because we must clear halt of stalled endpoint. */
@@ -979,7 +999,7 @@ a link to the userspace tools needed to get this to work.
 +		int target_pipe ;
 +		int ret;
 +
-+		if(in) {
++		if (in) {
 +			dbg_stub_rx("in\n");
 +			target_pipe = usb_rcvctrlpipe(urb->dev, endp);
 +		} else {
@@ -987,19 +1007,14 @@ a link to the userspace tools needed to get this to work.
 +			target_pipe = usb_sndctrlpipe(urb->dev, endp);
 +		}
 +
-+
-+
 +		dbg_stub_rx("CLEAR HALT command, devnum %d endp %d\n", urb->dev->devnum, endp);
 +		ret = usb_clear_halt(urb->dev, target_pipe);
-+		if(ret == 0) {
++		if (ret == 0)
 +			VHCI_INFO("clear halt ep %d ok\n",endp);
-+		} else {
++		else
 +			VHCI_INFO("clear halt ep %d failed, ret %d\n", endp, ret);
-+		}
-+
-+
-+	} else if(req->bRequest == USB_REQ_SET_INTERFACE
-+			&& req->bRequestType == USB_RECIP_INTERFACE) {
++	} else if (req->bRequest == USB_REQ_SET_INTERFACE &&
++		   req->bRequestType == USB_RECIP_INTERFACE) {
 +		/* SET INTERFACE command */
 +		__u16 alternate = req->wValue;
 +		__u16 interface = req->wIndex;
@@ -1007,16 +1022,10 @@ a link to the userspace tools needed to get this to work.
 +		dbg_stub_rx("SET INTERFACE command, interface %u alternate %u\n", interface, alternate);
 +
 +		usb_set_interface(urb->dev,   interface,  alternate);
-+
 +	} else {
 +		dbg_stub_rx("not a clear halt command\n");
 +	}
 +}
-+
-+
-+
-+
-+
 +
 +static int stub_recv_unlink(struct stub_device *sdev, struct usbip_header *pdu)
 +{
@@ -1033,14 +1042,14 @@ a link to the userspace tools needed to get this to work.
 +
 +	for(ptr = listhead->next; ptr != listhead; ptr = ptr->next) {
 +		priv = list_entry(ptr, struct stub_priv, list);
-+		if(priv->seqnum == seqnum) {
++		if (priv->seqnum == seqnum) {
 +			spin_unlock(&sdev->priv_lock);
 +			urb =  priv->urb;
 +			break;
 +		}
 +	}
 +
-+	if(!urb){
++	if (!urb){
 +		uinfo("An unlinking urb is already completed.\n");
 +		uinfo("Or, to begin with, stub did not recieve the urb\n");
 +		spin_unlock(&sdev->priv_lock);
@@ -1048,14 +1057,13 @@ a link to the userspace tools needed to get this to work.
 +	}
 +
 +	ret = usb_unlink_urb(urb);
-+	if(ret != -EINPROGRESS)
++	if (ret != -EINPROGRESS)
 +		uerr("faild to unlink a urb %p, ret %d\n", urb, ret);
 +
 +	spin_unlock(&sdev->priv_lock);
 +
 +	return 0;
 +}
-+
 +
 +static int valid_request(struct stub_device *sdev, struct usbip_header *pdu)
 +{
@@ -1064,24 +1072,18 @@ a link to the userspace tools needed to get this to work.
 +	int bus = interface_to_busnum(sdev->interface);
 +	int dev = interface_to_devnum(sdev->interface);
 +
-+	if( pdu->base.busnum == bus && pdu->base.devnum == dev ) {
-+
++	if (pdu->base.busnum == bus && pdu->base.devnum == dev) {
 +		spin_lock(&ud->lock);
-+		if(ud->status == SDEV_ST_USED) {
++		if (ud->status == SDEV_ST_USED) {
 +			/* A request is valid. */
 +			spin_unlock(&ud->lock);
 +			return 1;
 +		}
-+
 +		spin_unlock(&ud->lock);
 +	}
 +
 +	return 0;
 +}
-+
-+
-+
-+
 +
 +static void stub_recv_submit(struct stub_device *sdev, struct usbip_header *pdu)
 +{
@@ -1100,11 +1102,11 @@ a link to the userspace tools needed to get this to work.
 +		spin_lock_irqsave(&sdev->priv_lock, flag);
 +
 +		priv = kmem_cache_alloc(StubPrivCache, GFP_ATOMIC);
-+		if( !priv ) {
++		if (!priv) {
 +			VHCI_ERROR("malloc stub_priv\n");
 +			spin_unlock_irqrestore(&sdev->priv_lock, flag);
 +			usbip_event_add(ud, SDEV_EVENT_ERROR_MALLOC);
-+			return ;
++			return;
 +		}
 +		memset(priv, 0, sizeof(struct stub_priv));
 +
@@ -1116,28 +1118,24 @@ a link to the userspace tools needed to get this to work.
 +		spin_unlock_irqrestore(&sdev->priv_lock, flag);
 +	}
 +
-+
-+
 +	/*
 +	 * setup a urb
 +	 */
-+
-+	if(usb_pipeisoc(pdu->base.pipe)) {
++	if (usb_pipeisoc(pdu->base.pipe))
 +		priv->urb = usb_alloc_urb(pdu->submit.number_of_packets, GFP_KERNEL);
-+	} else {
++	else
 +		priv->urb = usb_alloc_urb(0, GFP_KERNEL);
-+	}
-+	if(!priv->urb) {
++
++	if (!priv->urb) {
 +		VHCI_ERROR("malloc urb\n");
 +		usbip_event_add(ud, SDEV_EVENT_ERROR_MALLOC);
 +		return;
 +	}
 +
-+
 +	/* set priv->urb->transfer_buffer */
-+	if(pdu->submit.transfer_buffer_length > 0) {
++	if (pdu->submit.transfer_buffer_length > 0) {
 +		priv->urb->transfer_buffer = kmalloc(pdu->submit.transfer_buffer_length, GFP_KERNEL);
-+		if(!priv->urb->transfer_buffer) {
++		if (!priv->urb->transfer_buffer) {
 +			VHCI_ERROR("malloc x_buff\n");
 +			usbip_event_add(ud, SDEV_EVENT_ERROR_MALLOC);
 +			return;
@@ -1148,7 +1146,7 @@ a link to the userspace tools needed to get this to work.
 +	/* set priv->urb->setup_packet */
 +	{
 +		priv->urb->setup_packet = kmalloc(8, GFP_KERNEL);
-+		if(!priv->urb->setup_packet) {
++		if (!priv->urb->setup_packet) {
 +			VHCI_ERROR("allocate setup_packet\n");
 +			usbip_event_add(ud, SDEV_EVENT_ERROR_MALLOC);
 +			return;
@@ -1165,11 +1163,11 @@ a link to the userspace tools needed to get this to work.
 +	usbip_pack_pdu(pdu, priv->urb, VHC_C_SUBMIT, 0);
 +
 +
-+	if( usbip_recv_xbuff(ud, priv->urb) < 0 ) return;
++	if (usbip_recv_xbuff(ud, priv->urb) < 0)
++		return;
 +
-+	if( usbip_recv_iso(ud, priv->urb) < 0 ) return;
-+
-+
++	if (usbip_recv_iso(ud, priv->urb) < 0)
++		return;
 +
 +	check_clear_halt(priv->urb);
 +
@@ -1184,7 +1182,7 @@ a link to the userspace tools needed to get this to work.
 +
 +	ret = usb_submit_urb(priv->urb, GFP_KERNEL);
 +
-+	if(ret == 0) {
++	if (ret == 0) {
 +		dbg_stub_rx("submit urb ok, seqnum %u\n", pdu->base.seqnum);
 +	} else {
 +		VHCI_ERROR("submit_urb error, %d\n", ret);
@@ -1196,12 +1194,9 @@ a link to the userspace tools needed to get this to work.
 +		usbip_event_add(ud, SDEV_EVENT_ERROR_SUBMIT);
 +	}
 +
-+
 +	dbg_stub_rx("Leave\n");
 +	return;
-+
 +}
-+
 +
 +/* recv a pdu */
 +static void stub_rx_pdu(struct usbip_device *ud)
@@ -1218,22 +1213,22 @@ a link to the userspace tools needed to get this to work.
 +
 +	/* 1. recieve a pdu header */
 +	ret = usbip_xmit(0, ud->tcp_socket, (char *) &pdu, sizeof(pdu),0);
-+	if(ret != sizeof(pdu)) {
++	if (ret != sizeof(pdu)) {
 +		VHCI_ERROR("recv a header, %d\n", ret);
 +		usbip_event_add(ud, SDEV_EVENT_ERROR_TCP);
 +		return;
 +	}
 +
-+	if(dbg_flag_stub_rx)
++	if (dbg_flag_stub_rx)
 +		usbip_dump_header(&pdu);
 +
-+	if(!valid_request(sdev, &pdu)) {
++	if (!valid_request(sdev, &pdu)) {
 +		VHCI_ERROR("recv invalid request\n");
 +		usbip_event_add(ud, SDEV_EVENT_ERROR_TCP);
 +		return;
 +	}
 +
-+	switch(pdu.base.command) {
++	switch (pdu.base.command) {
 +		case VHC_C_UNLINK:
 +			stub_recv_unlink(sdev, &pdu);
 +			break;
@@ -1251,18 +1246,18 @@ a link to the userspace tools needed to get this to work.
 +
 +}
 +
-+
-+void stub_rx_loop(struct usbip_task *ut) {
++void stub_rx_loop(struct usbip_task *ut)
++{
 +	struct usbip_device *ud = container_of(ut, struct usbip_device, tcp_rx);
 +
 +	while(1) {
-+		if(signal_pending(current)) {
++		if (signal_pending(current)) {
 +			dbg_stub_rx("signal catched!\n");
 +			break;
 +		}
 +
-+
-+		if( usbip_event_happend(ud) ) break;
++		if (usbip_event_happend(ud))
++			break;
 +
 +		stub_rx_pdu(ud);
 +	}
@@ -1478,7 +1473,7 @@ a link to the userspace tools needed to get this to work.
 +}
 --- /dev/null
 +++ gregkh-2.6/drivers/usb/ip/usbip_common.c
-@@ -0,0 +1,891 @@
+@@ -0,0 +1,857 @@
 +/*
 + * $Id: usbip_common.c 265 2005-09-01 09:24:10Z taka-hir $
 + *
@@ -1503,7 +1498,10 @@ a link to the userspace tools needed to get this to work.
 +
 +#include <linux/kernel.h>
 +#include <linux/file.h>
++#include <linux/tcp.h>
 +#include "usbip_common.h"
++
++static void usbip_dump_buffer(char *, int size);
 +
 +/*
 + *  Send or receive packet.
@@ -1532,13 +1530,13 @@ a link to the userspace tools needed to get this to work.
 +	if (dbg_flag_xmit) {
 +		if (send) {
 +			if (!in_interrupt())
-+				printk("%-10s:", current->comm);
++				printk(KERN_DEBUG "%-10s:", current->comm);
 +			else
-+				printk("interupt  :");
++				printk(KERN_DEBUG "interupt  :");
 +
 +			printk("usbip_xmit: sending... , sock %p, buf %p, size %d, msg_flags %d\n",
 +					sock, buf, size, msg_flags);
-+			dump_buffer(buf, size);
++			usbip_dump_buffer(buf, size);
 +		}
 +	}
 +
@@ -1576,12 +1574,12 @@ a link to the userspace tools needed to get this to work.
 +	if (dbg_flag_xmit) {
 +		if (!send) {
 +			if (!in_interrupt())
-+				printk("%-10s:", current->comm);
++				printk(KERN_DEBUG "%-10s:", current->comm);
 +			else
-+				printk("interupt  :");
++				printk(KERN_DEBUG "interupt  :");
 +
 +			printk("usbip_xmit: receiving....\n");
-+			dump_buffer(bp, osize);
++			usbip_dump_buffer(bp, osize);
 +			printk("usbip_xmit: received, osize %d ret %d size %d total %d\n",
 +					osize, result, size, total);
 +		}
@@ -1598,8 +1596,7 @@ a link to the userspace tools needed to get this to work.
 +	return result;
 +}
 +
-+
-+int usbip_sendmsg( struct socket *socket, struct msghdr *msg, int len )
++int usbip_sendmsg(struct socket *socket, struct msghdr *msg, int len)
 +{
 +	int rc = 0;
 +	mm_segment_t oldfs;
@@ -1609,14 +1606,14 @@ a link to the userspace tools needed to get this to work.
 +	if (dbg_flag_xmit) {
 +		int i;
 +		for(i = 0; i < msg->msg_iovlen; i++) {
-+			dump_buffer(msg->msg_iov[i].iov_base,
-+					msg->msg_iov[i].iov_len);
++			usbip_dump_buffer(msg->msg_iov[i].iov_base,
++					  msg->msg_iov[i].iov_len);
 +		}
 +	}
 +
 +	if (socket) {
 +		oldfs = get_fs();
-+		set_fs( get_ds() );
++		set_fs(get_ds());
 +
 +		/* Try to avoid resource acquisition deadlocks by using GFP_ATOMIC. */
 +		socket->sk->sk_allocation = GFP_ATOMIC;
@@ -1625,7 +1622,7 @@ a link to the userspace tools needed to get this to work.
 +		/* FIXME: ought to loop handling short writes, unless a signal occurs */
 +		rc = sock_sendmsg(socket, msg, len);
 +
-+		set_fs( oldfs );
++		set_fs(oldfs);
 +	}
 +
 +	return rc;
@@ -1653,12 +1650,12 @@ a link to the userspace tools needed to get this to work.
 +		set_fs( oldfs );
 +	}
 +
-+#ifdef CONFIG_USBIP_DEBUG
++#ifdef CONFIG_USB_DEBUG
 +	{
 +		int i;
 +		for(i = 0; i < msg->msg_iovlen; i++) {
-+			dump_buffer(msg->msg_iov[i].iov_base,
-+					msg->msg_iov[i].iov_len);
++			usbip_dump_buffer(msg->msg_iov[i].iov_base,
++					  msg->msg_iov[i].iov_len);
 +		}
 +	}
 +#endif
@@ -1668,10 +1665,7 @@ a link to the userspace tools needed to get this to work.
 +#endif
 +
 +
-+
-+
-+
-+void dump_buffer(char *buff, int bufflen)
++static void usbip_dump_buffer(char *buff, int bufflen)
 +{
 +	int i;
 +
@@ -1701,7 +1695,7 @@ a link to the userspace tools needed to get this to work.
 +}
 +
 +
-+void dump_pipe(unsigned int p)
++static void usbip_dump_pipe(unsigned int p)
 +{
 +	unsigned char type = usb_pipetype(p);
 +	unsigned char ep = usb_pipeendpoint(p);
@@ -1737,7 +1731,7 @@ a link to the userspace tools needed to get this to work.
 +}
 +
 +
-+void dump_usb_device(struct usb_device *dev)
++static void usbip_dump_usb_device(struct usb_device *dev)
 +{
 +	if (dev == NULL) {
 +		printk("      dump usb dev: null pointer!!\n");
@@ -1826,38 +1820,7 @@ a link to the userspace tools needed to get this to work.
 +	printk("\n");
 +}
 +
-+void dump_urb (struct urb *purb)
-+{
-+	if (!purb) {
-+		printk("   dump urb: null pointer!!\n");
-+		return;
-+	}
-+
-+	printk("   urb                   :%p\n", purb);
-+	//printk("   next                  :%p\n", purb->next);
-+	printk("   dev                   :%p\n", purb->dev);
-+	dump_usb_device(purb->dev);
-+	printk("   pipe                  :%08x ", purb->pipe);
-+	dump_pipe(purb->pipe);
-+	printk("   status                :%d\n", purb->status);
-+	printk("   transfer_flags        :%08X\n", purb->transfer_flags);
-+	printk("   transfer_buffer       :%p\n", purb->transfer_buffer);
-+	printk("   transfer_buffer_length:%d\n", purb->transfer_buffer_length);
-+	printk("   actual_length         :%d\n", purb->actual_length);
-+	printk("   bandwidth             :%d\n", purb->actual_length);
-+	printk("   setup_packet          :%p\n", purb->setup_packet);
-+	if (purb->setup_packet != NULL && usb_pipetype(purb->pipe) == PIPE_CONTROL) {
-+		dump_usb_ctrlrequest((struct usb_ctrlrequest *) purb->setup_packet);
-+	}
-+	printk("   start_frame           :%d\n", purb->start_frame);
-+	printk("   number_of_packets     :%d\n", purb->number_of_packets);
-+	printk("   interval              :%d\n", purb->interval);
-+	printk("   error_count           :%d\n", purb->error_count);
-+	printk("   context               :%p\n", purb->context);
-+	printk("   complete              :%p\n", purb->complete);
-+}
-+
-+static void dump_request_type(__u8 rt)
++static void usbip_dump_request_type(__u8 rt)
 +{
 +	switch(rt & USB_RECIP_MASK) {
 +		case USB_RECIP_DEVICE:
@@ -1877,10 +1840,10 @@ a link to the userspace tools needed to get this to work.
 +	}
 +}
 +
-+void dump_usb_ctrlrequest(struct usb_ctrlrequest *cmd)
++static void usbip_dump_usb_ctrlrequest(struct usb_ctrlrequest *cmd)
 +{
 +	if (cmd == NULL) {
-+		printk("      dump_usb_ctrlrequest : null pointer\n");
++		printk("      %s : null pointer\n", __FUNCTION__);
 +		return;
 +	}
 +
@@ -1934,7 +1897,7 @@ a link to the userspace tools needed to get this to work.
 +		}
 +
 +		printk(" ");
-+		dump_request_type(cmd->bRequestType);
++		usbip_dump_request_type(cmd->bRequestType);
 +
 +	}
 +	else if ((cmd->bRequestType & USB_TYPE_MASK) == USB_TYPE_CLASS) {
@@ -1947,34 +1910,47 @@ a link to the userspace tools needed to get this to work.
 +		printk("RESERVED");
 +	}
 +
-+
-+
 +	printk("\n");
 +}
 +
++static void usbip_dump_urb (struct urb *purb)
++{
++	if (!purb) {
++		printk("   dump urb: null pointer!!\n");
++		return;
++	}
 +
-+int interface_to_busnum(struct usb_interface *interface) {
-+	struct usb_device *udev = interface_to_usbdev(interface);
-+	return udev->bus->busnum;
++	printk("   urb                   :%p\n", purb);
++	//printk("   next                  :%p\n", purb->next);
++	printk("   dev                   :%p\n", purb->dev);
++	usbip_dump_usb_device(purb->dev);
++	printk("   pipe                  :%08x ", purb->pipe);
++	usbip_dump_pipe(purb->pipe);
++	printk("   status                :%d\n", purb->status);
++	printk("   transfer_flags        :%08X\n", purb->transfer_flags);
++	printk("   transfer_buffer       :%p\n", purb->transfer_buffer);
++	printk("   transfer_buffer_length:%d\n", purb->transfer_buffer_length);
++	printk("   actual_length         :%d\n", purb->actual_length);
++	printk("   bandwidth             :%d\n", purb->actual_length);
++	printk("   setup_packet          :%p\n", purb->setup_packet);
++	if (purb->setup_packet != NULL && usb_pipetype(purb->pipe) == PIPE_CONTROL)
++		usbip_dump_usb_ctrlrequest((struct usb_ctrlrequest *) purb->setup_packet);
++	printk("   start_frame           :%d\n", purb->start_frame);
++	printk("   number_of_packets     :%d\n", purb->number_of_packets);
++	printk("   interval              :%d\n", purb->interval);
++	printk("   error_count           :%d\n", purb->error_count);
++	printk("   context               :%p\n", purb->context);
++	printk("   complete              :%p\n", purb->complete);
 +}
 +
-+int interface_to_devnum(struct usb_interface *interface) {
-+	struct usb_device *udev = interface_to_usbdev(interface);
-+	return udev->devnum;
-+}
-+
-+int interface_to_infnum(struct usb_interface *interface) {
-+	return interface->cur_altsetting->desc.bInterfaceNumber;
-+}
-+
-+#include <linux/tcp.h>
 +
 +void setquickack(struct socket *socket)
 +{
 +	mm_segment_t oldfs;
 +	int ret = 1;
 +
-+	oldfs = get_fs(); set_fs(get_ds());
++	oldfs = get_fs();
++	set_fs(get_ds());
 +	ret = socket->ops->setsockopt(socket, SOL_TCP, TCP_QUICKACK, (char *) &ret, sizeof(ret));
 +	set_fs(oldfs);
 +}
@@ -1984,7 +1960,8 @@ a link to the userspace tools needed to get this to work.
 +	mm_segment_t oldfs;
 +	int ret = 1;
 +
-+	oldfs = get_fs(); set_fs(get_ds());
++	oldfs = get_fs();
++	set_fs(get_ds());
 +	ret = socket->ops->setsockopt(socket, SOL_TCP, TCP_NODELAY, (char *) &ret, sizeof(ret));
 +	set_fs(oldfs);
 +}
@@ -1994,7 +1971,8 @@ a link to the userspace tools needed to get this to work.
 +	mm_segment_t oldfs;
 +	int ret = 1;
 +
-+	oldfs = get_fs(); set_fs(get_ds());
++	oldfs = get_fs();
++	set_fs(get_ds());
 +	ret = socket->ops->setsockopt(socket, SOL_SOCKET, SO_KEEPALIVE, (char *) &ret, sizeof(ret));
 +	set_fs(oldfs);
 +}
@@ -2063,8 +2041,6 @@ a link to the userspace tools needed to get this to work.
 +}
 +#endif
 +
-+
-+
 +ssize_t socket_to_addrstr(struct socket *socket, char *buf)
 +{
 +	struct sockaddr uaddr;
@@ -2092,13 +2068,8 @@ a link to the userspace tools needed to get this to work.
 +	return ret;
 +}
 +
-+
-+
-+
-+
 +void usbip_dump_header(struct usbip_header *pdu)
 +{
-+
 +	VHCI_DEBUG("BASE: cmd %u bus %u dev %u seq %u pipe %04x\n",
 +			pdu->base.command,
 +			pdu->base.busnum,
@@ -2106,8 +2077,8 @@ a link to the userspace tools needed to get this to work.
 +			pdu->base.seqnum,
 +			pdu->base.pipe);
 +
-+#ifdef CONFIG_USBIP_DEBUG
-+	dump_pipe(pdu->base.pipe);
++#ifdef CONFIG_USB_DEBUG
++	usbip_dump_pipe(pdu->base.pipe);
 +#endif
 +
 +	switch(pdu->base.command) {
@@ -2170,14 +2141,13 @@ a link to the userspace tools needed to get this to work.
 +	/*
 +	 * threads are invoked per one device (per one connection).
 +	 */
-+	kernel_thread((int(*)(void *)) usbip_thread, (void *) &ud->tcp_rx, 0);
-+	kernel_thread((int(*)(void *)) usbip_thread, (void *) &ud->tcp_tx, 0);
++	kernel_thread((int(*)(void *))usbip_thread, (void *)&ud->tcp_rx, 0);
++	kernel_thread((int(*)(void *))usbip_thread, (void *)&ud->tcp_tx, 0);
 +
 +	/* confirm threads are starting */
 +	wait_for_completion(&ud->tcp_rx.thread_done);
 +	wait_for_completion(&ud->tcp_tx.thread_done);
 +}
-+
 +
 +void usbip_stop_threads(struct usbip_device *ud)
 +{
@@ -2194,7 +2164,6 @@ a link to the userspace tools needed to get this to work.
 +	}
 +}
 +
-+
 +void usbip_task_init(struct usbip_task *ut, char *name, void (*loop_ops)(struct usbip_task *))
 +{
 +	ut->thread = NULL;
@@ -2202,7 +2171,6 @@ a link to the userspace tools needed to get this to work.
 +	ut->name = name;
 +	ut->loop_ops = loop_ops;
 +}
-+
 +
 +static void usbip_pack_submit_pdu(struct usbip_header *pdu, struct urb *urb, int pack)
 +{
@@ -2224,7 +2192,6 @@ a link to the userspace tools needed to get this to work.
 +		urb->interval               = pdu->submit.interval;
 +	}
 +}
-+
 +
 +static void usbip_pack_return_pdu(struct usbip_header *pdu, struct urb *urb, int pack)
 +{
@@ -2263,8 +2230,6 @@ a link to the userspace tools needed to get this to work.
 +			BUG();
 +	}
 +}
-+
-+
 +
 +/* some members of urb must be substituted before. */
 +int usbip_recv_iso(struct usbip_device *ud, struct urb *urb)
@@ -2305,13 +2270,11 @@ a link to the userspace tools needed to get this to work.
 +	return happend;
 +}
 +
-+
 +/* some members of urb must be substituted before. */
 +int usbip_recv_xbuff(struct usbip_device *ud, struct urb *urb)
 +{
 +	int ret;
 +	int size;
-+
 +
 +	if (ud->side == USBIP_STUB) {
 +		/* stub_rx.c */
@@ -2347,9 +2310,7 @@ a link to the userspace tools needed to get this to work.
 +	return ret;
 +}
 +
-+
-+
-+#ifdef CONFIG_USBIP_DEBUG
++#ifdef CONFIG_USB_DEBUG
 +unsigned long usbip_debug_flag = 0xffff;
 +#else
 +unsigned long usbip_debug_flag = 0;
@@ -2357,7 +2318,7 @@ a link to the userspace tools needed to get this to work.
 +
 +static ssize_t show_flag(struct device *dev, struct device_attribute *attr, char *buf)
 +{
-+	return sprintf(buf, "%lx", usbip_debug_flag);
++	return sprintf(buf, "%lx\n", usbip_debug_flag);
 +}
 +
 +static ssize_t store_flag(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
@@ -2372,7 +2333,7 @@ a link to the userspace tools needed to get this to work.
 +DEVICE_ATTR(usbip_debug, (S_IRUGO | S_IWUSR), show_flag, store_flag);
 --- /dev/null
 +++ gregkh-2.6/drivers/usb/ip/usbip_common.h
-@@ -0,0 +1,388 @@
+@@ -0,0 +1,392 @@
 +/*
 + * $Id: usbip_common.h 265 2005-09-01 09:24:10Z taka-hir $
 + *
@@ -2640,16 +2601,22 @@ a link to the userspace tools needed to get this to work.
 +int usbip_sendmsg(struct socket *, struct msghdr *, int );
 +
 +
-+void dump_buffer(char *, int size);
-+void dump_urb(struct urb *);
-+void dump_usb_device(struct usb_device *);
-+void dump_pipe(unsigned int);
-+void dump_usb_ctrlrequest(struct usb_ctrlrequest *);
++static inline int interface_to_busnum(struct usb_interface *interface)
++{
++	struct usb_device *udev = interface_to_usbdev(interface);
++	return udev->bus->busnum;
++}
 +
++static inline int interface_to_devnum(struct usb_interface *interface)
++{
++	struct usb_device *udev = interface_to_usbdev(interface);
++	return udev->devnum;
++}
 +
-+int interface_to_busnum(struct usb_interface *interface);
-+int interface_to_devnum(struct usb_interface *interface);
-+int interface_to_infnum(struct usb_interface *interface);
++static inline int interface_to_infnum(struct usb_interface *interface)
++{
++	return interface->cur_altsetting->desc.bInterfaceNumber;
++}
 +
 +void setnodelay(struct socket *);
 +void setquickack(struct socket *);
@@ -2666,9 +2633,7 @@ a link to the userspace tools needed to get this to work.
 +void usbip_dump_header(struct usbip_header *pdu);
 +
 +
-+
-+
-+struct usbip_device ;
++struct usbip_device;
 +
 +struct usbip_task {
 +	struct task_struct *thread;
@@ -2913,7 +2878,7 @@ a link to the userspace tools needed to get this to work.
 +
 --- /dev/null
 +++ gregkh-2.6/drivers/usb/ip/vhci.h
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,110 @@
 +/*
 + * $Id: vhci.h 249 2005-08-10 12:15:26Z taka-hir $
 + *
@@ -2953,9 +2918,7 @@ a link to the userspace tools needed to get this to work.
 +
 +	__u32 rhport; /* root hub port number */
 +
-+
 +	struct usbip_device ud;
-+
 +
 +	/* vhci_priv is linked to any one of these lists. */
 +	spinlock_t priv_lock;
@@ -2997,8 +2960,6 @@ a link to the userspace tools needed to get this to work.
 +	unsigned	resuming:1;
 +	unsigned long	re_timeout;
 +
-+
-+
 +	atomic_t seqnum;
 +
 +	/*
@@ -3019,8 +2980,6 @@ a link to the userspace tools needed to get this to work.
 +void rh_port_disconnect(int rhport);
 +extern struct vhci_hcd *the_controller;
 +#define hardware        (&the_controller->pdev.dev)
-+
-+
 +
 +struct vhci_device *port_to_vdev(__u32 port);
 +
@@ -4213,7 +4172,7 @@ a link to the userspace tools needed to get this to work.
 +
 --- /dev/null
 +++ gregkh-2.6/drivers/usb/ip/vhci_sysfs.c
-@@ -0,0 +1,268 @@
+@@ -0,0 +1,265 @@
 +/*
 + * $Id: vhci_sysfs.c 260 2005-08-30 10:35:16Z taka-hir $
 + *
@@ -4272,10 +4231,8 @@ a link to the userspace tools needed to get this to work.
 +
 +static int vhci_proc_status(char *out)
 +{
-+
 +	char *s = out;
 +	int i = 0;
-+
 +
 +	/*
 +	 * prt sta bus dev ipaddr                                  port   busid
@@ -4284,7 +4241,6 @@ a link to the userspace tools needed to get this to work.
 +	 */
 +
 +	out += sprintf(out, "prt sta spd bus dev ipaddr                                  port   busid\n");
-+
 +
 +	if (!the_controller) {
 +		VHCI_ERROR("the_controller is NULL\n");
