@@ -1,0 +1,264 @@
+From mdharm@multivac.one-eyed-alien.net Sun Dec  4 22:01:36 2005
+Date: Sun, 4 Dec 2005 21:57:51 -0800
+From: Matthew Dharm <mdharm-usb@one-eyed-alien.net>
+To: Greg KH <greg@kroah.com>
+Subject: USB Storage: cleanups of sddr09
+Message-ID: <20051205055751.GB15047@one-eyed-alien.net>
+Content-Disposition: inline
+
+This is the first of three patches to prepare the sddr09 subdriver for
+conversion to the Sim-SCSI framework.  This patch (as594) straightens
+out the initialization procedures and headers:
+
+	Some ugly code from usb.c was moved into sddr09.c.
+
+	Set-up of the private data structures was moved into the
+	initialization routine.
+
+	The connection between the "dpcm" version and the standalone
+	version was clarified.
+
+	A private declaration was moved from a header file into the
+	subdriver's .c file.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Acked-by: Andries Brouwer <Andries.Brouwer@cwi.nl>
+Signed-off-by: Matthew Dharm <mdharm-usb@one-eyed-alien.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/storage/initializers.h |    4 --
+ drivers/usb/storage/sddr09.c       |   74 ++++++++++++++++++++++++++++---------
+ drivers/usb/storage/sddr09.h       |   15 +------
+ drivers/usb/storage/unusual_devs.h |   14 +++----
+ drivers/usb/storage/usb.c          |   22 -----------
+ 5 files changed, 65 insertions(+), 64 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/storage/unusual_devs.h
++++ gregkh-2.6/drivers/usb/storage/unusual_devs.h
+@@ -284,14 +284,14 @@ UNUSUAL_DEV(  0x04e6, 0x0002, 0x0100, 0x
+ UNUSUAL_DEV(  0x04e6, 0x0003, 0x0000, 0x9999, 
+ 		"Sandisk",
+ 		"ImageMate SDDR09",
+-		US_SC_SCSI, US_PR_EUSB_SDDR09, NULL,
+-		US_FL_SINGLE_LUN ),
++		US_SC_SCSI, US_PR_EUSB_SDDR09, usb_stor_sddr09_init,
++		0),
+ 
+ /* This entry is from Andries.Brouwer@cwi.nl */
+ UNUSUAL_DEV(  0x04e6, 0x0005, 0x0100, 0x0208,
+ 		"SCM Microsystems",
+ 		"eUSB SmartMedia / CompactFlash Adapter",
+-		US_SC_SCSI, US_PR_DPCM_USB, sddr09_init, 
++		US_SC_SCSI, US_PR_DPCM_USB, usb_stor_sddr09_dpcm_init,
+ 		0), 
+ #endif
+ 
+@@ -681,8 +681,8 @@ UNUSUAL_DEV(  0x0644, 0x0000, 0x0100, 0x
+ UNUSUAL_DEV(  0x066b, 0x0105, 0x0100, 0x0100, 
+ 		"Olympus",
+ 		"Camedia MAUSB-2",
+-		US_SC_SCSI, US_PR_EUSB_SDDR09, NULL,
+-		US_FL_SINGLE_LUN ),
++		US_SC_SCSI, US_PR_EUSB_SDDR09, usb_stor_sddr09_init,
++		0),
+ #endif
+ 
+ /* Reported by Darsen Lu <darsen@micro.ee.nthu.edu.tw> */
+@@ -747,8 +747,8 @@ UNUSUAL_DEV(  0x0781, 0x0100, 0x0100, 0x
+ UNUSUAL_DEV(  0x0781, 0x0200, 0x0000, 0x9999, 
+ 		"Sandisk",
+ 		"ImageMate SDDR-09",
+-		US_SC_SCSI, US_PR_EUSB_SDDR09, NULL,
+-		US_FL_SINGLE_LUN ),
++		US_SC_SCSI, US_PR_EUSB_SDDR09, usb_stor_sddr09_init,
++		0),
+ #endif
+ 
+ #ifdef CONFIG_USB_STORAGE_FREECOM
+--- gregkh-2.6.orig/drivers/usb/storage/sddr09.c
++++ gregkh-2.6/drivers/usb/storage/sddr09.c
+@@ -214,6 +214,20 @@ static void nand_store_ecc(unsigned char
+  * The actual driver starts here.
+  */
+ 
++struct sddr09_card_info {
++	unsigned long	capacity;	/* Size of card in bytes */
++	int		pagesize;	/* Size of page in bytes */
++	int		pageshift;	/* log2 of pagesize */
++	int		blocksize;	/* Size of block in pages */
++	int		blockshift;	/* log2 of blocksize */
++	int		blockmask;	/* 2^blockshift - 1 */
++	int		*lba_to_pba;	/* logical to physical map */
++	int		*pba_to_lba;	/* physical to logical map */
++	int		lbact;		/* number of available pages */
++	int		flags;
++#define	SDDR09_WP	1		/* write protected */
++};
++
+ /*
+  * On my 16MB card, control blocks have size 64 (16 real control bytes,
+  * and 48 junk bytes). In reality of course the card uses 16 control bytes,
+@@ -1342,27 +1356,51 @@ sddr09_card_info_destructor(void *extra)
+ 	kfree(info->pba_to_lba);
+ }
+ 
+-static void
+-sddr09_init_card_info(struct us_data *us) {
+-	if (!us->extra) {
+-		us->extra = kmalloc(sizeof(struct sddr09_card_info), GFP_NOIO);
+-		if (us->extra) {
+-			memset(us->extra, 0, sizeof(struct sddr09_card_info));
+-			us->extra_destructor = sddr09_card_info_destructor;
+-		}
+-	}
++static int
++sddr09_common_init(struct us_data *us) {
++	int result;
++
++	/* set the configuration -- STALL is an acceptable response here */
++	if (us->pusb_dev->actconfig->desc.bConfigurationValue != 1) {
++		US_DEBUGP("active config #%d != 1 ??\n", us->pusb_dev
++				->actconfig->desc.bConfigurationValue);
++		return -EINVAL;
++	}
++
++	result = usb_reset_configuration(us->pusb_dev);
++	US_DEBUGP("Result of usb_reset_configuration is %d\n", result);
++	if (result == -EPIPE) {
++		US_DEBUGP("-- stall on control interface\n");
++	} else if (result != 0) {
++		/* it's not a stall, but another error -- time to bail */
++		US_DEBUGP("-- Unknown error.  Rejecting device\n");
++		return -EINVAL;
++	}
++
++	us->extra = kzalloc(sizeof(struct sddr09_card_info), GFP_NOIO);
++	if (!us->extra)
++		return -ENOMEM;
++	us->extra_destructor = sddr09_card_info_destructor;
++
++	nand_init_ecc();
++	return 0;
+ }
+ 
++
+ /*
+  * This is needed at a very early stage. If this is not listed in the
+  * unusual devices list but called from here then LUN 0 of the combo reader
+  * is not recognized. But I do not know what precisely these calls do.
+  */
+ int
+-sddr09_init(struct us_data *us) {
++usb_stor_sddr09_dpcm_init(struct us_data *us) {
+ 	int result;
+ 	unsigned char *data = us->iobuf;
+ 
++	result = sddr09_common_init(us);
++	if (result)
++		return result;
++
+ 	result = sddr09_send_command(us, 0x01, USB_DIR_IN, data, 2);
+ 	if (result != USB_STOR_TRANSPORT_GOOD) {
+ 		US_DEBUGP("sddr09_init: send_command fails\n");
+@@ -1398,7 +1436,7 @@ sddr09_init(struct us_data *us) {
+ 
+ 	// test unit ready
+ 
+-	return USB_STOR_TRANSPORT_GOOD;		/* not result */
++	return 0;		/* not result */
+ }
+ 
+ /*
+@@ -1427,13 +1465,6 @@ int sddr09_transport(struct scsi_cmnd *s
+ 	};
+ 
+ 	info = (struct sddr09_card_info *)us->extra;
+-	if (!info) {
+-		nand_init_ecc();
+-		sddr09_init_card_info(us);
+-		info = (struct sddr09_card_info *)us->extra;
+-		if (!info)
+-			return USB_STOR_TRANSPORT_ERROR;
+-	}
+ 
+ 	if (srb->cmnd[0] == REQUEST_SENSE && havefakesense) {
+ 		/* for a faked command, we have to follow with a faked sense */
+@@ -1606,3 +1637,10 @@ int sddr09_transport(struct scsi_cmnd *s
+ 	return USB_STOR_TRANSPORT_GOOD;
+ }
+ 
++/*
++ * Initialization routine for the sddr09 subdriver
++ */
++int
++usb_stor_sddr09_init(struct us_data *us) {
++	return sddr09_common_init(us);
++}
+--- gregkh-2.6.orig/drivers/usb/storage/sddr09.h
++++ gregkh-2.6/drivers/usb/storage/sddr09.h
+@@ -31,18 +31,7 @@
+ 
+ extern int sddr09_transport(struct scsi_cmnd *srb, struct us_data *us);
+ 
+-struct sddr09_card_info {
+-	unsigned long	capacity;	/* Size of card in bytes */
+-	int		pagesize;	/* Size of page in bytes */
+-	int		pageshift;	/* log2 of pagesize */
+-	int		blocksize;	/* Size of block in pages */
+-	int		blockshift;	/* log2 of blocksize */
+-	int		blockmask;	/* 2^blockshift - 1 */
+-	int		*lba_to_pba;	/* logical to physical map */
+-	int		*pba_to_lba;	/* physical to logical map */
+-	int		lbact;		/* number of available pages */
+-	int		flags;
+-#define	SDDR09_WP	1		/* write protected */
+-};
++extern int usb_stor_sddr09_dpcm_init(struct us_data *us);
++extern int usb_stor_sddr09_init(struct us_data *us);
+ 
+ #endif
+--- gregkh-2.6.orig/drivers/usb/storage/usb.c
++++ gregkh-2.6/drivers/usb/storage/usb.c
+@@ -919,28 +919,6 @@ static int storage_probe(struct usb_inte
+ 	 */
+ 	get_device_info(us, id);
+ 
+-#ifdef CONFIG_USB_STORAGE_SDDR09
+-	if (us->protocol == US_PR_EUSB_SDDR09 ||
+-			us->protocol == US_PR_DPCM_USB) {
+-		/* set the configuration -- STALL is an acceptable response here */
+-		if (us->pusb_dev->actconfig->desc.bConfigurationValue != 1) {
+-			US_DEBUGP("active config #%d != 1 ??\n", us->pusb_dev
+-				->actconfig->desc.bConfigurationValue);
+-			goto BadDevice;
+-		}
+-		result = usb_reset_configuration(us->pusb_dev);
+-
+-		US_DEBUGP("Result of usb_reset_configuration is %d\n", result);
+-		if (result == -EPIPE) {
+-			US_DEBUGP("-- stall on control interface\n");
+-		} else if (result != 0) {
+-			/* it's not a stall, but another error -- time to bail */
+-			US_DEBUGP("-- Unknown error.  Rejecting device\n");
+-			goto BadDevice;
+-		}
+-	}
+-#endif
+-
+ 	/* Get the transport, protocol, and pipe settings */
+ 	result = get_transport(us);
+ 	if (result)
+--- gregkh-2.6.orig/drivers/usb/storage/initializers.h
++++ gregkh-2.6/drivers/usb/storage/initializers.h
+@@ -45,10 +45,6 @@
+  * mode */
+ int usb_stor_euscsi_init(struct us_data *us);
+ 
+-#ifdef CONFIG_USB_STORAGE_SDDR09
+-int sddr09_init(struct us_data *us);
+-#endif
+-
+ /* This function is required to activate all four slots on the UCR-61S2B
+  * flash reader */
+ int usb_stor_ucr61s2b_init(struct us_data *us);
