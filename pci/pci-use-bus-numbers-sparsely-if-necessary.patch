@@ -1,0 +1,88 @@
+From brodo@dominikbrodowski.de Thu Dec  8 08:03:36 2005
+Date: Thu, 8 Dec 2005 16:53:12 +0100
+From: Dominik Brodowski <linux@dominikbrodowski.net>
+To: greg@kroah.com
+Subject: PCI: use bus numbers sparsely, if necessary
+Message-ID: <20051208155312.GA3759@dominikbrodowski.de>
+Content-Disposition: inline
+
+Add a warning if a child bus may be inaccessible because the
+parent bridge has wrong secondary or subordinate bus numbers.
+Note that this may or may not happen on "transparent" bridges,
+as can be seen in bug #5557.
+
+Also, if we do not fix up the assignment of bus numbers, try to
+make use of the bus number space available.
+
+Signed-off-by: Dominik Brodowski <linux@dominikbrodowski.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/pci/probe.c |   39 +++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 37 insertions(+), 2 deletions(-)
+
+--- gregkh-2.6.orig/drivers/pci/probe.c
++++ gregkh-2.6/drivers/pci/probe.c
+@@ -433,7 +433,7 @@ int __devinit pci_scan_bridge(struct pci
+ {
+ 	struct pci_bus *child;
+ 	int is_cardbus = (dev->hdr_type == PCI_HEADER_TYPE_CARDBUS);
+-	u32 buses, i;
++	u32 buses, i, j = 0;
+ 	u16 bctl;
+ 
+ 	pci_read_config_dword(dev, PCI_PRIMARY_BUS, &buses);
+@@ -543,10 +543,29 @@ int __devinit pci_scan_bridge(struct pci
+ 			 * as cards with a PCI-to-PCI bridge can be
+ 			 * inserted later.
+ 			 */
+-			for (i=0; i<CARDBUS_RESERVE_BUSNR; i++)
++			for (i=0; i<CARDBUS_RESERVE_BUSNR; i++) {
++				struct pci_bus *parent = bus;
+ 				if (pci_find_bus(pci_domain_nr(bus),
+ 							max+i+1))
+ 					break;
++				while (parent->parent) {
++					if ((!pcibios_assign_all_busses()) &&
++					    (parent->subordinate > max) &&
++					    (parent->subordinate <= max+i)) {
++						j = 1;
++					}
++					parent = parent->parent;
++				}
++				if (j) {
++					/*
++					 * Often, there are two cardbus bridges
++					 * -- try to leave one valid bus number
++					 * for each one.
++					 */
++					i /= 2;
++					break;
++				}
++			}
+ 			max += i;
+ 			pci_fixup_parent_subordinate_busnr(child, max);
+ 		}
+@@ -561,6 +580,22 @@ int __devinit pci_scan_bridge(struct pci
+ 
+ 	sprintf(child->name, (is_cardbus ? "PCI CardBus #%02x" : "PCI Bus #%02x"), child->number);
+ 
++	while (bus->parent) {
++		if ((child->subordinate > bus->subordinate) ||
++		    (child->number > bus->subordinate) ||
++		    (child->number < bus->number) ||
++		    (child->subordinate < bus->number)) {
++			printk(KERN_WARNING "PCI: Bus #%02x (-#%02x) may be "
++			       "hidden behind%s bridge #%02x (-#%02x)%s\n",
++			       child->number, child->subordinate,
++			       bus->self->transparent ? " transparent" : " ",
++			       bus->number, bus->subordinate,
++			       pcibios_assign_all_busses() ? " " :
++			       " (try 'pci=assign-busses')");
++		}
++		bus = bus->parent;
++	}
++
+ 	return max;
+ }
+ 
