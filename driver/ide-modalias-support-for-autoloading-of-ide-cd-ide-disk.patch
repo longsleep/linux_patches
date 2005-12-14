@@ -1,13 +1,31 @@
-From akpm@osdl.org Sun Dec  4 15:17:42 2005
+From kay.sievers@vrfy.org Mon Dec 12 10:16:27 2005
+Date: Mon, 12 Dec 2005 18:03:44 +0100
 From: Kay Sievers <kay.sievers@vrfy.org>
+To: Bartlomiej Zolnierkiewicz <bzolnier@gmail.com>
+Cc: "gregkh@suse.de" <gregkh@suse.de>, akpm@osdl.org
 Subject: ide: MODALIAS support for autoloading of ide-cd, ide-disk, ...
-To: kay.sievers@vrfy.org, B.Zolnierkiewicz@elka.pw.edu.pl, greg@kroah.com, kay.sievers@suse.de
-Message-Id: <200512042313.jB4NDLLW019192@shell0.pdx.osdl.net>
-Date: Sun, 04 Dec 2005 15:13:11 -0800
+Message-ID: <20051212170344.GA24300@vrfy.org>
+Content-Disposition: inline
 
+IDE: MODALIAS support for autoloading of ide-cd, ide-disk, ...
 
-Add MODULE_ALIAS to IDE midlayer modules to autoload them depending
-on the probed media type.
+Add MODULE_ALIAS to IDE midlayer modules: ide-disk, ide-cd, ide-floppy and
+ide-tape, to autoload these modules depending on the probed media type of
+the IDE device.
+
+It is used by udev and replaces the former agent shell script of the hotplug
+package, which was required to lookup the media type in the proc filesystem.
+Using proc was racy, cause the media file is created after the hotplug event
+is sent out.
+
+The module autoloading does not take any effect, until something like the
+following udev rule is configured:
+  SUBSYSTEM=="ide",  ACTION=="add", ENV{MODALIAS}=="?*", RUN+="/sbin/modprobe $env{MODALIAS}"
+
+The module ide-scsi will not be autoloaded, cause it requires manual
+configuration. It can't be, and never was supported for automatic setup in
+the hotplug package. Adding a MODULE_ALIAS to ide-scsi for all supported
+media types, would just lead to a default blacklist entry anyway.
 
   $ modinfo ide-disk
   filename:       /lib/modules/2.6.15-rc4-g1b0997f5/kernel/drivers/ide/ide-disk.ko
@@ -17,7 +35,7 @@ on the probed media type.
   ...
 
   $ modprobe -vn ide:m-disk
-  insmod /lib/modules/2.6.15-rc4-g1b0997f5/kernel/drivers/ide/ide-disk.ko
+  insmod /lib/modules/2.6.15-rc4-g1b0997f5/kernel/drivers/ide/ide-disk.ko 
 
   $ cat /sys/bus/ide/devices/0.0/modalias
   ide:m-disk
@@ -40,93 +58,15 @@ It also adds attributes to the IDE device:
   disk
 
 Signed-off-by: Kay Sievers <kay.sievers@suse.de>
-Cc: Bartlomiej Zolnierkiewicz <B.Zolnierkiewicz@elka.pw.edu.pl>
-Signed-off-by: Andrew Morton <akpm@osdl.org>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 ---
  drivers/ide/ide-cd.c     |    1 
  drivers/ide/ide-disk.c   |    1 
  drivers/ide/ide-floppy.c |    1 
  drivers/ide/ide-tape.c   |    1 
- drivers/ide/ide.c        |   64 +++++++++++++++++++++++++++++++++++++++++++++++
- 5 files changed, 68 insertions(+)
+ drivers/ide/ide.c        |   60 +++++++++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 64 insertions(+)
 
---- gregkh-2.6.orig/drivers/ide/ide.c
-+++ gregkh-2.6/drivers/ide/ide.c
-@@ -1904,9 +1904,73 @@ static int ide_bus_match(struct device *
- 	return 1;
- }
- 
-+static char *media_string(ide_drive_t *drive)
-+{
-+	switch (drive->media) {
-+	case ide_disk:
-+		return "disk";
-+	case ide_cdrom:
-+		return "cdrom";
-+	case ide_tape:
-+		return "tape";
-+	case ide_floppy:
-+		return "floppy";
-+	default:
-+		return "UNKNOWN";
-+	}
-+}
-+
-+static ssize_t media_show(struct device *dev, struct device_attribute *attr, char *buf)
-+{
-+	ide_drive_t *drive = dev->driver_data;
-+	return sprintf(buf, "%s\n", media_string(drive));
-+}
-+
-+static ssize_t drivename_show(struct device *dev, struct device_attribute *attr, char *buf)
-+{
-+	ide_drive_t *drive = dev->driver_data;
-+	return sprintf(buf, "%s\n", drive->name);
-+}
-+
-+static ssize_t modalias_show(struct device *dev, struct device_attribute *attr, char *buf)
-+{
-+	ide_drive_t *drive = dev->driver_data;
-+	return sprintf(buf, "ide:m-%s\n", media_string(drive));
-+}
-+
-+static struct device_attribute ide_dev_attrs[] = {
-+	__ATTR_RO(media),
-+	__ATTR_RO(drivename),
-+	__ATTR_RO(modalias),
-+	__ATTR_NULL
-+};
-+
-+static int ide_uevent(struct device *dev, char **envp, int num_envp,
-+		      char *buffer, int buffer_size)
-+{
-+	ide_drive_t *drive = dev->driver_data;
-+	int i = 0;
-+	int length = 0;
-+
-+	add_uevent_var(envp, num_envp, &i, buffer, buffer_size, &length,
-+		       "MEDIA=%s", media_string(drive));
-+
-+	add_uevent_var(envp, num_envp, &i, buffer, buffer_size, &length,
-+		       "DRIVENAME=%s", drive->name);
-+
-+	add_uevent_var(envp, num_envp, &i, buffer, buffer_size, &length,
-+		       "MODALIAS=ide:m-%s",
-+		       media_string(drive));
-+
-+	envp[i] = NULL;
-+	return 0;
-+}
-+
- struct bus_type ide_bus_type = {
- 	.name		= "ide",
- 	.match		= ide_bus_match,
-+	.uevent		= ide_uevent,
-+	.dev_attrs	= ide_dev_attrs,
- 	.suspend	= generic_ide_suspend,
- 	.resume		= generic_ide_resume,
- };
 --- gregkh-2.6.orig/drivers/ide/ide-cd.c
 +++ gregkh-2.6/drivers/ide/ide-cd.c
 @@ -3516,6 +3516,7 @@ static int __init ide_cdrom_init(void)
@@ -167,3 +107,75 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  module_init(idetape_init);
  module_exit(idetape_exit);
  MODULE_ALIAS_CHARDEV_MAJOR(IDETAPE_MAJOR);
+--- gregkh-2.6.orig/drivers/ide/ide.c
++++ gregkh-2.6/drivers/ide/ide.c
+@@ -1904,9 +1904,69 @@ static int ide_bus_match(struct device *
+ 	return 1;
+ }
+ 
++static char *media_string(ide_drive_t *drive)
++{
++	switch (drive->media) {
++	case ide_disk:
++		return "disk";
++	case ide_cdrom:
++		return "cdrom";
++	case ide_tape:
++		return "tape";
++	case ide_floppy:
++		return "floppy";
++	default:
++		return "UNKNOWN";
++	}
++}
++
++static ssize_t media_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	ide_drive_t *drive = to_ide_device(dev);
++	return sprintf(buf, "%s\n", media_string(drive));
++}
++
++static ssize_t drivename_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	ide_drive_t *drive = to_ide_device(dev);
++	return sprintf(buf, "%s\n", drive->name);
++}
++
++static ssize_t modalias_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	ide_drive_t *drive = to_ide_device(dev);
++	return sprintf(buf, "ide:m-%s\n", media_string(drive));
++}
++
++static struct device_attribute ide_dev_attrs[] = {
++	__ATTR_RO(media),
++	__ATTR_RO(drivename),
++	__ATTR_RO(modalias),
++	__ATTR_NULL
++};
++
++static int ide_uevent(struct device *dev, char **envp, int num_envp,
++		      char *buffer, int buffer_size)
++{
++	ide_drive_t *drive = to_ide_device(dev);
++	int i = 0;
++	int length = 0;
++
++	add_uevent_var(envp, num_envp, &i, buffer, buffer_size, &length,
++		       "MEDIA=%s", media_string(drive));
++	add_uevent_var(envp, num_envp, &i, buffer, buffer_size, &length,
++		       "DRIVENAME=%s", drive->name);
++	add_uevent_var(envp, num_envp, &i, buffer, buffer_size, &length,
++		       "MODALIAS=ide:m-%s", media_string(drive));
++	envp[i] = NULL;
++	return 0;
++}
++
+ struct bus_type ide_bus_type = {
+ 	.name		= "ide",
+ 	.match		= ide_bus_match,
++	.uevent		= ide_uevent,
++	.dev_attrs	= ide_dev_attrs,
+ 	.suspend	= generic_ide_suspend,
+ 	.resume		= generic_ide_resume,
+ };
