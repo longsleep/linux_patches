@@ -1,0 +1,283 @@
+From foo@baz.org Thu Dec 15 13:04:03 2005
+Date: Thu, 15 Dec 2005 12:58:42 -0800
+From: Greg Kroah-Hartman <gregkh@suse.de>
+Subject: USB serial: add dynamic id support to usb-serial core
+
+This adds support for dynamic usb ids to the usb serial core.  The file
+"new_id" will show up under the usb serial driver, not the usb driver
+associated with the usb-serial driver (yeah, it can be a bit confusing
+at first glance...)
+
+This patch also modifies the USB core to allow the usb-serial core to
+reuse much of the dynamic id logic.
+
+
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+ drivers/usb/core/driver.c       |   33 ++++++++++++++++++--------------
+ drivers/usb/serial/bus.c        |   39 ++++++++++++++++++++++++++++++++++++++
+ drivers/usb/serial/usb-serial.c |   41 +++++++++++++++++++++++++++++++++++-----
+ drivers/usb/serial/usb-serial.h |    1 
+ include/linux/usb.h             |   13 ++++++++++++
+ 5 files changed, 108 insertions(+), 19 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/core/driver.c	2005-12-15 12:47:23.000000000 -0800
++++ gregkh-2.6/drivers/usb/core/driver.c	2005-12-15 16:47:23.000000000 -0800
+@@ -30,12 +30,6 @@
+ static int usb_match_one_id(struct usb_interface *interface,
+ 			    const struct usb_device_id *id);
+ 
+-struct usb_dynid {
+-	struct list_head node;
+-	struct usb_device_id id;
+-};
+-
+-
+ static int generic_probe(struct device *dev)
+ {
+ 	return 0;
+@@ -73,10 +67,10 @@
+  * Adds a new dynamic USBdevice ID to this driver,
+  * and cause the driver to probe for all devices again.
+  */
+-static ssize_t store_new_id(struct device_driver *driver,
+-			    const char *buf, size_t count)
++ssize_t usb_store_new_id(struct usb_dynids *dynids,
++			 struct device_driver *driver,
++			 const char *buf, size_t count)
+ {
+-	struct usb_driver *usb_drv = to_usb_driver(driver);
+ 	struct usb_dynid *dynid;
+ 	u32 idVendor = 0;
+ 	u32 idProduct = 0;
+@@ -95,9 +89,9 @@
+ 	dynid->id.idProduct = idProduct;
+ 	dynid->id.match_flags = USB_DEVICE_ID_MATCH_DEVICE;
+ 
+-	spin_lock(&usb_drv->dynids.lock);
+-	list_add_tail(&usb_drv->dynids.list, &dynid->node);
+-	spin_unlock(&usb_drv->dynids.lock);
++	spin_lock(&dynids->lock);
++	list_add_tail(&dynids->list, &dynid->node);
++	spin_unlock(&dynids->lock);
+ 
+ 	if (get_driver(driver)) {
+ 		driver_attach(driver);
+@@ -106,6 +100,15 @@
+ 
+ 	return count;
+ }
++EXPORT_SYMBOL_GPL(usb_store_new_id);
++
++static ssize_t store_new_id(struct device_driver *driver,
++			    const char *buf, size_t count)
++{
++	struct usb_driver *usb_drv = to_usb_driver(driver);
++
++	return usb_store_new_id(&usb_drv->dynids, driver, buf, count);
++}
+ static DRIVER_ATTR(new_id, S_IWUSR, NULL, store_new_id);
+ 
+ static int usb_create_newid_file(struct usb_driver *usb_drv)
+@@ -240,8 +243,8 @@
+ }
+ 
+ /* returns 0 if no match, 1 if match */
+-static int usb_match_one_id(struct usb_interface *interface,
+-			    const struct usb_device_id *id)
++int usb_match_one_id(struct usb_interface *interface,
++		     const struct usb_device_id *id)
+ {
+ 	struct usb_host_interface *intf;
+ 	struct usb_device *dev;
+@@ -297,6 +300,8 @@
+ 
+ 	return 1;
+ }
++EXPORT_SYMBOL(usb_match_one_id);
++
+ /**
+  * usb_match_id - find first usb_device_id matching device or interface
+  * @interface: the interface of interest
+--- gregkh-2.6.orig/include/linux/usb.h	2005-12-15 12:47:23.000000000 -0800
++++ gregkh-2.6/include/linux/usb.h	2005-12-15 16:47:47.000000000 -0800
+@@ -417,6 +417,8 @@
+ 			struct usb_interface *iface);
+ const struct usb_device_id *usb_match_id(struct usb_interface *interface,
+ 					 const struct usb_device_id *id);
++extern int usb_match_one_id(struct usb_interface *interface,
++			    const struct usb_device_id *id);
+ 
+ extern struct usb_interface *usb_find_interface(struct usb_driver *drv,
+ 		int minor);
+@@ -531,11 +533,21 @@
+ 
+ /* ----------------------------------------------------------------------- */
+ 
++/* Stuff for dynamic usb ids */
+ struct usb_dynids {
+ 	spinlock_t lock;
+ 	struct list_head list;
+ };
+ 
++struct usb_dynid {
++	struct list_head node;
++	struct usb_device_id id;
++};
++
++extern ssize_t usb_store_new_id(struct usb_dynids *dynids,
++				struct device_driver *driver,
++				const char *buf, size_t count);
++
+ /**
+  * struct usb_driver - identifies USB driver to usbcore
+  * @name: The driver name should be unique among USB drivers,
+@@ -1190,6 +1202,7 @@
+ extern void usb_register_notify(struct notifier_block *nb);
+ extern void usb_unregister_notify(struct notifier_block *nb);
+ 
++
+ #ifdef DEBUG
+ #define dbg(format, arg...) printk(KERN_DEBUG "%s: " format "\n" , \
+ 	__FILE__ , ## arg)
+--- gregkh-2.6.orig/drivers/usb/serial/usb-serial.h	2005-12-15 12:47:24.000000000 -0800
++++ gregkh-2.6/drivers/usb/serial/usb-serial.h	2005-12-15 14:53:38.000000000 -0800
+@@ -203,6 +203,7 @@
+ 
+ 	struct list_head	driver_list;
+ 	struct device_driver	driver;
++        struct usb_dynids	dynids;
+ 
+ 	int (*probe) (struct usb_serial *serial, const struct usb_device_id *id);
+ 	int (*attach) (struct usb_serial *serial);
+--- gregkh-2.6.orig/drivers/usb/serial/bus.c	2005-12-06 10:43:35.000000000 -0800
++++ gregkh-2.6/drivers/usb/serial/bus.c	2005-12-15 17:13:28.000000000 -0800
+@@ -37,9 +37,45 @@
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_HOTPLUG
++static ssize_t store_new_id(struct device_driver *driver,
++			    const char *buf, size_t count)
++{
++	struct usb_driver *usb_drv = to_usb_driver(driver);
++
++	return usb_store_new_id(&usb_drv->dynids, driver, buf, count);
++}
++
++static struct driver_attribute drv_attrs[] = {
++	__ATTR(new_id, S_IWUSR, NULL, store_new_id),
++	__ATTR_NULL,
++};
++
++static void free_dynids(struct usb_serial_driver *drv)
++{
++	struct usb_dynid *dynid, *n;
++
++	spin_lock(&drv->dynids.lock);
++	list_for_each_entry_safe(dynid, n, &drv->dynids.list, node) {
++		list_del(&dynid->node);
++		kfree(dynid);
++	}
++	spin_unlock(&drv->dynids.lock);
++}
++
++#else
++static struct driver_attribute drv_attrs[] = {
++	__ATTR_NULL,
++};
++static inline void free_dynids(struct usb_driver *drv)
++{
++}
++#endif
++
+ struct bus_type usb_serial_bus_type = {
+ 	.name =		"usb-serial",
+ 	.match =	usb_serial_device_match,
++	.drv_attrs = 	drv_attrs,
+ };
+ 
+ static int usb_serial_device_probe (struct device *dev)
+@@ -116,6 +152,8 @@
+ 	driver->driver.bus = &usb_serial_bus_type;
+ 	driver->driver.probe = usb_serial_device_probe;
+ 	driver->driver.remove = usb_serial_device_remove;
++	spin_lock_init(&driver->dynids.lock);
++	INIT_LIST_HEAD(&driver->dynids.list);
+ 
+ 	retval = driver_register(&driver->driver);
+ 
+@@ -124,6 +162,7 @@
+ 
+ void usb_serial_bus_deregister(struct usb_serial_driver *driver)
+ {
++	free_dynids(driver);
+ 	driver_unregister(&driver->driver);
+ }
+ 
+--- gregkh-2.6.orig/drivers/usb/serial/usb-serial.c	2005-12-15 12:47:38.000000000 -0800
++++ gregkh-2.6/drivers/usb/serial/usb-serial.c	2005-12-15 16:59:57.000000000 -0800
+@@ -578,6 +578,39 @@
+ 	return serial;
+ }
+ 
++static const struct usb_device_id *match_dynamic_id(struct usb_interface *intf,
++						    struct usb_serial_driver *drv)
++{
++	struct usb_dynid *dynid;
++
++	spin_lock(&drv->dynids.lock);
++	list_for_each_entry(dynid, &drv->dynids.list, node) {
++		if (usb_match_one_id(intf, &dynid->id)) {
++			spin_unlock(&drv->dynids.lock);
++			return &dynid->id;
++		}
++	}
++	spin_unlock(&drv->dynids.lock);
++	return NULL;
++}
++
++static const struct usb_device_id *get_iface_id(struct usb_serial_driver *drv,
++						struct usb_interface *intf)
++{
++	const struct usb_device_id *id;
++
++	id = usb_match_id(intf, drv->id_table);
++	if (id) {
++		dbg("static descriptor matches");
++		goto exit;
++	}
++	id = match_dynamic_id(intf, drv);
++	if (id)
++		dbg("dynamic descriptor matches");
++exit:
++	return id;
++}
++
+ static struct usb_serial_driver *search_serial_device(struct usb_interface *iface)
+ {
+ 	struct list_head *p;
+@@ -587,11 +620,9 @@
+ 	/* List trough know devices and see if the usb id matches */
+ 	list_for_each(p, &usb_serial_driver_list) {
+ 		t = list_entry(p, struct usb_serial_driver, driver_list);
+-		id = usb_match_id(iface, t->id_table);
+-		if (id != NULL) {
+-			dbg("descriptor matches");
++		id = get_iface_id(t, iface);
++		if (id)
+ 			return t;
+-		}
+ 	}
+ 
+ 	return NULL;
+@@ -643,7 +674,7 @@
+ 			return -EIO;
+ 		}
+ 
+-		id = usb_match_id(interface, type->id_table);
++		id = get_iface_id(type, interface);
+ 		retval = type->probe(serial, id);
+ 		module_put(type->driver.owner);
+ 
