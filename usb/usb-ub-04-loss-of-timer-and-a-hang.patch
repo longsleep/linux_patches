@@ -1,0 +1,56 @@
+From zaitcev@redhat.com Thu Jan  5 00:17:16 2006
+Date: Thu, 5 Jan 2006 00:14:02 -0800
+From: Pete Zaitcev <zaitcev@redhat.com>
+To: greg@kroah.com
+Subject: USB: ub 04 Loss of timer and a hang
+Message-Id: <20060105001402.0a1f019d.zaitcev@redhat.com>
+
+If SCSI commands are submitted while other commands are still processed,
+the dispatch loop turns, and we stop the work_timer. Then, if URB fails
+to complete, ub hangs until the device is unplugged.
+
+This does not happen often, becase we only allow one SCSI command per
+block device, but does happen (on multi-LUN devices, for example).
+
+The fix is to stop timer only when we actually going to change the state.
+
+The nicest code would be to have the timer stopped in URB callback, but
+this is impossible, because it can be called from inside a timer, through
+the urb_unlink. Then we get BUG in timer.c:cascade(). So, we do it a
+little dirtier.
+
+Signed-off-by: Pete Zaitcev <zaitcev@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/block/ub.c |    5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+--- gregkh-2.6.orig/drivers/block/ub.c
++++ gregkh-2.6/drivers/block/ub.c
+@@ -1106,7 +1106,8 @@ static void ub_urb_timeout(unsigned long
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(sc->lock, flags);
+-	usb_unlink_urb(&sc->work_urb);
++	if (!ub_is_completed(&sc->work_done))
++		usb_unlink_urb(&sc->work_urb);
+ 	spin_unlock_irqrestore(sc->lock, flags);
+ }
+ 
+@@ -1131,7 +1132,6 @@ static void ub_scsi_action(unsigned long
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(sc->lock, flags);
+-	del_timer(&sc->work_timer);
+ 	ub_scsi_dispatch(sc);
+ 	spin_unlock_irqrestore(sc->lock, flags);
+ }
+@@ -1155,6 +1155,7 @@ static void ub_scsi_dispatch(struct ub_d
+ 		} else {
+ 			if (!ub_is_completed(&sc->work_done))
+ 				break;
++			del_timer(&sc->work_timer);
+ 			ub_scsi_urb_compl(sc, cmd);
+ 		}
+ 	}
