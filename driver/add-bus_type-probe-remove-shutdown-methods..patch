@@ -1,0 +1,95 @@
+From rmk+greg=kroah.com@arm.linux.org.uk Thu Jan  5 06:31:35 2006
+From: Russell King <rmk@arm.linux.org.uk>
+CC: Greg K-H <greg@kroah.com>
+Subject: [CFT 1/29] Add bus_type probe, remove, shutdown methods.
+Date: Thu, 05 Jan 2006 14:29:51 +0000
+Message-ID: <20060105142951.13.01@flint.arm.linux.org.uk>
+
+Add bus_type probe, remove and shutdown methods to replace the
+corresponding methods in struct device_driver.  This matches
+the way we handle the suspend/resume methods.
+
+Since the bus methods override the device_driver methods, warn
+if a device driver is registered whose methods will not be
+called.
+
+The long-term idea is to remove the device_driver methods entirely.
+
+Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/base/dd.c             |   12 ++++++++++--
+ drivers/base/driver.c         |    5 +++++
+ drivers/base/power/shutdown.c |    5 ++++-
+ include/linux/device.h        |    3 +++
+ 4 files changed, 22 insertions(+), 3 deletions(-)
+
+--- gregkh-2.6.orig/drivers/base/dd.c
++++ gregkh-2.6/drivers/base/dd.c
+@@ -78,7 +78,13 @@ int driver_probe_device(struct device_dr
+ 	pr_debug("%s: Matched Device %s with Driver %s\n",
+ 		 drv->bus->name, dev->bus_id, drv->name);
+ 	dev->driver = drv;
+-	if (drv->probe) {
++	if (dev->bus->probe) {
++		ret = dev->bus->probe(dev);
++		if (ret) {
++			dev->driver = NULL;
++			goto ProbeFailed;
++		}
++	} else if (drv->probe) {
+ 		ret = drv->probe(dev);
+ 		if (ret) {
+ 			dev->driver = NULL;
+@@ -203,7 +209,9 @@ static void __device_release_driver(stru
+ 		sysfs_remove_link(&dev->kobj, "driver");
+ 		klist_remove(&dev->knode_driver);
+ 
+-		if (drv->remove)
++		if (dev->bus->remove)
++			dev->bus->remove(dev);
++		else if (drv->remove)
+ 			drv->remove(dev);
+ 		dev->driver = NULL;
+ 		put_driver(drv);
+--- gregkh-2.6.orig/drivers/base/driver.c
++++ gregkh-2.6/drivers/base/driver.c
+@@ -171,6 +171,11 @@ static void klist_devices_put(struct kli
+  */
+ int driver_register(struct device_driver * drv)
+ {
++	if ((drv->bus->probe && drv->probe) ||
++	    (drv->bus->remove && drv->remove) ||
++	    (drv->bus->shutdown && drv->shutdown)) {
++		printk(KERN_WARNING "Driver '%s' needs updating - please use bus_type methods\n", drv->name);
++	}
+ 	klist_init(&drv->klist_devices, klist_devices_get, klist_devices_put);
+ 	init_completion(&drv->unloaded);
+ 	return bus_add_driver(drv);
+--- gregkh-2.6.orig/drivers/base/power/shutdown.c
++++ gregkh-2.6/drivers/base/power/shutdown.c
+@@ -40,7 +40,10 @@ void device_shutdown(void)
+ 	down_write(&devices_subsys.rwsem);
+ 	list_for_each_entry_reverse(dev, &devices_subsys.kset.list,
+ 				kobj.entry) {
+-		if (dev->driver && dev->driver->shutdown) {
++		if (dev->bus && dev->bus->shutdown) {
++			dev_dbg(dev, "shutdown\n");
++			dev->bus->shutdown(dev);
++		} else if (dev->driver && dev->driver->shutdown) {
+ 			dev_dbg(dev, "shutdown\n");
+ 			dev->driver->shutdown(dev);
+ 		}
+--- gregkh-2.6.orig/include/linux/device.h
++++ gregkh-2.6/include/linux/device.h
+@@ -49,6 +49,9 @@ struct bus_type {
+ 	int		(*match)(struct device * dev, struct device_driver * drv);
+ 	int		(*uevent)(struct device *dev, char **envp,
+ 				  int num_envp, char *buffer, int buffer_size);
++	int		(*probe)(struct device * dev);
++	int		(*remove)(struct device * dev);
++	void		(*shutdown)(struct device * dev);
+ 	int		(*suspend)(struct device * dev, pm_message_t state);
+ 	int		(*resume)(struct device * dev);
+ };
