@@ -1,0 +1,3452 @@
+From SRS0+792853cd028d39ab690f+871+infradead.org+arjan@pentafluge.srs.infradead.org  Wed Jan 11 13:33:30 2006
+From: Arjan van de Ven <arjan@infradead.org>
+Subject: USB: convert a bunch of USB semaphores to mutexes
+To: <greg@kroah.com>
+Cc: <mingo@elte.hu>
+Date: Wed, 11 Jan 2006 15:55:29 +0100
+Message-Id: <1136991329.2929.57.camel@laptopd505.fenrus.org>
+
+the patch below converts a bunch of semaphores-used-as-mutex in the USB
+code to mutexes
+
+
+Signed-off-by: Arjan van de Ven <arjan@infradead.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/atm/cxacru.c         |    8 +-
+ drivers/usb/atm/ueagle-atm.c     |   27 +++---
+ drivers/usb/atm/usbatm.c         |   24 +++---
+ drivers/usb/atm/usbatm.h         |    3 
+ drivers/usb/class/cdc-acm.c      |   23 +++--
+ drivers/usb/class/usblp.c        |   15 ++-
+ drivers/usb/core/devices.c       |    7 +
+ drivers/usb/core/hcd.c           |   25 +++---
+ drivers/usb/core/hcd.h           |    2 
+ drivers/usb/core/hub.c           |    7 +
+ drivers/usb/core/notify.c        |   15 ++-
+ drivers/usb/core/usb.c           |    5 -
+ drivers/usb/image/mdc800.c       |   63 ++++++++-------
+ drivers/usb/input/ati_remote.c   |    2 
+ drivers/usb/media/dabusb.c       |   31 ++++---
+ drivers/usb/media/dabusb.h       |    2 
+ drivers/usb/media/ov511.c        |   91 +++++++++++-----------
+ drivers/usb/media/ov511.h        |   11 +-
+ drivers/usb/media/se401.c        |   12 +--
+ drivers/usb/media/se401.h        |    3 
+ drivers/usb/media/sn9c102.h      |    5 -
+ drivers/usb/media/sn9c102_core.c |  156 +++++++++++++++++++--------------------
+ drivers/usb/media/stv680.c       |   13 +--
+ drivers/usb/media/stv680.h       |    2 
+ drivers/usb/media/usbvideo.c     |   28 +++----
+ drivers/usb/media/usbvideo.h     |    5 -
+ drivers/usb/media/vicam.c        |   21 ++---
+ drivers/usb/media/w9968cf.c      |   68 ++++++++---------
+ drivers/usb/media/w9968cf.h      |    6 -
+ drivers/usb/misc/idmouse.c       |   25 +++---
+ drivers/usb/misc/ldusb.c         |   11 +-
+ drivers/usb/misc/legousbtower.c  |   11 +-
+ drivers/usb/mon/mon_main.c       |   19 ++--
+ drivers/usb/mon/mon_text.c       |   21 ++---
+ drivers/usb/mon/usb_mon.h        |    2 
+ drivers/usb/serial/pl2303.c      |    2 
+ drivers/usb/storage/scsiglue.c   |    9 +-
+ drivers/usb/storage/usb.c        |   25 +++---
+ drivers/usb/storage/usb.h        |    5 -
+ 39 files changed, 414 insertions(+), 396 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/class/cdc-acm.c
++++ gregkh-2.6/drivers/usb/class/cdc-acm.c
+@@ -60,6 +60,7 @@
+ #include <linux/tty_flip.h>
+ #include <linux/module.h>
+ #include <linux/smp_lock.h>
++#include <linux/mutex.h>
+ #include <asm/uaccess.h>
+ #include <linux/usb.h>
+ #include <linux/usb_cdc.h>
+@@ -80,7 +81,7 @@ static struct usb_driver acm_driver;
+ static struct tty_driver *acm_tty_driver;
+ static struct acm *acm_table[ACM_TTY_MINORS];
+ 
+-static DECLARE_MUTEX(open_sem);
++static DEFINE_MUTEX(open_mutex);
+ 
+ #define ACM_READY(acm)	(acm && acm->dev && acm->used)
+ 
+@@ -431,8 +432,8 @@ static int acm_tty_open(struct tty_struc
+ 	int rv = -EINVAL;
+ 	int i;
+ 	dbg("Entering acm_tty_open.\n");
+-	
+-	down(&open_sem);
++
++	mutex_lock(&open_mutex);
+ 
+ 	acm = acm_table[tty->index];
+ 	if (!acm || !acm->dev)
+@@ -474,14 +475,14 @@ static int acm_tty_open(struct tty_struc
+ 
+ done:
+ err_out:
+-	up(&open_sem);
++	mutex_unlock(&open_mutex);
+ 	return rv;
+ 
+ full_bailout:
+ 	usb_kill_urb(acm->ctrlurb);
+ bail_out:
+ 	acm->used--;
+-	up(&open_sem);
++	mutex_unlock(&open_mutex);
+ 	return -EIO;
+ }
+ 
+@@ -507,7 +508,7 @@ static void acm_tty_close(struct tty_str
+ 	if (!acm || !acm->used)
+ 		return;
+ 
+-	down(&open_sem);
++	mutex_lock(&open_mutex);
+ 	if (!--acm->used) {
+ 		if (acm->dev) {
+ 			acm_set_control(acm, acm->ctrlout = 0);
+@@ -518,7 +519,7 @@ static void acm_tty_close(struct tty_str
+ 		} else
+ 			acm_tty_unregister(acm);
+ 	}
+-	up(&open_sem);
++	mutex_unlock(&open_mutex);
+ }
+ 
+ static int acm_tty_write(struct tty_struct *tty, const unsigned char *buf, int count)
+@@ -1013,9 +1014,9 @@ static void acm_disconnect(struct usb_in
+ 		return;
+ 	}
+ 
+-	down(&open_sem);
++	mutex_lock(&open_mutex);
+ 	if (!usb_get_intfdata(intf)) {
+-		up(&open_sem);
++		mutex_unlock(&open_mutex);
+ 		return;
+ 	}
+ 	acm->dev = NULL;
+@@ -1045,11 +1046,11 @@ static void acm_disconnect(struct usb_in
+ 
+ 	if (!acm->used) {
+ 		acm_tty_unregister(acm);
+-		up(&open_sem);
++		mutex_unlock(&open_mutex);
+ 		return;
+ 	}
+ 
+-	up(&open_sem);
++	mutex_unlock(&open_mutex);
+ 
+ 	if (acm->tty)
+ 		tty_hangup(acm->tty);
+--- gregkh-2.6.orig/drivers/usb/class/usblp.c
++++ gregkh-2.6/drivers/usb/class/usblp.c
+@@ -55,6 +55,7 @@
+ #include <linux/init.h>
+ #include <linux/slab.h>
+ #include <linux/lp.h>
++#include <linux/mutex.h>
+ #undef DEBUG
+ #include <linux/usb.h>
+ 
+@@ -223,7 +224,7 @@ static int usblp_cache_device_id_string(
+ 
+ /* forward reference to make our lives easier */
+ static struct usb_driver usblp_driver;
+-static DECLARE_MUTEX(usblp_sem);	/* locks the existence of usblp's */
++static DEFINE_MUTEX(usblp_mutex);	/* locks the existence of usblp's */
+ 
+ /*
+  * Functions for usblp control messages.
+@@ -351,7 +352,7 @@ static int usblp_open(struct inode *inod
+ 	if (minor < 0)
+ 		return -ENODEV;
+ 
+-	down (&usblp_sem);
++	mutex_lock (&usblp_mutex);
+ 
+ 	retval = -ENODEV;
+ 	intf = usb_find_interface(&usblp_driver, minor);
+@@ -399,7 +400,7 @@ static int usblp_open(struct inode *inod
+ 		}
+ 	}
+ out:
+-	up (&usblp_sem);
++	mutex_unlock (&usblp_mutex);
+ 	return retval;
+ }
+ 
+@@ -425,13 +426,13 @@ static int usblp_release(struct inode *i
+ {
+ 	struct usblp *usblp = file->private_data;
+ 
+-	down (&usblp_sem);
++	mutex_lock (&usblp_mutex);
+ 	usblp->used = 0;
+ 	if (usblp->present) {
+ 		usblp_unlink_urbs(usblp);
+ 	} else 		/* finish cleanup from disconnect */
+ 		usblp_cleanup (usblp);
+-	up (&usblp_sem);
++	mutex_unlock (&usblp_mutex);
+ 	return 0;
+ }
+ 
+@@ -1152,7 +1153,7 @@ static void usblp_disconnect(struct usb_
+ 
+ 	device_remove_file(&intf->dev, &dev_attr_ieee1284_id);
+ 
+-	down (&usblp_sem);
++	mutex_lock (&usblp_mutex);
+ 	down (&usblp->sem);
+ 	usblp->present = 0;
+ 	usb_set_intfdata (intf, NULL);
+@@ -1166,7 +1167,7 @@ static void usblp_disconnect(struct usb_
+ 
+ 	if (!usblp->used)
+ 		usblp_cleanup (usblp);
+-	up (&usblp_sem);
++	mutex_unlock (&usblp_mutex);
+ }
+ 
+ static struct usb_device_id usblp_ids [] = {
+--- gregkh-2.6.orig/drivers/usb/core/hub.c
++++ gregkh-2.6/drivers/usb/core/hub.c
+@@ -22,6 +22,7 @@
+ #include <linux/usb.h>
+ #include <linux/usbdevice_fs.h>
+ #include <linux/kthread.h>
++#include <linux/mutex.h>
+ 
+ #include <asm/semaphore.h>
+ #include <asm/uaccess.h>
+@@ -2162,7 +2163,7 @@ static int
+ hub_port_init (struct usb_hub *hub, struct usb_device *udev, int port1,
+ 		int retry_counter)
+ {
+-	static DECLARE_MUTEX(usb_address0_sem);
++	static DEFINE_MUTEX(usb_address0_mutex);
+ 
+ 	struct usb_device	*hdev = hub->hdev;
+ 	int			i, j, retval;
+@@ -2183,7 +2184,7 @@ hub_port_init (struct usb_hub *hub, stru
+ 	if (oldspeed == USB_SPEED_LOW)
+ 		delay = HUB_LONG_RESET_TIME;
+ 
+-	down(&usb_address0_sem);
++	mutex_lock(&usb_address0_mutex);
+ 
+ 	/* Reset the device; full speed may morph to high speed */
+ 	retval = hub_port_reset(hub, port1, udev, delay);
+@@ -2381,7 +2382,7 @@ hub_port_init (struct usb_hub *hub, stru
+ fail:
+ 	if (retval)
+ 		hub_port_disable(hub, port1, 0);
+-	up(&usb_address0_sem);
++	mutex_unlock(&usb_address0_mutex);
+ 	return retval;
+ }
+ 
+--- gregkh-2.6.orig/drivers/usb/core/notify.c
++++ gregkh-2.6/drivers/usb/core/notify.c
+@@ -13,16 +13,17 @@
+ #include <linux/kernel.h>
+ #include <linux/notifier.h>
+ #include <linux/usb.h>
++#include <linux/mutex.h>
+ #include "usb.h"
+ 
+ 
+ static struct notifier_block *usb_notifier_list;
+-static DECLARE_MUTEX(usb_notifier_lock);
++static DEFINE_MUTEX(usb_notifier_lock);
+ 
+ static void usb_notifier_chain_register(struct notifier_block **list,
+ 					struct notifier_block *n)
+ {
+-	down(&usb_notifier_lock);
++	mutex_lock(&usb_notifier_lock);
+ 	while (*list) {
+ 		if (n->priority > (*list)->priority)
+ 			break;
+@@ -30,13 +31,13 @@ static void usb_notifier_chain_register(
+ 	}
+ 	n->next = *list;
+ 	*list = n;
+-	up(&usb_notifier_lock);
++	mutex_unlock(&usb_notifier_lock);
+ }
+ 
+ static void usb_notifier_chain_unregister(struct notifier_block **nl,
+ 				   struct notifier_block *n)
+ {
+-	down(&usb_notifier_lock);
++	mutex_lock(&usb_notifier_lock);
+ 	while ((*nl)!=NULL) {
+ 		if ((*nl)==n) {
+ 			*nl = n->next;
+@@ -45,7 +46,7 @@ static void usb_notifier_chain_unregiste
+ 		nl=&((*nl)->next);
+ 	}
+ exit:
+-	up(&usb_notifier_lock);
++	mutex_unlock(&usb_notifier_lock);
+ }
+ 
+ static int usb_notifier_call_chain(struct notifier_block **n,
+@@ -54,7 +55,7 @@ static int usb_notifier_call_chain(struc
+ 	int ret=NOTIFY_DONE;
+ 	struct notifier_block *nb = *n;
+ 
+-	down(&usb_notifier_lock);
++	mutex_lock(&usb_notifier_lock);
+ 	while (nb) {
+ 		ret = nb->notifier_call(nb,val,v);
+ 		if (ret&NOTIFY_STOP_MASK) {
+@@ -63,7 +64,7 @@ static int usb_notifier_call_chain(struc
+ 		nb = nb->next;
+ 	}
+ exit:
+-	up(&usb_notifier_lock);
++	mutex_unlock(&usb_notifier_lock);
+ 	return ret;
+ }
+ 
+--- gregkh-2.6.orig/drivers/usb/input/ati_remote.c
++++ gregkh-2.6/drivers/usb/input/ati_remote.c
+@@ -159,8 +159,6 @@ static const char accel[] = { 1, 2, 4, 6
+  */
+ #define FILTER_TIME (HZ / 20)
+ 
+-static DECLARE_MUTEX(disconnect_sem);
+-
+ struct ati_remote {
+ 	struct input_dev *idev;
+ 	struct usb_device *udev;
+--- gregkh-2.6.orig/drivers/usb/misc/idmouse.c
++++ gregkh-2.6/drivers/usb/misc/idmouse.c
+@@ -25,6 +25,7 @@
+ #include <linux/module.h>
+ #include <linux/smp_lock.h>
+ #include <linux/completion.h>
++#include <linux/mutex.h>
+ #include <asm/uaccess.h>
+ #include <linux/usb.h>
+ 
+@@ -121,7 +122,7 @@ static struct usb_driver idmouse_driver 
+ };
+ 
+ /* prevent races between open() and disconnect() */
+-static DECLARE_MUTEX(disconnect_sem);
++static DEFINE_MUTEX(disconnect_mutex);
+ 
+ static int idmouse_create_image(struct usb_idmouse *dev)
+ {
+@@ -213,18 +214,18 @@ static int idmouse_open(struct inode *in
+ 	int result = 0;
+ 
+ 	/* prevent disconnects */
+-	down(&disconnect_sem);
++	mutex_lock(&disconnect_mutex);
+ 
+ 	/* get the interface from minor number and driver information */
+ 	interface = usb_find_interface (&idmouse_driver, iminor (inode));
+ 	if (!interface) {
+-		up(&disconnect_sem);
++		mutex_unlock(&disconnect_mutex);
+ 		return -ENODEV;
+ 	}
+ 	/* get the device information block from the interface */
+ 	dev = usb_get_intfdata(interface);
+ 	if (!dev) {
+-		up(&disconnect_sem);
++		mutex_unlock(&disconnect_mutex);
+ 		return -ENODEV;
+ 	}
+ 
+@@ -258,7 +259,7 @@ error:
+ 	up(&dev->sem);
+ 
+ 	/* unlock the disconnect semaphore */
+-	up(&disconnect_sem);
++	mutex_unlock(&disconnect_mutex);
+ 	return result;
+ }
+ 
+@@ -267,12 +268,12 @@ static int idmouse_release(struct inode 
+ 	struct usb_idmouse *dev;
+ 
+ 	/* prevent a race condition with open() */
+-	down(&disconnect_sem);
++	mutex_lock(&disconnect_mutex);
+ 
+ 	dev = (struct usb_idmouse *) file->private_data;
+ 
+ 	if (dev == NULL) {
+-		up(&disconnect_sem);
++		mutex_unlock(&disconnect_mutex);
+ 		return -ENODEV;
+ 	}
+ 
+@@ -282,7 +283,7 @@ static int idmouse_release(struct inode 
+ 	/* are we really open? */
+ 	if (dev->open <= 0) {
+ 		up(&dev->sem);
+-		up(&disconnect_sem);
++		mutex_unlock(&disconnect_mutex);
+ 		return -ENODEV;
+ 	}
+ 
+@@ -292,12 +293,12 @@ static int idmouse_release(struct inode 
+ 		/* the device was unplugged before the file was released */
+ 		up(&dev->sem);
+ 		idmouse_delete(dev);
+-		up(&disconnect_sem);
++		mutex_unlock(&disconnect_mutex);
+ 		return 0;
+ 	}
+ 
+ 	up(&dev->sem);
+-	up(&disconnect_sem);
++	mutex_unlock(&disconnect_mutex);
+ 	return 0;
+ }
+ 
+@@ -399,7 +400,7 @@ static void idmouse_disconnect(struct us
+ 	struct usb_idmouse *dev;
+ 
+ 	/* prevent races with open() */
+-	down(&disconnect_sem);
++	mutex_lock(&disconnect_mutex);
+ 
+ 	/* get device structure */
+ 	dev = usb_get_intfdata(interface);
+@@ -421,7 +422,7 @@ static void idmouse_disconnect(struct us
+ 	if (!dev->open)
+ 		idmouse_delete(dev);
+ 
+-	up(&disconnect_sem);
++	mutex_unlock(&disconnect_mutex);
+ 
+ 	info("%s disconnected", DRIVER_DESC);
+ }
+--- gregkh-2.6.orig/drivers/usb/misc/ldusb.c
++++ gregkh-2.6/drivers/usb/misc/ldusb.c
+@@ -32,6 +32,7 @@
+ #include <linux/init.h>
+ #include <linux/slab.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ 
+ #include <asm/uaccess.h>
+ #include <linux/input.h>
+@@ -165,7 +166,7 @@ struct ld_usb {
+ };
+ 
+ /* prevent races between open() and disconnect() */
+-static DECLARE_MUTEX(disconnect_sem);
++static DEFINE_MUTEX(disconnect_mutex);
+ 
+ static struct usb_driver ld_usb_driver;
+ 
+@@ -286,7 +287,7 @@ static int ld_usb_open(struct inode *ino
+ 	nonseekable_open(inode, file);
+ 	subminor = iminor(inode);
+ 
+-	down(&disconnect_sem);
++	mutex_lock(&disconnect_mutex);
+ 
+ 	interface = usb_find_interface(&ld_usb_driver, subminor);
+ 
+@@ -348,7 +349,7 @@ unlock_exit:
+ 	up(&dev->sem);
+ 
+ unlock_disconnect_exit:
+-	up(&disconnect_sem);
++	mutex_unlock(&disconnect_mutex);
+ 
+ 	return retval;
+ }
+@@ -733,7 +734,7 @@ static void ld_usb_disconnect(struct usb
+ 	struct ld_usb *dev;
+ 	int minor;
+ 
+-	down(&disconnect_sem);
++	mutex_lock(&disconnect_mutex);
+ 
+ 	dev = usb_get_intfdata(intf);
+ 	usb_set_intfdata(intf, NULL);
+@@ -754,7 +755,7 @@ static void ld_usb_disconnect(struct usb
+ 		up(&dev->sem);
+ 	}
+ 
+-	up(&disconnect_sem);
++	mutex_unlock(&disconnect_mutex);
+ 
+ 	dev_info(&intf->dev, "LD USB Device #%d now disconnected\n",
+ 		 (minor - USB_LD_MINOR_BASE));
+--- gregkh-2.6.orig/drivers/usb/misc/legousbtower.c
++++ gregkh-2.6/drivers/usb/misc/legousbtower.c
+@@ -83,6 +83,7 @@
+ #include <linux/module.h>
+ #include <linux/smp_lock.h>
+ #include <linux/completion.h>
++#include <linux/mutex.h>
+ #include <asm/uaccess.h>
+ #include <linux/usb.h>
+ #include <linux/poll.h>
+@@ -256,7 +257,7 @@ static void tower_disconnect	(struct usb
+ 
+ 
+ /* prevent races between open() and disconnect */
+-static DECLARE_MUTEX (disconnect_sem);
++static DEFINE_MUTEX (disconnect_mutex);
+ 
+ /* file operations needed when we register this driver */
+ static struct file_operations tower_fops = {
+@@ -349,7 +350,7 @@ static int tower_open (struct inode *ino
+ 	nonseekable_open(inode, file);
+ 	subminor = iminor(inode);
+ 
+-	down (&disconnect_sem);
++	mutex_lock (&disconnect_mutex);
+ 
+ 	interface = usb_find_interface (&tower_driver, subminor);
+ 
+@@ -427,7 +428,7 @@ unlock_exit:
+ 	up (&dev->sem);
+ 
+ unlock_disconnect_exit:
+-	up (&disconnect_sem);
++	mutex_unlock (&disconnect_mutex);
+ 
+ 	dbg(2, "%s: leave, return value %d ", __FUNCTION__, retval);
+ 
+@@ -1005,7 +1006,7 @@ static void tower_disconnect (struct usb
+ 
+ 	dbg(2, "%s: enter", __FUNCTION__);
+ 
+-	down (&disconnect_sem);
++	mutex_lock (&disconnect_mutex);
+ 
+ 	dev = usb_get_intfdata (interface);
+ 	usb_set_intfdata (interface, NULL);
+@@ -1027,7 +1028,7 @@ static void tower_disconnect (struct usb
+ 		up (&dev->sem);
+ 	}
+ 
+-	up (&disconnect_sem);
++	mutex_unlock (&disconnect_mutex);
+ 
+ 	info("LEGO USB Tower #%d now disconnected", (minor - LEGO_USB_TOWER_MINOR_BASE));
+ 
+--- gregkh-2.6.orig/drivers/usb/serial/pl2303.c
++++ gregkh-2.6/drivers/usb/serial/pl2303.c
+@@ -43,8 +43,6 @@ static int debug;
+ #define PL2303_BUF_SIZE		1024
+ #define PL2303_TMP_BUF_SIZE	1024
+ 
+-static DECLARE_MUTEX(pl2303_tmp_buf_sem);
+-
+ struct pl2303_buf {
+ 	unsigned int	buf_size;
+ 	char		*buf_buf;
+--- gregkh-2.6.orig/drivers/usb/mon/mon_main.c
++++ gregkh-2.6/drivers/usb/mon/mon_main.c
+@@ -12,6 +12,7 @@
+ #include <linux/debugfs.h>
+ #include <linux/smp_lock.h>
+ #include <linux/notifier.h>
++#include <linux/mutex.h>
+ 
+ #include "usb_mon.h"
+ #include "../core/hcd.h"
+@@ -23,7 +24,7 @@ static void mon_dissolve(struct mon_bus 
+ static void mon_bus_drop(struct kref *r);
+ static void mon_bus_init(struct dentry *mondir, struct usb_bus *ubus);
+ 
+-DECLARE_MUTEX(mon_lock);
++DEFINE_MUTEX(mon_lock);
+ 
+ static struct dentry *mon_dir;		/* /dbg/usbmon */
+ static LIST_HEAD(mon_buses);		/* All buses we know: struct mon_bus */
+@@ -196,14 +197,14 @@ static void mon_bus_remove(struct usb_bu
+ {
+ 	struct mon_bus *mbus = ubus->mon_bus;
+ 
+-	down(&mon_lock);
++	mutex_lock(&mon_lock);
+ 	list_del(&mbus->bus_link);
+ 	debugfs_remove(mbus->dent_t);
+ 	debugfs_remove(mbus->dent_s);
+ 
+ 	mon_dissolve(mbus, ubus);
+ 	kref_put(&mbus->ref, mon_bus_drop);
+-	up(&mon_lock);
++	mutex_unlock(&mon_lock);
+ }
+ 
+ static int mon_notify(struct notifier_block *self, unsigned long action,
+@@ -307,9 +308,9 @@ static void mon_bus_init(struct dentry *
+ 		goto err_create_s;
+ 	mbus->dent_s = d;
+ 
+-	down(&mon_lock);
++	mutex_lock(&mon_lock);
+ 	list_add_tail(&mbus->bus_link, &mon_buses);
+-	up(&mon_lock);
++	mutex_unlock(&mon_lock);
+ 	return;
+ 
+ err_create_s:
+@@ -347,11 +348,11 @@ static int __init mon_init(void)
+ 
+ 	usb_register_notify(&mon_nb);
+ 
+-	down(&usb_bus_list_lock);
++	mutex_lock(&usb_bus_list_lock);
+ 	list_for_each_entry (ubus, &usb_bus_list, bus_list) {
+ 		mon_bus_init(mondir, ubus);
+ 	}
+-	up(&usb_bus_list_lock);
++	mutex_unlock(&usb_bus_list_lock);
+ 	return 0;
+ }
+ 
+@@ -363,7 +364,7 @@ static void __exit mon_exit(void)
+ 	usb_unregister_notify(&mon_nb);
+ 	usb_mon_deregister();
+ 
+-	down(&mon_lock);
++	mutex_lock(&mon_lock);
+ 	while (!list_empty(&mon_buses)) {
+ 		p = mon_buses.next;
+ 		mbus = list_entry(p, struct mon_bus, bus_link);
+@@ -387,7 +388,7 @@ static void __exit mon_exit(void)
+ 		mon_dissolve(mbus, mbus->u_bus);
+ 		kref_put(&mbus->ref, mon_bus_drop);
+ 	}
+-	up(&mon_lock);
++	mutex_unlock(&mon_lock);
+ 
+ 	debugfs_remove(mon_dir);
+ }
+--- gregkh-2.6.orig/drivers/usb/mon/mon_text.c
++++ gregkh-2.6/drivers/usb/mon/mon_text.c
+@@ -8,6 +8,7 @@
+ #include <linux/list.h>
+ #include <linux/usb.h>
+ #include <linux/time.h>
++#include <linux/mutex.h>
+ #include <asm/uaccess.h>
+ 
+ #include "usb_mon.h"
+@@ -54,7 +55,7 @@ struct mon_reader_text {
+ 	wait_queue_head_t wait;
+ 	int printf_size;
+ 	char *printf_buf;
+-	struct semaphore printf_lock;
++	struct mutex printf_lock;
+ 
+ 	char slab_name[SLAB_NAME_SZ];
+ };
+@@ -208,7 +209,7 @@ static int mon_text_open(struct inode *i
+ 	struct mon_reader_text *rp;
+ 	int rc;
+ 
+-	down(&mon_lock);
++	mutex_lock(&mon_lock);
+ 	mbus = inode->u.generic_ip;
+ 	ubus = mbus->u_bus;
+ 
+@@ -220,7 +221,7 @@ static int mon_text_open(struct inode *i
+ 	memset(rp, 0, sizeof(struct mon_reader_text));
+ 	INIT_LIST_HEAD(&rp->e_list);
+ 	init_waitqueue_head(&rp->wait);
+-	init_MUTEX(&rp->printf_lock);
++	mutex_init(&rp->printf_lock);
+ 
+ 	rp->printf_size = PRINTF_DFL;
+ 	rp->printf_buf = kmalloc(rp->printf_size, GFP_KERNEL);
+@@ -247,7 +248,7 @@ static int mon_text_open(struct inode *i
+ 	mon_reader_add(mbus, &rp->r);
+ 
+ 	file->private_data = rp;
+-	up(&mon_lock);
++	mutex_unlock(&mon_lock);
+ 	return 0;
+ 
+ // err_busy:
+@@ -257,7 +258,7 @@ err_slab:
+ err_alloc_pr:
+ 	kfree(rp);
+ err_alloc:
+-	up(&mon_lock);
++	mutex_unlock(&mon_lock);
+ 	return rc;
+ }
+ 
+@@ -301,7 +302,7 @@ static ssize_t mon_text_read(struct file
+ 	set_current_state(TASK_RUNNING);
+ 	remove_wait_queue(&rp->wait, &waita);
+ 
+-	down(&rp->printf_lock);
++	mutex_lock(&rp->printf_lock);
+ 	cnt = 0;
+ 	pbuf = rp->printf_buf;
+ 	limit = rp->printf_size;
+@@ -358,7 +359,7 @@ static ssize_t mon_text_read(struct file
+ 
+ 	if (copy_to_user(buf, rp->printf_buf, cnt))
+ 		cnt = -EFAULT;
+-	up(&rp->printf_lock);
++	mutex_unlock(&rp->printf_lock);
+ 	kmem_cache_free(rp->e_slab, ep);
+ 	return cnt;
+ }
+@@ -371,12 +372,12 @@ static int mon_text_release(struct inode
+ 	struct list_head *p;
+ 	struct mon_event_text *ep;
+ 
+-	down(&mon_lock);
++	mutex_lock(&mon_lock);
+ 	mbus = inode->u.generic_ip;
+ 
+ 	if (mbus->nreaders <= 0) {
+ 		printk(KERN_ERR TAG ": consistency error on close\n");
+-		up(&mon_lock);
++		mutex_unlock(&mon_lock);
+ 		return 0;
+ 	}
+ 	mon_reader_del(mbus, &rp->r);
+@@ -402,7 +403,7 @@ static int mon_text_release(struct inode
+ 	kfree(rp->printf_buf);
+ 	kfree(rp);
+ 
+-	up(&mon_lock);
++	mutex_unlock(&mon_lock);
+ 	return 0;
+ }
+ 
+--- gregkh-2.6.orig/drivers/usb/core/hcd.c
++++ gregkh-2.6/drivers/usb/core/hcd.c
+@@ -34,6 +34,7 @@
+ #include <asm/scatterlist.h>
+ #include <linux/device.h>
+ #include <linux/dma-mapping.h>
++#include <linux/mutex.h>
+ #include <asm/irq.h>
+ #include <asm/byteorder.h>
+ 
+@@ -93,7 +94,7 @@ struct usb_busmap {
+ static struct usb_busmap busmap;
+ 
+ /* used when updating list of hcds */
+-DECLARE_MUTEX (usb_bus_list_lock);	/* exported only for usbfs */
++DEFINE_MUTEX(usb_bus_list_lock);	/* exported only for usbfs */
+ EXPORT_SYMBOL_GPL (usb_bus_list_lock);
+ 
+ /* used for controlling access to virtual root hubs */
+@@ -761,14 +762,14 @@ static int usb_register_bus(struct usb_b
+ {
+ 	int busnum;
+ 
+-	down (&usb_bus_list_lock);
++	mutex_lock(&usb_bus_list_lock);
+ 	busnum = find_next_zero_bit (busmap.busmap, USB_MAXBUS, 1);
+ 	if (busnum < USB_MAXBUS) {
+ 		set_bit (busnum, busmap.busmap);
+ 		bus->busnum = busnum;
+ 	} else {
+ 		printk (KERN_ERR "%s: too many buses\n", usbcore_name);
+-		up(&usb_bus_list_lock);
++		mutex_unlock(&usb_bus_list_lock);
+ 		return -E2BIG;
+ 	}
+ 
+@@ -776,7 +777,7 @@ static int usb_register_bus(struct usb_b
+ 					     bus->controller, "usb_host%d", busnum);
+ 	if (IS_ERR(bus->class_dev)) {
+ 		clear_bit(busnum, busmap.busmap);
+-		up(&usb_bus_list_lock);
++		mutex_unlock(&usb_bus_list_lock);
+ 		return PTR_ERR(bus->class_dev);
+ 	}
+ 
+@@ -784,7 +785,7 @@ static int usb_register_bus(struct usb_b
+ 
+ 	/* Add it to the local list of buses */
+ 	list_add (&bus->bus_list, &usb_bus_list);
+-	up (&usb_bus_list_lock);
++	mutex_unlock(&usb_bus_list_lock);
+ 
+ 	usb_notify_add_bus(bus);
+ 
+@@ -809,9 +810,9 @@ static void usb_deregister_bus (struct u
+ 	 * controller code, as well as having it call this when cleaning
+ 	 * itself up
+ 	 */
+-	down (&usb_bus_list_lock);
++	mutex_lock(&usb_bus_list_lock);
+ 	list_del (&bus->bus_list);
+-	up (&usb_bus_list_lock);
++	mutex_unlock(&usb_bus_list_lock);
+ 
+ 	usb_notify_remove_bus(bus);
+ 
+@@ -844,14 +845,14 @@ static int register_root_hub (struct usb
+ 	set_bit (devnum, usb_dev->bus->devmap.devicemap);
+ 	usb_set_device_state(usb_dev, USB_STATE_ADDRESS);
+ 
+-	down (&usb_bus_list_lock);
++	mutex_lock(&usb_bus_list_lock);
+ 	usb_dev->bus->root_hub = usb_dev;
+ 
+ 	usb_dev->ep0.desc.wMaxPacketSize = __constant_cpu_to_le16(64);
+ 	retval = usb_get_device_descriptor(usb_dev, USB_DT_DEVICE_SIZE);
+ 	if (retval != sizeof usb_dev->descriptor) {
+ 		usb_dev->bus->root_hub = NULL;
+-		up (&usb_bus_list_lock);
++		mutex_unlock(&usb_bus_list_lock);
+ 		dev_dbg (parent_dev, "can't read %s device descriptor %d\n",
+ 				usb_dev->dev.bus_id, retval);
+ 		return (retval < 0) ? retval : -EMSGSIZE;
+@@ -863,7 +864,7 @@ static int register_root_hub (struct usb
+ 		dev_err (parent_dev, "can't register root hub for %s, %d\n",
+ 				usb_dev->dev.bus_id, retval);
+ 	}
+-	up (&usb_bus_list_lock);
++	mutex_unlock(&usb_bus_list_lock);
+ 
+ 	if (retval == 0) {
+ 		spin_lock_irq (&hcd_root_hub_lock);
+@@ -1891,9 +1892,9 @@ void usb_remove_hcd(struct usb_hcd *hcd)
+ 	hcd->rh_registered = 0;
+ 	spin_unlock_irq (&hcd_root_hub_lock);
+ 
+-	down(&usb_bus_list_lock);
++	mutex_lock(&usb_bus_list_lock);
+ 	usb_disconnect(&hcd->self.root_hub);
+-	up(&usb_bus_list_lock);
++	mutex_unlock(&usb_bus_list_lock);
+ 
+ 	hcd->poll_rh = 0;
+ 	del_timer_sync(&hcd->rh_timer);
+--- gregkh-2.6.orig/drivers/usb/core/hcd.h
++++ gregkh-2.6/drivers/usb/core/hcd.h
+@@ -364,7 +364,7 @@ extern void usb_set_device_state(struct 
+ /* exported only within usbcore */
+ 
+ extern struct list_head usb_bus_list;
+-extern struct semaphore usb_bus_list_lock;
++extern struct mutex usb_bus_list_lock;
+ extern wait_queue_head_t usb_kill_urb_queue;
+ 
+ extern struct usb_bus *usb_bus_get (struct usb_bus *bus);
+--- gregkh-2.6.orig/drivers/usb/core/usb.c
++++ gregkh-2.6/drivers/usb/core/usb.c
+@@ -33,6 +33,7 @@
+ #include <linux/errno.h>
+ #include <linux/smp_lock.h>
+ #include <linux/usb.h>
++#include <linux/mutex.h>
+ 
+ #include <asm/io.h>
+ #include <asm/scatterlist.h>
+@@ -639,7 +640,7 @@ struct usb_device *usb_find_device(u16 v
+ 	struct usb_bus *bus;
+ 	struct usb_device *dev = NULL;
+ 	
+-	down(&usb_bus_list_lock);
++	mutex_lock(&usb_bus_list_lock);
+ 	for (buslist = usb_bus_list.next;
+ 	     buslist != &usb_bus_list; 
+ 	     buslist = buslist->next) {
+@@ -653,7 +654,7 @@ struct usb_device *usb_find_device(u16 v
+ 			goto exit;
+ 	}
+ exit:
+-	up(&usb_bus_list_lock);
++	mutex_unlock(&usb_bus_list_lock);
+ 	return dev;
+ }
+ 
+--- gregkh-2.6.orig/drivers/usb/core/devices.c
++++ gregkh-2.6/drivers/usb/core/devices.c
+@@ -57,6 +57,7 @@
+ #include <linux/usb.h>
+ #include <linux/smp_lock.h>
+ #include <linux/usbdevice_fs.h>
++#include <linux/mutex.h>
+ #include <asm/uaccess.h>
+ 
+ #include "usb.h"
+@@ -570,7 +571,7 @@ static ssize_t usb_device_read(struct fi
+ 	if (!access_ok(VERIFY_WRITE, buf, nbytes))
+ 		return -EFAULT;
+ 
+-	down (&usb_bus_list_lock);
++	mutex_lock(&usb_bus_list_lock);
+ 	/* print devices for all busses */
+ 	list_for_each_entry(bus, &usb_bus_list, bus_list) {
+ 		/* recurse through all children of the root hub */
+@@ -580,12 +581,12 @@ static ssize_t usb_device_read(struct fi
+ 		ret = usb_device_dump(&buf, &nbytes, &skip_bytes, ppos, bus->root_hub, bus, 0, 0, 0);
+ 		usb_unlock_device(bus->root_hub);
+ 		if (ret < 0) {
+-			up(&usb_bus_list_lock);
++			mutex_unlock(&usb_bus_list_lock);
+ 			return ret;
+ 		}
+ 		total_written += ret;
+ 	}
+-	up (&usb_bus_list_lock);
++	mutex_unlock(&usb_bus_list_lock);
+ 	return total_written;
+ }
+ 
+--- gregkh-2.6.orig/drivers/usb/storage/scsiglue.c
++++ gregkh-2.6/drivers/usb/storage/scsiglue.c
+@@ -47,6 +47,7 @@
+ 
+ #include <linux/slab.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ 
+ #include <scsi/scsi.h>
+ #include <scsi/scsi_cmnd.h>
+@@ -271,9 +272,9 @@ static int device_reset(struct scsi_cmnd
+ 	US_DEBUGP("%s called\n", __FUNCTION__);
+ 
+ 	/* lock the device pointers and do the reset */
+-	down(&(us->dev_semaphore));
++	mutex_lock(&(us->dev_mutex));
+ 	result = us->transport_reset(us);
+-	up(&(us->dev_semaphore));
++	mutex_unlock(&us->dev_mutex);
+ 
+ 	return result < 0 ? FAILED : SUCCESS;
+ }
+@@ -286,9 +287,9 @@ static int bus_reset(struct scsi_cmnd *s
+ 
+ 	US_DEBUGP("%s called\n", __FUNCTION__);
+ 
+-	down(&(us->dev_semaphore));
++	mutex_lock(&(us->dev_mutex));
+ 	result = usb_stor_port_reset(us);
+-	up(&(us->dev_semaphore));
++	mutex_unlock(&us->dev_mutex);
+ 
+ 	return result < 0 ? FAILED : SUCCESS;
+ }
+--- gregkh-2.6.orig/drivers/usb/storage/usb.c
++++ gregkh-2.6/drivers/usb/storage/usb.c
+@@ -55,6 +55,7 @@
+ #include <linux/init.h>
+ #include <linux/slab.h>
+ #include <linux/kthread.h>
++#include <linux/mutex.h>
+ 
+ #include <scsi/scsi.h>
+ #include <scsi/scsi_cmnd.h>
+@@ -188,7 +189,7 @@ static int storage_suspend(struct usb_in
+ 	struct us_data *us = usb_get_intfdata(iface);
+ 
+ 	/* Wait until no command is running */
+-	down(&us->dev_semaphore);
++	mutex_lock(&us->dev_mutex);
+ 
+ 	US_DEBUGP("%s\n", __FUNCTION__);
+ 	if (us->suspend_resume_hook)
+@@ -198,7 +199,7 @@ static int storage_suspend(struct usb_in
+ 	/* When runtime PM is working, we'll set a flag to indicate
+ 	 * whether we should autoresume when a SCSI request arrives. */
+ 
+-	up(&us->dev_semaphore);
++	mutex_unlock(&us->dev_mutex);
+ 	return 0;
+ }
+ 
+@@ -206,14 +207,14 @@ static int storage_resume(struct usb_int
+ {
+ 	struct us_data *us = usb_get_intfdata(iface);
+ 
+-	down(&us->dev_semaphore);
++	mutex_lock(&us->dev_mutex);
+ 
+ 	US_DEBUGP("%s\n", __FUNCTION__);
+ 	if (us->suspend_resume_hook)
+ 		(us->suspend_resume_hook)(us, US_RESUME);
+ 	iface->dev.power.power_state.event = PM_EVENT_ON;
+ 
+-	up(&us->dev_semaphore);
++	mutex_unlock(&us->dev_mutex);
+ 	return 0;
+ }
+ 
+@@ -276,12 +277,12 @@ static int usb_stor_control_thread(void 
+ 		US_DEBUGP("*** thread awakened.\n");
+ 
+ 		/* lock the device pointers */
+-		down(&(us->dev_semaphore));
++		mutex_lock(&(us->dev_mutex));
+ 
+ 		/* if the device has disconnected, we are free to exit */
+ 		if (test_bit(US_FLIDX_DISCONNECTING, &us->flags)) {
+ 			US_DEBUGP("-- exiting\n");
+-			up(&(us->dev_semaphore));
++			mutex_unlock(&us->dev_mutex);
+ 			break;
+ 		}
+ 
+@@ -370,7 +371,7 @@ SkipForAbort:
+ 		scsi_unlock(host);
+ 
+ 		/* unlock the device pointers */
+-		up(&(us->dev_semaphore));
++		mutex_unlock(&us->dev_mutex);
+ 	} /* for (;;) */
+ 
+ 	scsi_host_put(host);
+@@ -815,8 +816,8 @@ static void quiesce_and_remove_host(stru
+ 	 * The thread will exit when it sees the DISCONNECTING flag. */
+ 
+ 	/* Wait for the current command to finish, then remove the host */
+-	down(&us->dev_semaphore);
+-	up(&us->dev_semaphore);
++	mutex_lock(&us->dev_mutex);
++	mutex_unlock(&us->dev_mutex);
+ 
+ 	/* queuecommand won't accept any new commands and the control
+ 	 * thread won't execute a previously-queued command.  If there
+@@ -870,9 +871,9 @@ retry:
+ 		/* For bulk-only devices, determine the max LUN value */
+ 		if (us->protocol == US_PR_BULK &&
+ 				!(us->flags & US_FL_SINGLE_LUN)) {
+-			down(&us->dev_semaphore);
++			mutex_lock(&us->dev_mutex);
+ 			us->max_lun = usb_stor_Bulk_max_lun(us);
+-			up(&us->dev_semaphore);
++			mutex_unlock(&us->dev_mutex);
+ 		}
+ 		scsi_scan_host(us_to_host(us));
+ 		printk(KERN_DEBUG "usb-storage: device scan complete\n");
+@@ -912,7 +913,7 @@ static int storage_probe(struct usb_inte
+ 
+ 	us = host_to_us(host);
+ 	memset(us, 0, sizeof(struct us_data));
+-	init_MUTEX(&(us->dev_semaphore));
++	mutex_init(&(us->dev_mutex));
+ 	init_MUTEX_LOCKED(&(us->sema));
+ 	init_completion(&(us->notify));
+ 	init_waitqueue_head(&us->delay_wait);
+--- gregkh-2.6.orig/drivers/usb/storage/usb.h
++++ gregkh-2.6/drivers/usb/storage/usb.h
+@@ -49,6 +49,7 @@
+ #include <linux/blkdev.h>
+ #include <linux/smp_lock.h>
+ #include <linux/completion.h>
++#include <linux/mutex.h>
+ #include <scsi/scsi_host.h>
+ 
+ struct us_data;
+@@ -103,9 +104,9 @@ typedef void (*pm_hook)(struct us_data *
+ struct us_data {
+ 	/* The device we're working with
+ 	 * It's important to note:
+-	 *    (o) you must hold dev_semaphore to change pusb_dev
++	 *    (o) you must hold dev_mutex to change pusb_dev
+ 	 */
+-	struct semaphore	dev_semaphore;	 /* protect pusb_dev */
++	struct mutex		dev_mutex;	 /* protect pusb_dev */
+ 	struct usb_device	*pusb_dev;	 /* this usb_device */
+ 	struct usb_interface	*pusb_intf;	 /* this interface */
+ 	struct us_unusual_dev   *unusual_dev;	 /* device-filter entry     */
+--- gregkh-2.6.orig/drivers/usb/mon/usb_mon.h
++++ gregkh-2.6/drivers/usb/mon/usb_mon.h
+@@ -49,7 +49,7 @@ void mon_reader_del(struct mon_bus *mbus
+  */
+ extern char mon_dmapeek(unsigned char *dst, dma_addr_t dma_addr, int len);
+ 
+-extern struct semaphore mon_lock;
++extern struct mutex mon_lock;
+ 
+ extern struct file_operations mon_fops_text;
+ extern struct file_operations mon_fops_stat;
+--- gregkh-2.6.orig/drivers/usb/atm/usbatm.c
++++ gregkh-2.6/drivers/usb/atm/usbatm.c
+@@ -741,7 +741,7 @@ static int usbatm_atm_open(struct atm_vc
+ 		return -EINVAL;
+ 	}
+ 
+-	down(&instance->serialize);	/* vs self, usbatm_atm_close */
++	mutex_lock(&instance->serialize);	/* vs self, usbatm_atm_close */
+ 
+ 	if (usbatm_find_vcc(instance, vpi, vci)) {
+ 		atm_dbg(instance, "%s: %hd/%d already in use!\n", __func__, vpi, vci);
+@@ -777,7 +777,7 @@ static int usbatm_atm_open(struct atm_vc
+ 	set_bit(ATM_VF_PARTIAL, &vcc->flags);
+ 	set_bit(ATM_VF_READY, &vcc->flags);
+ 
+-	up(&instance->serialize);
++	mutex_unlock(&instance->serialize);
+ 
+ 	atm_dbg(instance, "%s: allocated vcc data 0x%p\n", __func__, new);
+ 
+@@ -785,7 +785,7 @@ static int usbatm_atm_open(struct atm_vc
+ 
+ fail:
+ 	kfree(new);
+-	up(&instance->serialize);
++	mutex_unlock(&instance->serialize);
+ 	return ret;
+ }
+ 
+@@ -806,7 +806,7 @@ static void usbatm_atm_close(struct atm_
+ 
+ 	usbatm_cancel_send(instance, vcc);
+ 
+-	down(&instance->serialize);	/* vs self, usbatm_atm_open */
++	mutex_lock(&instance->serialize);	/* vs self, usbatm_atm_open */
+ 
+ 	tasklet_disable(&instance->rx_channel.tasklet);
+ 	list_del(&vcc_data->list);
+@@ -824,7 +824,7 @@ static void usbatm_atm_close(struct atm_
+ 	clear_bit(ATM_VF_PARTIAL, &vcc->flags);
+ 	clear_bit(ATM_VF_ADDR, &vcc->flags);
+ 
+-	up(&instance->serialize);
++	mutex_unlock(&instance->serialize);
+ 
+ 	atm_dbg(instance, "%s successful\n", __func__);
+ }
+@@ -903,9 +903,9 @@ static int usbatm_do_heavy_init(void *ar
+ 	if (!ret)
+ 		ret = usbatm_atm_init(instance);
+ 
+-	down(&instance->serialize);
++	mutex_lock(&instance->serialize);
+ 	instance->thread_pid = -1;
+-	up(&instance->serialize);
++	mutex_unlock(&instance->serialize);
+ 
+ 	complete_and_exit(&instance->thread_exited, ret);
+ }
+@@ -919,9 +919,9 @@ static int usbatm_heavy_init(struct usba
+ 		return ret;
+ 	}
+ 
+-	down(&instance->serialize);
++	mutex_lock(&instance->serialize);
+ 	instance->thread_pid = ret;
+-	up(&instance->serialize);
++	mutex_unlock(&instance->serialize);
+ 
+ 	wait_for_completion(&instance->thread_started);
+ 
+@@ -1005,7 +1005,7 @@ int usbatm_usb_probe(struct usb_interfac
+ 	/* private fields */
+ 
+ 	kref_init(&instance->refcount);		/* dropped in usbatm_usb_disconnect */
+-	init_MUTEX(&instance->serialize);
++	mutex_init(&instance->serialize);
+ 
+ 	instance->thread_pid = -1;
+ 	init_completion(&instance->thread_started);
+@@ -1125,10 +1125,10 @@ void usbatm_usb_disconnect(struct usb_in
+ 
+ 	usb_set_intfdata(intf, NULL);
+ 
+-	down(&instance->serialize);
++	mutex_lock(&instance->serialize);
+ 	if (instance->thread_pid >= 0)
+ 		kill_proc(instance->thread_pid, SIGTERM, 1);
+-	up(&instance->serialize);
++	mutex_unlock(&instance->serialize);
+ 
+ 	wait_for_completion(&instance->thread_exited);
+ 
+--- gregkh-2.6.orig/drivers/usb/atm/usbatm.h
++++ gregkh-2.6/drivers/usb/atm/usbatm.h
+@@ -39,6 +39,7 @@
+ #include <linux/list.h>
+ #include <linux/stringify.h>
+ #include <linux/usb.h>
++#include <linux/mutex.h>
+ 
+ #ifdef DEBUG
+ #define UDSL_ASSERT(x)	BUG_ON(!(x))
+@@ -157,7 +158,7 @@ struct usbatm_data {
+         ********************************/
+ 
+ 	struct kref refcount;
+-	struct semaphore serialize;
++	struct mutex serialize;
+ 
+ 	/* heavy init */
+ 	int thread_pid;
+--- gregkh-2.6.orig/drivers/usb/atm/cxacru.c
++++ gregkh-2.6/drivers/usb/atm/cxacru.c
+@@ -160,7 +160,7 @@ struct cxacru_data {
+ 	struct work_struct poll_work;
+ 
+ 	/* contol handles */
+-	struct semaphore cm_serialize;
++	struct mutex cm_serialize;
+ 	u8 *rcv_buf;
+ 	u8 *snd_buf;
+ 	struct urb *rcv_urb;
+@@ -219,7 +219,7 @@ static int cxacru_cm(struct cxacru_data 
+ 		goto fail;
+ 	}
+ 
+-	down(&instance->cm_serialize);
++	mutex_lock(&instance->cm_serialize);
+ 
+ 	/* submit reading urb before the writing one */
+ 	init_completion(&instance->rcv_done);
+@@ -288,7 +288,7 @@ static int cxacru_cm(struct cxacru_data 
+ 	ret = offd;
+ 	dbg("cm %#x", cm);
+ fail:
+-	up(&instance->cm_serialize);
++	mutex_unlock(&instance->cm_serialize);
+ 	return ret;
+ }
+ 
+@@ -721,7 +721,7 @@ static int cxacru_bind(struct usbatm_dat
+ 			instance->snd_buf, PAGE_SIZE,
+ 			cxacru_blocking_completion, &instance->snd_done, 4);
+ 
+-	init_MUTEX(&instance->cm_serialize);
++	mutex_init(&instance->cm_serialize);
+ 
+ 	INIT_WORK(&instance->poll_work, (void *)cxacru_poll_status, instance);
+ 
+--- gregkh-2.6.orig/drivers/usb/atm/ueagle-atm.c
++++ gregkh-2.6/drivers/usb/atm/ueagle-atm.c
+@@ -63,6 +63,7 @@
+ #include <linux/ctype.h>
+ #include <linux/kthread.h>
+ #include <linux/version.h>
++#include <linux/mutex.h>
+ #include <asm/unaligned.h>
+ 
+ #include "usbatm.h"
+@@ -358,7 +359,7 @@ struct intr_pkt {
+ #define INTR_PKT_SIZE 28
+ 
+ static struct usb_driver uea_driver;
+-static DECLARE_MUTEX(uea_semaphore);
++static DEFINE_MUTEX(uea_mutex);
+ static const char *chip_name[] = {"ADI930", "Eagle I", "Eagle II", "Eagle III"};
+ 
+ static int modem_index;
+@@ -1418,13 +1419,13 @@ static ssize_t read_status(struct device
+ 	int ret = -ENODEV;
+ 	struct uea_softc *sc;
+ 
+-	down(&uea_semaphore);
++	mutex_lock(&uea_mutex);
+ 	sc = dev_to_uea(dev);
+ 	if (!sc)
+ 		goto out;
+ 	ret = snprintf(buf, 10, "%08x\n", sc->stats.phy.state);
+ out:
+-	up(&uea_semaphore);
++	mutex_unlock(&uea_mutex);
+ 	return ret;
+ }
+ 
+@@ -1434,14 +1435,14 @@ static ssize_t reboot(struct device *dev
+ 	int ret = -ENODEV;
+ 	struct uea_softc *sc;
+ 
+-	down(&uea_semaphore);
++	mutex_lock(&uea_mutex);
+ 	sc = dev_to_uea(dev);
+ 	if (!sc)
+ 		goto out;
+ 	sc->reset = 1;
+ 	ret = count;
+ out:
+-	up(&uea_semaphore);
++	mutex_unlock(&uea_mutex);
+ 	return ret;
+ }
+ 
+@@ -1453,7 +1454,7 @@ static ssize_t read_human_status(struct 
+ 	int ret = -ENODEV;
+ 	struct uea_softc *sc;
+ 
+-	down(&uea_semaphore);
++	mutex_lock(&uea_mutex);
+ 	sc = dev_to_uea(dev);
+ 	if (!sc)
+ 		goto out;
+@@ -1473,7 +1474,7 @@ static ssize_t read_human_status(struct 
+ 		break;
+ 	}
+ out:
+-	up(&uea_semaphore);
++	mutex_unlock(&uea_mutex);
+ 	return ret;
+ }
+ 
+@@ -1485,7 +1486,7 @@ static ssize_t read_delin(struct device 
+ 	int ret = -ENODEV;
+ 	struct uea_softc *sc;
+ 
+-	down(&uea_semaphore);
++	mutex_lock(&uea_mutex);
+ 	sc = dev_to_uea(dev);
+ 	if (!sc)
+ 		goto out;
+@@ -1497,7 +1498,7 @@ static ssize_t read_delin(struct device 
+ 	else
+ 		ret = sprintf(buf, "GOOD\n");
+ out:
+-	up(&uea_semaphore);
++	mutex_unlock(&uea_mutex);
+ 	return ret;
+ }
+ 
+@@ -1511,7 +1512,7 @@ static ssize_t read_##name(struct device
+ 	int ret = -ENODEV; 					\
+ 	struct uea_softc *sc; 					\
+  								\
+-	down(&uea_semaphore); 					\
++	mutex_lock(&uea_mutex); 					\
+ 	sc = dev_to_uea(dev);					\
+ 	if (!sc) 						\
+ 		goto out; 					\
+@@ -1519,7 +1520,7 @@ static ssize_t read_##name(struct device
+ 	if (reset)						\
+ 		sc->stats.phy.name = 0;				\
+ out: 								\
+-	up(&uea_semaphore); 					\
++	mutex_unlock(&uea_mutex); 					\
+ 	return ret; 						\
+ } 								\
+ 								\
+@@ -1738,9 +1739,9 @@ static void uea_disconnect(struct usb_in
+ 	 * Pre-firmware device has one interface
+ 	 */
+ 	if (usb->config->desc.bNumInterfaces != 1 && ifnum == 0) {
+-		down(&uea_semaphore);
++		mutex_lock(&uea_mutex);
+ 		usbatm_usb_disconnect(intf);
+-		up(&uea_semaphore);
++		mutex_unlock(&uea_mutex);
+ 		uea_info(usb, "ADSL device removed\n");
+ 	}
+ 
+--- gregkh-2.6.orig/drivers/usb/image/mdc800.c
++++ gregkh-2.6/drivers/usb/image/mdc800.c
+@@ -96,6 +96,7 @@
+ #include <linux/module.h>
+ #include <linux/smp_lock.h>
+ #include <linux/wait.h>
++#include <linux/mutex.h>
+ 
+ #include <linux/usb.h>
+ #include <linux/fs.h>
+@@ -169,7 +170,7 @@ struct mdc800_data
+ 	int			out_count;	// Bytes in the buffer
+ 
+ 	int			open;		// Camera device open ?
+-	struct semaphore	io_lock;	// IO -lock
++	struct mutex		io_lock;	// IO -lock
+ 
+ 	char 			in [8];		// Command Input Buffer
+ 	int  			in_count;
+@@ -497,7 +498,7 @@ static int mdc800_usb_probe (struct usb_
+ 
+ 	info ("Found Mustek MDC800 on USB.");
+ 
+-	down (&mdc800->io_lock);
++	mutex_lock(&mdc800->io_lock);
+ 
+ 	retval = usb_register_dev(intf, &mdc800_class);
+ 	if (retval) {
+@@ -542,7 +543,7 @@ static int mdc800_usb_probe (struct usb_
+ 
+ 	mdc800->state=READY;
+ 
+-	up (&mdc800->io_lock);
++	mutex_unlock(&mdc800->io_lock);
+ 	
+ 	usb_set_intfdata(intf, mdc800);
+ 	return 0;
+@@ -620,7 +621,7 @@ static int mdc800_device_open (struct in
+ 	int retval=0;
+ 	int errn=0;
+ 
+-	down (&mdc800->io_lock);
++	mutex_lock(&mdc800->io_lock);
+ 	
+ 	if (mdc800->state == NOT_CONNECTED)
+ 	{
+@@ -656,7 +657,7 @@ static int mdc800_device_open (struct in
+ 	dbg ("Mustek MDC800 device opened.");
+ 
+ error_out:
+-	up (&mdc800->io_lock);
++	mutex_unlock(&mdc800->io_lock);
+ 	return errn;
+ }
+ 
+@@ -669,7 +670,7 @@ static int mdc800_device_release (struct
+ 	int retval=0;
+ 	dbg ("Mustek MDC800 device closed.");
+ 
+-	down (&mdc800->io_lock);
++	mutex_lock(&mdc800->io_lock);
+ 	if (mdc800->open && (mdc800->state != NOT_CONNECTED))
+ 	{
+ 		usb_kill_urb(mdc800->irq_urb);
+@@ -682,7 +683,7 @@ static int mdc800_device_release (struct
+ 		retval=-EIO;
+ 	}
+ 
+-	up(&mdc800->io_lock);
++	mutex_unlock(&mdc800->io_lock);
+ 	return retval;
+ }
+ 
+@@ -695,21 +696,21 @@ static ssize_t mdc800_device_read (struc
+ 	size_t left=len, sts=len; /* single transfer size */
+ 	char __user *ptr = buf;
+ 
+-	down (&mdc800->io_lock);
++	mutex_lock(&mdc800->io_lock);
+ 	if (mdc800->state == NOT_CONNECTED)
+ 	{
+-		up (&mdc800->io_lock);
++		mutex_unlock(&mdc800->io_lock);
+ 		return -EBUSY;
+ 	}
+ 	if (mdc800->state == WORKING)
+ 	{
+ 		warn ("Illegal State \"working\" reached during read ?!");
+-		up (&mdc800->io_lock);
++		mutex_unlock(&mdc800->io_lock);
+ 		return -EBUSY;
+ 	}
+ 	if (!mdc800->open)
+ 	{
+-		up (&mdc800->io_lock);
++		mutex_unlock(&mdc800->io_lock);
+ 		return -EBUSY;
+ 	}
+ 
+@@ -717,7 +718,7 @@ static ssize_t mdc800_device_read (struc
+ 	{
+ 		if (signal_pending (current)) 
+ 		{
+-			up (&mdc800->io_lock);
++			mutex_unlock(&mdc800->io_lock);
+ 			return -EINTR;
+ 		}
+ 
+@@ -736,7 +737,7 @@ static ssize_t mdc800_device_read (struc
+ 				if (usb_submit_urb (mdc800->download_urb, GFP_KERNEL))
+ 				{
+ 					err ("Can't submit download urb (status=%i)",mdc800->download_urb->status);
+-					up (&mdc800->io_lock);
++					mutex_unlock(&mdc800->io_lock);
+ 					return len-left;
+ 				}
+ 				wait_event_timeout(mdc800->download_wait, mdc800->downloaded,
+@@ -745,14 +746,14 @@ static ssize_t mdc800_device_read (struc
+ 				if (mdc800->download_urb->status != 0)
+ 				{
+ 					err ("request download-bytes fails (status=%i)",mdc800->download_urb->status);
+-					up (&mdc800->io_lock);
++					mutex_unlock(&mdc800->io_lock);
+ 					return len-left;
+ 				}
+ 			}
+ 			else
+ 			{
+ 				/* No more bytes -> that's an error*/
+-				up (&mdc800->io_lock);
++				mutex_unlock(&mdc800->io_lock);
+ 				return -EIO;
+ 			}
+ 		}
+@@ -761,7 +762,7 @@ static ssize_t mdc800_device_read (struc
+ 			/* Copy Bytes */
+ 			if (copy_to_user(ptr, &mdc800->out [mdc800->out_ptr],
+ 						sts)) {
+-				up(&mdc800->io_lock);
++				mutex_unlock(&mdc800->io_lock);
+ 				return -EFAULT;
+ 			}
+ 			ptr+=sts;
+@@ -770,7 +771,7 @@ static ssize_t mdc800_device_read (struc
+ 		}
+ 	}
+ 
+-	up (&mdc800->io_lock);
++	mutex_unlock(&mdc800->io_lock);
+ 	return len-left;
+ }
+ 
+@@ -785,15 +786,15 @@ static ssize_t mdc800_device_write (stru
+ {
+ 	size_t i=0;
+ 
+-	down (&mdc800->io_lock);
++	mutex_lock(&mdc800->io_lock);
+ 	if (mdc800->state != READY)
+ 	{
+-		up (&mdc800->io_lock);
++		mutex_unlock(&mdc800->io_lock);
+ 		return -EBUSY;
+ 	}
+ 	if (!mdc800->open )
+ 	{
+-		up (&mdc800->io_lock);
++		mutex_unlock(&mdc800->io_lock);
+ 		return -EBUSY;
+ 	}
+ 
+@@ -802,13 +803,13 @@ static ssize_t mdc800_device_write (stru
+ 		unsigned char c;
+ 		if (signal_pending (current)) 
+ 		{
+-			up (&mdc800->io_lock);
++			mutex_unlock(&mdc800->io_lock);
+ 			return -EINTR;
+ 		}
+ 		
+ 		if(get_user(c, buf+i))
+ 		{
+-			up(&mdc800->io_lock);
++			mutex_unlock(&mdc800->io_lock);
+ 			return -EFAULT;
+ 		}
+ 
+@@ -829,7 +830,7 @@ static ssize_t mdc800_device_write (stru
+ 		}
+ 		else
+ 		{
+-			up (&mdc800->io_lock);
++			mutex_unlock(&mdc800->io_lock);
+ 			return -EIO;
+ 		}
+ 
+@@ -841,7 +842,7 @@ static ssize_t mdc800_device_write (stru
+ 			if (mdc800_usb_waitForIRQ (0,TO_GET_READY))
+ 			{
+ 				err ("Camera didn't get ready.\n");
+-				up (&mdc800->io_lock);
++				mutex_unlock(&mdc800->io_lock);
+ 				return -EIO;
+ 			}
+ 
+@@ -853,7 +854,7 @@ static ssize_t mdc800_device_write (stru
+ 			if (usb_submit_urb (mdc800->write_urb, GFP_KERNEL))
+ 			{
+ 				err ("submitting write urb fails (status=%i)", mdc800->write_urb->status);
+-				up (&mdc800->io_lock);
++				mutex_unlock(&mdc800->io_lock);
+ 				return -EIO;
+ 			}
+ 			wait_event_timeout(mdc800->write_wait, mdc800->written, TO_WRITE_GET_READY*HZ/1000);
+@@ -861,7 +862,7 @@ static ssize_t mdc800_device_write (stru
+ 			if (mdc800->state == WORKING)
+ 			{
+ 				usb_kill_urb(mdc800->write_urb);
+-				up (&mdc800->io_lock);
++				mutex_unlock(&mdc800->io_lock);
+ 				return -EIO;
+ 			}
+ 
+@@ -873,7 +874,7 @@ static ssize_t mdc800_device_write (stru
+ 					{
+ 						err ("call 0x07 before 0x05,0x3e");
+ 						mdc800->state=READY;
+-						up (&mdc800->io_lock);
++						mutex_unlock(&mdc800->io_lock);
+ 						return -EIO;
+ 					}
+ 					mdc800->pic_len=-1;
+@@ -892,7 +893,7 @@ static ssize_t mdc800_device_write (stru
+ 						if (mdc800_usb_waitForIRQ (1,TO_READ_FROM_IRQ))
+ 						{
+ 							err ("requesting answer from irq fails");
+-							up (&mdc800->io_lock);
++							mutex_unlock(&mdc800->io_lock);
+ 							return -EIO;
+ 						}
+ 
+@@ -920,7 +921,7 @@ static ssize_t mdc800_device_write (stru
+ 						if (mdc800_usb_waitForIRQ (0,TO_DEFAULT_COMMAND))
+ 						{
+ 							err ("Command Timeout.");
+-							up (&mdc800->io_lock);
++							mutex_unlock(&mdc800->io_lock);
+ 							return -EIO;
+ 						}
+ 					}
+@@ -930,7 +931,7 @@ static ssize_t mdc800_device_write (stru
+ 		}
+ 		i++;
+ 	}
+-	up (&mdc800->io_lock);
++	mutex_unlock(&mdc800->io_lock);
+ 	return i;
+ }
+ 
+@@ -984,7 +985,7 @@ static int __init usb_mdc800_init (void)
+ 
+ 	mdc800->dev = NULL;
+ 	mdc800->state=NOT_CONNECTED;
+-	init_MUTEX (&mdc800->io_lock);
++	mutex_init (&mdc800->io_lock);
+ 
+ 	init_waitqueue_head (&mdc800->irq_wait);
+ 	init_waitqueue_head (&mdc800->write_wait);
+--- gregkh-2.6.orig/drivers/usb/media/dabusb.c
++++ gregkh-2.6/drivers/usb/media/dabusb.c
+@@ -38,6 +38,7 @@
+ #include <linux/delay.h>
+ #include <linux/usb.h>
+ #include <linux/smp_lock.h>
++#include <linux/mutex.h>
+ 
+ #include "dabusb.h"
+ #include "dabfirmware.h"
+@@ -570,7 +571,7 @@ static ssize_t dabusb_read (struct file 
+ 			s->readptr = 0;
+ 		}
+ 	}
+-      err:			//up(&s->mutex);
++      err:			//mutex_unlock(&s->mutex);
+ 	return ret;
+ }
+ 
+@@ -585,10 +586,10 @@ static int dabusb_open (struct inode *in
+ 	s = &dabusb[devnum - DABUSB_MINOR];
+ 
+ 	dbg("dabusb_open");
+-	down (&s->mutex);
++	mutex_lock(&s->mutex);
+ 
+ 	while (!s->usbdev || s->opened) {
+-		up (&s->mutex);
++		mutex_unlock(&s->mutex);
+ 
+ 		if (file->f_flags & O_NONBLOCK) {
+ 			return -EBUSY;
+@@ -598,15 +599,15 @@ static int dabusb_open (struct inode *in
+ 		if (signal_pending (current)) {
+ 			return -EAGAIN;
+ 		}
+-		down (&s->mutex);
++		mutex_lock(&s->mutex);
+ 	}
+ 	if (usb_set_interface (s->usbdev, _DABUSB_IF, 1) < 0) {
+-		up(&s->mutex);
++		mutex_unlock(&s->mutex);
+ 		err("set_interface failed");
+ 		return -EINVAL;
+ 	}
+ 	s->opened = 1;
+-	up (&s->mutex);
++	mutex_unlock(&s->mutex);
+ 
+ 	file->f_pos = 0;
+ 	file->private_data = s;
+@@ -620,10 +621,10 @@ static int dabusb_release (struct inode 
+ 
+ 	dbg("dabusb_release");
+ 
+-	down (&s->mutex);
++	mutex_lock(&s->mutex);
+ 	dabusb_stop (s);
+ 	dabusb_free_buffers (s);
+-	up (&s->mutex);
++	mutex_unlock(&s->mutex);
+ 
+ 	if (!s->remove_pending) {
+ 		if (usb_set_interface (s->usbdev, _DABUSB_IF, 0) < 0)
+@@ -648,10 +649,10 @@ static int dabusb_ioctl (struct inode *i
+ 	if (s->remove_pending)
+ 		return -EIO;
+ 
+-	down (&s->mutex);
++	mutex_lock(&s->mutex);
+ 
+ 	if (!s->usbdev) {
+-		up (&s->mutex);
++		mutex_unlock(&s->mutex);
+ 		return -EIO;
+ 	}
+ 
+@@ -691,7 +692,7 @@ static int dabusb_ioctl (struct inode *i
+ 		ret = -ENOIOCTLCMD;
+ 		break;
+ 	}
+-	up (&s->mutex);
++	mutex_unlock(&s->mutex);
+ 	return ret;
+ }
+ 
+@@ -737,7 +738,7 @@ static int dabusb_probe (struct usb_inte
+ 
+ 	s = &dabusb[intf->minor];
+ 
+-	down (&s->mutex);
++	mutex_lock(&s->mutex);
+ 	s->remove_pending = 0;
+ 	s->usbdev = usbdev;
+ 	s->devnum = intf->minor;
+@@ -760,7 +761,7 @@ static int dabusb_probe (struct usb_inte
+ 	}
+ 	dbg("bound to interface: %d", intf->altsetting->desc.bInterfaceNumber);
+ 	usb_set_intfdata (intf, s);
+-	up (&s->mutex);
++	mutex_unlock(&s->mutex);
+ 
+ 	retval = usb_register_dev(intf, &dabusb_class);
+ 	if (retval) {
+@@ -771,7 +772,7 @@ static int dabusb_probe (struct usb_inte
+ 	return 0;
+ 
+       reject:
+-	up (&s->mutex);
++	mutex_unlock(&s->mutex);
+ 	s->usbdev = NULL;
+ 	return -ENODEV;
+ }
+@@ -828,7 +829,7 @@ static int __init dabusb_init (void)
+ 	for (u = 0; u < NRDABUSB; u++) {
+ 		pdabusb_t s = &dabusb[u];
+ 		memset (s, 0, sizeof (dabusb_t));
+-		init_MUTEX (&s->mutex);
++		mutex_init (&s->mutex);
+ 		s->usbdev = NULL;
+ 		s->total_buffer_size = buffers;
+ 		init_waitqueue_head (&s->wait);
+--- gregkh-2.6.orig/drivers/usb/media/dabusb.h
++++ gregkh-2.6/drivers/usb/media/dabusb.h
+@@ -18,7 +18,7 @@ typedef enum { _stopped=0, _started } dr
+ 
+ typedef struct
+ {
+-	struct semaphore mutex;
++	struct mutex mutex;
+ 	struct usb_device *usbdev;
+ 	wait_queue_head_t wait;
+ 	wait_queue_head_t remove_ok;
+--- gregkh-2.6.orig/drivers/usb/media/sn9c102.h
++++ gregkh-2.6/drivers/usb/media/sn9c102.h
+@@ -32,6 +32,7 @@
+ #include <linux/types.h>
+ #include <linux/param.h>
+ #include <linux/rwsem.h>
++#include <linux/mutex.h>
+ #include <asm/semaphore.h>
+ 
+ #include "sn9c102_sensor.h"
+@@ -115,7 +116,7 @@ struct sn9c102_module_param {
+ 	u8 force_munmap;
+ };
+ 
+-static DECLARE_MUTEX(sn9c102_sysfs_lock);
++static DEFINE_MUTEX(sn9c102_sysfs_lock);
+ static DECLARE_RWSEM(sn9c102_disconnect);
+ 
+ struct sn9c102_device {
+@@ -149,7 +150,7 @@ struct sn9c102_device {
+ 	enum sn9c102_dev_state state;
+ 	u8 users;
+ 
+-	struct semaphore dev_sem, fileop_sem;
++	struct mutex dev_mutex, fileop_mutex;
+ 	spinlock_t queue_lock;
+ 	wait_queue_head_t open, wait_frame, wait_stream;
+ };
+--- gregkh-2.6.orig/drivers/usb/media/sn9c102_core.c
++++ gregkh-2.6/drivers/usb/media/sn9c102_core.c
+@@ -901,18 +901,18 @@ static ssize_t sn9c102_show_reg(struct c
+ 	struct sn9c102_device* cam;
+ 	ssize_t count;
+ 
+-	if (down_interruptible(&sn9c102_sysfs_lock))
++	if (mutex_lock_interruptible(&sn9c102_sysfs_lock))
+ 		return -ERESTARTSYS;
+ 
+ 	cam = video_get_drvdata(to_video_device(cd));
+ 	if (!cam) {
+-		up(&sn9c102_sysfs_lock);
++		mutex_unlock(&sn9c102_sysfs_lock);
+ 		return -ENODEV;
+ 	}
+ 
+ 	count = sprintf(buf, "%u\n", cam->sysfs.reg);
+ 
+-	up(&sn9c102_sysfs_lock);
++	mutex_unlock(&sn9c102_sysfs_lock);
+ 
+ 	return count;
+ } 
+@@ -925,18 +925,18 @@ sn9c102_store_reg(struct class_device* c
+ 	u8 index;
+ 	ssize_t count;
+ 
+-	if (down_interruptible(&sn9c102_sysfs_lock))
++	if (mutex_lock_interruptible(&sn9c102_sysfs_lock))
+ 		return -ERESTARTSYS;
+ 
+ 	cam = video_get_drvdata(to_video_device(cd));
+ 	if (!cam) {
+-		up(&sn9c102_sysfs_lock);
++		mutex_unlock(&sn9c102_sysfs_lock);
+ 		return -ENODEV;
+ 	}
+ 
+ 	index = sn9c102_strtou8(buf, len, &count);
+ 	if (index > 0x1f || !count) {
+-		up(&sn9c102_sysfs_lock);
++		mutex_unlock(&sn9c102_sysfs_lock);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -945,7 +945,7 @@ sn9c102_store_reg(struct class_device* c
+ 	DBG(2, "Moved SN9C10X register index to 0x%02X", cam->sysfs.reg);
+ 	DBG(3, "Written bytes: %zd", count);
+ 
+-	up(&sn9c102_sysfs_lock);
++	mutex_unlock(&sn9c102_sysfs_lock);
+ 
+ 	return count;
+ }
+@@ -957,17 +957,17 @@ static ssize_t sn9c102_show_val(struct c
+ 	ssize_t count;
+ 	int val;
+ 
+-	if (down_interruptible(&sn9c102_sysfs_lock))
++	if (mutex_lock_interruptible(&sn9c102_sysfs_lock))
+ 		return -ERESTARTSYS;
+ 
+ 	cam = video_get_drvdata(to_video_device(cd));
+ 	if (!cam) {
+-		up(&sn9c102_sysfs_lock);
++		mutex_unlock(&sn9c102_sysfs_lock);
+ 		return -ENODEV;
+ 	}
+ 
+ 	if ((val = sn9c102_read_reg(cam, cam->sysfs.reg)) < 0) {
+-		up(&sn9c102_sysfs_lock);
++		mutex_unlock(&sn9c102_sysfs_lock);
+ 		return -EIO;
+ 	}
+ 
+@@ -975,7 +975,7 @@ static ssize_t sn9c102_show_val(struct c
+ 
+ 	DBG(3, "Read bytes: %zd", count);
+ 
+-	up(&sn9c102_sysfs_lock);
++	mutex_unlock(&sn9c102_sysfs_lock);
+ 
+ 	return count;
+ } 
+@@ -989,24 +989,24 @@ sn9c102_store_val(struct class_device* c
+ 	ssize_t count;
+ 	int err;
+ 
+-	if (down_interruptible(&sn9c102_sysfs_lock))
++	if (mutex_lock_interruptible(&sn9c102_sysfs_lock))
+ 		return -ERESTARTSYS;
+ 
+ 	cam = video_get_drvdata(to_video_device(cd));
+ 	if (!cam) {
+-		up(&sn9c102_sysfs_lock);
++		mutex_unlock(&sn9c102_sysfs_lock);
+ 		return -ENODEV;
+ 	}
+ 
+ 	value = sn9c102_strtou8(buf, len, &count);
+ 	if (!count) {
+-		up(&sn9c102_sysfs_lock);
++		mutex_unlock(&sn9c102_sysfs_lock);
+ 		return -EINVAL;
+ 	}
+ 
+ 	err = sn9c102_write_reg(cam, value, cam->sysfs.reg);
+ 	if (err) {
+-		up(&sn9c102_sysfs_lock);
++		mutex_unlock(&sn9c102_sysfs_lock);
+ 		return -EIO;
+ 	}
+ 
+@@ -1014,7 +1014,7 @@ sn9c102_store_val(struct class_device* c
+ 	    cam->sysfs.reg, value);
+ 	DBG(3, "Written bytes: %zd", count);
+ 
+-	up(&sn9c102_sysfs_lock);
++	mutex_unlock(&sn9c102_sysfs_lock);
+ 
+ 	return count;
+ }
+@@ -1025,12 +1025,12 @@ static ssize_t sn9c102_show_i2c_reg(stru
+ 	struct sn9c102_device* cam;
+ 	ssize_t count;
+ 
+-	if (down_interruptible(&sn9c102_sysfs_lock))
++	if (mutex_lock_interruptible(&sn9c102_sysfs_lock))
+ 		return -ERESTARTSYS;
+ 
+ 	cam = video_get_drvdata(to_video_device(cd));
+ 	if (!cam) {
+-		up(&sn9c102_sysfs_lock);
++		mutex_unlock(&sn9c102_sysfs_lock);
+ 		return -ENODEV;
+ 	}
+ 
+@@ -1038,7 +1038,7 @@ static ssize_t sn9c102_show_i2c_reg(stru
+ 
+ 	DBG(3, "Read bytes: %zd", count);
+ 
+-	up(&sn9c102_sysfs_lock);
++	mutex_unlock(&sn9c102_sysfs_lock);
+ 
+ 	return count;
+ }
+@@ -1051,18 +1051,18 @@ sn9c102_store_i2c_reg(struct class_devic
+ 	u8 index;
+ 	ssize_t count;
+ 
+-	if (down_interruptible(&sn9c102_sysfs_lock))
++	if (mutex_lock_interruptible(&sn9c102_sysfs_lock))
+ 		return -ERESTARTSYS;
+ 
+ 	cam = video_get_drvdata(to_video_device(cd));
+ 	if (!cam) {
+-		up(&sn9c102_sysfs_lock);
++		mutex_unlock(&sn9c102_sysfs_lock);
+ 		return -ENODEV;
+ 	}
+ 
+ 	index = sn9c102_strtou8(buf, len, &count);
+ 	if (!count) {
+-		up(&sn9c102_sysfs_lock);
++		mutex_unlock(&sn9c102_sysfs_lock);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -1071,7 +1071,7 @@ sn9c102_store_i2c_reg(struct class_devic
+ 	DBG(2, "Moved sensor register index to 0x%02X", cam->sysfs.i2c_reg);
+ 	DBG(3, "Written bytes: %zd", count);
+ 
+-	up(&sn9c102_sysfs_lock);
++	mutex_unlock(&sn9c102_sysfs_lock);
+ 
+ 	return count;
+ }
+@@ -1083,22 +1083,22 @@ static ssize_t sn9c102_show_i2c_val(stru
+ 	ssize_t count;
+ 	int val;
+ 
+-	if (down_interruptible(&sn9c102_sysfs_lock))
++	if (mutex_lock_interruptible(&sn9c102_sysfs_lock))
+ 		return -ERESTARTSYS;
+ 
+ 	cam = video_get_drvdata(to_video_device(cd));
+ 	if (!cam) {
+-		up(&sn9c102_sysfs_lock);
++		mutex_unlock(&sn9c102_sysfs_lock);
+ 		return -ENODEV;
+ 	}
+ 
+ 	if (!(cam->sensor->sysfs_ops & SN9C102_I2C_READ)) {
+-		up(&sn9c102_sysfs_lock);
++		mutex_unlock(&sn9c102_sysfs_lock);
+ 		return -ENOSYS;
+ 	}
+ 
+ 	if ((val = sn9c102_i2c_read(cam, cam->sysfs.i2c_reg)) < 0) {
+-		up(&sn9c102_sysfs_lock);
++		mutex_unlock(&sn9c102_sysfs_lock);
+ 		return -EIO;
+ 	}
+ 
+@@ -1106,7 +1106,7 @@ static ssize_t sn9c102_show_i2c_val(stru
+ 
+ 	DBG(3, "Read bytes: %zd", count);
+ 
+-	up(&sn9c102_sysfs_lock);
++	mutex_unlock(&sn9c102_sysfs_lock);
+ 
+ 	return count;
+ } 
+@@ -1120,29 +1120,29 @@ sn9c102_store_i2c_val(struct class_devic
+ 	ssize_t count;
+ 	int err;
+ 
+-	if (down_interruptible(&sn9c102_sysfs_lock))
++	if (mutex_lock_interruptible(&sn9c102_sysfs_lock))
+ 		return -ERESTARTSYS;
+ 
+ 	cam = video_get_drvdata(to_video_device(cd));
+ 	if (!cam) {
+-		up(&sn9c102_sysfs_lock);
++		mutex_unlock(&sn9c102_sysfs_lock);
+ 		return -ENODEV;
+ 	}
+ 
+ 	if (!(cam->sensor->sysfs_ops & SN9C102_I2C_WRITE)) {
+-		up(&sn9c102_sysfs_lock);
++		mutex_unlock(&sn9c102_sysfs_lock);
+ 		return -ENOSYS;
+ 	}
+ 
+ 	value = sn9c102_strtou8(buf, len, &count);
+ 	if (!count) {
+-		up(&sn9c102_sysfs_lock);
++		mutex_unlock(&sn9c102_sysfs_lock);
+ 		return -EINVAL;
+ 	}
+ 
+ 	err = sn9c102_i2c_write(cam, cam->sysfs.i2c_reg, value);
+ 	if (err) {
+-		up(&sn9c102_sysfs_lock);
++		mutex_unlock(&sn9c102_sysfs_lock);
+ 		return -EIO;
+ 	}
+ 
+@@ -1150,7 +1150,7 @@ sn9c102_store_i2c_val(struct class_devic
+ 	    cam->sysfs.i2c_reg, value);
+ 	DBG(3, "Written bytes: %zd", count);
+ 
+-	up(&sn9c102_sysfs_lock);
++	mutex_unlock(&sn9c102_sysfs_lock);
+ 
+ 	return count;
+ }
+@@ -1165,18 +1165,18 @@ sn9c102_store_green(struct class_device*
+ 	u8 value;
+ 	ssize_t count;
+ 
+-	if (down_interruptible(&sn9c102_sysfs_lock))
++	if (mutex_lock_interruptible(&sn9c102_sysfs_lock))
+ 		return -ERESTARTSYS;
+ 
+ 	cam = video_get_drvdata(to_video_device(cd));
+ 	if (!cam) {
+-		up(&sn9c102_sysfs_lock);
++		mutex_unlock(&sn9c102_sysfs_lock);
+ 		return -ENODEV;
+ 	}
+ 
+ 	bridge = cam->bridge;
+ 
+-	up(&sn9c102_sysfs_lock);
++	mutex_unlock(&sn9c102_sysfs_lock);
+ 
+ 	value = sn9c102_strtou8(buf, len, &count);
+ 	if (!count)
+@@ -1438,7 +1438,7 @@ static int sn9c102_init(struct sn9c102_d
+ 	}
+ 
+ 	if (!(cam->state & DEV_INITIALIZED)) {
+-		init_MUTEX(&cam->fileop_sem);
++		mutex_init(&cam->fileop_mutex);
+ 		spin_lock_init(&cam->queue_lock);
+ 		init_waitqueue_head(&cam->wait_frame);
+ 		init_waitqueue_head(&cam->wait_stream);
+@@ -1456,13 +1456,13 @@ static int sn9c102_init(struct sn9c102_d
+ 
+ static void sn9c102_release_resources(struct sn9c102_device* cam)
+ {
+-	down(&sn9c102_sysfs_lock);
++	mutex_lock(&sn9c102_sysfs_lock);
+ 
+ 	DBG(2, "V4L2 device /dev/video%d deregistered", cam->v4ldev->minor);
+ 	video_set_drvdata(cam->v4ldev, NULL);
+ 	video_unregister_device(cam->v4ldev);
+ 
+-	up(&sn9c102_sysfs_lock);
++	mutex_unlock(&sn9c102_sysfs_lock);
+ 
+ 	kfree(cam->control_buffer);
+ }
+@@ -1483,7 +1483,7 @@ static int sn9c102_open(struct inode* in
+ 
+ 	cam = video_get_drvdata(video_devdata(filp));
+ 
+-	if (down_interruptible(&cam->dev_sem)) {
++	if (mutex_lock_interruptible(&cam->dev_mutex)) {
+ 		up_read(&sn9c102_disconnect);
+ 		return -ERESTARTSYS;
+ 	}
+@@ -1495,7 +1495,7 @@ static int sn9c102_open(struct inode* in
+ 			err = -EWOULDBLOCK;
+ 			goto out;
+ 		}
+-		up(&cam->dev_sem);
++		mutex_unlock(&cam->dev_mutex);
+ 		err = wait_event_interruptible_exclusive(cam->open,
+ 		                                  cam->state & DEV_DISCONNECTED
+ 		                                         || !cam->users);
+@@ -1507,7 +1507,7 @@ static int sn9c102_open(struct inode* in
+ 			up_read(&sn9c102_disconnect);
+ 			return -ENODEV;
+ 		}
+-		down(&cam->dev_sem);
++		mutex_lock(&cam->dev_mutex);
+ 	}
+ 
+ 
+@@ -1535,7 +1535,7 @@ static int sn9c102_open(struct inode* in
+ 	DBG(3, "Video device /dev/video%d is open", cam->v4ldev->minor);
+ 
+ out:
+-	up(&cam->dev_sem);
++	mutex_unlock(&cam->dev_mutex);
+ 	up_read(&sn9c102_disconnect);
+ 	return err;
+ }
+@@ -1545,7 +1545,7 @@ static int sn9c102_release(struct inode*
+ {
+ 	struct sn9c102_device* cam = video_get_drvdata(video_devdata(filp));
+ 
+-	down(&cam->dev_sem); /* prevent disconnect() to be called */
++	mutex_lock(&cam->dev_mutex); /* prevent disconnect() to be called */
+ 
+ 	sn9c102_stop_transfer(cam);
+ 
+@@ -1553,7 +1553,7 @@ static int sn9c102_release(struct inode*
+ 
+ 	if (cam->state & DEV_DISCONNECTED) {
+ 		sn9c102_release_resources(cam);
+-		up(&cam->dev_sem);
++		mutex_unlock(&cam->dev_mutex);
+ 		kfree(cam);
+ 		return 0;
+ 	}
+@@ -1563,7 +1563,7 @@ static int sn9c102_release(struct inode*
+ 
+ 	DBG(3, "Video device /dev/video%d closed", cam->v4ldev->minor);
+ 
+-	up(&cam->dev_sem);
++	mutex_unlock(&cam->dev_mutex);
+ 
+ 	return 0;
+ }
+@@ -1577,33 +1577,33 @@ sn9c102_read(struct file* filp, char __u
+ 	unsigned long lock_flags;
+ 	int err = 0;
+ 
+-	if (down_interruptible(&cam->fileop_sem))
++	if (mutex_lock_interruptible(&cam->fileop_mutex))
+ 		return -ERESTARTSYS;
+ 
+ 	if (cam->state & DEV_DISCONNECTED) {
+ 		DBG(1, "Device not present");
+-		up(&cam->fileop_sem);
++		mutex_unlock(&cam->fileop_mutex);
+ 		return -ENODEV;
+ 	}
+ 
+ 	if (cam->state & DEV_MISCONFIGURED) {
+ 		DBG(1, "The camera is misconfigured. Close and open it "
+ 		       "again.");
+-		up(&cam->fileop_sem);
++		mutex_unlock(&cam->fileop_mutex);
+ 		return -EIO;
+ 	}
+ 
+ 	if (cam->io == IO_MMAP) {
+ 		DBG(3, "Close and open the device again to choose "
+ 		       "the read method");
+-		up(&cam->fileop_sem);
++		mutex_unlock(&cam->fileop_mutex);
+ 		return -EINVAL;
+ 	}
+ 
+ 	if (cam->io == IO_NONE) {
+ 		if (!sn9c102_request_buffers(cam,cam->nreadbuffers, IO_READ)) {
+ 			DBG(1, "read() failed, not enough memory");
+-			up(&cam->fileop_sem);
++			mutex_unlock(&cam->fileop_mutex);
+ 			return -ENOMEM;
+ 		}
+ 		cam->io = IO_READ;
+@@ -1617,13 +1617,13 @@ sn9c102_read(struct file* filp, char __u
+ 	}
+ 
+ 	if (!count) {
+-		up(&cam->fileop_sem);
++		mutex_unlock(&cam->fileop_mutex);
+ 		return 0;
+ 	}
+ 
+ 	if (list_empty(&cam->outqueue)) {
+ 		if (filp->f_flags & O_NONBLOCK) {
+-			up(&cam->fileop_sem);
++			mutex_unlock(&cam->fileop_mutex);
+ 			return -EAGAIN;
+ 		}
+ 		err = wait_event_interruptible
+@@ -1632,15 +1632,15 @@ sn9c102_read(struct file* filp, char __u
+ 		        (cam->state & DEV_DISCONNECTED) ||
+ 			(cam->state & DEV_MISCONFIGURED) );
+ 		if (err) {
+-			up(&cam->fileop_sem);
++			mutex_unlock(&cam->fileop_mutex);
+ 			return err;
+ 		}
+ 		if (cam->state & DEV_DISCONNECTED) {
+-			up(&cam->fileop_sem);
++			mutex_unlock(&cam->fileop_mutex);
+ 			return -ENODEV;
+ 		}
+ 		if (cam->state & DEV_MISCONFIGURED) {
+-			up(&cam->fileop_sem);
++			mutex_unlock(&cam->fileop_mutex);
+ 			return -EIO;
+ 		}
+ 	}
+@@ -1668,7 +1668,7 @@ exit:
+ 	PDBGG("Frame #%lu, bytes read: %zu",
+ 	      (unsigned long)f->buf.index, count);
+ 
+-	up(&cam->fileop_sem);
++	mutex_unlock(&cam->fileop_mutex);
+ 
+ 	return count;
+ }
+@@ -1681,7 +1681,7 @@ static unsigned int sn9c102_poll(struct 
+ 	unsigned long lock_flags;
+ 	unsigned int mask = 0;
+ 
+-	if (down_interruptible(&cam->fileop_sem))
++	if (mutex_lock_interruptible(&cam->fileop_mutex))
+ 		return POLLERR;
+ 
+ 	if (cam->state & DEV_DISCONNECTED) {
+@@ -1719,12 +1719,12 @@ static unsigned int sn9c102_poll(struct 
+ 	if (!list_empty(&cam->outqueue))
+ 		mask |= POLLIN | POLLRDNORM;
+ 
+-	up(&cam->fileop_sem);
++	mutex_unlock(&cam->fileop_mutex);
+ 
+ 	return mask;
+ 
+ error:
+-	up(&cam->fileop_sem);
++	mutex_unlock(&cam->fileop_mutex);
+ 	return POLLERR;
+ }
+ 
+@@ -1759,25 +1759,25 @@ static int sn9c102_mmap(struct file* fil
+ 	              page;
+ 	u32 i;
+ 
+-	if (down_interruptible(&cam->fileop_sem))
++	if (mutex_lock_interruptible(&cam->fileop_mutex))
+ 		return -ERESTARTSYS;
+ 
+ 	if (cam->state & DEV_DISCONNECTED) {
+ 		DBG(1, "Device not present");
+-		up(&cam->fileop_sem);
++		mutex_unlock(&cam->fileop_mutex);
+ 		return -ENODEV;
+ 	}
+ 
+ 	if (cam->state & DEV_MISCONFIGURED) {
+ 		DBG(1, "The camera is misconfigured. Close and open it "
+ 		       "again.");
+-		up(&cam->fileop_sem);
++		mutex_unlock(&cam->fileop_mutex);
+ 		return -EIO;
+ 	}
+ 
+ 	if (cam->io != IO_MMAP || !(vma->vm_flags & VM_WRITE) ||
+ 	    size != PAGE_ALIGN(cam->frame[0].buf.length)) {
+-		up(&cam->fileop_sem);
++		mutex_unlock(&cam->fileop_mutex);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -1786,7 +1786,7 @@ static int sn9c102_mmap(struct file* fil
+ 			break;
+ 	}
+ 	if (i == cam->nbuffers) {
+-		up(&cam->fileop_sem);
++		mutex_unlock(&cam->fileop_mutex);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -1799,7 +1799,7 @@ static int sn9c102_mmap(struct file* fil
+ 		page = vmalloc_to_pfn((void *)pos);
+ 		if (remap_pfn_range(vma, start, page, PAGE_SIZE,
+ 		                    vma->vm_page_prot)) {
+-			up(&cam->fileop_sem);
++			mutex_unlock(&cam->fileop_mutex);
+ 			return -EAGAIN;
+ 		}
+ 		start += PAGE_SIZE;
+@@ -1812,7 +1812,7 @@ static int sn9c102_mmap(struct file* fil
+ 
+ 	sn9c102_vm_open(vma);
+ 
+-	up(&cam->fileop_sem);
++	mutex_unlock(&cam->fileop_mutex);
+ 
+ 	return 0;
+ }
+@@ -2692,25 +2692,25 @@ static int sn9c102_ioctl(struct inode* i
+ 	struct sn9c102_device* cam = video_get_drvdata(video_devdata(filp));
+ 	int err = 0;
+ 
+-	if (down_interruptible(&cam->fileop_sem))
++	if (mutex_lock_interruptible(&cam->fileop_mutex))
+ 		return -ERESTARTSYS;
+ 
+ 	if (cam->state & DEV_DISCONNECTED) {
+ 		DBG(1, "Device not present");
+-		up(&cam->fileop_sem);
++		mutex_unlock(&cam->fileop_mutex);
+ 		return -ENODEV;
+ 	}
+ 
+ 	if (cam->state & DEV_MISCONFIGURED) {
+ 		DBG(1, "The camera is misconfigured. Close and open it "
+ 		       "again.");
+-		up(&cam->fileop_sem);
++		mutex_unlock(&cam->fileop_mutex);
+ 		return -EIO;
+ 	}
+ 
+ 	err = sn9c102_ioctl_v4l2(inode, filp, cmd, (void __user *)arg);
+ 
+-	up(&cam->fileop_sem);
++	mutex_unlock(&cam->fileop_mutex);
+ 
+ 	return err;
+ }
+@@ -2758,7 +2758,7 @@ sn9c102_usb_probe(struct usb_interface* 
+ 		goto fail;
+ 	}
+ 
+-	init_MUTEX(&cam->dev_sem);
++	mutex_init(&cam->dev_mutex);
+ 
+ 	r = sn9c102_read_reg(cam, 0x00);
+ 	if (r < 0 || r != 0x10) {
+@@ -2812,7 +2812,7 @@ sn9c102_usb_probe(struct usb_interface* 
+ 	cam->v4ldev->release = video_device_release;
+ 	video_set_drvdata(cam->v4ldev, cam);
+ 
+-	down(&cam->dev_sem);
++	mutex_lock(&cam->dev_mutex);
+ 
+ 	err = video_register_device(cam->v4ldev, VFL_TYPE_GRABBER,
+ 	                            video_nr[dev_nr]);
+@@ -2822,7 +2822,7 @@ sn9c102_usb_probe(struct usb_interface* 
+ 			DBG(1, "Free /dev/videoX node not found");
+ 		video_nr[dev_nr] = -1;
+ 		dev_nr = (dev_nr < SN9C102_MAX_DEVICES-1) ? dev_nr+1 : 0;
+-		up(&cam->dev_sem);
++		mutex_unlock(&cam->dev_mutex);
+ 		goto fail;
+ 	}
+ 
+@@ -2837,7 +2837,7 @@ sn9c102_usb_probe(struct usb_interface* 
+ 
+ 	usb_set_intfdata(intf, cam);
+ 
+-	up(&cam->dev_sem);
++	mutex_unlock(&cam->dev_mutex);
+ 
+ 	return 0;
+ 
+@@ -2861,7 +2861,7 @@ static void sn9c102_usb_disconnect(struc
+ 
+ 	down_write(&sn9c102_disconnect);
+ 
+-	down(&cam->dev_sem); 
++	mutex_lock(&cam->dev_mutex);
+ 
+ 	DBG(2, "Disconnecting %s...", cam->v4ldev->name);
+ 
+@@ -2881,7 +2881,7 @@ static void sn9c102_usb_disconnect(struc
+ 		sn9c102_release_resources(cam);
+ 	}
+ 
+-	up(&cam->dev_sem);
++	mutex_unlock(&cam->dev_mutex);
+ 
+ 	if (!cam->users)
+ 		kfree(cam);
+--- gregkh-2.6.orig/drivers/usb/media/vicam.c
++++ gregkh-2.6/drivers/usb/media/vicam.c
+@@ -42,6 +42,7 @@
+ #include <linux/vmalloc.h>
+ #include <linux/slab.h>
+ #include <linux/proc_fs.h>
++#include <linux/mutex.h>
+ #include "usbvideo.h"
+ 
+ // #define VICAM_DEBUG
+@@ -407,7 +408,7 @@ struct vicam_camera {
+ 	struct usb_device *udev;	// usb device
+ 
+ 	/* guard against simultaneous accesses to the camera */
+-	struct semaphore cam_lock;
++	struct mutex cam_lock;
+ 
+ 	int is_initialized;
+ 	u8 open_count;
+@@ -461,12 +462,12 @@ static int send_control_msg(struct vicam
+ 			    u16 size)
+ {
+ 	int status = -ENODEV;
+-	down(&cam->cam_lock);
++	mutex_lock(&cam->cam_lock);
+ 	if (cam->udev) {
+ 		status = __send_control_msg(cam, request, value,
+ 					    index, cp, size);
+ 	}
+-	up(&cam->cam_lock);
++	mutex_unlock(&cam->cam_lock);
+ 	return status;
+ }
+ static int
+@@ -831,13 +832,13 @@ vicam_close(struct inode *inode, struct 
+ 	rvfree(cam->framebuf, VICAM_MAX_FRAME_SIZE * VICAM_FRAMES);
+ 	kfree(cam->cntrlbuf);
+ 
+-	down(&cam->cam_lock);
++	mutex_lock(&cam->cam_lock);
+ 
+ 	cam->open_count--;
+ 	open_count = cam->open_count;
+ 	udev = cam->udev;
+ 
+-	up(&cam->cam_lock);
++	mutex_unlock(&cam->cam_lock);
+ 
+ 	if (!open_count && !udev) {
+ 		kfree(cam);
+@@ -960,7 +961,7 @@ read_frame(struct vicam_camera *cam, int
+ 	request[8] = 0;
+ 	// bytes 9-15 do not seem to affect exposure or image quality
+ 
+-	down(&cam->cam_lock);
++	mutex_lock(&cam->cam_lock);
+ 
+ 	if (!cam->udev) {
+ 		goto done;
+@@ -985,7 +986,7 @@ read_frame(struct vicam_camera *cam, int
+ 	}
+ 
+  done:
+-	up(&cam->cam_lock);
++	mutex_unlock(&cam->cam_lock);
+ }
+ 
+ static ssize_t
+@@ -1309,7 +1310,7 @@ vicam_probe( struct usb_interface *intf,
+ 
+ 	cam->shutter_speed = 15;
+ 
+-	init_MUTEX(&cam->cam_lock);
++	mutex_init(&cam->cam_lock);
+ 
+ 	memcpy(&cam->vdev, &vicam_template,
+ 	       sizeof (vicam_template));
+@@ -1351,7 +1352,7 @@ vicam_disconnect(struct usb_interface *i
+ 
+ 	/* stop the camera from being used */
+ 
+-	down(&cam->cam_lock);
++	mutex_lock(&cam->cam_lock);
+ 
+ 	/* mark the camera as gone */
+ 
+@@ -1368,7 +1369,7 @@ vicam_disconnect(struct usb_interface *i
+ 
+ 	open_count = cam->open_count;
+ 
+-	up(&cam->cam_lock);
++	mutex_unlock(&cam->cam_lock);
+ 
+ 	if (!open_count) {
+ 		kfree(cam);
+--- gregkh-2.6.orig/drivers/usb/media/w9968cf.c
++++ gregkh-2.6/drivers/usb/media/w9968cf.c
+@@ -2418,7 +2418,7 @@ w9968cf_configure_camera(struct w9968cf_
+                          enum w9968cf_model_id mod_id,
+                          const unsigned short dev_nr)
+ {
+-	init_MUTEX(&cam->fileop_sem);
++	mutex_init(&cam->fileop_mutex);
+ 	init_waitqueue_head(&cam->open);
+ 	spin_lock_init(&cam->urb_lock);
+ 	spin_lock_init(&cam->flist_lock);
+@@ -2646,7 +2646,7 @@ static void w9968cf_adjust_configuration
+   --------------------------------------------------------------------------*/
+ static void w9968cf_release_resources(struct w9968cf_device* cam)
+ {
+-	down(&w9968cf_devlist_sem);
++	mutex_lock(&w9968cf_devlist_mutex);
+ 
+ 	DBG(2, "V4L device deregistered: /dev/video%d", cam->v4ldev->minor)
+ 
+@@ -2657,7 +2657,7 @@ static void w9968cf_release_resources(st
+ 	kfree(cam->control_buffer);
+ 	kfree(cam->data_buffer);
+ 
+-	up(&w9968cf_devlist_sem);
++	mutex_unlock(&w9968cf_devlist_mutex);
+ }
+ 
+ 
+@@ -2677,14 +2677,14 @@ static int w9968cf_open(struct inode* in
+ 
+ 	cam = (struct w9968cf_device*)video_get_drvdata(video_devdata(filp));
+ 
+-	down(&cam->dev_sem);
++	mutex_lock(&cam->dev_mutex);
+ 
+ 	if (cam->sensor == CC_UNKNOWN) {
+ 		DBG(2, "No supported image sensor has been detected by the "
+ 		       "'ovcamchip' module for the %s (/dev/video%d). Make "
+ 		       "sure it is loaded *before* (re)connecting the camera.",
+ 		    symbolic(camlist, cam->id), cam->v4ldev->minor)
+-		up(&cam->dev_sem);
++		mutex_unlock(&cam->dev_mutex);
+ 		up_read(&w9968cf_disconnect);
+ 		return -ENODEV;
+ 	}
+@@ -2693,11 +2693,11 @@ static int w9968cf_open(struct inode* in
+ 		DBG(2, "%s (/dev/video%d) has been already occupied by '%s'",
+ 		    symbolic(camlist, cam->id),cam->v4ldev->minor,cam->command)
+ 		if ((filp->f_flags & O_NONBLOCK)||(filp->f_flags & O_NDELAY)) {
+-			up(&cam->dev_sem);
++			mutex_unlock(&cam->dev_mutex);
+ 			up_read(&w9968cf_disconnect);
+ 			return -EWOULDBLOCK;
+ 		}
+-		up(&cam->dev_sem);
++		mutex_unlock(&cam->dev_mutex);
+ 		err = wait_event_interruptible_exclusive(cam->open,
+ 		                                         cam->disconnected ||
+ 		                                         !cam->users);
+@@ -2709,7 +2709,7 @@ static int w9968cf_open(struct inode* in
+ 			up_read(&w9968cf_disconnect);
+ 			return -ENODEV;
+ 		}
+-		down(&cam->dev_sem);
++		mutex_lock(&cam->dev_mutex);
+ 	}
+ 
+ 	DBG(5, "Opening '%s', /dev/video%d ...",
+@@ -2738,7 +2738,7 @@ static int w9968cf_open(struct inode* in
+ 
+ 	DBG(5, "Video device is open")
+ 
+-	up(&cam->dev_sem);
++	mutex_unlock(&cam->dev_mutex);
+ 	up_read(&w9968cf_disconnect);
+ 
+ 	return 0;
+@@ -2746,7 +2746,7 @@ static int w9968cf_open(struct inode* in
+ deallocate_memory:
+ 	w9968cf_deallocate_memory(cam);
+ 	DBG(2, "Failed to open the video device")
+-	up(&cam->dev_sem);
++	mutex_unlock(&cam->dev_mutex);
+ 	up_read(&w9968cf_disconnect);
+ 	return err;
+ }
+@@ -2758,13 +2758,13 @@ static int w9968cf_release(struct inode*
+ 
+ 	cam = (struct w9968cf_device*)video_get_drvdata(video_devdata(filp));
+ 
+-	down(&cam->dev_sem); /* prevent disconnect() to be called */
++	mutex_lock(&cam->dev_mutex); /* prevent disconnect() to be called */
+ 
+ 	w9968cf_stop_transfer(cam);
+ 
+ 	if (cam->disconnected) {
+ 		w9968cf_release_resources(cam);
+-		up(&cam->dev_sem);
++		mutex_unlock(&cam->dev_mutex);
+ 		kfree(cam);
+ 		return 0;
+ 	}
+@@ -2774,7 +2774,7 @@ static int w9968cf_release(struct inode*
+ 	wake_up_interruptible_nr(&cam->open, 1);
+ 
+ 	DBG(5, "Video device closed")
+-	up(&cam->dev_sem);
++	mutex_unlock(&cam->dev_mutex);
+ 	return 0;
+ }
+ 
+@@ -2791,18 +2791,18 @@ w9968cf_read(struct file* filp, char __u
+ 	if (filp->f_flags & O_NONBLOCK)
+ 		return -EWOULDBLOCK;
+ 
+-	if (down_interruptible(&cam->fileop_sem))
++	if (mutex_lock_interruptible(&cam->fileop_mutex))
+ 		return -ERESTARTSYS;
+ 
+ 	if (cam->disconnected) {
+ 		DBG(2, "Device not present")
+-		up(&cam->fileop_sem);
++		mutex_unlock(&cam->fileop_mutex);
+ 		return -ENODEV;
+ 	}
+ 
+ 	if (cam->misconfigured) {
+ 		DBG(2, "The camera is misconfigured. Close and open it again.")
+-		up(&cam->fileop_sem);
++		mutex_unlock(&cam->fileop_mutex);
+ 		return -EIO;
+ 	}
+ 
+@@ -2817,11 +2817,11 @@ w9968cf_read(struct file* filp, char __u
+ 	                               cam->frame[1].status == F_READY ||
+ 	                               cam->disconnected);
+ 	if (err) {
+-		up(&cam->fileop_sem);
++		mutex_unlock(&cam->fileop_mutex);
+ 		return err;
+ 	}
+ 	if (cam->disconnected) {
+-		up(&cam->fileop_sem);
++		mutex_unlock(&cam->fileop_mutex);
+ 		return -ENODEV;
+ 	}
+ 
+@@ -2835,7 +2835,7 @@ w9968cf_read(struct file* filp, char __u
+ 
+ 	if (copy_to_user(buf, fr->buffer, count)) {
+ 		fr->status = F_UNUSED;
+-		up(&cam->fileop_sem);
++		mutex_unlock(&cam->fileop_mutex);
+ 		return -EFAULT;
+ 	}
+ 	*f_pos += count;
+@@ -2844,7 +2844,7 @@ w9968cf_read(struct file* filp, char __u
+ 
+ 	DBG(5, "%zu bytes read", count)
+ 
+-	up(&cam->fileop_sem);
++	mutex_unlock(&cam->fileop_mutex);
+ 	return count;
+ }
+ 
+@@ -2898,24 +2898,24 @@ w9968cf_ioctl(struct inode* inode, struc
+ 
+ 	cam = (struct w9968cf_device*)video_get_drvdata(video_devdata(filp));
+ 
+-	if (down_interruptible(&cam->fileop_sem))
++	if (mutex_lock_interruptible(&cam->fileop_mutex))
+ 		return -ERESTARTSYS;
+ 
+ 	if (cam->disconnected) {
+ 		DBG(2, "Device not present")
+-		up(&cam->fileop_sem);
++		mutex_unlock(&cam->fileop_mutex);
+ 		return -ENODEV;
+ 	}
+ 
+ 	if (cam->misconfigured) {
+ 		DBG(2, "The camera is misconfigured. Close and open it again.")
+-		up(&cam->fileop_sem);
++		mutex_unlock(&cam->fileop_mutex);
+ 		return -EIO;
+ 	}
+ 
+ 	err = w9968cf_v4l_ioctl(inode, filp, cmd, (void __user *)arg);
+ 
+-	up(&cam->fileop_sem);
++	mutex_unlock(&cam->fileop_mutex);
+ 	return err;
+ }
+ 
+@@ -3502,8 +3502,8 @@ w9968cf_usb_probe(struct usb_interface* 
+ 	if (!cam)
+ 		return -ENOMEM;
+ 
+-	init_MUTEX(&cam->dev_sem);
+-	down(&cam->dev_sem);
++	mutex_init(&cam->dev_mutex);
++	mutex_lock(&cam->dev_mutex);
+ 
+ 	cam->usbdev = udev;
+ 	/* NOTE: a local copy is used to avoid possible race conditions */
+@@ -3515,10 +3515,10 @@ w9968cf_usb_probe(struct usb_interface* 
+ 		simcams = W9968CF_SIMCAMS;
+ 
+ 	/* How many cameras are connected ? */
+-	down(&w9968cf_devlist_sem);
++	mutex_lock(&w9968cf_devlist_mutex);
+ 	list_for_each(ptr, &w9968cf_dev_list)
+ 		sc++;
+-	up(&w9968cf_devlist_sem);
++	mutex_unlock(&w9968cf_devlist_mutex);
+ 
+ 	if (sc >= simcams) {
+ 		DBG(2, "Device rejected: too many connected cameras "
+@@ -3578,9 +3578,9 @@ w9968cf_usb_probe(struct usb_interface* 
+ 	w9968cf_configure_camera(cam, udev, mod_id, dev_nr);
+ 
+ 	/* Add a new entry into the list of V4L registered devices */
+-	down(&w9968cf_devlist_sem);
++	mutex_lock(&w9968cf_devlist_mutex);
+ 	list_add(&cam->v4llist, &w9968cf_dev_list);
+-	up(&w9968cf_devlist_sem);
++	mutex_unlock(&w9968cf_devlist_mutex);
+ 	dev_nr = (dev_nr < W9968CF_MAX_DEVICES-1) ? dev_nr+1 : 0;
+ 
+ 	w9968cf_turn_on_led(cam);
+@@ -3588,7 +3588,7 @@ w9968cf_usb_probe(struct usb_interface* 
+ 	w9968cf_i2c_init(cam);
+ 
+ 	usb_set_intfdata(intf, cam);
+-	up(&cam->dev_sem);
++	mutex_unlock(&cam->dev_mutex);
+ 	return 0;
+ 
+ fail: /* Free unused memory */
+@@ -3596,7 +3596,7 @@ fail: /* Free unused memory */
+ 	kfree(cam->data_buffer);
+ 	if (cam->v4ldev)
+ 		video_device_release(cam->v4ldev);
+-	up(&cam->dev_sem);
++	mutex_unlock(&cam->dev_mutex);
+ 	kfree(cam);
+ 	return err;
+ }
+@@ -3611,7 +3611,7 @@ static void w9968cf_usb_disconnect(struc
+ 
+ 	if (cam) {
+ 		/* Prevent concurrent accesses to data */
+-		down(&cam->dev_sem); 
++		mutex_lock(&cam->dev_mutex);
+ 
+ 		cam->disconnected = 1;
+ 
+@@ -3630,7 +3630,7 @@ static void w9968cf_usb_disconnect(struc
+ 		} else
+ 			w9968cf_release_resources(cam);
+ 
+-		up(&cam->dev_sem);
++		mutex_unlock(&cam->dev_mutex);
+ 
+ 		if (!cam->users)
+ 			kfree(cam);
+--- gregkh-2.6.orig/drivers/usb/media/w9968cf.h
++++ gregkh-2.6/drivers/usb/media/w9968cf.h
+@@ -32,7 +32,7 @@
+ #include <linux/param.h>
+ #include <linux/types.h>
+ #include <linux/rwsem.h>
+-#include <asm/semaphore.h>
++#include <linux/mutex.h>
+ 
+ #include <media/ovcamchip.h>
+ 
+@@ -277,8 +277,8 @@ struct w9968cf_device {
+ 	struct i2c_client* sensor_client;
+ 
+ 	/* Locks */
+-	struct semaphore dev_sem,    /* for probe, disconnect,open and close */
+-	                 fileop_sem; /* for read and ioctl */
++	struct mutex dev_mutex,    /* for probe, disconnect,open and close */
++	                 fileop_mutex; /* for read and ioctl */
+ 	spinlock_t urb_lock,   /* for submit_urb() and unlink_urb() */
+ 	           flist_lock; /* for requested frame list accesses */
+ 	wait_queue_head_t open, wait_queue;
+--- gregkh-2.6.orig/drivers/usb/media/ov511.c
++++ gregkh-2.6/drivers/usb/media/ov511.c
+@@ -365,14 +365,14 @@ reg_w(struct usb_ov511 *ov, unsigned cha
+ 
+ 	PDEBUG(5, "0x%02X:0x%02X", reg, value);
+ 
+-	down(&ov->cbuf_lock);
++	mutex_lock(&ov->cbuf_lock);
+ 	ov->cbuf[0] = value;
+ 	rc = usb_control_msg(ov->dev,
+ 			     usb_sndctrlpipe(ov->dev, 0),
+ 			     (ov->bclass == BCL_OV518)?1:2 /* REG_IO */,
+ 			     USB_TYPE_VENDOR | USB_RECIP_DEVICE,
+ 			     0, (__u16)reg, &ov->cbuf[0], 1, 1000);
+-	up(&ov->cbuf_lock);
++	mutex_unlock(&ov->cbuf_lock);
+ 
+ 	if (rc < 0)
+ 		err("reg write: error %d: %s", rc, symbolic(urb_errlist, rc));
+@@ -387,7 +387,7 @@ reg_r(struct usb_ov511 *ov, unsigned cha
+ {
+ 	int rc;
+ 
+-	down(&ov->cbuf_lock);
++	mutex_lock(&ov->cbuf_lock);
+ 	rc = usb_control_msg(ov->dev,
+ 			     usb_rcvctrlpipe(ov->dev, 0),
+ 			     (ov->bclass == BCL_OV518)?1:3 /* REG_IO */,
+@@ -401,7 +401,7 @@ reg_r(struct usb_ov511 *ov, unsigned cha
+ 		PDEBUG(5, "0x%02X:0x%02X", reg, ov->cbuf[0]);
+ 	}
+ 
+-	up(&ov->cbuf_lock);
++	mutex_unlock(&ov->cbuf_lock);
+ 
+ 	return rc;
+ }
+@@ -444,7 +444,7 @@ ov518_reg_w32(struct usb_ov511 *ov, unsi
+ 
+ 	PDEBUG(5, "0x%02X:%7d, n=%d", reg, val, n);
+ 
+-	down(&ov->cbuf_lock);
++	mutex_lock(&ov->cbuf_lock);
+ 
+ 	*((__le32 *)ov->cbuf) = __cpu_to_le32(val);
+ 
+@@ -453,7 +453,7 @@ ov518_reg_w32(struct usb_ov511 *ov, unsi
+ 			     1 /* REG_IO */,
+ 			     USB_TYPE_VENDOR | USB_RECIP_DEVICE,
+ 			     0, (__u16)reg, ov->cbuf, n, 1000);
+-	up(&ov->cbuf_lock);
++	mutex_unlock(&ov->cbuf_lock);
+ 
+ 	if (rc < 0)
+ 		err("reg write multiple: error %d: %s", rc,
+@@ -768,14 +768,14 @@ i2c_r(struct usb_ov511 *ov, unsigned cha
+ {
+ 	int rc;
+ 
+-	down(&ov->i2c_lock);
++	mutex_lock(&ov->i2c_lock);
+ 
+ 	if (ov->bclass == BCL_OV518)
+ 		rc = ov518_i2c_read_internal(ov, reg);
+ 	else
+ 		rc = ov511_i2c_read_internal(ov, reg);
+ 
+-	up(&ov->i2c_lock);
++	mutex_unlock(&ov->i2c_lock);
+ 
+ 	return rc;
+ }
+@@ -785,14 +785,14 @@ i2c_w(struct usb_ov511 *ov, unsigned cha
+ {
+ 	int rc;
+ 
+-	down(&ov->i2c_lock);
++	mutex_lock(&ov->i2c_lock);
+ 
+ 	if (ov->bclass == BCL_OV518)
+ 		rc = ov518_i2c_write_internal(ov, reg, value);
+ 	else
+ 		rc = ov511_i2c_write_internal(ov, reg, value);
+ 
+-	up(&ov->i2c_lock);
++	mutex_unlock(&ov->i2c_lock);
+ 
+ 	return rc;
+ }
+@@ -842,9 +842,9 @@ i2c_w_mask(struct usb_ov511 *ov,
+ {
+ 	int rc;
+ 
+-	down(&ov->i2c_lock);
++	mutex_lock(&ov->i2c_lock);
+ 	rc = ov51x_i2c_write_mask_internal(ov, reg, value, mask);
+-	up(&ov->i2c_lock);
++	mutex_unlock(&ov->i2c_lock);
+ 
+ 	return rc;
+ }
+@@ -880,7 +880,7 @@ i2c_w_slave(struct usb_ov511 *ov,
+ {
+ 	int rc = 0;
+ 
+-	down(&ov->i2c_lock);
++	mutex_lock(&ov->i2c_lock);
+ 
+ 	/* Set new slave IDs */
+ 	rc = i2c_set_slave_internal(ov, slave);
+@@ -894,7 +894,7 @@ out:
+ 	if (i2c_set_slave_internal(ov, ov->primary_i2c_slave) < 0)
+ 		err("Couldn't restore primary I2C slave");
+ 
+-	up(&ov->i2c_lock);
++	mutex_unlock(&ov->i2c_lock);
+ 	return rc;
+ }
+ 
+@@ -906,7 +906,7 @@ i2c_r_slave(struct usb_ov511 *ov,
+ {
+ 	int rc;
+ 
+-	down(&ov->i2c_lock);
++	mutex_lock(&ov->i2c_lock);
+ 
+ 	/* Set new slave IDs */
+ 	rc = i2c_set_slave_internal(ov, slave);
+@@ -923,7 +923,7 @@ out:
+ 	if (i2c_set_slave_internal(ov, ov->primary_i2c_slave) < 0)
+ 		err("Couldn't restore primary I2C slave");
+ 
+-	up(&ov->i2c_lock);
++	mutex_unlock(&ov->i2c_lock);
+ 	return rc;
+ }
+ 
+@@ -933,7 +933,7 @@ ov51x_set_slave_ids(struct usb_ov511 *ov
+ {
+ 	int rc;
+ 
+-	down(&ov->i2c_lock);
++	mutex_lock(&ov->i2c_lock);
+ 
+ 	rc = i2c_set_slave_internal(ov, sid);
+ 	if (rc < 0)
+@@ -942,7 +942,7 @@ ov51x_set_slave_ids(struct usb_ov511 *ov
+ 	// FIXME: Is this actually necessary?
+ 	rc = ov51x_reset(ov, OV511_RESET_NOREGS);
+ out:
+-	up(&ov->i2c_lock);
++	mutex_unlock(&ov->i2c_lock);
+ 	return rc;
+ }
+ 
+@@ -3832,7 +3832,7 @@ ov51x_alloc(struct usb_ov511 *ov)
+ 	const int raw_bufsize = OV511_NUMFRAMES * MAX_RAW_DATA_SIZE(w, h);
+ 
+ 	PDEBUG(4, "entered");
+-	down(&ov->buf_lock);
++	mutex_lock(&ov->buf_lock);
+ 
+ 	if (ov->buf_state == BUF_ALLOCATED)
+ 		goto out;
+@@ -3879,12 +3879,12 @@ ov51x_alloc(struct usb_ov511 *ov)
+ 
+ 	ov->buf_state = BUF_ALLOCATED;
+ out:
+-	up(&ov->buf_lock);
++	mutex_unlock(&ov->buf_lock);
+ 	PDEBUG(4, "leaving");
+ 	return 0;
+ error:
+ 	ov51x_do_dealloc(ov);
+-	up(&ov->buf_lock);
++	mutex_unlock(&ov->buf_lock);
+ 	PDEBUG(4, "errored");
+ 	return -ENOMEM;
+ }
+@@ -3893,9 +3893,9 @@ static void
+ ov51x_dealloc(struct usb_ov511 *ov)
+ {
+ 	PDEBUG(4, "entered");
+-	down(&ov->buf_lock);
++	mutex_lock(&ov->buf_lock);
+ 	ov51x_do_dealloc(ov);
+-	up(&ov->buf_lock);
++	mutex_unlock(&ov->buf_lock);
+ 	PDEBUG(4, "leaving");
+ }
+ 
+@@ -3914,7 +3914,7 @@ ov51x_v4l1_open(struct inode *inode, str
+ 
+ 	PDEBUG(4, "opening");
+ 
+-	down(&ov->lock);
++	mutex_lock(&ov->lock);
+ 
+ 	err = -EBUSY;
+ 	if (ov->user)
+@@ -3958,7 +3958,7 @@ ov51x_v4l1_open(struct inode *inode, str
+ 		ov51x_led_control(ov, 1);
+ 
+ out:
+-	up(&ov->lock);
++	mutex_unlock(&ov->lock);
+ 	return err;
+ }
+ 
+@@ -3970,7 +3970,7 @@ ov51x_v4l1_close(struct inode *inode, st
+ 
+ 	PDEBUG(4, "ov511_close");
+ 
+-	down(&ov->lock);
++	mutex_lock(&ov->lock);
+ 
+ 	ov->user--;
+ 	ov51x_stop_isoc(ov);
+@@ -3981,15 +3981,15 @@ ov51x_v4l1_close(struct inode *inode, st
+ 	if (ov->dev)
+ 		ov51x_dealloc(ov);
+ 
+-	up(&ov->lock);
++	mutex_unlock(&ov->lock);
+ 
+ 	/* Device unplugged while open. Only a minimum of unregistration is done
+ 	 * here; the disconnect callback already did the rest. */
+ 	if (!ov->dev) {
+-		down(&ov->cbuf_lock);
++		mutex_lock(&ov->cbuf_lock);
+ 		kfree(ov->cbuf);
+ 		ov->cbuf = NULL;
+-		up(&ov->cbuf_lock);
++		mutex_unlock(&ov->cbuf_lock);
+ 
+ 		ov51x_dealloc(ov);
+ 		kfree(ov);
+@@ -4449,12 +4449,12 @@ ov51x_v4l1_ioctl(struct inode *inode, st
+ 	struct usb_ov511 *ov = video_get_drvdata(vdev);
+ 	int rc;
+ 
+-	if (down_interruptible(&ov->lock))
++	if (mutex_lock_interruptible(&ov->lock))
+ 		return -EINTR;
+ 
+ 	rc = video_usercopy(inode, file, cmd, arg, ov51x_v4l1_ioctl_internal);
+ 
+-	up(&ov->lock);
++	mutex_unlock(&ov->lock);
+ 	return rc;
+ }
+ 
+@@ -4468,7 +4468,7 @@ ov51x_v4l1_read(struct file *file, char 
+ 	int i, rc = 0, frmx = -1;
+ 	struct ov511_frame *frame;
+ 
+-	if (down_interruptible(&ov->lock))
++	if (mutex_lock_interruptible(&ov->lock))
+ 		return -EINTR;
+ 
+ 	PDEBUG(4, "%ld bytes, noblock=%d", count, noblock);
+@@ -4604,11 +4604,11 @@ restart:
+ 
+ 	PDEBUG(4, "read finished, returning %ld (sweet)", count);
+ 
+-	up(&ov->lock);
++	mutex_unlock(&ov->lock);
+ 	return count;
+ 
+ error:
+-	up(&ov->lock);
++	mutex_unlock(&ov->lock);
+ 	return rc;
+ }
+ 
+@@ -4631,14 +4631,14 @@ ov51x_v4l1_mmap(struct file *file, struc
+ 	              + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1))))
+ 		return -EINVAL;
+ 
+-	if (down_interruptible(&ov->lock))
++	if (mutex_lock_interruptible(&ov->lock))
+ 		return -EINTR;
+ 
+ 	pos = (unsigned long)ov->fbuf;
+ 	while (size > 0) {
+ 		page = vmalloc_to_pfn((void *)pos);
+ 		if (remap_pfn_range(vma, start, page, PAGE_SIZE, PAGE_SHARED)) {
+-			up(&ov->lock);
++			mutex_unlock(&ov->lock);
+ 			return -EAGAIN;
+ 		}
+ 		start += PAGE_SIZE;
+@@ -4649,7 +4649,7 @@ ov51x_v4l1_mmap(struct file *file, struc
+ 			size = 0;
+ 	}
+ 
+-	up(&ov->lock);
++	mutex_unlock(&ov->lock);
+ 	return 0;
+ }
+ 
+@@ -5738,11 +5738,10 @@ ov51x_probe(struct usb_interface *intf, 
+ 
+ 	init_waitqueue_head(&ov->wq);
+ 
+-	init_MUTEX(&ov->lock);	/* to 1 == available */
+-	init_MUTEX(&ov->buf_lock);
+-	init_MUTEX(&ov->param_lock);
+-	init_MUTEX(&ov->i2c_lock);
+-	init_MUTEX(&ov->cbuf_lock);
++	mutex_init(&ov->lock);	/* to 1 == available */
++	mutex_init(&ov->buf_lock);
++	mutex_init(&ov->i2c_lock);
++	mutex_init(&ov->cbuf_lock);
+ 
+ 	ov->buf_state = BUF_NOT_ALLOCATED;
+ 
+@@ -5833,10 +5832,10 @@ error:
+ 	}
+ 
+ 	if (ov->cbuf) {
+-		down(&ov->cbuf_lock);
++		mutex_lock(&ov->cbuf_lock);
+ 		kfree(ov->cbuf);
+ 		ov->cbuf = NULL;
+-		up(&ov->cbuf_lock);
++		mutex_unlock(&ov->cbuf_lock);
+ 	}
+ 
+ 	kfree(ov);
+@@ -5881,10 +5880,10 @@ ov51x_disconnect(struct usb_interface *i
+ 
+ 	/* Free the memory */
+ 	if (ov && !ov->user) {
+-		down(&ov->cbuf_lock);
++		mutex_lock(&ov->cbuf_lock);
+ 		kfree(ov->cbuf);
+ 		ov->cbuf = NULL;
+-		up(&ov->cbuf_lock);
++		mutex_unlock(&ov->cbuf_lock);
+ 
+ 		ov51x_dealloc(ov);
+ 		kfree(ov);
+--- gregkh-2.6.orig/drivers/usb/media/ov511.h
++++ gregkh-2.6/drivers/usb/media/ov511.h
+@@ -5,6 +5,7 @@
+ #include <linux/videodev.h>
+ #include <linux/smp_lock.h>
+ #include <linux/usb.h>
++#include <linux/mutex.h>
+ 
+ #define OV511_DEBUG	/* Turn on debug messages */
+ 
+@@ -435,7 +436,7 @@ struct usb_ov511 {
+ 
+ 	int led_policy;		/* LED: off|on|auto; OV511+ only */
+ 
+-	struct semaphore lock;	/* Serializes user-accessible operations */
++	struct mutex lock;	/* Serializes user-accessible operations */
+ 	int user;		/* user count for exclusive use */
+ 
+ 	int streaming;		/* Are we streaming Isochronous? */
+@@ -473,11 +474,9 @@ struct usb_ov511 {
+ 	int packet_size;	/* Frame size per isoc desc */
+ 	int packet_numbering;	/* Is ISO frame numbering enabled? */
+ 
+-	struct semaphore param_lock;	/* params lock for this camera */
+-
+ 	/* Framebuffer/sbuf management */
+ 	int buf_state;
+-	struct semaphore buf_lock;
++	struct mutex buf_lock;
+ 
+ 	struct ov51x_decomp_ops *decomp_ops;
+ 
+@@ -494,12 +493,12 @@ struct usb_ov511 {
+ 	int pal;		/* Device is designed for PAL resolution */
+ 
+ 	/* I2C interface */
+-	struct semaphore i2c_lock;	  /* Protect I2C controller regs */
++	struct mutex i2c_lock;	  /* Protect I2C controller regs */
+ 	unsigned char primary_i2c_slave;  /* I2C write id of sensor */
+ 
+ 	/* Control transaction stuff */
+ 	unsigned char *cbuf;		/* Buffer for payload */
+-	struct semaphore cbuf_lock;
++	struct mutex cbuf_lock;
+ };
+ 
+ /* Used to represent a list of values and their respective symbolic names */
+--- gregkh-2.6.orig/drivers/usb/media/se401.c
++++ gregkh-2.6/drivers/usb/media/se401.c
+@@ -1157,21 +1157,21 @@ static int se401_mmap(struct file *file,
+ 	unsigned long size  = vma->vm_end-vma->vm_start;
+ 	unsigned long page, pos;
+ 
+-	down(&se401->lock);
++	mutex_lock(&se401->lock);
+ 
+ 	if (se401->dev == NULL) {
+-		up(&se401->lock);
++		mutex_unlock(&se401->lock);
+ 		return -EIO;
+ 	}
+ 	if (size > (((SE401_NUMFRAMES * se401->maxframesize) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1))) {
+-		up(&se401->lock);
++		mutex_unlock(&se401->lock);
+ 		return -EINVAL;
+ 	}
+ 	pos = (unsigned long)se401->fbuf;
+ 	while (size > 0) {
+ 		page = vmalloc_to_pfn((void *)pos);
+ 		if (remap_pfn_range(vma, start, page, PAGE_SIZE, PAGE_SHARED)) {
+-			up(&se401->lock);
++			mutex_unlock(&se401->lock);
+ 			return -EAGAIN;
+ 		}
+ 		start += PAGE_SIZE;
+@@ -1181,7 +1181,7 @@ static int se401_mmap(struct file *file,
+ 		else
+ 			size = 0;
+ 	}
+-	up(&se401->lock);
++	mutex_unlock(&se401->lock);
+ 
+         return 0;
+ }
+@@ -1366,7 +1366,7 @@ static int se401_probe(struct usb_interf
+ 	memcpy(&se401->vdev, &se401_template, sizeof(se401_template));
+ 	memcpy(se401->vdev.name, se401->camera_name, strlen(se401->camera_name));
+ 	init_waitqueue_head(&se401->wq);
+-	init_MUTEX(&se401->lock);
++	mutex_init(&se401->lock);
+ 	wmb();
+ 
+ 	if (video_register_device(&se401->vdev, VFL_TYPE_GRABBER, video_nr) == -1) {
+--- gregkh-2.6.orig/drivers/usb/media/se401.h
++++ gregkh-2.6/drivers/usb/media/se401.h
+@@ -5,6 +5,7 @@
+ #include <asm/uaccess.h>
+ #include <linux/videodev.h>
+ #include <linux/smp_lock.h>
++#include <linux/mutex.h>
+ 
+ #define se401_DEBUG	/* Turn on debug messages */
+ 
+@@ -189,7 +190,7 @@ struct usb_se401 {
+ 	int maxframesize;
+ 	int cframesize;		/* current framesize */
+ 
+-	struct semaphore lock;
++	struct mutex lock;
+ 	int user;		/* user count for exclusive use */
+ 	int removed;		/* device disconnected */
+ 
+--- gregkh-2.6.orig/drivers/usb/media/stv680.c
++++ gregkh-2.6/drivers/usb/media/stv680.c
+@@ -67,6 +67,7 @@
+ #include <linux/errno.h>
+ #include <linux/videodev.h>
+ #include <linux/usb.h>
++#include <linux/mutex.h>
+ 
+ #include "stv680.h"
+ 
+@@ -1258,22 +1259,22 @@ static int stv680_mmap (struct file *fil
+ 	unsigned long size  = vma->vm_end-vma->vm_start;
+ 	unsigned long page, pos;
+ 
+-	down (&stv680->lock);
++	mutex_lock(&stv680->lock);
+ 
+ 	if (stv680->udev == NULL) {
+-		up (&stv680->lock);
++		mutex_unlock(&stv680->lock);
+ 		return -EIO;
+ 	}
+ 	if (size > (((STV680_NUMFRAMES * stv680->maxframesize) + PAGE_SIZE - 1)
+ 		    & ~(PAGE_SIZE - 1))) {
+-		up (&stv680->lock);
++		mutex_unlock(&stv680->lock);
+ 		return -EINVAL;
+ 	}
+ 	pos = (unsigned long) stv680->fbuf;
+ 	while (size > 0) {
+ 		page = vmalloc_to_pfn((void *)pos);
+ 		if (remap_pfn_range(vma, start, page, PAGE_SIZE, PAGE_SHARED)) {
+-			up (&stv680->lock);
++			mutex_unlock(&stv680->lock);
+ 			return -EAGAIN;
+ 		}
+ 		start += PAGE_SIZE;
+@@ -1283,7 +1284,7 @@ static int stv680_mmap (struct file *fil
+ 		else
+ 			size = 0;
+ 	}
+-	up (&stv680->lock);
++	mutex_unlock(&stv680->lock);
+ 
+ 	return 0;
+ }
+@@ -1409,7 +1410,7 @@ static int stv680_probe (struct usb_inte
+ 
+ 	memcpy (stv680->vdev->name, stv680->camera_name, strlen (stv680->camera_name));
+ 	init_waitqueue_head (&stv680->wq);
+-	init_MUTEX (&stv680->lock);
++	mutex_init (&stv680->lock);
+ 	wmb ();
+ 
+ 	if (video_register_device (stv680->vdev, VFL_TYPE_GRABBER, video_nr) == -1) {
+--- gregkh-2.6.orig/drivers/usb/media/stv680.h
++++ gregkh-2.6/drivers/usb/media/stv680.h
+@@ -118,7 +118,7 @@ struct usb_stv {
+ 	int origGain;
+ 	int origMode;		/* original camera mode */
+ 
+-	struct semaphore lock;	/* to lock the structure */
++	struct mutex lock;	/* to lock the structure */
+ 	int user;		/* user count for exclusive use */
+ 	int removed;		/* device disconnected */
+ 	int streaming;		/* Are we streaming video? */
+--- gregkh-2.6.orig/drivers/usb/media/usbvideo.c
++++ gregkh-2.6/drivers/usb/media/usbvideo.c
+@@ -714,7 +714,7 @@ int usbvideo_register(
+ 	cams->md_module = md;
+ 	if (cams->md_module == NULL)
+ 		warn("%s: module == NULL!", __FUNCTION__);
+-	init_MUTEX(&cams->lock);	/* to 1 == available */
++	mutex_init(&cams->lock);	/* to 1 == available */
+ 
+ 	for (i = 0; i < num_cams; i++) {
+ 		struct uvd *up = &cams->cam[i];
+@@ -862,7 +862,7 @@ static void usbvideo_Disconnect(struct u
+ 	if (uvd->debug > 0)
+ 		info("%s(%p.)", __FUNCTION__, intf);
+ 
+-	down(&uvd->lock);
++	mutex_lock(&uvd->lock);
+ 	uvd->remove_pending = 1; /* Now all ISO data will be ignored */
+ 
+ 	/* At this time we ask to cancel outstanding URBs */
+@@ -882,7 +882,7 @@ static void usbvideo_Disconnect(struct u
+ 		info("%s: In use, disconnect pending.", __FUNCTION__);
+ 	else
+ 		usbvideo_CameraRelease(uvd);
+-	up(&uvd->lock);
++	mutex_unlock(&uvd->lock);
+ 	info("USB camera disconnected.");
+ 
+ 	usbvideo_ClientDecModCount(uvd);
+@@ -929,19 +929,19 @@ static int usbvideo_find_struct(struct u
+ 		err("No usbvideo handle?");
+ 		return -1;
+ 	}
+-	down(&cams->lock);
++	mutex_lock(&cams->lock);
+ 	for (u = 0; u < cams->num_cameras; u++) {
+ 		struct uvd *uvd = &cams->cam[u];
+ 		if (!uvd->uvd_used) /* This one is free */
+ 		{
+ 			uvd->uvd_used = 1;	/* In use now */
+-			init_MUTEX(&uvd->lock);	/* to 1 == available */
++			mutex_init(&uvd->lock);	/* to 1 == available */
+ 			uvd->dev = NULL;
+ 			rv = u;
+ 			break;
+ 		}
+ 	}
+-	up(&cams->lock);
++	mutex_unlock(&cams->lock);
+ 	return rv;
+ }
+ 
+@@ -983,7 +983,7 @@ struct uvd *usbvideo_AllocateDevice(stru
+ 	/* Not relying upon caller we increase module counter ourselves */
+ 	usbvideo_ClientIncModCount(uvd);
+ 
+-	down(&uvd->lock);
++	mutex_lock(&uvd->lock);
+ 	for (i=0; i < USBVIDEO_NUMSBUF; i++) {
+ 		uvd->sbuf[i].urb = usb_alloc_urb(FRAMES_PER_DESC, GFP_KERNEL);
+ 		if (uvd->sbuf[i].urb == NULL) {
+@@ -1006,7 +1006,7 @@ struct uvd *usbvideo_AllocateDevice(stru
+ 	 * return control to the client's probe function right now.
+ 	 */
+ allocate_done:
+-	up (&uvd->lock);
++	mutex_unlock(&uvd->lock);
+ 	usbvideo_ClientDecModCount(uvd);
+ 	return uvd;
+ }
+@@ -1120,7 +1120,7 @@ static int usbvideo_v4l_open(struct inod
+ 		info("%s($%p)", __FUNCTION__, dev);
+ 
+ 	usbvideo_ClientIncModCount(uvd);
+-	down(&uvd->lock);
++	mutex_lock(&uvd->lock);
+ 
+ 	if (uvd->user) {
+ 		err("%s: Someone tried to open an already opened device!", __FUNCTION__);
+@@ -1201,7 +1201,7 @@ static int usbvideo_v4l_open(struct inod
+ 			}
+ 		}
+ 	}
+-	up(&uvd->lock);
++	mutex_unlock(&uvd->lock);
+ 	if (errCode != 0)
+ 		usbvideo_ClientDecModCount(uvd);
+ 	if (uvd->debug > 0)
+@@ -1230,7 +1230,7 @@ static int usbvideo_v4l_close(struct ino
+ 	if (uvd->debug > 1)
+ 		info("%s($%p)", __FUNCTION__, dev);
+ 
+-	down(&uvd->lock);
++	mutex_lock(&uvd->lock);
+ 	GET_CALLBACK(uvd, stopDataPump)(uvd);
+ 	usbvideo_rvfree(uvd->fbuf, uvd->fbuf_size);
+ 	uvd->fbuf = NULL;
+@@ -1251,7 +1251,7 @@ static int usbvideo_v4l_close(struct ino
+ 			info("usbvideo_v4l_close: Final disconnect.");
+ 		usbvideo_CameraRelease(uvd);
+ 	}
+-	up(&uvd->lock);
++	mutex_unlock(&uvd->lock);
+ 	usbvideo_ClientDecModCount(uvd);
+ 
+ 	if (uvd->debug > 1)
+@@ -1511,7 +1511,7 @@ static ssize_t usbvideo_v4l_read(struct 
+ 	if (uvd->debug >= 1)
+ 		info("%s: %Zd. bytes, noblock=%d.", __FUNCTION__, count, noblock);
+ 
+-	down(&uvd->lock);	
++	mutex_lock(&uvd->lock);
+ 
+ 	/* See if a frame is completed, then use it. */
+ 	for(i = 0; i < USBVIDEO_NUMFRAMES; i++) {
+@@ -1643,7 +1643,7 @@ static ssize_t usbvideo_v4l_read(struct 
+ 		}
+ 	}
+ read_done:
+-	up(&uvd->lock);	
++	mutex_unlock(&uvd->lock);
+ 	return count;
+ }
+ 
+--- gregkh-2.6.orig/drivers/usb/media/usbvideo.h
++++ gregkh-2.6/drivers/usb/media/usbvideo.h
+@@ -19,6 +19,7 @@
+ #include <linux/config.h>
+ #include <linux/videodev.h>
+ #include <linux/usb.h>
++#include <linux/mutex.h>
+ 
+ /* Most helpful debugging aid */
+ #define assert(expr) ((void) ((expr) ? 0 : (err("assert failed at line %d",__LINE__))))
+@@ -213,7 +214,7 @@ struct uvd {
+ 	unsigned long flags;		/* FLAGS_USBVIDEO_xxx */
+ 	unsigned long paletteBits;	/* Which palettes we accept? */
+ 	unsigned short defaultPalette;	/* What palette to use for read() */
+-	struct semaphore lock;
++	struct mutex lock;
+ 	int user;		/* user count for exclusive use */
+ 
+ 	videosize_t videosize;	/* Current setting */
+@@ -272,7 +273,7 @@ struct usbvideo {
+ 	int num_cameras;		/* As allocated */
+ 	struct usb_driver usbdrv;	/* Interface to the USB stack */
+ 	char drvName[80];		/* Driver name */
+-	struct semaphore lock;		/* Mutex protecting camera structures */
++	struct mutex lock;		/* Mutex protecting camera structures */
+ 	struct usbvideo_cb cb;		/* Table of callbacks (virtual methods) */
+ 	struct video_device vdt;	/* Video device template */
+ 	struct uvd *cam;			/* Array of camera structures */
