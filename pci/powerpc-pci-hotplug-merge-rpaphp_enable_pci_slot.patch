@@ -1,0 +1,134 @@
+From linas@austin.ibm.com Thu Jan 12 16:28:24 2006
+Date: Thu, 12 Jan 2006 18:28:22 -0600
+From: linas@austin.ibm.com
+To: Greg KH <greg@kroah.com>, akpm@osdl.org
+Cc: Paul Mackerras <paulus@samba.org>
+Subject: [PATCH 6/9] powerpc/PCI hotplug: merge rpaphp_enable_pci_slot()
+Message-ID: <20060113002822.GD26221@austin.ibm.com>
+Content-Disposition: inline
+
+
+
+Remove general baroqueness.  The function rpaphp_enable_pci_slot()
+has a fairly simple logic structure, once all of the debug printk's
+are removed. Its called from only one place, and that place also
+has a very simple structure once he printk's are removed.  Merge
+the two together.
+
+Signed-off-by: Linas Vepstas <linas@austin.ibm.com>
+Acked-by: John Rose <johnrose@austin.ibm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ drivers/pci/hotplug/rpaphp.h      |    1 +
+ drivers/pci/hotplug/rpaphp_core.c |   38 ++++++++++++++++++++++++++++----------
+ drivers/pci/hotplug/rpaphp_pci.c  |   30 +-----------------------------
+ 3 files changed, 30 insertions(+), 39 deletions(-)
+
+--- gregkh-2.6.orig/drivers/pci/hotplug/rpaphp_core.c
++++ gregkh-2.6/drivers/pci/hotplug/rpaphp_core.c
+@@ -393,22 +393,40 @@ static void __exit rpaphp_exit(void)
+ 	cleanup_slots();
+ }
+ 
+-static int enable_slot(struct hotplug_slot *hotplug_slot)
++static int __enable_slot(struct slot *slot)
+ {
+-	int retval = 0;
+-	struct slot *slot = (struct slot *)hotplug_slot->private;
++	int state;
++	int retval;
++
++	if (slot->state == CONFIGURED)
++		return 0;
+ 
+-	if (slot->state == CONFIGURED) {
+-		dbg("%s: %s is already enabled\n", __FUNCTION__, slot->name);
+-		goto exit;
++	retval = rpaphp_get_sensor_state(slot, &state);
++	if (retval)
++		return retval;
++
++	if (state == PRESENT) {
++		pcibios_add_pci_devices(slot->bus);
++		slot->state = CONFIGURED;
++	} else if (state == EMPTY) {
++		slot->state = EMPTY;
++	} else {
++		err("%s: slot[%s] is in invalid state\n", __FUNCTION__, slot->name);
++		slot->state = NOT_VALID;
++		return -EINVAL;
+ 	}
++	return 0;
++}
++
++static int enable_slot(struct hotplug_slot *hotplug_slot)
++{
++	int retval;
++	struct slot *slot = (struct slot *)hotplug_slot->private;
+ 
+-	dbg("ENABLING SLOT %s\n", slot->name);
+ 	down(&rpaphp_sem);
+-	retval = rpaphp_enable_pci_slot(slot);
++	retval = __enable_slot(slot);
+ 	up(&rpaphp_sem);
+-exit:
+-	dbg("%s - Exit: rc[%d]\n", __FUNCTION__, retval);
++
+ 	return retval;
+ }
+ 
+--- gregkh-2.6.orig/drivers/pci/hotplug/rpaphp_pci.c
++++ gregkh-2.6/drivers/pci/hotplug/rpaphp_pci.c
+@@ -32,7 +32,7 @@
+ #include "../pci.h"		/* for pci_add_new_bus */
+ #include "rpaphp.h"
+ 
+-static int rpaphp_get_sensor_state(struct slot *slot, int *state)
++int rpaphp_get_sensor_state(struct slot *slot, int *state)
+ {
+ 	int rc;
+ 	int setlevel;
+@@ -212,31 +212,3 @@ exit_rc:
+ 	return rc;
+ }
+ 
+-int rpaphp_enable_pci_slot(struct slot *slot)
+-{
+-	int retval = 0, state;
+-
+-	retval = rpaphp_get_sensor_state(slot, &state);
+-	if (retval)
+-		goto exit;
+-	dbg("%s: sensor state[%d]\n", __FUNCTION__, state);
+-	/* if slot is not empty, enable the adapter */
+-	if (state == PRESENT) {
+-		dbg("%s : slot[%s] is occupied.\n", __FUNCTION__, slot->name);
+-		pcibios_add_pci_devices(slot->bus);
+-		slot->state = CONFIGURED;
+-		info("%s: devices in slot[%s] configured\n",
+-					__FUNCTION__, slot->name);
+-	} else if (state == EMPTY) {
+-		dbg("%s : slot[%s] is empty\n", __FUNCTION__, slot->name);
+-		slot->state = EMPTY;
+-	} else {
+-		err("%s: slot[%s] is in invalid state\n", __FUNCTION__,
+-		    slot->name);
+-		slot->state = NOT_VALID;
+-		retval = -EINVAL;
+-	}
+-exit:
+-	dbg("%s - Exit: rc[%d]\n", __FUNCTION__, retval);
+-	return retval;
+-}
+--- gregkh-2.6.orig/drivers/pci/hotplug/rpaphp.h
++++ gregkh-2.6/drivers/pci/hotplug/rpaphp.h
+@@ -91,6 +91,7 @@ extern int num_slots;
+ extern int rpaphp_enable_pci_slot(struct slot *slot);
+ extern int register_pci_slot(struct slot *slot);
+ extern int rpaphp_get_pci_adapter_status(struct slot *slot, int is_init, u8 * value);
++extern int rpaphp_get_sensor_state(struct slot *slot, int *state);
+ 
+ /* rpaphp_core.c */
+ extern int rpaphp_add_slot(struct device_node *dn);

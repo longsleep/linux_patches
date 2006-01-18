@@ -1,0 +1,124 @@
+From owner-linux-pci@atrey.karlin.mff.cuni.cz Thu Jan 12 16:26:37 2006
+Date: Thu, 12 Jan 2006 18:26:27 -0600
+From: linas@austin.ibm.com
+To: Greg KH <greg@kroah.com>, akpm@osdl.org
+Cc: Paul Mackerras <paulus@samba.org>
+Subject: [PATCH 5/9] powerpc/PCI hotplug: de-convolute rpaphp_unconfig_pci_adap
+Message-ID: <20060113002627.GC26221@austin.ibm.com>
+Content-Disposition: inline
+
+
+
+Remove general baroqueness.  The function rpaphp_unconfig_pci_adapter()
+is really just three lines of code, once all the dbg printks are removed.
+And its called in only one place. So replace the call by the thre lines.
+Also, provide proper semaphore locking in the affected function 
+disable_slot()
+
+Signed-off-by: Linas Vepstas <linas@austin.ibm.com>
+Acked-by: John Rose <johnrose@austin.ibm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ drivers/pci/hotplug/rpadlpar_core.c |    6 +++++-
+ drivers/pci/hotplug/rpaphp.h        |    2 --
+ drivers/pci/hotplug/rpaphp_core.c   |   32 ++++++++++++++++++--------------
+ drivers/pci/hotplug/rpaphp_pci.c    |   12 ------------
+ 4 files changed, 23 insertions(+), 29 deletions(-)
+
+--- gregkh-2.6.orig/drivers/pci/hotplug/rpadlpar_core.c
++++ gregkh-2.6/drivers/pci/hotplug/rpadlpar_core.c
+@@ -380,7 +380,11 @@ int dlpar_remove_pci_slot(char *drc_name
+ 			return -EIO;
+ 		}
+ 	} else {
+-		rpaphp_unconfig_pci_adapter(bus);
++		struct pci_dev *dev, *tmp;
++		list_for_each_entry_safe(dev, tmp, &bus->devices, bus_list) {
++			eeh_remove_bus_device(dev);
++			pci_remove_bus_device(dev);
++		}
+ 	}
+ 
+ 	if (unmap_bus_range(bus)) {
+--- gregkh-2.6.orig/drivers/pci/hotplug/rpaphp_core.c
++++ gregkh-2.6/drivers/pci/hotplug/rpaphp_core.c
+@@ -412,27 +412,31 @@ exit:
+ 	return retval;
+ }
+ 
+-static int disable_slot(struct hotplug_slot *hotplug_slot)
++static int __disable_slot(struct slot *slot)
+ {
+-	int retval = -EINVAL;
+-	struct slot *slot = (struct slot *)hotplug_slot->private;
++	struct pci_dev *dev, *tmp;
+ 
+-	dbg("%s - Entry: slot[%s]\n", __FUNCTION__, slot->name);
++	if (slot->state == NOT_CONFIGURED)
++		return -EINVAL;
+ 
+-	if (slot->state == NOT_CONFIGURED) {
+-		dbg("%s: %s is already disabled\n", __FUNCTION__, slot->name);
+-		goto exit;
++	list_for_each_entry_safe(dev, tmp, &slot->bus->devices, bus_list) {
++		eeh_remove_bus_device(dev);
++		pci_remove_bus_device(dev);
+ 	}
+ 
+-	dbg("DISABLING SLOT %s\n", slot->name);
++	slot->state = NOT_CONFIGURED;
++	return 0;
++}
++
++static int disable_slot(struct hotplug_slot *hotplug_slot)
++{
++	struct slot *slot = (struct slot *)hotplug_slot->private;
++	int retval;
++
+ 	down(&rpaphp_sem);
+-	retval = rpaphp_unconfig_pci_adapter(slot->bus);
++	retval = __disable_slot (slot);
+ 	up(&rpaphp_sem);
+-	slot->state = NOT_CONFIGURED;
+-	info("%s: devices in slot[%s] unconfigured.\n", __FUNCTION__,
+-	     slot->name);
+-exit:
+-	dbg("%s - Exit: rc[%d]\n", __FUNCTION__, retval);
++
+ 	return retval;
+ }
+ 
+--- gregkh-2.6.orig/drivers/pci/hotplug/rpaphp_pci.c
++++ gregkh-2.6/drivers/pci/hotplug/rpaphp_pci.c
+@@ -116,18 +116,6 @@ static void print_slot_pci_funcs(struct 
+ 	return;
+ }
+ 
+-int rpaphp_unconfig_pci_adapter(struct pci_bus *bus)
+-{
+-	struct pci_dev *dev, *tmp;
+-
+-	list_for_each_entry_safe(dev, tmp, &bus->devices, bus_list) {
+-		eeh_remove_bus_device(dev);
+-		pci_remove_bus_device(dev);
+-	}
+-	return 0;
+-}
+-EXPORT_SYMBOL_GPL(rpaphp_unconfig_pci_adapter);
+-
+ static int setup_pci_hotplug_slot_info(struct slot *slot)
+ {
+ 	struct hotplug_slot_info *hotplug_slot_info = slot->hotplug_slot->info;
+--- gregkh-2.6.orig/drivers/pci/hotplug/rpaphp.h
++++ gregkh-2.6/drivers/pci/hotplug/rpaphp.h
+@@ -92,8 +92,6 @@ extern int rpaphp_enable_pci_slot(struct
+ extern int register_pci_slot(struct slot *slot);
+ extern int rpaphp_get_pci_adapter_status(struct slot *slot, int is_init, u8 * value);
+ 
+-extern int rpaphp_unconfig_pci_adapter(struct pci_bus *bus);
+-
+ /* rpaphp_core.c */
+ extern int rpaphp_add_slot(struct device_node *dn);
+ extern int rpaphp_remove_slot(struct slot *slot);
