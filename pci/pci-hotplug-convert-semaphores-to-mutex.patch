@@ -1,0 +1,1228 @@
+From mingo@elte.hu  Tue Jan 17 16:42:33 2006
+Date: Fri, 13 Jan 2006 16:02:15 +0100
+From: Ingo Molnar <mingo@elte.hu>
+To: Andrew Morton <akpm@osdl.org>, gregkh@suse.de
+Cc: Arjan van de Ven <arjan@infradead.org>, Jes Sorensen <jes@trained-monkey.org>
+Subject: PCI hotplug: convert semaphores to mutex
+Message-ID: <20060113150215.GA25327@elte.hu>
+Content-Disposition: inline
+
+From: Ingo Molnar <mingo@elte.hu>
+
+semaphore to mutex conversion.
+
+the conversion was generated via scripts, and the result was validated
+automatically via a script as well.
+
+build tested with allyesconfig.
+
+Signed-off-by: Ingo Molnar <mingo@elte.hu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+----
+
+---
+ drivers/pci/hotplug/acpiphp.h      |    3 -
+ drivers/pci/hotplug/acpiphp_glue.c |   12 ++--
+ drivers/pci/hotplug/cpqphp.h       |    3 -
+ drivers/pci/hotplug/cpqphp_core.c  |   14 ++---
+ drivers/pci/hotplug/cpqphp_ctrl.c  |   56 ++++++++++-----------
+ drivers/pci/hotplug/ibmphp_hpc.c   |   10 ++-
+ drivers/pci/hotplug/pciehp.h       |    3 -
+ drivers/pci/hotplug/pciehp_core.c  |    6 +-
+ drivers/pci/hotplug/pciehp_ctrl.c  |   68 ++++++++++++-------------
+ drivers/pci/hotplug/pciehp_hpc.c   |    2 
+ drivers/pci/hotplug/shpchp.h       |    3 -
+ drivers/pci/hotplug/shpchp_ctrl.c  |   98 ++++++++++++++++++-------------------
+ drivers/pci/hotplug/shpchp_hpc.c   |    2 
+ 13 files changed, 143 insertions(+), 137 deletions(-)
+
+--- gregkh-2.6.orig/drivers/pci/hotplug/acpiphp.h
++++ gregkh-2.6/drivers/pci/hotplug/acpiphp.h
+@@ -37,6 +37,7 @@
+ 
+ #include <linux/acpi.h>
+ #include <linux/kobject.h>	/* for KOBJ_NAME_LEN */
++#include <linux/mutex.h>
+ #include "pci_hotplug.h"
+ 
+ #define dbg(format, arg...)					\
+@@ -118,7 +119,7 @@ struct acpiphp_slot {
+ 	struct acpiphp_bridge *bridge;	/* parent */
+ 	struct list_head funcs;		/* one slot may have different
+ 					   objects (i.e. for each function) */
+-	struct semaphore crit_sect;
++	struct mutex crit_sect;
+ 
+ 	u32		id;		/* slot id (serial #) for hotplug core */
+ 	u8		device;		/* pci device# */
+--- gregkh-2.6.orig/drivers/pci/hotplug/acpiphp_glue.c
++++ gregkh-2.6/drivers/pci/hotplug/acpiphp_glue.c
+@@ -46,7 +46,7 @@
+ #include <linux/kernel.h>
+ #include <linux/pci.h>
+ #include <linux/smp_lock.h>
+-#include <asm/semaphore.h>
++#include <linux/mutex.h>
+ 
+ #include "../pci.h"
+ #include "pci_hotplug.h"
+@@ -188,7 +188,7 @@ register_slot(acpi_handle handle, u32 lv
+ 		slot->device = device;
+ 		slot->sun = sun;
+ 		INIT_LIST_HEAD(&slot->funcs);
+-		init_MUTEX(&slot->crit_sect);
++		mutex_init(&slot->crit_sect);
+ 
+ 		slot->next = bridge->slots;
+ 		bridge->slots = slot;
+@@ -1401,7 +1401,7 @@ int acpiphp_enable_slot(struct acpiphp_s
+ {
+ 	int retval;
+ 
+-	down(&slot->crit_sect);
++	mutex_lock(&slot->crit_sect);
+ 
+ 	/* wake up all functions */
+ 	retval = power_on_slot(slot);
+@@ -1413,7 +1413,7 @@ int acpiphp_enable_slot(struct acpiphp_s
+ 		retval = enable_device(slot);
+ 
+  err_exit:
+-	up(&slot->crit_sect);
++	mutex_unlock(&slot->crit_sect);
+ 	return retval;
+ }
+ 
+@@ -1424,7 +1424,7 @@ int acpiphp_disable_slot(struct acpiphp_
+ {
+ 	int retval = 0;
+ 
+-	down(&slot->crit_sect);
++	mutex_lock(&slot->crit_sect);
+ 
+ 	/* unconfigure all functions */
+ 	retval = disable_device(slot);
+@@ -1437,7 +1437,7 @@ int acpiphp_disable_slot(struct acpiphp_
+ 		goto err_exit;
+ 
+  err_exit:
+-	up(&slot->crit_sect);
++	mutex_unlock(&slot->crit_sect);
+ 	return retval;
+ }
+ 
+--- gregkh-2.6.orig/drivers/pci/hotplug/cpqphp.h
++++ gregkh-2.6/drivers/pci/hotplug/cpqphp.h
+@@ -32,6 +32,7 @@
+ #include <linux/interrupt.h>
+ #include <asm/io.h>		/* for read? and write? functions */
+ #include <linux/delay.h>	/* for delays */
++#include <linux/mutex.h>
+ 
+ #define MY_NAME	"cpqphp"
+ 
+@@ -286,7 +287,7 @@ struct event_info {
+ struct controller {
+ 	struct controller *next;
+ 	u32 ctrl_int_comp;
+-	struct semaphore crit_sect;	/* critical section semaphore */
++	struct mutex crit_sect;		/* critical section mutex */
+ 	void __iomem *hpc_reg;		/* cookie for our pci controller location */
+ 	struct pci_resource *mem_head;
+ 	struct pci_resource *p_mem_head;
+--- gregkh-2.6.orig/drivers/pci/hotplug/cpqphp_core.c
++++ gregkh-2.6/drivers/pci/hotplug/cpqphp_core.c
+@@ -599,7 +599,7 @@ cpqhp_set_attention_status(struct contro
+ 	hp_slot = func->device - ctrl->slot_device_offset;
+ 
+ 	// Wait for exclusive access to hardware
+-	down(&ctrl->crit_sect);
++	mutex_lock(&ctrl->crit_sect);
+ 
+ 	if (status == 1) {
+ 		amber_LED_on (ctrl, hp_slot);
+@@ -607,7 +607,7 @@ cpqhp_set_attention_status(struct contro
+ 		amber_LED_off (ctrl, hp_slot);
+ 	} else {
+ 		// Done with exclusive hardware access
+-		up(&ctrl->crit_sect);
++		mutex_unlock(&ctrl->crit_sect);
+ 		return(1);
+ 	}
+ 
+@@ -617,7 +617,7 @@ cpqhp_set_attention_status(struct contro
+ 	wait_for_ctrl_irq (ctrl);
+ 
+ 	// Done with exclusive hardware access
+-	up(&ctrl->crit_sect);
++	mutex_unlock(&ctrl->crit_sect);
+ 
+ 	return(0);
+ }
+@@ -1084,7 +1084,7 @@ static int cpqhpc_probe(struct pci_dev *
+ 	dbg("bus device function rev: %d %d %d %d\n", ctrl->bus,
+ 		PCI_SLOT(pdev->devfn), PCI_FUNC(pdev->devfn), ctrl->rev);
+ 
+-	init_MUTEX(&ctrl->crit_sect);
++	mutex_init(&ctrl->crit_sect);
+ 	init_waitqueue_head(&ctrl->queue);
+ 
+ 	/* initialize our threads if they haven't already been started up */
+@@ -1223,7 +1223,7 @@ static int cpqhpc_probe(struct pci_dev *
+ 
+ 	// turn off empty slots here unless command line option "ON" set
+ 	// Wait for exclusive access to hardware
+-	down(&ctrl->crit_sect);
++	mutex_lock(&ctrl->crit_sect);
+ 
+ 	num_of_slots = readb(ctrl->hpc_reg + SLOT_MASK) & 0x0F;
+ 
+@@ -1270,12 +1270,12 @@ static int cpqhpc_probe(struct pci_dev *
+ 	rc = init_SERR(ctrl);
+ 	if (rc) {
+ 		err("init_SERR failed\n");
+-		up(&ctrl->crit_sect);
++		mutex_unlock(&ctrl->crit_sect);
+ 		goto err_free_irq;
+ 	}
+ 
+ 	// Done with exclusive hardware access
+-	up(&ctrl->crit_sect);
++	mutex_unlock(&ctrl->crit_sect);
+ 
+ 	cpqhp_create_debugfs_files(ctrl);
+ 
+--- gregkh-2.6.orig/drivers/pci/hotplug/cpqphp_ctrl.c
++++ gregkh-2.6/drivers/pci/hotplug/cpqphp_ctrl.c
+@@ -1299,7 +1299,7 @@ static u32 board_replaced(struct pci_fun
+ 		 **********************************/
+ 		rc = CARD_FUNCTIONING;
+ 	} else {
+-		down(&ctrl->crit_sect);
++		mutex_lock(&ctrl->crit_sect);
+ 
+ 		/* turn on board without attaching to the bus */
+ 		enable_slot_power (ctrl, hp_slot);
+@@ -1333,12 +1333,12 @@ static u32 board_replaced(struct pci_fun
+ 		/* Wait for SOBS to be unset */
+ 		wait_for_ctrl_irq (ctrl);
+ 
+-		up(&ctrl->crit_sect);
++		mutex_unlock(&ctrl->crit_sect);
+ 
+ 		if (rc)
+ 			return rc;
+ 
+-		down(&ctrl->crit_sect);
++		mutex_lock(&ctrl->crit_sect);
+ 
+ 		slot_enable (ctrl, hp_slot);
+ 		green_LED_blink (ctrl, hp_slot);
+@@ -1350,7 +1350,7 @@ static u32 board_replaced(struct pci_fun
+ 		/* Wait for SOBS to be unset */
+ 		wait_for_ctrl_irq (ctrl);
+ 
+-		up(&ctrl->crit_sect);
++		mutex_unlock(&ctrl->crit_sect);
+ 
+ 		/* Wait for ~1 second because of hot plug spec */
+ 		long_delay(1*HZ);
+@@ -1375,7 +1375,7 @@ static u32 board_replaced(struct pci_fun
+ 				 * called for the "base" bus/dev/func of an
+ 				 * adapter. */
+ 
+-				down(&ctrl->crit_sect);
++				mutex_lock(&ctrl->crit_sect);
+ 
+ 				amber_LED_on (ctrl, hp_slot);
+ 				green_LED_off (ctrl, hp_slot);
+@@ -1386,7 +1386,7 @@ static u32 board_replaced(struct pci_fun
+ 				/* Wait for SOBS to be unset */
+ 				wait_for_ctrl_irq (ctrl);
+ 
+-				up(&ctrl->crit_sect);
++				mutex_unlock(&ctrl->crit_sect);
+ 
+ 				if (rc)
+ 					return rc;
+@@ -1410,7 +1410,7 @@ static u32 board_replaced(struct pci_fun
+ 				 * called for the "base" bus/dev/func of an
+ 				 * adapter. */
+ 
+-				down(&ctrl->crit_sect);
++				mutex_lock(&ctrl->crit_sect);
+ 
+ 				amber_LED_on (ctrl, hp_slot);
+ 				green_LED_off (ctrl, hp_slot);
+@@ -1421,13 +1421,13 @@ static u32 board_replaced(struct pci_fun
+ 				/* Wait for SOBS to be unset */
+ 				wait_for_ctrl_irq (ctrl);
+ 
+-				up(&ctrl->crit_sect);
++				mutex_unlock(&ctrl->crit_sect);
+ 
+ 				return rc;
+ 			}
+ 			/* Done configuring so turn LED on full time */
+ 
+-			down(&ctrl->crit_sect);
++			mutex_lock(&ctrl->crit_sect);
+ 
+ 			green_LED_on (ctrl, hp_slot);
+ 
+@@ -1436,7 +1436,7 @@ static u32 board_replaced(struct pci_fun
+ 			/* Wait for SOBS to be unset */
+ 			wait_for_ctrl_irq (ctrl);
+ 
+-			up(&ctrl->crit_sect);
++			mutex_unlock(&ctrl->crit_sect);
+ 			rc = 0;
+ 		} else {
+ 			/* Something is wrong
+@@ -1445,7 +1445,7 @@ static u32 board_replaced(struct pci_fun
+ 			 * in this case it will always be called for the "base"
+ 			 * bus/dev/func of an adapter. */
+ 
+-			down(&ctrl->crit_sect);
++			mutex_lock(&ctrl->crit_sect);
+ 
+ 			amber_LED_on (ctrl, hp_slot);
+ 			green_LED_off (ctrl, hp_slot);
+@@ -1456,7 +1456,7 @@ static u32 board_replaced(struct pci_fun
+ 			/* Wait for SOBS to be unset */
+ 			wait_for_ctrl_irq (ctrl);
+ 
+-			up(&ctrl->crit_sect);
++			mutex_unlock(&ctrl->crit_sect);
+ 		}
+ 
+ 	}
+@@ -1488,7 +1488,7 @@ static u32 board_added(struct pci_func *
+ 	dbg("%s: func->device, slot_offset, hp_slot = %d, %d ,%d\n",
+ 	    __FUNCTION__, func->device, ctrl->slot_device_offset, hp_slot);
+ 
+-	down(&ctrl->crit_sect);
++	mutex_lock(&ctrl->crit_sect);
+ 
+ 	/* turn on board without attaching to the bus */
+ 	enable_slot_power(ctrl, hp_slot);
+@@ -1522,7 +1522,7 @@ static u32 board_added(struct pci_func *
+ 	/* Wait for SOBS to be unset */
+ 	wait_for_ctrl_irq(ctrl);
+ 
+-	up(&ctrl->crit_sect);
++	mutex_unlock(&ctrl->crit_sect);
+ 
+ 	if (rc)
+ 		return rc;
+@@ -1532,7 +1532,7 @@ static u32 board_added(struct pci_func *
+ 	/* turn on board and blink green LED */
+ 
+ 	dbg("%s: before down\n", __FUNCTION__);
+-	down(&ctrl->crit_sect);
++	mutex_lock(&ctrl->crit_sect);
+ 	dbg("%s: after down\n", __FUNCTION__);
+ 
+ 	dbg("%s: before slot_enable\n", __FUNCTION__);
+@@ -1553,7 +1553,7 @@ static u32 board_added(struct pci_func *
+ 	dbg("%s: after wait_for_ctrl_irq\n", __FUNCTION__);
+ 
+ 	dbg("%s: before up\n", __FUNCTION__);
+-	up(&ctrl->crit_sect);
++	mutex_unlock(&ctrl->crit_sect);
+ 	dbg("%s: after up\n", __FUNCTION__);
+ 
+ 	/* Wait for ~1 second because of hot plug spec */
+@@ -1607,7 +1607,7 @@ static u32 board_added(struct pci_func *
+ 		cpqhp_resource_sort_and_combine(&(ctrl->bus_head));
+ 
+ 		if (rc) {
+-			down(&ctrl->crit_sect);
++			mutex_lock(&ctrl->crit_sect);
+ 
+ 			amber_LED_on (ctrl, hp_slot);
+ 			green_LED_off (ctrl, hp_slot);
+@@ -1618,7 +1618,7 @@ static u32 board_added(struct pci_func *
+ 			/* Wait for SOBS to be unset */
+ 			wait_for_ctrl_irq (ctrl);
+ 
+-			up(&ctrl->crit_sect);
++			mutex_unlock(&ctrl->crit_sect);
+ 			return rc;
+ 		} else {
+ 			cpqhp_save_slot_config(ctrl, func);
+@@ -1640,7 +1640,7 @@ static u32 board_added(struct pci_func *
+ 			}
+ 		} while (new_slot);
+ 
+-		down(&ctrl->crit_sect);
++		mutex_lock(&ctrl->crit_sect);
+ 
+ 		green_LED_on (ctrl, hp_slot);
+ 
+@@ -1649,9 +1649,9 @@ static u32 board_added(struct pci_func *
+ 		/* Wait for SOBS to be unset */
+ 		wait_for_ctrl_irq (ctrl);
+ 
+-		up(&ctrl->crit_sect);
++		mutex_unlock(&ctrl->crit_sect);
+ 	} else {
+-		down(&ctrl->crit_sect);
++		mutex_lock(&ctrl->crit_sect);
+ 
+ 		amber_LED_on (ctrl, hp_slot);
+ 		green_LED_off (ctrl, hp_slot);
+@@ -1662,7 +1662,7 @@ static u32 board_added(struct pci_func *
+ 		/* Wait for SOBS to be unset */
+ 		wait_for_ctrl_irq (ctrl);
+ 
+-		up(&ctrl->crit_sect);
++		mutex_unlock(&ctrl->crit_sect);
+ 
+ 		return rc;
+ 	}
+@@ -1721,7 +1721,7 @@ static u32 remove_board(struct pci_func 
+ 		func->status = 0x01;
+ 	func->configured = 0;
+ 
+-	down(&ctrl->crit_sect);
++	mutex_lock(&ctrl->crit_sect);
+ 
+ 	green_LED_off (ctrl, hp_slot);
+ 	slot_disable (ctrl, hp_slot);
+@@ -1736,7 +1736,7 @@ static u32 remove_board(struct pci_func 
+ 	/* Wait for SOBS to be unset */
+ 	wait_for_ctrl_irq (ctrl);
+ 
+-	up(&ctrl->crit_sect);
++	mutex_unlock(&ctrl->crit_sect);
+ 
+ 	if (!replace_flag && ctrl->add_support) {
+ 		while (func) {
+@@ -1899,7 +1899,7 @@ static void interrupt_event_handler(stru
+ 					dbg("button cancel\n");
+ 					del_timer(&p_slot->task_event);
+ 
+-					down(&ctrl->crit_sect);
++					mutex_lock(&ctrl->crit_sect);
+ 
+ 					if (p_slot->state == BLINKINGOFF_STATE) {
+ 						/* slot is on */
+@@ -1922,7 +1922,7 @@ static void interrupt_event_handler(stru
+ 					/* Wait for SOBS to be unset */
+ 					wait_for_ctrl_irq (ctrl);
+ 
+-					up(&ctrl->crit_sect);
++					mutex_unlock(&ctrl->crit_sect);
+ 				}
+ 				/*** button Released (No action on press...) */
+ 				else if (ctrl->event_queue[loop].event_type == INT_BUTTON_RELEASE) {
+@@ -1937,7 +1937,7 @@ static void interrupt_event_handler(stru
+ 						p_slot->state = BLINKINGON_STATE;
+ 						info(msg_button_on, p_slot->number);
+ 					}
+-					down(&ctrl->crit_sect);
++					mutex_lock(&ctrl->crit_sect);
+ 					
+ 					dbg("blink green LED and turn off amber\n");
+ 					
+@@ -1949,7 +1949,7 @@ static void interrupt_event_handler(stru
+ 					/* Wait for SOBS to be unset */
+ 					wait_for_ctrl_irq (ctrl);
+ 
+-					up(&ctrl->crit_sect);
++					mutex_unlock(&ctrl->crit_sect);
+ 					init_timer(&p_slot->task_event);
+ 					p_slot->hp_slot = hp_slot;
+ 					p_slot->ctrl = ctrl;
+--- gregkh-2.6.orig/drivers/pci/hotplug/ibmphp_hpc.c
++++ gregkh-2.6/drivers/pci/hotplug/ibmphp_hpc.c
+@@ -34,6 +34,8 @@
+ #include <linux/pci.h>
+ #include <linux/smp_lock.h>
+ #include <linux/init.h>
++#include <linux/mutex.h>
++
+ #include "ibmphp.h"
+ 
+ static int to_debug = FALSE;
+@@ -101,7 +103,7 @@ static int to_debug = FALSE;
+ //----------------------------------------------------------------------------
+ static int ibmphp_shutdown;
+ static int tid_poll;
+-static struct semaphore sem_hpcaccess;	// lock access to HPC
++static struct mutex sem_hpcaccess;	// lock access to HPC
+ static struct semaphore semOperations;	// lock all operations and
+ 					// access to data structures
+ static struct semaphore sem_exit;	// make sure polling thread goes away
+@@ -131,7 +133,7 @@ void __init ibmphp_hpc_initvars (void)
+ {
+ 	debug ("%s - Entry\n", __FUNCTION__);
+ 
+-	init_MUTEX (&sem_hpcaccess);
++	mutex_init(&sem_hpcaccess);
+ 	init_MUTEX (&semOperations);
+ 	init_MUTEX_LOCKED (&sem_exit);
+ 	to_debug = FALSE;
+@@ -778,7 +780,7 @@ int ibmphp_hpc_writeslot (struct slot * 
+ *---------------------------------------------------------------------*/
+ static void get_hpc_access (void)
+ {
+-	down (&sem_hpcaccess);
++	mutex_lock(&sem_hpcaccess);
+ }
+ 
+ /*----------------------------------------------------------------------
+@@ -786,7 +788,7 @@ static void get_hpc_access (void)
+ *---------------------------------------------------------------------*/
+ void free_hpc_access (void)
+ {
+-	up (&sem_hpcaccess);
++	mutex_unlock(&sem_hpcaccess);
+ }
+ 
+ /*----------------------------------------------------------------------
+--- gregkh-2.6.orig/drivers/pci/hotplug/pciehp.h
++++ gregkh-2.6/drivers/pci/hotplug/pciehp.h
+@@ -34,6 +34,7 @@
+ #include <linux/delay.h>
+ #include <linux/sched.h>		/* signal_pending() */
+ #include <linux/pcieport_if.h>
++#include <linux/mutex.h>
+ #include "pci_hotplug.h"
+ 
+ #define MY_NAME	"pciehp"
+@@ -96,7 +97,7 @@ struct php_ctlr_state_s {
+ #define MAX_EVENTS		10
+ struct controller {
+ 	struct controller *next;
+-	struct semaphore crit_sect;	/* critical section semaphore */
++	struct mutex crit_sect;		/* critical section mutex */
+ 	struct php_ctlr_state_s *hpc_ctlr_handle; /* HPC controller handle */
+ 	int num_slots;			/* Number of slots on ctlr */
+ 	int slot_num_inc;		/* 1 or -1 */
+--- gregkh-2.6.orig/drivers/pci/hotplug/pciehp_core.c
++++ gregkh-2.6/drivers/pci/hotplug/pciehp_core.c
+@@ -439,7 +439,7 @@ static int pciehp_probe(struct pcie_devi
+ 	}
+ 
+ 	/* Wait for exclusive access to hardware */
+-	down(&ctrl->crit_sect);
++	mutex_lock(&ctrl->crit_sect);
+ 
+ 	t_slot->hpc_ops->get_adapter_status(t_slot, &value); /* Check if slot is occupied */
+ 	
+@@ -447,7 +447,7 @@ static int pciehp_probe(struct pcie_devi
+ 		rc = t_slot->hpc_ops->power_off_slot(t_slot); /* Power off slot if not occupied*/
+ 		if (rc) {
+ 			/* Done with exclusive hardware access */
+-			up(&ctrl->crit_sect);
++			mutex_unlock(&ctrl->crit_sect);
+ 			goto err_out_free_ctrl_slot;
+ 		} else
+ 			/* Wait for the command to complete */
+@@ -455,7 +455,7 @@ static int pciehp_probe(struct pcie_devi
+ 	}
+ 
+ 	/* Done with exclusive hardware access */
+-	up(&ctrl->crit_sect);
++	mutex_unlock(&ctrl->crit_sect);
+ 
+ 	return 0;
+ 
+--- gregkh-2.6.orig/drivers/pci/hotplug/pciehp_ctrl.c
++++ gregkh-2.6/drivers/pci/hotplug/pciehp_ctrl.c
+@@ -229,13 +229,13 @@ u8 pciehp_handle_power_fault(u8 hp_slot,
+ static void set_slot_off(struct controller *ctrl, struct slot * pslot)
+ {
+ 	/* Wait for exclusive access to hardware */
+-	down(&ctrl->crit_sect);
++	mutex_lock(&ctrl->crit_sect);
+ 
+ 	/* turn off slot, turn on Amber LED, turn off Green LED if supported*/
+ 	if (POWER_CTRL(ctrl->ctrlcap)) {
+ 		if (pslot->hpc_ops->power_off_slot(pslot)) {   
+ 			err("%s: Issue of Slot Power Off command failed\n", __FUNCTION__);
+-			up(&ctrl->crit_sect);
++			mutex_unlock(&ctrl->crit_sect);
+ 			return;
+ 		}
+ 		wait_for_ctrl_irq (ctrl);
+@@ -249,14 +249,14 @@ static void set_slot_off(struct controll
+ 	if (ATTN_LED(ctrl->ctrlcap)) { 
+ 		if (pslot->hpc_ops->set_attention_status(pslot, 1)) {   
+ 			err("%s: Issue of Set Attention Led command failed\n", __FUNCTION__);
+-			up(&ctrl->crit_sect);
++			mutex_unlock(&ctrl->crit_sect);
+ 			return;
+ 		}
+ 		wait_for_ctrl_irq (ctrl);
+ 	}
+ 
+ 	/* Done with exclusive hardware access */
+-	up(&ctrl->crit_sect);
++	mutex_unlock(&ctrl->crit_sect);
+ }
+ 
+ /**
+@@ -279,13 +279,13 @@ static int board_added(struct slot *p_sl
+ 			ctrl->slot_device_offset, hp_slot);
+ 
+ 	/* Wait for exclusive access to hardware */
+-	down(&ctrl->crit_sect);
++	mutex_lock(&ctrl->crit_sect);
+ 
+ 	if (POWER_CTRL(ctrl->ctrlcap)) {
+ 		/* Power on slot */
+ 		rc = p_slot->hpc_ops->power_on_slot(p_slot);
+ 		if (rc) {
+-			up(&ctrl->crit_sect);
++			mutex_unlock(&ctrl->crit_sect);
+ 			return -1;
+ 		}
+ 
+@@ -301,7 +301,7 @@ static int board_added(struct slot *p_sl
+ 	}
+ 
+ 	/* Done with exclusive hardware access */
+-	up(&ctrl->crit_sect);
++	mutex_unlock(&ctrl->crit_sect);
+ 
+ 	/* Wait for ~1 second */
+ 	wait_for_ctrl_irq (ctrl);
+@@ -335,7 +335,7 @@ static int board_added(struct slot *p_sl
+ 		pci_fixup_device(pci_fixup_final, ctrl->pci_dev);
+ 	if (PWR_LED(ctrl->ctrlcap)) {
+ 		/* Wait for exclusive access to hardware */
+-  		down(&ctrl->crit_sect);
++  		mutex_lock(&ctrl->crit_sect);
+ 
+   		p_slot->hpc_ops->green_led_on(p_slot);
+   
+@@ -343,7 +343,7 @@ static int board_added(struct slot *p_sl
+   		wait_for_ctrl_irq (ctrl);
+   	
+   		/* Done with exclusive hardware access */
+-  		up(&ctrl->crit_sect);
++  		mutex_unlock(&ctrl->crit_sect);
+   	}
+ 	return 0;
+ 
+@@ -375,14 +375,14 @@ static int remove_board(struct slot *p_s
+ 	dbg("In %s, hp_slot = %d\n", __FUNCTION__, hp_slot);
+ 
+ 	/* Wait for exclusive access to hardware */
+-	down(&ctrl->crit_sect);
++	mutex_lock(&ctrl->crit_sect);
+ 
+ 	if (POWER_CTRL(ctrl->ctrlcap)) {
+ 		/* power off slot */
+ 		rc = p_slot->hpc_ops->power_off_slot(p_slot);
+ 		if (rc) {
+ 			err("%s: Issue of Slot Disable command failed\n", __FUNCTION__);
+-			up(&ctrl->crit_sect);
++			mutex_unlock(&ctrl->crit_sect);
+ 			return rc;
+ 		}
+ 		/* Wait for the command to complete */
+@@ -398,7 +398,7 @@ static int remove_board(struct slot *p_s
+ 	}
+ 
+ 	/* Done with exclusive hardware access */
+-	up(&ctrl->crit_sect);
++	mutex_unlock(&ctrl->crit_sect);
+ 
+ 	return 0;
+ }
+@@ -445,7 +445,7 @@ static void pciehp_pushbutton_thread(uns
+ 
+ 		if (pciehp_enable_slot(p_slot) && PWR_LED(p_slot->ctrl->ctrlcap)) {
+ 			/* Wait for exclusive access to hardware */
+-			down(&p_slot->ctrl->crit_sect);
++			mutex_lock(&p_slot->ctrl->crit_sect);
+ 
+ 			p_slot->hpc_ops->green_led_off(p_slot);
+ 
+@@ -453,7 +453,7 @@ static void pciehp_pushbutton_thread(uns
+ 			wait_for_ctrl_irq (p_slot->ctrl);
+ 
+ 			/* Done with exclusive hardware access */
+-			up(&p_slot->ctrl->crit_sect);
++			mutex_unlock(&p_slot->ctrl->crit_sect);
+ 		}
+ 		p_slot->state = STATIC_STATE;
+ 	}
+@@ -495,7 +495,7 @@ static void pciehp_surprise_rm_thread(un
+ 
+ 		if (pciehp_enable_slot(p_slot) && PWR_LED(p_slot->ctrl->ctrlcap)) {
+ 			/* Wait for exclusive access to hardware */
+-			down(&p_slot->ctrl->crit_sect);
++			mutex_lock(&p_slot->ctrl->crit_sect);
+ 
+ 			p_slot->hpc_ops->green_led_off(p_slot);
+ 
+@@ -503,7 +503,7 @@ static void pciehp_surprise_rm_thread(un
+ 			wait_for_ctrl_irq (p_slot->ctrl);
+ 
+ 			/* Done with exclusive hardware access */
+-			up(&p_slot->ctrl->crit_sect);
++			mutex_unlock(&p_slot->ctrl->crit_sect);
+ 		}
+ 		p_slot->state = STATIC_STATE;
+ 	}
+@@ -616,7 +616,7 @@ static void interrupt_event_handler(stru
+ 					switch (p_slot->state) {
+ 					case BLINKINGOFF_STATE:
+ 						/* Wait for exclusive access to hardware */
+-						down(&ctrl->crit_sect);
++						mutex_lock(&ctrl->crit_sect);
+ 						
+ 						if (PWR_LED(ctrl->ctrlcap)) {
+ 							p_slot->hpc_ops->green_led_on(p_slot);
+@@ -630,11 +630,11 @@ static void interrupt_event_handler(stru
+ 							wait_for_ctrl_irq (ctrl);
+ 						}
+ 						/* Done with exclusive hardware access */
+-						up(&ctrl->crit_sect);
++						mutex_unlock(&ctrl->crit_sect);
+ 						break;
+ 					case BLINKINGON_STATE:
+ 						/* Wait for exclusive access to hardware */
+-						down(&ctrl->crit_sect);
++						mutex_lock(&ctrl->crit_sect);
+ 
+ 						if (PWR_LED(ctrl->ctrlcap)) {
+ 							p_slot->hpc_ops->green_led_off(p_slot);
+@@ -647,7 +647,7 @@ static void interrupt_event_handler(stru
+ 							wait_for_ctrl_irq (ctrl);
+ 						}
+ 						/* Done with exclusive hardware access */
+-						up(&ctrl->crit_sect);
++						mutex_unlock(&ctrl->crit_sect);
+ 
+ 						break;
+ 					default:
+@@ -676,7 +676,7 @@ static void interrupt_event_handler(stru
+ 						}
+ 
+ 						/* Wait for exclusive access to hardware */
+-						down(&ctrl->crit_sect);
++						mutex_lock(&ctrl->crit_sect);
+ 
+ 						/* blink green LED and turn off amber */
+ 						if (PWR_LED(ctrl->ctrlcap)) {
+@@ -693,7 +693,7 @@ static void interrupt_event_handler(stru
+ 						}
+ 
+ 						/* Done with exclusive hardware access */
+-						up(&ctrl->crit_sect);
++						mutex_unlock(&ctrl->crit_sect);
+ 
+ 						init_timer(&p_slot->task_event);
+ 						p_slot->task_event.expires = jiffies + 5 * HZ;   /* 5 second delay */
+@@ -708,7 +708,7 @@ static void interrupt_event_handler(stru
+ 					if (POWER_CTRL(ctrl->ctrlcap)) {
+ 						dbg("power fault\n");
+ 						/* Wait for exclusive access to hardware */
+-						down(&ctrl->crit_sect);
++						mutex_lock(&ctrl->crit_sect);
+ 
+ 						if (ATTN_LED(ctrl->ctrlcap)) {
+ 							p_slot->hpc_ops->set_attention_status(p_slot, 1);
+@@ -721,7 +721,7 @@ static void interrupt_event_handler(stru
+ 						}
+ 
+ 						/* Done with exclusive hardware access */
+-						up(&ctrl->crit_sect);
++						mutex_unlock(&ctrl->crit_sect);
+ 					}
+ 				}
+ 				/***********SURPRISE REMOVAL********************/
+@@ -756,19 +756,19 @@ int pciehp_enable_slot(struct slot *p_sl
+ 	int rc;
+ 
+ 	/* Check to see if (latch closed, card present, power off) */
+-	down(&p_slot->ctrl->crit_sect);
++	mutex_lock(&p_slot->ctrl->crit_sect);
+ 
+ 	rc = p_slot->hpc_ops->get_adapter_status(p_slot, &getstatus);
+ 	if (rc || !getstatus) {
+ 		info("%s: no adapter on slot(%x)\n", __FUNCTION__, p_slot->number);
+-		up(&p_slot->ctrl->crit_sect);
++		mutex_unlock(&p_slot->ctrl->crit_sect);
+ 		return 1;
+ 	}
+ 	if (MRL_SENS(p_slot->ctrl->ctrlcap)) {	
+ 		rc = p_slot->hpc_ops->get_latch_status(p_slot, &getstatus);
+ 		if (rc || getstatus) {
+ 			info("%s: latch open on slot(%x)\n", __FUNCTION__, p_slot->number);
+-			up(&p_slot->ctrl->crit_sect);
++			mutex_unlock(&p_slot->ctrl->crit_sect);
+ 			return 1;
+ 		}
+ 	}
+@@ -777,11 +777,11 @@ int pciehp_enable_slot(struct slot *p_sl
+ 		rc = p_slot->hpc_ops->get_power_status(p_slot, &getstatus);
+ 		if (rc || getstatus) {
+ 			info("%s: already enabled on slot(%x)\n", __FUNCTION__, p_slot->number);
+-			up(&p_slot->ctrl->crit_sect);
++			mutex_unlock(&p_slot->ctrl->crit_sect);
+ 			return 1;
+ 		}
+ 	}
+-	up(&p_slot->ctrl->crit_sect);
++	mutex_unlock(&p_slot->ctrl->crit_sect);
+ 
+ 	p_slot->hpc_ops->get_latch_status(p_slot, &getstatus);
+ 
+@@ -806,13 +806,13 @@ int pciehp_disable_slot(struct slot *p_s
+ 		return 1;
+ 
+ 	/* Check to see if (latch closed, card present, power on) */
+-	down(&p_slot->ctrl->crit_sect);
++	mutex_lock(&p_slot->ctrl->crit_sect);
+ 
+ 	if (!HP_SUPR_RM(p_slot->ctrl->ctrlcap)) {	
+ 		ret = p_slot->hpc_ops->get_adapter_status(p_slot, &getstatus);
+ 		if (ret || !getstatus) {
+ 			info("%s: no adapter on slot(%x)\n", __FUNCTION__, p_slot->number);
+-			up(&p_slot->ctrl->crit_sect);
++			mutex_unlock(&p_slot->ctrl->crit_sect);
+ 			return 1;
+ 		}
+ 	}
+@@ -821,7 +821,7 @@ int pciehp_disable_slot(struct slot *p_s
+ 		ret = p_slot->hpc_ops->get_latch_status(p_slot, &getstatus);
+ 		if (ret || getstatus) {
+ 			info("%s: latch open on slot(%x)\n", __FUNCTION__, p_slot->number);
+-			up(&p_slot->ctrl->crit_sect);
++			mutex_unlock(&p_slot->ctrl->crit_sect);
+ 			return 1;
+ 		}
+ 	}
+@@ -830,12 +830,12 @@ int pciehp_disable_slot(struct slot *p_s
+ 		ret = p_slot->hpc_ops->get_power_status(p_slot, &getstatus);
+ 		if (ret || !getstatus) {
+ 			info("%s: already disabled slot(%x)\n", __FUNCTION__, p_slot->number);
+-			up(&p_slot->ctrl->crit_sect);
++			mutex_unlock(&p_slot->ctrl->crit_sect);
+ 			return 1;
+ 		}
+ 	}
+ 
+-	up(&p_slot->ctrl->crit_sect);
++	mutex_unlock(&p_slot->ctrl->crit_sect);
+ 
+ 	ret = remove_board(p_slot);
+ 	update_slot_info(p_slot);
+--- gregkh-2.6.orig/drivers/pci/hotplug/pciehp_hpc.c
++++ gregkh-2.6/drivers/pci/hotplug/pciehp_hpc.c
+@@ -1334,7 +1334,7 @@ int pcie_init(struct controller * ctrl, 
+ 	if (pci_enable_device(pdev))
+ 		goto abort_free_ctlr;
+ 	
+-	init_MUTEX(&ctrl->crit_sect);
++	mutex_init(&ctrl->crit_sect);
+ 	/* setup wait queue */
+ 	init_waitqueue_head(&ctrl->queue);
+ 
+--- gregkh-2.6.orig/drivers/pci/hotplug/shpchp.h
++++ gregkh-2.6/drivers/pci/hotplug/shpchp.h
+@@ -33,6 +33,7 @@
+ #include <linux/pci.h>
+ #include <linux/delay.h>
+ #include <linux/sched.h>	/* signal_pending(), struct timer_list */
++#include <linux/mutex.h>
+ 
+ #include "pci_hotplug.h"
+ 
+@@ -79,7 +80,7 @@ struct event_info {
+ 
+ struct controller {
+ 	struct controller *next;
+-	struct semaphore crit_sect;	/* critical section semaphore */
++	struct mutex crit_sect;		/* critical section mutex */
+ 	struct php_ctlr_state_s *hpc_ctlr_handle; /* HPC controller handle */
+ 	int num_slots;			/* Number of slots on ctlr */
+ 	int slot_num_inc;		/* 1 or -1 */
+--- gregkh-2.6.orig/drivers/pci/hotplug/shpchp_ctrl.c
++++ gregkh-2.6/drivers/pci/hotplug/shpchp_ctrl.c
+@@ -242,10 +242,10 @@ static int change_bus_speed(struct contr
+ 	int rc = 0;
+ 
+ 	dbg("%s: change to speed %d\n", __FUNCTION__, speed);
+-	down(&ctrl->crit_sect);
++	mutex_lock(&ctrl->crit_sect);
+ 	if ((rc = p_slot->hpc_ops->set_bus_speed_mode(p_slot, speed))) {
+ 		err("%s: Issue of set bus speed mode command failed\n", __FUNCTION__);
+-		up(&ctrl->crit_sect);
++		mutex_unlock(&ctrl->crit_sect);
+ 		return WRONG_BUS_FREQUENCY;
+ 	}
+ 		
+@@ -253,10 +253,10 @@ static int change_bus_speed(struct contr
+ 		err("%s: Can't set bus speed/mode in the case of adapter & bus mismatch\n",
+ 			  __FUNCTION__);
+ 		err("%s: Error code (%d)\n", __FUNCTION__, rc);
+-		up(&ctrl->crit_sect);
++		mutex_unlock(&ctrl->crit_sect);
+ 		return WRONG_BUS_FREQUENCY;
+ 	}
+-	up(&ctrl->crit_sect);
++	mutex_unlock(&ctrl->crit_sect);
+ 	return rc;
+ }
+ 
+@@ -319,14 +319,14 @@ static int board_added(struct slot *p_sl
+ 			ctrl->slot_device_offset, hp_slot);
+ 
+ 	/* Wait for exclusive access to hardware */
+-	down(&ctrl->crit_sect);
++	mutex_lock(&ctrl->crit_sect);
+ 
+ 	/* Power on slot without connecting to bus */
+ 	rc = p_slot->hpc_ops->power_on_slot(p_slot);
+ 	if (rc) {
+ 		err("%s: Failed to power on slot\n", __FUNCTION__);
+ 		/* Done with exclusive hardware access */
+-		up(&ctrl->crit_sect);
++		mutex_unlock(&ctrl->crit_sect);
+ 		return -1;
+ 	}
+ 	
+@@ -334,7 +334,7 @@ static int board_added(struct slot *p_sl
+ 	if (rc) {
+ 		err("%s: Failed to power on slot, error code(%d)\n", __FUNCTION__, rc);
+ 		/* Done with exclusive hardware access */
+-		up(&ctrl->crit_sect);
++		mutex_unlock(&ctrl->crit_sect);
+ 		return -1;
+ 	}
+ 
+@@ -345,7 +345,7 @@ static int board_added(struct slot *p_sl
+ 		
+ 		if ((rc = p_slot->hpc_ops->set_bus_speed_mode(p_slot, PCI_SPEED_33MHz))) {
+ 			err("%s: Issue of set bus speed mode command failed\n", __FUNCTION__);
+-			up(&ctrl->crit_sect);
++			mutex_unlock(&ctrl->crit_sect);
+ 			return WRONG_BUS_FREQUENCY;
+ 		}
+ 		
+@@ -353,19 +353,19 @@ static int board_added(struct slot *p_sl
+ 			err("%s: Can't set bus speed/mode in the case of adapter & bus mismatch\n",
+ 				  __FUNCTION__);
+ 			err("%s: Error code (%d)\n", __FUNCTION__, rc);
+-			up(&ctrl->crit_sect);
++			mutex_unlock(&ctrl->crit_sect);
+ 			return WRONG_BUS_FREQUENCY;
+ 		}
+ 		/* turn on board, blink green LED, turn off Amber LED */
+ 		if ((rc = p_slot->hpc_ops->slot_enable(p_slot))) {
+ 			err("%s: Issue of Slot Enable command failed\n", __FUNCTION__);
+-			up(&ctrl->crit_sect);
++			mutex_unlock(&ctrl->crit_sect);
+ 			return rc;
+ 		}
+ 
+ 		if ((rc = p_slot->hpc_ops->check_cmd_status(ctrl))) {
+ 			err("%s: Failed to enable slot, error code(%d)\n", __FUNCTION__, rc);
+-			up(&ctrl->crit_sect);
++			mutex_unlock(&ctrl->crit_sect);
+ 			return rc;  
+ 		}
+ 	}
+@@ -380,7 +380,7 @@ static int board_added(struct slot *p_sl
+ 	if (rc  || adapter_speed == PCI_SPEED_UNKNOWN) {
+ 		err("%s: Can't get adapter speed or bus mode mismatch\n", __FUNCTION__);
+ 		/* Done with exclusive hardware access */
+-		up(&ctrl->crit_sect);
++		mutex_unlock(&ctrl->crit_sect);
+ 		return WRONG_BUS_FREQUENCY;
+ 	}
+ 
+@@ -388,7 +388,7 @@ static int board_added(struct slot *p_sl
+ 	if (rc || bus_speed == PCI_SPEED_UNKNOWN) {
+ 		err("%s: Can't get bus operation speed\n", __FUNCTION__);
+ 		/* Done with exclusive hardware access */
+-		up(&ctrl->crit_sect);
++		mutex_unlock(&ctrl->crit_sect);
+ 		return WRONG_BUS_FREQUENCY;
+ 	}
+ 
+@@ -399,7 +399,7 @@ static int board_added(struct slot *p_sl
+ 	}
+ 
+ 	/* Done with exclusive hardware access */
+-	up(&ctrl->crit_sect);
++	mutex_unlock(&ctrl->crit_sect);
+ 
+ 	if ((rc  = p_slot->hpc_ops->get_prog_int(p_slot, &pi))) {
+ 		err("%s: Can't get controller programming interface, set it to 1\n", __FUNCTION__);
+@@ -481,21 +481,21 @@ static int board_added(struct slot *p_sl
+ 				return rc;
+ 	}
+ 
+-	down(&ctrl->crit_sect);
++	mutex_lock(&ctrl->crit_sect);
+ 	/* turn on board, blink green LED, turn off Amber LED */
+ 	if ((rc = p_slot->hpc_ops->slot_enable(p_slot))) {
+ 		err("%s: Issue of Slot Enable command failed\n", __FUNCTION__);
+-		up(&ctrl->crit_sect);
++		mutex_unlock(&ctrl->crit_sect);
+ 		return rc;
+ 	}
+ 
+ 	if ((rc = p_slot->hpc_ops->check_cmd_status(ctrl))) {
+ 		err("%s: Failed to enable slot, error code(%d)\n", __FUNCTION__, rc);
+-		up(&ctrl->crit_sect);
++		mutex_unlock(&ctrl->crit_sect);
+ 		return rc;  
+ 	}
+ 
+-	up(&ctrl->crit_sect);
++	mutex_unlock(&ctrl->crit_sect);
+ 
+ 	/* Wait for ~1 second */
+ 	wait_for_ctrl_irq (ctrl);
+@@ -521,25 +521,25 @@ static int board_added(struct slot *p_sl
+ 	p_slot->pwr_save = 1;
+ 
+ 	/* Wait for exclusive access to hardware */
+-	down(&ctrl->crit_sect);
++	mutex_lock(&ctrl->crit_sect);
+ 
+ 	p_slot->hpc_ops->green_led_on(p_slot);
+ 
+ 	/* Done with exclusive hardware access */
+-	up(&ctrl->crit_sect);
++	mutex_unlock(&ctrl->crit_sect);
+ 
+ 	return 0;
+ 
+ err_exit:
+ 	/* Wait for exclusive access to hardware */
+-	down(&ctrl->crit_sect);
++	mutex_lock(&ctrl->crit_sect);
+ 
+ 	/* turn off slot, turn on Amber LED, turn off Green LED */
+ 	rc = p_slot->hpc_ops->slot_disable(p_slot);
+ 	if (rc) {
+ 		err("%s: Issue of Slot Disable command failed\n", __FUNCTION__);
+ 		/* Done with exclusive hardware access */
+-		up(&ctrl->crit_sect);
++		mutex_unlock(&ctrl->crit_sect);
+ 		return rc;
+ 	}
+ 
+@@ -547,12 +547,12 @@ err_exit:
+ 	if (rc) {
+ 		err("%s: Failed to disable slot, error code(%d)\n", __FUNCTION__, rc);
+ 		/* Done with exclusive hardware access */
+-		up(&ctrl->crit_sect);
++		mutex_unlock(&ctrl->crit_sect);
+ 		return rc;
+ 	}
+ 
+ 	/* Done with exclusive hardware access */
+-	up(&ctrl->crit_sect);
++	mutex_unlock(&ctrl->crit_sect);
+ 
+ 	return(rc);
+ }
+@@ -581,14 +581,14 @@ static int remove_board(struct slot *p_s
+ 		p_slot->status = 0x01;
+ 
+ 	/* Wait for exclusive access to hardware */
+-	down(&ctrl->crit_sect);
++	mutex_lock(&ctrl->crit_sect);
+ 
+ 	/* turn off slot, turn on Amber LED, turn off Green LED */
+ 	rc = p_slot->hpc_ops->slot_disable(p_slot);
+ 	if (rc) {
+ 		err("%s: Issue of Slot Disable command failed\n", __FUNCTION__);
+ 		/* Done with exclusive hardware access */
+-		up(&ctrl->crit_sect);
++		mutex_unlock(&ctrl->crit_sect);
+ 		return rc;
+ 	}
+ 
+@@ -596,7 +596,7 @@ static int remove_board(struct slot *p_s
+ 	if (rc) {
+ 		err("%s: Failed to disable slot, error code(%d)\n", __FUNCTION__, rc);
+ 		/* Done with exclusive hardware access */
+-		up(&ctrl->crit_sect);
++		mutex_unlock(&ctrl->crit_sect);
+ 		return rc;  
+ 	}
+ 	
+@@ -604,12 +604,12 @@ static int remove_board(struct slot *p_s
+ 	if (rc) {
+ 		err("%s: Issue of Set Attention command failed\n", __FUNCTION__);
+ 		/* Done with exclusive hardware access */
+-		up(&ctrl->crit_sect);
++		mutex_unlock(&ctrl->crit_sect);
+ 		return rc;
+ 	}
+ 
+ 	/* Done with exclusive hardware access */
+-	up(&ctrl->crit_sect);
++	mutex_unlock(&ctrl->crit_sect);
+ 
+ 	p_slot->pwr_save = 0;
+ 	p_slot->is_a_board = 0;
+@@ -656,12 +656,12 @@ static void shpchp_pushbutton_thread (un
+ 
+ 		if (shpchp_enable_slot(p_slot)) {
+ 			/* Wait for exclusive access to hardware */
+-			down(&p_slot->ctrl->crit_sect);
++			mutex_lock(&p_slot->ctrl->crit_sect);
+ 
+ 			p_slot->hpc_ops->green_led_off(p_slot);
+ 
+ 			/* Done with exclusive hardware access */
+-			up(&p_slot->ctrl->crit_sect);
++			mutex_unlock(&p_slot->ctrl->crit_sect);
+ 		}
+ 		p_slot->state = STATIC_STATE;
+ 	}
+@@ -768,25 +768,25 @@ static void interrupt_event_handler(stru
+ 					switch (p_slot->state) {
+ 					case BLINKINGOFF_STATE:
+ 						/* Wait for exclusive access to hardware */
+-						down(&ctrl->crit_sect);
++						mutex_lock(&ctrl->crit_sect);
+ 
+ 						p_slot->hpc_ops->green_led_on(p_slot);
+ 
+ 						p_slot->hpc_ops->set_attention_status(p_slot, 0);
+ 
+ 						/* Done with exclusive hardware access */
+-						up(&ctrl->crit_sect);
++						mutex_unlock(&ctrl->crit_sect);
+ 						break;
+ 					case BLINKINGON_STATE:
+ 						/* Wait for exclusive access to hardware */
+-						down(&ctrl->crit_sect);
++						mutex_lock(&ctrl->crit_sect);
+ 
+ 						p_slot->hpc_ops->green_led_off(p_slot);
+ 
+ 						p_slot->hpc_ops->set_attention_status(p_slot, 0);
+ 
+ 						/* Done with exclusive hardware access */
+-						up(&ctrl->crit_sect);
++						mutex_unlock(&ctrl->crit_sect);
+ 
+ 						break;
+ 					default:
+@@ -813,7 +813,7 @@ static void interrupt_event_handler(stru
+ 					}
+ 
+ 					/* Wait for exclusive access to hardware */
+-					down(&ctrl->crit_sect);
++					mutex_lock(&ctrl->crit_sect);
+ 
+ 					/* blink green LED and turn off amber */
+ 					p_slot->hpc_ops->green_led_blink(p_slot);
+@@ -821,7 +821,7 @@ static void interrupt_event_handler(stru
+ 					p_slot->hpc_ops->set_attention_status(p_slot, 0);
+ 
+ 					/* Done with exclusive hardware access */
+-					up(&ctrl->crit_sect);
++					mutex_unlock(&ctrl->crit_sect);
+ 
+ 					init_timer(&p_slot->task_event);
+ 					p_slot->task_event.expires = jiffies + 5 * HZ;   /* 5 second delay */
+@@ -834,14 +834,14 @@ static void interrupt_event_handler(stru
+ 					/***********POWER FAULT********************/
+ 					dbg("%s: power fault\n", __FUNCTION__);
+ 					/* Wait for exclusive access to hardware */
+-					down(&ctrl->crit_sect);
++					mutex_lock(&ctrl->crit_sect);
+ 
+ 					p_slot->hpc_ops->set_attention_status(p_slot, 1);
+ 					
+ 					p_slot->hpc_ops->green_led_off(p_slot);
+ 
+ 					/* Done with exclusive hardware access */
+-					up(&ctrl->crit_sect);
++					mutex_unlock(&ctrl->crit_sect);
+ 				} else {
+ 					/* refresh notification */
+ 					if (p_slot)
+@@ -865,26 +865,26 @@ int shpchp_enable_slot (struct slot *p_s
+ 	int rc;
+ 
+ 	/* Check to see if (latch closed, card present, power off) */
+-	down(&p_slot->ctrl->crit_sect);
++	mutex_lock(&p_slot->ctrl->crit_sect);
+ 	rc = p_slot->hpc_ops->get_adapter_status(p_slot, &getstatus);
+ 	if (rc || !getstatus) {
+ 		info("%s: no adapter on slot(%x)\n", __FUNCTION__, p_slot->number);
+-		up(&p_slot->ctrl->crit_sect);
++		mutex_unlock(&p_slot->ctrl->crit_sect);
+ 		return -ENODEV;
+ 	}
+ 	rc = p_slot->hpc_ops->get_latch_status(p_slot, &getstatus);
+ 	if (rc || getstatus) {
+ 		info("%s: latch open on slot(%x)\n", __FUNCTION__, p_slot->number);
+-		up(&p_slot->ctrl->crit_sect);
++		mutex_unlock(&p_slot->ctrl->crit_sect);
+ 		return -ENODEV;
+ 	}
+ 	rc = p_slot->hpc_ops->get_power_status(p_slot, &getstatus);
+ 	if (rc || getstatus) {
+ 		info("%s: already enabled on slot(%x)\n", __FUNCTION__, p_slot->number);
+-		up(&p_slot->ctrl->crit_sect);
++		mutex_unlock(&p_slot->ctrl->crit_sect);
+ 		return -ENODEV;
+ 	}
+-	up(&p_slot->ctrl->crit_sect);
++	mutex_unlock(&p_slot->ctrl->crit_sect);
+ 
+ 	p_slot->is_a_board = 1;
+ 
+@@ -915,27 +915,27 @@ int shpchp_disable_slot (struct slot *p_
+ 		return -ENODEV;
+ 
+ 	/* Check to see if (latch closed, card present, power on) */
+-	down(&p_slot->ctrl->crit_sect);
++	mutex_lock(&p_slot->ctrl->crit_sect);
+ 
+ 	ret = p_slot->hpc_ops->get_adapter_status(p_slot, &getstatus);
+ 	if (ret || !getstatus) {
+ 		info("%s: no adapter on slot(%x)\n", __FUNCTION__, p_slot->number);
+-		up(&p_slot->ctrl->crit_sect);
++		mutex_unlock(&p_slot->ctrl->crit_sect);
+ 		return -ENODEV;
+ 	}
+ 	ret = p_slot->hpc_ops->get_latch_status(p_slot, &getstatus);
+ 	if (ret || getstatus) {
+ 		info("%s: latch open on slot(%x)\n", __FUNCTION__, p_slot->number);
+-		up(&p_slot->ctrl->crit_sect);
++		mutex_unlock(&p_slot->ctrl->crit_sect);
+ 		return -ENODEV;
+ 	}
+ 	ret = p_slot->hpc_ops->get_power_status(p_slot, &getstatus);
+ 	if (ret || !getstatus) {
+ 		info("%s: already disabled slot(%x)\n", __FUNCTION__, p_slot->number);
+-		up(&p_slot->ctrl->crit_sect);
++		mutex_unlock(&p_slot->ctrl->crit_sect);
+ 		return -ENODEV;
+ 	}
+-	up(&p_slot->ctrl->crit_sect);
++	mutex_unlock(&p_slot->ctrl->crit_sect);
+ 
+ 	ret = remove_board(p_slot);
+ 	update_slot_info(p_slot);
+--- gregkh-2.6.orig/drivers/pci/hotplug/shpchp_hpc.c
++++ gregkh-2.6/drivers/pci/hotplug/shpchp_hpc.c
+@@ -1454,7 +1454,7 @@ int shpc_init(struct controller * ctrl, 
+ 	}
+ 	dbg("%s: php_ctlr->creg %p\n", __FUNCTION__, php_ctlr->creg);
+ 
+-	init_MUTEX(&ctrl->crit_sect);
++	mutex_init(&ctrl->crit_sect);
+ 	/* Setup wait queue */
+ 	init_waitqueue_head(&ctrl->queue);
+ 
