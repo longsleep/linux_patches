@@ -1,0 +1,160 @@
+From stern@rowland.harvard.edu Thu Jan 19 07:46:36 2006
+Date: Thu, 19 Jan 2006 10:46:27 -0500 (EST)
+From: Alan Stern <stern@rowland.harvard.edu>
+To: Greg KH <greg@kroah.com>
+cc: David Brownell <david-b@pacbell.net>, Olav Kongas <ok@artecdesign.ee>
+Subject: [PATCH] USB core and HCDs: don't put_device while atomic
+Message-ID: <Pine.LNX.4.44L0.0601191036380.4622-100000@iolanthe.rowland.org>
+
+This patch (as640) removes several put_device and the corresponding
+get_device calls from the USB core and HCDs.  Some of the puts were done
+in atomic contexts, and none of them are needed since the core now
+guarantees that every endpoint will be disabled and every URB completed
+before a USB device is released.
+
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Acked-by: David Brownell <david-b@pacbell.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/hcd.c         |    2 --
+ drivers/usb/host/ehci-mem.c    |    1 -
+ drivers/usb/host/ehci-q.c      |    2 +-
+ drivers/usb/host/ehci-sched.c  |    6 ++----
+ drivers/usb/host/isp116x-hcd.c |    3 +--
+ drivers/usb/host/sl811-hcd.c   |    3 +--
+ drivers/usb/host/uhci-q.c      |    2 --
+ 7 files changed, 5 insertions(+), 14 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/host/uhci-q.c
++++ gregkh-2.6/drivers/usb/host/uhci-q.c
+@@ -179,7 +179,6 @@ static struct uhci_qh *uhci_alloc_qh(str
+ 		qh->hep = hep;
+ 		qh->udev = udev;
+ 		hep->hcpriv = qh;
+-		usb_get_dev(udev);
+ 
+ 	} else {		/* Skeleton QH */
+ 		qh->state = QH_STATE_ACTIVE;
+@@ -197,7 +196,6 @@ static void uhci_free_qh(struct uhci_hcd
+ 	list_del(&qh->node);
+ 	if (qh->udev) {
+ 		qh->hep->hcpriv = NULL;
+-		usb_put_dev(qh->udev);
+ 		uhci_free_td(uhci, qh->dummy_td);
+ 	}
+ 	dma_pool_free(uhci->qh_pool, qh, qh->dma_handle);
+--- gregkh-2.6.orig/drivers/usb/core/hcd.c
++++ gregkh-2.6/drivers/usb/core/hcd.c
+@@ -1091,7 +1091,6 @@ static void urb_unlink (struct urb *urb)
+ 	spin_lock_irqsave (&hcd_data_lock, flags);
+ 	list_del_init (&urb->urb_list);
+ 	spin_unlock_irqrestore (&hcd_data_lock, flags);
+-	usb_put_dev (urb->dev);
+ }
+ 
+ 
+@@ -1131,7 +1130,6 @@ static int hcd_submit_urb (struct urb *u
+ 	case HC_STATE_RUNNING:
+ 	case HC_STATE_RESUMING:
+ doit:
+-		usb_get_dev (urb->dev);
+ 		list_add_tail (&urb->urb_list, &ep->urb_list);
+ 		status = 0;
+ 		break;
+--- gregkh-2.6.orig/drivers/usb/host/isp116x-hcd.c
++++ gregkh-2.6/drivers/usb/host/isp116x-hcd.c
+@@ -724,7 +724,7 @@ static int isp116x_urb_enqueue(struct us
+ 		ep = hep->hcpriv;
+ 	else {
+ 		INIT_LIST_HEAD(&ep->schedule);
+-		ep->udev = usb_get_dev(udev);
++		ep->udev = udev;
+ 		ep->epnum = epnum;
+ 		ep->maxpacket = usb_maxpacket(udev, urb->pipe, is_out);
+ 		usb_settoggle(udev, epnum, is_out, 0);
+@@ -891,7 +891,6 @@ static void isp116x_endpoint_disable(str
+ 	if (!list_empty(&hep->urb_list))
+ 		WARN("ep %p not empty?\n", ep);
+ 
+-	usb_put_dev(ep->udev);
+ 	kfree(ep);
+ 	hep->hcpriv = NULL;
+ }
+--- gregkh-2.6.orig/drivers/usb/host/ehci-mem.c
++++ gregkh-2.6/drivers/usb/host/ehci-mem.c
+@@ -75,7 +75,6 @@ static void qh_destroy (struct kref *kre
+ 	}
+ 	if (qh->dummy)
+ 		ehci_qtd_free (ehci, qh->dummy);
+-	usb_put_dev (qh->dev);
+ 	dma_pool_free (ehci->qh_pool, qh, qh->qh_dma);
+ }
+ 
+--- gregkh-2.6.orig/drivers/usb/host/ehci-q.c
++++ gregkh-2.6/drivers/usb/host/ehci-q.c
+@@ -702,7 +702,7 @@ qh_make (
+ 	}
+ 
+ 	/* support for tt scheduling, and access to toggles */
+-	qh->dev = usb_get_dev (urb->dev);
++	qh->dev = urb->dev;
+ 
+ 	/* using TT? */
+ 	switch (urb->dev->speed) {
+--- gregkh-2.6.orig/drivers/usb/host/ehci-sched.c
++++ gregkh-2.6/drivers/usb/host/ehci-sched.c
+@@ -1397,7 +1397,7 @@ itd_complete (
+ 	 */
+ 
+ 	/* give urb back to the driver ... can be out-of-order */
+-	dev = usb_get_dev (urb->dev);
++	dev = urb->dev;
+ 	ehci_urb_done (ehci, urb, regs);
+ 	urb = NULL;
+ 
+@@ -1416,7 +1416,6 @@ itd_complete (
+ 			(stream->bEndpointAddress & USB_DIR_IN) ? "in" : "out");
+ 	}
+ 	iso_stream_put (ehci, stream);
+-	usb_put_dev (dev);
+ 
+ 	return 1;
+ }
+@@ -1763,7 +1762,7 @@ sitd_complete (
+ 	 */
+ 
+ 	/* give urb back to the driver */
+-	dev = usb_get_dev (urb->dev);
++	dev = urb->dev;
+ 	ehci_urb_done (ehci, urb, regs);
+ 	urb = NULL;
+ 
+@@ -1782,7 +1781,6 @@ sitd_complete (
+ 			(stream->bEndpointAddress & USB_DIR_IN) ? "in" : "out");
+ 	}
+ 	iso_stream_put (ehci, stream);
+-	usb_put_dev (dev);
+ 
+ 	return 1;
+ }
+--- gregkh-2.6.orig/drivers/usb/host/sl811-hcd.c
++++ gregkh-2.6/drivers/usb/host/sl811-hcd.c
+@@ -853,7 +853,7 @@ static int sl811h_urb_enqueue(
+ 
+ 	} else {
+ 		INIT_LIST_HEAD(&ep->schedule);
+-		ep->udev = usb_get_dev(udev);
++		ep->udev = udev;
+ 		ep->epnum = epnum;
+ 		ep->maxpacket = usb_maxpacket(udev, urb->pipe, is_out);
+ 		ep->defctrl = SL11H_HCTLMASK_ARM | SL11H_HCTLMASK_ENABLE;
+@@ -1052,7 +1052,6 @@ sl811h_endpoint_disable(struct usb_hcd *
+ 	if (!list_empty(&hep->urb_list))
+ 		WARN("ep %p not empty?\n", ep);
+ 
+-	usb_put_dev(ep->udev);
+ 	kfree(ep);
+ 	hep->hcpriv = NULL;
+ }
