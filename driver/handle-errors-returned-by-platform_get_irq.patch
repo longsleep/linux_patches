@@ -1,0 +1,305 @@
+From dvrabel@arcom.com Thu Jan 19 09:57:38 2006
+Message-ID: <43CFD2CD.8090803@arcom.com>
+Date: Thu, 19 Jan 2006 17:56:29 +0000
+From: David Vrabel <dvrabel@arcom.com>
+To: Greg KH <gregkh@suse.de>
+Subject: handle errors returned by platform_get_irq*()
+
+platform_get_irq*() now returns on -ENXIO when the resource cannot be
+found.  Ensure all users of platform_get_irq*() handle this error
+appropriately.
+
+Signed-off-by: David Vrabel <dvrabel@arcom.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ arch/arm/common/locomo.c           |    2 ++
+ arch/arm/common/sa1111.c           |    2 ++
+ drivers/char/s3c2410-rtc.c         |    4 ++--
+ drivers/char/watchdog/mpcore_wdt.c |    4 ++++
+ drivers/i2c/busses/i2c-iop3xx.c    |    9 +++++++--
+ drivers/i2c/busses/i2c-mpc.c       |    5 +++++
+ drivers/i2c/busses/i2c-mv64xxx.c   |    4 ++++
+ drivers/ide/mips/au1xxx-ide.c      |    5 +++++
+ drivers/mmc/pxamci.c               |    2 +-
+ drivers/net/arm/am79c961a.c        |    4 +++-
+ drivers/net/fs_enet/mac-fcc.c      |    2 ++
+ drivers/net/fs_enet/mac-fec.c      |    2 ++
+ drivers/net/fs_enet/mac-scc.c      |    2 ++
+ drivers/net/gianfar.c              |    4 ++++
+ drivers/net/smc91x.c               |    4 ++++
+ drivers/pcmcia/omap_cf.c           |    2 +-
+ drivers/serial/s3c2410.c           |    2 ++
+ drivers/usb/host/ohci-omap.c       |    9 +++++++--
+ drivers/video/sa1100fb.c           |    2 +-
+ 19 files changed, 60 insertions(+), 10 deletions(-)
+
+--- gregkh-2.6.orig/arch/arm/common/locomo.c
++++ gregkh-2.6/arch/arm/common/locomo.c
+@@ -767,6 +767,8 @@ static int locomo_probe(struct platform_
+ 	if (!mem)
+ 		return -EINVAL;
+ 	irq = platform_get_irq(dev, 0);
++	if (irq < 0)
++		return -ENXIO;
+ 
+ 	return __locomo_probe(&dev->dev, mem, irq);
+ }
+--- gregkh-2.6.orig/arch/arm/common/sa1111.c
++++ gregkh-2.6/arch/arm/common/sa1111.c
+@@ -943,6 +943,8 @@ static int sa1111_probe(struct platform_
+ 	if (!mem)
+ 		return -EINVAL;
+ 	irq = platform_get_irq(pdev, 0);
++	if (irq < 0)
++		return -ENXIO;
+ 
+ 	return __sa1111_probe(&pdev->dev, mem, irq);
+ }
+--- gregkh-2.6.orig/drivers/char/s3c2410-rtc.c
++++ gregkh-2.6/drivers/char/s3c2410-rtc.c
+@@ -448,13 +448,13 @@ static int s3c2410_rtc_probe(struct plat
+ 	/* find the IRQs */
+ 
+ 	s3c2410_rtc_tickno = platform_get_irq(pdev, 1);
+-	if (s3c2410_rtc_tickno <= 0) {
++	if (s3c2410_rtc_tickno < 0) {
+ 		dev_err(&pdev->dev, "no irq for rtc tick\n");
+ 		return -ENOENT;
+ 	}
+ 
+ 	s3c2410_rtc_alarmno = platform_get_irq(pdev, 0);
+-	if (s3c2410_rtc_alarmno <= 0) {
++	if (s3c2410_rtc_alarmno < 0) {
+ 		dev_err(&pdev->dev, "no irq for alarm\n");
+ 		return -ENOENT;
+ 	}
+--- gregkh-2.6.orig/drivers/char/watchdog/mpcore_wdt.c
++++ gregkh-2.6/drivers/char/watchdog/mpcore_wdt.c
+@@ -338,6 +338,10 @@ static int __devinit mpcore_wdt_probe(st
+ 
+ 	wdt->dev = &dev->dev;
+ 	wdt->irq = platform_get_irq(dev, 0);
++	if (wdt->irq < 0) {
++		ret = -ENXIO;
++		goto err_free;
++	}
+ 	wdt->base = ioremap(res->start, res->end - res->start + 1);
+ 	if (!wdt->base) {
+ 		ret = -ENOMEM;
+--- gregkh-2.6.orig/drivers/i2c/busses/i2c-iop3xx.c
++++ gregkh-2.6/drivers/i2c/busses/i2c-iop3xx.c
+@@ -434,7 +434,7 @@ static int 
+ iop3xx_i2c_probe(struct platform_device *pdev)
+ {
+ 	struct resource *res;
+-	int ret;
++	int ret, irq;
+ 	struct i2c_adapter *new_adapter;
+ 	struct i2c_algo_iop3xx_data *adapter_data;
+ 
+@@ -470,7 +470,12 @@ iop3xx_i2c_probe(struct platform_device 
+ 		goto release_region;
+ 	}
+ 
+-	ret = request_irq(platform_get_irq(pdev, 0), iop3xx_i2c_irq_handler, 0,
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0) {
++		ret = -ENXIO;
++		goto unmap;
++	}
++	ret = request_irq(irq, iop3xx_i2c_irq_handler, 0,
+ 				pdev->name, adapter_data);
+ 
+ 	if (ret) {
+--- gregkh-2.6.orig/drivers/i2c/busses/i2c-mpc.c
++++ gregkh-2.6/drivers/i2c/busses/i2c-mpc.c
+@@ -302,6 +302,10 @@ static int fsl_i2c_probe(struct platform
+ 	}
+ 
+ 	i2c->irq = platform_get_irq(pdev, 0);
++	if (i2c->irq < 0) {
++		result = -ENXIO;
++		goto fail_get_irq;
++	}
+ 	i2c->flags = pdata->device_flags;
+ 	init_waitqueue_head(&i2c->queue);
+ 
+@@ -340,6 +344,7 @@ static int fsl_i2c_probe(struct platform
+       fail_irq:
+ 	iounmap(i2c->base);
+       fail_map:
++      fail_get_irq:
+ 	kfree(i2c);
+ 	return result;
+ };
+--- gregkh-2.6.orig/drivers/i2c/busses/i2c-mv64xxx.c
++++ gregkh-2.6/drivers/i2c/busses/i2c-mv64xxx.c
+@@ -516,6 +516,10 @@ mv64xxx_i2c_probe(struct platform_device
+ 	drv_data->freq_m = pdata->freq_m;
+ 	drv_data->freq_n = pdata->freq_n;
+ 	drv_data->irq = platform_get_irq(pd, 0);
++	if (drv_data->irq < 0) {
++		rc = -ENXIO;
++		goto exit_unmap_regs;
++	}
+ 	drv_data->adapter.id = I2C_HW_MV64XXX;
+ 	drv_data->adapter.algo = &mv64xxx_i2c_algo;
+ 	drv_data->adapter.owner = THIS_MODULE;
+--- gregkh-2.6.orig/drivers/ide/mips/au1xxx-ide.c
++++ gregkh-2.6/drivers/ide/mips/au1xxx-ide.c
+@@ -674,6 +674,11 @@ static int au_ide_probe(struct device *d
+ 		ret = -ENODEV;
+ 		goto out;
+ 	}
++	if (ahwif->irq < 0) {
++		pr_debug("%s %d: no IRQ\n", DRV_NAME, pdev->id);
++		ret = -ENODEV;
++		goto out;
++	}
+ 
+ 	if (!request_mem_region (res->start, res->end-res->start, pdev->name)) {
+ 		pr_debug("%s: request_mem_region failed\n", DRV_NAME);
+--- gregkh-2.6.orig/drivers/mmc/pxamci.c
++++ gregkh-2.6/drivers/mmc/pxamci.c
+@@ -437,7 +437,7 @@ static int pxamci_probe(struct platform_
+ 
+ 	r = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+ 	irq = platform_get_irq(pdev, 0);
+-	if (!r || irq == NO_IRQ)
++	if (!r || irq < 0)
+ 		return -ENXIO;
+ 
+ 	r = request_mem_region(r->start, SZ_4K, DRIVER_NAME);
+--- gregkh-2.6.orig/drivers/net/arm/am79c961a.c
++++ gregkh-2.6/drivers/net/arm/am79c961a.c
+@@ -696,7 +696,9 @@ static int __init am79c961_probe(struct 
+ 	dev->base_addr = res->start;
+ 	dev->irq = platform_get_irq(pdev, 0);
+ 
+-    	ret = -ENODEV;
++	ret = -ENODEV;
++	if (dev->irq < 0)
++		goto nodev;
+ 	if (!request_region(dev->base_addr, 0x18, dev->name))
+ 		goto nodev;
+ 
+--- gregkh-2.6.orig/drivers/net/fs_enet/mac-fcc.c
++++ gregkh-2.6/drivers/net/fs_enet/mac-fcc.c
+@@ -118,6 +118,8 @@ static int do_pd_setup(struct fs_enet_pr
+ 
+ 	/* Fill out IRQ field */
+ 	fep->interrupt = platform_get_irq(pdev, 0);
++	if (fep->interrupt < 0)
++		return -EINVAL;
+ 
+ 	/* Attach the memory for the FCC Parameter RAM */
+ 	r = platform_get_resource_byname(pdev, IORESOURCE_MEM, "fcc_pram");
+--- gregkh-2.6.orig/drivers/net/fs_enet/mac-fec.c
++++ gregkh-2.6/drivers/net/fs_enet/mac-fec.c
+@@ -144,6 +144,8 @@ static int do_pd_setup(struct fs_enet_pr
+ 	
+ 	/* Fill out IRQ field */
+ 	fep->interrupt = platform_get_irq_byname(pdev,"interrupt");
++	if (fep->interrupt < 0)
++		return -EINVAL;
+ 	
+ 	r = platform_get_resource_byname(pdev, IORESOURCE_MEM, "regs");
+ 	fep->fec.fecp =(void*)r->start;
+--- gregkh-2.6.orig/drivers/net/fs_enet/mac-scc.c
++++ gregkh-2.6/drivers/net/fs_enet/mac-scc.c
+@@ -118,6 +118,8 @@ static int do_pd_setup(struct fs_enet_pr
+ 
+ 	/* Fill out IRQ field */
+ 	fep->interrupt = platform_get_irq_byname(pdev, "interrupt");
++	if (fep->interrupt < 0)
++		return -EINVAL;
+ 
+ 	r = platform_get_resource_byname(pdev, IORESOURCE_MEM, "regs");
+ 	fep->scc.sccp = (void *)r->start;
+--- gregkh-2.6.orig/drivers/net/gianfar.c
++++ gregkh-2.6/drivers/net/gianfar.c
+@@ -193,8 +193,12 @@ static int gfar_probe(struct platform_de
+ 		priv->interruptTransmit = platform_get_irq_byname(pdev, "tx");
+ 		priv->interruptReceive = platform_get_irq_byname(pdev, "rx");
+ 		priv->interruptError = platform_get_irq_byname(pdev, "error");
++		if (priv->interruptTransmit < 0 || priv->interruptReceive < 0 || priv->interruptError < 0)
++			goto regs_fail;
+ 	} else {
+ 		priv->interruptTransmit = platform_get_irq(pdev, 0);
++		if (priv->interruptTransmit < 0)
++			goto regs_fail;
+ 	}
+ 
+ 	/* get a pointer to the register memory */
+--- gregkh-2.6.orig/drivers/net/smc91x.c
++++ gregkh-2.6/drivers/net/smc91x.c
+@@ -2221,6 +2221,10 @@ static int smc_drv_probe(struct platform
+ 
+ 	ndev->dma = (unsigned char)-1;
+ 	ndev->irq = platform_get_irq(pdev, 0);
++	if (ndev->irq < 0) {
++		ret = -ENODEV;
++		goto out_free_netdev;
++	}
+ 
+ 	ret = smc_request_attrib(pdev);
+ 	if (ret)
+--- gregkh-2.6.orig/drivers/pcmcia/omap_cf.c
++++ gregkh-2.6/drivers/pcmcia/omap_cf.c
+@@ -218,7 +218,7 @@ static int __init omap_cf_probe(struct d
+ 
+ 	/* either CFLASH.IREQ (INT_1610_CF) or some GPIO */
+ 	irq = platform_get_irq(pdev, 0);
+-	if (!irq)
++	if (irq < 0)
+ 		return -EINVAL;
+ 
+ 	cf = kcalloc(1, sizeof *cf, GFP_KERNEL);
+--- gregkh-2.6.orig/drivers/serial/s3c2410.c
++++ gregkh-2.6/drivers/serial/s3c2410.c
+@@ -1060,6 +1060,8 @@ static int s3c24xx_serial_init_port(stru
+ 	port->mapbase	= res->start;
+ 	port->membase	= S3C24XX_VA_UART + (res->start - S3C2410_PA_UART);
+ 	port->irq	= platform_get_irq(platdev, 0);
++	if (port->irq < 0)
++		port->irq = 0;
+ 
+ 	ourport->clk	= clk_get(&platdev->dev, "uart");
+ 
+--- gregkh-2.6.orig/drivers/usb/host/ohci-omap.c
++++ gregkh-2.6/drivers/usb/host/ohci-omap.c
+@@ -286,7 +286,7 @@ void usb_hcd_omap_remove (struct usb_hcd
+ int usb_hcd_omap_probe (const struct hc_driver *driver,
+ 			  struct platform_device *pdev)
+ {
+-	int retval;
++	int retval, irq;
+ 	struct usb_hcd *hcd = 0;
+ 	struct ohci_hcd *ohci;
+ 
+@@ -329,7 +329,12 @@ int usb_hcd_omap_probe (const struct hc_
+ 	if (retval < 0)
+ 		goto err2;
+ 
+-	retval = usb_add_hcd(hcd, platform_get_irq(pdev, 0), SA_INTERRUPT);
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0) {
++		retval = -ENXIO;
++		goto err2;
++	}
++	retval = usb_add_hcd(hcd, irq, SA_INTERRUPT);
+ 	if (retval == 0)
+ 		return retval;
+ 
+--- gregkh-2.6.orig/drivers/video/sa1100fb.c
++++ gregkh-2.6/drivers/video/sa1100fb.c
+@@ -1457,7 +1457,7 @@ static int __init sa1100fb_probe(struct 
+ 	int ret, irq;
+ 
+ 	irq = platform_get_irq(pdev, 0);
+-	if (irq <= 0)
++	if (irq < 0)
+ 		return -EINVAL;
+ 
+ 	if (!request_mem_region(0xb0100000, 0x10000, "LCD"))
