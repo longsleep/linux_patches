@@ -1,0 +1,180 @@
+From david-b@pacbell.net Sat Jan 21 13:21:44 2006
+From: David Brownell <david-b@pacbell.net>
+To: Linus Torvalds <torvalds@osdl.org>
+Subject: SPI: spi_butterfly, restore lost deltas
+Date: Sat, 21 Jan 2006 13:21:43 -0800
+Cc: Greg KH <greg@kroah.com>
+Message-Id: <200601211321.43845.david-b@pacbell.net>
+
+This resolves some minor version skew glitches that accumulated for the AVR
+Butterfly adapter driver, which caused among other things the existence of
+a duplicate Kconfig entry.  Most of it boils down to comment updates, but in
+one case it removes some now-superfluous code that would be better if not
+copied into other controller-level drivers.
+
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+
+---
+ Documentation/spi/butterfly |   23 +++++++++++++++++------
+ drivers/spi/Kconfig         |   10 ----------
+ drivers/spi/spi_butterfly.c |   38 ++++++++++++++++++--------------------
+ 3 files changed, 35 insertions(+), 36 deletions(-)
+
+--- gregkh-2.6.orig/drivers/spi/Kconfig
++++ gregkh-2.6/drivers/spi/Kconfig
+@@ -75,16 +75,6 @@ config SPI_BUTTERFLY
+ 	  inexpensive battery powered microcontroller evaluation board.
+ 	  This same cable can be used to flash new firmware.
+ 
+-config SPI_BUTTERFLY
+-	tristate "Parallel port adapter for AVR Butterfly (DEVELOPMENT)"
+-	depends on SPI_MASTER && PARPORT && EXPERIMENTAL
+-	select SPI_BITBANG
+-	help
+-	  This uses a custom parallel port cable to connect to an AVR
+-	  Butterfly <http://www.atmel.com/products/avr/butterfly>, an
+-	  inexpensive battery powered microcontroller evaluation board.
+-	  This same cable can be used to flash new firmware.
+-
+ #
+ # Add new SPI master controllers in alphabetical order above this line
+ #
+--- gregkh-2.6.orig/drivers/spi/spi_butterfly.c
++++ gregkh-2.6/drivers/spi/spi_butterfly.c
+@@ -163,21 +163,20 @@ static void butterfly_chipselect(struct 
+ 	struct butterfly	*pp = spidev_to_pp(spi);
+ 
+ 	/* set default clock polarity */
+-	if (value)
++	if (value != BITBANG_CS_INACTIVE)
+ 		setsck(spi, spi->mode & SPI_CPOL);
+ 
+ 	/* no chipselect on this USI link config */
+ 	if (is_usidev(spi))
+ 		return;
+ 
+-	/* here, value == "activate or not" */
+-
+-	/* most PARPORT_CONTROL_* bits are negated */
++	/* here, value == "activate or not";
++	 * most PARPORT_CONTROL_* bits are negated, so we must
++	 * morph it to value == "bit value to write in control register"
++	 */
+ 	if (spi_cs_bit == PARPORT_CONTROL_INIT)
+ 		value = !value;
+-
+-	/* here, value == "bit value to write in control register"  */
+-
++
+ 	parport_frob_control(pp->port, spi_cs_bit, value ? spi_cs_bit : 0);
+ }
+ 
+@@ -202,7 +201,9 @@ butterfly_txrx_word_mode0(struct spi_dev
+ 
+ /* override default partitioning with cmdlinepart */
+ static struct mtd_partition partitions[] = { {
+-	/* JFFS2 wants partitions of 4*N blocks for this device ... */
++	/* JFFS2 wants partitions of 4*N blocks for this device,
++	 * so sectors 0 and 1 can't be partitions by themselves.
++	 */
+ 
+ 	/* sector 0 = 8 pages * 264 bytes/page (1 block)
+ 	 * sector 1 = 248 pages * 264 bytes/page
+@@ -316,8 +317,9 @@ static void butterfly_attach(struct parp
+ 	if (status < 0)
+ 		goto clean2;
+ 
+-	/* Bus 1 lets us talk to at45db041b (firmware disables AVR)
+-	 * or AVR (firmware resets at45, acts as spi slave)
++	/* Bus 1 lets us talk to at45db041b (firmware disables AVR SPI), AVR
++	 * (firmware resets at45, acts as spi slave) or neither (we ignore
++	 * both, AVR uses AT45).  Here we expect firmware for the first option.
+ 	 */
+ 	pp->info[0].max_speed_hz = 15 * 1000 * 1000;
+ 	strcpy(pp->info[0].modalias, "mtd_dataflash");
+@@ -330,7 +332,9 @@ static void butterfly_attach(struct parp
+ 				pp->dataflash->dev.bus_id);
+ 
+ #ifdef	HAVE_USI
+-	/* even more custom AVR firmware */
++	/* Bus 2 is only for talking to the AVR, and it can work no
++	 * matter who masters bus 1; needs appropriate AVR firmware.
++	 */
+ 	pp->info[1].max_speed_hz = 10 /* ?? */ * 1000 * 1000;
+ 	strcpy(pp->info[1].modalias, "butterfly");
+ 	// pp->info[1].platform_data = ... TBD ... ;
+@@ -378,13 +382,8 @@ static void butterfly_detach(struct parp
+ 	pp = butterfly;
+ 	butterfly = NULL;
+ 
+-#ifdef	HAVE_USI
+-	spi_unregister_device(pp->butterfly);
+-	pp->butterfly = NULL;
+-#endif
+-	spi_unregister_device(pp->dataflash);
+-	pp->dataflash = NULL;
+-
++	/* stop() unregisters child devices too */
++	pdev = to_platform_device(pp->bitbang.master->cdev.dev);
+ 	status = spi_bitbang_stop(&pp->bitbang);
+ 
+ 	/* turn off VCC */
+@@ -394,8 +393,6 @@ static void butterfly_detach(struct parp
+ 	parport_release(pp->pd);
+ 	parport_unregister_device(pp->pd);
+ 
+-	pdev = to_platform_device(pp->bitbang.master->cdev.dev);
+-
+ 	(void) spi_master_put(pp->bitbang.master);
+ 
+ 	platform_device_unregister(pdev);
+@@ -420,4 +417,5 @@ static void __exit butterfly_exit(void)
+ }
+ module_exit(butterfly_exit);
+ 
++MODULE_DESCRIPTION("Parport Adapter driver for AVR Butterfly");
+ MODULE_LICENSE("GPL");
+--- gregkh-2.6.orig/Documentation/spi/butterfly
++++ gregkh-2.6/Documentation/spi/butterfly
+@@ -12,13 +12,20 @@ You can make this adapter from an old pr
+ directly to the Butterfly.  Or (if you have the parts and skills) you
+ can come up with something fancier, providing ciruit protection to the
+ Butterfly and the printer port, or with a better power supply than two
+-signal pins from the printer port.
++signal pins from the printer port.  Or for that matter, you can use
++similar cables to talk to many AVR boards, even a breadboard.
++
++This is more powerful than "ISP programming" cables since it lets kernel
++SPI protocol drivers interact with the AVR, and could even let the AVR
++issue interrupts to them.  Later, your protocol driver should work
++easily with a "real SPI controller", instead of this bitbanger.
+ 
+ 
+ The first cable connections will hook Linux up to one SPI bus, with the
+ AVR and a DataFlash chip; and to the AVR reset line.  This is all you
+ need to reflash the firmware, and the pins are the standard Atmel "ISP"
+-connector pins (used also on non-Butterfly AVR boards).
++connector pins (used also on non-Butterfly AVR boards).  On the parport
++side this is like "sp12" programming cables.
+ 
+ 	Signal	  Butterfly	  Parport (DB-25)
+ 	------	  ---------	  ---------------
+@@ -40,10 +47,14 @@ by clearing PORTB.[0-3]); (b) configure 
+ 	SELECT	= J400.PB0/nSS	= pin 17/C3,nSELECT
+ 	GND	= J400.GND	= pin 24/GND
+ 
+-The "USI" controller, using J405, can be used for a second SPI bus.  That
+-would let you talk to the AVR over SPI, running firmware that makes it act
+-as an SPI slave, while letting either Linux or the AVR use the DataFlash.
+-There are plenty of spare parport pins to wire this one up, such as:
++Or you could flash firmware making the AVR into an SPI slave (keeping the
++DataFlash in reset) and tweak the spi_butterfly driver to make it bind to
++the driver for your custom SPI-based protocol.
++
++The "USI" controller, using J405, can also be used for a second SPI bus.
++That would let you talk to the AVR using custom SPI-with-USI firmware,
++while letting either Linux or the AVR use the DataFlash.  There are plenty
++of spare parport pins to wire this one up, such as:
+ 
+ 	Signal	  Butterfly	  Parport (DB-25)
+ 	------	  ---------	  ---------------
