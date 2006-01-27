@@ -1,0 +1,181 @@
+From david-b@pacbell.net Tue Jan 24 08:40:38 2006
+From: David Brownell <david-b@pacbell.net>
+Subject: USB: remove usbcore-specific wakeup flags
+Date: Tue, 24 Jan 2006 08:40:27 -0800
+Cc: Alan Stern <stern@rowland.harvard.edu>, Greg KH <greg@kroah.com>
+Message-Id: <200601240840.27533.david-b@pacbell.net>
+
+
+This makes usbcore use the driver model wakeup flags for host controllers
+and for their root hubs.  Since previous patches have removed all users of
+the HCD flags they replace, this converts the last users of those flags.
+
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/hcd-pci.c |   11 ++++++++---
+ drivers/usb/core/hcd.c     |   40 ++++++++++++++++++++++++++--------------
+ drivers/usb/core/hcd.h     |    2 --
+ drivers/usb/core/hub.c     |   22 ++++++++++++++--------
+ 4 files changed, 48 insertions(+), 27 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/core/hcd.h
++++ gregkh-2.6/drivers/usb/core/hcd.h
+@@ -78,8 +78,6 @@ struct usb_hcd {	/* usb_bus.hcpriv point
+ #define HCD_FLAG_HW_ACCESSIBLE	0x00000001
+ #define HCD_FLAG_SAW_IRQ	0x00000002
+ 
+-	unsigned		can_wakeup:1;	/* hw supports wakeup? */
+-	unsigned		remote_wakeup:1;/* sw should use wakeup? */
+ 	unsigned		rh_registered:1;/* is root hub registered? */
+ 
+ 	/* The next flag is a stopgap, to be removed when all the HCDs
+--- gregkh-2.6.orig/drivers/usb/core/hcd.c
++++ gregkh-2.6/drivers/usb/core/hcd.c
+@@ -367,21 +367,39 @@ static int rh_call_control (struct usb_h
+ 
+ 	/* DEVICE REQUESTS */
+ 
++	/* The root hub's remote wakeup enable bit is implemented using
++	 * driver model wakeup flags.  If this system supports wakeup
++	 * through USB, userspace may change the default "allow wakeup"
++	 * policy through sysfs or these calls.
++	 *
++	 * Most root hubs support wakeup from downstream devices, for
++	 * runtime power management (disabling USB clocks and reducing
++	 * VBUS power usage).  However, not all of them do so; silicon,
++	 * board, and BIOS bugs here are not uncommon, so these can't
++	 * be treated quite like external hubs.
++	 *
++	 * Likewise, not all root hubs will pass wakeup events upstream,
++	 * to wake up the whole system.  So don't assume root hub and
++	 * controller capabilities are identical.
++	 */
++
+ 	case DeviceRequest | USB_REQ_GET_STATUS:
+-		tbuf [0] = (hcd->remote_wakeup << USB_DEVICE_REMOTE_WAKEUP)
++		tbuf [0] = (device_may_wakeup(&hcd->self.root_hub->dev)
++					<< USB_DEVICE_REMOTE_WAKEUP)
+ 				| (1 << USB_DEVICE_SELF_POWERED);
+ 		tbuf [1] = 0;
+ 		len = 2;
+ 		break;
+ 	case DeviceOutRequest | USB_REQ_CLEAR_FEATURE:
+ 		if (wValue == USB_DEVICE_REMOTE_WAKEUP)
+-			hcd->remote_wakeup = 0;
++			device_set_wakeup_enable(&hcd->self.root_hub->dev, 0);
+ 		else
+ 			goto error;
+ 		break;
+ 	case DeviceOutRequest | USB_REQ_SET_FEATURE:
+-		if (hcd->can_wakeup && wValue == USB_DEVICE_REMOTE_WAKEUP)
+-			hcd->remote_wakeup = 1;
++		if (device_can_wakeup(&hcd->self.root_hub->dev)
++				&& wValue == USB_DEVICE_REMOTE_WAKEUP)
++			device_set_wakeup_enable(&hcd->self.root_hub->dev, 1);
+ 		else
+ 			goto error;
+ 		break;
+@@ -410,7 +428,7 @@ static int rh_call_control (struct usb_h
+ 				bufp = fs_rh_config_descriptor;
+ 				len = sizeof fs_rh_config_descriptor;
+ 			}
+-			if (hcd->can_wakeup)
++			if (device_can_wakeup(&hcd->self.root_hub->dev))
+ 				patch_wakeup = 1;
+ 			break;
+ 		case USB_DT_STRING << 8:
+@@ -1802,16 +1820,10 @@ int usb_add_hcd(struct usb_hcd *hcd,
+ 	device_init_wakeup(&rhdev->dev,
+ 			device_can_wakeup(hcd->self.controller));
+ 
+-	// ... all these hcd->*_wakeup flags will vanish
+-	hcd->can_wakeup = device_can_wakeup(hcd->self.controller);
+-
+-	/* hcd->driver->reset() reported can_wakeup, probably with
+-	 * assistance from board's boot firmware.
+-	 * NOTE:  normal devices won't enable wakeup by default.
+-	 */
+-	if (hcd->can_wakeup)
++	/* NOTE: root hub and controller capabilities may not be the same */
++	if (device_can_wakeup(hcd->self.controller)
++			&& device_can_wakeup(&hcd->self.root_hub->dev))
+ 		dev_dbg(hcd->self.controller, "supports USB remote wakeup\n");
+-	hcd->remote_wakeup = hcd->can_wakeup;
+ 
+ 	/* enable irqs just before we start the controller */
+ 	if (hcd->driver->irq) {
+--- gregkh-2.6.orig/drivers/usb/core/hcd-pci.c
++++ gregkh-2.6/drivers/usb/core/hcd-pci.c
+@@ -264,14 +264,19 @@ int usb_hcd_pci_suspend (struct pci_dev 
+ 		 */
+ 		retval = pci_set_power_state (dev, PCI_D3hot);
+ 		if (retval == 0) {
+-			dev_dbg (hcd->self.controller, "--> PCI D3\n");
++			int wake = device_can_wakeup(&hcd->self.root_hub->dev);
++
++			wake = wake && device_may_wakeup(hcd->self.controller);
++
++			dev_dbg (hcd->self.controller, "--> PCI D3%s\n",
++					wake ? "/wakeup" : "");
+ 
+ 			/* Ignore these return values.  We rely on pci code to
+ 			 * reject requests the hardware can't implement, rather
+ 			 * than coding the same thing.
+ 			 */
+-			(void) pci_enable_wake (dev, PCI_D3hot, hcd->remote_wakeup);
+-			(void) pci_enable_wake (dev, PCI_D3cold, hcd->remote_wakeup);
++			(void) pci_enable_wake (dev, PCI_D3hot, wake);
++			(void) pci_enable_wake (dev, PCI_D3cold, wake);
+ 		} else {
+ 			dev_dbg (&dev->dev, "PCI D3 suspend fail, %d\n",
+ 					retval);
+--- gregkh-2.6.orig/drivers/usb/core/hub.c
++++ gregkh-2.6/drivers/usb/core/hub.c
+@@ -1006,12 +1006,18 @@ void usb_set_device_state(struct usb_dev
+ 		;	/* do nothing */
+ 	else if (new_state != USB_STATE_NOTATTACHED) {
+ 		udev->state = new_state;
+-		if (new_state == USB_STATE_CONFIGURED)
+-			device_init_wakeup(&udev->dev,
+-				(udev->actconfig->desc.bmAttributes
+-				 & USB_CONFIG_ATT_WAKEUP));
+-		else if (new_state != USB_STATE_SUSPENDED)
+-			device_init_wakeup(&udev->dev, 0);
++
++		/* root hub wakeup capabilities are managed out-of-band
++		 * and may involve silicon errata ... ignore them here.
++		 */
++		if (udev->parent) {
++			if (new_state == USB_STATE_CONFIGURED)
++				device_init_wakeup(&udev->dev,
++					(udev->actconfig->desc.bmAttributes
++					 & USB_CONFIG_ATT_WAKEUP));
++			else if (new_state != USB_STATE_SUSPENDED)
++				device_init_wakeup(&udev->dev, 0);
++		}
+ 	} else
+ 		recursively_mark_NOTATTACHED(udev);
+ 	spin_unlock_irqrestore(&device_state_lock, flags);
+@@ -1875,9 +1881,9 @@ int usb_resume_device(struct usb_device 
+ 	if (udev->state == USB_STATE_NOTATTACHED)
+ 		return -ENODEV;
+ 
+-#ifdef	CONFIG_USB_SUSPEND
+ 	/* selective resume of one downstream hub-to-device port */
+ 	if (udev->parent) {
++#ifdef	CONFIG_USB_SUSPEND
+ 		if (udev->state == USB_STATE_SUSPENDED) {
+ 			// NOTE swsusp may bork us, device state being wrong...
+ 			// NOTE this fails if parent is also suspended...
+@@ -1885,8 +1891,8 @@ int usb_resume_device(struct usb_device 
+ 					udev->portnum, udev);
+ 		} else
+ 			status = 0;
+-	} else
+ #endif
++	} else
+ 		status = finish_device_resume(udev);
+ 	if (status < 0)
+ 		dev_dbg(&udev->dev, "can't resume, status %d\n",
