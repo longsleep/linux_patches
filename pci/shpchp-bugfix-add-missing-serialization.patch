@@ -1,0 +1,197 @@
+From kaneshige.kenji@jp.fujitsu.com Wed Jan 25 17:02:31 2006
+Message-ID: <43D81F31.9010608@jp.fujitsu.com>
+Date: Thu, 26 Jan 2006 10:00:33 +0900
+From: Kenji Kaneshige <kaneshige.kenji@jp.fujitsu.com>
+To: Greg KH <gregkh@suse.de>
+Cc: Kenji Kaneshige <kaneshige.kenji@jp.fujitsu.com>
+Subject: [PATCH 6/11] shpchp - bugfix: add missing serialization
+
+Current shpchp driver might cause system panic because of lack of
+serialization. It can be reproduced very easily by the following
+operation.
+
+	# cd /sys/bus/pci/slots/<slot#>
+	# while true; do echo 0 > power ; echo 1 > power ; done &
+	# while true; do echo 0 > power ; echo 1 > power ; done &
+
+This patch fixes this issue by changing shpchp to get appropreate
+semaphore for hot-plug operation.
+
+Signed-off-by: Kenji Kaneshige <kaneshige.kenji@jp.fujitsu.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/pci/hotplug/shpchp_ctrl.c |   66 +++++++++++++-------------------------
+ 1 file changed, 24 insertions(+), 42 deletions(-)
+
+--- gregkh-2.6.orig/drivers/pci/hotplug/shpchp_ctrl.c
++++ gregkh-2.6/drivers/pci/hotplug/shpchp_ctrl.c
+@@ -307,15 +307,10 @@ static int board_added(struct slot *p_sl
+ 			__FUNCTION__, p_slot->device,
+ 			ctrl->slot_device_offset, hp_slot);
+ 
+-	/* Wait for exclusive access to hardware */
+-	mutex_lock(&ctrl->crit_sect);
+-
+ 	/* Power on slot without connecting to bus */
+ 	rc = p_slot->hpc_ops->power_on_slot(p_slot);
+ 	if (rc) {
+ 		err("%s: Failed to power on slot\n", __FUNCTION__);
+-		/* Done with exclusive hardware access */
+-		mutex_unlock(&ctrl->crit_sect);
+ 		return -1;
+ 	}
+ 	
+@@ -325,14 +320,12 @@ static int board_added(struct slot *p_sl
+ 		
+ 		if ((rc = p_slot->hpc_ops->set_bus_speed_mode(p_slot, PCI_SPEED_33MHz))) {
+ 			err("%s: Issue of set bus speed mode command failed\n", __FUNCTION__);
+-			mutex_unlock(&ctrl->crit_sect);
+ 			return WRONG_BUS_FREQUENCY;
+ 		}
+ 		
+ 		/* turn on board, blink green LED, turn off Amber LED */
+ 		if ((rc = p_slot->hpc_ops->slot_enable(p_slot))) {
+ 			err("%s: Issue of Slot Enable command failed\n", __FUNCTION__);
+-			mutex_unlock(&ctrl->crit_sect);
+ 			return rc;
+ 		}
+ 	}
+@@ -346,16 +339,12 @@ static int board_added(struct slot *p_sl
+ 
+ 	if (rc  || adapter_speed == PCI_SPEED_UNKNOWN) {
+ 		err("%s: Can't get adapter speed or bus mode mismatch\n", __FUNCTION__);
+-		/* Done with exclusive hardware access */
+-		mutex_unlock(&ctrl->crit_sect);
+ 		return WRONG_BUS_FREQUENCY;
+ 	}
+ 
+ 	rc = p_slot->hpc_ops->get_cur_bus_speed(p_slot, &bus_speed);
+ 	if (rc || bus_speed == PCI_SPEED_UNKNOWN) {
+ 		err("%s: Can't get bus operation speed\n", __FUNCTION__);
+-		/* Done with exclusive hardware access */
+-		mutex_unlock(&ctrl->crit_sect);
+ 		return WRONG_BUS_FREQUENCY;
+ 	}
+ 
+@@ -365,9 +354,6 @@ static int board_added(struct slot *p_sl
+ 		max_bus_speed = bus_speed;
+ 	}
+ 
+-	/* Done with exclusive hardware access */
+-	mutex_unlock(&ctrl->crit_sect);
+-
+ 	if ((rc  = p_slot->hpc_ops->get_prog_int(p_slot, &pi))) {
+ 		err("%s: Can't get controller programming interface, set it to 1\n", __FUNCTION__);
+ 		pi = 1;
+@@ -744,29 +730,25 @@ static void interrupt_event_handler(stru
+ int shpchp_enable_slot (struct slot *p_slot)
+ {
+ 	u8 getstatus = 0;
+-	int rc;
++	int rc, retval = -ENODEV;
+ 
+ 	/* Check to see if (latch closed, card present, power off) */
+ 	mutex_lock(&p_slot->ctrl->crit_sect);
+ 	rc = p_slot->hpc_ops->get_adapter_status(p_slot, &getstatus);
+ 	if (rc || !getstatus) {
+ 		info("%s: no adapter on slot(%x)\n", __FUNCTION__, p_slot->number);
+-		mutex_unlock(&p_slot->ctrl->crit_sect);
+-		return -ENODEV;
++		goto out;
+ 	}
+ 	rc = p_slot->hpc_ops->get_latch_status(p_slot, &getstatus);
+ 	if (rc || getstatus) {
+ 		info("%s: latch open on slot(%x)\n", __FUNCTION__, p_slot->number);
+-		mutex_unlock(&p_slot->ctrl->crit_sect);
+-		return -ENODEV;
++		goto out;
+ 	}
+ 	rc = p_slot->hpc_ops->get_power_status(p_slot, &getstatus);
+ 	if (rc || getstatus) {
+ 		info("%s: already enabled on slot(%x)\n", __FUNCTION__, p_slot->number);
+-		mutex_unlock(&p_slot->ctrl->crit_sect);
+-		return -ENODEV;
++		goto out;
+ 	}
+-	mutex_unlock(&p_slot->ctrl->crit_sect);
+ 
+ 	p_slot->is_a_board = 1;
+ 
+@@ -781,27 +763,29 @@ int shpchp_enable_slot (struct slot *p_s
+ 	     && p_slot->ctrl->num_slots == 1) {
+ 		/* handle amd pogo errata; this must be done before enable  */
+ 		amd_pogo_errata_save_misc_reg(p_slot);
+-		rc = board_added(p_slot);
++		retval = board_added(p_slot);
+ 		/* handle amd pogo errata; this must be done after enable  */
+ 		amd_pogo_errata_restore_misc_reg(p_slot);
+ 	} else
+-		rc = board_added(p_slot);
++		retval = board_added(p_slot);
+ 
+-	if (rc) {
++	if (retval) {
+ 		p_slot->hpc_ops->get_adapter_status(p_slot,
+ 				&(p_slot->presence_save));
+ 		p_slot->hpc_ops->get_latch_status(p_slot, &getstatus);
+ 	}
+ 
+ 	update_slot_info(p_slot);
+-	return rc;
++ out:
++	mutex_unlock(&p_slot->ctrl->crit_sect);
++	return retval;
+ }
+ 
+ 
+ int shpchp_disable_slot (struct slot *p_slot)
+ {
+ 	u8 getstatus = 0;
+-	int ret = 0;
++	int rc, retval = -ENODEV;
+ 
+ 	if (!p_slot->ctrl)
+ 		return -ENODEV;
+@@ -809,28 +793,26 @@ int shpchp_disable_slot (struct slot *p_
+ 	/* Check to see if (latch closed, card present, power on) */
+ 	mutex_lock(&p_slot->ctrl->crit_sect);
+ 
+-	ret = p_slot->hpc_ops->get_adapter_status(p_slot, &getstatus);
+-	if (ret || !getstatus) {
++	rc = p_slot->hpc_ops->get_adapter_status(p_slot, &getstatus);
++	if (rc || !getstatus) {
+ 		info("%s: no adapter on slot(%x)\n", __FUNCTION__, p_slot->number);
+-		mutex_unlock(&p_slot->ctrl->crit_sect);
+-		return -ENODEV;
++		goto out;
+ 	}
+-	ret = p_slot->hpc_ops->get_latch_status(p_slot, &getstatus);
+-	if (ret || getstatus) {
++	rc = p_slot->hpc_ops->get_latch_status(p_slot, &getstatus);
++	if (rc || getstatus) {
+ 		info("%s: latch open on slot(%x)\n", __FUNCTION__, p_slot->number);
+-		mutex_unlock(&p_slot->ctrl->crit_sect);
+-		return -ENODEV;
++		goto out;
+ 	}
+-	ret = p_slot->hpc_ops->get_power_status(p_slot, &getstatus);
+-	if (ret || !getstatus) {
++	rc = p_slot->hpc_ops->get_power_status(p_slot, &getstatus);
++	if (rc || !getstatus) {
+ 		info("%s: already disabled slot(%x)\n", __FUNCTION__, p_slot->number);
+-		mutex_unlock(&p_slot->ctrl->crit_sect);
+-		return -ENODEV;
++		goto out;
+ 	}
+-	mutex_unlock(&p_slot->ctrl->crit_sect);
+ 
+-	ret = remove_board(p_slot);
++	retval = remove_board(p_slot);
+ 	update_slot_info(p_slot);
+-	return ret;
++ out:
++	mutex_unlock(&p_slot->ctrl->crit_sect);
++	return retval;
+ }
+ 
