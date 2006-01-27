@@ -1,0 +1,120 @@
+From david-b@pacbell.net Fri Jan 20 17:25:17 2006
+From: David Brownell <david-b@pacbell.net>
+Subject: USB: EHCI and NF2 quirk
+To: Greg KH <greg@kroah.com>
+Date: Fri, 20 Jan 2006 13:55:14 -0800
+Message-Id: <200601201355.14378.david-b@pacbell.net>
+
+This teaches the EHCI driver about a quirk seen in older NForce2 chips,
+adding a workaround to ignore selective suspend requests.  Bus-wide
+(so-called "global") suspend still works, as does USB wakeup of a
+root hub that's globally suspended.
+
+There's still a hole in this support though.  Strictly speaking, this
+should _fail_ selective suspend requests, rather than ignoring them,
+since doing it this way means that devices which should be able to issue
+remote wakeup are not going to be able to do that.  For now, we'll just
+live with that problem ... since usbcore expects to do selective suspend
+on the way towards a full bus suspend, and usbcore needs to be able to
+do full bus suspend.
+
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/ehci-hub.c |    4 ++++
+ drivers/usb/host/ehci-pci.c |   25 ++++++++++++++++++++++++-
+ drivers/usb/host/ehci.h     |    3 ++-
+ 3 files changed, 30 insertions(+), 2 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/host/ehci-pci.c
++++ gregkh-2.6/drivers/usb/host/ehci-pci.c
+@@ -106,11 +106,11 @@ static int ehci_pci_setup(struct usb_hcd
+ 		}
+ 		break;
+ 	case PCI_VENDOR_ID_NVIDIA:
++		switch (pdev->device) {
+ 		/* NVidia reports that certain chips don't handle
+ 		 * QH, ITD, or SITD addresses above 2GB.  (But TD,
+ 		 * data buffer, and periodic schedule are normal.)
+ 		 */
+-		switch (pdev->device) {
+ 		case 0x003c:	/* MCP04 */
+ 		case 0x005b:	/* CK804 */
+ 		case 0x00d8:	/* CK8 */
+@@ -120,6 +120,14 @@ static int ehci_pci_setup(struct usb_hcd
+ 				ehci_warn(ehci, "can't enable NVidia "
+ 					"workaround for >2GB RAM\n");
+ 			break;
++		/* Some NForce2 chips have problems with selective suspend;
++		 * fixed in newer silicon.
++		 */
++		case 0x0068:
++			pci_read_config_dword(pdev, PCI_REVISION_ID, &temp);
++			if ((temp & 0xff) < 0xa4)
++				ehci->no_selective_suspend = 1;
++			break;
+ 		}
+ 		break;
+ 	}
+@@ -163,6 +171,21 @@ static int ehci_pci_setup(struct usb_hcd
+ 			device_init_wakeup(&pdev->dev, 1);
+ 	}
+ 
++#ifdef	CONFIG_USB_SUSPEND
++	/* REVISIT: the controller works fine for wakeup iff the root hub
++	 * itself is "globally" suspended, but usbcore currently doesn't
++	 * understand such things.
++	 *
++	 * System suspend currently expects to be able to suspend the entire
++	 * device tree, device-at-a-time.  If we failed selective suspend
++	 * reports, system suspend would fail; so the root hub code must claim
++	 * success.  That's lying to usbcore, and it matters for for runtime
++	 * PM scenarios with selective suspend and remote wakeup...
++	 */
++	if (ehci->no_selective_suspend && device_can_wakeup(&pdev->dev))
++		ehci_warn(ehci, "selective suspend/wakeup unavailable\n");
++#endif
++
+ 	retval = ehci_pci_reinit(ehci, pdev);
+ done:
+ 	return retval;
+--- gregkh-2.6.orig/drivers/usb/host/ehci-hub.c
++++ gregkh-2.6/drivers/usb/host/ehci-hub.c
+@@ -359,6 +359,8 @@ static int ehci_hub_control (
+ 		case USB_PORT_FEAT_SUSPEND:
+ 			if (temp & PORT_RESET)
+ 				goto error;
++			if (ehci->no_selective_suspend)
++				break;
+ 			if (temp & PORT_SUSPEND) {
+ 				if ((temp & PORT_PE) == 0)
+ 					goto error;
+@@ -514,6 +516,8 @@ static int ehci_hub_control (
+ 		temp &= ~PORT_RWC_BITS;
+ 		switch (wValue) {
+ 		case USB_PORT_FEAT_SUSPEND:
++			if (ehci->no_selective_suspend)
++				break;
+ 			if ((temp & PORT_PE) == 0
+ 					|| (temp & PORT_RESET) != 0)
+ 				goto error;
+--- gregkh-2.6.orig/drivers/usb/host/ehci.h
++++ gregkh-2.6/drivers/usb/host/ehci.h
+@@ -89,6 +89,8 @@ struct ehci_hcd {			/* one per controlle
+ 	u32			command;
+ 
+ 	unsigned		is_tdi_rh_tt:1;	/* TDI roothub with TT */
++	unsigned		no_selective_suspend:1;
++	u8			sbrn;		/* packed release number */
+ 
+ 	/* irq statistics */
+ #ifdef EHCI_STATS
+@@ -97,7 +99,6 @@ struct ehci_hcd {			/* one per controlle
+ #else
+ #	define COUNT(x) do {} while (0)
+ #endif
+-	u8			sbrn;		/* packed release number */
+ };
+ 
+ /* convert between an HCD pointer and the corresponding EHCI_HCD */ 
