@@ -37,8 +37,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  drivers/usb/media/usbvideo.c     |   28 +++----
  drivers/usb/media/usbvideo.h     |    5 -
  drivers/usb/media/vicam.c        |   21 ++---
- drivers/usb/media/w9968cf.c      |   68 ++++++++---------
- drivers/usb/media/w9968cf.h      |    6 -
+ drivers/usb/media/w9968cf.c      |   75 ++++++++++--------
+ drivers/usb/media/w9968cf.h      |   14 ---
  drivers/usb/misc/idmouse.c       |   25 +++---
  drivers/usb/misc/ldusb.c         |   11 +-
  drivers/usb/misc/legousbtower.c  |   11 +-
@@ -48,7 +48,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  drivers/usb/storage/scsiglue.c   |    9 +-
  drivers/usb/storage/usb.c        |   25 +++---
  drivers/usb/storage/usb.h        |    5 -
- 34 files changed, 382 insertions(+), 364 deletions(-)
+ 34 files changed, 389 insertions(+), 372 deletions(-)
 
 --- gregkh-2.6.orig/drivers/usb/class/cdc-acm.c
 +++ gregkh-2.6/drivers/usb/class/cdc-acm.c
@@ -2208,7 +2208,21 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		kfree(cam);
 --- gregkh-2.6.orig/drivers/usb/media/w9968cf.c
 +++ gregkh-2.6/drivers/usb/media/w9968cf.c
-@@ -2418,7 +2418,7 @@ w9968cf_configure_camera(struct w9968cf_
+@@ -47,6 +47,13 @@
+ #include "w9968cf.h"
+ #include "w9968cf_decoder.h"
+ 
++static struct w9968cf_vpp_t* w9968cf_vpp;
++static DECLARE_WAIT_QUEUE_HEAD(w9968cf_vppmod_wait);
++
++static LIST_HEAD(w9968cf_dev_list); /* head of V4L registered cameras list */
++static DEFINE_MUTEX(w9968cf_devlist_mutex); /* semaphore for list traversal */
++
++static DECLARE_RWSEM(w9968cf_disconnect); /* prevent races with open() */
+ 
+ 
+ /****************************************************************************
+@@ -2418,7 +2425,7 @@ w9968cf_configure_camera(struct w9968cf_
                           enum w9968cf_model_id mod_id,
                           const unsigned short dev_nr)
  {
@@ -2217,7 +2231,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	init_waitqueue_head(&cam->open);
  	spin_lock_init(&cam->urb_lock);
  	spin_lock_init(&cam->flist_lock);
-@@ -2646,7 +2646,7 @@ static void w9968cf_adjust_configuration
+@@ -2646,7 +2653,7 @@ static void w9968cf_adjust_configuration
    --------------------------------------------------------------------------*/
  static void w9968cf_release_resources(struct w9968cf_device* cam)
  {
@@ -2226,7 +2240,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  	DBG(2, "V4L device deregistered: /dev/video%d", cam->v4ldev->minor)
  
-@@ -2657,7 +2657,7 @@ static void w9968cf_release_resources(st
+@@ -2657,7 +2664,7 @@ static void w9968cf_release_resources(st
  	kfree(cam->control_buffer);
  	kfree(cam->data_buffer);
  
@@ -2235,7 +2249,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  }
  
  
-@@ -2677,14 +2677,14 @@ static int w9968cf_open(struct inode* in
+@@ -2677,14 +2684,14 @@ static int w9968cf_open(struct inode* in
  
  	cam = (struct w9968cf_device*)video_get_drvdata(video_devdata(filp));
  
@@ -2252,7 +2266,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		up_read(&w9968cf_disconnect);
  		return -ENODEV;
  	}
-@@ -2693,11 +2693,11 @@ static int w9968cf_open(struct inode* in
+@@ -2693,11 +2700,11 @@ static int w9968cf_open(struct inode* in
  		DBG(2, "%s (/dev/video%d) has been already occupied by '%s'",
  		    symbolic(camlist, cam->id),cam->v4ldev->minor,cam->command)
  		if ((filp->f_flags & O_NONBLOCK)||(filp->f_flags & O_NDELAY)) {
@@ -2266,7 +2280,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		err = wait_event_interruptible_exclusive(cam->open,
  		                                         cam->disconnected ||
  		                                         !cam->users);
-@@ -2709,7 +2709,7 @@ static int w9968cf_open(struct inode* in
+@@ -2709,7 +2716,7 @@ static int w9968cf_open(struct inode* in
  			up_read(&w9968cf_disconnect);
  			return -ENODEV;
  		}
@@ -2275,7 +2289,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	}
  
  	DBG(5, "Opening '%s', /dev/video%d ...",
-@@ -2738,7 +2738,7 @@ static int w9968cf_open(struct inode* in
+@@ -2738,7 +2745,7 @@ static int w9968cf_open(struct inode* in
  
  	DBG(5, "Video device is open")
  
@@ -2284,7 +2298,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	up_read(&w9968cf_disconnect);
  
  	return 0;
-@@ -2746,7 +2746,7 @@ static int w9968cf_open(struct inode* in
+@@ -2746,7 +2753,7 @@ static int w9968cf_open(struct inode* in
  deallocate_memory:
  	w9968cf_deallocate_memory(cam);
  	DBG(2, "Failed to open the video device")
@@ -2293,7 +2307,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	up_read(&w9968cf_disconnect);
  	return err;
  }
-@@ -2758,13 +2758,13 @@ static int w9968cf_release(struct inode*
+@@ -2758,13 +2765,13 @@ static int w9968cf_release(struct inode*
  
  	cam = (struct w9968cf_device*)video_get_drvdata(video_devdata(filp));
  
@@ -2309,7 +2323,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		kfree(cam);
  		return 0;
  	}
-@@ -2774,7 +2774,7 @@ static int w9968cf_release(struct inode*
+@@ -2774,7 +2781,7 @@ static int w9968cf_release(struct inode*
  	wake_up_interruptible_nr(&cam->open, 1);
  
  	DBG(5, "Video device closed")
@@ -2318,7 +2332,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	return 0;
  }
  
-@@ -2791,18 +2791,18 @@ w9968cf_read(struct file* filp, char __u
+@@ -2791,18 +2798,18 @@ w9968cf_read(struct file* filp, char __u
  	if (filp->f_flags & O_NONBLOCK)
  		return -EWOULDBLOCK;
  
@@ -2340,7 +2354,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		return -EIO;
  	}
  
-@@ -2817,11 +2817,11 @@ w9968cf_read(struct file* filp, char __u
+@@ -2817,11 +2824,11 @@ w9968cf_read(struct file* filp, char __u
  	                               cam->frame[1].status == F_READY ||
  	                               cam->disconnected);
  	if (err) {
@@ -2354,7 +2368,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		return -ENODEV;
  	}
  
-@@ -2835,7 +2835,7 @@ w9968cf_read(struct file* filp, char __u
+@@ -2835,7 +2842,7 @@ w9968cf_read(struct file* filp, char __u
  
  	if (copy_to_user(buf, fr->buffer, count)) {
  		fr->status = F_UNUSED;
@@ -2363,7 +2377,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		return -EFAULT;
  	}
  	*f_pos += count;
-@@ -2844,7 +2844,7 @@ w9968cf_read(struct file* filp, char __u
+@@ -2844,7 +2851,7 @@ w9968cf_read(struct file* filp, char __u
  
  	DBG(5, "%zu bytes read", count)
  
@@ -2372,7 +2386,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	return count;
  }
  
-@@ -2898,24 +2898,24 @@ w9968cf_ioctl(struct inode* inode, struc
+@@ -2898,24 +2905,24 @@ w9968cf_ioctl(struct inode* inode, struc
  
  	cam = (struct w9968cf_device*)video_get_drvdata(video_devdata(filp));
  
@@ -2401,7 +2415,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	return err;
  }
  
-@@ -3502,8 +3502,8 @@ w9968cf_usb_probe(struct usb_interface* 
+@@ -3502,8 +3509,8 @@ w9968cf_usb_probe(struct usb_interface* 
  	if (!cam)
  		return -ENOMEM;
  
@@ -2412,7 +2426,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  	cam->usbdev = udev;
  	/* NOTE: a local copy is used to avoid possible race conditions */
-@@ -3515,10 +3515,10 @@ w9968cf_usb_probe(struct usb_interface* 
+@@ -3515,10 +3522,10 @@ w9968cf_usb_probe(struct usb_interface* 
  		simcams = W9968CF_SIMCAMS;
  
  	/* How many cameras are connected ? */
@@ -2425,7 +2439,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  	if (sc >= simcams) {
  		DBG(2, "Device rejected: too many connected cameras "
-@@ -3578,9 +3578,9 @@ w9968cf_usb_probe(struct usb_interface* 
+@@ -3578,9 +3585,9 @@ w9968cf_usb_probe(struct usb_interface* 
  	w9968cf_configure_camera(cam, udev, mod_id, dev_nr);
  
  	/* Add a new entry into the list of V4L registered devices */
@@ -2437,7 +2451,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	dev_nr = (dev_nr < W9968CF_MAX_DEVICES-1) ? dev_nr+1 : 0;
  
  	w9968cf_turn_on_led(cam);
-@@ -3588,7 +3588,7 @@ w9968cf_usb_probe(struct usb_interface* 
+@@ -3588,7 +3595,7 @@ w9968cf_usb_probe(struct usb_interface* 
  	w9968cf_i2c_init(cam);
  
  	usb_set_intfdata(intf, cam);
@@ -2446,7 +2460,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	return 0;
  
  fail: /* Free unused memory */
-@@ -3596,7 +3596,7 @@ fail: /* Free unused memory */
+@@ -3596,7 +3603,7 @@ fail: /* Free unused memory */
  	kfree(cam->data_buffer);
  	if (cam->v4ldev)
  		video_device_release(cam->v4ldev);
@@ -2455,7 +2469,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	kfree(cam);
  	return err;
  }
-@@ -3611,7 +3611,7 @@ static void w9968cf_usb_disconnect(struc
+@@ -3611,7 +3618,7 @@ static void w9968cf_usb_disconnect(struc
  
  	if (cam) {
  		/* Prevent concurrent accesses to data */
@@ -2464,7 +2478,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  		cam->disconnected = 1;
  
-@@ -3630,7 +3630,7 @@ static void w9968cf_usb_disconnect(struc
+@@ -3630,7 +3637,7 @@ static void w9968cf_usb_disconnect(struc
  		} else
  			w9968cf_release_resources(cam);
  
@@ -2484,7 +2498,22 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  #include <media/ovcamchip.h>
  
-@@ -277,8 +277,8 @@ struct w9968cf_device {
+@@ -194,14 +194,6 @@ enum w9968cf_vpp_flag {
+ 	VPP_UYVY_TO_RGBX = 0x08,
+ };
+ 
+-static struct w9968cf_vpp_t* w9968cf_vpp;
+-static DECLARE_WAIT_QUEUE_HEAD(w9968cf_vppmod_wait);
+-
+-static LIST_HEAD(w9968cf_dev_list); /* head of V4L registered cameras list */
+-static DECLARE_MUTEX(w9968cf_devlist_sem); /* semaphore for list traversal */
+-
+-static DECLARE_RWSEM(w9968cf_disconnect); /* prevent races with open() */
+-
+ /* Main device driver structure */
+ struct w9968cf_device {
+ 	struct device dev; /* device structure */
+@@ -277,8 +269,8 @@ struct w9968cf_device {
  	struct i2c_client* sensor_client;
  
  	/* Locks */
