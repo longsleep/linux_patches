@@ -13,17 +13,17 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
  arch/ia64/sn/kernel/io_init.c              |    2 
- arch/ia64/sn/kernel/irq.c                  |  144 +++++++++++---------
+ arch/ia64/sn/kernel/irq.c                  |  143 +++++++++++---------
  arch/ia64/sn/pci/msi.c                     |  200 ++++++++++++++++++++++++++++-
  arch/ia64/sn/pci/pci_dma.c                 |   10 -
  arch/ia64/sn/pci/pcibr/pcibr_dma.c         |   62 ++++++--
  arch/ia64/sn/pci/tioca_provider.c          |    8 +
  arch/ia64/sn/pci/tioce_provider.c          |   65 ++++++---
- include/asm-ia64/sn/intr.h                 |   10 +
+ include/asm-ia64/sn/intr.h                 |    8 +
  include/asm-ia64/sn/pcibr_provider.h       |    7 -
  include/asm-ia64/sn/pcibus_provider_defs.h |   17 ++
  include/asm-ia64/sn/tiocp.h                |    3 
- 11 files changed, 407 insertions(+), 121 deletions(-)
+ 11 files changed, 406 insertions(+), 119 deletions(-)
 
 --- gregkh-2.6.orig/arch/ia64/sn/pci/msi.c
 +++ gregkh-2.6/arch/ia64/sn/pci/msi.c
@@ -250,7 +250,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  }
 --- gregkh-2.6.orig/arch/ia64/sn/kernel/irq.c
 +++ gregkh-2.6/arch/ia64/sn/kernel/irq.c
-@@ -25,11 +25,11 @@ static void unregister_intr_pda(struct s
+@@ -26,11 +26,11 @@ static void unregister_intr_pda(struct s
  
  int sn_force_interrupt_flag = 1;
  extern int sn_ioif_inited;
@@ -265,7 +265,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  				     int req_irq, nasid_t req_nasid,
  				     int req_slice)
  {
-@@ -39,12 +39,13 @@ static inline u64 sn_intr_alloc(nasid_t 
+@@ -40,12 +40,13 @@ static inline u64 sn_intr_alloc(nasid_t 
  
  	SAL_CALL_NOLOCK(ret_stuff, (u64) SN_SAL_IOIF_INTERRUPT,
  			(u64) SAL_INTR_ALLOC, (u64) local_nasid,
@@ -281,7 +281,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  				struct sn_irq_info *sn_irq_info)
  {
  	struct ia64_sal_retval ret_stuff;
-@@ -113,73 +114,91 @@ static void sn_end_irq(unsigned int irq)
+@@ -112,73 +113,91 @@ static void sn_end_irq(unsigned int irq)
  
  static void sn_irq_info_free(struct rcu_head *head);
  
@@ -354,22 +354,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -			break;
 -		}
 +	local_nasid = NASID_GET(bridge);
- 
--		new_irq_info->irq_cpuid = cpuid;
--		register_intr_pda(new_irq_info);
++
 +	if (local_nasid & 1)
 +		local_widget = TIO_SWIN_WIDGETNUM(bridge);
 +	else
 +		local_widget = SWIN_WIDGETNUM(bridge);
- 
--		pci_provider = sn_pci_provider[new_irq_info->irq_bridge_type];
--		if (pci_provider && pci_provider->target_interrupt)
--			(pci_provider->target_interrupt)(new_irq_info);
--
--		spin_lock(&sn_irq_info_lock);
--		list_replace_rcu(&sn_irq_info->list, &new_irq_info->list);
--		spin_unlock(&sn_irq_info_lock);
--		call_rcu(&sn_irq_info->rcu, sn_irq_info_free);
++
 +	vector = sn_irq_info->irq_irq;
 +	/* Free the old PROM new_irq_info structure */
 +	sn_intr_free(local_nasid, local_widget, new_irq_info);
@@ -392,7 +382,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	register_intr_pda(new_irq_info);
 +
 +	pci_provider = sn_pci_provider[new_irq_info->irq_bridge_type];
-+
+ 
+-		new_irq_info->irq_cpuid = cpuid;
+-		register_intr_pda(new_irq_info);
 +	/*
 +	 * If this represents a line interrupt, target it.  If it's
 +	 * an msi (irq_int_bit < 0), it's already targeted.
@@ -400,7 +392,15 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	if (new_irq_info->irq_int_bit >= 0 &&
 +	    pci_provider && pci_provider->target_interrupt)
 +		(pci_provider->target_interrupt)(new_irq_info);
-+
+ 
+-		pci_provider = sn_pci_provider[new_irq_info->irq_bridge_type];
+-		if (pci_provider && pci_provider->target_interrupt)
+-			(pci_provider->target_interrupt)(new_irq_info);
+-
+-		spin_lock(&sn_irq_info_lock);
+-		list_replace_rcu(&sn_irq_info->list, &new_irq_info->list);
+-		spin_unlock(&sn_irq_info_lock);
+-		call_rcu(&sn_irq_info->rcu, sn_irq_info_free);
 +	spin_lock(&sn_irq_info_lock);
 +	list_replace_rcu(&sn_irq_info->list, &new_irq_info->list);
 +	spin_unlock(&sn_irq_info_lock);
@@ -430,12 +430,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  }
  
  struct hw_interrupt_type irq_type_sn = {
-@@ -441,5 +460,4 @@ void sn_irq_lh_init(void)
- 
- 		INIT_LIST_HEAD(sn_irq_lh[i]);
- 	}
--
- }
 --- gregkh-2.6.orig/arch/ia64/sn/pci/pci_dma.c
 +++ gregkh-2.6/arch/ia64/sn/pci/pci_dma.c
 @@ -11,7 +11,7 @@
@@ -880,21 +874,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  /**
 --- gregkh-2.6.orig/include/asm-ia64/sn/intr.h
 +++ gregkh-2.6/include/asm-ia64/sn/intr.h
-@@ -3,13 +3,14 @@
-  * License.  See the file "COPYING" in the main directory of this archive
-  * for more details.
-  *
-- * Copyright (C) 1992 - 1997, 2000-2004 Silicon Graphics, Inc. All rights reserved.
-+ * Copyright (C) 1992 - 1997, 2000-2005 Silicon Graphics, Inc. All rights reserved.
-  */
- 
- #ifndef _ASM_IA64_SN_INTR_H
+@@ -10,6 +10,7 @@
  #define _ASM_IA64_SN_INTR_H
  
  #include <linux/rcupdate.h>
 +#include <asm/sn/types.h>
  
- #define SGI_UART_VECTOR		(0xe9)
+ #define SGI_UART_VECTOR		0xe9
  
 @@ -40,6 +41,7 @@ struct sn_irq_info {
  	int		irq_cpuid;	/* kernel logical cpuid	     */
