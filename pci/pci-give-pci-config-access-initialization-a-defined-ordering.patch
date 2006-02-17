@@ -1,0 +1,190 @@
+From ak@suse.de Fri Feb 10 02:47:08 2006
+From: Andi Kleen <ak@suse.de>
+To: Greg KH <greg@kroah.com>
+Subject: PCI: Give PCI config access initialization a defined ordering
+Date: Fri, 10 Feb 2006 11:46:29 +0100
+Cc: Stephen Hemminger <shemminger@osdl.org>, Matthew Wilcox <matthew@wil.cx>
+Content-Disposition: inline
+Message-Id: <200602101146.30126.ak@suse.de>
+
+
+I moved it to a separate function which is safer.
+
+This avoids problems with the linker reordering them and the
+less useful PCI config space access methods taking priority
+over the better ones.
+
+Fixes some problems with broken MMCONFIG
+
+Signed-off-by: Andi Kleen <ak@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ arch/i386/pci/Makefile   |    2 +-
+ arch/i386/pci/direct.c   |   15 +++++----------
+ arch/i386/pci/init.c     |   25 +++++++++++++++++++++++++
+ arch/i386/pci/mmconfig.c |   11 +++--------
+ arch/i386/pci/pcbios.c   |    4 +---
+ arch/i386/pci/pci.h      |    3 +++
+ arch/x86_64/pci/Makefile |    3 ++-
+ 7 files changed, 40 insertions(+), 23 deletions(-)
+
+--- gregkh-2.6.orig/arch/i386/pci/direct.c
++++ gregkh-2.6/arch/i386/pci/direct.c
+@@ -245,7 +245,7 @@ static int __init pci_check_type2(void)
+ 	return works;
+ }
+ 
+-static int __init pci_direct_init(void)
++void __init pci_direct_init(void)
+ {
+ 	struct resource *region, *region2;
+ 
+@@ -258,16 +258,16 @@ static int __init pci_direct_init(void)
+ 	if (pci_check_type1()) {
+ 		printk(KERN_INFO "PCI: Using configuration type 1\n");
+ 		raw_pci_ops = &pci_direct_conf1;
+-		return 0;
++		return;
+ 	}
+ 	release_resource(region);
+ 
+  type2:
+ 	if ((pci_probe & PCI_PROBE_CONF2) == 0)
+-		goto out;
++		return;
+ 	region = request_region(0xCF8, 4, "PCI conf2");
+ 	if (!region)
+-		goto out;
++		return;
+ 	region2 = request_region(0xC000, 0x1000, "PCI conf2");
+ 	if (!region2)
+ 		goto fail2;
+@@ -275,15 +275,10 @@ static int __init pci_direct_init(void)
+ 	if (pci_check_type2()) {
+ 		printk(KERN_INFO "PCI: Using configuration type 2\n");
+ 		raw_pci_ops = &pci_direct_conf2;
+-		return 0;
++		return;
+ 	}
+ 
+ 	release_resource(region2);
+  fail2:
+ 	release_resource(region);
+-
+- out:
+-	return 0;
+ }
+-
+-arch_initcall(pci_direct_init);
+--- gregkh-2.6.orig/arch/i386/pci/mmconfig.c
++++ gregkh-2.6/arch/i386/pci/mmconfig.c
+@@ -172,25 +172,20 @@ static __init void unreachable_devices(v
+ 	}
+ }
+ 
+-static int __init pci_mmcfg_init(void)
++void __init pci_mmcfg_init(void)
+ {
+ 	if ((pci_probe & PCI_PROBE_MMCONF) == 0)
+-		goto out;
++		return;
+ 
+ 	acpi_table_parse(ACPI_MCFG, acpi_parse_mcfg);
+ 	if ((pci_mmcfg_config_num == 0) ||
+ 	    (pci_mmcfg_config == NULL) ||
+ 	    (pci_mmcfg_config[0].base_address == 0))
+-		goto out;
++		return;
+ 
+ 	printk(KERN_INFO "PCI: Using MMCONFIG\n");
+ 	raw_pci_ops = &pci_mmcfg;
+ 	pci_probe = (pci_probe & ~PCI_PROBE_MASK) | PCI_PROBE_MMCONF;
+ 
+ 	unreachable_devices();
+-
+- out:
+-	return 0;
+ }
+-
+-arch_initcall(pci_mmcfg_init);
+--- gregkh-2.6.orig/arch/i386/pci/pcbios.c
++++ gregkh-2.6/arch/i386/pci/pcbios.c
+@@ -476,14 +476,12 @@ int pcibios_set_irq_routing(struct pci_d
+ }
+ EXPORT_SYMBOL(pcibios_set_irq_routing);
+ 
+-static int __init pci_pcbios_init(void)
++void __init pci_pcbios_init(void)
+ {
+ 	if ((pci_probe & PCI_PROBE_BIOS) 
+ 		&& ((raw_pci_ops = pci_find_bios()))) {
+ 		pci_probe |= PCI_BIOS_SORT;
+ 		pci_bios_present = 1;
+ 	}
+-	return 0;
+ }
+ 
+-arch_initcall(pci_pcbios_init);
+--- gregkh-2.6.orig/arch/i386/pci/pci.h
++++ gregkh-2.6/arch/i386/pci/pci.h
+@@ -80,4 +80,7 @@ extern int pci_conf1_write(unsigned int 
+ extern int pci_conf1_read(unsigned int seg, unsigned int bus,
+ 			  unsigned int devfn, int reg, int len, u32 *value);
+ 
++extern void pci_direct_init(void);
++extern void pci_pcbios_init(void);
++extern void pci_mmcfg_init(void);
+ 
+--- gregkh-2.6.orig/arch/x86_64/pci/Makefile
++++ gregkh-2.6/arch/x86_64/pci/Makefile
+@@ -7,7 +7,7 @@ CFLAGS += -Iarch/i386/pci
+ 
+ obj-y		:= i386.o
+ obj-$(CONFIG_PCI_DIRECT)+= direct.o
+-obj-y		+= fixup.o
++obj-y		+= fixup.o init.o
+ obj-$(CONFIG_ACPI)	+= acpi.o
+ obj-y			+= legacy.o irq.o common.o
+ # mmconfig has a 64bit special
+@@ -22,3 +22,4 @@ irq-y    += ../../i386/pci/irq.o
+ common-y += ../../i386/pci/common.o
+ fixup-y  += ../../i386/pci/fixup.o
+ i386-y  += ../../i386/pci/i386.o
++init-y += ../../i386/pci/init.o
+--- /dev/null
++++ gregkh-2.6/arch/i386/pci/init.c
+@@ -0,0 +1,25 @@
++#include <linux/config.h>
++#include <linux/pci.h>
++#include <linux/init.h>
++#include "pci.h"
++
++/* arch_initcall has too random ordering, so call the initializers
++   in the right sequence from here. */
++static __init int pci_access_init(void)
++{
++#ifdef CONFIG_PCI_MMCONFIG
++	pci_mmcfg_init();
++#endif
++	if (raw_pci_ops)
++		return 0;
++#ifdef CONFIG_PCI_DIRECT
++	pci_direct_init();
++#endif
++	if (raw_pci_ops)
++		return 0;
++#ifdef CONFIG_PCI_BIOS
++	pci_pcbios_init();
++#endif
++	return 0;
++}
++arch_initcall(pci_access_init);
+--- gregkh-2.6.orig/arch/i386/pci/Makefile
++++ gregkh-2.6/arch/i386/pci/Makefile
+@@ -1,4 +1,4 @@
+-obj-y				:= i386.o
++obj-y				:= i386.o init.o
+ 
+ obj-$(CONFIG_PCI_BIOS)		+= pcbios.o
+ obj-$(CONFIG_PCI_MMCONFIG)	+= mmconfig.o direct.o
