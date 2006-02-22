@@ -1,0 +1,214 @@
+From luca.risolia@studio.unibo.it Tue Feb  7 15:03:45 2006
+Date: Wed, 8 Feb 2006 00:05:27 +0000
+From: Luca Risolia <luca.risolia@studio.unibo.it>
+To: Greg Kroah-Hartman <gregkh@suse.de>
+Cc: Andrew Morton <akpm@osdl.org>
+Subject: USB: ZC0301 driver updates
+Message-ID: <20060208000527.GA10310@studio.unibo.it>
+Content-Disposition: inline
+
+"Cosmetic" driver updates for the ZC0301 driver:
+
+- Fix stream_interrupt() (and work around a possible kernel bug);
+
+- Fix vidioc_enum_input() and split vidioc_gs_input() in two parts;
+- Use wait_event_interruptible_timeout() instead of wait_event_interruptible()
+  when waiting for video frames;
+- replace erroneous wake_up_interruptible(&wait_stream) with
+  wake_up(&wait_stream);
+- Cosmetic cleanups in the documentation.
+
+Signed-off-by: Luca Risolia <luca.risolia@studio.unibo.it>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ Documentation/usb/zc0301.txt         |   19 +++++----------
+ drivers/usb/media/zc0301.h           |    2 -
+ drivers/usb/media/zc0301_core.c      |   43 ++++++++++++++++++++++-------------
+ drivers/usb/media/zc0301_pas202bcb.c |    2 -
+ 4 files changed, 37 insertions(+), 29 deletions(-)
+
+--- gregkh-2.6.orig/Documentation/usb/zc0301.txt
++++ gregkh-2.6/Documentation/usb/zc0301.txt
+@@ -67,8 +67,7 @@ Some of the features of the driver are:
+ - available mmap or read/poll methods for video streaming through isochronous
+   data transfers;
+ - automatic detection of image sensor;
+-- video formats is standard JPEG in various compression qualities
+-  (see also "Notes for V4L2 application developers" paragraph);
++- video format is standard JPEG;
+ - full support for the capabilities of every possible image sensors that can
+   be connected to the ZC0301 bridges, including, for istance, red, green,
+   blue and global gain adjustments and exposure control (see "Supported
+@@ -226,10 +225,6 @@ The same number of buffers as before wil
+ of the new video frames, so you have to map the buffers again before any I/O
+ attempts on them.
+ 
+-This driver supports the standard JPEG video format. The current compression
+-quality may vary from 0 to 3 and can be selected or queried thanks to the
+-VIDIOC_S_JPEGCOMP and VIDIOC_G_JPEGCOMP V4L2 ioctl's.
+-
+ 
+ 10. Contact information
+ =======================
+@@ -242,9 +237,9 @@ the fingerprint is: '88E8 F32F 7244 68BA
+ 
+ 11. Credits
+ ===========
+-- Informations about the chip internals to enable the I2C protocol have been
+-  taken from the documentation of the ZC030x Video4Linux1 driver written by
+-  Andrew Birkett <andy@nobugs.org>;
+-- Initialization values of the ZC0301 connected to the PAS202BCB image sensor
+-  have been taken from the SPCA5XX driver maintained by
+-  Michel Xhaard  <mxhaard@magic.fr>
++- Informations about the chip internals needed to enable the I2C protocol have
++  been taken from the documentation of the ZC030x Video4Linux1 driver written
++  by Andrew Birkett <andy@nobugs.org>;
++- Initialization values of the ZC0301 controller connected to the PAS202BCB
++  image sensor have been taken from the SPCA5XX driver maintained by
++  Michel Xhaard <mxhaard@magic.fr>.
+--- gregkh-2.6.orig/drivers/usb/media/zc0301_core.c
++++ gregkh-2.6/drivers/usb/media/zc0301_core.c
+@@ -3,9 +3,9 @@
+  *                                                                         *
+  * Copyright (C) 2006 by Luca Risolia <luca.risolia@studio.unibo.it>       *
+  *                                                                         *
+- * Informations about the chip internals to enable the I2C protocol have   *
+- * been taken from the documentation of the ZC030x Video4Linux1 driver     *
+- * written by Andrew Birkett <andy@nobugs.org>                             *
++ * Informations about the chip internals needed to enable the I2C protocol *
++ * have been taken from the documentation of the ZC030x Video4Linux1       *
++ * driver written by Andrew Birkett <andy@nobugs.org>                      *
+  *                                                                         *
+  * This program is free software; you can redistribute it and/or modify    *
+  * it under the terms of the GNU General Public License as published by    *
+@@ -54,8 +54,8 @@
+ #define ZC0301_MODULE_AUTHOR  "(C) 2006 Luca Risolia"
+ #define ZC0301_AUTHOR_EMAIL   "<luca.risolia@studio.unibo.it>"
+ #define ZC0301_MODULE_LICENSE "GPL"
+-#define ZC0301_MODULE_VERSION "1:1.00"
+-#define ZC0301_MODULE_VERSION_CODE  KERNEL_VERSION(1, 0, 0)
++#define ZC0301_MODULE_VERSION "1:1.01"
++#define ZC0301_MODULE_VERSION_CODE  KERNEL_VERSION(1, 0, 1)
+ 
+ /*****************************************************************************/
+ 
+@@ -314,7 +314,7 @@ static void zc0301_urb_complete(struct u
+ 		if ((*f))
+ 			(*f)->state = F_QUEUED;
+ 		DBG(3, "Stream interrupted");
+-		wake_up_interruptible(&cam->wait_stream);
++		wake_up(&cam->wait_stream);
+ 	}
+ 
+ 	if (cam->state & DEV_DISCONNECTED)
+@@ -526,7 +526,7 @@ static int zc0301_stream_interrupt(struc
+ 	                             ZC0301_URB_TIMEOUT);
+ 	if (cam->state & DEV_DISCONNECTED)
+ 		return -ENODEV;
+-	else if (!timeout) {
++	else if (cam->stream != STREAM_OFF) {
+ 		cam->state |= DEV_MISCONFIGURED;
+ 		DBG(1, "URB timeout reached. The camera is misconfigured. To "
+ 		       "use it, close and open /dev/video%d again.",
+@@ -547,8 +547,7 @@ zc0301_set_compression(struct zc0301_dev
+ 
+ 	if ((r = zc0301_read_reg(cam, 0x0008)) < 0)
+ 		err += r;
+-	err += zc0301_write_reg(cam, 0x0008,
+-	                        r | 0x11 | (compression->quality >> 1));
++	err += zc0301_write_reg(cam, 0x0008, r | 0x11 | compression->quality);
+ 
+ 	return err ? -EIO : 0;
+ }
+@@ -737,8 +736,7 @@ static int zc0301_release(struct inode* 
+ 
+ 
+ static ssize_t
+-zc0301_read(struct file* filp, char __user * buf,
+-              size_t count, loff_t* f_pos)
++zc0301_read(struct file* filp, char __user * buf, size_t count, loff_t* f_pos)
+ {
+ 	struct zc0301_device* cam = video_get_drvdata(video_devdata(filp));
+ 	struct zc0301_frame_t* f, * i;
+@@ -1019,6 +1017,7 @@ zc0301_vidioc_enuminput(struct zc0301_de
+ 
+ 	memset(&i, 0, sizeof(i));
+ 	strcpy(i.name, "Camera");
++	i.type = V4L2_INPUT_TYPE_CAMERA;
+ 
+ 	if (copy_to_user(arg, &i, sizeof(i)))
+ 		return -EFAULT;
+@@ -1028,7 +1027,19 @@ zc0301_vidioc_enuminput(struct zc0301_de
+ 
+ 
+ static int
+-zc0301_vidioc_gs_input(struct zc0301_device* cam, void __user * arg)
++zc0301_vidioc_g_input(struct zc0301_device* cam, void __user * arg)
++{
++	int index = 0;
++
++	if (copy_to_user(arg, &index, sizeof(index)))
++		return -EFAULT;
++
++	return 0;
++}
++
++
++static int
++zc0301_vidioc_s_input(struct zc0301_device* cam, void __user * arg)
+ {
+ 	int index;
+ 
+@@ -1446,7 +1457,7 @@ zc0301_vidioc_s_jpegcomp(struct zc0301_d
+ 	if (copy_from_user(&jc, arg, sizeof(jc)))
+ 		return -EFAULT;
+ 
+-	if (jc.quality < 0 || jc.quality > 3)
++	if (jc.quality != 0)
+ 		return -EINVAL;
+ 
+ 	if (cam->stream == STREAM_ON)
+@@ -1738,8 +1749,10 @@ static int zc0301_ioctl_v4l2(struct inod
+ 		return zc0301_vidioc_enuminput(cam, arg);
+ 
+ 	case VIDIOC_G_INPUT:
++		return zc0301_vidioc_g_input(cam, arg);
++
+ 	case VIDIOC_S_INPUT:
+-		return zc0301_vidioc_gs_input(cam, arg);
++		return zc0301_vidioc_s_input(cam, arg);
+ 
+ 	case VIDIOC_QUERYCTRL:
+ 		return zc0301_vidioc_query_ctrl(cam, arg);
+@@ -1980,7 +1993,7 @@ static void zc0301_usb_disconnect(struct
+ 		zc0301_stop_transfer(cam);
+ 		cam->state |= DEV_DISCONNECTED;
+ 		wake_up_interruptible(&cam->wait_frame);
+-		wake_up_interruptible(&cam->wait_stream);
++		wake_up(&cam->wait_stream);
+ 	} else {
+ 		cam->state |= DEV_DISCONNECTED;
+ 		zc0301_release_resources(cam);
+--- gregkh-2.6.orig/drivers/usb/media/zc0301.h
++++ gregkh-2.6/drivers/usb/media/zc0301.h
+@@ -45,7 +45,7 @@
+ #define ZC0301_MAX_DEVICES         64
+ #define ZC0301_FORCE_MUNMAP        0
+ #define ZC0301_MAX_FRAMES          32
+-#define ZC0301_COMPRESSION_QUALITY 2
++#define ZC0301_COMPRESSION_QUALITY 0
+ #define ZC0301_URBS                2
+ #define ZC0301_ISO_PACKETS         7
+ #define ZC0301_ALTERNATE_SETTING   7
+--- gregkh-2.6.orig/drivers/usb/media/zc0301_pas202bcb.c
++++ gregkh-2.6/drivers/usb/media/zc0301_pas202bcb.c
+@@ -318,7 +318,7 @@ static struct zc0301_sensor pas202bcb = 
+ 		.width = 640,
+ 		.height = 480,
+ 		.pixelformat = V4L2_PIX_FMT_JPEG,
+-		.priv = 16,
++		.priv = 8,
+ 	},
+ };
+ 
