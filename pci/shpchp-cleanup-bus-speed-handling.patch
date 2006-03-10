@@ -1,0 +1,762 @@
+From kaneshige.kenji@jp.fujitsu.com Tue Feb 28 21:56:42 2006
+Message-ID: <4405373F.2020806@jp.fujitsu.com>
+Date: Wed, 01 Mar 2006 14:55:11 +0900
+From: Kenji Kaneshige <kaneshige.kenji@jp.fujitsu.com>
+To: pcihpd-discuss@lists.sourceforge.net, Greg KH <greg@kroah.com>, Kristen Accardi <kristen.c.accardi@intel.com>
+Subject: shpchp: cleanup bus speed handling
+
+The code related to handling bus speed in SHPCHP driver is
+unnecessarily complex. This patch cleans up and simplify that.
+
+Signed-off-by: Kenji Kaneshige <kaneshige.kenji@jp.fujitsu.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/pci/hotplug/shpchp_ctrl.c |  152 ++----------
+ drivers/pci/hotplug/shpchp_hpc.c  |  466 ++++++++++++--------------------------
+ 2 files changed, 189 insertions(+), 429 deletions(-)
+
+--- gregkh-2.6.orig/drivers/pci/hotplug/shpchp_ctrl.c
++++ gregkh-2.6/drivers/pci/hotplug/shpchp_ctrl.c
+@@ -198,7 +198,8 @@ static int change_bus_speed(struct contr
+ 
+ 	dbg("%s: change to speed %d\n", __FUNCTION__, speed);
+ 	if ((rc = p_slot->hpc_ops->set_bus_speed_mode(p_slot, speed))) {
+-		err("%s: Issue of set bus speed mode command failed\n", __FUNCTION__);
++		err("%s: Issue of set bus speed mode command failed\n",
++		    __FUNCTION__);
+ 		return WRONG_BUS_FREQUENCY;
+ 	}
+ 	return rc;
+@@ -209,33 +210,26 @@ static int fix_bus_speed(struct controll
+ 		enum pci_bus_speed msp)
+ { 
+ 	int rc = 0;
+-	
+-	if (flag != 0) { /* Other slots on the same bus are occupied */
+-		if ( asp < bsp ) {
+-			err("%s: speed of bus %x and adapter %x mismatch\n", __FUNCTION__, bsp, asp);
+-			return WRONG_BUS_FREQUENCY;
++
++	/*
++	 * If other slots on the same bus are occupied, we cannot
++	 * change the bus speed.
++	 */
++	if (flag) {
++		if (asp < bsp) {
++			err("%s: speed of bus %x and adapter %x mismatch\n",
++			    __FUNCTION__, bsp, asp);
++			rc = WRONG_BUS_FREQUENCY;
+ 		}
++		return rc;
++	}
++
++	if (asp < msp) {
++		if (bsp != asp)
++			rc = change_bus_speed(ctrl, pslot, asp);
+ 	} else {
+-		/* Other slots on the same bus are empty */
+-		if (msp == bsp) {
+-		/* if adapter_speed >= bus_speed, do nothing */
+-			if (asp < bsp) {
+-				/* 
+-				* Try to lower bus speed to accommodate the adapter if other slots 
+-				* on the same controller are empty
+-				*/
+-				if ((rc = change_bus_speed(ctrl, pslot, asp)))
+-					return rc;
+-			} 
+-		} else {
+-			if (asp < msp) {
+-				if ((rc = change_bus_speed(ctrl, pslot, asp)))
+-					return rc;
+-			} else {
+-				if ((rc = change_bus_speed(ctrl, pslot, msp)))
+-					return rc;
+-			}
+-		}
++		if (bsp != msp)
++			rc = change_bus_speed(ctrl, pslot, msp);
+ 	}
+ 	return rc;
+ }
+@@ -252,8 +246,7 @@ static int board_added(struct slot *p_sl
+ 	u8 hp_slot;
+ 	u8 slots_not_empty = 0;
+ 	int rc = 0;
+-	enum pci_bus_speed adapter_speed, bus_speed, max_bus_speed;
+-	u8 pi, mode;
++	enum pci_bus_speed asp, bsp, msp;
+ 	struct controller *ctrl = p_slot->ctrl;
+ 
+ 	hp_slot = p_slot->device - ctrl->slot_device_offset;
+@@ -285,109 +278,36 @@ static int board_added(struct slot *p_sl
+ 		}
+ 	}
+  
+-	rc = p_slot->hpc_ops->get_adapter_speed(p_slot, &adapter_speed);
+-	/* 0 = PCI 33Mhz, 1 = PCI 66 Mhz, 2 = PCI-X 66 PA, 4 = PCI-X 66 ECC, */
+-	/* 5 = PCI-X 133 PA, 7 = PCI-X 133 ECC,  0xa = PCI-X 133 Mhz 266, */
+-	/* 0xd = PCI-X 133 Mhz 533 */
+-	/* This encoding is different from the one used in cur_bus_speed & */
+-	/* max_bus_speed */
+-
+-	if (rc  || adapter_speed == PCI_SPEED_UNKNOWN) {
+-		err("%s: Can't get adapter speed or bus mode mismatch\n", __FUNCTION__);
++	rc = p_slot->hpc_ops->get_adapter_speed(p_slot, &asp);
++	if (rc) {
++		err("%s: Can't get adapter speed or bus mode mismatch\n",
++		    __FUNCTION__);
+ 		return WRONG_BUS_FREQUENCY;
+ 	}
+ 
+-	rc = p_slot->hpc_ops->get_cur_bus_speed(p_slot, &bus_speed);
+-	if (rc || bus_speed == PCI_SPEED_UNKNOWN) {
++	rc = p_slot->hpc_ops->get_cur_bus_speed(p_slot, &bsp);
++	if (rc) {
+ 		err("%s: Can't get bus operation speed\n", __FUNCTION__);
+ 		return WRONG_BUS_FREQUENCY;
+ 	}
+ 
+-	rc = p_slot->hpc_ops->get_max_bus_speed(p_slot, &max_bus_speed);
+-	if (rc || max_bus_speed == PCI_SPEED_UNKNOWN) {
++	rc = p_slot->hpc_ops->get_max_bus_speed(p_slot, &msp);
++	if (rc) {
+ 		err("%s: Can't get max bus operation speed\n", __FUNCTION__);
+-		max_bus_speed = bus_speed;
+-	}
+-
+-	if ((rc  = p_slot->hpc_ops->get_prog_int(p_slot, &pi))) {
+-		err("%s: Can't get controller programming interface, set it to 1\n", __FUNCTION__);
+-		pi = 1;
++		msp = bsp;
+ 	}
+ 
+ 	/* Check if there are other slots or devices on the same bus */
+ 	if (!list_empty(&ctrl->pci_dev->subordinate->devices))
+ 		slots_not_empty = 1;
+ 
+-	dbg("%s: slots_not_empty %d, pi %d\n", __FUNCTION__, 
+-		slots_not_empty, pi);
+-	dbg("adapter_speed %d, bus_speed %d, max_bus_speed %d\n", 
+-		adapter_speed, bus_speed, max_bus_speed);
+-
+-	if (pi == 2) {
+-		dbg("%s: In PI = %d\n", __FUNCTION__, pi);
+-		if ((rc = p_slot->hpc_ops->get_mode1_ECC_cap(p_slot, &mode))) {
+-			err("%s: Can't get Mode1_ECC, set mode to 0\n", __FUNCTION__);
+-			mode = 0;
+-		}
++	dbg("%s: slots_not_empty %d, adapter_speed %d, bus_speed %d, "
++	    "max_bus_speed %d\n", __FUNCTION__, slots_not_empty, asp,
++	    bsp, msp);
+ 
+-		switch (adapter_speed) {
+-		case PCI_SPEED_133MHz_PCIX_533:
+-		case PCI_SPEED_133MHz_PCIX_266:
+-			if ((bus_speed != adapter_speed) &&
+-			   ((rc = fix_bus_speed(ctrl, p_slot, slots_not_empty, adapter_speed, bus_speed, max_bus_speed)))) 
+-				return rc;
+-			break;	
+-		case PCI_SPEED_133MHz_PCIX_ECC:
+-		case PCI_SPEED_133MHz_PCIX:
+-			if (mode) { /* Bus - Mode 1 ECC */
+-				if ((bus_speed != 0x7) &&
+-				   ((rc = fix_bus_speed(ctrl, p_slot, slots_not_empty, adapter_speed, bus_speed, max_bus_speed)))) 
+-					return rc;
+-			} else {
+-				if ((bus_speed != 0x4) &&
+-				   ((rc = fix_bus_speed(ctrl, p_slot, slots_not_empty, adapter_speed, bus_speed, max_bus_speed)))) 
+-					return rc;
+-			}
+-			break;
+-		case PCI_SPEED_66MHz_PCIX_ECC:
+-		case PCI_SPEED_66MHz_PCIX:
+-			if (mode) { /* Bus - Mode 1 ECC */
+-				if ((bus_speed != 0x5) &&
+-				   ((rc = fix_bus_speed(ctrl, p_slot, slots_not_empty, adapter_speed, bus_speed, max_bus_speed)))) 
+-					return rc;
+-			} else {
+-				if ((bus_speed != 0x2) &&
+-				   ((rc = fix_bus_speed(ctrl, p_slot, slots_not_empty, adapter_speed, bus_speed, max_bus_speed)))) 
+-					return rc;
+-			}
+-			break;
+-		case PCI_SPEED_66MHz:
+-			if ((bus_speed != 0x1) &&
+-			   ((rc = fix_bus_speed(ctrl, p_slot, slots_not_empty, adapter_speed, bus_speed, max_bus_speed)))) 
+-				return rc;
+-			break;	
+-		case PCI_SPEED_33MHz:
+-			if (bus_speed > 0x0) {
+-				if (slots_not_empty == 0) {
+-					if ((rc = change_bus_speed(ctrl, p_slot, adapter_speed)))
+-						return rc;
+-				} else {
+-					err("%s: speed of bus %x and adapter %x mismatch\n", __FUNCTION__, bus_speed, adapter_speed);
+-					return WRONG_BUS_FREQUENCY;
+-				}
+-			}
+-			break;
+-		default:
+-			err("%s: speed of bus %x and adapter %x mismatch\n", __FUNCTION__, bus_speed, adapter_speed);
+-			return WRONG_BUS_FREQUENCY;
+-		}
+-	} else {
+-		/* If adpater_speed == bus_speed, nothing to do here */
+-		dbg("%s: In PI = %d\n", __FUNCTION__, pi);
+-		if ((adapter_speed != bus_speed) &&
+-		   ((rc = fix_bus_speed(ctrl, p_slot, slots_not_empty, adapter_speed, bus_speed, max_bus_speed))))
+-				return rc;
+-	}
++	rc = fix_bus_speed(ctrl, p_slot, slots_not_empty, asp, bsp, msp);
++	if (rc)
++		return rc;
+ 
+ 	/* turn on board, blink green LED, turn off Amber LED */
+ 	if ((rc = p_slot->hpc_ops->slot_enable(p_slot))) {
+--- gregkh-2.6.orig/drivers/pci/hotplug/shpchp_hpc.c
++++ gregkh-2.6/drivers/pci/hotplug/shpchp_hpc.c
+@@ -82,31 +82,6 @@
+ #define SLOT_100MHZ_PCIX_533	0x0f000000
+ #define SLOT_133MHZ_PCIX_533	0xf0000000
+ 
+-
+-/* Secondary Bus Configuration Register */
+-/* For PI = 1, Bits 0 to 2 have been encoded as follows to show current bus speed/mode */
+-#define PCI_33MHZ		0x0
+-#define PCI_66MHZ		0x1
+-#define PCIX_66MHZ		0x2
+-#define PCIX_100MHZ		0x3
+-#define PCIX_133MHZ		0x4
+-
+-/* For PI = 2, Bits 0 to 3 have been encoded as follows to show current bus speed/mode */
+-#define PCI_33MHZ		0x0
+-#define PCI_66MHZ		0x1
+-#define PCIX_66MHZ		0x2
+-#define PCIX_100MHZ		0x3
+-#define PCIX_133MHZ		0x4
+-#define PCIX_66MHZ_ECC		0x5
+-#define PCIX_100MHZ_ECC		0x6
+-#define PCIX_133MHZ_ECC		0x7
+-#define PCIX_66MHZ_266		0x9
+-#define PCIX_100MHZ_266		0xa
+-#define PCIX_133MHZ_266		0xb
+-#define PCIX_66MHZ_533		0x11
+-#define PCIX_100MHZ_533		0x12
+-#define PCIX_133MHZ_533		0x13
+-
+ /* Slot Configuration */
+ #define SLOT_NUM		0x0000001F
+ #define	FIRST_DEV_NUM		0x00001F00
+@@ -548,81 +523,41 @@ static int hpc_get_prog_int(struct slot 
+ 
+ static int hpc_get_adapter_speed(struct slot *slot, enum pci_bus_speed *value)
+ {
+-	struct php_ctlr_state_s *php_ctlr = slot->ctrl->hpc_ctlr_handle;
+-	u32 slot_reg;
+-	u16 slot_status, sec_bus_status;
+-	u8 m66_cap, pcix_cap, pi;
+ 	int retval = 0;
++	struct php_ctlr_state_s *php_ctlr = slot->ctrl->hpc_ctlr_handle;
++	u32 slot_reg = readl(php_ctlr->creg + SLOT1 + 4 * slot->hp_slot);
++	u8 pcix_cap = (slot_reg >> 12) & 7;
++	u8 m66_cap  = (slot_reg >> 9) & 1;
+ 
+ 	DBG_ENTER_ROUTINE 
+ 
+-	if (!slot->ctrl->hpc_ctlr_handle) {
+-		err("%s: Invalid HPC controller handle!\n", __FUNCTION__);
+-		return -1;
+-	}
+-
+-	if (slot->hp_slot >= php_ctlr->num_slots) {
+-		err("%s: Invalid HPC slot number!\n", __FUNCTION__);
+-		return -1;
+-	}
+-	
+-	pi = readb(php_ctlr->creg + PROG_INTERFACE);
+-	slot_reg = readl(php_ctlr->creg + SLOT1 + 4*(slot->hp_slot));
+-	dbg("%s: pi = %d, slot_reg = %x\n", __FUNCTION__, pi, slot_reg);
+-	slot_status = (u16) slot_reg;
+-	dbg("%s: slot_status = %x\n", __FUNCTION__, slot_status);
+-	sec_bus_status = readw(php_ctlr->creg + SEC_BUS_CONFIG);
+-
+-	pcix_cap = (u8) ((slot_status & 0x3000) >> 12);
+-	dbg("%s:  pcix_cap = %x\n", __FUNCTION__, pcix_cap);
+-	m66_cap = (u8) ((slot_status & 0x0200) >> 9);
+-	dbg("%s:  m66_cap = %x\n", __FUNCTION__, m66_cap);
++	dbg("%s: slot_reg = %x, pcix_cap = %x, m66_cap = %x\n",
++	    __FUNCTION__, slot_reg, pcix_cap, m66_cap);
+ 
+-
+-	if (pi == 2) {
+-		switch (pcix_cap) {
+-		case 0:
+-			*value = m66_cap ? PCI_SPEED_66MHz : PCI_SPEED_33MHz;
+-			break;
+-		case 1:
+-			*value = PCI_SPEED_66MHz_PCIX;
+-			break;
+-		case 3:
+-			*value = PCI_SPEED_133MHz_PCIX;
+-			break;
+-		case 4:
+-			*value = PCI_SPEED_133MHz_PCIX_266;	
+-			break;
+-		case 5:
+-			*value = PCI_SPEED_133MHz_PCIX_533;	
+-			break;
+-		case 2:	/* Reserved */
+-		default:
+-			*value = PCI_SPEED_UNKNOWN;
+-			retval = -ENODEV;
+-			break;
+-		}
+-	} else {
+-		switch (pcix_cap) {
+-		case 0:
+-			*value = m66_cap ? PCI_SPEED_66MHz : PCI_SPEED_33MHz;
+-			break;
+-		case 1:
+-			*value = PCI_SPEED_66MHz_PCIX;
+-			break;
+-		case 3:
+-			*value = PCI_SPEED_133MHz_PCIX;	
+-			break;
+-		case 2:	/* Reserved */
+-		default:
+-			*value = PCI_SPEED_UNKNOWN;
+-			retval = -ENODEV;
+-			break;
+-		}
++	switch (pcix_cap) {
++	case 0x0:
++		*value = m66_cap ? PCI_SPEED_66MHz : PCI_SPEED_33MHz;
++		break;
++	case 0x1:
++		*value = PCI_SPEED_66MHz_PCIX;
++		break;
++	case 0x3:
++		*value = PCI_SPEED_133MHz_PCIX;
++		break;
++	case 0x4:
++		*value = PCI_SPEED_133MHz_PCIX_266;
++		break;
++	case 0x5:
++		*value = PCI_SPEED_133MHz_PCIX_533;
++		break;
++	case 0x2:
++	default:
++		*value = PCI_SPEED_UNKNOWN;
++		retval = -ENODEV;
++		break;
+ 	}
+ 
+ 	dbg("Adapter speed = %d\n", *value);
+-	
+ 	DBG_LEAVE_ROUTINE 
+ 	return retval;
+ }
+@@ -965,98 +900,66 @@ static int hpc_slot_disable(struct slot 
+ 
+ static int hpc_set_bus_speed_mode(struct slot * slot, enum pci_bus_speed value)
+ {
+-	u8 slot_cmd;
+-	u8 pi;
+-	int retval = 0;
++	int retval;
+ 	struct php_ctlr_state_s *php_ctlr = slot->ctrl->hpc_ctlr_handle;
++	u8 pi, cmd;
+ 
+ 	DBG_ENTER_ROUTINE 
+-	
+-	if (!slot->ctrl->hpc_ctlr_handle) {
+-		err("%s: Invalid HPC controller handle!\n", __FUNCTION__);
+-		return -1;
+-	}
+ 
+ 	pi = readb(php_ctlr->creg + PROG_INTERFACE);
+-	
+-	if (pi == 1) {
+-		switch (value) {
+-		case 0:
+-			slot_cmd = SETA_PCI_33MHZ;
+-			break;
+-		case 1:
+-			slot_cmd = SETA_PCI_66MHZ;
+-			break;
+-		case 2:
+-			slot_cmd = SETA_PCIX_66MHZ;
+-			break;
+-		case 3:
+-			slot_cmd = SETA_PCIX_100MHZ;	
+-			break;
+-		case 4:
+-			slot_cmd = SETA_PCIX_133MHZ;	
+-			break;
+-		default:
+-			slot_cmd = PCI_SPEED_UNKNOWN;
+-			retval = -ENODEV;
+-			return retval;	
+-		}
+-	} else {
+-		switch (value) {
+-		case 0:
+-			slot_cmd = SETB_PCI_33MHZ;
+-			break;
+-		case 1:
+-			slot_cmd = SETB_PCI_66MHZ;
+-			break;
+-		case 2:
+-			slot_cmd = SETB_PCIX_66MHZ_PM;
+-			break;
+-		case 3:
+-			slot_cmd = SETB_PCIX_100MHZ_PM;	
+-			break;
+-		case 4:
+-			slot_cmd = SETB_PCIX_133MHZ_PM;	
+-			break;
+-		case 5:
+-			slot_cmd = SETB_PCIX_66MHZ_EM;	
+-			break;
+-		case 6:
+-			slot_cmd = SETB_PCIX_100MHZ_EM;	
+-			break;
+-		case 7:
+-			slot_cmd = SETB_PCIX_133MHZ_EM;	
+-			break;
+-		case 8:
+-			slot_cmd = SETB_PCIX_66MHZ_266;	
+-			break;
+-		case 0x9:
+-			slot_cmd = SETB_PCIX_100MHZ_266;	
+-			break;
+-		case 0xa:
+-			slot_cmd = SETB_PCIX_133MHZ_266;	
+-			break;
+-		case 0xb:
+-			slot_cmd = SETB_PCIX_66MHZ_533;	
+-			break;
+-		case 0xc:
+-			slot_cmd = SETB_PCIX_100MHZ_533;	
+-			break;
+-		case 0xd:
+-			slot_cmd = SETB_PCIX_133MHZ_533;	
+-			break;
+-		default:
+-			slot_cmd = PCI_SPEED_UNKNOWN;
+-			retval = -ENODEV;
+-			return retval;	
+-		}
++	if ((pi == 1) && (value > PCI_SPEED_133MHz_PCIX))
++		return -EINVAL;
+ 
++	switch (value) {
++	case PCI_SPEED_33MHz:
++		cmd = SETA_PCI_33MHZ;
++		break;
++	case PCI_SPEED_66MHz:
++		cmd = SETA_PCI_66MHZ;
++		break;
++	case PCI_SPEED_66MHz_PCIX:
++		cmd = SETA_PCIX_66MHZ;
++		break;
++	case PCI_SPEED_100MHz_PCIX:
++		cmd = SETA_PCIX_100MHZ;
++		break;
++	case PCI_SPEED_133MHz_PCIX:
++		cmd = SETA_PCIX_133MHZ;
++		break;
++	case PCI_SPEED_66MHz_PCIX_ECC:
++		cmd = SETB_PCIX_66MHZ_EM;
++		break;
++	case PCI_SPEED_100MHz_PCIX_ECC:
++		cmd = SETB_PCIX_100MHZ_EM;
++		break;
++	case PCI_SPEED_133MHz_PCIX_ECC:
++		cmd = SETB_PCIX_133MHZ_EM;
++		break;
++	case PCI_SPEED_66MHz_PCIX_266:
++		cmd = SETB_PCIX_66MHZ_266;
++		break;
++	case PCI_SPEED_100MHz_PCIX_266:
++		cmd = SETB_PCIX_100MHZ_266;
++		break;
++	case PCI_SPEED_133MHz_PCIX_266:
++		cmd = SETB_PCIX_133MHZ_266;
++		break;
++	case PCI_SPEED_66MHz_PCIX_533:
++		cmd = SETB_PCIX_66MHZ_533;
++		break;
++	case PCI_SPEED_100MHz_PCIX_533:
++		cmd = SETB_PCIX_100MHZ_533;
++		break;
++	case PCI_SPEED_133MHz_PCIX_533:
++		cmd = SETB_PCIX_133MHZ_533;
++		break;
++	default:
++		return -EINVAL;
+ 	}
+-	retval = shpc_write_cmd(slot, 0, slot_cmd);
+-	if (retval) {
++
++	retval = shpc_write_cmd(slot, 0, cmd);
++	if (retval)
+ 		err("%s: Write command failed!\n", __FUNCTION__);
+-		return -1;
+-	}
+ 
+ 	DBG_LEAVE_ROUTINE
+ 	return retval;
+@@ -1163,64 +1066,43 @@ static irqreturn_t shpc_isr(int IRQ, voi
+ 
+ static int hpc_get_max_bus_speed (struct slot *slot, enum pci_bus_speed *value)
+ {
++	int retval = 0;
+ 	struct php_ctlr_state_s *php_ctlr = slot->ctrl->hpc_ctlr_handle;
+ 	enum pci_bus_speed bus_speed = PCI_SPEED_UNKNOWN;
+-	int retval = 0;
+-	u8 pi;
+-	u32 slot_avail1, slot_avail2;
++	u8 pi = readb(php_ctlr->creg + PROG_INTERFACE);
++	u32 slot_avail1 = readl(php_ctlr->creg + SLOT_AVAIL1);
++	u32 slot_avail2 = readl(php_ctlr->creg + SLOT_AVAIL2);
+ 
+ 	DBG_ENTER_ROUTINE 
+ 
+-	if (!slot->ctrl->hpc_ctlr_handle) {
+-		err("%s: Invalid HPC controller handle!\n", __FUNCTION__);
+-		return -1;
+-	}
+-
+-	if (slot->hp_slot >= php_ctlr->num_slots) {
+-		err("%s: Invalid HPC slot number!\n", __FUNCTION__);
+-		return -1;
+-	}
+-
+-	pi = readb(php_ctlr->creg + PROG_INTERFACE);
+-	slot_avail1 = readl(php_ctlr->creg + SLOT_AVAIL1);
+-	slot_avail2 = readl(php_ctlr->creg + SLOT_AVAIL2);
+-
+ 	if (pi == 2) {
+ 		if (slot_avail2 & SLOT_133MHZ_PCIX_533)
+-			bus_speed = PCIX_133MHZ_533;
++			bus_speed = PCI_SPEED_133MHz_PCIX_533;
+ 		else if (slot_avail2 & SLOT_100MHZ_PCIX_533)
+-			bus_speed = PCIX_100MHZ_533;
++			bus_speed = PCI_SPEED_100MHz_PCIX_533;
+ 		else if (slot_avail2 & SLOT_66MHZ_PCIX_533)
+-			bus_speed = PCIX_66MHZ_533;
++			bus_speed = PCI_SPEED_66MHz_PCIX_533;
+ 		else if (slot_avail2 & SLOT_133MHZ_PCIX_266)
+-			bus_speed = PCIX_133MHZ_266;
++			bus_speed = PCI_SPEED_133MHz_PCIX_266;
+ 		else if (slot_avail2 & SLOT_100MHZ_PCIX_266)
+-			bus_speed = PCIX_100MHZ_266;
++			bus_speed = PCI_SPEED_100MHz_PCIX_266;
+ 		else if (slot_avail2 & SLOT_66MHZ_PCIX_266)
+-			bus_speed = PCIX_66MHZ_266;
+-		else if (slot_avail1 & SLOT_133MHZ_PCIX)
+-			bus_speed = PCIX_133MHZ;
+-		else if (slot_avail1 & SLOT_100MHZ_PCIX)
+-			bus_speed = PCIX_100MHZ;
+-		else if (slot_avail1 & SLOT_66MHZ_PCIX)
+-			bus_speed = PCIX_66MHZ;
+-		else if (slot_avail2 & SLOT_66MHZ)
+-			bus_speed = PCI_66MHZ;
+-		else if (slot_avail1 & SLOT_33MHZ)
+-			bus_speed = PCI_33MHZ;
+-		else bus_speed = PCI_SPEED_UNKNOWN;
+-	} else {
++			bus_speed = PCI_SPEED_66MHz_PCIX_266;
++	}
++
++	if (bus_speed == PCI_SPEED_UNKNOWN) {
+ 		if (slot_avail1 & SLOT_133MHZ_PCIX)
+-			bus_speed = PCIX_133MHZ;
++			bus_speed = PCI_SPEED_133MHz_PCIX;
+ 		else if (slot_avail1 & SLOT_100MHZ_PCIX)
+-			bus_speed = PCIX_100MHZ;
++			bus_speed = PCI_SPEED_100MHz_PCIX;
+ 		else if (slot_avail1 & SLOT_66MHZ_PCIX)
+-			bus_speed = PCIX_66MHZ;
++			bus_speed = PCI_SPEED_66MHz_PCIX;
+ 		else if (slot_avail2 & SLOT_66MHZ)
+-			bus_speed = PCI_66MHZ;
++			bus_speed = PCI_SPEED_66MHz;
+ 		else if (slot_avail1 & SLOT_33MHZ)
+-			bus_speed = PCI_33MHZ;
+-		else bus_speed = PCI_SPEED_UNKNOWN;
++			bus_speed = PCI_SPEED_33MHz;
++		else
++			retval = -ENODEV;
+ 	}
+ 
+ 	*value = bus_speed;
+@@ -1231,111 +1113,69 @@ static int hpc_get_max_bus_speed (struct
+ 
+ static int hpc_get_cur_bus_speed (struct slot *slot, enum pci_bus_speed *value)
+ {
++	int retval = 0;
+ 	struct php_ctlr_state_s *php_ctlr = slot->ctrl->hpc_ctlr_handle;
+ 	enum pci_bus_speed bus_speed = PCI_SPEED_UNKNOWN;
+-	u16 sec_bus_status;
+-	int retval = 0;
+-	u8 pi;
++	u16 sec_bus_reg = readw(php_ctlr->creg + SEC_BUS_CONFIG);
++	u8 pi = readb(php_ctlr->creg + PROG_INTERFACE);
++	u8 speed_mode = (pi == 2) ? (sec_bus_reg & 0xF) : (sec_bus_reg & 0x7);
+ 
+ 	DBG_ENTER_ROUTINE 
+ 
+-	if (!slot->ctrl->hpc_ctlr_handle) {
+-		err("%s: Invalid HPC controller handle!\n", __FUNCTION__);
+-		return -1;
+-	}
+-
+-	if (slot->hp_slot >= php_ctlr->num_slots) {
+-		err("%s: Invalid HPC slot number!\n", __FUNCTION__);
+-		return -1;
++	if ((pi == 1) && (speed_mode > 4)) {
++		*value = PCI_SPEED_UNKNOWN;
++		return -ENODEV;
+ 	}
+ 
+-	pi = readb(php_ctlr->creg + PROG_INTERFACE);
+-	sec_bus_status = readw(php_ctlr->creg + SEC_BUS_CONFIG);
+-
+-	if (pi == 2) {
+-		switch (sec_bus_status & 0x000f) {
+-		case 0:
+-			bus_speed = PCI_SPEED_33MHz;
+-			break;
+-		case 1:
+-			bus_speed = PCI_SPEED_66MHz;
+-			break;
+-		case 2:
+-			bus_speed = PCI_SPEED_66MHz_PCIX;
+-			break;
+-		case 3:
+-			bus_speed = PCI_SPEED_100MHz_PCIX;	
+-			break;
+-		case 4:
+-			bus_speed = PCI_SPEED_133MHz_PCIX;	
+-			break;
+-		case 5:
+-			bus_speed = PCI_SPEED_66MHz_PCIX_ECC;
+-			break;
+-		case 6:
+-			bus_speed = PCI_SPEED_100MHz_PCIX_ECC;
+-			break;
+-		case 7:
+-			bus_speed = PCI_SPEED_133MHz_PCIX_ECC;	
+-			break;
+-		case 8:
+-			bus_speed = PCI_SPEED_66MHz_PCIX_266;	
+-			break;
+-		case 9:
+-			bus_speed = PCI_SPEED_100MHz_PCIX_266;	
+-			break;
+-		case 0xa:
+-			bus_speed = PCI_SPEED_133MHz_PCIX_266;	
+-			break;
+-		case 0xb:
+-			bus_speed = PCI_SPEED_66MHz_PCIX_533;	
+-			break;
+-		case 0xc:
+-			bus_speed = PCI_SPEED_100MHz_PCIX_533;	
+-			break;
+-		case 0xd:
+-			bus_speed = PCI_SPEED_133MHz_PCIX_533;	
+-			break;
+-		case 0xe:
+-		case 0xf:
+-		default:
+-			bus_speed = PCI_SPEED_UNKNOWN;
+-			break;
+-		}
+-	} else {
+-		/* In the case where pi is undefined, default it to 1 */ 
+-		switch (sec_bus_status & 0x0007) {
+-		case 0:
+-			bus_speed = PCI_SPEED_33MHz;
+-			break;
+-		case 1:
+-			bus_speed = PCI_SPEED_66MHz;
+-			break;
+-		case 2:
+-			bus_speed = PCI_SPEED_66MHz_PCIX;
+-			break;
+-		case 3:
+-			bus_speed = PCI_SPEED_100MHz_PCIX;	
+-			break;
+-		case 4:
+-			bus_speed = PCI_SPEED_133MHz_PCIX;	
+-			break;
+-		case 5:
+-			bus_speed = PCI_SPEED_UNKNOWN;		/*	Reserved */
+-			break;
+-		case 6:
+-			bus_speed = PCI_SPEED_UNKNOWN;		/*	Reserved */
+-			break;
+-		case 7:
+-			bus_speed = PCI_SPEED_UNKNOWN;		/*	Reserved */	
+-			break;
+-		default:
+-			bus_speed = PCI_SPEED_UNKNOWN;
+-			break;
+-		}
++	switch (speed_mode) {
++	case 0x0:
++		*value = PCI_SPEED_33MHz;
++		break;
++	case 0x1:
++		*value = PCI_SPEED_66MHz;
++		break;
++	case 0x2:
++		*value = PCI_SPEED_66MHz_PCIX;
++		break;
++	case 0x3:
++		*value = PCI_SPEED_100MHz_PCIX;
++		break;
++	case 0x4:
++		*value = PCI_SPEED_133MHz_PCIX;
++		break;
++	case 0x5:
++		*value = PCI_SPEED_66MHz_PCIX_ECC;
++		break;
++	case 0x6:
++		*value = PCI_SPEED_100MHz_PCIX_ECC;
++		break;
++	case 0x7:
++		*value = PCI_SPEED_133MHz_PCIX_ECC;
++		break;
++	case 0x8:
++		*value = PCI_SPEED_66MHz_PCIX_266;
++		break;
++	case 0x9:
++		*value = PCI_SPEED_100MHz_PCIX_266;
++		break;
++	case 0xa:
++		*value = PCI_SPEED_133MHz_PCIX_266;
++		break;
++	case 0xb:
++		*value = PCI_SPEED_66MHz_PCIX_533;
++		break;
++	case 0xc:
++		*value = PCI_SPEED_100MHz_PCIX_533;
++		break;
++	case 0xd:
++		*value = PCI_SPEED_133MHz_PCIX_533;
++		break;
++	default:
++		*value = PCI_SPEED_UNKNOWN;
++		retval = -ENODEV;
++		break;
+ 	}
+ 
+-	*value = bus_speed;
+ 	dbg("Current bus speed = %d\n", bus_speed);
+ 	DBG_LEAVE_ROUTINE 
+ 	return retval;
