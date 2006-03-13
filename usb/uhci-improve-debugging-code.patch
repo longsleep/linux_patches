@@ -21,44 +21,94 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  drivers/usb/host/uhci-q.c     |   12 --------
  4 files changed, 70 insertions(+), 39 deletions(-)
 
---- gregkh-2.6.orig/drivers/usb/host/uhci-q.c
-+++ gregkh-2.6/drivers/usb/host/uhci-q.c
-@@ -736,7 +736,6 @@ err:
- 		if (errbuf) {
- 			/* Print the chain for debugging purposes */
- 			uhci_show_qh(urbp->qh, errbuf, ERRBUF_LEN, 0);
--
- 			lprintk(errbuf);
- 		}
+--- gregkh-2.6.orig/drivers/usb/host/uhci-debug.c
++++ gregkh-2.6/drivers/usb/host/uhci-debug.c
+@@ -17,10 +17,13 @@
+ 
+ #include "uhci-hcd.h"
+ 
+-static struct dentry *uhci_debugfs_root = NULL;
++#define uhci_debug_operations (* (struct file_operations *) NULL)
++static struct dentry *uhci_debugfs_root;
++
++#ifdef DEBUG
+ 
+ /* Handle REALLY large printks so we don't overflow buffers */
+-static inline void lprintk(char *buf)
++static void lprintk(char *buf)
+ {
+ 	char *p;
+ 
+@@ -196,7 +199,6 @@ static int uhci_show_qh(struct uhci_qh *
+ 	return out - buf;
+ }
+ 
+-#ifdef CONFIG_PROC_FS
+ static const char * const qh_names[] = {
+   "skel_unlink_qh", "skel_iso_qh",
+   "skel_int128_qh", "skel_int64_qh",
+@@ -393,12 +395,13 @@ static int uhci_sprint_schedule(struct u
+ 	return out - buf;
+ }
+ 
++#ifdef CONFIG_DEBUG_FS
++
+ #define MAX_OUTPUT	(64 * 1024)
+ 
+ struct uhci_debug {
+ 	int size;
+ 	char *data;
+-	struct uhci_hcd *uhci;
+ };
+ 
+ static int uhci_debug_open(struct inode *inode, struct file *file)
+@@ -419,8 +422,10 @@ static int uhci_debug_open(struct inode 
+ 		goto out;
  	}
-@@ -924,26 +923,17 @@ td_error:
- 	ret = uhci_map_status(status, uhci_packetout(td_token(td)));
  
- err:
--	/* 
--	 * Enable this chunk of code if you want to see some more debugging.
--	 * But be careful, it has the tendancy to starve out khubd and prevent
--	 * disconnects from happening successfully if you have a slow debug
--	 * log interface (like a serial console.
--	 */
--#if 0
- 	if ((debug == 1 && ret != -EPIPE) || debug > 1) {
- 		/* Some debugging code */
- 		dev_dbg(uhci_dev(uhci), "%s: failed with status %x\n",
- 				__FUNCTION__, status);
++	up->size = 0;
+ 	spin_lock_irqsave(&uhci->lock, flags);
+-	up->size = uhci_sprint_schedule(uhci, up->data, MAX_OUTPUT);
++	if (uhci->is_initialized)
++		up->size = uhci_sprint_schedule(uhci, up->data, MAX_OUTPUT);
+ 	spin_unlock_irqrestore(&uhci->lock, flags);
  
--		if (errbuf) {
-+		if (debug > 1 && errbuf) {
- 			/* Print the chain for debugging purposes */
- 			uhci_show_qh(urbp->qh, errbuf, ERRBUF_LEN, 0);
--
- 			lprintk(errbuf);
- 		}
- 	}
--#endif
+ 	file->private_data = up;
+@@ -472,15 +477,32 @@ static int uhci_debug_release(struct ino
+ 	return 0;
+ }
  
- 	/* Note that the queue has stopped and save the next toggle value */
- 	urbp->qh->element = UHCI_PTR_TERM;
++#undef uhci_debug_operations
+ static struct file_operations uhci_debug_operations = {
++	.owner =	THIS_MODULE,
+ 	.open =		uhci_debug_open,
+ 	.llseek =	uhci_debug_lseek,
+ 	.read =		uhci_debug_read,
+ 	.release =	uhci_debug_release,
+ };
+ 
+-#else	/* CONFIG_DEBUG_FS */
++#endif	/* CONFIG_DEBUG_FS */
+ 
+-#define uhci_debug_operations (* (struct file_operations *) NULL)
++#else	/* DEBUG */
++
++static inline void lprintk(char *buf)
++{}
++
++static inline int uhci_show_qh(struct uhci_qh *qh, char *buf,
++		int len, int space)
++{
++	return 0;
++}
++
++static inline int uhci_sprint_schedule(struct uhci_hcd *uhci,
++		char *buf, int len)
++{
++	return 0;
++}
+ 
+ #endif
 --- gregkh-2.6.orig/drivers/usb/host/uhci-hcd.c
 +++ gregkh-2.6/drivers/usb/host/uhci-hcd.c
 @@ -68,12 +68,16 @@ Alan Stern"
@@ -185,94 +235,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	uhci_up_cachep = kmem_cache_create("uhci_urb_priv",
  		sizeof(struct urb_priv), 0, 0, NULL, NULL);
  	if (!uhci_up_cachep)
---- gregkh-2.6.orig/drivers/usb/host/uhci-debug.c
-+++ gregkh-2.6/drivers/usb/host/uhci-debug.c
-@@ -17,10 +17,13 @@
- 
- #include "uhci-hcd.h"
- 
--static struct dentry *uhci_debugfs_root = NULL;
-+#define uhci_debug_operations (* (struct file_operations *) NULL)
-+static struct dentry *uhci_debugfs_root;
-+
-+#ifdef DEBUG
- 
- /* Handle REALLY large printks so we don't overflow buffers */
--static inline void lprintk(char *buf)
-+static void lprintk(char *buf)
- {
- 	char *p;
- 
-@@ -196,7 +199,6 @@ static int uhci_show_qh(struct uhci_qh *
- 	return out - buf;
- }
- 
--#ifdef CONFIG_PROC_FS
- static const char * const qh_names[] = {
-   "skel_unlink_qh", "skel_iso_qh",
-   "skel_int128_qh", "skel_int64_qh",
-@@ -393,12 +395,13 @@ static int uhci_sprint_schedule(struct u
- 	return out - buf;
- }
- 
-+#ifdef CONFIG_DEBUG_FS
-+
- #define MAX_OUTPUT	(64 * 1024)
- 
- struct uhci_debug {
- 	int size;
- 	char *data;
--	struct uhci_hcd *uhci;
- };
- 
- static int uhci_debug_open(struct inode *inode, struct file *file)
-@@ -419,8 +422,10 @@ static int uhci_debug_open(struct inode 
- 		goto out;
- 	}
- 
-+	up->size = 0;
- 	spin_lock_irqsave(&uhci->lock, flags);
--	up->size = uhci_sprint_schedule(uhci, up->data, MAX_OUTPUT);
-+	if (uhci->is_initialized)
-+		up->size = uhci_sprint_schedule(uhci, up->data, MAX_OUTPUT);
- 	spin_unlock_irqrestore(&uhci->lock, flags);
- 
- 	file->private_data = up;
-@@ -472,15 +477,32 @@ static int uhci_debug_release(struct ino
- 	return 0;
- }
- 
-+#undef uhci_debug_operations
- static struct file_operations uhci_debug_operations = {
-+	.owner =	THIS_MODULE,
- 	.open =		uhci_debug_open,
- 	.llseek =	uhci_debug_lseek,
- 	.read =		uhci_debug_read,
- 	.release =	uhci_debug_release,
- };
- 
--#else	/* CONFIG_DEBUG_FS */
-+#endif	/* CONFIG_DEBUG_FS */
- 
--#define uhci_debug_operations (* (struct file_operations *) NULL)
-+#else	/* DEBUG */
-+
-+static inline void lprintk(char *buf)
-+{}
-+
-+static inline int uhci_show_qh(struct uhci_qh *qh, char *buf,
-+		int len, int space)
-+{
-+	return 0;
-+}
-+
-+static inline int uhci_sprint_schedule(struct uhci_hcd *uhci,
-+		char *buf, int len)
-+{
-+	return 0;
-+}
- 
- #endif
 --- gregkh-2.6.orig/drivers/usb/host/uhci-hcd.h
 +++ gregkh-2.6/drivers/usb/host/uhci-hcd.h
 @@ -411,6 +411,7 @@ struct uhci_hcd {
@@ -283,3 +245,41 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  	/* Support for port suspend/resume/reset */
  	unsigned long port_c_suspend;		/* Bit-arrays of ports */
+--- gregkh-2.6.orig/drivers/usb/host/uhci-q.c
++++ gregkh-2.6/drivers/usb/host/uhci-q.c
+@@ -736,7 +736,6 @@ err:
+ 		if (errbuf) {
+ 			/* Print the chain for debugging purposes */
+ 			uhci_show_qh(urbp->qh, errbuf, ERRBUF_LEN, 0);
+-
+ 			lprintk(errbuf);
+ 		}
+ 	}
+@@ -924,26 +923,17 @@ td_error:
+ 	ret = uhci_map_status(status, uhci_packetout(td_token(td)));
+ 
+ err:
+-	/* 
+-	 * Enable this chunk of code if you want to see some more debugging.
+-	 * But be careful, it has the tendancy to starve out khubd and prevent
+-	 * disconnects from happening successfully if you have a slow debug
+-	 * log interface (like a serial console.
+-	 */
+-#if 0
+ 	if ((debug == 1 && ret != -EPIPE) || debug > 1) {
+ 		/* Some debugging code */
+ 		dev_dbg(uhci_dev(uhci), "%s: failed with status %x\n",
+ 				__FUNCTION__, status);
+ 
+-		if (errbuf) {
++		if (debug > 1 && errbuf) {
+ 			/* Print the chain for debugging purposes */
+ 			uhci_show_qh(urbp->qh, errbuf, ERRBUF_LEN, 0);
+-
+ 			lprintk(errbuf);
+ 		}
+ 	}
+-#endif
+ 
+ 	/* Note that the queue has stopped and save the next toggle value */
+ 	urbp->qh->element = UHCI_PTR_TERM;

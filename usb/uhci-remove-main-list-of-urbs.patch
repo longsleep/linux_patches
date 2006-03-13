@@ -30,6 +30,84 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  drivers/usb/host/uhci-q.c     |  633 ++++++++++++++++++------------------------
  4 files changed, 280 insertions(+), 371 deletions(-)
 
+--- gregkh-2.6.orig/drivers/usb/host/uhci-debug.c
++++ gregkh-2.6/drivers/usb/host/uhci-debug.c
+@@ -114,7 +114,6 @@ static int uhci_show_urbp(struct urb_pri
+ 	}
+ 
+ 	out += sprintf(out, "%s", (urbp->fsbr ? " FSBR" : ""));
+-	out += sprintf(out, "%s", (urbp->fsbr_timeout ? " FSBR_TO" : ""));
+ 
+ 	if (urbp->urb->status != -EINPROGRESS)
+ 		out += sprintf(out, " Status=%d", urbp->urb->status);
+--- gregkh-2.6.orig/drivers/usb/host/uhci-hcd.c
++++ gregkh-2.6/drivers/usb/host/uhci-hcd.c
+@@ -491,8 +491,6 @@ static int uhci_start(struct usb_hcd *hc
+ 	spin_lock_init(&uhci->lock);
+ 
+ 	INIT_LIST_HEAD(&uhci->td_remove_list);
+-	INIT_LIST_HEAD(&uhci->urb_list);
+-	INIT_LIST_HEAD(&uhci->complete_list);
+ 	INIT_LIST_HEAD(&uhci->idle_qh_list);
+ 
+ 	init_waitqueue_head(&uhci->waitqh);
+--- gregkh-2.6.orig/drivers/usb/host/uhci-hcd.h
++++ gregkh-2.6/drivers/usb/host/uhci-hcd.h
+@@ -132,6 +132,10 @@ struct uhci_qh {
+ 
+ 	unsigned int unlink_frame;	/* When the QH was unlinked */
+ 	int state;			/* QH_STATE_xxx; see above */
++
++	unsigned int initial_toggle:1;	/* Endpoint's current toggle value */
++	unsigned int needs_fixup:1;	/* Must fix the TD toggle values */
++	unsigned int is_stopped:1;	/* Queue was stopped by an error */
+ } __attribute__((aligned(16)));
+ 
+ /*
+@@ -384,6 +388,7 @@ struct uhci_hcd {
+ 
+ 	struct uhci_td *term_td;	/* Terminating TD, see UHCI bug */
+ 	struct uhci_qh *skelqh[UHCI_NUM_SKELQH];	/* Skeleton QHs */
++	struct uhci_qh *next_qh;	/* Next QH to scan */
+ 
+ 	spinlock_t lock;
+ 
+@@ -413,16 +418,10 @@ struct uhci_hcd {
+ 	unsigned long resuming_ports;
+ 	unsigned long ports_timeout;		/* Time to stop signalling */
+ 
+-	/* Main list of URBs currently controlled by this HC */
+-	struct list_head urb_list;
+-
+ 	/* List of TDs that are done, but waiting to be freed (race) */
+ 	struct list_head td_remove_list;
+ 	unsigned int td_remove_age;		/* Age in frames */
+ 
+-	/* List of URBs awaiting completion callback */
+-	struct list_head complete_list;
+-
+ 	struct list_head idle_qh_list;		/* Where the idle QHs live */
+ 
+ 	int rh_numports;			/* Number of root-hub ports */
+@@ -448,7 +447,6 @@ static inline struct usb_hcd *uhci_to_hc
+  *	Private per-URB data
+  */
+ struct urb_priv {
+-	struct list_head urb_list;
+ 	struct list_head node;		/* Node in the QH's urbp list */
+ 
+ 	struct urb *urb;
+@@ -456,10 +454,7 @@ struct urb_priv {
+ 	struct uhci_qh *qh;		/* QH for this URB */
+ 	struct list_head td_list;
+ 
+-	unsigned long fsbrtime;		/* In jiffies */
+-
+ 	unsigned fsbr : 1;		/* URB turned on FSBR */
+-	unsigned fsbr_timeout : 1;	/* URB timed out on FSBR */
+ 	unsigned short_transfer : 1;	/* URB got a short transfer, no
+ 					 * need to rescan */
+ };
 --- gregkh-2.6.orig/drivers/usb/host/uhci-q.c
 +++ gregkh-2.6/drivers/usb/host/uhci-q.c
 @@ -151,53 +151,6 @@ static void uhci_unlink_isochronous_tds(
@@ -847,81 +925,3 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  	/* Really disable FSBR */
  	if (!uhci->fsbr && uhci->fsbrtimeout && time_after_eq(jiffies, uhci->fsbrtimeout)) {
---- gregkh-2.6.orig/drivers/usb/host/uhci-hcd.h
-+++ gregkh-2.6/drivers/usb/host/uhci-hcd.h
-@@ -132,6 +132,10 @@ struct uhci_qh {
- 
- 	unsigned int unlink_frame;	/* When the QH was unlinked */
- 	int state;			/* QH_STATE_xxx; see above */
-+
-+	unsigned int initial_toggle:1;	/* Endpoint's current toggle value */
-+	unsigned int needs_fixup:1;	/* Must fix the TD toggle values */
-+	unsigned int is_stopped:1;	/* Queue was stopped by an error */
- } __attribute__((aligned(16)));
- 
- /*
-@@ -384,6 +388,7 @@ struct uhci_hcd {
- 
- 	struct uhci_td *term_td;	/* Terminating TD, see UHCI bug */
- 	struct uhci_qh *skelqh[UHCI_NUM_SKELQH];	/* Skeleton QHs */
-+	struct uhci_qh *next_qh;	/* Next QH to scan */
- 
- 	spinlock_t lock;
- 
-@@ -413,16 +418,10 @@ struct uhci_hcd {
- 	unsigned long resuming_ports;
- 	unsigned long ports_timeout;		/* Time to stop signalling */
- 
--	/* Main list of URBs currently controlled by this HC */
--	struct list_head urb_list;
--
- 	/* List of TDs that are done, but waiting to be freed (race) */
- 	struct list_head td_remove_list;
- 	unsigned int td_remove_age;		/* Age in frames */
- 
--	/* List of URBs awaiting completion callback */
--	struct list_head complete_list;
--
- 	struct list_head idle_qh_list;		/* Where the idle QHs live */
- 
- 	int rh_numports;			/* Number of root-hub ports */
-@@ -448,7 +447,6 @@ static inline struct usb_hcd *uhci_to_hc
-  *	Private per-URB data
-  */
- struct urb_priv {
--	struct list_head urb_list;
- 	struct list_head node;		/* Node in the QH's urbp list */
- 
- 	struct urb *urb;
-@@ -456,10 +454,7 @@ struct urb_priv {
- 	struct uhci_qh *qh;		/* QH for this URB */
- 	struct list_head td_list;
- 
--	unsigned long fsbrtime;		/* In jiffies */
--
- 	unsigned fsbr : 1;		/* URB turned on FSBR */
--	unsigned fsbr_timeout : 1;	/* URB timed out on FSBR */
- 	unsigned short_transfer : 1;	/* URB got a short transfer, no
- 					 * need to rescan */
- };
---- gregkh-2.6.orig/drivers/usb/host/uhci-hcd.c
-+++ gregkh-2.6/drivers/usb/host/uhci-hcd.c
-@@ -491,8 +491,6 @@ static int uhci_start(struct usb_hcd *hc
- 	spin_lock_init(&uhci->lock);
- 
- 	INIT_LIST_HEAD(&uhci->td_remove_list);
--	INIT_LIST_HEAD(&uhci->urb_list);
--	INIT_LIST_HEAD(&uhci->complete_list);
- 	INIT_LIST_HEAD(&uhci->idle_qh_list);
- 
- 	init_waitqueue_head(&uhci->waitqh);
---- gregkh-2.6.orig/drivers/usb/host/uhci-debug.c
-+++ gregkh-2.6/drivers/usb/host/uhci-debug.c
-@@ -114,7 +114,6 @@ static int uhci_show_urbp(struct urb_pri
- 	}
- 
- 	out += sprintf(out, "%s", (urbp->fsbr ? " FSBR" : ""));
--	out += sprintf(out, "%s", (urbp->fsbr_timeout ? " FSBR_TO" : ""));
- 
- 	if (urbp->urb->status != -EINPROGRESS)
- 		out += sprintf(out, " Status=%d", urbp->urb->status);

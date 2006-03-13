@@ -28,77 +28,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	struct php_ctlr_state_s *hpc_ctlr_handle; /* HPC controller handle */
  	int num_slots;			/* Number of slots on ctlr */
  	int slot_num_inc;		/* 1 or -1 */
---- gregkh-2.6.orig/drivers/pci/hotplug/shpchp_hpc.c
-+++ gregkh-2.6/drivers/pci/hotplug/shpchp_hpc.c
-@@ -231,6 +231,7 @@ static spinlock_t list_lock;
- static irqreturn_t shpc_isr(int IRQ, void *dev_id, struct pt_regs *regs);
- 
- static void start_int_poll_timer(struct php_ctlr_state_s *php_ctlr, int seconds);
-+static int hpc_check_cmd_status(struct controller *ctrl);
- 
- /* This is the interrupt polling timeout function. */
- static void int_poll_timeout(unsigned long lphp_ctlr)
-@@ -303,10 +304,13 @@ static int shpc_write_cmd(struct slot *s
- 	int i;
- 
- 	DBG_ENTER_ROUTINE 
--	
-+
-+	mutex_lock(&slot->ctrl->cmd_lock);
-+
- 	if (!php_ctlr) {
- 		err("%s: Invalid HPC controller handle!\n", __FUNCTION__);
--		return -1;
-+		retval = -EINVAL;
-+		goto out;
- 	}
- 
- 	for (i = 0; i < 10; i++) {
-@@ -323,7 +327,8 @@ static int shpc_write_cmd(struct slot *s
- 	if (cmd_status & 0x1) { 
- 		/* After 1 sec and and the controller is still busy */
- 		err("%s : Controller is still busy after 1 sec.\n", __FUNCTION__);
--		return -1;
-+		retval = -EBUSY;
-+		goto out;
- 	}
- 
- 	++t_slot;
-@@ -340,6 +345,17 @@ static int shpc_write_cmd(struct slot *s
- 	 * Wait for command completion.
- 	 */
- 	retval = shpc_wait_cmd(slot->ctrl);
-+	if (retval)
-+		goto out;
-+
-+	cmd_status = hpc_check_cmd_status(slot->ctrl);
-+	if (cmd_status) {
-+		err("%s: Failed to issued command 0x%x (error code = %d)\n",
-+		    __FUNCTION__, cmd, cmd_status);
-+		retval = -EIO;
-+	}
-+ out:
-+	mutex_unlock(&slot->ctrl->cmd_lock);
- 
- 	DBG_LEAVE_ROUTINE 
- 	return retval;
-@@ -1343,7 +1359,6 @@ static struct hpc_ops shpchp_hpc_ops = {
- 	.green_led_blink		= hpc_set_green_led_blink,
- 	
- 	.release_ctlr			= hpc_release_ctlr,
--	.check_cmd_status		= hpc_check_cmd_status,
- };
- 
- inline static int shpc_indirect_creg_read(struct controller *ctrl, int index,
-@@ -1455,6 +1470,8 @@ int shpc_init(struct controller * ctrl, 
- 	dbg("%s: php_ctlr->creg %p\n", __FUNCTION__, php_ctlr->creg);
- 
- 	mutex_init(&ctrl->crit_sect);
-+	mutex_init(&ctrl->cmd_lock);
-+
- 	/* Setup wait queue */
- 	init_waitqueue_head(&ctrl->queue);
- 
 --- gregkh-2.6.orig/drivers/pci/hotplug/shpchp_ctrl.c
 +++ gregkh-2.6/drivers/pci/hotplug/shpchp_ctrl.c
 @@ -242,21 +242,10 @@ static int change_bus_speed(struct contr
@@ -346,3 +275,74 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  				} else {
  					/* refresh notification */
  					if (p_slot)
+--- gregkh-2.6.orig/drivers/pci/hotplug/shpchp_hpc.c
++++ gregkh-2.6/drivers/pci/hotplug/shpchp_hpc.c
+@@ -231,6 +231,7 @@ static spinlock_t list_lock;
+ static irqreturn_t shpc_isr(int IRQ, void *dev_id, struct pt_regs *regs);
+ 
+ static void start_int_poll_timer(struct php_ctlr_state_s *php_ctlr, int seconds);
++static int hpc_check_cmd_status(struct controller *ctrl);
+ 
+ /* This is the interrupt polling timeout function. */
+ static void int_poll_timeout(unsigned long lphp_ctlr)
+@@ -303,10 +304,13 @@ static int shpc_write_cmd(struct slot *s
+ 	int i;
+ 
+ 	DBG_ENTER_ROUTINE 
+-	
++
++	mutex_lock(&slot->ctrl->cmd_lock);
++
+ 	if (!php_ctlr) {
+ 		err("%s: Invalid HPC controller handle!\n", __FUNCTION__);
+-		return -1;
++		retval = -EINVAL;
++		goto out;
+ 	}
+ 
+ 	for (i = 0; i < 10; i++) {
+@@ -323,7 +327,8 @@ static int shpc_write_cmd(struct slot *s
+ 	if (cmd_status & 0x1) { 
+ 		/* After 1 sec and and the controller is still busy */
+ 		err("%s : Controller is still busy after 1 sec.\n", __FUNCTION__);
+-		return -1;
++		retval = -EBUSY;
++		goto out;
+ 	}
+ 
+ 	++t_slot;
+@@ -340,6 +345,17 @@ static int shpc_write_cmd(struct slot *s
+ 	 * Wait for command completion.
+ 	 */
+ 	retval = shpc_wait_cmd(slot->ctrl);
++	if (retval)
++		goto out;
++
++	cmd_status = hpc_check_cmd_status(slot->ctrl);
++	if (cmd_status) {
++		err("%s: Failed to issued command 0x%x (error code = %d)\n",
++		    __FUNCTION__, cmd, cmd_status);
++		retval = -EIO;
++	}
++ out:
++	mutex_unlock(&slot->ctrl->cmd_lock);
+ 
+ 	DBG_LEAVE_ROUTINE 
+ 	return retval;
+@@ -1343,7 +1359,6 @@ static struct hpc_ops shpchp_hpc_ops = {
+ 	.green_led_blink		= hpc_set_green_led_blink,
+ 	
+ 	.release_ctlr			= hpc_release_ctlr,
+-	.check_cmd_status		= hpc_check_cmd_status,
+ };
+ 
+ inline static int shpc_indirect_creg_read(struct controller *ctrl, int index,
+@@ -1455,6 +1470,8 @@ int shpc_init(struct controller * ctrl, 
+ 	dbg("%s: php_ctlr->creg %p\n", __FUNCTION__, php_ctlr->creg);
+ 
+ 	mutex_init(&ctrl->crit_sect);
++	mutex_init(&ctrl->cmd_lock);
++
+ 	/* Setup wait queue */
+ 	init_waitqueue_head(&ctrl->queue);
+ 

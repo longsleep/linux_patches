@@ -28,6 +28,148 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  include/asm-x86_64/msi.h       |    8 ++
  12 files changed, 300 insertions(+), 129 deletions(-)
 
+--- gregkh-2.6.orig/arch/ia64/sn/pci/Makefile
++++ gregkh-2.6/arch/ia64/sn/pci/Makefile
+@@ -3,10 +3,11 @@
+ # License.  See the file "COPYING" in the main directory of this archive
+ # for more details.
+ #
+-# Copyright (C) 2000-2004 Silicon Graphics, Inc.  All Rights Reserved.
++# Copyright (C) 2000-2005 Silicon Graphics, Inc.  All Rights Reserved.
+ #
+ # Makefile for the sn pci general routines.
+ 
+ CPPFLAGS += -I$(srctree)/arch/ia64/sn/include
+ 
+ obj-y := pci_dma.o tioca_provider.o tioce_provider.o pcibr/
++obj-$(CONFIG_PCI_MSI) += msi.o
+--- /dev/null
++++ gregkh-2.6/arch/ia64/sn/pci/msi.c
+@@ -0,0 +1,18 @@
++/*
++ * This file is subject to the terms and conditions of the GNU General Public
++ * License.  See the file "COPYING" in the main directory of this archive
++ * for more details.
++ *
++ * Copyright (C) 2005 Silicon Graphics, Inc.  All Rights Reserved.
++ */
++
++#include <asm/errno.h>
++
++int
++sn_msi_init(void)
++{
++	/*
++	 * return error until MSI is supported on altix platforms
++	 */
++	return -EINVAL;
++}
+--- gregkh-2.6.orig/drivers/pci/Makefile
++++ gregkh-2.6/drivers/pci/Makefile
+@@ -26,7 +26,7 @@ obj-$(CONFIG_PPC32) += setup-irq.o
+ obj-$(CONFIG_PPC64) += setup-bus.o
+ obj-$(CONFIG_MIPS) += setup-bus.o setup-irq.o
+ obj-$(CONFIG_X86_VISWS) += setup-irq.o
+-obj-$(CONFIG_PCI_MSI) += msi.o
++obj-$(CONFIG_PCI_MSI) += msi.o msi-apic.o
+ 
+ #
+ # ACPI Related PCI FW Functions
+--- /dev/null
++++ gregkh-2.6/drivers/pci/msi-apic.c
+@@ -0,0 +1,92 @@
++/*
++ * MSI hooks for standard x86 apic
++ *
++ * This file is subject to the terms and conditions of the GNU General Public
++ * License.  See the file "COPYING" in the main directory of this archive
++ * for more details.
++ *
++ * Copyright (C) 2005 Silicon Graphics, Inc.  All Rights Reserved.
++ */
++
++#include <linux/pci.h>
++#include <linux/irq.h>
++
++#include "pci.h"
++#include "msi.h"
++
++/* Shifts for APIC-based data */
++#define MSI_DATA_VECTOR_SHIFT		0
++#define	    MSI_DATA_VECTOR(v)		(((u8)v) << MSI_DATA_VECTOR_SHIFT)
++
++#define MSI_DATA_DELIVERY_SHIFT		8
++#define     MSI_DATA_DELIVERY_FIXED	(0 << MSI_DATA_DELIVERY_SHIFT)
++#define     MSI_DATA_DELIVERY_LOWPRI	(1 << MSI_DATA_DELIVERY_SHIFT)
++
++#define MSI_DATA_LEVEL_SHIFT		14
++#define     MSI_DATA_LEVEL_DEASSERT	(0 << MSI_DATA_LEVEL_SHIFT)
++#define     MSI_DATA_LEVEL_ASSERT	(1 << MSI_DATA_LEVEL_SHIFT)
++
++#define MSI_DATA_TRIGGER_SHIFT		15
++#define     MSI_DATA_TRIGGER_EDGE	(0 << MSI_DATA_TRIGGER_SHIFT)
++#define     MSI_DATA_TRIGGER_LEVEL	(1 << MSI_DATA_TRIGGER_SHIFT)
++
++/* Shift/mask fields for APIC-based bus address */
++#define MSI_ADDR_HEADER			0xfee00000
++
++#define MSI_ADDR_DESTID_MASK		0xfff0000f
++#define     MSI_ADDR_DESTID_CPU(cpu)	((cpu) << MSI_TARGET_CPU_SHIFT)
++
++#define MSI_ADDR_DESTMODE_SHIFT		2
++#define     MSI_ADDR_DESTMODE_PHYS	(0 << MSI_ADDR_DESTMODE_SHIFT)
++#define	    MSI_ADDR_DESTMODE_LOGIC	(1 << MSI_ADDR_DESTMODE_SHIFT)
++
++#define MSI_ADDR_REDIRECTION_SHIFT	3
++#define     MSI_ADDR_REDIRECTION_CPU	(0 << MSI_ADDR_REDIRECTION_SHIFT)
++#define     MSI_ADDR_REDIRECTION_LOWPRI	(1 << MSI_ADDR_REDIRECTION_SHIFT)
++
++
++static void msi_target_apic(unsigned int vector, unsigned int dest_cpu,
++			    u32 *address_hi, u32 *address_lo)
++{
++	u32 addr = *address_lo;
++
++	addr &= MSI_ADDR_DESTID_MASK;
++	addr |= MSI_ADDR_DESTID_CPU(cpu_physical_id(dest_cpu));
++
++	*address_lo = addr;
++}
++
++static int msi_setup_apic(struct pci_dev *pdev, unsigned int vector,
++			  u32 *address_hi, u32 *address_lo, u32 *data)
++{
++	unsigned long	dest_phys_id;
++
++	dest_phys_id = cpu_physical_id(first_cpu(cpu_online_map));
++
++	*address_hi = 0;
++	*address_lo =	MSI_ADDR_HEADER |
++			MSI_ADDR_DESTMODE_PHYS |
++			MSI_ADDR_REDIRECTION_CPU |
++			MSI_ADDR_DESTID_CPU(dest_phys_id);
++
++	*data = MSI_DATA_TRIGGER_EDGE |
++		MSI_DATA_LEVEL_ASSERT |
++		MSI_DATA_DELIVERY_FIXED |
++		MSI_DATA_VECTOR(vector);
++
++	return 0;
++}
++
++static void msi_teardown_apic(unsigned int vector)
++{
++	return;
++}
++
++/*
++ * Generic ops used on most IA archs/platforms.  Set with msi_register()
++ */
++struct msi_ops msi_apic_ops = {
++	.setup =	msi_setup_apic,
++	.teardown =	msi_teardown_apic,
++	.target =	msi_target_apic,
++};
 --- gregkh-2.6.orig/drivers/pci/msi.c
 +++ gregkh-2.6/drivers/pci/msi.c
 @@ -23,8 +23,6 @@
@@ -276,266 +418,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	spin_lock_irqsave(&msi_lock, flags);
  	entry = msi_desc[vector];
  	if (!entry || entry->dev != dev) {
---- gregkh-2.6.orig/include/asm-i386/msi.h
-+++ gregkh-2.6/include/asm-i386/msi.h
-@@ -12,4 +12,12 @@
- #define LAST_DEVICE_VECTOR		232
- #define MSI_TARGET_CPU_SHIFT	12
- 
-+extern struct msi_ops msi_apic_ops;
-+
-+static inline int msi_arch_init(void)
-+{
-+	msi_register(&msi_apic_ops);
-+	return 0;
-+}
-+
- #endif /* ASM_MSI_H */
---- gregkh-2.6.orig/include/asm-x86_64/msi.h
-+++ gregkh-2.6/include/asm-x86_64/msi.h
-@@ -13,4 +13,12 @@
- #define LAST_DEVICE_VECTOR		232
- #define MSI_TARGET_CPU_SHIFT	12
- 
-+extern struct msi_ops msi_apic_ops;
-+
-+static inline int msi_arch_init(void)
-+{
-+	msi_register(&msi_apic_ops);
-+	return 0;
-+}
-+
- #endif /* ASM_MSI_H */
---- gregkh-2.6.orig/include/asm-ia64/machvec.h
-+++ gregkh-2.6/include/asm-ia64/machvec.h
-@@ -74,6 +74,7 @@ typedef unsigned char ia64_mv_readb_rela
- typedef unsigned short ia64_mv_readw_relaxed_t (const volatile void __iomem *);
- typedef unsigned int ia64_mv_readl_relaxed_t (const volatile void __iomem *);
- typedef unsigned long ia64_mv_readq_relaxed_t (const volatile void __iomem *);
-+typedef int ia64_mv_msi_init_t (void);
- 
- static inline void
- machvec_noop (void)
-@@ -146,6 +147,7 @@ extern void machvec_tlb_migrate_finish (
- #  define platform_readw_relaxed        ia64_mv.readw_relaxed
- #  define platform_readl_relaxed        ia64_mv.readl_relaxed
- #  define platform_readq_relaxed        ia64_mv.readq_relaxed
-+#  define platform_msi_init	ia64_mv.msi_init
- # endif
- 
- /* __attribute__((__aligned__(16))) is required to make size of the
-@@ -194,6 +196,7 @@ struct ia64_machine_vector {
- 	ia64_mv_readw_relaxed_t *readw_relaxed;
- 	ia64_mv_readl_relaxed_t *readl_relaxed;
- 	ia64_mv_readq_relaxed_t *readq_relaxed;
-+	ia64_mv_msi_init_t *msi_init;
- } __attribute__((__aligned__(16))); /* align attrib? see above comment */
- 
- #define MACHVEC_INIT(name)			\
-@@ -238,6 +241,7 @@ struct ia64_machine_vector {
- 	platform_readw_relaxed,			\
- 	platform_readl_relaxed,			\
- 	platform_readq_relaxed,			\
-+	platform_msi_init,			\
- }
- 
- extern struct ia64_machine_vector ia64_mv;
-@@ -386,5 +390,13 @@ extern ia64_mv_dma_supported		swiotlb_dm
- #ifndef platform_readq_relaxed
- # define platform_readq_relaxed	__ia64_readq_relaxed
- #endif
-+#ifndef platform_msi_init
-+#ifdef CONFIG_PCI_MSI
-+#include <asm/msi.h>		/* pull in ia64_msi_init() */
-+# define platform_msi_init	ia64_msi_init
-+#else
-+# define platform_msi_init	NULL
-+#endif /* CONFIG_PCI_MSI */
-+#endif
- 
- #endif /* _ASM_IA64_MACHVEC_H */
---- gregkh-2.6.orig/include/asm-ia64/machvec_sn2.h
-+++ gregkh-2.6/include/asm-ia64/machvec_sn2.h
-@@ -66,6 +66,7 @@ extern ia64_mv_dma_sync_single_for_devic
- extern ia64_mv_dma_sync_sg_for_device	sn_dma_sync_sg_for_device;
- extern ia64_mv_dma_mapping_error	sn_dma_mapping_error;
- extern ia64_mv_dma_supported		sn_dma_supported;
-+extern ia64_mv_msi_init_t		sn_msi_init;
- 
- /*
-  * This stuff has dual use!
-@@ -115,6 +116,11 @@ extern ia64_mv_dma_supported		sn_dma_sup
- #define platform_dma_sync_sg_for_device	sn_dma_sync_sg_for_device
- #define platform_dma_mapping_error		sn_dma_mapping_error
- #define platform_dma_supported		sn_dma_supported
-+#ifdef CONFIG_PCI_MSI
-+#define platform_msi_init		sn_msi_init
-+#else
-+#define platform_msi_init		NULL
-+#endif
- 
- #include <asm/sn/io.h>
- 
---- gregkh-2.6.orig/include/asm-ia64/msi.h
-+++ gregkh-2.6/include/asm-ia64/msi.h
-@@ -14,4 +14,15 @@ static inline void set_intr_gate (int nr
- #define ack_APIC_irq		ia64_eoi
- #define MSI_TARGET_CPU_SHIFT	4
- 
-+extern struct msi_ops msi_apic_ops;
-+
-+/* default ia64 msi init routine */
-+static inline int ia64_msi_init(void)
-+{
-+	msi_register(&msi_apic_ops);
-+	return 0;
-+}
-+
-+#define msi_arch_init		platform_msi_init	/* in asm/machvec.h */
-+
- #endif /* ASM_MSI_H */
---- gregkh-2.6.orig/arch/ia64/sn/pci/Makefile
-+++ gregkh-2.6/arch/ia64/sn/pci/Makefile
-@@ -3,10 +3,11 @@
- # License.  See the file "COPYING" in the main directory of this archive
- # for more details.
- #
--# Copyright (C) 2000-2004 Silicon Graphics, Inc.  All Rights Reserved.
-+# Copyright (C) 2000-2005 Silicon Graphics, Inc.  All Rights Reserved.
- #
- # Makefile for the sn pci general routines.
- 
- CPPFLAGS += -I$(srctree)/arch/ia64/sn/include
- 
- obj-y := pci_dma.o tioca_provider.o tioce_provider.o pcibr/
-+obj-$(CONFIG_PCI_MSI) += msi.o
---- /dev/null
-+++ gregkh-2.6/arch/ia64/sn/pci/msi.c
-@@ -0,0 +1,18 @@
-+/*
-+ * This file is subject to the terms and conditions of the GNU General Public
-+ * License.  See the file "COPYING" in the main directory of this archive
-+ * for more details.
-+ *
-+ * Copyright (C) 2005 Silicon Graphics, Inc.  All Rights Reserved.
-+ */
-+
-+#include <asm/errno.h>
-+
-+int
-+sn_msi_init(void)
-+{
-+	/*
-+	 * return error until MSI is supported on altix platforms
-+	 */
-+	return -EINVAL;
-+}
---- gregkh-2.6.orig/drivers/pci/Makefile
-+++ gregkh-2.6/drivers/pci/Makefile
-@@ -26,7 +26,7 @@ obj-$(CONFIG_PPC32) += setup-irq.o
- obj-$(CONFIG_PPC64) += setup-bus.o
- obj-$(CONFIG_MIPS) += setup-bus.o setup-irq.o
- obj-$(CONFIG_X86_VISWS) += setup-irq.o
--obj-$(CONFIG_PCI_MSI) += msi.o
-+obj-$(CONFIG_PCI_MSI) += msi.o msi-apic.o
- 
- #
- # ACPI Related PCI FW Functions
---- /dev/null
-+++ gregkh-2.6/drivers/pci/msi-apic.c
-@@ -0,0 +1,92 @@
-+/*
-+ * MSI hooks for standard x86 apic
-+ *
-+ * This file is subject to the terms and conditions of the GNU General Public
-+ * License.  See the file "COPYING" in the main directory of this archive
-+ * for more details.
-+ *
-+ * Copyright (C) 2005 Silicon Graphics, Inc.  All Rights Reserved.
-+ */
-+
-+#include <linux/pci.h>
-+#include <linux/irq.h>
-+
-+#include "pci.h"
-+#include "msi.h"
-+
-+/* Shifts for APIC-based data */
-+#define MSI_DATA_VECTOR_SHIFT		0
-+#define	    MSI_DATA_VECTOR(v)		(((u8)v) << MSI_DATA_VECTOR_SHIFT)
-+
-+#define MSI_DATA_DELIVERY_SHIFT		8
-+#define     MSI_DATA_DELIVERY_FIXED	(0 << MSI_DATA_DELIVERY_SHIFT)
-+#define     MSI_DATA_DELIVERY_LOWPRI	(1 << MSI_DATA_DELIVERY_SHIFT)
-+
-+#define MSI_DATA_LEVEL_SHIFT		14
-+#define     MSI_DATA_LEVEL_DEASSERT	(0 << MSI_DATA_LEVEL_SHIFT)
-+#define     MSI_DATA_LEVEL_ASSERT	(1 << MSI_DATA_LEVEL_SHIFT)
-+
-+#define MSI_DATA_TRIGGER_SHIFT		15
-+#define     MSI_DATA_TRIGGER_EDGE	(0 << MSI_DATA_TRIGGER_SHIFT)
-+#define     MSI_DATA_TRIGGER_LEVEL	(1 << MSI_DATA_TRIGGER_SHIFT)
-+
-+/* Shift/mask fields for APIC-based bus address */
-+#define MSI_ADDR_HEADER			0xfee00000
-+
-+#define MSI_ADDR_DESTID_MASK		0xfff0000f
-+#define     MSI_ADDR_DESTID_CPU(cpu)	((cpu) << MSI_TARGET_CPU_SHIFT)
-+
-+#define MSI_ADDR_DESTMODE_SHIFT		2
-+#define     MSI_ADDR_DESTMODE_PHYS	(0 << MSI_ADDR_DESTMODE_SHIFT)
-+#define	    MSI_ADDR_DESTMODE_LOGIC	(1 << MSI_ADDR_DESTMODE_SHIFT)
-+
-+#define MSI_ADDR_REDIRECTION_SHIFT	3
-+#define     MSI_ADDR_REDIRECTION_CPU	(0 << MSI_ADDR_REDIRECTION_SHIFT)
-+#define     MSI_ADDR_REDIRECTION_LOWPRI	(1 << MSI_ADDR_REDIRECTION_SHIFT)
-+
-+
-+static void msi_target_apic(unsigned int vector, unsigned int dest_cpu,
-+			    u32 *address_hi, u32 *address_lo)
-+{
-+	u32 addr = *address_lo;
-+
-+	addr &= MSI_ADDR_DESTID_MASK;
-+	addr |= MSI_ADDR_DESTID_CPU(cpu_physical_id(dest_cpu));
-+
-+	*address_lo = addr;
-+}
-+
-+static int msi_setup_apic(struct pci_dev *pdev, unsigned int vector,
-+			  u32 *address_hi, u32 *address_lo, u32 *data)
-+{
-+	unsigned long	dest_phys_id;
-+
-+	dest_phys_id = cpu_physical_id(first_cpu(cpu_online_map));
-+
-+	*address_hi = 0;
-+	*address_lo =	MSI_ADDR_HEADER |
-+			MSI_ADDR_DESTMODE_PHYS |
-+			MSI_ADDR_REDIRECTION_CPU |
-+			MSI_ADDR_DESTID_CPU(dest_phys_id);
-+
-+	*data = MSI_DATA_TRIGGER_EDGE |
-+		MSI_DATA_LEVEL_ASSERT |
-+		MSI_DATA_DELIVERY_FIXED |
-+		MSI_DATA_VECTOR(vector);
-+
-+	return 0;
-+}
-+
-+static void msi_teardown_apic(unsigned int vector)
-+{
-+	return;
-+}
-+
-+/*
-+ * Generic ops used on most IA archs/platforms.  Set with msi_register()
-+ */
-+struct msi_ops msi_apic_ops = {
-+	.setup =	msi_setup_apic,
-+	.teardown =	msi_teardown_apic,
-+	.target =	msi_target_apic,
-+};
 --- gregkh-2.6.orig/drivers/pci/msi.h
 +++ gregkh-2.6/drivers/pci/msi.h
 @@ -63,67 +63,6 @@ extern int pci_vector_resources(int last
@@ -693,3 +575,121 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  #endif
  
  extern int pcie_mch_quirk;
+--- gregkh-2.6.orig/include/asm-i386/msi.h
++++ gregkh-2.6/include/asm-i386/msi.h
+@@ -12,4 +12,12 @@
+ #define LAST_DEVICE_VECTOR		232
+ #define MSI_TARGET_CPU_SHIFT	12
+ 
++extern struct msi_ops msi_apic_ops;
++
++static inline int msi_arch_init(void)
++{
++	msi_register(&msi_apic_ops);
++	return 0;
++}
++
+ #endif /* ASM_MSI_H */
+--- gregkh-2.6.orig/include/asm-ia64/machvec.h
++++ gregkh-2.6/include/asm-ia64/machvec.h
+@@ -74,6 +74,7 @@ typedef unsigned char ia64_mv_readb_rela
+ typedef unsigned short ia64_mv_readw_relaxed_t (const volatile void __iomem *);
+ typedef unsigned int ia64_mv_readl_relaxed_t (const volatile void __iomem *);
+ typedef unsigned long ia64_mv_readq_relaxed_t (const volatile void __iomem *);
++typedef int ia64_mv_msi_init_t (void);
+ 
+ static inline void
+ machvec_noop (void)
+@@ -146,6 +147,7 @@ extern void machvec_tlb_migrate_finish (
+ #  define platform_readw_relaxed        ia64_mv.readw_relaxed
+ #  define platform_readl_relaxed        ia64_mv.readl_relaxed
+ #  define platform_readq_relaxed        ia64_mv.readq_relaxed
++#  define platform_msi_init	ia64_mv.msi_init
+ # endif
+ 
+ /* __attribute__((__aligned__(16))) is required to make size of the
+@@ -194,6 +196,7 @@ struct ia64_machine_vector {
+ 	ia64_mv_readw_relaxed_t *readw_relaxed;
+ 	ia64_mv_readl_relaxed_t *readl_relaxed;
+ 	ia64_mv_readq_relaxed_t *readq_relaxed;
++	ia64_mv_msi_init_t *msi_init;
+ } __attribute__((__aligned__(16))); /* align attrib? see above comment */
+ 
+ #define MACHVEC_INIT(name)			\
+@@ -238,6 +241,7 @@ struct ia64_machine_vector {
+ 	platform_readw_relaxed,			\
+ 	platform_readl_relaxed,			\
+ 	platform_readq_relaxed,			\
++	platform_msi_init,			\
+ }
+ 
+ extern struct ia64_machine_vector ia64_mv;
+@@ -386,5 +390,13 @@ extern ia64_mv_dma_supported		swiotlb_dm
+ #ifndef platform_readq_relaxed
+ # define platform_readq_relaxed	__ia64_readq_relaxed
+ #endif
++#ifndef platform_msi_init
++#ifdef CONFIG_PCI_MSI
++#include <asm/msi.h>		/* pull in ia64_msi_init() */
++# define platform_msi_init	ia64_msi_init
++#else
++# define platform_msi_init	NULL
++#endif /* CONFIG_PCI_MSI */
++#endif
+ 
+ #endif /* _ASM_IA64_MACHVEC_H */
+--- gregkh-2.6.orig/include/asm-ia64/machvec_sn2.h
++++ gregkh-2.6/include/asm-ia64/machvec_sn2.h
+@@ -66,6 +66,7 @@ extern ia64_mv_dma_sync_single_for_devic
+ extern ia64_mv_dma_sync_sg_for_device	sn_dma_sync_sg_for_device;
+ extern ia64_mv_dma_mapping_error	sn_dma_mapping_error;
+ extern ia64_mv_dma_supported		sn_dma_supported;
++extern ia64_mv_msi_init_t		sn_msi_init;
+ 
+ /*
+  * This stuff has dual use!
+@@ -115,6 +116,11 @@ extern ia64_mv_dma_supported		sn_dma_sup
+ #define platform_dma_sync_sg_for_device	sn_dma_sync_sg_for_device
+ #define platform_dma_mapping_error		sn_dma_mapping_error
+ #define platform_dma_supported		sn_dma_supported
++#ifdef CONFIG_PCI_MSI
++#define platform_msi_init		sn_msi_init
++#else
++#define platform_msi_init		NULL
++#endif
+ 
+ #include <asm/sn/io.h>
+ 
+--- gregkh-2.6.orig/include/asm-ia64/msi.h
++++ gregkh-2.6/include/asm-ia64/msi.h
+@@ -14,4 +14,15 @@ static inline void set_intr_gate (int nr
+ #define ack_APIC_irq		ia64_eoi
+ #define MSI_TARGET_CPU_SHIFT	4
+ 
++extern struct msi_ops msi_apic_ops;
++
++/* default ia64 msi init routine */
++static inline int ia64_msi_init(void)
++{
++	msi_register(&msi_apic_ops);
++	return 0;
++}
++
++#define msi_arch_init		platform_msi_init	/* in asm/machvec.h */
++
+ #endif /* ASM_MSI_H */
+--- gregkh-2.6.orig/include/asm-x86_64/msi.h
++++ gregkh-2.6/include/asm-x86_64/msi.h
+@@ -13,4 +13,12 @@
+ #define LAST_DEVICE_VECTOR		232
+ #define MSI_TARGET_CPU_SHIFT	12
+ 
++extern struct msi_ops msi_apic_ops;
++
++static inline int msi_arch_init(void)
++{
++	msi_register(&msi_apic_ops);
++	return 0;
++}
++
+ #endif /* ASM_MSI_H */

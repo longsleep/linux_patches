@@ -17,106 +17,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  include/linux/pci.h |   31 ++++++
  4 files changed, 282 insertions(+), 31 deletions(-)
 
---- gregkh-2.6.orig/include/linux/pci.h
-+++ gregkh-2.6/include/linux/pci.h
-@@ -100,6 +100,12 @@ enum pci_bus_flags {
- 	PCI_BUS_FLAGS_NO_MSI = (pci_bus_flags_t) 1,
- };
- 
-+struct pci_cap_saved_state {
-+	struct hlist_node next;
-+	char cap_nr;
-+	u32 data[0];
-+};
-+
- /*
-  * The pci_dev structure is used to describe PCI devices.
-  */
-@@ -159,6 +165,7 @@ struct pci_dev {
- 	unsigned int	block_ucfg_access:1;	/* userspace config space access is blocked */
- 
- 	u32		saved_config_space[16]; /* config space saved at suspend time */
-+	struct hlist_head saved_cap_space;
- 	struct bin_attribute *rom_attr; /* attribute descriptor for sysfs ROM entry */
- 	int rom_attr_enabled;		/* has display of the rom attribute been enabled? */
- 	struct bin_attribute *res_attr[DEVICE_COUNT_RESOURCE]; /* sysfs file for resources */
-@@ -169,6 +176,30 @@ struct pci_dev {
- #define	to_pci_dev(n) container_of(n, struct pci_dev, dev)
- #define for_each_pci_dev(d) while ((d = pci_get_device(PCI_ANY_ID, PCI_ANY_ID, d)) != NULL)
- 
-+static inline struct pci_cap_saved_state *pci_find_saved_cap(
-+	struct pci_dev *pci_dev,char cap)
-+{
-+	struct pci_cap_saved_state *tmp;
-+	struct hlist_node *pos;
-+
-+	hlist_for_each_entry(tmp, pos, &pci_dev->saved_cap_space, next) {
-+		if (tmp->cap_nr == cap)
-+			return tmp;
-+	}
-+	return NULL;
-+}
-+
-+static inline void pci_add_saved_cap(struct pci_dev *pci_dev,
-+	struct pci_cap_saved_state *new_cap)
-+{
-+	hlist_add_head(&new_cap->next, &pci_dev->saved_cap_space);
-+}
-+
-+static inline void pci_remove_saved_cap(struct pci_cap_saved_state *cap)
-+{
-+	hlist_del(&cap->next);
-+}
-+
- /*
-  *  For PCI devices, the region numbers are assigned this way:
-  *
---- gregkh-2.6.orig/drivers/pci/pci.h
-+++ gregkh-2.6/drivers/pci/pci.h
-@@ -57,6 +57,18 @@ static inline void disable_msi_mode(stru
- static inline int msi_register(struct msi_ops *ops) { return 0; }
- #endif
- 
-+#if defined(CONFIG_PCI_MSI) && defined(CONFIG_PM)
-+int pci_save_msi_state(struct pci_dev *dev);
-+int pci_save_msix_state(struct pci_dev *dev);
-+int pci_restore_msi_state(struct pci_dev *dev);
-+int pci_restore_msix_state(struct pci_dev *dev);
-+#else
-+static inline int pci_save_msi_state(struct pci_dev *dev) { return 0; }
-+static inline int pci_save_msix_state(struct pci_dev *dev) { return 0; }
-+static inline int pci_restore_msi_state(struct pci_dev *dev) { return 0; }
-+static inline int pci_restore_msix_state(struct pci_dev *dev) { return 0; }
-+#endif
-+
- extern int pcie_mch_quirk;
- extern struct device_attribute pci_dev_attrs[];
- extern struct class_device_attribute class_device_attr_cpuaffinity;
---- gregkh-2.6.orig/drivers/pci/pci.c
-+++ gregkh-2.6/drivers/pci/pci.c
-@@ -444,6 +444,11 @@ pci_save_state(struct pci_dev *dev)
- 	/* XXX: 100% dword access ok here? */
- 	for (i = 0; i < 16; i++)
- 		pci_read_config_dword(dev, i * 4,&dev->saved_config_space[i]);
-+	if ((i = pci_save_msi_state(dev)) != 0)
-+		return i;
-+	if ((i = pci_save_msix_state(dev)) != 0)
-+		return i;
-+
- 	return 0;
- }
- 
-@@ -458,6 +463,10 @@ pci_restore_state(struct pci_dev *dev)
- 
- 	for (i = 0; i < 16; i++)
- 		pci_write_config_dword(dev,i * 4, dev->saved_config_space[i]);
-+	if ((i = pci_restore_msi_state(dev)) != 0)
-+		return i;
-+	if ((i = pci_restore_msix_state(dev)) != 0)
-+		return i;
- 	return 0;
- }
- 
 --- gregkh-2.6.orig/drivers/pci/msi.c
 +++ gregkh-2.6/drivers/pci/msi.c
 @@ -514,6 +514,221 @@ void pci_scan_msi_device(struct pci_dev 
@@ -415,3 +315,103 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		}
  		spin_unlock_irqrestore(&msi_lock, flags);
  		dev->irq = temp;
+--- gregkh-2.6.orig/drivers/pci/pci.c
++++ gregkh-2.6/drivers/pci/pci.c
+@@ -444,6 +444,11 @@ pci_save_state(struct pci_dev *dev)
+ 	/* XXX: 100% dword access ok here? */
+ 	for (i = 0; i < 16; i++)
+ 		pci_read_config_dword(dev, i * 4,&dev->saved_config_space[i]);
++	if ((i = pci_save_msi_state(dev)) != 0)
++		return i;
++	if ((i = pci_save_msix_state(dev)) != 0)
++		return i;
++
+ 	return 0;
+ }
+ 
+@@ -458,6 +463,10 @@ pci_restore_state(struct pci_dev *dev)
+ 
+ 	for (i = 0; i < 16; i++)
+ 		pci_write_config_dword(dev,i * 4, dev->saved_config_space[i]);
++	if ((i = pci_restore_msi_state(dev)) != 0)
++		return i;
++	if ((i = pci_restore_msix_state(dev)) != 0)
++		return i;
+ 	return 0;
+ }
+ 
+--- gregkh-2.6.orig/drivers/pci/pci.h
++++ gregkh-2.6/drivers/pci/pci.h
+@@ -57,6 +57,18 @@ static inline void disable_msi_mode(stru
+ static inline int msi_register(struct msi_ops *ops) { return 0; }
+ #endif
+ 
++#if defined(CONFIG_PCI_MSI) && defined(CONFIG_PM)
++int pci_save_msi_state(struct pci_dev *dev);
++int pci_save_msix_state(struct pci_dev *dev);
++int pci_restore_msi_state(struct pci_dev *dev);
++int pci_restore_msix_state(struct pci_dev *dev);
++#else
++static inline int pci_save_msi_state(struct pci_dev *dev) { return 0; }
++static inline int pci_save_msix_state(struct pci_dev *dev) { return 0; }
++static inline int pci_restore_msi_state(struct pci_dev *dev) { return 0; }
++static inline int pci_restore_msix_state(struct pci_dev *dev) { return 0; }
++#endif
++
+ extern int pcie_mch_quirk;
+ extern struct device_attribute pci_dev_attrs[];
+ extern struct class_device_attribute class_device_attr_cpuaffinity;
+--- gregkh-2.6.orig/include/linux/pci.h
++++ gregkh-2.6/include/linux/pci.h
+@@ -100,6 +100,12 @@ enum pci_bus_flags {
+ 	PCI_BUS_FLAGS_NO_MSI = (pci_bus_flags_t) 1,
+ };
+ 
++struct pci_cap_saved_state {
++	struct hlist_node next;
++	char cap_nr;
++	u32 data[0];
++};
++
+ /*
+  * The pci_dev structure is used to describe PCI devices.
+  */
+@@ -159,6 +165,7 @@ struct pci_dev {
+ 	unsigned int	block_ucfg_access:1;	/* userspace config space access is blocked */
+ 
+ 	u32		saved_config_space[16]; /* config space saved at suspend time */
++	struct hlist_head saved_cap_space;
+ 	struct bin_attribute *rom_attr; /* attribute descriptor for sysfs ROM entry */
+ 	int rom_attr_enabled;		/* has display of the rom attribute been enabled? */
+ 	struct bin_attribute *res_attr[DEVICE_COUNT_RESOURCE]; /* sysfs file for resources */
+@@ -169,6 +176,30 @@ struct pci_dev {
+ #define	to_pci_dev(n) container_of(n, struct pci_dev, dev)
+ #define for_each_pci_dev(d) while ((d = pci_get_device(PCI_ANY_ID, PCI_ANY_ID, d)) != NULL)
+ 
++static inline struct pci_cap_saved_state *pci_find_saved_cap(
++	struct pci_dev *pci_dev,char cap)
++{
++	struct pci_cap_saved_state *tmp;
++	struct hlist_node *pos;
++
++	hlist_for_each_entry(tmp, pos, &pci_dev->saved_cap_space, next) {
++		if (tmp->cap_nr == cap)
++			return tmp;
++	}
++	return NULL;
++}
++
++static inline void pci_add_saved_cap(struct pci_dev *pci_dev,
++	struct pci_cap_saved_state *new_cap)
++{
++	hlist_add_head(&new_cap->next, &pci_dev->saved_cap_space);
++}
++
++static inline void pci_remove_saved_cap(struct pci_cap_saved_state *cap)
++{
++	hlist_del(&cap->next);
++}
++
+ /*
+  *  For PCI devices, the region numbers are assigned this way:
+  *
