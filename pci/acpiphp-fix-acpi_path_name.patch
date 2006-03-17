@@ -1,0 +1,198 @@
+From pcihpd-discuss-admin@lists.sourceforge.net Thu Mar 16 16:20:02 2006
+Message-ID: <87k6atc49s.wl%muneda.takahiro@jp.fujitsu.com>
+From: MUNEDA Takahiro <muneda.takahiro@jp.fujitsu.com>
+To: Prarit Bhargava <prarit@sgi.com>, Greg KH <greg@kroah.com>, Kristen Accardi <kristen.c.accardi@intel.com>
+Cc: MUNEDA Takahiro <muneda.takahiro@jp.fujitsu.com>, pcihpd-discuss@lists.sourceforge.net
+Subject: acpiphp: fix acpi_path_name
+Date: Fri, 17 Mar 2006 09:18:39 +0900
+
+I encountered the problem that the insmod of the acpiphp
+fails because of the mis-freeing of the memory.
+
+I tested this patch on my tiger4 box.
+
+Signed-off-by: MUNEDA Takahiro <muneda.takahiro@jp.fujitsu.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+---
+ drivers/pci/hotplug/acpi_pcihp.c  |   54 +++++++++++++-------------------------
+ drivers/pci/hotplug/pci_hotplug.h |    1 
+ drivers/pci/hotplug/pciehp_hpc.c  |   15 +++++-----
+ 3 files changed, 27 insertions(+), 43 deletions(-)
+
+--- gregkh-2.6.orig/drivers/pci/hotplug/acpi_pcihp.c
++++ gregkh-2.6/drivers/pci/hotplug/acpi_pcihp.c
+@@ -37,28 +37,6 @@
+ #define	METHOD_NAME__HPP	"_HPP"
+ #define	METHOD_NAME_OSHP	"OSHP"
+ 
+-/* acpi_path_name
+- *
+- * @handle - the acpi_handle of the object who's name you want.
+- *
+- * Caller must free buffer.
+- */
+-u8 * acpi_path_name(acpi_handle handle)
+-{
+-	acpi_status status;
+-	struct acpi_buffer ret_buf = {ACPI_ALLOCATE_BUFFER, NULL};
+-	union acpi_object *obj;
+-
+-	status = acpi_get_name(handle, ACPI_FULL_PATHNAME, &ret_buf);
+-	if (ACPI_FAILURE(status)) {
+-		return NULL;
+-	}
+-	obj = ret_buf.pointer;
+-	return obj->string.pointer;
+-}
+-EXPORT_SYMBOL_GPL(acpi_path_name);
+-
+-
+ 
+ static acpi_status
+ acpi_run_hpp(acpi_handle handle, struct hotplug_params *hpp)
+@@ -66,10 +44,12 @@ acpi_run_hpp(acpi_handle handle, struct 
+ 	acpi_status		status;
+ 	u8			nui[4];
+ 	struct acpi_buffer	ret_buf = { 0, NULL};
++	struct acpi_buffer	string = { ACPI_ALLOCATE_BUFFER, NULL };
+ 	union acpi_object	*ext_obj, *package;
+-	u8			*path_name = acpi_path_name(handle);
+ 	int			i, len = 0;
+ 
++	acpi_get_name(handle, ACPI_FULL_PATHNAME, &string);
++
+ 	/* get _hpp */
+ 	status = acpi_evaluate_object(handle, METHOD_NAME__HPP, NULL, &ret_buf);
+ 	switch (status) {
+@@ -77,8 +57,8 @@ acpi_run_hpp(acpi_handle handle, struct 
+ 		ret_buf.pointer = kmalloc (ret_buf.length, GFP_KERNEL);
+ 		if (!ret_buf.pointer) {
+ 			printk(KERN_ERR "%s:%s alloc for _HPP fail\n",
+-				__FUNCTION__, path_name);
+-			acpi_os_free(path_name);
++				__FUNCTION__, (char *)string.pointer);
++			acpi_os_free(string.pointer);
+ 			return AE_NO_MEMORY;
+ 		}
+ 		status = acpi_evaluate_object(handle, METHOD_NAME__HPP,
+@@ -88,8 +68,8 @@ acpi_run_hpp(acpi_handle handle, struct 
+ 	default:
+ 		if (ACPI_FAILURE(status)) {
+ 			pr_debug("%s:%s _HPP fail=0x%x\n", __FUNCTION__,
+-					path_name, status);
+-			acpi_os_free(path_name);
++				(char *)string.pointer, status);
++			acpi_os_free(string.pointer);
+ 			return status;
+ 		}
+ 	}
+@@ -97,7 +77,7 @@ acpi_run_hpp(acpi_handle handle, struct 
+ 	ext_obj = (union acpi_object *) ret_buf.pointer;
+ 	if (ext_obj->type != ACPI_TYPE_PACKAGE) {
+ 		printk(KERN_ERR "%s:%s _HPP obj not a package\n", __FUNCTION__,
+-				path_name);
++				(char *)string.pointer);
+ 		status = AE_ERROR;
+ 		goto free_and_return;
+ 	}
+@@ -112,7 +92,7 @@ acpi_run_hpp(acpi_handle handle, struct 
+ 			break;
+ 		default:
+ 			printk(KERN_ERR "%s:%s _HPP obj type incorrect\n",
+-				__FUNCTION__, path_name);
++				__FUNCTION__, (char *)string.pointer);
+ 			status = AE_ERROR;
+ 			goto free_and_return;
+ 		}
+@@ -129,8 +109,8 @@ acpi_run_hpp(acpi_handle handle, struct 
+ 	pr_debug("  _HPP: enable PERR    =0x%x\n", hpp->enable_perr);
+ 
+ free_and_return:
+-	acpi_os_free(path_name);
+-	kfree(ret_buf.pointer);
++	acpi_os_free(string.pointer);
++	acpi_os_free(ret_buf.pointer);
+ 	return status;
+ }
+ 
+@@ -143,16 +123,20 @@ free_and_return:
+ acpi_status acpi_run_oshp(acpi_handle handle)
+ {
+ 	acpi_status		status;
+-	u8			*path_name = acpi_path_name(handle);
++	struct acpi_buffer	string = { ACPI_ALLOCATE_BUFFER, NULL };
++
++	acpi_get_name(handle, ACPI_FULL_PATHNAME, &string);
+ 
+ 	/* run OSHP */
+ 	status = acpi_evaluate_object(handle, METHOD_NAME_OSHP, NULL, NULL);
+ 	if (ACPI_FAILURE(status))
+ 		printk(KERN_ERR "%s:%s OSHP fails=0x%x\n", __FUNCTION__,
+-			path_name, status);
++			(char *)string.pointer, status);
+ 	else
+-		pr_debug("%s:%s OSHP passes\n", __FUNCTION__, path_name);
+-	acpi_os_free(path_name);
++		pr_debug("%s:%s OSHP passes\n", __FUNCTION__,
++			(char *)string.pointer);
++
++	acpi_os_free(string.pointer);
+ 	return status;
+ }
+ EXPORT_SYMBOL_GPL(acpi_run_oshp);
+--- gregkh-2.6.orig/drivers/pci/hotplug/pci_hotplug.h
++++ gregkh-2.6/drivers/pci/hotplug/pci_hotplug.h
+@@ -190,7 +190,6 @@ struct hotplug_params {
+ extern acpi_status acpi_run_oshp(acpi_handle handle);
+ extern acpi_status acpi_get_hp_params_from_firmware(struct pci_dev *dev,
+ 				struct hotplug_params *hpp);
+-extern u8 * acpi_path_name(acpi_handle handle);
+ int acpi_root_bridge(acpi_handle handle);
+ #endif
+ #endif
+--- gregkh-2.6.orig/drivers/pci/hotplug/pciehp_hpc.c
++++ gregkh-2.6/drivers/pci/hotplug/pciehp_hpc.c
+@@ -1246,7 +1246,7 @@ int pciehp_acpi_get_hp_hw_control_from_f
+ 	acpi_handle chandle, handle = DEVICE_ACPI_HANDLE(&(dev->dev));
+ 	struct pci_dev *pdev = dev;
+ 	struct pci_bus *parent;
+-	u8 *path_name = NULL;
++	struct acpi_buffer string = { ACPI_ALLOCATE_BUFFER, NULL };
+ 
+ 	/*
+ 	 * Per PCI firmware specification, we should run the ACPI _OSC
+@@ -1278,16 +1278,17 @@ int pciehp_acpi_get_hp_hw_control_from_f
+ 	}
+ 
+ 	while (handle) {
+-		path_name = acpi_path_name(handle);
+-		dbg("Trying to get hotplug control for %s \n", path_name);
++		acpi_get_name(handle, ACPI_FULL_PATHNAME, &string);
++		dbg("Trying to get hotplug control for %s \n",
++			(char *)string.pointer);
+ 		status = pci_osc_control_set(handle,
+ 				OSC_PCI_EXPRESS_NATIVE_HP_CONTROL);
+ 		if (status == AE_NOT_FOUND)
+ 			status = acpi_run_oshp(handle);
+ 		if (ACPI_SUCCESS(status)) {
+ 			dbg("Gained control for hotplug HW for pci %s (%s)\n",
+-				pci_name(dev), path_name);
+-			acpi_os_free(path_name);
++				pci_name(dev), (char *)string.pointer);
++			acpi_os_free(string.pointer);
+ 			return 0;
+ 		}
+ 		if (acpi_root_bridge(handle))
+@@ -1300,8 +1301,8 @@ int pciehp_acpi_get_hp_hw_control_from_f
+ 
+ 	err("Cannot get control of hotplug hardware for pci %s\n",
+ 			pci_name(dev));
+-	if (path_name)
+-		acpi_os_free(path_name);
++
++	acpi_os_free(string.pointer);
+ 	return -1;
+ }
+ #endif
