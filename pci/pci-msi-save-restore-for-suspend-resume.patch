@@ -11,15 +11,15 @@ Add MSI(X) configure space save/restore in generic PCI helper.
 Signed-off-by: Shaohua Li <shaohua.li@intel.com>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 ---
- drivers/pci/msi.c   |  261 +++++++++++++++++++++++++++++++++++++++++++++-------
+ drivers/pci/msi.c   |  255 +++++++++++++++++++++++++++++++++++++++++++++-------
  drivers/pci/pci.c   |    9 +
  drivers/pci/pci.h   |   12 ++
  include/linux/pci.h |   31 ++++++
- 4 files changed, 282 insertions(+), 31 deletions(-)
+ 4 files changed, 277 insertions(+), 30 deletions(-)
 
 --- gregkh-2.6.orig/drivers/pci/msi.c
 +++ gregkh-2.6/drivers/pci/msi.c
-@@ -514,6 +514,221 @@ void pci_scan_msi_device(struct pci_dev 
+@@ -504,6 +504,217 @@ void pci_scan_msi_device(struct pci_dev 
  		nr_reserved_vectors++;
  }
  
@@ -205,11 +205,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	pos = pci_find_capability(dev, PCI_CAP_ID_MSI);
 +	pci_read_config_word(dev, msi_control_reg(pos), &control);
 +
-+	/* Configure MSI capability structure */
-+	status = msi_ops->setup(dev, vector,
-+				&address_hi,
-+				&address_lo,
-+				&data);
++	status = msi_register_init(dev, entry);
 +	if (status < 0)
 +		return status;
 +
@@ -241,42 +237,25 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  /**
   * msi_capability_init - configure device's MSI capability structure
   * @dev: pointer to the pci_dev data structure of MSI device function
-@@ -527,9 +742,6 @@ static int msi_capability_init(struct pc
- {
- 	int status;
- 	struct msi_desc *entry;
--	u32 address_lo;
--	u32 address_hi;
--	u32 data;
- 	int pos, vector;
- 	u16 control;
- 
-@@ -558,11 +770,8 @@ static int msi_capability_init(struct pc
- 		entry->mask_base = (void __iomem *)(long)msi_mask_bits_reg(pos,
- 				is_64bit_address(control));
+@@ -548,35 +759,8 @@ static int msi_capability_init(struct pc
  	}
--	/* Configure MSI capability structure */
--	status = msi_ops->setup(dev, vector,
--				&address_hi,
--				&address_lo,
--				&data);
-+
-+	status = msi_register_init(dev, entry);
- 	if (status < 0) {
- 		dev->irq = entry->msi_attrib.default_vector;
- 		kmem_cache_free(msi_cachep, entry);
-@@ -571,27 +780,6 @@ static int msi_capability_init(struct pc
  	/* Replace with MSI handler */
  	irq_handler_init(PCI_CAP_ID_MSI, vector, entry->msi_attrib.maskbit);
- 
--	pci_write_config_dword(dev, msi_lower_address_reg(pos), address_lo);
+-	/* Configure MSI capability structure */
+-	msi_address_init(&address);
+-	msi_data_init(&data, vector);
+-	entry->msi_attrib.current_cpu = ((address.lo_address.u.dest_id >>
+-				MSI_TARGET_CPU_SHIFT) & MSI_TARGET_CPU_MASK);
+-	pci_write_config_dword(dev, msi_lower_address_reg(pos),
+-			address.lo_address.value);
 -	if (is_64bit_address(control)) {
 -		pci_write_config_dword(dev,
--			msi_upper_address_reg(pos), address_hi);
--		pci_write_config_word(dev, msi_data_reg(pos, 1), data);
+-			msi_upper_address_reg(pos), address.hi_address);
+-		pci_write_config_word(dev,
+-			msi_data_reg(pos, 1), *((u32*)&data));
 -	} else
--		pci_write_config_word(dev, msi_data_reg(pos, 0), data);
--
+-		pci_write_config_word(dev,
+-			msi_data_reg(pos, 0), *((u32*)&data));
 -	if (entry->msi_attrib.maskbit) {
 -		unsigned int maskbits, temp;
 -		/* All MSIs are unmasked by default, Mask them all */
@@ -291,9 +270,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -			maskbits);
 -	}
  	attach_msi_entry(entry, vector);
++
  	/* Set MSI enabled bits	 */
  	enable_msi_mode(dev, pos, PCI_CAP_ID_MSI);
-@@ -750,8 +938,19 @@ int pci_enable_msi(struct pci_dev* dev)
+ 
+@@ -730,8 +914,19 @@ int pci_enable_msi(struct pci_dev* dev)
  			vector_irq[dev->irq] = -1;
  			nr_released_vectors--;
  			spin_unlock_irqrestore(&msi_lock, flags);
@@ -342,8 +323,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
 --- gregkh-2.6.orig/drivers/pci/pci.h
 +++ gregkh-2.6/drivers/pci/pci.h
-@@ -57,6 +57,18 @@ static inline void disable_msi_mode(stru
- static inline int msi_register(struct msi_ops *ops) { return 0; }
+@@ -54,6 +54,18 @@ void disable_msi_mode(struct pci_dev *de
+ static inline void disable_msi_mode(struct pci_dev *dev, int pos, int type) { }
  #endif
  
 +#if defined(CONFIG_PCI_MSI) && defined(CONFIG_PM)
