@@ -1,17 +1,19 @@
-From neilb@suse.de Tue Dec 20 15:19:48 2005
-From: Neil Brown <neilb@suse.de>
-To: Greg KH <greg@kroah.com>, <maneesh@in.ibm.com>
-Date: Wed, 21 Dec 2005 10:14:29 +1100
-Message-ID: <17320.36949.269788.520946@cse.unsw.edu.au>
-Subject: [PATCH - 2.6.15-rc5-mm3] Allow sysfs attribute files to be pollable.
+From neilb@suse.de  Wed Mar 22 15:03:35 2006
+From: NeilBrown <neilb@suse.de>
+To: Andrew Morton <akpm@osdl.org>, Greg KH <greg@kroah.com>
+Date: Mon, 20 Mar 2006 17:53:53 +1100
+Message-Id: <1060320065353.30933@suse.de>
+Cc: linux-kernel@vger.kernel.org
+Subject: sysfs: Allow sysfs attribute files to be pollable
 
-This allows an attribute file in sysfs to be polled for activity.
 
 It works like this:
   Open the file
   Read all the contents.
   Call poll requesting POLLERR or POLLPRI (so select/exceptfds works)
-  When poll returns, close the file, and go to top of loop.
+  When poll returns, 
+     close the file and go to top of loop.
+   or lseek to start of file and go back to the 'read'.
 
 Events are signaled by an object manager calling
    sysfs_notify(kobj, dir, attr);
@@ -32,16 +34,27 @@ to be pollable
 Signed-off-by: Neil Brown <neilb@suse.de>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
----
- fs/sysfs/dir.c          |    1 +
- fs/sysfs/file.c         |   47 +++++++++++++++++++++++++++++++++++++++++++++++
- fs/sysfs/inode.c        |   21 +++++++++++++++++++++
- fs/sysfs/sysfs.h        |    1 +
- include/linux/kobject.h |    2 ++
- include/linux/sysfs.h   |    7 +++++++
- lib/kobject.c           |    1 +
- 7 files changed, 80 insertions(+)
 
+---
+ drivers/md/md.c         |    1 
+ fs/sysfs/dir.c          |    1 
+ fs/sysfs/file.c         |   76 ++++++++++++++++++++++++++++++++++++++++++++++++
+ fs/sysfs/sysfs.h        |    1 
+ include/linux/kobject.h |    2 +
+ include/linux/sysfs.h   |    6 +++
+ lib/kobject.c           |    1 
+ 7 files changed, 88 insertions(+)
+
+--- gregkh-2.6.orig/drivers/md/md.c
++++ gregkh-2.6/drivers/md/md.c
+@@ -162,6 +162,7 @@ static void md_new_event(mddev_t *mddev)
+ {
+ 	atomic_inc(&md_event_count);
+ 	wake_up(&md_event_waiters);
++	sysfs_notify(&mddev->kobj, NULL, "sync_action");
+ }
+ 
+ /*
 --- gregkh-2.6.orig/fs/sysfs/dir.c
 +++ gregkh-2.6/fs/sysfs/dir.c
 @@ -43,6 +43,7 @@ static struct sysfs_dirent * sysfs_new_d
@@ -86,7 +99,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	count = ops->show(kobj,attr,buffer->page);
  	buffer->needs_read_fill = 0;
  	BUG_ON(count > (ssize_t)PAGE_SIZE);
-@@ -348,12 +352,55 @@ static int sysfs_release(struct inode * 
+@@ -348,12 +352,84 @@ static int sysfs_release(struct inode * 
  	return 0;
  }
  
@@ -101,7 +114,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + * again will not get new data, or reset the state of 'poll'.
 + * Reminder: this only works for attributes which actively support
 + * it, and it is not possible to test an attribute from userspace
-+ * to see if it supports poll.
++ * to see if it supports poll (Nether 'poll' or 'select' return
++ * an appropriate error code).  When in doubt, set a suitable timeout value.
 + */
 +static unsigned int sysfs_poll(struct file *filp, poll_table *wait)
 +{
@@ -112,22 +126,50 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	poll_wait(filp, &kobj->poll, wait);
 +
-+	if (buffer->event != atomic_read(&sd->s_event))
++	if (buffer->event != atomic_read(&sd->s_event)) {
 +		res = POLLERR|POLLPRI;
++		buffer->needs_read_fill = 1;
++	}
 +
 +	return res;
 +}
 +
++
++static struct dentry *step_down(struct dentry *dir, const char * name)
++{
++	struct dentry * de;
++
++	if (dir == NULL || dir->d_inode == NULL)
++		return NULL;
++
++	mutex_lock(&dir->d_inode->i_mutex);
++	de = lookup_one_len(name, dir, strlen(name));
++	mutex_unlock(&dir->d_inode->i_mutex);
++	dput(dir);
++	if (IS_ERR(de))
++		return NULL;
++	if (de->d_inode == NULL) {
++		dput(de);
++		return NULL;
++	}
++	return de;
++}
++
 +void sysfs_notify(struct kobject * k, char *dir, char *attr)
 +{
-+	struct sysfs_dirent * sd = k->dentry->d_fsdata;
-+	if (sd && dir)
-+		sd = sysfs_find(sd, dir);
-+	if (sd && attr)
-+		sd = sysfs_find(sd, attr);
-+	if (sd) {
-+		atomic_inc(&sd->s_event);
++	struct dentry *de = k->dentry;
++	if (de)
++		dget(de);
++	if (de && dir)
++		de = step_down(de, dir);
++	if (de && attr)
++		de = step_down(de, attr);
++	if (de) {
++		struct sysfs_dirent * sd = de->d_fsdata;
++		if (sd)
++			atomic_inc(&sd->s_event);
 +		wake_up_interruptible(&k->poll);
++		dput(de);
 +	}
 +}
 +EXPORT_SYMBOL_GPL(sysfs_notify);
@@ -142,33 +184,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  };
  
  
---- gregkh-2.6.orig/fs/sysfs/inode.c
-+++ gregkh-2.6/fs/sysfs/inode.c
-@@ -249,3 +249,24 @@ void sysfs_hash_and_remove(struct dentry
- 	}
- 	mutex_unlock(&dir->d_inode->i_mutex);
- }
-+
-+struct sysfs_dirent *sysfs_find(struct sysfs_dirent *dir, const char * name)
-+{
-+	struct sysfs_dirent * sd, * rv = NULL;
-+
-+	if (dir->s_dentry == NULL ||
-+	    dir->s_dentry->d_inode == NULL)
-+		return NULL;
-+
-+	mutex_lock(&dir->s_dentry->d_inode->i_mutex);
-+	list_for_each_entry(sd, &dir->s_children, s_sibling) {
-+		if (!sd->s_element)
-+			continue;
-+		if (!strcmp(sysfs_get_name(sd), name)) {
-+			rv = sd;
-+			break;
-+		}
-+	}
-+	mutex_unlock(&dir->s_dentry->d_inode->i_mutex);
-+	return rv;
-+}
 --- gregkh-2.6.orig/fs/sysfs/sysfs.h
 +++ gregkh-2.6/fs/sysfs/sysfs.h
 @@ -11,6 +11,7 @@ extern int sysfs_make_dirent(struct sysf
@@ -207,21 +222,20 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  };
  
  #define SYSFS_ROOT		0x0001
-@@ -118,6 +119,7 @@ int sysfs_remove_bin_file(struct kobject
+@@ -117,6 +118,7 @@ int sysfs_remove_bin_file(struct kobject
+ 
  int sysfs_create_group(struct kobject *, const struct attribute_group *);
  void sysfs_remove_group(struct kobject *, const struct attribute_group *);
- 
 +void sysfs_notify(struct kobject * k, char *dir, char *attr);
+ 
  #else /* CONFIG_SYSFS */
  
- static inline int sysfs_create_dir(struct kobject * k)
-@@ -185,6 +187,11 @@ static inline void sysfs_remove_group(st
+@@ -185,6 +187,10 @@ static inline void sysfs_remove_group(st
  	;
  }
  
 +static inline void sysfs_notify(struct kobject * k, char *dir, char *attr)
 +{
-+	;
 +}
 +
  #endif /* CONFIG_SYSFS */
