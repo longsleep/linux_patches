@@ -1,0 +1,155 @@
+From johnpol@2ka.mipt.ru Thu Mar 23 07:59:58 2006
+Cc: Evgeniy Polyakov <johnpol@2ka.mipt.ru>
+Subject: [PATCH 1/5] w1: Added default generic read/write operations.
+Date: Thu, 23 Mar 2006 19:11:58 +0300
+Message-Id: <11431303182664@2ka.mipt.ru>
+To: GregKH <greg@kroah.com>
+From: Evgeniy Polyakov <johnpol@2ka.mipt.ru>
+
+
+Special file in each w1 slave device's directory called "rw" is created
+each time new slave and no appropriate w1 family is registered.
+"rw" file supports read and write operations, which allows to perform
+almost any kind of operations. Each logical operation is a transaction
+in nature, which can contain several (two or one) low-level operations.
+Let's see how one can read EEPROM context:
+1. one must write control buffer, i.e. buffer containing command byte
+and two byte address. At this step bus is reset and appropriate device
+is selected using either W1_SKIP_ROM or W1_MATCH_ROM command.
+Then provided control buffer is being written to the wire.
+2. reading. This will issue reading eeprom response.
+
+It is possible that between 1. and 2. w1 master thread will reset bus for
+searching and slave device will be even removed, but in this case 0xff will
+be read, since no device was selected.
+
+Signed-off-by: Evgeniy Polyakov <johnpol@2ka.mipt.ru>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ Documentation/w1/w1.generic |   18 +++++++++--
+ drivers/w1/w1.c             |   69 +++++++++++++++++++++++++++++++++++++++++++-
+ drivers/w1/w1.h             |    2 -
+ 3 files changed, 84 insertions(+), 5 deletions(-)
+
+--- gregkh-2.6.orig/Documentation/w1/w1.generic
++++ gregkh-2.6/Documentation/w1/w1.generic
+@@ -27,8 +27,19 @@ When a w1 master driver registers with t
+ 
+ When a device is found on the bus, w1 core checks if driver for it's family is
+ loaded. If so, the family driver is attached to the slave.
+-If there is no driver for the family, a simple sysfs entry is created
+-for the slave device.
++If there is no driver for the family, default one is assigned, which allows to perform
++almost any kind of operations. Each logical operation is a transaction
++in nature, which can contain several (two or one) low-level operations.
++Let's see how one can read EEPROM context:
++1. one must write control buffer, i.e. buffer containing command byte
++and two byte address. At this step bus is reset and appropriate device
++is selected using either W1_SKIP_ROM or W1_MATCH_ROM command.
++Then provided control buffer is being written to the wire.
++2. reading. This will issue reading eeprom response.
++
++It is possible that between 1. and 2. w1 master thread will reset bus for searching
++and slave device will be even removed, but in this case 0xff will
++be read, since no device was selected.
+ 
+ 
+ W1 device families
+@@ -89,4 +100,5 @@ driver             - (standard) symlink 
+ name               - the device name, usually the same as the directory name
+ w1_slave           - (optional) a binary file whose meaning depends on the
+                      family driver
+-
++rw		   - (optional) created for slave devices which do not have
++		     appropriate family driver. Allows to read/write binary data.
+--- gregkh-2.6.orig/drivers/w1/w1.c
++++ gregkh-2.6/drivers/w1/w1.c
+@@ -139,7 +139,74 @@ static struct bin_attribute w1_slave_att
+ };
+ 
+ /* Default family */
+-static struct w1_family w1_default_family;
++
++static ssize_t w1_default_write(struct kobject *kobj, char *buf, loff_t off, size_t count)
++{
++	struct w1_slave *sl = kobj_to_w1_slave(kobj);
++
++	if (down_interruptible(&sl->master->mutex)) {
++		count = 0;
++		goto out;
++	}
++
++	if (w1_reset_select_slave(sl)) {
++		count = 0;
++		goto out_up;
++	}
++
++	w1_write_block(sl->master, buf, count);
++
++out_up:
++	up(&sl->master->mutex);
++out:
++	return count;
++}
++
++static ssize_t w1_default_read(struct kobject *kobj, char *buf, loff_t off, size_t count)
++{
++	struct w1_slave *sl = kobj_to_w1_slave(kobj);
++
++	if (down_interruptible(&sl->master->mutex)) {
++		count = 0;
++		goto out;
++	}
++
++	w1_read_block(sl->master, buf, count);
++
++	up(&sl->master->mutex);
++out:
++	return count;
++}
++
++static struct bin_attribute w1_default_attr = {
++      .attr = {
++              .name = "rw",
++              .mode = S_IRUGO | S_IWUSR,
++              .owner = THIS_MODULE,
++      },
++      .size = PAGE_SIZE,
++      .read = w1_default_read,
++      .write = w1_default_write,
++};
++
++static int w1_default_add_slave(struct w1_slave *sl)
++{
++	return sysfs_create_bin_file(&sl->dev.kobj, &w1_default_attr);
++}
++
++static void w1_default_remove_slave(struct w1_slave *sl)
++{
++	sysfs_remove_bin_file(&sl->dev.kobj, &w1_default_attr);
++}
++
++static struct w1_family_ops w1_default_fops = {
++	.add_slave	= w1_default_add_slave,
++	.remove_slave	= w1_default_remove_slave,
++};
++
++static struct w1_family w1_default_family = {
++	.fops = &w1_default_fops,
++};
+ 
+ static int w1_uevent(struct device *dev, char **envp, int num_envp, char *buffer, int buffer_size);
+ 
+--- gregkh-2.6.orig/drivers/w1/w1.h
++++ gregkh-2.6/drivers/w1/w1.h
+@@ -60,7 +60,7 @@ struct w1_reg_num
+ #define W1_READ_PSUPPLY		0xB4
+ #define W1_MATCH_ROM		0x55
+ 
+-#define W1_SLAVE_ACTIVE		(1<<0)
++#define W1_SLAVE_ACTIVE		0
+ 
+ struct w1_slave
+ {
