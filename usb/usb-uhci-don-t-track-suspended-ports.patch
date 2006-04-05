@@ -1,0 +1,102 @@
+From stern@rowland.harvard.edu Tue Apr  4 11:47:48 2006
+Date: Tue, 4 Apr 2006 14:47:44 -0400 (EDT)
+From: Alan Stern <stern@rowland.harvard.edu>
+To: Greg KH <greg@kroah.com>
+cc: USB development list <linux-usb-devel@lists.sourceforge.net>
+Subject: USB: UHCI: don't track suspended ports
+Message-ID: <Pine.LNX.4.44L0.0604041441280.4587-100000@iolanthe.rowland.org>
+
+Someone recently posted a bug report where it turned out that uhci-hcd
+was disagreeing with the UHCI controller over whether or not a port was
+suspended: The driver thought it wasn't and the hardware thought it was.
+This patch (as665) fixes the problem and simplifies the driver by
+removing the internal state-tracking completely.  Now the driver just
+asks the hardware whether a port is suspended.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/uhci-hcd.c |    3 +--
+ drivers/usb/host/uhci-hcd.h |    1 -
+ drivers/usb/host/uhci-hub.c |   18 +++++++++---------
+ 3 files changed, 10 insertions(+), 12 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/host/uhci-hcd.c
++++ gregkh-2.6/drivers/usb/host/uhci-hcd.c
+@@ -115,8 +115,7 @@ static void finish_reset(struct uhci_hcd
+ 	for (port = 0; port < uhci->rh_numports; ++port)
+ 		outw(0, uhci->io_addr + USBPORTSC1 + (port * 2));
+ 
+-	uhci->port_c_suspend = uhci->suspended_ports =
+-			uhci->resuming_ports = 0;
++	uhci->port_c_suspend = uhci->resuming_ports = 0;
+ 	uhci->rh_state = UHCI_RH_RESET;
+ 	uhci->is_stopped = UHCI_IS_STOPPED;
+ 	uhci_to_hcd(uhci)->state = HC_STATE_HALT;
+--- gregkh-2.6.orig/drivers/usb/host/uhci-hcd.h
++++ gregkh-2.6/drivers/usb/host/uhci-hcd.h
+@@ -415,7 +415,6 @@ struct uhci_hcd {
+ 
+ 	/* Support for port suspend/resume/reset */
+ 	unsigned long port_c_suspend;		/* Bit-arrays of ports */
+-	unsigned long suspended_ports;
+ 	unsigned long resuming_ports;
+ 	unsigned long ports_timeout;		/* Time to stop signalling */
+ 
+--- gregkh-2.6.orig/drivers/usb/host/uhci-hub.c
++++ gregkh-2.6/drivers/usb/host/uhci-hub.c
+@@ -85,11 +85,10 @@ static void uhci_finish_suspend(struct u
+ {
+ 	int status;
+ 
+-	if (test_bit(port, &uhci->suspended_ports)) {
++	if (inw(port_addr) & (USBPORTSC_SUSP | USBPORTSC_RD)) {
+ 		CLR_RH_PORTSTAT(USBPORTSC_SUSP | USBPORTSC_RD);
+-		clear_bit(port, &uhci->suspended_ports);
+-		clear_bit(port, &uhci->resuming_ports);
+-		set_bit(port, &uhci->port_c_suspend);
++		if (test_bit(port, &uhci->resuming_ports))
++			set_bit(port, &uhci->port_c_suspend);
+ 
+ 		/* The controller won't actually turn off the RD bit until
+ 		 * it has had a chance to send a low-speed EOP sequence,
+@@ -97,6 +96,7 @@ static void uhci_finish_suspend(struct u
+ 		 * slightly longer for good luck. */
+ 		udelay(4);
+ 	}
++	clear_bit(port, &uhci->resuming_ports);
+ }
+ 
+ /* Wait for the UHCI controller in HP's iLO2 server management chip.
+@@ -265,8 +265,6 @@ static int uhci_hub_control(struct usb_h
+ 			wPortChange |= USB_PORT_STAT_C_SUSPEND;
+ 			lstatus |= 1;
+ 		}
+-		if (test_bit(port, &uhci->suspended_ports))
+-			lstatus |= 2;
+ 		if (test_bit(port, &uhci->resuming_ports))
+ 			lstatus |= 4;
+ 
+@@ -309,7 +307,6 @@ static int uhci_hub_control(struct usb_h
+ 
+ 		switch (wValue) {
+ 		case USB_PORT_FEAT_SUSPEND:
+-			set_bit(port, &uhci->suspended_ports);
+ 			SET_RH_PORTSTAT(USBPORTSC_SUSP);
+ 			OK(0);
+ 		case USB_PORT_FEAT_RESET:
+@@ -343,8 +340,11 @@ static int uhci_hub_control(struct usb_h
+ 			CLR_RH_PORTSTAT(USBPORTSC_PEC);
+ 			OK(0);
+ 		case USB_PORT_FEAT_SUSPEND:
+-			if (test_bit(port, &uhci->suspended_ports) &&
+-					!test_and_set_bit(port,
++			if (!(inw(port_addr) & USBPORTSC_SUSP)) {
++
++				/* Make certain the port isn't suspended */
++				uhci_finish_suspend(uhci, port, port_addr);
++			} else if (!test_and_set_bit(port,
+ 						&uhci->resuming_ports)) {
+ 				SET_RH_PORTSTAT(USBPORTSC_RD);
+ 
