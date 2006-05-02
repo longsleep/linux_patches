@@ -1,0 +1,148 @@
+From kaneshige.kenji@jp.fujitsu.com Mon May  1 19:14:15 2006
+Message-ID: <4456BFEA.4070008@jp.fujitsu.com>
+Date: Tue, 02 May 2006 11:11:54 +0900
+From: Kenji Kaneshige <kaneshige.kenji@jp.fujitsu.com>
+To: Greg KH <gregkh@suse.de>, Kristen Accardi <kristen.c.accardi@intel.com>
+Cc: Kenji Kaneshige <kaneshige.kenji@jp.fujitsu.com>
+Subject: SHPC: Fix SHPC Logical Slot Register bits access
+
+Current SHPCHP driver doesn't take care of RsvdP/RsvdZ[*] bits
+in logical slot registers. This might cause unpredicable results. This
+patch fixes this bug.
+
+[*] RsvdP and RsvdZ are defined in SHPC spec as follows:
+
+    RsvdP - Reserved and Preserved. Register bits of this type are
+    reserved for future use as R/W bits. The value read is
+    undefined. Writes are ignored. Software must follow These rules
+    when accessing RsvdP bits:
+
+	- Software must ignore RsvdP bits when testing values read
+          from these registers.
+	- Software must not depend on RsvdP bit's ability to retain
+          information when written
+	- Software must always write back the value read in the RsvdP
+	  bits when writing one of these registers.
+
+    RsvdZ - Reserved and Zero. Register bits of this type are reserved
+    for future use as R/WC bits. The value read is undefined. Writes
+    are ignored. Software must follow these rules when accessing RsvdZ
+    bits:
+
+        - Software must ignore RsvdZ bits when testing values read
+	  from these registers.
+	- Software must not depends on a RsvdZ bit's ability to retain
+	  information when written.
+	- Software must always write 0 to RsvdZ bits when writing one
+	  of these register.
+
+Signed-off-by: Kenji Kaneshige <kaneshige.kenji@jp.fujitsu.com>
+Cc: Kristen Accardi <kristen.c.accardi@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/pci/hotplug/shpchp_hpc.c |   49 +++++++++++++++++++++++++++++++--------
+ 1 file changed, 40 insertions(+), 9 deletions(-)
+
+--- gregkh-2.6.orig/drivers/pci/hotplug/shpchp_hpc.c
++++ gregkh-2.6/drivers/pci/hotplug/shpchp_hpc.c
+@@ -554,11 +554,25 @@ static int hpc_get_adapter_speed(struct 
+ 	int retval = 0;
+ 	struct controller *ctrl = slot->ctrl;
+ 	u32 slot_reg = shpc_readl(ctrl, SLOT_REG(slot->hp_slot));
+-	u8 pcix_cap = (slot_reg & PCIX_CAP_MASK_PI2) >> PCIX_CAP_SHIFT;
+ 	u8 m66_cap  = !!(slot_reg & MHZ66_CAP);
++	u8 pi, pcix_cap;
+ 
+ 	DBG_ENTER_ROUTINE 
+ 
++	if ((retval = hpc_get_prog_int(slot, &pi)))
++		return retval;
++
++	switch (pi) {
++	case 1:
++		pcix_cap = (slot_reg & PCIX_CAP_MASK_PI1) >> PCIX_CAP_SHIFT;
++		break;
++	case 2:
++		pcix_cap = (slot_reg & PCIX_CAP_MASK_PI2) >> PCIX_CAP_SHIFT;
++		break;
++	default:
++		return -ENODEV;
++	}
++
+ 	dbg("%s: slot_reg = %x, pcix_cap = %x, m66_cap = %x\n",
+ 	    __FUNCTION__, slot_reg, pcix_cap, m66_cap);
+ 
+@@ -773,6 +787,7 @@ static void hpc_release_ctlr(struct cont
+ 	struct php_ctlr_state_s *php_ctlr = ctrl->hpc_ctlr_handle;
+ 	struct php_ctlr_state_s *p, *p_prev;
+ 	int i;
++	u32 slot_reg;
+ 
+ 	DBG_ENTER_ROUTINE 
+ 
+@@ -782,10 +797,17 @@ static void hpc_release_ctlr(struct cont
+ 	}
+ 
+ 	/*
+-	 * Mask all slot event interrupts
++	 * Mask event interrupts and SERRs of all slots
+ 	 */
+-	for (i = 0; i < ctrl->num_slots; i++)
+-		shpc_writel(ctrl, SLOT_REG(i), 0xffff3fff);
++	for (i = 0; i < ctrl->num_slots; i++) {
++		slot_reg = shpc_readl(ctrl, SLOT_REG(i));
++		slot_reg |= (PRSNT_CHANGE_INTR_MASK | ISO_PFAULT_INTR_MASK |
++			     BUTTON_PRESS_INTR_MASK | MRL_CHANGE_INTR_MASK |
++			     CON_PFAULT_INTR_MASK   | MRL_CHANGE_SERR_MASK |
++			     CON_PFAULT_SERR_MASK);
++		slot_reg &= ~SLOT_REG_RSVDZ_MASK;
++		shpc_writel(ctrl, SLOT_REG(i), slot_reg);
++	}
+ 
+ 	cleanup_slots(ctrl);
+ 
+@@ -1072,7 +1094,7 @@ static irqreturn_t shpc_isr(int IRQ, voi
+ 					hp_slot, php_ctlr->callback_instance_id);
+ 			
+ 			/* Clear all slot events */
+-			temp_dword = 0xe01f3fff;
++			temp_dword &= ~SLOT_REG_RSVDZ_MASK;
+ 			shpc_writel(ctrl, SLOT_REG(hp_slot), temp_dword);
+ 
+ 			intr_loc2 = shpc_readl(ctrl, INTR_LOC);
+@@ -1364,8 +1386,12 @@ int shpc_init(struct controller * ctrl, 
+ 		slot_reg = shpc_readl(ctrl, SLOT_REG(hp_slot));
+ 		dbg("%s: Default Logical Slot Register %d value %x\n", __FUNCTION__,
+ 			hp_slot, slot_reg);
+-		tempdword = 0xffff3fff;  
+-		shpc_writel(ctrl, SLOT_REG(hp_slot), tempdword);
++		slot_reg |= (PRSNT_CHANGE_INTR_MASK | ISO_PFAULT_INTR_MASK |
++			     BUTTON_PRESS_INTR_MASK | MRL_CHANGE_INTR_MASK |
++			     CON_PFAULT_INTR_MASK   | MRL_CHANGE_SERR_MASK |
++			     CON_PFAULT_SERR_MASK);
++		slot_reg &= ~SLOT_REG_RSVDZ_MASK;
++		shpc_writel(ctrl, SLOT_REG(hp_slot), slot_reg);
+ 	}
+ 	
+ 	if (shpchp_poll_mode)  {/* Install interrupt polling code */
+@@ -1411,12 +1437,17 @@ int shpc_init(struct controller * ctrl, 
+ 
+ 	ctlr_seq_num++;
+ 
++	/*
++	 * Unmask all event interrupts of all slots
++	 */
+ 	for (hp_slot = 0; hp_slot < php_ctlr->num_slots; hp_slot++) {
+ 		slot_reg = shpc_readl(ctrl, SLOT_REG(hp_slot));
+ 		dbg("%s: Default Logical Slot Register %d value %x\n", __FUNCTION__,
+ 			hp_slot, slot_reg);
+-		tempdword = 0xe01f3fff;  
+-		shpc_writel(ctrl, SLOT_REG(hp_slot), tempdword);
++		slot_reg &= ~(PRSNT_CHANGE_INTR_MASK | ISO_PFAULT_INTR_MASK |
++			      BUTTON_PRESS_INTR_MASK | MRL_CHANGE_INTR_MASK |
++			      CON_PFAULT_INTR_MASK | SLOT_REG_RSVDZ_MASK);
++		shpc_writel(ctrl, SLOT_REG(hp_slot), slot_reg);
+ 	}
+ 	if (!shpchp_poll_mode) {
+ 		/* Unmask all general input interrupts and SERR */
