@@ -1,0 +1,136 @@
+From bart@cs.pdx.edu Mon May  8 14:40:54 2006
+Message-Id: <200605082140.k48LeDTC002769@murzim.cs.pdx.edu>
+To: "Vojtech Pavlik" <vojtech@suse.cz>, "Dmitry Torokhov" <dtor_core@ameritech.net>
+cc: "Greg Kroah-Hartman" <greg@kroah.com>
+Subject: USB HID/HIDBP, INPUT DRIVERS: fix various usb/input/hid-input.c bugs that make Apple Mighty Mouse work poorly
+Date: Mon, 08 May 2006 14:40:13 -0700
+From: Barton C Massey <bart@cs.pdx.edu>
+
+From: Bart Massey <bart@cs.pdx.edu>
+
+Transposed lines of code in drivers/usb/input/hid-input.c causes the
+capability bits for a new HID device to be set before quirks are applied
+at configuration time.  When an HID event is then sent up to the input
+layer, it may then be discarded as irrelevant because the wrong
+capability bit is set.
+
+Further, the quirks for the Apple Mighty Mouse are not quite right: the
+horizontal scrolling needs its axis reversed, and the left and center
+buttons are transposed.  Also, the mouse is labeled in the kernel with
+its earlier name (I think) of Apple PowerMouse.
+
+Steps to reproduce problem: Plug in an Apple Mighty Mouse.  Note that
+horizontal scrolling doesn't work at all, and in fact doesn't generate
+any input events on /dev/input/eventN.  Note also that pushing the
+middle button performs the right button action, and vice versa.  Once
+you have the horizontal scrolling working, note that it is backward WRT
+both to vertical scrolling and to common sense.
+
+This patch maybe should be broken up, as it does address two problems.
+The transposed code in hidinput_configure_usage() probably creates bugs
+beyond just the Mighty Mouse.  The rest of the patch renames POWERMOUSE
+to MIGHTYMOUSE everywhere (which I *believe* is correct), fixes the
+MIGHTYMOUSE quirk to swap the center and right mouse buttons, and adds a
+new quirk HID_QUIRK_INVERT_HWHEEL also assigned to the MIGHTYMOUSE with
+code in hidinput_hid_event() to implement it.
+
+Signed-off-by: Bart Massey <bart@cs.pdx.edu>
+
+---
+
+---
+ drivers/usb/input/hid-core.c  |    4 ++--
+ drivers/usb/input/hid-input.c |   32 ++++++++++++++++++++++----------
+ drivers/usb/input/hid.h       |    3 ++-
+ 3 files changed, 26 insertions(+), 13 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/input/hid-core.c
++++ gregkh-2.6/drivers/usb/input/hid-core.c
+@@ -1549,7 +1549,7 @@ void hid_init_reports(struct hid_device 
+ #define USB_DEVICE_ID_LD_MACHINETEST	0x2040
+ 
+ #define USB_VENDOR_ID_APPLE		0x05ac
+-#define USB_DEVICE_ID_APPLE_POWERMOUSE	0x0304
++#define USB_DEVICE_ID_APPLE_MIGHTYMOUSE	0x0304
+ 
+ #define USB_VENDOR_ID_CHERRY		0x046a
+ #define USB_DEVICE_ID_CHERRY_CYMOTION	0x0023
+@@ -1689,7 +1689,7 @@ static const struct hid_blacklist {
+ 	{ USB_VENDOR_ID_WISEGROUP, USB_DEVICE_ID_DUAL_USB_JOYPAD, HID_QUIRK_NOGET | HID_QUIRK_MULTI_INPUT },
+ 	{ USB_VENDOR_ID_SILVERCREST, USB_DEVICE_ID_SILVERCREST_KB, HID_QUIRK_NOGET },
+ 
+-	{ USB_VENDOR_ID_APPLE, USB_DEVICE_ID_APPLE_POWERMOUSE, HID_QUIRK_2WHEEL_POWERMOUSE },
++	{ USB_VENDOR_ID_APPLE, USB_DEVICE_ID_APPLE_MIGHTYMOUSE, HID_QUIRK_MIGHTYMOUSE | HID_QUIRK_INVERT_HWHEEL },
+ 	{ USB_VENDOR_ID_A4TECH, USB_DEVICE_ID_A4TECH_WCP32PU, HID_QUIRK_2WHEEL_MOUSE_HACK_7 },
+ 	{ USB_VENDOR_ID_CYPRESS, USB_DEVICE_ID_CYPRESS_MOUSE, HID_QUIRK_2WHEEL_MOUSE_HACK_5 },
+ 
+--- gregkh-2.6.orig/drivers/usb/input/hid-input.c
++++ gregkh-2.6/drivers/usb/input/hid-input.c
+@@ -567,16 +567,14 @@ static void hidinput_configure_usage(str
+ 			break;
+ 	}
+ 
+-	set_bit(usage->type, input->evbit);
+-
+-	while (usage->code <= max && test_and_set_bit(usage->code, bit))
+-		usage->code = find_next_zero_bit(bit, max + 1, usage->code);
+-
+-	if (usage->code > max)
+-		goto ignore;
+-
+-	if (((device->quirks & (HID_QUIRK_2WHEEL_POWERMOUSE)) && (usage->hid == 0x00010032)))
+-		map_rel(REL_HWHEEL);
++	if (device->quirks & HID_QUIRK_MIGHTYMOUSE) {
++		if (usage->hid == HID_GD_Z)
++			map_rel(REL_HWHEEL);
++		else if (usage->code == BTN_1)
++			map_key(BTN_2);
++		else if (usage->code == BTN_2)
++			map_key(BTN_1);
++	}
+ 
+ 	if ((device->quirks & (HID_QUIRK_2WHEEL_MOUSE_HACK_7 | HID_QUIRK_2WHEEL_MOUSE_HACK_5)) &&
+ 		 (usage->type == EV_REL) && (usage->code == REL_WHEEL))
+@@ -586,6 +584,15 @@ static void hidinput_configure_usage(str
+ 		|| ((device->quirks & HID_QUIRK_2WHEEL_MOUSE_HACK_7) && (usage->hid == 0x00090007)))
+ 		goto ignore;
+ 
++	set_bit(usage->type, input->evbit);
++
++	while (usage->code <= max && test_and_set_bit(usage->code, bit))
++		usage->code = find_next_zero_bit(bit, max + 1, usage->code);
++
++	if (usage->code > max)
++		goto ignore;
++
++
+ 	if (usage->type == EV_ABS) {
+ 
+ 		int a = field->logical_minimum;
+@@ -647,6 +654,11 @@ void hidinput_hid_event(struct hid_devic
+ 		return;
+ 	}
+ 
++	if ((hid->quirks & HID_QUIRK_INVERT_HWHEEL) && (usage->code == REL_HWHEEL)) {
++		input_event(input, usage->type, usage->code, -value);
++		return;
++	}
++
+ 	if ((hid->quirks & HID_QUIRK_2WHEEL_MOUSE_HACK_ON) && (usage->code == REL_WHEEL)) {
+ 		input_event(input, usage->type, REL_HWHEEL, value);
+ 		return;
+--- gregkh-2.6.orig/drivers/usb/input/hid.h
++++ gregkh-2.6/drivers/usb/input/hid.h
+@@ -247,10 +247,11 @@ struct hid_item {
+ #define HID_QUIRK_2WHEEL_MOUSE_HACK_7		0x00000080
+ #define HID_QUIRK_2WHEEL_MOUSE_HACK_5		0x00000100
+ #define HID_QUIRK_2WHEEL_MOUSE_HACK_ON		0x00000200
+-#define HID_QUIRK_2WHEEL_POWERMOUSE		0x00000400
++#define HID_QUIRK_MIGHTYMOUSE			0x00000400
+ #define HID_QUIRK_CYMOTION			0x00000800
+ #define HID_QUIRK_POWERBOOK_HAS_FN		0x00001000
+ #define HID_QUIRK_POWERBOOK_FN_ON		0x00002000
++#define HID_QUIRK_INVERT_HWHEEL			0x00004000
+ 
+ /*
+  * This is the global environment of the parser. This information is
