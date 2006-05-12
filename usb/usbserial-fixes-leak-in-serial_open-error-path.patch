@@ -1,0 +1,63 @@
+From lcapitulino@mandriva.com.br Thu May 11 18:31:41 2006
+Date: Thu, 11 May 2006 22:34:24 -0300
+From: Luiz Fernando Capitulino <lcapitulino@mandriva.com.br>
+To: gregkh@suse.de
+Subject: usbserial: Fixes leak in serial_open() error path.
+Message-ID: <20060511223424.7e7df2fc@home.brethil>
+
+
+If serial_open() fails at the port assignment or mutex_lock_interruptible()
+is interrupted, the 'serial' object will never be freed.
+
+We should call kref_put() when those errors happens.
+
+Signed-off-by: Luiz Fernando N. Capitulino <lcapitulino@mandriva.com.br>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/serial/usb-serial.c |   17 +++++++++++------
+ 1 file changed, 11 insertions(+), 6 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/serial/usb-serial.c
++++ gregkh-2.6/drivers/usb/serial/usb-serial.c
+@@ -189,11 +189,15 @@ static int serial_open (struct tty_struc
+ 
+ 	portNumber = tty->index - serial->minor;
+ 	port = serial->port[portNumber];
+-	if (!port)
+-		return -ENODEV;
++	if (!port) {
++		retval = -ENODEV;
++		goto bailout_kref_put;
++	}
+ 
+-	if (mutex_lock_interruptible(&port->mutex))
+-		return -ERESTARTSYS;
++	if (mutex_lock_interruptible(&port->mutex)) {
++		retval = -ERESTARTSYS;
++		goto bailout_kref_put;
++	}
+ 	 
+ 	++port->open_count;
+ 
+@@ -209,7 +213,7 @@ static int serial_open (struct tty_struc
+ 		 * safe because we are called with BKL held */
+ 		if (!try_module_get(serial->type->driver.owner)) {
+ 			retval = -ENODEV;
+-			goto bailout_kref_put;
++			goto bailout_mutex_unlock;
+ 		}
+ 
+ 		/* only call the device specific open if this 
+@@ -224,9 +228,10 @@ static int serial_open (struct tty_struc
+ 
+ bailout_module_put:
+ 	module_put(serial->type->driver.owner);
+-bailout_kref_put:
++bailout_mutex_unlock:
+ 	port->open_count = 0;
+ 	mutex_unlock(&port->mutex);
++bailout_kref_put:
+ 	kref_put(&serial->kref, destroy_serial);
+ 	return retval;
+ }
