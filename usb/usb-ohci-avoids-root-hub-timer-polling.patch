@@ -1,0 +1,287 @@
+From linux-usb-devel-admin@lists.sourceforge.net Tue May 16 05:23:39 2006
+From: David Brownell <david-b@pacbell.net>
+Message-Id: <200605121849.09003.david-b@pacbell.net>
+Subject: USB: OHCI avoids root hub timer polling
+Date: Fri, 12 May 2006 18:49:08 -0700
+
+
+This teaches OHCI to use the root hub status change (RHSC) IRQ, bypassing
+the root hub timer except to trigger autosuspend.  Avoiding that timer means
+that mechanisms like "dynamic tick" or "variable scheduler timeouts" can
+now can be used to leave the CPU in low modes for longer intervals.
+
+If there are any OHCI implementations where INTR_RHSC doesn't work, they
+will need to turn off the "uses_new_polling" flag.
+
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/ohci-at91.c    |    2 -
+ drivers/usb/host/ohci-au1xxx.c  |    1 
+ drivers/usb/host/ohci-hcd.c     |   23 +++++++++++++-------
+ drivers/usb/host/ohci-hub.c     |   45 +++++++++++++++++++++++++++-------------
+ drivers/usb/host/ohci-lh7a404.c |    1 
+ drivers/usb/host/ohci-omap.c    |    1 
+ drivers/usb/host/ohci-pci.c     |    1 
+ drivers/usb/host/ohci-ppc-soc.c |    1 
+ drivers/usb/host/ohci-pxa27x.c  |    1 
+ drivers/usb/host/ohci-s3c2410.c |    1 
+ drivers/usb/host/ohci-sa1111.c  |    1 
+ drivers/usb/host/ohci.h         |    2 -
+ 12 files changed, 56 insertions(+), 24 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/host/ohci-at91.c
++++ gregkh-2.6/drivers/usb/host/ohci-at91.c
+@@ -230,7 +230,7 @@ static const struct hc_driver ohci_at91_
+ 	 */
+ 	.hub_status_data =	ohci_hub_status_data,
+ 	.hub_control =		ohci_hub_control,
+-
++	.hub_irq_enable =	ohci_rhsc_enable,
+ #ifdef CONFIG_PM
+ 	.bus_suspend =		ohci_bus_suspend,
+ 	.bus_resume =		ohci_bus_resume,
+--- gregkh-2.6.orig/drivers/usb/host/ohci-au1xxx.c
++++ gregkh-2.6/drivers/usb/host/ohci-au1xxx.c
+@@ -289,6 +289,7 @@ static const struct hc_driver ohci_au1xx
+ 	 */
+ 	.hub_status_data =	ohci_hub_status_data,
+ 	.hub_control =		ohci_hub_control,
++	.hub_irq_enable =	ohci_rhsc_enable,
+ #ifdef	CONFIG_PM
+ 	.bus_suspend =		ohci_bus_suspend,
+ 	.bus_resume =		ohci_bus_resume,
+--- gregkh-2.6.orig/drivers/usb/host/ohci-hcd.c
++++ gregkh-2.6/drivers/usb/host/ohci-hcd.c
+@@ -102,7 +102,7 @@
+ 
+ #include "../core/hcd.h"
+ 
+-#define DRIVER_VERSION "2005 April 22"
++#define DRIVER_VERSION "2006 May 12"
+ #define DRIVER_AUTHOR "Roman Weissgaerber, David Brownell"
+ #define DRIVER_DESC "USB 1.1 'Open' Host Controller (OHCI) Driver"
+ 
+@@ -111,7 +111,7 @@
+ #undef OHCI_VERBOSE_DEBUG	/* not always helpful */
+ 
+ /* For initializing controller (mask in an HCFS mode too) */
+-#define	OHCI_CONTROL_INIT 	OHCI_CTRL_CBSR
++#define	OHCI_CONTROL_INIT	OHCI_CTRL_CBSR
+ #define	OHCI_INTR_INIT \
+ 	(OHCI_INTR_MIE | OHCI_INTR_UE | OHCI_INTR_RD | OHCI_INTR_WDH)
+ 
+@@ -447,7 +447,7 @@ static int ohci_init (struct ohci_hcd *o
+ 
+ 	disable (ohci);
+ 	ohci->regs = hcd->regs;
+-	ohci->next_statechange = jiffies;
++	ohci->next_statechange = jiffies + msecs_to_jiffies (250);
+ 
+ 	/* REVISIT this BIOS handshake is now moved into PCI "quirks", and
+ 	 * was never needed for most non-PCI systems ... remove the code?
+@@ -637,11 +637,12 @@ retry:
+ 			ohci_readl (ohci, &ohci->regs->periodicstart));
+ 		return -EOVERFLOW;
+ 	}
++	hcd->uses_new_polling = 1;
+ 
+- 	/* start controller operations */
++	/* start controller operations */
+ 	ohci->hc_control &= OHCI_CTRL_RWC;
+- 	ohci->hc_control |= OHCI_CONTROL_INIT | OHCI_USB_OPER;
+- 	ohci_writel (ohci, ohci->hc_control, &ohci->regs->control);
++	ohci->hc_control |= OHCI_CONTROL_INIT | OHCI_USB_OPER;
++	ohci_writel (ohci, ohci->hc_control, &ohci->regs->control);
+ 	hcd->state = HC_STATE_RUNNING;
+ 
+ 	/* wake on ConnectStatusChange, matching external hubs */
+@@ -649,7 +650,7 @@ retry:
+ 
+ 	/* Choose the interrupts we care about now, others later on demand */
+ 	mask = OHCI_INTR_INIT;
+-	ohci_writel (ohci, mask, &ohci->regs->intrstatus);
++	ohci_writel (ohci, ~0, &ohci->regs->intrstatus);
+ 	ohci_writel (ohci, mask, &ohci->regs->intrenable);
+ 
+ 	/* handle root hub init quirks ... */
+@@ -710,7 +711,13 @@ static irqreturn_t ohci_irq (struct usb_
+ 	/* interrupt for some other device? */
+ 	} else if ((ints &= ohci_readl (ohci, &regs->intrenable)) == 0) {
+ 		return IRQ_NOTMINE;
+-	} 
++	}
++
++	if (ints & OHCI_INTR_RHSC) {
++		ohci_vdbg (ohci, "rhsc\n");
++		ohci_writel (ohci, OHCI_INTR_RHSC, &regs->intrstatus);
++		usb_hcd_poll_rh_status(hcd);
++	}
+ 
+ 	if (ints & OHCI_INTR_UE) {
+ 		disable (ohci);
+--- gregkh-2.6.orig/drivers/usb/host/ohci-hub.c
++++ gregkh-2.6/drivers/usb/host/ohci-hub.c
+@@ -36,6 +36,14 @@
+ 
+ /*-------------------------------------------------------------------------*/
+ 
++/* hcd->hub_irq_enable() ? */
++static void ohci_rhsc_enable (struct usb_hcd *hcd)
++{
++	struct ohci_hcd		*ohci = hcd_to_ohci (hcd);
++
++	ohci_writel (ohci, OHCI_INTR_RHSC, &ohci->regs->intrenable);
++}
++
+ #ifdef	CONFIG_PM
+ 
+ #define OHCI_SCHED_ENABLES \
+@@ -123,6 +131,9 @@ static int ohci_bus_suspend (struct usb_
+ 	/* no resumes until devices finish suspending */
+ 	ohci->next_statechange = jiffies + msecs_to_jiffies (5);
+ 
++	/* RHSC or RD irq will wakeup; no timer polling */
++	hcd->poll_rh = 0;
++
+ done:
+ 	/* external suspend vs self autosuspend ... same effect */
+ 	if (status == 0)
+@@ -349,35 +360,41 @@ ohci_hub_status_data (struct usb_hcd *hc
+ 			continue;
+ 		}
+ 
+-		/* can suspend if no ports are enabled; or if all all
++
++		/* can suspend if no ports are enabled; or if all the
+ 		 * enabled ports are suspended AND remote wakeup is on.
+ 		 */
+ 		if (!(status & RH_PS_CCS))
+ 			continue;
+-		if ((status & RH_PS_PSS) && can_suspend)
+-			continue;
+-		can_suspend = 0;
++		if (!(status & RH_PS_PSS))
++			can_suspend = 0;
+ 	}
++
+ done:
+ 	spin_unlock_irqrestore (&ohci->lock, flags);
+ 
+ #ifdef CONFIG_PM
+-	/* save power by suspending idle root hubs;
+-	 * INTR_RD wakes us when there's work
++	/* save power by suspending idle root hubs and avoiding timer polls;
++	 * INTR_RD or INTR_RHSC wakes us when there's work, and polling is
++	 * used only to defer autosuspend.
+ 	 */
+ 	if (can_suspend
+ 			&& !changed
+ 			&& !ohci->ed_rm_list
+ 			&& ((OHCI_CTRL_HCFS | OHCI_SCHED_ENABLES)
+ 					& ohci->hc_control)
+-				== OHCI_USB_OPER
+-			&& time_after (jiffies, ohci->next_statechange)
+-			&& usb_trylock_device (hcd->self.root_hub) == 0
+-			) {
+-		ohci_vdbg (ohci, "autosuspend\n");
+-		(void) ohci_bus_suspend (hcd);
+-		usb_unlock_device (hcd->self.root_hub);
+-	}
++				== OHCI_USB_OPER) {
++		/* if we can't yet autosuspend, poll until we can */
++		if (time_after (jiffies, ohci->next_statechange)
++				&& usb_trylock_device (hcd->self.root_hub) == 0
++				) {
++			ohci_vdbg (ohci, "autosuspend\n");
++			(void) ohci_bus_suspend (hcd);
++			usb_unlock_device (hcd->self.root_hub);
++		} else
++			hcd->poll_rh = 1;
++	} else
++		hcd->poll_rh = 0;
+ #endif
+ 
+ 	return changed ? length : 0;
+--- gregkh-2.6.orig/drivers/usb/host/ohci-lh7a404.c
++++ gregkh-2.6/drivers/usb/host/ohci-lh7a404.c
+@@ -196,6 +196,7 @@ static const struct hc_driver ohci_lh7a4
+ 	 */
+ 	.hub_status_data =	ohci_hub_status_data,
+ 	.hub_control =		ohci_hub_control,
++	.hub_irq_enable =	ohci_rhsc_enable,
+ #ifdef	CONFIG_PM
+ 	.bus_suspend =		ohci_bus_suspend,
+ 	.bus_resume =		ohci_bus_resume,
+--- gregkh-2.6.orig/drivers/usb/host/ohci-omap.c
++++ gregkh-2.6/drivers/usb/host/ohci-omap.c
+@@ -429,6 +429,7 @@ static const struct hc_driver ohci_omap_
+ 	 */
+ 	.hub_status_data =	ohci_hub_status_data,
+ 	.hub_control =		ohci_hub_control,
++	.hub_irq_enable =	ohci_rhsc_enable,
+ #ifdef	CONFIG_PM
+ 	.bus_suspend =		ohci_bus_suspend,
+ 	.bus_resume =		ohci_bus_resume,
+--- gregkh-2.6.orig/drivers/usb/host/ohci-pci.c
++++ gregkh-2.6/drivers/usb/host/ohci-pci.c
+@@ -194,6 +194,7 @@ static const struct hc_driver ohci_pci_h
+ 	 */
+ 	.hub_status_data =	ohci_hub_status_data,
+ 	.hub_control =		ohci_hub_control,
++	.hub_irq_enable =	ohci_rhsc_enable,
+ #ifdef	CONFIG_PM
+ 	.bus_suspend =		ohci_bus_suspend,
+ 	.bus_resume =		ohci_bus_resume,
+--- gregkh-2.6.orig/drivers/usb/host/ohci-ppc-soc.c
++++ gregkh-2.6/drivers/usb/host/ohci-ppc-soc.c
+@@ -166,6 +166,7 @@ static const struct hc_driver ohci_ppc_s
+ 	 */
+ 	.hub_status_data =	ohci_hub_status_data,
+ 	.hub_control =		ohci_hub_control,
++	.hub_irq_enable =	ohci_rhsc_enable,
+ #ifdef	CONFIG_PM
+ 	.bus_suspend =		ohci_bus_suspend,
+ 	.bus_resume =		ohci_bus_resume,
+--- gregkh-2.6.orig/drivers/usb/host/ohci-pxa27x.c
++++ gregkh-2.6/drivers/usb/host/ohci-pxa27x.c
+@@ -285,6 +285,7 @@ static const struct hc_driver ohci_pxa27
+ 	 */
+ 	.hub_status_data =	ohci_hub_status_data,
+ 	.hub_control =		ohci_hub_control,
++	.hub_irq_enable =	ohci_rhsc_enable,
+ #ifdef  CONFIG_PM
+ 	.bus_suspend =		ohci_bus_suspend,
+ 	.bus_resume =		ohci_bus_resume,
+--- gregkh-2.6.orig/drivers/usb/host/ohci-s3c2410.c
++++ gregkh-2.6/drivers/usb/host/ohci-s3c2410.c
+@@ -465,6 +465,7 @@ static const struct hc_driver ohci_s3c24
+ 	 */
+ 	.hub_status_data =	ohci_s3c2410_hub_status_data,
+ 	.hub_control =		ohci_s3c2410_hub_control,
++	.hub_irq_enable =	ohci_rhsc_enable,
+ #ifdef	CONFIG_PM
+ 	.bus_suspend =		ohci_bus_suspend,
+ 	.bus_resume =		ohci_bus_resume,
+--- gregkh-2.6.orig/drivers/usb/host/ohci-sa1111.c
++++ gregkh-2.6/drivers/usb/host/ohci-sa1111.c
+@@ -235,6 +235,7 @@ static const struct hc_driver ohci_sa111
+ 	 */
+ 	.hub_status_data =	ohci_hub_status_data,
+ 	.hub_control =		ohci_hub_control,
++	.hub_irq_enable =	ohci_rhsc_enable,
+ #ifdef	CONFIG_PM
+ 	.bus_suspend =		ohci_bus_suspend,
+ 	.bus_resume =		ohci_bus_resume,
+--- gregkh-2.6.orig/drivers/usb/host/ohci.h
++++ gregkh-2.6/drivers/usb/host/ohci.h
+@@ -385,7 +385,7 @@ struct ohci_hcd {
+ 	 */
+ 	int			num_ports;
+ 	int			load [NUM_INTS];
+-	u32 			hc_control;	/* copy of hc control reg */
++	u32			hc_control;	/* copy of hc control reg */
+ 	unsigned long		next_statechange;	/* suspend/resume */
+ 	u32			fminterval;		/* saved register */
+ 
