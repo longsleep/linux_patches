@@ -1,0 +1,219 @@
+From vivek@in.ibm.com Fri May  5 10:29:02 2006
+Date: Fri, 5 May 2006 13:28:47 -0400
+From: Vivek Goyal <vgoyal@in.ibm.com>
+Cc: Greg KH <gregkh@suse.de>, Morton Andrew Morton <akpm@osdl.org>
+Subject: kconfigurable resources core changes
+Message-ID: <20060505172847.GC6450@in.ibm.com>
+Content-Disposition: inline
+
+
+
+o Core changes for Kconfigurable memory and IO resources. By default resources
+  are 64bit until chosen to be 32bit.
+
+o Last time I posted the patches for 64bit memory resources but it raised
+  the concerns regarding code bloat on 32bit systems who use 32 bit
+  resources.
+
+o This patch-set allows resources to be kconfigurable.
+
+o I have done cross compilation on i386, x86_64, ppc, powerpc, sparc, sparc64
+  ia64 and alpha.
+
+Signed-off-by: Vivek Goyal <vgoyal@in.ibm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ include/linux/ioport.h |   25 ++++++++++++++-----------
+ include/linux/types.h  |    6 ++++++
+ kernel/resource.c      |   43 +++++++++++++++++++++++++++----------------
+ 3 files changed, 47 insertions(+), 27 deletions(-)
+
+--- gregkh-2.6.orig/include/linux/ioport.h
++++ gregkh-2.6/include/linux/ioport.h
+@@ -15,7 +15,7 @@
+  * nesting etc..
+  */
+ struct resource {
+-	u64 start, end;
++	resource_size_t start, end;
+ 	const char *name;
+ 	unsigned long flags;
+ 	struct resource *parent, *sibling, *child;
+@@ -97,31 +97,34 @@ extern struct resource * ____request_res
+ extern int release_resource(struct resource *new);
+ extern __deprecated_for_modules int insert_resource(struct resource *parent, struct resource *new);
+ extern int allocate_resource(struct resource *root, struct resource *new,
+-			     u64 size,
+-			     u64 min, u64 max,
+-			     u64 align,
++			     resource_size_t size, resource_size_t min,
++			     resource_size_t max, resource_size_t align,
+ 			     void (*alignf)(void *, struct resource *,
+-					    u64, u64),
++					    resource_size_t, resource_size_t),
+ 			     void *alignf_data);
+-int adjust_resource(struct resource *res, u64 start,
+-		    u64 size);
++int adjust_resource(struct resource *res, resource_size_t start,
++		    resource_size_t size);
+ 
+ /* Convenience shorthand with allocation */
+ #define request_region(start,n,name)	__request_region(&ioport_resource, (start), (n), (name))
+ #define request_mem_region(start,n,name) __request_region(&iomem_resource, (start), (n), (name))
+ #define rename_region(region, newname) do { (region)->name = (newname); } while (0)
+ 
+-extern struct resource * __request_region(struct resource *, u64 start, u64 n, const char *name);
++extern struct resource * __request_region(struct resource *,
++					resource_size_t start,
++					resource_size_t n, const char *name);
+ 
+ /* Compatibility cruft */
+ #define release_region(start,n)	__release_region(&ioport_resource, (start), (n))
+ #define check_mem_region(start,n)	__check_region(&iomem_resource, (start), (n))
+ #define release_mem_region(start,n)	__release_region(&iomem_resource, (start), (n))
+ 
+-extern int __check_region(struct resource *, u64, u64);
+-extern void __release_region(struct resource *, u64, u64);
++extern int __check_region(struct resource *, resource_size_t, resource_size_t);
++extern void __release_region(struct resource *, resource_size_t,
++				resource_size_t);
+ 
+-static inline int __deprecated check_region(u64 s, u64 n)
++static inline int __deprecated check_region(resource_size_t s,
++						resource_size_t n)
+ {
+ 	return __check_region(&ioport_resource, s, n);
+ }
+--- gregkh-2.6.orig/include/linux/types.h
++++ gregkh-2.6/include/linux/types.h
+@@ -141,6 +141,12 @@ typedef unsigned long sector_t;
+ typedef unsigned long blkcnt_t;
+ #endif
+ 
++#ifdef CONFIG_RESOURCES_32BIT
++typedef u32 resource_size_t;
++#else
++typedef u64 resource_size_t;
++#endif
++
+ /*
+  * The type of an index into the pagecache.  Use a #define so asm/types.h
+  * can override it.
+--- gregkh-2.6.orig/kernel/resource.c
++++ gregkh-2.6/kernel/resource.c
+@@ -23,7 +23,11 @@
+ 
+ struct resource ioport_resource = {
+ 	.name	= "PCI IO",
++#ifdef CONFIG_RESOURCES_32BIT
++	.start	= 0x0000UL,
++#else
+ 	.start	= 0x0000ULL,
++#endif
+ 	.end	= IO_SPACE_LIMIT,
+ 	.flags	= IORESOURCE_IO,
+ };
+@@ -32,8 +36,13 @@ EXPORT_SYMBOL(ioport_resource);
+ 
+ struct resource iomem_resource = {
+ 	.name	= "PCI mem",
++#ifdef CONFIG_RESOURCES_32BIT
++	.start	= 0UL,
++	.end	= ~0UL,
++#else
+ 	.start	= 0ULL,
+ 	.end	= ~0ULL,
++#endif
+ 	.flags	= IORESOURCE_MEM,
+ };
+ 
+@@ -151,8 +160,8 @@ __initcall(ioresources_init);
+ /* Return the conflict entry if you can't request it */
+ static struct resource * __request_resource(struct resource *root, struct resource *new)
+ {
+-	u64 start = new->start;
+-	u64 end = new->end;
++	resource_size_t start = new->start;
++	resource_size_t end = new->end;
+ 	struct resource *tmp, **p;
+ 
+ 	if (end < start)
+@@ -236,11 +245,10 @@ EXPORT_SYMBOL(release_resource);
+  * Find empty slot in the resource tree given range and alignment.
+  */
+ static int find_resource(struct resource *root, struct resource *new,
+-			 u64 size,
+-			 u64 min, u64 max,
+-			 u64 align,
++			 resource_size_t size, resource_size_t min,
++			 resource_size_t max, resource_size_t align,
+ 			 void (*alignf)(void *, struct resource *,
+-					u64, u64),
++					resource_size_t, resource_size_t),
+ 			 void *alignf_data)
+ {
+ 	struct resource *this = root->child;
+@@ -282,11 +290,10 @@ static int find_resource(struct resource
+  * Allocate empty slot in the resource tree given range and alignment.
+  */
+ int allocate_resource(struct resource *root, struct resource *new,
+-		      u64 size,
+-		      u64 min, u64 max,
+-		      u64 align,
++		      resource_size_t size, resource_size_t min,
++		      resource_size_t max, resource_size_t align,
+ 		      void (*alignf)(void *, struct resource *,
+-				     u64, u64),
++				     resource_size_t, resource_size_t),
+ 		      void *alignf_data)
+ {
+ 	int err;
+@@ -378,10 +385,10 @@ EXPORT_SYMBOL(insert_resource);
+  * arguments.  Returns -EBUSY if it can't fit.  Existing children of
+  * the resource are assumed to be immutable.
+  */
+-int adjust_resource(struct resource *res, u64 start, u64 size)
++int adjust_resource(struct resource *res, resource_size_t start, resource_size_t size)
+ {
+ 	struct resource *tmp, *parent = res->parent;
+-	u64 end = start + size - 1;
++	resource_size_t end = start + size - 1;
+ 	int result = -EBUSY;
+ 
+ 	write_lock(&resource_lock);
+@@ -428,7 +435,9 @@ EXPORT_SYMBOL(adjust_resource);
+  *
+  * Release-region releases a matching busy region.
+  */
+-struct resource * __request_region(struct resource *parent, u64 start, u64 n, const char *name)
++struct resource * __request_region(struct resource *parent,
++				   resource_size_t start, resource_size_t n,
++				   const char *name)
+ {
+ 	struct resource *res = kzalloc(sizeof(*res), GFP_KERNEL);
+ 
+@@ -464,7 +473,8 @@ struct resource * __request_region(struc
+ 
+ EXPORT_SYMBOL(__request_region);
+ 
+-int __check_region(struct resource *parent, u64 start, u64 n)
++int __check_region(struct resource *parent, resource_size_t start,
++			resource_size_t n)
+ {
+ 	struct resource * res;
+ 
+@@ -479,10 +489,11 @@ int __check_region(struct resource *pare
+ 
+ EXPORT_SYMBOL(__check_region);
+ 
+-void __release_region(struct resource *parent, u64 start, u64 n)
++void __release_region(struct resource *parent, resource_size_t start,
++			resource_size_t n)
+ {
+ 	struct resource **p;
+-	u64 end;
++	resource_size_t end;
+ 
+ 	p = &parent->child;
+ 	end = start + n - 1;
