@@ -1,0 +1,301 @@
+From stern@rowland.harvard.edu Fri May 19 13:52:46 2006
+Date: Fri, 19 May 2006 16:52:35 -0400 (EDT)
+From: Alan Stern <stern@rowland.harvard.edu>
+To: Greg KH <greg@kroah.com>
+Subject: UHCI: remove ISO TDs as they are used
+Message-ID: <Pine.LNX.4.44L0.0605191644570.5761-100000@iolanthe.rowland.org>
+
+This patch (as690) does the same thing for ISO TDs as as680 did for
+non-ISO TDs: free them as they are used rather than all at once when an
+URB is complete.  At the same time it fixes a minor buglet (I'm not
+aware of it ever affecting anyone): An ISO TD should be retired when its
+frame is over, regardless of whether or not the hardware has marked it
+inactive.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/uhci-debug.c |   14 +++--
+ drivers/usb/host/uhci-hcd.h   |   10 +++-
+ drivers/usb/host/uhci-q.c     |  105 +++++++++++++++++++++++++++++-------------
+ 3 files changed, 91 insertions(+), 38 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/host/uhci-debug.c
++++ gregkh-2.6/drivers/usb/host/uhci-debug.c
+@@ -127,7 +127,8 @@ static int uhci_show_urbp(struct urb_pri
+ 
+ 	i = nactive = ninactive = 0;
+ 	list_for_each_entry(td, &urbp->td_list, list) {
+-		if (++i <= 10 || debug > 2) {
++		if (urbp->qh->type != USB_ENDPOINT_XFER_ISOC &&
++				(++i <= 10 || debug > 2)) {
+ 			out += sprintf(out, "%*s%d: ", space + 2, "", i);
+ 			out += uhci_show_td(td, out, len - (out - buf), 0);
+ 		} else {
+@@ -168,8 +169,9 @@ static int uhci_show_qh(struct uhci_qh *
+ 			space, "", qh, qtype,
+ 			le32_to_cpu(qh->link), le32_to_cpu(element));
+ 	if (qh->type == USB_ENDPOINT_XFER_ISOC)
+-		out += sprintf(out, "%*s    period %d\n",
+-				space, "", qh->period);
++		out += sprintf(out, "%*s    period %d frame %x desc [%p]\n",
++				space, "", qh->period, qh->iso_frame,
++				qh->iso_packet_desc);
+ 
+ 	if (element & UHCI_PTR_QH)
+ 		out += sprintf(out, "%*s  Element points to QH (bug?)\n", space, "");
+@@ -331,8 +333,10 @@ static int uhci_show_status(struct uhci_
+ 	out += sprintf(out, "  sof       =       %02x\n", sof);
+ 	out += uhci_show_sc(1, portsc1, out, len - (out - buf));
+ 	out += uhci_show_sc(2, portsc2, out, len - (out - buf));
+-	out += sprintf(out, "Most recent frame: %x\n",
+-			uhci->frame_number);
++	out += sprintf(out, "Most recent frame: %x (%d)   "
++			"Last ISO frame: %x (%d)\n",
++			uhci->frame_number, uhci->frame_number & 1023,
++			uhci->last_iso_frame, uhci->last_iso_frame & 1023);
+ 
+ 	return out - buf;
+ }
+--- gregkh-2.6.orig/drivers/usb/host/uhci-hcd.h
++++ gregkh-2.6/drivers/usb/host/uhci-hcd.h
+@@ -128,8 +128,6 @@ struct uhci_qh {
+ 	__le32 element;			/* Queue element (TD) pointer */
+ 
+ 	/* Software fields */
+-	dma_addr_t dma_handle;
+-
+ 	struct list_head node;		/* Node in the list of QHs */
+ 	struct usb_host_endpoint *hep;	/* Endpoint information */
+ 	struct usb_device *udev;
+@@ -138,13 +136,19 @@ struct uhci_qh {
+ 	struct uhci_td *dummy_td;	/* Dummy TD to end the queue */
+ 	struct uhci_td *post_td;	/* Last TD completed */
+ 
++	struct usb_iso_packet_descriptor *iso_packet_desc;
++					/* Next urb->iso_frame_desc entry */
+ 	unsigned long advance_jiffies;	/* Time of last queue advance */
+ 	unsigned int unlink_frame;	/* When the QH was unlinked */
+ 	unsigned int period;		/* For Interrupt and Isochronous QHs */
++	unsigned int iso_frame;		/* Frame # for iso_packet_desc */
++	int iso_status;			/* Status for Isochronous URBs */
+ 
+ 	int state;			/* QH_STATE_xxx; see above */
+ 	int type;			/* Queue type (control, bulk, etc) */
+ 
++	dma_addr_t dma_handle;
++
+ 	unsigned int initial_toggle:1;	/* Endpoint's current toggle value */
+ 	unsigned int needs_fixup:1;	/* Must fix the TD toggle values */
+ 	unsigned int is_stopped:1;	/* Queue was stopped by error/unlink */
+@@ -386,6 +390,8 @@ struct uhci_hcd {
+ 	unsigned int frame_number;		/* As of last check */
+ 	unsigned int is_stopped;
+ #define UHCI_IS_STOPPED		9999		/* Larger than a frame # */
++	unsigned int last_iso_frame;		/* Frame of last scan */
++	unsigned int cur_iso_frame;		/* Frame for current scan */
+ 
+ 	unsigned int scan_in_progress:1;	/* Schedule scan is running */
+ 	unsigned int need_rescan:1;		/* Redo the schedule scan */
+--- gregkh-2.6.orig/drivers/usb/host/uhci-q.c
++++ gregkh-2.6/drivers/usb/host/uhci-q.c
+@@ -184,6 +184,24 @@ static inline void uhci_remove_td_from_f
+ 	td->frame = -1;
+ }
+ 
++static inline void uhci_remove_tds_from_frame(struct uhci_hcd *uhci,
++		unsigned int framenum)
++{
++	struct uhci_td *ftd, *ltd;
++
++	framenum &= (UHCI_NUMFRAMES - 1);
++
++	ftd = uhci->frame_cpu[framenum];
++	if (ftd) {
++		ltd = list_entry(ftd->fl_list.prev, struct uhci_td, fl_list);
++		uhci->frame[framenum] = ltd->link;
++		uhci->frame_cpu[framenum] = NULL;
++
++		while (!list_empty(&ftd->fl_list))
++			list_del_init(ftd->fl_list.prev);
++	}
++}
++
+ /*
+  * Remove all the TDs for an Isochronous URB from the frame list
+  */
+@@ -523,7 +541,6 @@ static int uhci_map_status(int status, i
+ 		return -ENOSR;
+ 	if (status & TD_CTRL_STALLED)			/* Stalled */
+ 		return -EPIPE;
+-	WARN_ON(status & TD_CTRL_ACTIVE);		/* Active */
+ 	return 0;
+ }
+ 
+@@ -960,12 +977,12 @@ static int uhci_submit_isochronous(struc
+ 		return -EFBIG;
+ 
+ 	/* Check the period and figure out the starting frame number */
+-	uhci_get_current_frame_number(uhci);
+ 	if (qh->period == 0) {
+ 		if (urb->transfer_flags & URB_ISO_ASAP) {
++			uhci_get_current_frame_number(uhci);
+ 			urb->start_frame = uhci->frame_number + 10;
+ 		} else {
+-			i = urb->start_frame - uhci->frame_number;
++			i = urb->start_frame - uhci->last_iso_frame;
+ 			if (i <= 0 || i >= UHCI_NUMFRAMES)
+ 				return -EINVAL;
+ 		}
+@@ -974,7 +991,7 @@ static int uhci_submit_isochronous(struc
+ 
+ 	} else {	/* Pick up where the last URB leaves off */
+ 		if (list_empty(&qh->queue)) {
+-			frame = uhci->frame_number + 10;
++			frame = qh->iso_frame;
+ 		} else {
+ 			struct urb *lurb;
+ 
+@@ -986,11 +1003,12 @@ static int uhci_submit_isochronous(struc
+ 		}
+ 		if (urb->transfer_flags & URB_ISO_ASAP)
+ 			urb->start_frame = frame;
+-		/* FIXME: Sanity check */
++		else if (urb->start_frame != frame)
++			return -EINVAL;
+ 	}
+ 
+ 	/* Make sure we won't have to go too far into the future */
+-	if (uhci_frame_before_eq(uhci->frame_number + UHCI_NUMFRAMES,
++	if (uhci_frame_before_eq(uhci->last_iso_frame + UHCI_NUMFRAMES,
+ 			urb->start_frame + urb->number_of_packets *
+ 				urb->interval))
+ 		return -EFBIG;
+@@ -1020,7 +1038,13 @@ static int uhci_submit_isochronous(struc
+ 	frame = urb->start_frame;
+ 	list_for_each_entry(td, &urbp->td_list, list) {
+ 		uhci_insert_td_in_frame_list(uhci, td, frame);
+-		frame += urb->interval;
++		frame += qh->period;
++	}
++
++	if (list_empty(&qh->queue)) {
++		qh->iso_packet_desc = &urb->iso_frame_desc[0];
++		qh->iso_frame = urb->start_frame;
++		qh->iso_status = 0;
+ 	}
+ 
+ 	return 0;
+@@ -1028,37 +1052,44 @@ static int uhci_submit_isochronous(struc
+ 
+ static int uhci_result_isochronous(struct uhci_hcd *uhci, struct urb *urb)
+ {
+-	struct uhci_td *td;
+-	struct urb_priv *urbp = (struct urb_priv *)urb->hcpriv;
+-	int status;
+-	int i, ret = 0;
+-
+-	urb->actual_length = urb->error_count = 0;
++	struct uhci_td *td, *tmp;
++	struct urb_priv *urbp = urb->hcpriv;
++	struct uhci_qh *qh = urbp->qh;
+ 
+-	i = 0;
+-	list_for_each_entry(td, &urbp->td_list, list) {
++	list_for_each_entry_safe(td, tmp, &urbp->td_list, list) {
++		unsigned int ctrlstat;
++		int status;
+ 		int actlength;
+-		unsigned int ctrlstat = td_status(td);
+ 
+-		if (ctrlstat & TD_CTRL_ACTIVE)
++		if (uhci_frame_before_eq(uhci->cur_iso_frame, qh->iso_frame))
+ 			return -EINPROGRESS;
+ 
+-		actlength = uhci_actual_length(ctrlstat);
+-		urb->iso_frame_desc[i].actual_length = actlength;
+-		urb->actual_length += actlength;
+-
+-		status = uhci_map_status(uhci_status_bits(ctrlstat),
+-				usb_pipeout(urb->pipe));
+-		urb->iso_frame_desc[i].status = status;
++		uhci_remove_tds_from_frame(uhci, qh->iso_frame);
++
++		ctrlstat = td_status(td);
++		if (ctrlstat & TD_CTRL_ACTIVE) {
++			status = -EXDEV;	/* TD was added too late? */
++		} else {
++			status = uhci_map_status(uhci_status_bits(ctrlstat),
++					usb_pipeout(urb->pipe));
++			actlength = uhci_actual_length(ctrlstat);
++
++			urb->actual_length += actlength;
++			qh->iso_packet_desc->actual_length = actlength;
++			qh->iso_packet_desc->status = status;
++		}
++
+ 		if (status) {
+ 			urb->error_count++;
+-			ret = status;
++			qh->iso_status = status;
+ 		}
+ 
+-		i++;
++		uhci_remove_td_from_urbp(td);
++		uhci_free_td(uhci, td);
++		qh->iso_frame += qh->period;
++		++qh->iso_packet_desc;
+ 	}
+-
+-	return ret;
++	return qh->iso_status;
+ }
+ 
+ static int uhci_urb_enqueue(struct usb_hcd *hcd,
+@@ -1119,6 +1150,7 @@ static int uhci_urb_enqueue(struct usb_h
+ 		}
+ 		break;
+ 	case USB_ENDPOINT_XFER_ISOC:
++		urb->error_count = 0;
+ 		bustime = usb_check_bandwidth(urb->dev, urb);
+ 		if (bustime < 0) {
+ 			ret = bustime;
+@@ -1200,9 +1232,18 @@ __acquires(uhci->lock)
+ {
+ 	struct urb_priv *urbp = (struct urb_priv *) urb->hcpriv;
+ 
+-	/* Isochronous TDs get unlinked directly from the frame list */
+-	if (qh->type == USB_ENDPOINT_XFER_ISOC)
+-		uhci_unlink_isochronous_tds(uhci, urb);
++	/* When giving back the first URB in an Isochronous queue,
++	 * reinitialize the QH's iso-related members for the next URB. */
++	if (qh->type == USB_ENDPOINT_XFER_ISOC &&
++			urbp->node.prev == &qh->queue &&
++			urbp->node.next != &qh->queue) {
++		struct urb *nurb = list_entry(urbp->node.next,
++				struct urb_priv, node)->urb;
++
++		qh->iso_packet_desc = &nurb->iso_frame_desc[0];
++		qh->iso_frame = nurb->start_frame;
++		qh->iso_status = 0;
++	}
+ 
+ 	/* Take the URB off the QH's queue.  If the queue is now empty,
+ 	 * this is a perfect time for a toggle fixup. */
+@@ -1434,6 +1475,7 @@ rescan:
+ 
+ 	uhci_clear_next_interrupt(uhci);
+ 	uhci_get_current_frame_number(uhci);
++	uhci->cur_iso_frame = uhci->frame_number;
+ 
+ 	/* Go through all the QH queues and process the URBs in each one */
+ 	for (i = 0; i < UHCI_NUM_SKELQH - 1; ++i) {
+@@ -1451,6 +1493,7 @@ rescan:
+ 		}
+ 	}
+ 
++	uhci->last_iso_frame = uhci->cur_iso_frame;
+ 	if (uhci->need_rescan)
+ 		goto rescan;
+ 	uhci->scan_in_progress = 0;
