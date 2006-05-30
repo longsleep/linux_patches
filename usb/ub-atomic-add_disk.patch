@@ -1,0 +1,85 @@
+From zaitcev@redhat.com Thu May 25 20:05:07 2006
+Date: Thu, 25 May 2006 20:04:54 -0700
+From: Pete Zaitcev <zaitcev@redhat.com>
+To: greg@kroah.com
+Cc: zaitcev@redhat.com, viro@www.linux.org.uk
+Subject: ub: atomic add_disk
+Message-Id: <20060525200454.d80905b6.zaitcev@redhat.com>
+
+<zaitcev> I am taling about this: "if (disk->flags & GENHD_FL_UP) del_gendisk(disk);"
+<zaitcev> If del_gendisk() undoes add_disk() like viro just said, why is it conditional?
+<viro> huh?
+<viro> add_disk() sets the damn flag
+<zaitcev> So, I should not need to check ever
+<viro> so the above is "if I've called add_disk(), call gendisk()"
+<viro> which might be what you want, of course
+<viro> but usually you know if you'd done add_disk() on that puppy anyway
+
+In ub, nobody upstream should ever see half-constructed disks before
+they were passed to add_disk. To that end, only add the struct lun to
+the list on the path of no return. With that fix in place, we do
+not need to test GENHD_FL_UP.
+
+Signed-off-by: Pete Zaitcev <zaitcev@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ drivers/block/ub.c |   10 +++-------
+ 1 file changed, 3 insertions(+), 7 deletions(-)
+
+--- gregkh-2.6.orig/drivers/block/ub.c
++++ gregkh-2.6/drivers/block/ub.c
+@@ -2314,7 +2314,6 @@ static int ub_probe_lun(struct ub_dev *s
+ 		goto err_id;
+ 
+ 	lun->udev = sc;
+-	list_add(&lun->link, &sc->luns);
+ 
+ 	snprintf(lun->name, 16, DRV_NAME "%c(%d.%d.%d)",
+ 	    lun->id + 'a', sc->dev->bus->busnum, sc->dev->devnum, lun->num);
+@@ -2327,7 +2326,6 @@ static int ub_probe_lun(struct ub_dev *s
+ 	if ((disk = alloc_disk(UB_PARTS_PER_LUN)) == NULL)
+ 		goto err_diskalloc;
+ 
+-	lun->disk = disk;
+ 	sprintf(disk->disk_name, DRV_NAME "%c", lun->id + 'a');
+ 	sprintf(disk->devfs_name, DEVFS_NAME "/%c", lun->id + 'a');
+ 	disk->major = UB_MAJOR;
+@@ -2349,7 +2347,9 @@ static int ub_probe_lun(struct ub_dev *s
+ 	blk_queue_max_sectors(q, UB_MAX_SECTORS);
+ 	blk_queue_hardsect_size(q, lun->capacity.bsize);
+ 
++	lun->disk = disk;
+ 	q->queuedata = lun;
++	list_add(&lun->link, &sc->luns);
+ 
+ 	set_capacity(disk, lun->capacity.nsec);
+ 	if (lun->removable)
+@@ -2362,7 +2362,6 @@ static int ub_probe_lun(struct ub_dev *s
+ err_blkqinit:
+ 	put_disk(disk);
+ err_diskalloc:
+-	list_del(&lun->link);
+ 	ub_id_put(lun->id);
+ err_id:
+ 	kfree(lun);
+@@ -2375,7 +2374,6 @@ static void ub_disconnect(struct usb_int
+ 	struct ub_dev *sc = usb_get_intfdata(intf);
+ 	struct list_head *p;
+ 	struct ub_lun *lun;
+-	struct gendisk *disk;
+ 	unsigned long flags;
+ 
+ 	/*
+@@ -2431,9 +2429,7 @@ static void ub_disconnect(struct usb_int
+ 	 */
+ 	list_for_each (p, &sc->luns) {
+ 		lun = list_entry(p, struct ub_lun, link);
+-		disk = lun->disk;
+-		if (disk->flags & GENHD_FL_UP)
+-			del_gendisk(disk);
++		del_gendisk(lun->disk);
+ 		/*
+ 		 * I wish I could do:
+ 		 *    set_bit(QUEUE_FLAG_DEAD, &q->queue_flags);

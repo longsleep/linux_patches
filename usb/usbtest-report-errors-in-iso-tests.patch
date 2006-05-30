@@ -1,0 +1,125 @@
+From stern@rowland.harvard.edu Mon May 22 13:47:15 2006
+Date: Mon, 22 May 2006 16:47:13 -0400 (EDT)
+From: Alan Stern <stern@rowland.harvard.edu>
+To: Greg KH <greg@kroah.com>, David Brownell <david-b@pacbell.net>
+cc: USB development list <linux-usb-devel@lists.sourceforge.net>
+Subject: usbtest: report errors in iso tests
+Message-ID: <Pine.LNX.4.44L0.0605221643560.5848-100000@iolanthe.rowland.org>
+
+This patch (as693b) makes the usbtest driver report errors in the
+isochronous bulk transfer tests instead of always returning 0.  As an
+arbitrary cutoff, an error is returned if more than 10% of the packet
+transfers fail.  It also stops a test immediately upon receiving an URB
+submission error.
+
+For a test harness, it's especially important to report when errors occur!
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/misc/usbtest.c |   36 +++++++++++++++++++++++++++++-------
+ 1 file changed, 29 insertions(+), 7 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/misc/usbtest.c
++++ gregkh-2.6/drivers/usb/misc/usbtest.c
+@@ -1337,7 +1337,9 @@ struct iso_context {
+ 	unsigned		pending;
+ 	spinlock_t		lock;
+ 	struct completion	done;
++	int			submit_error;
+ 	unsigned long		errors;
++	unsigned long		packet_count;
+ 	struct usbtest_dev	*dev;
+ };
+ 
+@@ -1348,10 +1350,14 @@ static void iso_callback (struct urb *ur
+ 	spin_lock(&ctx->lock);
+ 	ctx->count--;
+ 
++	ctx->packet_count += urb->number_of_packets;
+ 	if (urb->error_count > 0)
+ 		ctx->errors += urb->error_count;
++	else if (urb->status != 0)
++		ctx->errors += urb->number_of_packets;
+ 
+-	if (urb->status == 0 && ctx->count > (ctx->pending - 1)) {
++	if (urb->status == 0 && ctx->count > (ctx->pending - 1)
++			&& !ctx->submit_error) {
+ 		int status = usb_submit_urb (urb, GFP_ATOMIC);
+ 		switch (status) {
+ 		case 0:
+@@ -1362,6 +1368,8 @@ static void iso_callback (struct urb *ur
+ 					status);
+ 			/* FALLTHROUGH */
+ 		case -ENODEV:			/* disconnected */
++		case -ESHUTDOWN:		/* endpoint disabled */
++			ctx->submit_error = 1;
+ 			break;
+ 		}
+ 	}
+@@ -1371,8 +1379,8 @@ static void iso_callback (struct urb *ur
+ 	if (ctx->pending == 0) {
+ 		if (ctx->errors)
+ 			dev_dbg (&ctx->dev->intf->dev,
+-				"iso test, %lu errors\n",
+-				ctx->errors);
++				"iso test, %lu errors out of %lu\n",
++				ctx->errors, ctx->packet_count);
+ 		complete (&ctx->done);
+ 	}
+ done:
+@@ -1433,15 +1441,14 @@ test_iso_queue (struct usbtest_dev *dev,
+ 	struct usb_device	*udev;
+ 	unsigned		i;
+ 	unsigned long		packets = 0;
+-	int			status;
++	int			status = 0;
+ 	struct urb		*urbs[10];	/* FIXME no limit */
+ 
+ 	if (param->sglen > 10)
+ 		return -EDOM;
+ 
++	memset(&context, 0, sizeof context);
+ 	context.count = param->iterations * param->sglen;
+-	context.pending = param->sglen;
+-	context.errors = 0;
+ 	context.dev = dev;
+ 	init_completion (&context.done);
+ 	spin_lock_init (&context.lock);
+@@ -1473,6 +1480,7 @@ test_iso_queue (struct usbtest_dev *dev,
+ 
+ 	spin_lock_irq (&context.lock);
+ 	for (i = 0; i < param->sglen; i++) {
++		++context.pending;
+ 		status = usb_submit_urb (urbs [i], SLAB_ATOMIC);
+ 		if (status < 0) {
+ 			ERROR (dev, "submit iso[%d], error %d\n", i, status);
+@@ -1483,12 +1491,26 @@ test_iso_queue (struct usbtest_dev *dev,
+ 
+ 			simple_free_urb (urbs [i]);
+ 			context.pending--;
++			context.submit_error = 1;
++			break;
+ 		}
+ 	}
+ 	spin_unlock_irq (&context.lock);
+ 
+ 	wait_for_completion (&context.done);
+-	return 0;
++
++	/*
++	 * Isochronous transfers are expected to fail sometimes.  As an
++	 * arbitrary limit, we will report an error if any submissions
++	 * fail or if the transfer failure rate is > 10%.
++	 */
++	if (status != 0)
++		;
++	else if (context.submit_error)
++		status = -EACCES;
++	else if (context.errors > context.packet_count / 10)
++		status = -EIO;
++	return status;
+ 
+ fail:
+ 	for (i = 0; i < param->sglen; i++) {
