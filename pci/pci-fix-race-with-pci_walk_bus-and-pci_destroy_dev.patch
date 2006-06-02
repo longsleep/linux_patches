@@ -1,0 +1,326 @@
+From yanmin_zhang@linux.intel.com Thu Jun  1 21:41:48 2006
+From: Zhang Yanmin <yanmin_zhang@linux.intel.com>
+Subject: PCI: fix race with pci_walk_bus and pci_destroy_dev
+To: Greg KH <greg@kroah.com>
+Message-Id: <1149222942.8436.189.camel@ymzhang-perf.sh.intel.com>
+Date: Fri, 02 Jun 2006 12:35:43 +0800
+
+From: Zhang Yanmin <yanmin.zhang@intel.com>
+
+pci_walk_bus has a race with pci_destroy_dev. When cb is called
+in pci_walk_bus, pci_destroy_dev might unlink the dev pointed by next.
+Later on in the next loop, pointer next becomes NULL and cause
+kernel panic.
+
+Below patch against 2.6.17-rc4 fixes it by changing pci_bus_lock (spin_lock)
+to pci_bus_sem (rw_semaphore).
+
+Signed-off-by: Zhang Yanmin <yanmin.zhang@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ drivers/pci/bus.c    |   21 +++++++++------------
+ drivers/pci/pci.h    |    2 +-
+ drivers/pci/probe.c  |   17 +++++++++--------
+ drivers/pci/remove.c |   12 ++++++------
+ drivers/pci/search.c |   32 ++++++++++++++++----------------
+ 5 files changed, 41 insertions(+), 43 deletions(-)
+
+--- gregkh-2.6.orig/drivers/pci/bus.c
++++ gregkh-2.6/drivers/pci/bus.c
+@@ -81,9 +81,9 @@ void __devinit pci_bus_add_device(struct
+ {
+ 	device_add(&dev->dev);
+ 
+-	spin_lock(&pci_bus_lock);
++	down_write(&pci_bus_sem);
+ 	list_add_tail(&dev->global_list, &pci_devices);
+-	spin_unlock(&pci_bus_lock);
++	up_write(&pci_bus_sem);
+ 
+ 	pci_proc_attach_device(dev);
+ 	pci_create_sysfs_dev_files(dev);
+@@ -125,10 +125,10 @@ void __devinit pci_bus_add_devices(struc
+ 		 */
+ 		if (dev->subordinate) {
+ 		       if (list_empty(&dev->subordinate->node)) {
+-			       spin_lock(&pci_bus_lock);
++			       down_write(&pci_bus_sem);
+ 			       list_add_tail(&dev->subordinate->node,
+ 					       &dev->bus->children);
+-			       spin_unlock(&pci_bus_lock);
++			       up_write(&pci_bus_sem);
+ 		       }
+ 			pci_bus_add_devices(dev->subordinate);
+ 
+@@ -168,7 +168,7 @@ void pci_walk_bus(struct pci_bus *top, v
+ 	struct list_head *next;
+ 
+ 	bus = top;
+-	spin_lock(&pci_bus_lock);
++	down_read(&pci_bus_sem);
+ 	next = top->devices.next;
+ 	for (;;) {
+ 		if (next == &bus->devices) {
+@@ -180,22 +180,19 @@ void pci_walk_bus(struct pci_bus *top, v
+ 			continue;
+ 		}
+ 		dev = list_entry(next, struct pci_dev, bus_list);
+-		pci_dev_get(dev);
+ 		if (dev->subordinate) {
+ 			/* this is a pci-pci bridge, do its devices next */
+ 			next = dev->subordinate->devices.next;
+ 			bus = dev->subordinate;
+ 		} else
+ 			next = dev->bus_list.next;
+-		spin_unlock(&pci_bus_lock);
+ 
+-		/* Run device routines with the bus unlocked */
++		/* Run device routines with the device locked */
++		down(&dev->dev.sem);
+ 		cb(dev, userdata);
+-
+-		spin_lock(&pci_bus_lock);
+-		pci_dev_put(dev);
++		up(&dev->dev.sem);
+ 	}
+-	spin_unlock(&pci_bus_lock);
++	up_read(&pci_bus_sem);
+ }
+ EXPORT_SYMBOL_GPL(pci_walk_bus);
+ 
+--- gregkh-2.6.orig/drivers/pci/pci.h
++++ gregkh-2.6/drivers/pci/pci.h
+@@ -40,7 +40,7 @@ extern int pci_bus_find_capability (stru
+ extern void pci_remove_legacy_files(struct pci_bus *bus);
+ 
+ /* Lock for read/write access to pci device and bus lists */
+-extern spinlock_t pci_bus_lock;
++extern struct rw_semaphore pci_bus_sem;
+ 
+ #ifdef CONFIG_X86_IO_APIC
+ extern int pci_msi_quirk;
+--- gregkh-2.6.orig/drivers/pci/probe.c
++++ gregkh-2.6/drivers/pci/probe.c
+@@ -383,9 +383,9 @@ struct pci_bus * __devinit pci_add_new_b
+ 
+ 	child = pci_alloc_child_bus(parent, dev, busnr);
+ 	if (child) {
+-		spin_lock(&pci_bus_lock);
++		down_write(&pci_bus_sem);
+ 		list_add_tail(&child->node, &parent->children);
+-		spin_unlock(&pci_bus_lock);
++		up_write(&pci_bus_sem);
+ 	}
+ 	return child;
+ }
+@@ -844,9 +844,9 @@ void __devinit pci_device_add(struct pci
+ 	 * and the bus list for fixup functions, etc.
+ 	 */
+ 	INIT_LIST_HEAD(&dev->global_list);
+-	spin_lock(&pci_bus_lock);
++	down_write(&pci_bus_sem);
+ 	list_add_tail(&dev->bus_list, &bus->devices);
+-	spin_unlock(&pci_bus_lock);
++	up_write(&pci_bus_sem);
+ }
+ 
+ struct pci_dev * __devinit
+@@ -981,9 +981,10 @@ struct pci_bus * __devinit pci_create_bu
+ 		pr_debug("PCI: Bus %04x:%02x already known\n", pci_domain_nr(b), bus);
+ 		goto err_out;
+ 	}
+-	spin_lock(&pci_bus_lock);
++
++	down_write(&pci_bus_sem);
+ 	list_add_tail(&b->node, &pci_root_buses);
+-	spin_unlock(&pci_bus_lock);
++	up_write(&pci_bus_sem);
+ 
+ 	memset(dev, 0, sizeof(*dev));
+ 	dev->parent = parent;
+@@ -1023,9 +1024,9 @@ class_dev_create_file_err:
+ class_dev_reg_err:
+ 	device_unregister(dev);
+ dev_reg_err:
+-	spin_lock(&pci_bus_lock);
++	down_write(&pci_bus_sem);
+ 	list_del(&b->node);
+-	spin_unlock(&pci_bus_lock);
++	up_write(&pci_bus_sem);
+ err_out:
+ 	kfree(dev);
+ 	kfree(b);
+--- gregkh-2.6.orig/drivers/pci/remove.c
++++ gregkh-2.6/drivers/pci/remove.c
+@@ -22,18 +22,18 @@ static void pci_destroy_dev(struct pci_d
+ 		pci_proc_detach_device(dev);
+ 		pci_remove_sysfs_dev_files(dev);
+ 		device_unregister(&dev->dev);
+-		spin_lock(&pci_bus_lock);
++		down_write(&pci_bus_sem);
+ 		list_del(&dev->global_list);
+ 		dev->global_list.next = dev->global_list.prev = NULL;
+-		spin_unlock(&pci_bus_lock);
++		up_write(&pci_bus_sem);
+ 	}
+ 
+ 	/* Remove the device from the device lists, and prevent any further
+ 	 * list accesses from this device */
+-	spin_lock(&pci_bus_lock);
++	down_write(&pci_bus_sem);
+ 	list_del(&dev->bus_list);
+ 	dev->bus_list.next = dev->bus_list.prev = NULL;
+-	spin_unlock(&pci_bus_lock);
++	up_write(&pci_bus_sem);
+ 
+ 	pci_free_resources(dev);
+ 	pci_dev_put(dev);
+@@ -62,9 +62,9 @@ void pci_remove_bus(struct pci_bus *pci_
+ {
+ 	pci_proc_detach_bus(pci_bus);
+ 
+-	spin_lock(&pci_bus_lock);
++	down_write(&pci_bus_sem);
+ 	list_del(&pci_bus->node);
+-	spin_unlock(&pci_bus_lock);
++	up_write(&pci_bus_sem);
+ 	pci_remove_legacy_files(pci_bus);
+ 	class_device_remove_file(&pci_bus->class_dev,
+ 		&class_device_attr_cpuaffinity);
+--- gregkh-2.6.orig/drivers/pci/search.c
++++ gregkh-2.6/drivers/pci/search.c
+@@ -13,7 +13,7 @@
+ #include <linux/interrupt.h>
+ #include "pci.h"
+ 
+-DEFINE_SPINLOCK(pci_bus_lock);
++DECLARE_RWSEM(pci_bus_sem);
+ 
+ static struct pci_bus * __devinit
+ pci_do_find_bus(struct pci_bus* bus, unsigned char busnr)
+@@ -72,11 +72,11 @@ pci_find_next_bus(const struct pci_bus *
+ 	struct pci_bus *b = NULL;
+ 
+ 	WARN_ON(in_interrupt());
+-	spin_lock(&pci_bus_lock);
++	down_read(&pci_bus_sem);
+ 	n = from ? from->node.next : pci_root_buses.next;
+ 	if (n != &pci_root_buses)
+ 		b = pci_bus_b(n);
+-	spin_unlock(&pci_bus_lock);
++	up_read(&pci_bus_sem);
+ 	return b;
+ }
+ 
+@@ -124,7 +124,7 @@ struct pci_dev * pci_get_slot(struct pci
+ 	struct pci_dev *dev;
+ 
+ 	WARN_ON(in_interrupt());
+-	spin_lock(&pci_bus_lock);
++	down_read(&pci_bus_sem);
+ 
+ 	list_for_each(tmp, &bus->devices) {
+ 		dev = pci_dev_b(tmp);
+@@ -135,7 +135,7 @@ struct pci_dev * pci_get_slot(struct pci
+ 	dev = NULL;
+  out:
+ 	pci_dev_get(dev);
+-	spin_unlock(&pci_bus_lock);
++	up_read(&pci_bus_sem);
+ 	return dev;
+ }
+ 
+@@ -167,7 +167,7 @@ static struct pci_dev * pci_find_subsys(
+ 	struct pci_dev *dev;
+ 
+ 	WARN_ON(in_interrupt());
+-	spin_lock(&pci_bus_lock);
++	down_read(&pci_bus_sem);
+ 	n = from ? from->global_list.next : pci_devices.next;
+ 
+ 	while (n && (n != &pci_devices)) {
+@@ -181,7 +181,7 @@ static struct pci_dev * pci_find_subsys(
+ 	}
+ 	dev = NULL;
+ exit:
+-	spin_unlock(&pci_bus_lock);
++	up_read(&pci_bus_sem);
+ 	return dev;
+ }
+ 
+@@ -232,7 +232,7 @@ pci_get_subsys(unsigned int vendor, unsi
+ 	struct pci_dev *dev;
+ 
+ 	WARN_ON(in_interrupt());
+-	spin_lock(&pci_bus_lock);
++	down_read(&pci_bus_sem);
+ 	n = from ? from->global_list.next : pci_devices.next;
+ 
+ 	while (n && (n != &pci_devices)) {
+@@ -247,7 +247,7 @@ pci_get_subsys(unsigned int vendor, unsi
+ 	dev = NULL;
+ exit:
+ 	dev = pci_dev_get(dev);
+-	spin_unlock(&pci_bus_lock);
++	up_read(&pci_bus_sem);
+ 	pci_dev_put(from);
+ 	return dev;
+ }
+@@ -292,7 +292,7 @@ pci_find_device_reverse(unsigned int ven
+ 	struct pci_dev *dev;
+ 
+ 	WARN_ON(in_interrupt());
+-	spin_lock(&pci_bus_lock);
++	down_read(&pci_bus_sem);
+ 	n = from ? from->global_list.prev : pci_devices.prev;
+ 
+ 	while (n && (n != &pci_devices)) {
+@@ -304,7 +304,7 @@ pci_find_device_reverse(unsigned int ven
+ 	}
+ 	dev = NULL;
+ exit:
+-	spin_unlock(&pci_bus_lock);
++	up_read(&pci_bus_sem);
+ 	return dev;
+ }
+ 
+@@ -328,7 +328,7 @@ struct pci_dev *pci_get_class(unsigned i
+ 	struct pci_dev *dev;
+ 
+ 	WARN_ON(in_interrupt());
+-	spin_lock(&pci_bus_lock);
++	down_read(&pci_bus_sem);
+ 	n = from ? from->global_list.next : pci_devices.next;
+ 
+ 	while (n && (n != &pci_devices)) {
+@@ -340,7 +340,7 @@ struct pci_dev *pci_get_class(unsigned i
+ 	dev = NULL;
+ exit:
+ 	dev = pci_dev_get(dev);
+-	spin_unlock(&pci_bus_lock);
++	up_read(&pci_bus_sem);
+ 	pci_dev_put(from);
+ 	return dev;
+ }
+@@ -362,7 +362,7 @@ int pci_dev_present(const struct pci_dev
+ 	int found = 0;
+ 
+ 	WARN_ON(in_interrupt());
+-	spin_lock(&pci_bus_lock);
++	down_read(&pci_bus_sem);
+ 	while (ids->vendor || ids->subvendor || ids->class_mask) {
+ 		list_for_each_entry(dev, &pci_devices, global_list) {
+ 			if (pci_match_one_device(ids, dev)) {
+@@ -372,8 +372,8 @@ int pci_dev_present(const struct pci_dev
+ 		}
+ 		ids++;
+ 	}
+-exit:				
+-	spin_unlock(&pci_bus_lock);
++exit:
++	up_read(&pci_bus_sem);
+ 	return found;
+ }
+ EXPORT_SYMBOL(pci_dev_present);
