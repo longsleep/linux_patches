@@ -1,0 +1,93 @@
+From stern@rowland.harvard.edu Thu Jun  1 10:55:36 2006
+Date: Thu, 1 Jun 2006 13:55:28 -0400 (EDT)
+From: Alan Stern <stern@rowland.harvard.edu>
+To: Greg KH <greg@kroah.com>, Dmitry Torokhov <dtor_core@ameritech.net>, Vojtech Pavlik <vojtech@suse.cz>
+Subject: usbhid: use usb_reset_composite_device
+Message-ID: <Pine.LNX.4.44L0.0606011350500.7209-100000@iolanthe.rowland.org>
+
+This patch (as702) makes usbhid use the new usb_reset_composite_device
+API.  Now HID interfaces can coexist with other interfaces on the same
+device, and a reset can safely be requested by any of the drivers.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/input/hid-core.c |   37 ++++++++++++++++++++++++++++++++-----
+ 1 file changed, 32 insertions(+), 5 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/input/hid-core.c
++++ gregkh-2.6/drivers/usb/input/hid-core.c
+@@ -944,21 +944,28 @@ static void hid_reset(void *_hid)
+ 	dev_dbg(&hid->intf->dev, "resetting device\n");
+ 	rc = rc_lock = usb_lock_device_for_reset(hid->dev, hid->intf);
+ 	if (rc_lock >= 0) {
+-		rc = usb_reset_device(hid->dev);
++		rc = usb_reset_composite_device(hid->dev, hid->intf);
+ 		if (rc_lock)
+ 			usb_unlock_device(hid->dev);
+ 	}
+ 	clear_bit(HID_RESET_PENDING, &hid->iofl);
+ 
+-	if (rc == 0) {
+-		hid->retry_delay = 0;
+-		if (hid_start_in(hid))
++	switch (rc) {
++	case 0:
++		if (!test_bit(HID_IN_RUNNING, &hid->iofl))
+ 			hid_io_error(hid);
+-	} else if (!(rc == -ENODEV || rc == -EHOSTUNREACH || rc == -EINTR))
++		break;
++	default:
+ 		err("can't reset device, %s-%s/input%d, status %d",
+ 				hid->dev->bus->bus_name,
+ 				hid->dev->devpath,
+ 				hid->ifnum, rc);
++		/* FALLTHROUGH */
++	case -EHOSTUNREACH:
++	case -ENODEV:
++	case -EINTR:
++		break;
++	}
+ }
+ 
+ /* Main I/O error handler */
+@@ -2063,11 +2070,29 @@ static int hid_resume(struct usb_interfa
+ 	int status;
+ 
+ 	clear_bit(HID_SUSPENDED, &hid->iofl);
++	hid->retry_delay = 0;
+ 	status = hid_start_in(hid);
+ 	dev_dbg(&intf->dev, "resume status %d\n", status);
+ 	return status;
+ }
+ 
++/* Treat USB reset pretty much the same as suspend/resume */
++static void hid_pre_reset(struct usb_interface *intf)
++{
++	/* FIXME: What if the interface is already suspended? */
++	hid_suspend(intf, PMSG_ON);
++}
++
++static void hid_post_reset(struct usb_interface *intf)
++{
++	struct usb_device *dev = interface_to_usbdev (intf);
++
++	hid_set_idle(dev, intf->cur_altsetting->desc.bInterfaceNumber, 0, 0);
++	/* FIXME: Any more reinitialization needed? */
++
++	hid_resume(intf);
++}
++
+ static struct usb_device_id hid_usb_ids [] = {
+ 	{ .match_flags = USB_DEVICE_ID_MATCH_INT_CLASS,
+ 		.bInterfaceClass = USB_INTERFACE_CLASS_HID },
+@@ -2082,6 +2107,8 @@ static struct usb_driver hid_driver = {
+ 	.disconnect =	hid_disconnect,
+ 	.suspend =	hid_suspend,
+ 	.resume =	hid_resume,
++	.pre_reset =	hid_pre_reset,
++	.post_reset =	hid_post_reset,
+ 	.id_table =	hid_usb_ids,
+ };
+ 
