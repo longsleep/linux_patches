@@ -1,0 +1,131 @@
+From 57f2f6f5f7ecb281719f6012406990854ec5b7a3 Mon Sep 17 00:00:00 2001
+From: Greg Kroah-Hartman <gregkh@suse.de>
+Date: Mon, 12 Jun 2006 17:07:52 -0700
+Subject: [PATCH 15/16] 64bit Resource: convert a few remaining drivers to use resource_size_t where needed
+
+Based on a patch series originally from Vivek Goyal <vgoyal@in.ibm.com>
+
+Cc: Vivek Goyal <vgoyal@in.ibm.com>
+Cc: Andrew Morton <akpm@osdl.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/ieee1394/ohci1394.c     |    2 +-
+ drivers/isdn/hisax/hfc_pci.c    |    2 +-
+ drivers/net/8139cp.c            |    2 +-
+ drivers/pcmcia/rsrc_nonstatic.c |   14 +++++++-------
+ drivers/serial/8250_pci.c       |    4 ++--
+ drivers/usb/host/sl811-hcd.c    |   10 +++++++---
+ 6 files changed, 19 insertions(+), 15 deletions(-)
+
+--- gregkh-2.6.orig/drivers/ieee1394/ohci1394.c
++++ gregkh-2.6/drivers/ieee1394/ohci1394.c
+@@ -3210,7 +3210,7 @@ static int __devinit ohci1394_pci_probe(
+ {
+ 	struct hpsb_host *host;
+ 	struct ti_ohci *ohci;	/* shortcut to currently handled device */
+-	unsigned long ohci_base;
++	resource_size_t ohci_base;
+ 
+         if (pci_enable_device(dev))
+ 		FAIL(-ENXIO, "Failed to enable OHCI hardware");
+--- gregkh-2.6.orig/drivers/isdn/hisax/hfc_pci.c
++++ gregkh-2.6/drivers/isdn/hisax/hfc_pci.c
+@@ -1688,7 +1688,7 @@ setup_hfcpci(struct IsdnCard *card)
+ 				printk(KERN_WARNING "HFC-PCI: No IRQ for PCI card found\n");
+ 				return (0);
+ 			}
+-			cs->hw.hfcpci.pci_io = (char *) dev_hfcpci->resource[ 1].start;
++			cs->hw.hfcpci.pci_io = (char *)(unsigned long)dev_hfcpci->resource[1].start;
+ 			printk(KERN_INFO "HiSax: HFC-PCI card manufacturer: %s card name: %s\n", id_list[i].vendor_name, id_list[i].card_name);
+ 		} else {
+ 			printk(KERN_WARNING "HFC-PCI: No PCI card found\n");
+--- gregkh-2.6.orig/drivers/net/8139cp.c
++++ gregkh-2.6/drivers/net/8139cp.c
+@@ -1668,7 +1668,7 @@ static int cp_init_one (struct pci_dev *
+ 	struct cp_private *cp;
+ 	int rc;
+ 	void __iomem *regs;
+-	long pciaddr;
++	resource_size_t pciaddr;
+ 	unsigned int addr_len, i, pci_using_dac;
+ 	u8 pci_rev;
+ 
+--- gregkh-2.6.orig/drivers/pcmcia/rsrc_nonstatic.c
++++ gregkh-2.6/drivers/pcmcia/rsrc_nonstatic.c
+@@ -72,7 +72,7 @@ static DEFINE_MUTEX(rsrc_mutex);
+ ======================================================================*/
+ 
+ static struct resource *
+-make_resource(unsigned long b, unsigned long n, int flags, char *name)
++make_resource(resource_size_t b, resource_size_t n, int flags, char *name)
+ {
+ 	struct resource *res = kzalloc(sizeof(*res), GFP_KERNEL);
+ 
+@@ -86,8 +86,8 @@ make_resource(unsigned long b, unsigned 
+ }
+ 
+ static struct resource *
+-claim_region(struct pcmcia_socket *s, unsigned long base, unsigned long size,
+-	     int type, char *name)
++claim_region(struct pcmcia_socket *s, resource_size_t base,
++		resource_size_t size, int type, char *name)
+ {
+ 	struct resource *res, *parent;
+ 
+@@ -519,10 +519,10 @@ struct pcmcia_align_data {
+ 
+ static void
+ pcmcia_common_align(void *align_data, struct resource *res,
+-		    unsigned long size, unsigned long align)
++			resource_size_t size, resource_size_t align)
+ {
+ 	struct pcmcia_align_data *data = align_data;
+-	unsigned long start;
++	resource_size_t start;
+ 	/*
+ 	 * Ensure that we have the correct start address
+ 	 */
+@@ -533,8 +533,8 @@ pcmcia_common_align(void *align_data, st
+ }
+ 
+ static void
+-pcmcia_align(void *align_data, struct resource *res,
+-	     unsigned long size, unsigned long align)
++pcmcia_align(void *align_data, struct resource *res, resource_size_t size,
++		resource_size_t align)
+ {
+ 	struct pcmcia_align_data *data = align_data;
+ 	struct resource_map *m;
+--- gregkh-2.6.orig/drivers/serial/8250_pci.c
++++ gregkh-2.6/drivers/serial/8250_pci.c
+@@ -594,8 +594,8 @@ pci_default_setup(struct serial_private 
+ 	else
+ 		offset += idx * board->uart_offset;
+ 
+-	maxnr = (pci_resource_len(priv->dev, bar) - board->first_offset) /
+-		(8 << board->reg_shift);
++	maxnr = (pci_resource_len(priv->dev, bar) - board->first_offset) >>
++		(board->reg_shift + 3);
+ 
+ 	if (board->flags & FL_REGION_SZ_CAP && idx >= maxnr)
+ 		return 1;
+--- gregkh-2.6.orig/drivers/usb/host/sl811-hcd.c
++++ gregkh-2.6/drivers/usb/host/sl811-hcd.c
+@@ -1684,9 +1684,13 @@ sl811h_probe(struct platform_device *dev
+ 		if (!addr || !data)
+ 			return -ENODEV;
+ 		ioaddr = 1;
+-
+-		addr_reg = (void __iomem *) addr->start;
+-		data_reg = (void __iomem *) data->start;
++		/*
++		 * NOTE: 64-bit resource->start is getting truncated
++		 * to avoid compiler warning, assuming that ->start
++		 * is always 32-bit for this case
++		 */
++		addr_reg = (void __iomem *) (unsigned long) addr->start;
++		data_reg = (void __iomem *) (unsigned long) data->start;
+ 	} else {
+ 		addr_reg = ioremap(addr->start, 1);
+ 		if (addr_reg == NULL) {
