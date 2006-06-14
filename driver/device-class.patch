@@ -1,3 +1,6 @@
+From foo@baz Tue Apr  9 12:12:43 2002
+Date: Wed, 14 Jun 2006 12:14:34 -0700
+To: Greg KH <greg@kroah.com>
 From: Greg Kroah-Hartman <gregkh@suse.de>
 Subject: Driver core: allow struct device to have a dev_t
 
@@ -6,14 +9,14 @@ struct device.  It allows struct device to export a dev_t and makes it
 easy to dynamically create and destroy struct device as long as they are
 associated with a specific class.
 
-
+Cc: Kay Sievers <kay.sievers@vrfy.org>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
  drivers/base/class.c   |    1 
- drivers/base/core.c    |  128 ++++++++++++++++++++++++++++++++++++++++++++++++-
- include/linux/device.h |   13 ++++
- 3 files changed, 141 insertions(+), 1 deletion(-)
+ drivers/base/core.c    |  162 ++++++++++++++++++++++++++++++++++++++++++++++++-
+ include/linux/device.h |   14 ++++
+ 3 files changed, 176 insertions(+), 1 deletion(-)
 
 --- gregkh-2.6.orig/drivers/base/class.c
 +++ gregkh-2.6/drivers/base/class.c
@@ -77,7 +80,20 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	/* add bus name of physical device */
  	if (dev->bus)
  		add_uevent_var(envp, num_envp, &i,
-@@ -231,6 +251,7 @@ void device_initialize(struct device *de
+@@ -161,6 +181,12 @@ static ssize_t store_uevent(struct devic
+ 	return count;
+ }
+ 
++static ssize_t show_dev(struct device *dev, struct device_attribute *attr,
++			char *buf)
++{
++	return print_dev_t(buf, dev->devt);
++}
++
+ /*
+  *	devices_subsys - structure to be registered with kobject core.
+  */
+@@ -231,6 +257,7 @@ void device_initialize(struct device *de
  	klist_init(&dev->klist_children, klist_children_get,
  		   klist_children_put);
  	INIT_LIST_HEAD(&dev->dma_pools);
@@ -85,7 +101,55 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	init_MUTEX(&dev->sem);
  	device_init_wakeup(dev, 0);
  }
-@@ -451,3 +472,108 @@ EXPORT_SYMBOL_GPL(put_device);
+@@ -274,6 +301,26 @@ int device_add(struct device *dev)
+ 	dev->uevent_attr.store = store_uevent;
+ 	device_create_file(dev, &dev->uevent_attr);
+ 
++	if (MAJOR(dev->devt)) {
++		struct device_attribute *attr;
++		attr = kzalloc(sizeof(*attr), GFP_KERNEL);
++		if (!attr) {
++			error = -ENOMEM;
++			goto PMError;
++		}
++		attr->attr.name = "dev";
++		attr->attr.mode = S_IRUGO;
++		if (dev->driver)
++			attr->attr.owner = dev->driver->owner;
++		attr->show = show_dev;
++		error = device_create_file(dev, attr);
++		if (error) {
++			kfree(attr);
++			goto attrError;
++		}
++
++		dev->devt_attr = attr;
++	}
+ 	if ((error = device_pm_add(dev)))
+ 		goto PMError;
+ 	if ((error = bus_add_device(dev)))
+@@ -292,6 +339,11 @@ int device_add(struct device *dev)
+  BusError:
+ 	device_pm_remove(dev);
+  PMError:
++	if (dev->devt_attr) {
++		device_remove_file(dev, dev->devt_attr);
++		kfree(dev->devt_attr);
++	}
++ attrError:
+ 	kobject_uevent(&dev->kobj, KOBJ_REMOVE);
+ 	kobject_del(&dev->kobj);
+  Error:
+@@ -367,6 +419,8 @@ void device_del(struct device * dev)
+ 
+ 	if (parent)
+ 		klist_del(&dev->knode_parent);
++	if (dev->devt_attr)
++		device_remove_file(dev, dev->devt_attr);
+ 	device_remove_file(dev, &dev->uevent_attr);
+ 
+ 	/* Notify the platform of the removal, in case they
+@@ -451,3 +505,109 @@ EXPORT_SYMBOL_GPL(put_device);
  
  EXPORT_SYMBOL_GPL(device_create_file);
  EXPORT_SYMBOL_GPL(device_remove_file);
@@ -153,8 +217,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	/* tie the class to the device */
 +	down(&class->sem);
 +	list_add_tail(&dev->node, &class->devices);
-+	/* FIXME add a symlink here from the class to the device */
 +	up(&class->sem);
++	sysfs_create_link(&class->subsys.kset.kobj, &dev->kobj, dev->bus_id);
 +
 +	return dev;
 +
@@ -187,6 +251,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	up(&class->sem);
 +
 +	if (dev) {
++		sysfs_remove_link(&class->subsys.kset.kobj, dev->bus_id);
 +		list_del_init(&dev->node);
 +		device_unregister(dev);
 +	}
@@ -204,7 +269,15 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	struct list_head	interfaces;
  	struct semaphore	sem;	/* locks both the children and interfaces lists */
  
-@@ -333,6 +334,11 @@ struct device {
+@@ -306,6 +307,7 @@ struct device {
+ 	struct kobject kobj;
+ 	char	bus_id[BUS_ID_SIZE];	/* position on parent bus */
+ 	struct device_attribute uevent_attr;
++	struct device_attribute *devt_attr;
+ 
+ 	struct semaphore	sem;	/* semaphore to synchronize calls to
+ 					 * its driver.
+@@ -333,6 +335,11 @@ struct device {
  	struct dma_coherent_mem	*dma_mem; /* internal for coherent mem
  					     override */
  
@@ -216,7 +289,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	void	(*release)(struct device * dev);
  };
  
-@@ -374,6 +380,13 @@ extern int  device_attach(struct device 
+@@ -374,6 +381,13 @@ extern int  device_attach(struct device 
  extern void driver_attach(struct device_driver * drv);
  extern void device_reprobe(struct device *dev);
  
