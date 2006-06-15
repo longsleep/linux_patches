@@ -11,9 +11,9 @@ easier manner than the current usbfs provides us.
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
- drivers/usb/core/endpoint.c |  246 +++++++++++++++++++++++++++-----------------
+ drivers/usb/core/endpoint.c |  238 +++++++++++++++++++++++++++-----------------
  include/linux/usb.h         |    4 
- 2 files changed, 159 insertions(+), 91 deletions(-)
+ 2 files changed, 151 insertions(+), 91 deletions(-)
 
 --- gregkh-2.6.orig/drivers/usb/core/endpoint.c
 +++ gregkh-2.6/drivers/usb/core/endpoint.c
@@ -145,7 +145,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	if (interval % 1000)
  		unit = 'u';
  	else {
-@@ -119,95 +118,162 @@ static ssize_t show_ep_interval(struct u
+@@ -119,95 +118,154 @@ static ssize_t show_ep_interval(struct u
  
  	return sprintf(buf, "%d%cs\n", interval, unit);
  }
@@ -197,13 +197,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static struct attribute_group ep_dev_attr_grp = {
 +	.attrs = ep_dev_attrs,
 +};
-+
+ 
+-static void ep_object_release(struct kobject *kobj)
 +static struct endpoint_class {
 +	struct kref kref;
 +	struct class *class;
 +} *ep_class;
- 
--static void ep_object_release(struct kobject *kobj)
++
 +static int init_endpoint_class(void)
  {
 -	kfree(to_ep_object(kobj));
@@ -267,11 +267,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	dev_dbg(dev, "%s called for %s\n", __FUNCTION__, dev->bus_id);
 +	kfree(ep_dev);
 +}
-+
-+static int create_endpoint_class_device(struct device *parent,
-+					struct usb_host_endpoint *endpoint,
-+					struct usb_device *udev)
-+{
+ 
+ void usb_create_ep_files(struct device *parent,
+ 			 struct usb_host_endpoint *endpoint,
+ 			 struct usb_device *udev)
+ {
+-	struct ep_object *ep_obj;
+-	struct kobject *kobj;
++	char name[8];
 +	struct ep_device *ep_dev;
 +	int minor;
 +	int retval;
@@ -285,41 +288,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		retval = -ENOMEM;
 +		goto exit;
 +	}
-+
-+	/* fun calculation to determine the minor of this endpoint */
-+	minor = (((udev->bus->busnum - 1) * 128) * 16) + (udev->devnum - 1);
-+
-+	ep_dev->desc = &endpoint->desc;
-+	ep_dev->udev = udev;
-+	ep_dev->dev.devt = MKDEV(442, minor);
-+	ep_dev->dev.class = ep_class->class;
-+	ep_dev->dev.parent = parent;
-+	ep_dev->dev.release = ep_device_release;
-+	snprintf(ep_dev->dev.bus_id, BUS_ID_SIZE, "usbdev%d.%d_ep%02x",
-+		 udev->bus->busnum, udev->devnum,
-+		 endpoint->desc.bEndpointAddress);
-+
-+	retval = device_register(&ep_dev->dev);
-+	if (retval)
-+		goto error;
-+	sysfs_create_group(&ep_dev->dev.kobj, &ep_dev_attr_grp);
-+
-+	endpoint->ep_dev = ep_dev;
-+
-+exit:
-+	return retval;
-+error:
-+	kfree(ep_dev);
-+	goto exit;
-+}
- 
- void usb_create_ep_files(struct device *parent,
- 			 struct usb_host_endpoint *endpoint,
- 			 struct usb_device *udev)
- {
--	struct ep_object *ep_obj;
--	struct kobject *kobj;
-+	static char name[8];
  
 -	ep_obj = kzalloc(sizeof(struct ep_object), GFP_KERNEL);
 -	if (!ep_obj)
@@ -339,11 +307,35 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -		endpoint->kobj = kobj;
 -	else
 -		kobject_put(kobj);
-+	create_endpoint_class_device(parent, endpoint, udev);
++	/* fun calculation to determine the minor of this endpoint */
++	minor = (((udev->bus->busnum - 1) * 128) * 16) + (udev->devnum - 1);
++
++	ep_dev->desc = &endpoint->desc;
++	ep_dev->udev = udev;
++	ep_dev->dev.devt = MKDEV(442, minor);	// FIXME fake number...
++	ep_dev->dev.class = ep_class->class;
++	ep_dev->dev.parent = parent;
++	ep_dev->dev.release = ep_device_release;
++	snprintf(ep_dev->dev.bus_id, BUS_ID_SIZE, "usbdev%d.%d_ep%02x",
++		 udev->bus->busnum, udev->devnum,
++		 endpoint->desc.bEndpointAddress);
++
++	retval = device_register(&ep_dev->dev);
++	if (retval)
++		goto error;
++	sysfs_create_group(&ep_dev->dev.kobj, &ep_dev_attr_grp);
++
++	endpoint->ep_dev = ep_dev;
 +
 +	/* create the symlink to the old-style "ep_XX" directory */
 +	sprintf(name, "ep_%02x", endpoint->desc.bEndpointAddress);
 +	sysfs_create_link(&parent->kobj, &endpoint->ep_dev->dev.kobj, name);
++
++exit:
++	return;
++error:
++	kfree(ep_dev);
++	goto exit;
  }
  
  void usb_remove_ep_files(struct usb_host_endpoint *endpoint)
