@@ -1,0 +1,122 @@
+From zaitcev@redhat.com Fri Jun  9 20:10:27 2006
+Date: Fri, 9 Jun 2006 20:10:10 -0700
+From: Pete Zaitcev <zaitcev@redhat.com>
+To: greg@kroah.com
+Cc: zaitcev@redhat.com, linux-usb-devel@lists.sourceforge.net
+Subject: USB: update usbmon, fix glued lines
+Message-Id: <20060609201010.2ae8d733.zaitcev@redhat.com>
+
+This update contains one bug fix: some lines can come out truncated,
+because of the safety cutoff. This happened because I forgot to update
+the size when status packets began to be printed.
+
+The rest is:
+ - Comments updates
+ - Allow snooping with pkmap on x86_64, which is cache-coherent
+ - Enlarge event buffers (certainly we can have a couple of pages)
+ - Add event counter
+
+First touch upon usbmon for 2.6.18.
+
+Signed-off-by: Pete Zaitcev <zaitcev@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ drivers/usb/mon/mon_dma.c  |    5 ++++-
+ drivers/usb/mon/mon_main.c |    3 ++-
+ drivers/usb/mon/mon_stat.c |    4 ++--
+ drivers/usb/mon/mon_text.c |    9 ++++++---
+ drivers/usb/mon/usb_mon.h  |    1 +
+ 5 files changed, 15 insertions(+), 7 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/mon/mon_dma.c
++++ gregkh-2.6/drivers/usb/mon/mon_dma.c
+@@ -13,7 +13,10 @@
+ #include <linux/usb.h>	/* Only needed for declarations in usb_mon.h */
+ #include "usb_mon.h"
+ 
+-#ifdef __i386__		/* CONFIG_ARCH_I386 does not exit */
++/*
++ * PC-compatibles, are, fortunately, sufficiently cache-coherent for this.
++ */
++#if defined(__i386__) || defined(__x86_64__) /* CONFIG_ARCH_I386 doesn't exit */
+ #define MON_HAS_UNMAP 1
+ 
+ #define phys_to_page(phys)	pfn_to_page((phys) >> PAGE_SHIFT)
+--- gregkh-2.6.orig/drivers/usb/mon/mon_main.c
++++ gregkh-2.6/drivers/usb/mon/mon_main.c
+@@ -97,6 +97,7 @@ static void mon_submit(struct usb_bus *u
+ 	if (mbus->nreaders == 0)
+ 		goto out_locked;
+ 
++	mbus->cnt_events++;
+ 	list_for_each (pos, &mbus->r_list) {
+ 		r = list_entry(pos, struct mon_reader, r_link);
+ 		r->rnf_submit(r->r_data, urb);
+@@ -152,6 +153,7 @@ static void mon_complete(struct usb_bus 
+ 	}
+ 
+ 	spin_lock_irqsave(&mbus->lock, flags);
++	mbus->cnt_events++;
+ 	list_for_each (pos, &mbus->r_list) {
+ 		r = list_entry(pos, struct mon_reader, r_link);
+ 		r->rnf_complete(r->r_data, urb);
+@@ -163,7 +165,6 @@ static void mon_complete(struct usb_bus 
+ 
+ /*
+  * Stop monitoring.
+- * Obviously this must be well locked, so no need to play with mb's.
+  */
+ static void mon_stop(struct mon_bus *mbus)
+ {
+--- gregkh-2.6.orig/drivers/usb/mon/mon_stat.c
++++ gregkh-2.6/drivers/usb/mon/mon_stat.c
+@@ -31,8 +31,8 @@ static int mon_stat_open(struct inode *i
+ 	mbus = inode->u.generic_ip;
+ 
+ 	sp->slen = snprintf(sp->str, STAT_BUF_SIZE,
+-	    "nreaders %d text_lost %u\n",
+-	    mbus->nreaders, mbus->cnt_text_lost);
++	    "nreaders %d events %u text_lost %u\n",
++	    mbus->nreaders, mbus->cnt_events, mbus->cnt_text_lost);
+ 
+ 	file->private_data = sp;
+ 	return 0;
+--- gregkh-2.6.orig/drivers/usb/mon/mon_text.c
++++ gregkh-2.6/drivers/usb/mon/mon_text.c
+@@ -26,10 +26,13 @@
+ 
+ /*
+  * This limit exists to prevent OOMs when the user process stops reading.
++ * If usbmon were available to unprivileged processes, it might be open
++ * to a local DoS. But we have to keep to root in order to prevent
++ * password sniffing from HID devices.
+  */
+-#define EVENT_MAX  25
++#define EVENT_MAX  (2*PAGE_SIZE / sizeof(struct mon_event_text))
+ 
+-#define PRINTF_DFL  130
++#define PRINTF_DFL  160
+ 
+ struct mon_event_text {
+ 	struct list_head e_link;
+@@ -111,7 +114,7 @@ static inline char mon_text_get_data(str
+ 	 * number of corner cases, but it seems that the following is
+ 	 * more or less safe.
+ 	 *
+-	 * We do not even try to look transfer_buffer, because it can
++	 * We do not even try to look at transfer_buffer, because it can
+ 	 * contain non-NULL garbage in case the upper level promised to
+ 	 * set DMA for the HCD.
+ 	 */
+--- gregkh-2.6.orig/drivers/usb/mon/usb_mon.h
++++ gregkh-2.6/drivers/usb/mon/usb_mon.h
+@@ -27,6 +27,7 @@ struct mon_bus {
+ 	struct kref ref;		/* Under mon_lock */
+ 
+ 	/* Stats */
++	unsigned int cnt_events;
+ 	unsigned int cnt_text_lost;
+ };
+ 
