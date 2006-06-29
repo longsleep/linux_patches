@@ -1,11 +1,827 @@
 ---
+ drivers/infiniband/ulp/ipoib/ipoib_main.c |   33 +--
+ drivers/infiniband/ulp/ipoib/ipoib_vlan.c |   11 -
+ drivers/infiniband/ulp/iser/iscsi_iser.c  |    1 
+ drivers/net/bonding/bond_sysfs.c          |  271 ++++++++++++++++++------------
  drivers/net/wireless/hostap/hostap_main.c |    2 
  drivers/net/wireless/orinoco.c            |    4 
+ drivers/net/wireless/orinoco_cs.c         |    2 
+ drivers/net/wireless/spectrum_cs.c        |    2 
  include/linux/netdevice.h                 |    5 
- net/core/dev.c                            |    6 -
- net/core/net-sysfs.c                      |  175 +++++++++++++++---------------
- 5 files changed, 102 insertions(+), 90 deletions(-)
+ net/bridge/br_if.c                        |    2 
+ net/bridge/br_sysfs_br.c                  |  234 ++++++++++++++-----------
+ net/bridge/br_sysfs_if.c                  |    2 
+ net/core/dev.c                            |    6 
+ net/core/net-sysfs.c                      |  175 ++++++++++---------
+ 14 files changed, 417 insertions(+), 333 deletions(-)
 
+--- gregkh-2.6.orig/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ gregkh-2.6/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@ -925,16 +925,17 @@ struct ipoib_dev_priv *ipoib_intf_alloc(
+ 	return netdev_priv(dev);
+ }
+ 
+-static ssize_t show_pkey(struct class_device *cdev, char *buf)
++static ssize_t show_pkey(struct device *dev,
++			 struct device_attribute *attr, char *buf)
+ {
+-	struct ipoib_dev_priv *priv =
+-		netdev_priv(container_of(cdev, struct net_device, class_dev));
++	struct ipoib_dev_priv *priv = netdev_priv(to_net_dev(dev));
+ 
+ 	return sprintf(buf, "0x%04x\n", priv->pkey);
+ }
+-static CLASS_DEVICE_ATTR(pkey, S_IRUGO, show_pkey, NULL);
++static DEVICE_ATTR(pkey, S_IRUGO, show_pkey, NULL);
+ 
+-static ssize_t create_child(struct class_device *cdev,
++static ssize_t create_child(struct device *dev,
++			    struct device_attribute *attr,
+ 			    const char *buf, size_t count)
+ {
+ 	int pkey;
+@@ -952,14 +953,14 @@ static ssize_t create_child(struct class
+ 	 */
+ 	pkey |= 0x8000;
+ 
+-	ret = ipoib_vlan_add(container_of(cdev, struct net_device, class_dev),
+-			     pkey);
++	ret = ipoib_vlan_add(to_net_dev(dev), pkey);
+ 
+ 	return ret ? ret : count;
+ }
+-static CLASS_DEVICE_ATTR(create_child, S_IWUGO, NULL, create_child);
++static DEVICE_ATTR(create_child, S_IWUGO, NULL, create_child);
+ 
+-static ssize_t delete_child(struct class_device *cdev,
++static ssize_t delete_child(struct device *dev,
++			    struct device_attribute *attr,
+ 			    const char *buf, size_t count)
+ {
+ 	int pkey;
+@@ -971,18 +972,16 @@ static ssize_t delete_child(struct class
+ 	if (pkey < 0 || pkey > 0xffff)
+ 		return -EINVAL;
+ 
+-	ret = ipoib_vlan_delete(container_of(cdev, struct net_device, class_dev),
+-				pkey);
++	ret = ipoib_vlan_delete(to_net_dev(dev), pkey);
+ 
+ 	return ret ? ret : count;
+ 
+ }
+-static CLASS_DEVICE_ATTR(delete_child, S_IWUGO, NULL, delete_child);
++static DEVICE_ATTR(delete_child, S_IWUGO, NULL, delete_child);
+ 
+ int ipoib_add_pkey_attr(struct net_device *dev)
+ {
+-	return class_device_create_file(&dev->class_dev,
+-					&class_device_attr_pkey);
++	return device_create_file(&dev->dev, &dev_attr_pkey);
+ }
+ 
+ static struct net_device *ipoib_add_port(const char *format,
+@@ -1050,11 +1049,9 @@ static struct net_device *ipoib_add_port
+ 
+ 	if (ipoib_add_pkey_attr(priv->dev))
+ 		goto sysfs_failed;
+-	if (class_device_create_file(&priv->dev->class_dev,
+-				     &class_device_attr_create_child))
++	if (device_create_file(&priv->dev->dev, &dev_attr_create_child))
+ 		goto sysfs_failed;
+-	if (class_device_create_file(&priv->dev->class_dev,
+-				     &class_device_attr_delete_child))
++	if (device_create_file(&priv->dev->dev, &dev_attr_delete_child))
+ 		goto sysfs_failed;
+ 
+ 	return priv->dev;
+--- gregkh-2.6.orig/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
++++ gregkh-2.6/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+@@ -42,15 +42,15 @@
+ 
+ #include "ipoib.h"
+ 
+-static ssize_t show_parent(struct class_device *class_dev, char *buf)
++static ssize_t show_parent(struct device *d, struct device_attribute *attr,
++			   char *buf)
+ {
+-	struct net_device *dev =
+-		container_of(class_dev, struct net_device, class_dev);
++	struct net_device *dev = to_net_dev(d);
+ 	struct ipoib_dev_priv *priv = netdev_priv(dev);
+ 
+ 	return sprintf(buf, "%s\n", priv->parent->name);
+ }
+-static CLASS_DEVICE_ATTR(parent, S_IRUGO, show_parent, NULL);
++static DEVICE_ATTR(parent, S_IRUGO, show_parent, NULL);
+ 
+ int ipoib_vlan_add(struct net_device *pdev, unsigned short pkey)
+ {
+@@ -118,8 +118,7 @@ int ipoib_vlan_add(struct net_device *pd
+ 	if (ipoib_add_pkey_attr(priv->dev))
+ 		goto sysfs_failed;
+ 
+-	if (class_device_create_file(&priv->dev->class_dev,
+-				     &class_device_attr_parent))
++	if (device_create_file(&priv->dev->dev, &dev_attr_parent))
+ 		goto sysfs_failed;
+ 
+ 	list_add_tail(&priv->list, &ppriv->child_intfs);
+--- gregkh-2.6.orig/drivers/infiniband/ulp/iser/iscsi_iser.c
++++ gregkh-2.6/drivers/infiniband/ulp/iser/iscsi_iser.c
+@@ -54,7 +54,6 @@
+ #include <linux/blkdev.h>
+ #include <linux/init.h>
+ #include <linux/ioctl.h>
+-#include <linux/devfs_fs_kernel.h>
+ #include <linux/cdev.h>
+ #include <linux/in.h>
+ #include <linux/net.h>
+--- gregkh-2.6.orig/drivers/net/bonding/bond_sysfs.c
++++ gregkh-2.6/drivers/net/bonding/bond_sysfs.c
+@@ -40,8 +40,7 @@
+ 
+ /* #define BONDING_DEBUG 1 */
+ #include "bonding.h"
+-#define to_class_dev(obj) container_of(obj,struct class_device,kobj)
+-#define to_net_dev(class) container_of(class, struct net_device, class_dev)
++#define to_dev(obj)	container_of(obj,struct device,kobj)
+ #define to_bond(cd)	((struct bonding *)(to_net_dev(cd)->priv))
+ 
+ /*---------------------------- Declarations -------------------------------*/
+@@ -154,7 +153,7 @@ static ssize_t bonding_store_bonds(struc
+ 				 * If it's > expected, then there's a file open,
+ 				 * and we have to fail.
+ 				 */
+-				if (atomic_read(&bond->dev->class_dev.kobj.kref.refcount)
++				if (atomic_read(&bond->dev->dev.kobj.kref.refcount)
+ 							> expected_refcount){
+ 					rtnl_unlock();
+ 					printk(KERN_INFO DRV_NAME
+@@ -201,13 +200,13 @@ int bond_create_slave_symlinks(struct ne
+ 	int ret = 0;
+ 
+ 	/* first, create a link from the slave back to the master */
+-	ret = sysfs_create_link(&(slave->class_dev.kobj), &(master->class_dev.kobj),
++	ret = sysfs_create_link(&(slave->dev.kobj), &(master->dev.kobj),
+ 				"master");
+ 	if (ret)
+ 		return ret;
+ 	/* next, create a link from the master to the slave */
+ 	sprintf(linkname,"slave_%s",slave->name);
+-	ret = sysfs_create_link(&(master->class_dev.kobj), &(slave->class_dev.kobj),
++	ret = sysfs_create_link(&(master->dev.kobj), &(slave->dev.kobj),
+ 				linkname);
+ 	return ret;
+ 
+@@ -217,20 +216,21 @@ void bond_destroy_slave_symlinks(struct 
+ {
+ 	char linkname[IFNAMSIZ+7];
+ 
+-	sysfs_remove_link(&(slave->class_dev.kobj), "master");
++	sysfs_remove_link(&(slave->dev.kobj), "master");
+ 	sprintf(linkname,"slave_%s",slave->name);
+-	sysfs_remove_link(&(master->class_dev.kobj), linkname);
++	sysfs_remove_link(&(master->dev.kobj), linkname);
+ }
+ 
+ 
+ /*
+  * Show the slaves in the current bond.
+  */
+-static ssize_t bonding_show_slaves(struct class_device *cd, char *buf)
++static ssize_t bonding_show_slaves(struct device *d,
++				   struct device_attribute *attr, char *buf)
+ {
+ 	struct slave *slave;
+ 	int i, res = 0;
+-	struct bonding *bond = to_bond(cd);
++	struct bonding *bond = to_bond(d);
+ 
+ 	read_lock_bh(&bond->lock);
+ 	bond_for_each_slave(bond, slave, i) {
+@@ -254,14 +254,16 @@ static ssize_t bonding_show_slaves(struc
+  * up for this to succeed.
+  * This function is largely the same flow as bonding_update_bonds().
+  */
+-static ssize_t bonding_store_slaves(struct class_device *cd, const char *buffer, size_t count)
++static ssize_t bonding_store_slaves(struct device *d,
++				    struct device_attribute *attr,
++				    const char *buffer, size_t count)
+ {
+ 	char command[IFNAMSIZ + 1] = { 0, };
+ 	char *ifname;
+ 	int i, res, found, ret = count;
+ 	struct slave *slave;
+ 	struct net_device *dev = NULL;
+-	struct bonding *bond = to_bond(cd);
++	struct bonding *bond = to_bond(d);
+ 
+ 	/* Quick sanity check -- is the bond interface up? */
+ 	if (!(bond->dev->flags & IFF_UP)) {
+@@ -387,25 +389,28 @@ out:
+ 	return ret;
+ }
+ 
+-static CLASS_DEVICE_ATTR(slaves, S_IRUGO | S_IWUSR, bonding_show_slaves, bonding_store_slaves);
++static DEVICE_ATTR(slaves, S_IRUGO | S_IWUSR, bonding_show_slaves, bonding_store_slaves);
+ 
+ /*
+  * Show and set the bonding mode.  The bond interface must be down to
+  * change the mode.
+  */
+-static ssize_t bonding_show_mode(struct class_device *cd, char *buf)
++static ssize_t bonding_show_mode(struct device *d,
++				 struct device_attribute *attr, char *buf)
+ {
+-	struct bonding *bond = to_bond(cd);
++	struct bonding *bond = to_bond(d);
+ 
+ 	return sprintf(buf, "%s %d\n",
+ 			bond_mode_tbl[bond->params.mode].modename,
+ 			bond->params.mode) + 1;
+ }
+ 
+-static ssize_t bonding_store_mode(struct class_device *cd, const char *buf, size_t count)
++static ssize_t bonding_store_mode(struct device *d,
++				  struct device_attribute *attr,
++				  const char *buf, size_t count)
+ {
+ 	int new_value, ret = count;
+-	struct bonding *bond = to_bond(cd);
++	struct bonding *bond = to_bond(d);
+ 
+ 	if (bond->dev->flags & IFF_UP) {
+ 		printk(KERN_ERR DRV_NAME
+@@ -438,16 +443,18 @@ static ssize_t bonding_store_mode(struct
+ out:
+ 	return ret;
+ }
+-static CLASS_DEVICE_ATTR(mode, S_IRUGO | S_IWUSR, bonding_show_mode, bonding_store_mode);
++static DEVICE_ATTR(mode, S_IRUGO | S_IWUSR, bonding_show_mode, bonding_store_mode);
+ 
+ /*
+  * Show and set the bonding transmit hash method.  The bond interface must be down to
+  * change the xmit hash policy.
+  */
+-static ssize_t bonding_show_xmit_hash(struct class_device *cd, char *buf)
++static ssize_t bonding_show_xmit_hash(struct device *d,
++				      struct device_attribute *attr,
++				      char *buf)
+ {
+ 	int count;
+-	struct bonding *bond = to_bond(cd);
++	struct bonding *bond = to_bond(d);
+ 
+ 	if ((bond->params.mode != BOND_MODE_XOR) &&
+ 	    (bond->params.mode != BOND_MODE_8023AD)) {
+@@ -462,10 +469,12 @@ static ssize_t bonding_show_xmit_hash(st
+ 	return count;
+ }
+ 
+-static ssize_t bonding_store_xmit_hash(struct class_device *cd, const char *buf, size_t count)
++static ssize_t bonding_store_xmit_hash(struct device *d,
++				       struct device_attribute *attr,
++				       const char *buf, size_t count)
+ {
+ 	int new_value, ret = count;
+-	struct bonding *bond = to_bond(cd);
++	struct bonding *bond = to_bond(d);
+ 
+ 	if (bond->dev->flags & IFF_UP) {
+ 		printk(KERN_ERR DRV_NAME
+@@ -501,7 +510,7 @@ static ssize_t bonding_store_xmit_hash(s
+ out:
+ 	return ret;
+ }
+-static CLASS_DEVICE_ATTR(xmit_hash_policy, S_IRUGO | S_IWUSR, bonding_show_xmit_hash, bonding_store_xmit_hash);
++static DEVICE_ATTR(xmit_hash_policy, S_IRUGO | S_IWUSR, bonding_show_xmit_hash, bonding_store_xmit_hash);
+ 
+ /*
+  * Show and set the arp timer interval.  There are two tricky bits
+@@ -509,17 +518,21 @@ static CLASS_DEVICE_ATTR(xmit_hash_polic
+  * MII monitoring.  Second, if the ARP timer isn't running, we must
+  * start it.
+  */
+-static ssize_t bonding_show_arp_interval(struct class_device *cd, char *buf)
++static ssize_t bonding_show_arp_interval(struct device *d,
++					 struct device_attribute *attr,
++					 char *buf)
+ {
+-	struct bonding *bond = to_bond(cd);
++	struct bonding *bond = to_bond(d);
+ 
+ 	return sprintf(buf, "%d\n", bond->params.arp_interval) + 1;
+ }
+ 
+-static ssize_t bonding_store_arp_interval(struct class_device *cd, const char *buf, size_t count)
++static ssize_t bonding_store_arp_interval(struct device *d,
++					  struct device_attribute *attr,
++					  const char *buf, size_t count)
+ {
+ 	int new_value, ret = count;
+-	struct bonding *bond = to_bond(cd);
++	struct bonding *bond = to_bond(d);
+ 
+ 	if (sscanf(buf, "%d", &new_value) != 1) {
+ 		printk(KERN_ERR DRV_NAME
+@@ -591,15 +604,17 @@ static ssize_t bonding_store_arp_interva
+ out:
+ 	return ret;
+ }
+-static CLASS_DEVICE_ATTR(arp_interval, S_IRUGO | S_IWUSR , bonding_show_arp_interval, bonding_store_arp_interval);
++static DEVICE_ATTR(arp_interval, S_IRUGO | S_IWUSR , bonding_show_arp_interval, bonding_store_arp_interval);
+ 
+ /*
+  * Show and set the arp targets.
+  */
+-static ssize_t bonding_show_arp_targets(struct class_device *cd, char *buf)
++static ssize_t bonding_show_arp_targets(struct device *d,
++					struct device_attribute *attr,
++					char *buf)
+ {
+ 	int i, res = 0;
+-	struct bonding *bond = to_bond(cd);
++	struct bonding *bond = to_bond(d);
+ 
+ 	for (i = 0; i < BOND_MAX_ARP_TARGETS; i++) {
+ 		if (bond->params.arp_targets[i])
+@@ -613,11 +628,13 @@ static ssize_t bonding_show_arp_targets(
+ 	return res;
+ }
+ 
+-static ssize_t bonding_store_arp_targets(struct class_device *cd, const char *buf, size_t count)
++static ssize_t bonding_store_arp_targets(struct device *d,
++					 struct device_attribute *attr,
++					 const char *buf, size_t count)
+ {
+ 	u32 newtarget;
+ 	int i = 0, done = 0, ret = count;
+-	struct bonding *bond = to_bond(cd);
++	struct bonding *bond = to_bond(d);
+ 	u32 *targets;
+ 
+ 	targets = bond->params.arp_targets;
+@@ -695,24 +712,28 @@ static ssize_t bonding_store_arp_targets
+ out:
+ 	return ret;
+ }
+-static CLASS_DEVICE_ATTR(arp_ip_target, S_IRUGO | S_IWUSR , bonding_show_arp_targets, bonding_store_arp_targets);
++static DEVICE_ATTR(arp_ip_target, S_IRUGO | S_IWUSR , bonding_show_arp_targets, bonding_store_arp_targets);
+ 
+ /*
+  * Show and set the up and down delays.  These must be multiples of the
+  * MII monitoring value, and are stored internally as the multiplier.
+  * Thus, we must translate to MS for the real world.
+  */
+-static ssize_t bonding_show_downdelay(struct class_device *cd, char *buf)
++static ssize_t bonding_show_downdelay(struct device *d,
++				      struct device_attribute *attr,
++				      char *buf)
+ {
+-	struct bonding *bond = to_bond(cd);
++	struct bonding *bond = to_bond(d);
+ 
+ 	return sprintf(buf, "%d\n", bond->params.downdelay * bond->params.miimon) + 1;
+ }
+ 
+-static ssize_t bonding_store_downdelay(struct class_device *cd, const char *buf, size_t count)
++static ssize_t bonding_store_downdelay(struct device *d,
++				       struct device_attribute *attr,
++				       const char *buf, size_t count)
+ {
+ 	int new_value, ret = count;
+-	struct bonding *bond = to_bond(cd);
++	struct bonding *bond = to_bond(d);
+ 
+ 	if (!(bond->params.miimon)) {
+ 		printk(KERN_ERR DRV_NAME
+@@ -753,20 +774,24 @@ static ssize_t bonding_store_downdelay(s
+ out:
+ 	return ret;
+ }
+-static CLASS_DEVICE_ATTR(downdelay, S_IRUGO | S_IWUSR , bonding_show_downdelay, bonding_store_downdelay);
++static DEVICE_ATTR(downdelay, S_IRUGO | S_IWUSR , bonding_show_downdelay, bonding_store_downdelay);
+ 
+-static ssize_t bonding_show_updelay(struct class_device *cd, char *buf)
++static ssize_t bonding_show_updelay(struct device *d,
++				    struct device_attribute *attr,
++				    char *buf)
+ {
+-	struct bonding *bond = to_bond(cd);
++	struct bonding *bond = to_bond(d);
+ 
+ 	return sprintf(buf, "%d\n", bond->params.updelay * bond->params.miimon) + 1;
+ 
+ }
+ 
+-static ssize_t bonding_store_updelay(struct class_device *cd, const char *buf, size_t count)
++static ssize_t bonding_store_updelay(struct device *d,
++				     struct device_attribute *attr,
++				     const char *buf, size_t count)
+ {
+ 	int new_value, ret = count;
+-	struct bonding *bond = to_bond(cd);
++	struct bonding *bond = to_bond(d);
+ 
+ 	if (!(bond->params.miimon)) {
+ 		printk(KERN_ERR DRV_NAME
+@@ -807,25 +832,29 @@ static ssize_t bonding_store_updelay(str
+ out:
+ 	return ret;
+ }
+-static CLASS_DEVICE_ATTR(updelay, S_IRUGO | S_IWUSR , bonding_show_updelay, bonding_store_updelay);
++static DEVICE_ATTR(updelay, S_IRUGO | S_IWUSR , bonding_show_updelay, bonding_store_updelay);
+ 
+ /*
+  * Show and set the LACP interval.  Interface must be down, and the mode
+  * must be set to 802.3ad mode.
+  */
+-static ssize_t bonding_show_lacp(struct class_device *cd, char *buf)
++static ssize_t bonding_show_lacp(struct device *d,
++				 struct device_attribute *attr,
++				 char *buf)
+ {
+-	struct bonding *bond = to_bond(cd);
++	struct bonding *bond = to_bond(d);
+ 
+ 	return sprintf(buf, "%s %d\n",
+ 		bond_lacp_tbl[bond->params.lacp_fast].modename,
+ 		bond->params.lacp_fast) + 1;
+ }
+ 
+-static ssize_t bonding_store_lacp(struct class_device *cd, const char *buf, size_t count)
++static ssize_t bonding_store_lacp(struct device *d,
++				  struct device_attribute *attr,
++				  const char *buf, size_t count)
+ {
+ 	int new_value, ret = count;
+-	struct bonding *bond = to_bond(cd);
++	struct bonding *bond = to_bond(d);
+ 
+ 	if (bond->dev->flags & IFF_UP) {
+ 		printk(KERN_ERR DRV_NAME
+@@ -859,7 +888,7 @@ static ssize_t bonding_store_lacp(struct
+ out:
+ 	return ret;
+ }
+-static CLASS_DEVICE_ATTR(lacp_rate, S_IRUGO | S_IWUSR, bonding_show_lacp, bonding_store_lacp);
++static DEVICE_ATTR(lacp_rate, S_IRUGO | S_IWUSR, bonding_show_lacp, bonding_store_lacp);
+ 
+ /*
+  * Show and set the MII monitor interval.  There are two tricky bits
+@@ -867,17 +896,21 @@ static CLASS_DEVICE_ATTR(lacp_rate, S_IR
+  * ARP monitoring.  Second, if the timer isn't running, we must
+  * start it.
+  */
+-static ssize_t bonding_show_miimon(struct class_device *cd, char *buf)
++static ssize_t bonding_show_miimon(struct device *d,
++				   struct device_attribute *attr,
++				   char *buf)
+ {
+-	struct bonding *bond = to_bond(cd);
++	struct bonding *bond = to_bond(d);
+ 
+ 	return sprintf(buf, "%d\n", bond->params.miimon) + 1;
+ }
+ 
+-static ssize_t bonding_store_miimon(struct class_device *cd, const char *buf, size_t count)
++static ssize_t bonding_store_miimon(struct device *d,
++				    struct device_attribute *attr,
++				    const char *buf, size_t count)
+ {
+ 	int new_value, ret = count;
+-	struct bonding *bond = to_bond(cd);
++	struct bonding *bond = to_bond(d);
+ 
+ 	if (sscanf(buf, "%d", &new_value) != 1) {
+ 		printk(KERN_ERR DRV_NAME
+@@ -948,7 +981,7 @@ static ssize_t bonding_store_miimon(stru
+ out:
+ 	return ret;
+ }
+-static CLASS_DEVICE_ATTR(miimon, S_IRUGO | S_IWUSR, bonding_show_miimon, bonding_store_miimon);
++static DEVICE_ATTR(miimon, S_IRUGO | S_IWUSR, bonding_show_miimon, bonding_store_miimon);
+ 
+ /*
+  * Show and set the primary slave.  The store function is much
+@@ -957,10 +990,12 @@ static CLASS_DEVICE_ATTR(miimon, S_IRUGO
+  * The bond must be a mode that supports a primary for this be
+  * set.
+  */
+-static ssize_t bonding_show_primary(struct class_device *cd, char *buf)
++static ssize_t bonding_show_primary(struct device *d,
++				    struct device_attribute *attr,
++				    char *buf)
+ {
+ 	int count = 0;
+-	struct bonding *bond = to_bond(cd);
++	struct bonding *bond = to_bond(d);
+ 
+ 	if (bond->primary_slave)
+ 		count = sprintf(buf, "%s\n", bond->primary_slave->dev->name) + 1;
+@@ -970,11 +1005,13 @@ static ssize_t bonding_show_primary(stru
+ 	return count;
+ }
+ 
+-static ssize_t bonding_store_primary(struct class_device *cd, const char *buf, size_t count)
++static ssize_t bonding_store_primary(struct device *d,
++				     struct device_attribute *attr,
++				     const char *buf, size_t count)
+ {
+ 	int i;
+ 	struct slave *slave;
+-	struct bonding *bond = to_bond(cd);
++	struct bonding *bond = to_bond(d);
+ 
+ 	write_lock_bh(&bond->lock);
+ 	if (!USES_PRIMARY(bond->params.mode)) {
+@@ -1013,22 +1050,26 @@ out:
+ 	write_unlock_bh(&bond->lock);
+ 	return count;
+ }
+-static CLASS_DEVICE_ATTR(primary, S_IRUGO | S_IWUSR, bonding_show_primary, bonding_store_primary);
++static DEVICE_ATTR(primary, S_IRUGO | S_IWUSR, bonding_show_primary, bonding_store_primary);
+ 
+ /*
+  * Show and set the use_carrier flag.
+  */
+-static ssize_t bonding_show_carrier(struct class_device *cd, char *buf)
++static ssize_t bonding_show_carrier(struct device *d,
++				    struct device_attribute *attr,
++				    char *buf)
+ {
+-	struct bonding *bond = to_bond(cd);
++	struct bonding *bond = to_bond(d);
+ 
+ 	return sprintf(buf, "%d\n", bond->params.use_carrier) + 1;
+ }
+ 
+-static ssize_t bonding_store_carrier(struct class_device *cd, const char *buf, size_t count)
++static ssize_t bonding_store_carrier(struct device *d,
++				     struct device_attribute *attr,
++				     const char *buf, size_t count)
+ {
+ 	int new_value, ret = count;
+-	struct bonding *bond = to_bond(cd);
++	struct bonding *bond = to_bond(d);
+ 
+ 
+ 	if (sscanf(buf, "%d", &new_value) != 1) {
+@@ -1050,16 +1091,18 @@ static ssize_t bonding_store_carrier(str
+ out:
+ 	return count;
+ }
+-static CLASS_DEVICE_ATTR(use_carrier, S_IRUGO | S_IWUSR, bonding_show_carrier, bonding_store_carrier);
++static DEVICE_ATTR(use_carrier, S_IRUGO | S_IWUSR, bonding_show_carrier, bonding_store_carrier);
+ 
+ 
+ /*
+  * Show and set currently active_slave.
+  */
+-static ssize_t bonding_show_active_slave(struct class_device *cd, char *buf)
++static ssize_t bonding_show_active_slave(struct device *d,
++					 struct device_attribute *attr,
++					 char *buf)
+ {
+ 	struct slave *curr;
+-	struct bonding *bond = to_bond(cd);
++	struct bonding *bond = to_bond(d);
+ 	int count;
+ 
+ 
+@@ -1074,13 +1117,15 @@ static ssize_t bonding_show_active_slave
+ 	return count;
+ }
+ 
+-static ssize_t bonding_store_active_slave(struct class_device *cd, const char *buf, size_t count)
++static ssize_t bonding_store_active_slave(struct device *d,
++					  struct device_attribute *attr,
++					  const char *buf, size_t count)
+ {
+ 	int i;
+ 	struct slave *slave;
+         struct slave *old_active = NULL;
+         struct slave *new_active = NULL;
+-	struct bonding *bond = to_bond(cd);
++	struct bonding *bond = to_bond(d);
+ 
+ 	write_lock_bh(&bond->lock);
+ 	if (!USES_PRIMARY(bond->params.mode)) {
+@@ -1142,16 +1187,18 @@ out:
+ 	return count;
+ 
+ }
+-static CLASS_DEVICE_ATTR(active_slave, S_IRUGO | S_IWUSR, bonding_show_active_slave, bonding_store_active_slave);
++static DEVICE_ATTR(active_slave, S_IRUGO | S_IWUSR, bonding_show_active_slave, bonding_store_active_slave);
+ 
+ 
+ /*
+  * Show link status of the bond interface.
+  */
+-static ssize_t bonding_show_mii_status(struct class_device *cd, char *buf)
++static ssize_t bonding_show_mii_status(struct device *d,
++				       struct device_attribute *attr,
++				       char *buf)
+ {
+ 	struct slave *curr;
+-	struct bonding *bond = to_bond(cd);
++	struct bonding *bond = to_bond(d);
+ 
+ 	read_lock(&bond->curr_slave_lock);
+ 	curr = bond->curr_active_slave;
+@@ -1159,16 +1206,18 @@ static ssize_t bonding_show_mii_status(s
+ 
+ 	return sprintf(buf, "%s\n", (curr) ? "up" : "down") + 1;
+ }
+-static CLASS_DEVICE_ATTR(mii_status, S_IRUGO, bonding_show_mii_status, NULL);
++static DEVICE_ATTR(mii_status, S_IRUGO, bonding_show_mii_status, NULL);
+ 
+ 
+ /*
+  * Show current 802.3ad aggregator ID.
+  */
+-static ssize_t bonding_show_ad_aggregator(struct class_device *cd, char *buf)
++static ssize_t bonding_show_ad_aggregator(struct device *d,
++					  struct device_attribute *attr,
++					  char *buf)
+ {
+ 	int count = 0;
+-	struct bonding *bond = to_bond(cd);
++	struct bonding *bond = to_bond(d);
+ 
+ 	if (bond->params.mode == BOND_MODE_8023AD) {
+ 		struct ad_info ad_info;
+@@ -1179,16 +1228,18 @@ static ssize_t bonding_show_ad_aggregato
+ 
+ 	return count;
+ }
+-static CLASS_DEVICE_ATTR(ad_aggregator, S_IRUGO, bonding_show_ad_aggregator, NULL);
++static DEVICE_ATTR(ad_aggregator, S_IRUGO, bonding_show_ad_aggregator, NULL);
+ 
+ 
+ /*
+  * Show number of active 802.3ad ports.
+  */
+-static ssize_t bonding_show_ad_num_ports(struct class_device *cd, char *buf)
++static ssize_t bonding_show_ad_num_ports(struct device *d,
++					 struct device_attribute *attr,
++					 char *buf)
+ {
+ 	int count = 0;
+-	struct bonding *bond = to_bond(cd);
++	struct bonding *bond = to_bond(d);
+ 
+ 	if (bond->params.mode == BOND_MODE_8023AD) {
+ 		struct ad_info ad_info;
+@@ -1199,16 +1250,18 @@ static ssize_t bonding_show_ad_num_ports
+ 
+ 	return count;
+ }
+-static CLASS_DEVICE_ATTR(ad_num_ports, S_IRUGO, bonding_show_ad_num_ports, NULL);
++static DEVICE_ATTR(ad_num_ports, S_IRUGO, bonding_show_ad_num_ports, NULL);
+ 
+ 
+ /*
+  * Show current 802.3ad actor key.
+  */
+-static ssize_t bonding_show_ad_actor_key(struct class_device *cd, char *buf)
++static ssize_t bonding_show_ad_actor_key(struct device *d,
++					 struct device_attribute *attr,
++					 char *buf)
+ {
+ 	int count = 0;
+-	struct bonding *bond = to_bond(cd);
++	struct bonding *bond = to_bond(d);
+ 
+ 	if (bond->params.mode == BOND_MODE_8023AD) {
+ 		struct ad_info ad_info;
+@@ -1219,16 +1272,18 @@ static ssize_t bonding_show_ad_actor_key
+ 
+ 	return count;
+ }
+-static CLASS_DEVICE_ATTR(ad_actor_key, S_IRUGO, bonding_show_ad_actor_key, NULL);
++static DEVICE_ATTR(ad_actor_key, S_IRUGO, bonding_show_ad_actor_key, NULL);
+ 
+ 
+ /*
+  * Show current 802.3ad partner key.
+  */
+-static ssize_t bonding_show_ad_partner_key(struct class_device *cd, char *buf)
++static ssize_t bonding_show_ad_partner_key(struct device *d,
++					   struct device_attribute *attr,
++					   char *buf)
+ {
+ 	int count = 0;
+-	struct bonding *bond = to_bond(cd);
++	struct bonding *bond = to_bond(d);
+ 
+ 	if (bond->params.mode == BOND_MODE_8023AD) {
+ 		struct ad_info ad_info;
+@@ -1239,16 +1294,18 @@ static ssize_t bonding_show_ad_partner_k
+ 
+ 	return count;
+ }
+-static CLASS_DEVICE_ATTR(ad_partner_key, S_IRUGO, bonding_show_ad_partner_key, NULL);
++static DEVICE_ATTR(ad_partner_key, S_IRUGO, bonding_show_ad_partner_key, NULL);
+ 
+ 
+ /*
+  * Show current 802.3ad partner mac.
+  */
+-static ssize_t bonding_show_ad_partner_mac(struct class_device *cd, char *buf)
++static ssize_t bonding_show_ad_partner_mac(struct device *d,
++					   struct device_attribute *attr,
++					   char *buf)
+ {
+ 	int count = 0;
+-	struct bonding *bond = to_bond(cd);
++	struct bonding *bond = to_bond(d);
+ 
+ 	if (bond->params.mode == BOND_MODE_8023AD) {
+ 		struct ad_info ad_info;
+@@ -1267,29 +1324,29 @@ static ssize_t bonding_show_ad_partner_m
+ 
+ 	return count;
+ }
+-static CLASS_DEVICE_ATTR(ad_partner_mac, S_IRUGO, bonding_show_ad_partner_mac, NULL);
++static DEVICE_ATTR(ad_partner_mac, S_IRUGO, bonding_show_ad_partner_mac, NULL);
+ 
+ 
+ 
+ static struct attribute *per_bond_attrs[] = {
+-	&class_device_attr_slaves.attr,
+-	&class_device_attr_mode.attr,
+-	&class_device_attr_arp_interval.attr,
+-	&class_device_attr_arp_ip_target.attr,
+-	&class_device_attr_downdelay.attr,
+-	&class_device_attr_updelay.attr,
+-	&class_device_attr_lacp_rate.attr,
+-	&class_device_attr_xmit_hash_policy.attr,
+-	&class_device_attr_miimon.attr,
+-	&class_device_attr_primary.attr,
+-	&class_device_attr_use_carrier.attr,
+-	&class_device_attr_active_slave.attr,
+-	&class_device_attr_mii_status.attr,
+-	&class_device_attr_ad_aggregator.attr,
+-	&class_device_attr_ad_num_ports.attr,
+-	&class_device_attr_ad_actor_key.attr,
+-	&class_device_attr_ad_partner_key.attr,
+-	&class_device_attr_ad_partner_mac.attr,
++	&dev_attr_slaves.attr,
++	&dev_attr_mode.attr,
++	&dev_attr_arp_interval.attr,
++	&dev_attr_arp_ip_target.attr,
++	&dev_attr_downdelay.attr,
++	&dev_attr_updelay.attr,
++	&dev_attr_lacp_rate.attr,
++	&dev_attr_xmit_hash_policy.attr,
++	&dev_attr_miimon.attr,
++	&dev_attr_primary.attr,
++	&dev_attr_use_carrier.attr,
++	&dev_attr_active_slave.attr,
++	&dev_attr_mii_status.attr,
++	&dev_attr_ad_aggregator.attr,
++	&dev_attr_ad_num_ports.attr,
++	&dev_attr_ad_actor_key.attr,
++	&dev_attr_ad_partner_key.attr,
++	&dev_attr_ad_partner_mac.attr,
+ 	NULL,
+ };
+ 
+@@ -1314,7 +1371,7 @@ int bond_create_sysfs(void)
+ 	if (!firstbond)
+ 		return -ENODEV;
+ 
+-	netdev_class = firstbond->dev->class_dev.class;
++	netdev_class = firstbond->dev->dev.class;
+ 	if (!netdev_class)
+ 		return -ENODEV;
+ 
+@@ -1342,13 +1399,13 @@ int bond_create_sysfs_entry(struct bondi
+ 	struct net_device *dev = bond->dev;
+ 	int err;
+ 
+-	err = sysfs_create_group(&(dev->class_dev.kobj), &bonding_group);
++	err = sysfs_create_group(&(dev->dev.kobj), &bonding_group);
+ 	if (err) {
+ 		printk(KERN_EMERG "eek! didn't create group!\n");
+ 	}
+ 
+ 	if (expected_refcount < 1)
+-		expected_refcount = atomic_read(&bond->dev->class_dev.kobj.kref.refcount);
++		expected_refcount = atomic_read(&bond->dev->dev.kobj.kref.refcount);
+ 
+ 	return err;
+ }
+@@ -1359,6 +1416,6 @@ void bond_destroy_sysfs_entry(struct bon
+ {
+ 	struct net_device *dev = bond->dev;
+ 
+-	sysfs_remove_group(&(dev->class_dev.kobj), &bonding_group);
++	sysfs_remove_group(&(dev->dev.kobj), &bonding_group);
+ }
+ 
 --- gregkh-2.6.orig/drivers/net/wireless/hostap/hostap_main.c
 +++ gregkh-2.6/drivers/net/wireless/hostap/hostap_main.c
 @@ -85,7 +85,7 @@ struct net_device * hostap_add_interface
@@ -30,6 +846,28 @@
  			sizeof(info->bus_info) - 1);
  	else
  		snprintf(info->bus_info, sizeof(info->bus_info) - 1,
+--- gregkh-2.6.orig/drivers/net/wireless/orinoco_cs.c
++++ gregkh-2.6/drivers/net/wireless/orinoco_cs.c
+@@ -344,7 +344,7 @@ orinoco_cs_config(struct pcmcia_device *
+ 
+ 	/* Finally, report what we've done */
+ 	printk(KERN_DEBUG "%s: " DRIVER_NAME " at %s, irq %d, io "
+-	       "0x%04x-0x%04x\n", dev->name, dev->class_dev.dev->bus_id,
++	       "0x%04x-0x%04x\n", dev->name, dev->dev.parent->bus_id,
+ 	       link->irq.AssignedIRQ, link->io.BasePort1,
+ 	       link->io.BasePort1 + link->io.NumPorts1 - 1);
+ 
+--- gregkh-2.6.orig/drivers/net/wireless/spectrum_cs.c
++++ gregkh-2.6/drivers/net/wireless/spectrum_cs.c
+@@ -823,7 +823,7 @@ spectrum_cs_config(struct pcmcia_device 
+ 
+ 	/* Finally, report what we've done */
+ 	printk(KERN_DEBUG "%s: " DRIVER_NAME " at %s, irq %d, io "
+-	       "0x%04x-0x%04x\n", dev->name, dev->class_dev.dev->bus_id,
++	       "0x%04x-0x%04x\n", dev->name, dev->dev.parent->bus_id,
+ 	       link->irq.AssignedIRQ, link->io.BasePort1,
+ 	       link->io.BasePort1 + link->io.NumPorts1 - 1);
+ 
 --- gregkh-2.6.orig/include/linux/netdevice.h
 +++ gregkh-2.6/include/linux/netdevice.h
 @@ -515,10 +515,11 @@ struct net_device
@@ -54,6 +892,438 @@
  
  struct packet_type {
  	__be16			type;	/* This is really htons(ether_type). */
+--- gregkh-2.6.orig/net/bridge/br_if.c
++++ gregkh-2.6/net/bridge/br_if.c
+@@ -282,7 +282,7 @@ static struct net_bridge_port *new_nbp(s
+ 	kobject_init(&p->kobj);
+ 	kobject_set_name(&p->kobj, SYSFS_BRIDGE_PORT_ATTR);
+ 	p->kobj.ktype = &brport_ktype;
+-	p->kobj.parent = &(dev->class_dev.kobj);
++	p->kobj.parent = &(dev->dev.kobj);
+ 	p->kobj.kset = NULL;
+ 
+ 	return p;
+--- gregkh-2.6.orig/net/bridge/br_sysfs_br.c
++++ gregkh-2.6/net/bridge/br_sysfs_br.c
+@@ -21,18 +21,17 @@
+ 
+ #include "br_private.h"
+ 
+-#define to_class_dev(obj) container_of(obj,struct class_device,kobj)
+-#define to_net_dev(class) container_of(class, struct net_device, class_dev)
++#define to_dev(obj)	container_of(obj, struct device, kobj)
+ #define to_bridge(cd)	((struct net_bridge *)(to_net_dev(cd)->priv))
+ 
+ /*
+  * Common code for storing bridge parameters.
+  */
+-static ssize_t store_bridge_parm(struct class_device *cd,
++static ssize_t store_bridge_parm(struct device *d,
+ 				 const char *buf, size_t len,
+ 				 void (*set)(struct net_bridge *, unsigned long))
+ {
+-	struct net_bridge *br = to_bridge(cd);
++	struct net_bridge *br = to_bridge(d);
+ 	char *endp;
+ 	unsigned long val;
+ 
+@@ -50,9 +49,10 @@ static ssize_t store_bridge_parm(struct 
+ }
+ 
+ 
+-static ssize_t show_forward_delay(struct class_device *cd, char *buf)
++static ssize_t show_forward_delay(struct device *d,
++				  struct device_attribute *attr, char *buf)
+ {
+-	struct net_bridge *br = to_bridge(cd);
++	struct net_bridge *br = to_bridge(d);
+ 	return sprintf(buf, "%lu\n", jiffies_to_clock_t(br->forward_delay));
+ }
+ 
+@@ -64,18 +64,20 @@ static void set_forward_delay(struct net
+ 		br->bridge_forward_delay = delay;
+ }
+ 
+-static ssize_t store_forward_delay(struct class_device *cd, const char *buf,
+-				   size_t len)
++static ssize_t store_forward_delay(struct device *d,
++				   struct device_attribute *attr,
++				   const char *buf, size_t len)
+ {
+-	return store_bridge_parm(cd, buf, len, set_forward_delay);
++	return store_bridge_parm(d, buf, len, set_forward_delay);
+ }
+-static CLASS_DEVICE_ATTR(forward_delay, S_IRUGO | S_IWUSR,
+-			 show_forward_delay, store_forward_delay);
++static DEVICE_ATTR(forward_delay, S_IRUGO | S_IWUSR,
++		   show_forward_delay, store_forward_delay);
+ 
+-static ssize_t show_hello_time(struct class_device *cd, char *buf)
++static ssize_t show_hello_time(struct device *d, struct device_attribute *attr,
++			       char *buf)
+ {
+ 	return sprintf(buf, "%lu\n",
+-		       jiffies_to_clock_t(to_bridge(cd)->hello_time));
++		       jiffies_to_clock_t(to_bridge(d)->hello_time));
+ }
+ 
+ static void set_hello_time(struct net_bridge *br, unsigned long val)
+@@ -86,19 +88,20 @@ static void set_hello_time(struct net_br
+ 		br->bridge_hello_time = t;
+ }
+ 
+-static ssize_t store_hello_time(struct class_device *cd, const char *buf,
++static ssize_t store_hello_time(struct device *d,
++				struct device_attribute *attr, const char *buf,
+ 				size_t len)
+ {
+-	return store_bridge_parm(cd, buf, len, set_hello_time);
++	return store_bridge_parm(d, buf, len, set_hello_time);
+ }
++static DEVICE_ATTR(hello_time, S_IRUGO | S_IWUSR, show_hello_time,
++		   store_hello_time);
+ 
+-static CLASS_DEVICE_ATTR(hello_time, S_IRUGO | S_IWUSR, show_hello_time,
+-			 store_hello_time);
+-
+-static ssize_t show_max_age(struct class_device *cd, char *buf)
++static ssize_t show_max_age(struct device *d, struct device_attribute *attr,
++			    char *buf)
+ {
+ 	return sprintf(buf, "%lu\n",
+-		       jiffies_to_clock_t(to_bridge(cd)->max_age));
++		       jiffies_to_clock_t(to_bridge(d)->max_age));
+ }
+ 
+ static void set_max_age(struct net_bridge *br, unsigned long val)
+@@ -109,18 +112,17 @@ static void set_max_age(struct net_bridg
+ 		br->bridge_max_age = t;
+ }
+ 
+-static ssize_t store_max_age(struct class_device *cd, const char *buf,
+-				size_t len)
++static ssize_t store_max_age(struct device *d, struct device_attribute *attr,
++			     const char *buf, size_t len)
+ {
+-	return store_bridge_parm(cd, buf, len, set_max_age);
++	return store_bridge_parm(d, buf, len, set_max_age);
+ }
++static DEVICE_ATTR(max_age, S_IRUGO | S_IWUSR, show_max_age, store_max_age);
+ 
+-static CLASS_DEVICE_ATTR(max_age, S_IRUGO | S_IWUSR, show_max_age,
+-			 store_max_age);
+-
+-static ssize_t show_ageing_time(struct class_device *cd, char *buf)
++static ssize_t show_ageing_time(struct device *d,
++				struct device_attribute *attr, char *buf)
+ {
+-	struct net_bridge *br = to_bridge(cd);
++	struct net_bridge *br = to_bridge(d);
+ 	return sprintf(buf, "%lu\n", jiffies_to_clock_t(br->ageing_time));
+ }
+ 
+@@ -129,17 +131,19 @@ static void set_ageing_time(struct net_b
+ 	br->ageing_time = clock_t_to_jiffies(val);
+ }
+ 
+-static ssize_t store_ageing_time(struct class_device *cd, const char *buf,
+-				 size_t len)
++static ssize_t store_ageing_time(struct device *d,
++				 struct device_attribute *attr,
++				 const char *buf, size_t len)
+ {
+-	return store_bridge_parm(cd, buf, len, set_ageing_time);
++	return store_bridge_parm(d, buf, len, set_ageing_time);
+ }
++static DEVICE_ATTR(ageing_time, S_IRUGO | S_IWUSR, show_ageing_time,
++		   store_ageing_time);
+ 
+-static CLASS_DEVICE_ATTR(ageing_time, S_IRUGO | S_IWUSR, show_ageing_time,
+-			 store_ageing_time);
+-static ssize_t show_stp_state(struct class_device *cd, char *buf)
++static ssize_t show_stp_state(struct device *d,
++			      struct device_attribute *attr, char *buf)
+ {
+-	struct net_bridge *br = to_bridge(cd);
++	struct net_bridge *br = to_bridge(d);
+ 	return sprintf(buf, "%d\n", br->stp_enabled);
+ }
+ 
+@@ -148,18 +152,19 @@ static void set_stp_state(struct net_bri
+ 	br->stp_enabled = val;
+ }
+ 
+-static ssize_t store_stp_state(struct class_device *cd,
+-			       const char *buf, size_t len)
++static ssize_t store_stp_state(struct device *d,
++			       struct device_attribute *attr, const char *buf,
++			       size_t len)
+ {
+-	return store_bridge_parm(cd, buf, len, set_stp_state);
++	return store_bridge_parm(d, buf, len, set_stp_state);
+ }
++static DEVICE_ATTR(stp_state, S_IRUGO | S_IWUSR, show_stp_state,
++		   store_stp_state);
+ 
+-static CLASS_DEVICE_ATTR(stp_state, S_IRUGO | S_IWUSR, show_stp_state,
+-			 store_stp_state);
+-
+-static ssize_t show_priority(struct class_device *cd, char *buf)
++static ssize_t show_priority(struct device *d, struct device_attribute *attr,
++			     char *buf)
+ {
+-	struct net_bridge *br = to_bridge(cd);
++	struct net_bridge *br = to_bridge(d);
+ 	return sprintf(buf, "%d\n",
+ 		       (br->bridge_id.prio[0] << 8) | br->bridge_id.prio[1]);
+ }
+@@ -169,92 +174,107 @@ static void set_priority(struct net_brid
+ 	br_stp_set_bridge_priority(br, (u16) val);
+ }
+ 
+-static ssize_t store_priority(struct class_device *cd,
++static ssize_t store_priority(struct device *d, struct device_attribute *attr,
+ 			       const char *buf, size_t len)
+ {
+-	return store_bridge_parm(cd, buf, len, set_priority);
++	return store_bridge_parm(d, buf, len, set_priority);
+ }
+-static CLASS_DEVICE_ATTR(priority, S_IRUGO | S_IWUSR, show_priority,
+-			 store_priority);
++static DEVICE_ATTR(priority, S_IRUGO | S_IWUSR, show_priority, store_priority);
+ 
+-static ssize_t show_root_id(struct class_device *cd, char *buf)
++static ssize_t show_root_id(struct device *d, struct device_attribute *attr,
++			    char *buf)
+ {
+-	return br_show_bridge_id(buf, &to_bridge(cd)->designated_root);
++	return br_show_bridge_id(buf, &to_bridge(d)->designated_root);
+ }
+-static CLASS_DEVICE_ATTR(root_id, S_IRUGO, show_root_id, NULL);
++static DEVICE_ATTR(root_id, S_IRUGO, show_root_id, NULL);
+ 
+-static ssize_t show_bridge_id(struct class_device *cd, char *buf)
++static ssize_t show_bridge_id(struct device *d, struct device_attribute *attr,
++			      char *buf)
+ {
+-	return br_show_bridge_id(buf, &to_bridge(cd)->bridge_id);
++	return br_show_bridge_id(buf, &to_bridge(d)->bridge_id);
+ }
+-static CLASS_DEVICE_ATTR(bridge_id, S_IRUGO, show_bridge_id, NULL);
++static DEVICE_ATTR(bridge_id, S_IRUGO, show_bridge_id, NULL);
+ 
+-static ssize_t show_root_port(struct class_device *cd, char *buf)
++static ssize_t show_root_port(struct device *d, struct device_attribute *attr,
++			      char *buf)
+ {
+-	return sprintf(buf, "%d\n", to_bridge(cd)->root_port);
++	return sprintf(buf, "%d\n", to_bridge(d)->root_port);
+ }
+-static CLASS_DEVICE_ATTR(root_port, S_IRUGO, show_root_port, NULL);
++static DEVICE_ATTR(root_port, S_IRUGO, show_root_port, NULL);
+ 
+-static ssize_t show_root_path_cost(struct class_device *cd, char *buf)
++static ssize_t show_root_path_cost(struct device *d,
++				   struct device_attribute *attr, char *buf)
+ {
+-	return sprintf(buf, "%d\n", to_bridge(cd)->root_path_cost);
++	return sprintf(buf, "%d\n", to_bridge(d)->root_path_cost);
+ }
+-static CLASS_DEVICE_ATTR(root_path_cost, S_IRUGO, show_root_path_cost, NULL);
++static DEVICE_ATTR(root_path_cost, S_IRUGO, show_root_path_cost, NULL);
+ 
+-static ssize_t show_topology_change(struct class_device *cd, char *buf)
++static ssize_t show_topology_change(struct device *d,
++				    struct device_attribute *attr, char *buf)
+ {
+-	return sprintf(buf, "%d\n", to_bridge(cd)->topology_change);
++	return sprintf(buf, "%d\n", to_bridge(d)->topology_change);
+ }
+-static CLASS_DEVICE_ATTR(topology_change, S_IRUGO, show_topology_change, NULL);
++static DEVICE_ATTR(topology_change, S_IRUGO, show_topology_change, NULL);
+ 
+-static ssize_t show_topology_change_detected(struct class_device *cd, char *buf)
++static ssize_t show_topology_change_detected(struct device *d,
++					     struct device_attribute *attr,
++					     char *buf)
+ {
+-	struct net_bridge *br = to_bridge(cd);
++	struct net_bridge *br = to_bridge(d);
+ 	return sprintf(buf, "%d\n", br->topology_change_detected);
+ }
+-static CLASS_DEVICE_ATTR(topology_change_detected, S_IRUGO, show_topology_change_detected, NULL);
++static DEVICE_ATTR(topology_change_detected, S_IRUGO,
++		   show_topology_change_detected, NULL);
+ 
+-static ssize_t show_hello_timer(struct class_device *cd, char *buf)
++static ssize_t show_hello_timer(struct device *d,
++				struct device_attribute *attr, char *buf)
+ {
+-	struct net_bridge *br = to_bridge(cd);
++	struct net_bridge *br = to_bridge(d);
+ 	return sprintf(buf, "%ld\n", br_timer_value(&br->hello_timer));
+ }
+-static CLASS_DEVICE_ATTR(hello_timer, S_IRUGO, show_hello_timer, NULL);
++static DEVICE_ATTR(hello_timer, S_IRUGO, show_hello_timer, NULL);
+ 
+-static ssize_t show_tcn_timer(struct class_device *cd, char *buf)
++static ssize_t show_tcn_timer(struct device *d, struct device_attribute *attr,
++			      char *buf)
+ {
+-	struct net_bridge *br = to_bridge(cd);
++	struct net_bridge *br = to_bridge(d);
+ 	return sprintf(buf, "%ld\n", br_timer_value(&br->tcn_timer));
+ }
+-static CLASS_DEVICE_ATTR(tcn_timer, S_IRUGO, show_tcn_timer, NULL);
++static DEVICE_ATTR(tcn_timer, S_IRUGO, show_tcn_timer, NULL);
+ 
+-static ssize_t show_topology_change_timer(struct class_device *cd, char *buf)
++static ssize_t show_topology_change_timer(struct device *d,
++					  struct device_attribute *attr,
++					  char *buf)
+ {
+-	struct net_bridge *br = to_bridge(cd);
++	struct net_bridge *br = to_bridge(d);
+ 	return sprintf(buf, "%ld\n", br_timer_value(&br->topology_change_timer));
+ }
+-static CLASS_DEVICE_ATTR(topology_change_timer, S_IRUGO, show_topology_change_timer, NULL);
++static DEVICE_ATTR(topology_change_timer, S_IRUGO, show_topology_change_timer,
++		   NULL);
+ 
+-static ssize_t show_gc_timer(struct class_device *cd, char *buf)
++static ssize_t show_gc_timer(struct device *d, struct device_attribute *attr,
++			     char *buf)
+ {
+-	struct net_bridge *br = to_bridge(cd);
++	struct net_bridge *br = to_bridge(d);
+ 	return sprintf(buf, "%ld\n", br_timer_value(&br->gc_timer));
+ }
+-static CLASS_DEVICE_ATTR(gc_timer, S_IRUGO, show_gc_timer, NULL);
++static DEVICE_ATTR(gc_timer, S_IRUGO, show_gc_timer, NULL);
+ 
+-static ssize_t show_group_addr(struct class_device *cd, char *buf)
++static ssize_t show_group_addr(struct device *d,
++			       struct device_attribute *attr, char *buf)
+ {
+-	struct net_bridge *br = to_bridge(cd);
++	struct net_bridge *br = to_bridge(d);
+ 	return sprintf(buf, "%x:%x:%x:%x:%x:%x\n",
+ 		       br->group_addr[0], br->group_addr[1],
+ 		       br->group_addr[2], br->group_addr[3],
+ 		       br->group_addr[4], br->group_addr[5]);
+ }
+ 
+-static ssize_t store_group_addr(struct class_device *cd, const char *buf,
+-				    size_t len)
++static ssize_t store_group_addr(struct device *d,
++				struct device_attribute *attr,
++				const char *buf, size_t len)
+ {
+-	struct net_bridge *br = to_bridge(cd);
++	struct net_bridge *br = to_bridge(d);
+ 	unsigned new_addr[6];
+ 	int i;
+ 
+@@ -286,28 +306,28 @@ static ssize_t store_group_addr(struct c
+ 	return len;
+ }
+ 
+-static CLASS_DEVICE_ATTR(group_addr, S_IRUGO | S_IWUSR,
+-			 show_group_addr, store_group_addr);
++static DEVICE_ATTR(group_addr, S_IRUGO | S_IWUSR,
++		   show_group_addr, store_group_addr);
+ 
+ 
+ static struct attribute *bridge_attrs[] = {
+-	&class_device_attr_forward_delay.attr,
+-	&class_device_attr_hello_time.attr,
+-	&class_device_attr_max_age.attr,
+-	&class_device_attr_ageing_time.attr,
+-	&class_device_attr_stp_state.attr,
+-	&class_device_attr_priority.attr,
+-	&class_device_attr_bridge_id.attr,
+-	&class_device_attr_root_id.attr,
+-	&class_device_attr_root_path_cost.attr,
+-	&class_device_attr_root_port.attr,
+-	&class_device_attr_topology_change.attr,
+-	&class_device_attr_topology_change_detected.attr,
+-	&class_device_attr_hello_timer.attr,
+-	&class_device_attr_tcn_timer.attr,
+-	&class_device_attr_topology_change_timer.attr,
+-	&class_device_attr_gc_timer.attr,
+-	&class_device_attr_group_addr.attr,
++	&dev_attr_forward_delay.attr,
++	&dev_attr_hello_time.attr,
++	&dev_attr_max_age.attr,
++	&dev_attr_ageing_time.attr,
++	&dev_attr_stp_state.attr,
++	&dev_attr_priority.attr,
++	&dev_attr_bridge_id.attr,
++	&dev_attr_root_id.attr,
++	&dev_attr_root_path_cost.attr,
++	&dev_attr_root_port.attr,
++	&dev_attr_topology_change.attr,
++	&dev_attr_topology_change_detected.attr,
++	&dev_attr_hello_timer.attr,
++	&dev_attr_tcn_timer.attr,
++	&dev_attr_topology_change_timer.attr,
++	&dev_attr_gc_timer.attr,
++	&dev_attr_group_addr.attr,
+ 	NULL
+ };
+ 
+@@ -325,8 +345,8 @@ static struct attribute_group bridge_gro
+ static ssize_t brforward_read(struct kobject *kobj, char *buf,
+ 			   loff_t off, size_t count)
+ {
+-	struct class_device *cdev = to_class_dev(kobj);
+-	struct net_bridge *br = to_bridge(cdev);
++	struct device *dev = to_dev(kobj);
++	struct net_bridge *br = to_bridge(dev);
+ 	int n;
+ 
+ 	/* must read whole records */
+@@ -363,7 +383,7 @@ static struct bin_attribute bridge_forwa
+  */
+ int br_sysfs_addbr(struct net_device *dev)
+ {
+-	struct kobject *brobj = &dev->class_dev.kobj;
++	struct kobject *brobj = &dev->dev.kobj;
+ 	struct net_bridge *br = netdev_priv(dev);
+ 	int err;
+ 
+@@ -395,9 +415,9 @@ int br_sysfs_addbr(struct net_device *de
+ 	}
+ 	return 0;
+  out3:
+-	sysfs_remove_bin_file(&dev->class_dev.kobj, &bridge_forward);
++	sysfs_remove_bin_file(&dev->dev.kobj, &bridge_forward);
+  out2:
+-	sysfs_remove_group(&dev->class_dev.kobj, &bridge_group);
++	sysfs_remove_group(&dev->dev.kobj, &bridge_group);
+  out1:
+ 	return err;
+ 
+@@ -405,7 +425,7 @@ int br_sysfs_addbr(struct net_device *de
+ 
+ void br_sysfs_delbr(struct net_device *dev)
+ {
+-	struct kobject *kobj = &dev->class_dev.kobj;
++	struct kobject *kobj = &dev->dev.kobj;
+ 	struct net_bridge *br = netdev_priv(dev);
+ 
+ 	kobject_unregister(&br->ifobj);
+--- gregkh-2.6.orig/net/bridge/br_sysfs_if.c
++++ gregkh-2.6/net/bridge/br_sysfs_if.c
+@@ -211,7 +211,7 @@ int br_sysfs_addif(struct net_bridge_por
+ 	struct brport_attribute **a;
+ 	int err;
+ 
+-	err = sysfs_create_link(&p->kobj, &br->dev->class_dev.kobj, 
++	err = sysfs_create_link(&p->kobj, &br->dev->dev.kobj,
+ 				SYSFS_BRIDGE_PORT_LINK);
+ 	if (err)
+ 		goto out2;
 --- gregkh-2.6.orig/net/core/dev.c
 +++ gregkh-2.6/net/core/dev.c
 @@ -742,7 +742,7 @@ int dev_change_name(struct net_device *d
