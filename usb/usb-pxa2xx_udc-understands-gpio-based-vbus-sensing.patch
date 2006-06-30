@@ -1,0 +1,231 @@
+From david-b@pacbell.net Thu Jun 29 14:02:38 2006
+From: David Brownell <david-b@pacbell.net>
+To: Greg KH <greg@kroah.com>
+Subject: USB: pxa2xx_udc understands GPIO based VBUS sensing
+Date: Thu, 29 Jun 2006 12:25:39 -0700
+Cc: linux-usb-devel@lists.sourceforge.net, Dave Hylands <dhylands@gmail.com>
+Message-Id: <200606291225.39983.david-b@pacbell.net>
+
+This updates the PXA 25x UDC board-independent infrastructure for VBUS sensing
+and the D+ pullup.  The original code evolved from rather bizarre support on
+Intel's "Lubbock" reference hardware, so that on more sensible hardware it
+doesn't work as well as it could/should.
+
+The change is just to teach the UDC driver how to use built-in PXA GPIO pins
+directly.  This reduces the amount of board-specfic object code needed, and
+enables the use of a VBUS sensing IRQ on boards (like Gumstix) that have one.
+With VBUS sensing, the UDC is unclocked until a host is actually connected.
+
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ arch/arm/mach-pxa/corgi.c       |   15 --------
+ drivers/usb/gadget/pxa2xx_udc.c |   70 ++++++++++++++++++++++++++++++++++++++--
+ drivers/usb/gadget/pxa2xx_udc.h |   24 ++++---------
+ include/asm-arm/arch-pxa/udc.h  |    8 ++++
+ 4 files changed, 85 insertions(+), 32 deletions(-)
+
+--- gregkh-2.6.orig/arch/arm/mach-pxa/corgi.c
++++ gregkh-2.6/arch/arm/mach-pxa/corgi.c
+@@ -284,21 +284,9 @@ static struct pxaficp_platform_data corg
+ /*
+  * USB Device Controller
+  */
+-static void corgi_udc_command(int cmd)
+-{
+-	switch(cmd)	{
+-	case PXA2XX_UDC_CMD_CONNECT:
+-		GPSR(CORGI_GPIO_USB_PULLUP) = GPIO_bit(CORGI_GPIO_USB_PULLUP);
+-		break;
+-	case PXA2XX_UDC_CMD_DISCONNECT:
+-		GPCR(CORGI_GPIO_USB_PULLUP) = GPIO_bit(CORGI_GPIO_USB_PULLUP);
+-		break;
+-	}
+-}
+-
+ static struct pxa2xx_udc_mach_info udc_info __initdata = {
+ 	/* no connect GPIO; corgi can't tell connection status */
+-	.udc_command		= corgi_udc_command,
++	.gpio_pullup		= CORGI_GPIO_USB_PULLUP,
+ };
+ 
+ 
+@@ -350,7 +338,6 @@ static void __init corgi_init(void)
+ 	corgi_ssp_set_machinfo(&corgi_ssp_machinfo);
+ 
+ 	pxa_gpio_mode(CORGI_GPIO_IR_ON | GPIO_OUT);
+-	pxa_gpio_mode(CORGI_GPIO_USB_PULLUP | GPIO_OUT);
+ 	pxa_gpio_mode(CORGI_GPIO_HSYNC | GPIO_IN);
+ 
+  	pxa_set_udc_info(&udc_info);
+--- gregkh-2.6.orig/drivers/usb/gadget/pxa2xx_udc.c
++++ gregkh-2.6/drivers/usb/gadget/pxa2xx_udc.c
+@@ -151,6 +151,39 @@ MODULE_PARM_DESC (fifo_mode, "pxa2xx udc
+ static void pxa2xx_ep_fifo_flush (struct usb_ep *ep);
+ static void nuke (struct pxa2xx_ep *, int status);
+ 
++/* one GPIO should be used to detect VBUS from the host */
++static int is_vbus_present(void)
++{
++	struct pxa2xx_udc_mach_info		*mach = the_controller->mach;
++
++	if (mach->gpio_vbus)
++		return pxa_gpio_get(mach->gpio_vbus);
++	if (mach->udc_is_connected)
++		return mach->udc_is_connected();
++	return 1;
++}
++
++/* one GPIO should control a D+ pullup, so host sees this device (or not) */
++static void pullup_off(void)
++{
++	struct pxa2xx_udc_mach_info		*mach = the_controller->mach;
++
++	if (mach->gpio_pullup)
++		pxa_gpio_set(mach->gpio_pullup, 0);
++	else if (mach->udc_command)
++		mach->udc_command(PXA2XX_UDC_CMD_DISCONNECT);
++}
++
++static void pullup_on(void)
++{
++	struct pxa2xx_udc_mach_info		*mach = the_controller->mach;
++
++	if (mach->gpio_pullup)
++		pxa_gpio_set(mach->gpio_pullup, 1);
++	else if (mach->udc_command)
++		mach->udc_command(PXA2XX_UDC_CMD_CONNECT);
++}
++
+ static void pio_irq_enable(int bEndpointAddress)
+ {
+         bEndpointAddress &= 0xf;
+@@ -1722,6 +1755,16 @@ lubbock_vbus_irq(int irq, void *_dev, st
+ 
+ #endif
+ 
++static irqreturn_t
++udc_vbus_irq(int irq, void *_dev, struct pt_regs *r)
++{
++	struct pxa2xx_udc	*dev = _dev;
++	int			vbus = pxa_gpio_get(dev->mach->gpio_vbus);
++
++	pxa2xx_udc_vbus_session(&dev->gadget, vbus);
++	return IRQ_HANDLED;
++}
++
+ 
+ /*-------------------------------------------------------------------------*/
+ 
+@@ -2439,7 +2482,7 @@ static struct pxa2xx_udc memory = {
+ static int __init pxa2xx_udc_probe(struct platform_device *pdev)
+ {
+ 	struct pxa2xx_udc *dev = &memory;
+-	int retval, out_dma = 1;
++	int retval, out_dma = 1, vbus_irq;
+ 	u32 chiprev;
+ 
+ 	/* insist on Intel/ARM/XScale */
+@@ -2503,6 +2546,16 @@ static int __init pxa2xx_udc_probe(struc
+ 	/* other non-static parts of init */
+ 	dev->dev = &pdev->dev;
+ 	dev->mach = pdev->dev.platform_data;
++	if (dev->mach->gpio_vbus) {
++		vbus_irq = IRQ_GPIO(dev->mach->gpio_vbus & GPIO_MD_MASK_NR);
++		pxa_gpio_mode((dev->mach->gpio_vbus & GPIO_MD_MASK_NR)
++				| GPIO_IN);
++		set_irq_type(vbus_irq, IRQT_BOTHEDGE);
++	} else
++		vbus_irq = 0;
++	if (dev->mach->gpio_pullup)
++		pxa_gpio_mode((dev->mach->gpio_pullup & GPIO_MD_MASK_NR)
++				| GPIO_OUT | GPIO_DFLT_LOW);
+ 
+ 	init_timer(&dev->timer);
+ 	dev->timer.function = udc_watchdog;
+@@ -2558,8 +2611,19 @@ lubbock_fail0:
+ 		HEX_DISPLAY(dev->stats.irqs);
+ 		LUB_DISC_BLNK_LED &= 0xff;
+ #endif
+-	}
++	} else
+ #endif
++	if (vbus_irq) {
++		retval = request_irq(vbus_irq, udc_vbus_irq,
++				SA_INTERRUPT | SA_SAMPLE_RANDOM,
++				driver_name, dev);
++		if (retval != 0) {
++			printk(KERN_ERR "%s: can't get irq %i, err %d\n",
++				driver_name, vbus_irq, retval);
++			free_irq(IRQ_USB, dev);
++			return -EBUSY;
++		}
++	}
+ 	create_proc_files();
+ 
+ 	return 0;
+@@ -2588,6 +2652,8 @@ static int __exit pxa2xx_udc_remove(stru
+ 		free_irq(LUBBOCK_USB_IRQ, dev);
+ 	}
+ #endif
++	if (dev->mach->gpio_vbus)
++		free_irq(IRQ_GPIO(dev->mach->gpio_vbus), dev);
+ 	platform_set_drvdata(pdev, NULL);
+ 	the_controller = NULL;
+ 	return 0;
+--- gregkh-2.6.orig/drivers/usb/gadget/pxa2xx_udc.h
++++ gregkh-2.6/drivers/usb/gadget/pxa2xx_udc.h
+@@ -177,27 +177,19 @@ struct pxa2xx_udc {
+ 
+ static struct pxa2xx_udc *the_controller;
+ 
+-/* one GPIO should be used to detect VBUS from the host */
+-static inline int is_vbus_present(void)
++static inline int pxa_gpio_get(unsigned gpio)
+ {
+-	if (!the_controller->mach->udc_is_connected)
+-		return 1;
+-	return the_controller->mach->udc_is_connected();
++	return (GPLR(gpio) & GPIO_bit(gpio)) != 0;
+ }
+ 
+-/* one GPIO should control a D+ pullup, so host sees this device (or not) */
+-static inline void pullup_off(void)
++static inline void pxa_gpio_set(unsigned gpio, int is_on)
+ {
+-	if (!the_controller->mach->udc_command)
+-		return;
+-	the_controller->mach->udc_command(PXA2XX_UDC_CMD_DISCONNECT);
+-}
++	int mask = GPIO_bit(gpio);
+ 
+-static inline void pullup_on(void)
+-{
+-	if (!the_controller->mach->udc_command)
+-		return;
+-	the_controller->mach->udc_command(PXA2XX_UDC_CMD_CONNECT);
++	if (is_on)
++		GPSR(gpio) = mask;
++	else
++		GPCR(gpio) = mask;
+ }
+ 
+ /*-------------------------------------------------------------------------*/
+--- gregkh-2.6.orig/include/asm-arm/arch-pxa/udc.h
++++ gregkh-2.6/include/asm-arm/arch-pxa/udc.h
+@@ -12,6 +12,14 @@ struct pxa2xx_udc_mach_info {
+         void (*udc_command)(int cmd);
+ #define	PXA2XX_UDC_CMD_CONNECT		0	/* let host see us */
+ #define	PXA2XX_UDC_CMD_DISCONNECT	1	/* so host won't see us */
++
++	/* Boards following the design guidelines in the developer's manual,
++	 * with on-chip GPIOs not Lubbock's wierd hardware, can have a sane
++	 * VBUS IRQ and omit the methods above.  Store the GPIO number
++	 * here; for GPIO 0, also mask in one of the pxa_gpio_mode() bits.
++	 */
++	u16	gpio_vbus;			/* high == vbus present */
++	u16	gpio_pullup;			/* high == pullup activated */
+ };
+ 
+ extern void pxa_set_udc_info(struct pxa2xx_udc_mach_info *info);
