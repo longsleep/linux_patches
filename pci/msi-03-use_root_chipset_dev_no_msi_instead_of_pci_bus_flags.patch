@@ -1,0 +1,74 @@
+From owner-linux-pci@atrey.karlin.mff.cuni.cz Sun Jul  2 17:50:42 2006
+Message-Id: <20060703004055.835863000@myri.com>
+Date: Sun, 02 Jul 2006 20:40:02 -0400
+From: Brice Goglin <brice@myri.com>
+To: linux-pci@atrey.karlin.mff.cuni.cz
+Cc: linux-kernel@vger.kernel.org
+Subject: [patch 3/7] MSI: Check root chipset no_msi flag instead of all parent busses flags
+Content-Disposition: inline; filename=msi-03-use_root_chipset_dev_no_msi_instead_of_pci_bus_flags.patch
+
+MSI only requires support in the root chipset, which may not even have
+a subordinate bus.
+pci_msi_supported() now checks the no_msi flag in the root_chipset pci_dev
+struct instead of the PCI_BUS_FLAGS_NO_MSI flag of all its parent busses.
+The MSI quirk now sets the no_msi flag accordingly.
+
+Signed-off-by: Brice Goglin <brice@myri.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/pci/msi.c    |   15 ++++++++++-----
+ drivers/pci/quirks.c |   10 ++++------
+ 2 files changed, 14 insertions(+), 11 deletions(-)
+
+--- gregkh-2.6.orig/drivers/pci/msi.c
++++ gregkh-2.6/drivers/pci/msi.c
+@@ -905,19 +905,24 @@ static int msix_capability_init(struct p
+  * @dev: pointer to the pci_dev data structure of MSI device function
+  *
+  * MSI must be globally enabled and supported by the device and
+- * its parent busses.
++ * its root chipset.
+  **/
+ static
+ int pci_msi_supported(struct pci_dev * dev)
+ {
+-	struct pci_bus *bus;
++	struct pci_dev *pdev;
+ 
+ 	if (!pci_msi_enable || !dev || dev->no_msi)
+ 		return -1;
+ 
+-	for (bus = dev->bus; bus; bus = bus->parent)
+-		if (bus->bus_flags & PCI_BUS_FLAGS_NO_MSI)
+-			return -1;
++	/* find root complex for our device */
++	pdev = dev;
++	while (pdev->bus && pdev->bus->self)
++		pdev = pdev->bus->self;
++
++	/* check whether it supports MSI */
++	if (pdev->no_msi)
++		return -1;
+ 
+ 	return 0;
+ }
+--- gregkh-2.6.orig/drivers/pci/quirks.c
++++ gregkh-2.6/drivers/pci/quirks.c
+@@ -1535,12 +1535,10 @@ DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_NV
+ /* Disable MSI on chipsets that are known to not support it */
+ static void __devinit quirk_disable_msi(struct pci_dev *dev)
+ {
+-	if (dev->subordinate) {
+-		printk(KERN_WARNING "PCI: MSI quirk detected. "
+-		       "PCI_BUS_FLAGS_NO_MSI set for %s subordinate bus.\n",
+-		       pci_name(dev));
+-		dev->subordinate->bus_flags |= PCI_BUS_FLAGS_NO_MSI;
+-	}
++	printk(KERN_WARNING "PCI: MSI quirk detected. "
++	       "MSI disabled on chipset %s.\n",
++	       pci_name(dev));
++	dev->no_msi = 1;
+ }
+ DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_8131_BRIDGE, quirk_disable_msi);
+ DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_SERVERWORKS, PCI_DEVICE_ID_SERVERWORKS_GCNB_LE,
