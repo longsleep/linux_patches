@@ -1,0 +1,202 @@
+From stern@rowland.harvard.edu Sat Jul  1 19:12:20 2006
+Date: Sat, 1 Jul 2006 22:12:19 -0400 (EDT)
+From: Alan Stern <stern@rowland.harvard.edu>
+To: Greg KH <greg@kroah.com>
+Subject: [PATCH 11/15] usbcore: set device and power states properly
+Message-ID: <Pine.LNX.4.44L0.0607012211460.2691-100000@mabel.localdomain>
+
+This patch (as733) fixes up the places where device states and power
+states are set in usbcore.  Right now things are duplicated or missing;
+this should straighten things out.
+
+The idea is that udev->state is USB_STATE_SUSPENDED exactly when the
+device's upstream port has been suspended, whereas
+udev->dev.power.power_state.event reflects the result of the last call
+to the suspend/resume routines (which might not actually change the
+device state, especially if CONFIG_USB_SUSPEND isn't set).
+
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/driver.c |   71 +++++++++++++++++++++++++++-------------------
+ drivers/usb/core/hub.c    |   10 ++----
+ 2 files changed, 46 insertions(+), 35 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/core/driver.c
++++ gregkh-2.6/drivers/usb/core/driver.c
+@@ -759,48 +759,57 @@ EXPORT_SYMBOL_GPL_FUTURE(usb_deregister)
+ static int suspend_device(struct usb_device *udev, pm_message_t msg)
+ {
+ 	struct usb_device_driver	*udriver;
++	int				status = 0;
+ 
+ 	if (udev->dev.driver == NULL)
+-		return 0;
++		goto done;
+ 	udriver = to_usb_device_driver(udev->dev.driver);
+ 	if (udev->dev.power.power_state.event == msg.event)
+-		return 0;
+-	return udriver->suspend(udev, msg);
++		goto done;
++	status = udriver->suspend(udev, msg);
++
++done:
++	if (status == 0)
++		udev->dev.power.power_state.event = msg.event;
++	return status;
+ }
+ 
+ /* Caller has locked udev */
+ static int resume_device(struct usb_device *udev)
+ {
+ 	struct usb_device_driver	*udriver;
++	int				status = 0;
+ 
+ 	if (udev->dev.power.power_state.event == PM_EVENT_ON)
+-		return 0;
+-
+-	/* mark things as "on" immediately, no matter what errors crop up */
+-	udev->dev.power.power_state.event = PM_EVENT_ON;
++		goto done;
+ 
+ 	if (udev->dev.driver == NULL)
+-		return 0;
++		goto done;
+ 	udriver = to_usb_device_driver(udev->dev.driver);
+ 	if (udev->state == USB_STATE_NOTATTACHED)
+-		return 0;
+-	return udriver->resume(udev);
++		goto done;
++	status = udriver->resume(udev);
++
++done:
++	if (status == 0)
++		udev->dev.power.power_state.event = PM_EVENT_ON;
++	return status;
+ }
+ 
+ /* Caller has locked intf's usb_device */
+ static int suspend_interface(struct usb_interface *intf, pm_message_t msg)
+ {
+ 	struct usb_driver	*driver;
+-	int			status;
++	int			status = 0;
+ 
+ 	if (intf->dev.driver == NULL)
+-		return 0;
++		goto done;
+ 
+ 	driver = to_usb_driver(intf->dev.driver);
+ 
+ 	/* with no hardware, USB interfaces only use FREEZE and ON states */
+ 	if (!is_active(intf))
+-		return 0;
++		goto done;
+ 
+ 	if (driver->suspend && driver->resume) {
+ 		status = driver->suspend(intf, msg);
+@@ -814,8 +823,11 @@ static int suspend_interface(struct usb_
+ 		dev_warn(&intf->dev, "no suspend for driver %s?\n",
+ 				driver->name);
+ 		mark_quiesced(intf);
+-		status = 0;
+ 	}
++
++done:
++	if (status == 0)
++		intf->dev.power.power_state.event = msg.event;
+ 	return status;
+ }
+ 
+@@ -824,24 +836,19 @@ static int resume_interface(struct usb_i
+ {
+ 	struct usb_driver	*driver;
+ 	struct usb_device	*udev;
+-	int			status;
++	int			status = 0;
+ 
+ 	if (intf->dev.power.power_state.event == PM_EVENT_ON)
+-		return 0;
++		goto done;
+ 
+-	/* mark things as "on" immediately, no matter what errors crop up */
+-	intf->dev.power.power_state.event = PM_EVENT_ON;
+-
+-	if (intf->dev.driver == NULL) {
+-		intf->dev.power.power_state.event = PM_EVENT_FREEZE;
+-		return 0;
+-	}
++	if (intf->dev.driver == NULL)
++		goto done;
+ 
+ 	driver = to_usb_driver(intf->dev.driver);
+ 
+ 	udev = interface_to_usbdev(intf);
+ 	if (udev->state == USB_STATE_NOTATTACHED)
+-		return 0;
++		goto done;
+ 
+ 	/* if driver was suspended, it has a resume method;
+ 	 * however, sysfs can wrongly mark things as suspended
+@@ -849,15 +856,21 @@ static int resume_interface(struct usb_i
+ 	 */
+ 	if (driver->resume) {
+ 		status = driver->resume(intf);
+-		if (status) {
++		if (status)
+ 			dev_err(&intf->dev, "%s error %d\n",
+ 					"resume", status);
+-			mark_quiesced(intf);
+-		}
+-	} else
++		else
++			mark_active(intf);
++	} else {
+ 		dev_warn(&intf->dev, "no resume for driver %s?\n",
+ 				driver->name);
+-	return 0;
++		mark_active(intf);
++	}
++
++done:
++	if (status == 0)
++		intf->dev.power.power_state.event = PM_EVENT_ON;
++	return status;
+ }
+ 
+ /* Caller has locked udev */
+--- gregkh-2.6.orig/drivers/usb/core/hub.c
++++ gregkh-2.6/drivers/usb/core/hub.c
+@@ -1582,9 +1582,10 @@ static int __usb_port_suspend (struct us
+ 	if (udev->parent)
+ 		status = hub_port_suspend(hdev_to_hub(udev->parent), port1,
+ 				udev);
+-
+-	if (status == 0)
+-		udev->dev.power.power_state = PMSG_SUSPEND;
++	else {
++		dev_dbg(&udev->dev, "usb suspend\n");
++		usb_set_device_state(udev, USB_STATE_SUSPENDED);
++	}
+ 	return status;
+ }
+ 
+@@ -1617,8 +1618,6 @@ int usb_port_suspend(struct usb_device *
+ 		return -ENODEV;
+ 	return __usb_port_suspend(udev, udev->portnum);
+ #else
+-	/* NOTE:  udev->state unchanged, it's not lying ... */
+-	udev->dev.power.power_state = PMSG_SUSPEND;
+ 	return 0;
+ #endif
+ }
+@@ -1647,7 +1646,6 @@ static int finish_port_resume(struct usb
+ 	usb_set_device_state(udev, udev->actconfig
+ 			? USB_STATE_CONFIGURED
+ 			: USB_STATE_ADDRESS);
+-	udev->dev.power.power_state = PMSG_ON;
+ 
+  	/* 10.5.4.5 says be sure devices in the tree are still there.
+  	 * For now let's assume the device didn't go crazy on resume,

@@ -1,0 +1,223 @@
+From stern@rowland.harvard.edu Sat Jul  1 19:13:07 2006
+Date: Sat, 1 Jul 2006 22:13:04 -0400 (EDT)
+From: Alan Stern <stern@rowland.harvard.edu>
+To: Greg KH <greg@kroah.com>
+Subject: [PATCH 12/15] usbcore: fix up device and power state tests
+Message-ID: <Pine.LNX.4.44L0.0607012212210.2691-100000@mabel.localdomain>
+
+This patch (as734) rationalizes the various tests of device state and
+power states.  There are duplications and mistaken tests in several
+places.
+
+Perhaps the most interesting challenge is where the hub driver tests to
+see that all the child devices are suspended before allowing itself to
+be suspended.  When CONFIG_USB_SUSPEND is set the test is
+straightforward, since we expect that the children _will_ be suspended.
+But when CONFIG_USB_SUSPEND isn't set, it's not so clear what should be
+done.  The code compromises by checking the child's
+power.power_state.event field.
+
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/driver.c  |   40 ++++++++++++++++++--------------------
+ drivers/usb/core/generic.c |    3 --
+ drivers/usb/core/hub.c     |   47 +++++++++------------------------------------
+ 3 files changed, 29 insertions(+), 61 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/core/driver.c
++++ gregkh-2.6/drivers/usb/core/driver.c
+@@ -761,11 +761,13 @@ static int suspend_device(struct usb_dev
+ 	struct usb_device_driver	*udriver;
+ 	int				status = 0;
+ 
++	if (udev->state == USB_STATE_NOTATTACHED ||
++			udev->state == USB_STATE_SUSPENDED)
++		goto done;
++
+ 	if (udev->dev.driver == NULL)
+ 		goto done;
+ 	udriver = to_usb_device_driver(udev->dev.driver);
+-	if (udev->dev.power.power_state.event == msg.event)
+-		goto done;
+ 	status = udriver->suspend(udev, msg);
+ 
+ done:
+@@ -780,14 +782,13 @@ static int resume_device(struct usb_devi
+ 	struct usb_device_driver	*udriver;
+ 	int				status = 0;
+ 
+-	if (udev->dev.power.power_state.event == PM_EVENT_ON)
++	if (udev->state == USB_STATE_NOTATTACHED ||
++			udev->state != USB_STATE_SUSPENDED)
+ 		goto done;
+ 
+ 	if (udev->dev.driver == NULL)
+ 		goto done;
+ 	udriver = to_usb_device_driver(udev->dev.driver);
+-	if (udev->state == USB_STATE_NOTATTACHED)
+-		goto done;
+ 	status = udriver->resume(udev);
+ 
+ done:
+@@ -802,14 +803,14 @@ static int suspend_interface(struct usb_
+ 	struct usb_driver	*driver;
+ 	int			status = 0;
+ 
+-	if (intf->dev.driver == NULL)
++	/* with no hardware, USB interfaces only use FREEZE and ON states */
++	if (interface_to_usbdev(intf)->state == USB_STATE_NOTATTACHED ||
++			!is_active(intf))
+ 		goto done;
+ 
+-	driver = to_usb_driver(intf->dev.driver);
+-
+-	/* with no hardware, USB interfaces only use FREEZE and ON states */
+-	if (!is_active(intf))
++	if (intf->dev.driver == NULL)
+ 		goto done;
++	driver = to_usb_driver(intf->dev.driver);
+ 
+ 	if (driver->suspend && driver->resume) {
+ 		status = driver->suspend(intf, msg);
+@@ -835,25 +836,16 @@ done:
+ static int resume_interface(struct usb_interface *intf)
+ {
+ 	struct usb_driver	*driver;
+-	struct usb_device	*udev;
+ 	int			status = 0;
+ 
+-	if (intf->dev.power.power_state.event == PM_EVENT_ON)
++	if (interface_to_usbdev(intf)->state == USB_STATE_NOTATTACHED ||
++			is_active(intf))
+ 		goto done;
+ 
+ 	if (intf->dev.driver == NULL)
+ 		goto done;
+-
+ 	driver = to_usb_driver(intf->dev.driver);
+ 
+-	udev = interface_to_usbdev(intf);
+-	if (udev->state == USB_STATE_NOTATTACHED)
+-		goto done;
+-
+-	/* if driver was suspended, it has a resume method;
+-	 * however, sysfs can wrongly mark things as suspended
+-	 * (on the "no suspend method" FIXME path above)
+-	 */
+ 	if (driver->resume) {
+ 		status = driver->resume(intf);
+ 		if (status)
+@@ -908,6 +900,12 @@ int usb_resume_both(struct usb_device *u
+ 	int			i;
+ 	struct usb_interface	*intf;
+ 
++	/* Can't resume if the parent is suspended */
++	if (udev->parent && udev->parent->state == USB_STATE_SUSPENDED) {
++		dev_warn(&udev->dev, "can't resume; parent is suspended\n");
++		return -EHOSTUNREACH;
++	}
++
+ 	status = resume_device(udev);
+ 	if (status == 0 && udev->actconfig) {
+ 		for (i = 0; i < udev->actconfig->desc.bNumInterfaces; i++) {
+--- gregkh-2.6.orig/drivers/usb/core/generic.c
++++ gregkh-2.6/drivers/usb/core/generic.c
+@@ -195,9 +195,6 @@ static int generic_suspend(struct usb_de
+ 
+ static int generic_resume(struct usb_device *udev)
+ {
+-	if (udev->state == USB_STATE_NOTATTACHED)
+-		return 0;
+-
+ 	return usb_port_resume(udev);
+ }
+ 
+--- gregkh-2.6.orig/drivers/usb/core/hub.c
++++ gregkh-2.6/drivers/usb/core/hub.c
+@@ -1556,26 +1556,6 @@ static int __usb_port_suspend (struct us
+ 	if (port1 < 0)
+ 		return port1;
+ 
+-	if (udev->state == USB_STATE_SUSPENDED
+-			|| udev->state == USB_STATE_NOTATTACHED) {
+-		return 0;
+-	}
+-
+-	/* all interfaces must already be suspended */
+-	if (udev->actconfig) {
+-		int	i;
+-
+-		for (i = 0; i < udev->actconfig->desc.bNumInterfaces; i++) {
+-			struct usb_interface	*intf;
+-
+-			intf = udev->actconfig->interface[i];
+-			if (is_active(intf)) {
+-				dev_dbg(&intf->dev, "nyet suspended\n");
+-				return -EBUSY;
+-			}
+-		}
+-	}
+-
+ 	/* we change the device's upstream USB link,
+ 	 * but root hubs have no upstream USB link.
+ 	 */
+@@ -1614,8 +1594,6 @@ static int __usb_port_suspend (struct us
+ int usb_port_suspend(struct usb_device *udev)
+ {
+ #ifdef	CONFIG_USB_SUSPEND
+-	if (udev->state == USB_STATE_NOTATTACHED)
+-		return -ENODEV;
+ 	return __usb_port_suspend(udev, udev->portnum);
+ #else
+ 	return 0;
+@@ -1761,24 +1739,17 @@ hub_port_resume(struct usb_hub *hub, int
+  */
+ int usb_port_resume(struct usb_device *udev)
+ {
+-	int	status;
+-
+-	if (udev->state == USB_STATE_NOTATTACHED)
+-		return -ENODEV;
++	int	status = 0;
+ 
+ 	/* we change the device's upstream USB link,
+ 	 * but root hubs have no upstream USB link.
+ 	 */
+ 	if (udev->parent) {
+ #ifdef	CONFIG_USB_SUSPEND
+-		if (udev->state == USB_STATE_SUSPENDED) {
+-			// NOTE swsusp may bork us, device state being wrong...
+-			// NOTE this fails if parent is also suspended...
+-			status = hub_port_resume(hdev_to_hub(udev->parent),
+-					udev->portnum, udev);
+-		} else
++		// NOTE this fails if parent is also suspended...
++		status = hub_port_resume(hdev_to_hub(udev->parent),
++				udev->portnum, udev);
+ #endif
+-			status = 0;
+ 	} else
+ 		status = finish_port_resume(udev);
+ 	if (status < 0)
+@@ -1821,12 +1792,14 @@ static int hub_suspend(struct usb_interf
+ 		struct usb_device	*udev;
+ 
+ 		udev = hdev->children [port1-1];
+-		if (udev && (udev->dev.power.power_state.event
+-					== PM_EVENT_ON
++		if (udev && msg.event == PM_EVENT_SUSPEND &&
+ #ifdef	CONFIG_USB_SUSPEND
+-				|| udev->state != USB_STATE_SUSPENDED
++				udev->state != USB_STATE_SUSPENDED
++#else
++				udev->dev.power.power_state.event
++					== PM_EVENT_ON
+ #endif
+-				)) {
++				) {
+ 			dev_dbg(&intf->dev, "port %d nyet suspended\n", port1);
+ 			return -EBUSY;
+ 		}
