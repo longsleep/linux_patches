@@ -14,8 +14,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 ---
  drivers/usb/serial/Kconfig   |   10 
  drivers/usb/serial/Makefile  |    1 
- drivers/usb/serial/mos7720.c | 1963 +++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 1974 insertions(+)
+ drivers/usb/serial/mos7720.c | 1858 +++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 1869 insertions(+)
 
 --- gregkh-2.6.orig/drivers/usb/serial/Kconfig
 +++ gregkh-2.6/drivers/usb/serial/Kconfig
@@ -48,7 +48,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  obj-$(CONFIG_USB_SERIAL_OPTION)			+= option.o
 --- /dev/null
 +++ gregkh-2.6/drivers/usb/serial/mos7720.c
-@@ -0,0 +1,1963 @@
+@@ -0,0 +1,1858 @@
 +/*
 + * mos7720.c
 + *   Controls the Moschip 7720 usb to dual port serial convertor
@@ -72,7 +72,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + *	Copyright (C) 2000 Inside Out Networks, All rights reserved.
 + *	Copyright (C) 2001-2002 Greg Kroah-Hartman <greg@kroah.com>
 + */
-+#include <linux/config.h>
 +#include <linux/kernel.h>
 +#include <linux/errno.h>
 +#include <linux/init.h>
@@ -87,10 +86,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#include <linux/usb.h>
 +#include <asm/uaccess.h>
 +
-+static int debug;
 +#include "usb-serial.h"
-+
-+#define DPRINTK(fmt, args...) printk( "%s: " fmt, __FUNCTION__ , ## args)
 +
 +/*
 + * Version Information
@@ -122,21 +118,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +/* This structure holds all of the local port information */
 +struct moschip_port
 +{
-+	__s16			rxBytesAvail;		/* the number of bytes that we need to read from this device */
-+	__s16			rxBytesRemaining;	/* the number of port bytes left to read */
-+	char			write_in_progress;	/* TRUE while a write URB is outstanding */
 +	__u8			shadowLCR;		/* last LCR value received */
 +	__u8			shadowMCR;		/* last MCR value received */
 +	__u8			shadowMSR;		/* last MSR value received */
-+	__u8			shadowLSR;		/* last LSR value received */
-+	__u8			shadowXonChar;		/* last value set as XON char in moschip */
-+	__u8			shadowXoffChar;		/* last value set as XOFF char in moschip */
-+	__u8			validDataMask;
 +	char			open;
 +	char			chaseResponsePending;
 +	wait_queue_head_t	wait_chase;		/* for handling sleeping while waiting for chase to finish */
-+	wait_queue_head_t	wait_open;		/* for handling sleeping while waiting for open to finish */
-+	wait_queue_head_t	wait_command;		/* for handling sleeping while waiting for command to finish */
 +	wait_queue_head_t	delta_msr_wait;		/* for handling sleeping while waiting for msr change to happen */
 +	struct async_icount	icount;
 +	struct usb_serial_port	*port;			/* loop back to the owner of this object */
@@ -150,6 +137,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	int interrupt_started;
 +};
 +
++static int debug;
++
 +#define USB_VENDOR_ID_MOSCHIP		0x9710
 +#define MOSCHIP_DEVICE_ID_7720		0x7720
 +#define MOSCHIP_DEVICE_ID_7715		0x7715
@@ -160,18 +149,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +};
 +MODULE_DEVICE_TABLE (usb, moschip_port_id_table);
 +
-+/* function prototypes for the usbserial callbacks */
-+static int mos7720_chars_in_buffer(struct usb_serial_port *port);
-+
-+
-+/* function prototypes for all of our local functions */
-+
-+static int  calc_baud_rate_divisor	(int baud_rate, int *divisor);
-+static void change_port_settings	(struct moschip_port *mos7720_port, struct termios *old_termios);
-+
-+static void block_until_chase_response(struct moschip_port *mos7720_port);
-+static void block_until_tx_empty(struct moschip_port *mos7720_port);
-+
 +
 +/*
 + * mos7720_interrupt_callback
@@ -181,11 +158,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static void mos7720_interrupt_callback(struct urb *urb,struct pt_regs *regs)
 +{
 +	int result;
-+	int length ;
-+	__u32 *data ;
-+	struct moschip_port   *mos7720_port;
++	int length;
++	__u32 *data;
 +	unsigned int status;
-+	__u8 sp1,sp2,st;
++	__u8 sp1;
++	__u8 sp2;
++	__u8 st;
 +
 +	dbg("%s"," : Entering\n");
 +
@@ -212,19 +190,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	length = urb->actual_length;
 +	data = urb->transfer_buffer;
 +
-+	mos7720_port= (struct moschip_port*)urb->context;
-+
-+	if (!mos7720_port) {
-+		DPRINTK("%s","NULL mos7720_serial pointer \n");
-+		return ;
-+	}
-+
 +	/* Moschip get 4 bytes
 +	 * Byte 1 IIR Port 1 (port.number is 0)
 +	 * Byte 2 IIR Port 2 (port.number is 1)
 +	 * Byte 3 --------------
 +	 * Byte 4 FIFO status for both */
-+
 +	if (length && length > 4) {
 +		dbg("Wrong data !!!");
 +		return;
@@ -266,7 +236,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	}
 +
 +exit:
-+	result = usb_submit_urb (urb, GFP_ATOMIC);
++	result = usb_submit_urb(urb, GFP_ATOMIC);
 +	if (result)
 +		dev_err(&urb->dev->dev,
 +			"%s - Error %d submitting control urb\n",
@@ -281,12 +251,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + */
 +static void mos7720_bulk_in_callback(struct urb *urb, struct pt_regs *regs)
 +{
-+	int			status;
-+	unsigned char		*data ;
-+	struct usb_serial	*serial;
-+	struct usb_serial_port	*port;
-+	struct moschip_serial	*mos7720_serial;
-+	struct moschip_port	*mos7720_port;
++	int status;
++	unsigned char *data ;
++	struct usb_serial_port *port;
++	struct moschip_serial *mos7720_serial;
++	struct moschip_port *mos7720_port;
 +	struct tty_struct *tty;
 +
 +	if (urb->status) {
@@ -302,12 +271,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	port = mos7720_port->port;
 +
-+	serial = port->serial;
-+
-+	dbg("Entering...");
++	dbg("Entering...%s", __FUNCTION__);
 +
 +	data = urb->transfer_buffer;
-+	mos7720_serial = usb_get_serial_data(serial);
++	mos7720_serial = usb_get_serial_data(port->serial);
 +
 +	tty = port->tty;
 +	if (tty && urb->actual_length) {
@@ -322,7 +289,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	}
 +
 +	if (port->read_urb->status != -EINPROGRESS) {
-+		port->read_urb->dev = serial->dev;
++		port->read_urb->dev = port->serial->dev;
 +
 +		status = usb_submit_urb(port->read_urb, GFP_ATOMIC);
 +		if (status)
@@ -341,18 +308,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	struct moschip_port *mos7720_port;
 +	struct tty_struct *tty;
 +
-+	if (!urb) {
-+		dbg("Invalid Pointer !!!!");
-+		return;
-+	}
-+
 +	if (urb->status) {
 +		dbg("nonzero write bulk status received:%d", urb->status);
 +		return;
 +	}
 +
-+	mos7720_port = (struct moschip_port *)urb->context;
-+	if(!mos7720_port) {
++	mos7720_port = urb->context;
++	if (!mos7720_port) {
 +		dbg("NULL mos7720_port pointer");
 +		return ;
 +	}
@@ -370,9 +332,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		/* tell the tty driver that something has changed */
 +		wake_up_interruptible(&tty->write_wait);
 +	}
-+
-+	/* Release the Write URB */
-+	mos7720_port->write_in_progress = 0;
 +
 +	//schedule_work(&mos7720_port->port->work);
 +}
@@ -407,7 +366,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		value = 0x0000;
 +		if ((le16_to_cpu(serial->dev->descriptor.idProduct) == MOSCHIP_DEVICE_ID_7715) &&
 +		    (index != 0x08)) {
-+			DPRINTK("serial->product== MOSCHIP_DEVICE_ID_7715");
++			dbg("serial->product== MOSCHIP_DEVICE_ID_7715");
 +			//index = 0x01 ;
 +		}
 +	}
@@ -434,12 +393,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return status;
 +}
 +
-+/*
-+ * mos7720_open
-+ *	this function is called by the tty driver when a port is opened
-+ *	If successful, we return 0
-+ *	Otherwise we return a negative error number.
-+ */
 +static int mos7720_open(struct usb_serial_port *port, struct file * filp)
 +{
 +	struct usb_serial *serial;
@@ -485,43 +438,42 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		}
 +	}
 +
-+/*****************************************************************************
-+ * Initialize MCS7720 -- Write Init values to corresponding Registers
-+ *
-+ * Register Index
-+ * 1 : IER
-+ * 2 : FCR
-+ * 3 : LCR
-+ * 4 : MCR
-+ *
-+ * 0x08 : SP1/2 Control Reg
-+ *****************************************************************************/
++	 /* Initialize MCS7720 -- Write Init values to corresponding Registers
++	  *
++	  * Register Index
++	  * 1 : IER
++	  * 2 : FCR
++	  * 3 : LCR
++	  * 4 : MCR
++	  *
++	  * 0x08 : SP1/2 Control Reg
++	  */
 +
 +	SendMosCmd(port->serial,MOS_READ,mos7720_port->port->number - mos7720_port->port->serial->minor, UART_LSR, &data);
-+	DPRINTK("\nSS::%x               LSR:%x\n",(unsigned int)mos7720_port,data);
++	dbg("SS::%p LSR:%x\n",mos7720_port, data);
 +
-+	DPRINTK("%s", "Check:Sending Command .......... \n");
++	dbg("Check:Sending Command ..........");
 +
 +	data = 0x02;
-+	SendMosCmd(port->serial,MOS_WRITE,MOS_MAX_PORT,0x01, &data);
++	SendMosCmd(port->serial, MOS_WRITE, MOS_MAX_PORT, 0x01, &data);
 +	data = 0x02;
-+	SendMosCmd(port->serial,MOS_WRITE,MOS_MAX_PORT,0x02, &data);
++	SendMosCmd(port->serial, MOS_WRITE, MOS_MAX_PORT, 0x02, &data);
 +
 +	data = 0x00;
-+	SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x01, &data);
++	SendMosCmd(port->serial, MOS_WRITE, port->number - port->serial->minor,0x01, &data);
 +	data = 0x00;
-+	SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x02, &data);
++	SendMosCmd(port->serial, MOS_WRITE, port->number - port->serial->minor,0x02, &data);
 +
 +	data = 0xCF;
-+	SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x02, &data);
++	SendMosCmd(port->serial, MOS_WRITE, port->number - port->serial->minor,0x02, &data);
 +	data = 0x03;
 +        mos7720_port->shadowLCR  = data;
-+	SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x03, &data);
++	SendMosCmd(port->serial, MOS_WRITE, port->number - port->serial->minor,0x03, &data);
 +	data = 0x0b;
 +        mos7720_port->shadowMCR  = data;
-+	SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x04, &data);
++	SendMosCmd(port->serial, MOS_WRITE, port->number - port->serial->minor,0x04, &data);
 +	data = 0x0b;
-+	SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x04, &data);
++	SendMosCmd(port->serial, MOS_WRITE, port->number - port->serial->minor,0x04, &data);
 +
 +	data = 0x00;
 +	SendMosCmd(port->serial,MOS_READ,MOS_MAX_PORT,0x08, &data);
@@ -607,10 +559,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			"%s - Error %d submitting read urb", __FUNCTION__, response);
 +
 +	/* initialize our wait queues */
-+	init_waitqueue_head(&mos7720_port->wait_open);
 +	init_waitqueue_head(&mos7720_port->wait_chase);
 +	init_waitqueue_head(&mos7720_port->delta_msr_wait);
-+	init_waitqueue_head(&mos7720_port->wait_command);
 +
 +	/* initialize our icount structure */
 +	memset (&(mos7720_port->icount), 0x00, sizeof(mos7720_port->icount));
@@ -620,169 +570,39 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	mos7720_port->chaseResponsePending = 0;
 +	/* send a open port command */
 +	mos7720_port->open = 1;
-+	mos7720_port->rxBytesAvail = 0x0;
 +
 +	return 0;
 +}
 +
-+/*****************************************************************************
-+ * mos7720_close
-+ *	this function is called by the tty driver when a port is closed
-+ *****************************************************************************/
-+
-+static void mos7720_close (struct usb_serial_port *port, struct file * filp)
++/*
++ * mos7720_chars_in_buffer
++ *	this function is called by the tty driver when it wants to know how many
++ *	bytes of data we currently have outstanding in the port (data that has
++ *	been written, but hasn't made it out the port yet)
++ *	If successful, we return the number of bytes left to be written in the
++ *	system,
++ *	Otherwise we return a negative error number.
++ */
++static int mos7720_chars_in_buffer(struct usb_serial_port *port)
 +{
-+	struct usb_serial *serial;
-+	struct moschip_serial *mos7720_serial;
-+	struct moschip_port *mos7720_port;
-+	char data;
-+	int j;
-+
-+	DPRINTK("%s\n","mos7720_close:entering...");
-+
-+	serial = port->serial;
-+
-+	mos7720_serial = usb_get_serial_data(serial);
-+	mos7720_port = usb_get_serial_port_data(port);
-+	if ((mos7720_serial == NULL) || (mos7720_port == NULL))
-+		return;
-+
-+	for (j = 0; j < NUM_URBS; ++j)
-+		usb_unlink_urb (mos7720_port->write_urb_pool[j]);
-+
-+
-+	   /* Freeing Write URBs*/
-+	   for (j = 0; j < NUM_URBS; ++j)
-+ 	   {
-+                if (mos7720_port->write_urb_pool[j])
-+                {
-+                    if (mos7720_port->write_urb_pool[j]->transfer_buffer)
-+                            kfree(mos7720_port->write_urb_pool[j]->transfer_buffer);
-+
-+                    usb_free_urb (mos7720_port->write_urb_pool[j]);
-+                }
-+          }
-+
-+
-+	if (serial->dev)
-+	{
-+		/* flush and block until tx is empty*/
-+		block_until_tx_empty(mos7720_port);
-+	}
-+
-+	/* While closing port, shutdown all bulk read, write  *
-+	 * and interrupt read if they exists                  */
-+	if (serial->dev) {
-+		if (port->write_urb) {
-+			DPRINTK("%s","Shutdown bulk write\n");
-+			usb_unlink_urb(port->write_urb);
-+		}
-+		if (port->read_urb) {
-+			DPRINTK("%s","Shutdown bulk read\n");
-+			usb_unlink_urb(port->read_urb);
-+		}
-+	}
-+
-+
-+
-+
-+	data = 0x00;
-+	SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x04, &data);
-+
-+	data = 0x00;
-+	SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x01, &data);
-+
-+	mos7720_port->open = 0;
-+
-+	DPRINTK("%s \n","Leaving ............");
-+}
-+
-+
-+/*****************************************************************************
-+ * SerialBreak
-+ *	this function sends a break to the port
-+ *****************************************************************************/
-+static void mos7720_break (struct usb_serial_port *port, int break_state)
-+{
-+        unsigned char data;
-+	struct usb_serial *serial;
-+	struct moschip_serial *mos7720_serial;
++	int i;
++	int chars = 0;
 +	struct moschip_port *mos7720_port;
 +
-+	DPRINTK("%s \n","Entering ...........");
++	dbg("%s:entering ...........", __FUNCTION__);
 +
-+	serial = port->serial;
-+
-+	mos7720_serial = usb_get_serial_data(serial);
 +	mos7720_port = usb_get_serial_port_data(port);
-+	if ((mos7720_serial == NULL) || (mos7720_port == NULL))
-+		return;
-+
-+	/* flush and chase */
-+	mos7720_port->chaseResponsePending = 1;
-+
-+	if (serial->dev) {
-+		/* flush and block until tx is empty*/
-+		block_until_chase_response(mos7720_port);
++	if (mos7720_port == NULL) {
++		dbg("%s:leaving ...........", __FUNCTION__);
++		return -ENODEV;
 +	}
 +
-+	if (break_state == -1) {
-+		data = mos7720_port->shadowLCR | UART_LCR_SBC;
-+	} else {
-+		data = mos7720_port->shadowLCR & ~UART_LCR_SBC;
++	for (i = 0; i < NUM_URBS; ++i) {
++		if (mos7720_port->write_urb_pool[i]->status == -EINPROGRESS)
++			chars += URB_TRANSFER_BUFFER_SIZE;
 +	}
-+
-+	mos7720_port->shadowLCR  = data;
-+	SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x03, &data);
-+
-+	return;
-+}
-+
-+
-+/************************************************************************
-+ *
-+ * block_until_chase_response
-+ *
-+ *	This function will block the close until one of the following:
-+ *		1. Response to our Chase comes from mos7720
-+ *		2. A timout of 10 seconds without activity has expired
-+ *		   (1K of mos7720 data @ 2400 baud ==> 4 sec to empty)
-+ *
-+ ************************************************************************/
-+
-+static void block_until_chase_response(struct moschip_port *mos7720_port)
-+{
-+	int timeout = 1*HZ;
-+	int wait = 10;
-+	int count ;
-+
-+
-+	while (1)
-+	{
-+		count = mos7720_chars_in_buffer(mos7720_port->port);
-+
-+		/* Check for Buffer status */
-+		if (count <= 0) {
-+			mos7720_port->chaseResponsePending = 0;
-+			return;
-+		}
-+
-+		/* Block the thread for a while */
-+		interruptible_sleep_on_timeout (&mos7720_port->wait_chase, timeout);
-+                /* No activity.. count down section */
-+		wait--;
-+		if (wait == 0)
-+		{
-+			dbg("%s - TIMEOUT", __FUNCTION__);
-+			return;
-+		}
-+		else
-+		{
-+	                /* Reset timout value back to seconds */
-+			wait = 10;
-+		}
-+	}
-+
++	dbg("%s - returns %d", __FUNCTION__, chars);
++	return chars;
 +}
 +
 +
@@ -828,6 +648,165 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	}
 +}
 +
++
++/*****************************************************************************
++ * mos7720_close
++ *	this function is called by the tty driver when a port is closed
++ *****************************************************************************/
++
++static void mos7720_close (struct usb_serial_port *port, struct file * filp)
++{
++	struct usb_serial *serial;
++	struct moschip_serial *mos7720_serial;
++	struct moschip_port *mos7720_port;
++	char data;
++	int j;
++
++	dbg("mos7720_close:entering...");
++
++	serial = port->serial;
++
++	mos7720_serial = usb_get_serial_data(serial);
++	mos7720_port = usb_get_serial_port_data(port);
++	if ((mos7720_serial == NULL) || (mos7720_port == NULL))
++		return;
++
++	for (j = 0; j < NUM_URBS; ++j)
++		usb_unlink_urb (mos7720_port->write_urb_pool[j]);
++
++
++	   /* Freeing Write URBs*/
++	   for (j = 0; j < NUM_URBS; ++j)
++ 	   {
++                if (mos7720_port->write_urb_pool[j])
++                {
++                    if (mos7720_port->write_urb_pool[j]->transfer_buffer)
++                            kfree(mos7720_port->write_urb_pool[j]->transfer_buffer);
++
++                    usb_free_urb (mos7720_port->write_urb_pool[j]);
++                }
++          }
++
++
++	if (serial->dev) {
++		/* flush and block until tx is empty*/
++		block_until_tx_empty(mos7720_port);
++	}
++
++	/* While closing port, shutdown all bulk read, write  *
++	 * and interrupt read if they exists                  */
++	if (serial->dev) {
++		if (port->write_urb) {
++			dbg("Shutdown bulk write");
++			usb_unlink_urb(port->write_urb);
++		}
++		if (port->read_urb) {
++			dbg("Shutdown bulk read");
++			usb_unlink_urb(port->read_urb);
++		}
++	}
++
++
++
++
++	data = 0x00;
++	SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x04, &data);
++
++	data = 0x00;
++	SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x01, &data);
++
++	mos7720_port->open = 0;
++
++	dbg("Leaving %s", __FUNCTION__);
++}
++
++
++/************************************************************************
++ *
++ * block_until_chase_response
++ *
++ *	This function will block the close until one of the following:
++ *		1. Response to our Chase comes from mos7720
++ *		2. A timout of 10 seconds without activity has expired
++ *		   (1K of mos7720 data @ 2400 baud ==> 4 sec to empty)
++ *
++ ************************************************************************/
++static void block_until_chase_response(struct moschip_port *mos7720_port)
++{
++	int timeout = 1*HZ;
++	int wait = 10;
++	int count ;
++
++
++	while (1)
++	{
++		count = mos7720_chars_in_buffer(mos7720_port->port);
++
++		/* Check for Buffer status */
++		if (count <= 0) {
++			mos7720_port->chaseResponsePending = 0;
++			return;
++		}
++
++		/* Block the thread for a while */
++		interruptible_sleep_on_timeout (&mos7720_port->wait_chase, timeout);
++                /* No activity.. count down section */
++		wait--;
++		if (wait == 0)
++		{
++			dbg("%s - TIMEOUT", __FUNCTION__);
++			return;
++		}
++		else
++		{
++	                /* Reset timout value back to seconds */
++			wait = 10;
++		}
++	}
++
++}
++
++/*****************************************************************************
++ * SerialBreak
++ *	this function sends a break to the port
++ *****************************************************************************/
++static void mos7720_break (struct usb_serial_port *port, int break_state)
++{
++        unsigned char data;
++	struct usb_serial *serial;
++	struct moschip_serial *mos7720_serial;
++	struct moschip_port *mos7720_port;
++
++	dbg("Entering %s", __FUNCTION__);
++
++	serial = port->serial;
++
++	mos7720_serial = usb_get_serial_data(serial);
++	mos7720_port = usb_get_serial_port_data(port);
++	if ((mos7720_serial == NULL) || (mos7720_port == NULL))
++		return;
++
++	/* flush and chase */
++	mos7720_port->chaseResponsePending = 1;
++
++	if (serial->dev) {
++		/* flush and block until tx is empty*/
++		block_until_chase_response(mos7720_port);
++	}
++
++	if (break_state == -1) {
++		data = mos7720_port->shadowLCR | UART_LCR_SBC;
++	} else {
++		data = mos7720_port->shadowLCR & ~UART_LCR_SBC;
++	}
++
++	mos7720_port->shadowLCR  = data;
++	SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x03, &data);
++
++	return;
++}
++
++
 +/*
 + * mos7720_write_room
 + *	this function is called by the tty driver when it wants to know how many
@@ -841,11 +820,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	int room = 0;
 +	int i;
 +
-+	DPRINTK("%s \n"," mos7720_write_room:entering ...........");
++	dbg("%s:entering ...........", __FUNCTION__);
 +
 +	mos7720_port = usb_get_serial_port_data(port);
 +	if (mos7720_port == NULL) {
-+		DPRINTK("%s \n","mos7720_break:leaving ...........");
++		dbg("%s:leaving ...........", __FUNCTION__);
 +		return -ENODEV;
 +	}
 +
@@ -857,38 +836,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	dbg("%s - returns %d", __FUNCTION__, room);
 +	return room;
 +}
-+
-+/*
-+ * mos7720_chars_in_buffer
-+ *	this function is called by the tty driver when it wants to know how many
-+ *	bytes of data we currently have outstanding in the port (data that has
-+ *	been written, but hasn't made it out the port yet)
-+ *	If successful, we return the number of bytes left to be written in the
-+ *	system,
-+ *	Otherwise we return a negative error number.
-+ */
-+static int mos7720_chars_in_buffer(struct usb_serial_port *port)
-+{
-+	int i;
-+	int chars = 0;
-+	struct moschip_port *mos7720_port;
-+
-+	DPRINTK("%s \n"," mos7720_chars_in_buffer:entering ...........");
-+
-+	mos7720_port = usb_get_serial_port_data(port);
-+	if (mos7720_port == NULL) {
-+		DPRINTK("%s \n","mos7720_break:leaving ...........");
-+		return -ENODEV;
-+	}
-+
-+	for (i = 0; i < NUM_URBS; ++i) {
-+		if (mos7720_port->write_urb_pool[i]->status == -EINPROGRESS)
-+			chars += URB_TRANSFER_BUFFER_SIZE;
-+	}
-+	dbg("%s - returns %d", __FUNCTION__, chars);
-+	return chars;
-+}
-+
 +
 +/*
 + * mos7720_write
@@ -911,84 +858,70 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	const unsigned char *current_position = data;
 +
-+	DPRINTK("%s \n","entering ...........");
++	dbg("%s:entering ...........", __FUNCTION__);
 +
 +	serial = port->serial;
 +
 +	mos7720_port = usb_get_serial_port_data(port);
-+	if(mos7720_port==NULL)
-+	{
-+		DPRINTK("%s","mos7720_port is NULL\n");
-+		return -1;
++	if(mos7720_port == NULL) {
++		dbg("mos7720_port is NULL");
++		return -ENODEV;
 +	}
 +
 +	mos7720_serial = usb_get_serial_data(serial);
-+	if (mos7720_serial==NULL) {
-+		DPRINTK("%s","mos7720_serial is NULL \n");
-+		return -1;
++	if (mos7720_serial == NULL) {
++		dbg("mos7720_serial is NULL");
++		return -ENODEV;
 +	}
 +
++	/* try to find a free urb in the list */
++	urb = NULL;
 +
-+        	/* try to find a free urb in the list */
-+        	urb = NULL;
++	for (i = 0; i < NUM_URBS; ++i) {
++		if (mos7720_port->write_urb_pool[i]->status != -EINPROGRESS) {
++			urb = mos7720_port->write_urb_pool[i];
++			dbg("URB:%d",i);
++			break;
++		}
++	}
 +
-+        	for (i = 0; i < NUM_URBS; ++i)
-+		{
-+                	if (mos7720_port->write_urb_pool[i]->status != -EINPROGRESS)
-+			{
-+                        	urb = mos7720_port->write_urb_pool[i];
-+				DPRINTK("\nURB:%d",i);
-+                        	break;
-+                	}
-+        	}
++	if (urb == NULL) {
++		dbg("%s - no more free urbs", __FUNCTION__);
++		goto exit;
++	}
 +
-+	        if (urb == NULL)
-+		{
-+                	dbg("%s - no more free urbs", __FUNCTION__);
-+                	goto exit;
-+        	}
++	if (urb->transfer_buffer == NULL) {
++		urb->transfer_buffer = kmalloc(URB_TRANSFER_BUFFER_SIZE, GFP_KERNEL);
 +
-+        	if (urb->transfer_buffer == NULL)
-+		{
-+          	urb->transfer_buffer = kmalloc (URB_TRANSFER_BUFFER_SIZE, GFP_KERNEL);
-+
-+                	if (urb->transfer_buffer == NULL)
-+			{
-+                        	err("%s no more kernel memory...", __FUNCTION__);
-+                        	goto exit;
-+                	}
-+        	}
-+        	transfer_size = min (count, URB_TRANSFER_BUFFER_SIZE);
-+
-+               	memcpy (urb->transfer_buffer, current_position, transfer_size);
-+		usb_serial_debug_data(debug, &port->dev, __FUNCTION__, transfer_size, urb->transfer_buffer);
-+
-+		/* fill urb with data and submit  */
-+
-+           	usb_fill_bulk_urb (urb,
-+		 serial->dev,
-+		 usb_sndbulkpipe(serial->dev,
-+		 port->bulk_out_endpointAddress),
-+		 urb->transfer_buffer,
-+		 transfer_size,
-+		 mos7720_bulk_out_data_callback,
-+		 mos7720_port);
-+
-+
-+        	/* send it down the pipe */
-+        	status = usb_submit_urb(urb,GFP_ATOMIC);
-+
-+        	if (status)
-+		{
-+                	err("%s - usb_submit_urb(write bulk) failed with status = %d", __FUNCTION__, status);
-+                	bytes_sent = status;
++		if (urb->transfer_buffer == NULL) {
++			err("%s no more kernel memory...", __FUNCTION__);
 +			goto exit;
-+        	}
-+        	bytes_sent = transfer_size;
++		}
++	}
++	transfer_size = min (count, URB_TRANSFER_BUFFER_SIZE);
++
++	memcpy (urb->transfer_buffer, current_position, transfer_size);
++	usb_serial_debug_data(debug, &port->dev, __FUNCTION__, transfer_size, urb->transfer_buffer);
++
++	/* fill urb with data and submit  */
++	usb_fill_bulk_urb (urb, serial->dev,
++			   usb_sndbulkpipe(serial->dev,
++					   port->bulk_out_endpointAddress),
++			   urb->transfer_buffer, transfer_size,
++			   mos7720_bulk_out_data_callback, mos7720_port);
++
++
++	/* send it down the pipe */
++	status = usb_submit_urb(urb,GFP_ATOMIC);
++	if (status) {
++		err("%s - usb_submit_urb(write bulk) failed with status = %d", __FUNCTION__, status);
++		bytes_sent = status;
++		goto exit;
++	}
++	bytes_sent = transfer_size;
 +
 +exit:
 +	return bytes_sent;
-+
 +}
 +
 +/*
@@ -1002,7 +935,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	struct tty_struct *tty;
 +	int status;
 +
-+	DPRINTK("- port %d\n", port->number);
++	dbg("%s- port %d\n", __FUNCTION__, port->number);
 +
 +	mos7720_port = usb_get_serial_port_data(port);
 +
@@ -1010,11 +943,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		return;
 +
 +	if (!mos7720_port->open) {
-+		DPRINTK("%s\n","port not opened");
++		dbg("port not opened");
 +		return;
 +	}
 +
-+	DPRINTK("%s","Entering .......... \n");
++	dbg("%s: Entering ..........", __FUNCTION__);
 +
 +	tty = port->tty;
 +	if (!tty) {
@@ -1061,7 +994,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		return;
 +	}
 +
-+	DPRINTK("%s","Entering .......... \n");
++	dbg("%s: Entering ..........", __FUNCTION__);
 +
 +	tty = port->tty;
 +	if (!tty) {
@@ -1087,6 +1020,401 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			return;
 +	}
 +
++	return;
++}
++
++/*****************************************************************************
++ * set_higher_rates
++ *      function to set for Higher rates
++ *****************************************************************************/
++
++static int set_higher_rates(struct moschip_port *mos7720_port, unsigned int baud)
++{
++	unsigned char data;
++
++	struct usb_serial_port *port;
++	struct usb_serial *serial;
++
++
++	if (mos7720_port == NULL)
++		return -1;
++
++	port = (struct usb_serial_port*)mos7720_port->port;
++
++	serial = (struct usb_serial*)port->serial;
++
++        /***********************************************
++         *      Init Sequence for higher rates
++         ***********************************************/
++
++	dbg("Sending Setting Commands ..........");
++
++	data = 0x000;
++	SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x01, &data);
++	data = 0x000;
++	SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x02, &data);
++	data = 0x0CF;
++	SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x02, &data);
++	data = 0x00b;
++        mos7720_port->shadowMCR  = data;
++	SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x04, &data);
++	data = 0x00b;
++	SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x04, &data);
++
++	data = 0x000;
++	SendMosCmd(port->serial,MOS_READ,MOS_MAX_PORT,0x08, &data);
++	data = 0x000;
++	SendMosCmd(port->serial,MOS_WRITE,MOS_MAX_PORT,0x08, &data);
++
++
++        /***********************************************
++         *              Set for higher rates           *
++         ***********************************************/
++
++	data = baud * 0x10;
++	SendMosCmd(port->serial,MOS_WRITE,MOS_MAX_PORT,port->number - port->serial->minor + 1,&data);
++
++	data = 0x003;
++	SendMosCmd(port->serial,MOS_READ,MOS_MAX_PORT,0x08, &data);
++	data = 0x003;
++	SendMosCmd(port->serial,MOS_WRITE,MOS_MAX_PORT,0x08, &data);
++
++	data = 0x02b;
++        mos7720_port->shadowMCR  = data;
++	SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x04, &data);
++	data = 0x02b;
++	SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x04, &data);
++
++        /***********************************************
++         *              Set DLL/DLM
++         ***********************************************/
++
++	data = mos7720_port->shadowLCR | UART_LCR_DLAB;
++        mos7720_port->shadowLCR  = data;
++	SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x03, &data);
++
++	data =  0x001; /* DLL */
++        SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x00, &data);
++	data =  0x000; /* DLM */
++        SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x01, &data);
++
++	data = mos7720_port->shadowLCR & ~UART_LCR_DLAB;
++        mos7720_port->shadowLCR  = data;
++	SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x03, &data);
++
++
++	return 0;
++}
++
++
++/* baud rate information */
++struct divisor_table_entry
++{
++	__u32  baudrate;
++	__u16  divisor;
++};
++
++/* Define table of divisors for moschip 7720 hardware	   *
++ * These assume a 3.6864MHz crystal, the standard /16, and *
++ * MCR.7 = 0.						   */
++static struct divisor_table_entry divisor_table[] = {
++	{   50,		2304},
++	{   110,	1047},	/* 2094.545455 => 230450   => .0217 % over */
++	{   134,	857},	/* 1713.011152 => 230398.5 => .00065% under */
++	{   150,	768},
++	{   300,	384},
++	{   600,	192},
++	{   1200,	96},
++	{   1800,	64},
++	{   2400,	48},
++	{   4800,	24},
++	{   7200,	16},
++	{   9600,	12},
++	{   19200,	6},
++	{   38400,	3},
++	{   57600,	2},
++	{   115200,	1},
++};
++
++/*****************************************************************************
++ * calc_baud_rate_divisor
++ *	this function calculates the proper baud rate divisor for the specified
++ *	baud rate.
++ *****************************************************************************/
++static int calc_baud_rate_divisor(int baudrate, int *divisor)
++{
++	int i;
++	__u16 custom;
++	__u16 round1;
++	__u16 round;
++
++
++	dbg("%s - %d", __FUNCTION__, baudrate);
++
++	for (i = 0; i < ARRAY_SIZE(divisor_table); i++) {
++		if (divisor_table[i].baudrate == baudrate) {
++			*divisor = divisor_table[i].divisor;
++			return 0;
++		}
++	}
++
++        /* After trying for all the standard baud rates    *
++         * Try calculating the divisor for this baud rate  */
++	if (baudrate > 75 &&  baudrate < 230400) {
++		/* get the divisor */
++		custom = (__u16)(230400L  / baudrate);
++
++		/* Check for round off */
++		round1 = (__u16)(2304000L / baudrate);
++		round = (__u16)(round1 - (custom * 10));
++		if (round > 4)
++			custom++;
++		*divisor = custom;
++
++		dbg("Baud %d = %d",baudrate, custom);
++		return 0;
++	}
++
++	dbg("Baud calculation Failed...");
++	return -EINVAL;
++}
++
++
++/*****************************************************************************
++ * send_cmd_write_baud_rate
++ *	this function sends the proper command to change the baud rate of the
++ *	specified port.
++ *****************************************************************************/
++
++static int send_cmd_write_baud_rate (struct moschip_port *mos7720_port, int baudrate)
++{
++	int divisor;
++	int status;
++	unsigned char data;
++	unsigned char number ;
++
++	struct usb_serial_port *port;
++
++	if (mos7720_port == NULL)
++		return -1;
++
++	port = mos7720_port->port;
++
++	dbg("%s: Entering ..........", __FUNCTION__);
++
++	number = mos7720_port->port->number - mos7720_port->port->serial->minor;
++	dbg("%s - port = %d, baud = %d", __FUNCTION__, mos7720_port->port->number, baudrate);
++
++        /* Calculate the Divisor */
++	status = calc_baud_rate_divisor (baudrate, &divisor);
++	if (status) {
++		err("%s - bad baud rate", __FUNCTION__);
++		return status;
++	}
++
++        /* Enable access to divisor latch */
++        data = mos7720_port->shadowLCR | UART_LCR_DLAB;
++        mos7720_port->shadowLCR  = data;
++        SendMosCmd(mos7720_port->port->serial,MOS_WRITE,port->number - port->serial->minor, UART_LCR, &data);
++
++	/* Write the divisor */
++	data = ((unsigned char)(divisor & 0xff));
++        SendMosCmd(mos7720_port->port->serial,MOS_WRITE,port->number - port->serial->minor,0x00, &data);
++
++	data = ((unsigned char)((divisor & 0xff00) >> 8));
++        SendMosCmd(mos7720_port->port->serial,MOS_WRITE,port->number - port->serial->minor,0x01, &data);
++
++        /* Disable access to divisor latch */
++        data = mos7720_port->shadowLCR & ~UART_LCR_DLAB;
++        mos7720_port->shadowLCR = data;
++        SendMosCmd(mos7720_port->port->serial,MOS_WRITE,port->number - port->serial->minor,0x03, &data);
++
++	return status;
++}
++
++/*****************************************************************************
++ * change_port_settings
++ *	This routine is called to set the UART on the device to match
++ *      the specified new settings.
++ *****************************************************************************/
++
++static void change_port_settings (struct moschip_port *mos7720_port, struct termios *old_termios)
++{
++	struct tty_struct *tty;
++	int baud;
++	unsigned cflag;
++	unsigned iflag;
++	__u8 mask = 0xff;
++	__u8 lData;
++	__u8 lParity;
++	__u8 lStop;
++	int status;
++	char data;
++
++	struct usb_serial_port *port;
++	struct usb_serial *serial;
++
++	if (mos7720_port == NULL)
++		return ;
++
++	port = (struct usb_serial_port *)mos7720_port->port;
++
++	serial = port->serial;
++
++	dbg("%s - port %d", __FUNCTION__, mos7720_port->port->number);
++
++	if (!mos7720_port->open) {
++		dbg("%s - port not opened", __FUNCTION__);
++		return;
++	}
++
++	tty = mos7720_port->port->tty;
++
++	if ((!tty) || (!tty->termios))
++	{
++		dbg("%s - no tty structures", __FUNCTION__);
++		return;
++	}
++
++	dbg("%s: Entering ..........", __FUNCTION__);
++
++	lData = UART_LCR_WLEN8;
++	lStop = 0x00;	/* 1 stop bit */
++	lParity = 0x00;	/* No parity */
++
++	cflag = tty->termios->c_cflag;
++	iflag = tty->termios->c_iflag;
++
++	/* Change the number of bits */
++	switch (cflag & CSIZE)
++	{
++		case CS5:	lData = UART_LCR_WLEN5;
++				mask = 0x1f;
++			    	break;
++
++		case CS6:   	lData = UART_LCR_WLEN6;
++				mask = 0x3f;
++			    	break;
++
++		case CS7:   	lData = UART_LCR_WLEN7;
++				mask = 0x7f;
++			    	break;
++		default:
++		case CS8:   	lData = UART_LCR_WLEN8;
++			    	break;
++	}
++
++	/* Change the Parity bit */
++	if (cflag & PARENB) {
++		if (cflag & PARODD) {
++			lParity = UART_LCR_PARITY;
++			dbg("%s - parity = odd", __FUNCTION__);
++		} else {
++			lParity = (UART_LCR_EPAR | UART_LCR_PARITY);
++			dbg("%s - parity = even", __FUNCTION__);
++		}
++
++	} else {
++		dbg("%s - parity = none", __FUNCTION__);
++	}
++
++	if (cflag & CMSPAR)
++		lParity = lParity | 0x20;
++
++	/* Change the Stop bit */
++	if (cflag & CSTOPB) {
++		lStop = UART_LCR_STOP;
++		dbg("%s - stop bits = 2", __FUNCTION__);
++	} else {
++		lStop = 0x00;
++		dbg("%s - stop bits = 1", __FUNCTION__);
++	}
++
++#define LCR_BITS_MASK		0x03	/* Mask for bits/char field */
++#define LCR_STOP_MASK		0x04	/* Mask for stop bits field */
++#define LCR_PAR_MASK		0x38	/* Mask for parity field */
++
++	/* Update the LCR with the correct value */
++	mos7720_port->shadowLCR &= ~(LCR_BITS_MASK | LCR_STOP_MASK | LCR_PAR_MASK);
++	mos7720_port->shadowLCR |= (lData | lParity | lStop);
++
++	/* Disable Interrupts */
++	data = 0x00;
++        SendMosCmd(mos7720_port->port->serial,MOS_WRITE,port->number - port->serial->minor, UART_IER, &data);
++
++	data = 0x00;
++        SendMosCmd(mos7720_port->port->serial,MOS_WRITE,port->number - port->serial->minor, UART_FCR, &data);
++
++	data = 0xcf;
++        SendMosCmd(mos7720_port->port->serial,MOS_WRITE,port->number - port->serial->minor, UART_FCR, &data);
++
++	/* Send the updated LCR value to the mos7720 */
++	data = mos7720_port->shadowLCR;
++        SendMosCmd(mos7720_port->port->serial,MOS_WRITE,port->number - port->serial->minor, UART_LCR, &data);
++
++        data = 0x00b;
++        mos7720_port->shadowMCR = data;
++        SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x04, &data);
++        data = 0x00b;
++        SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x04, &data);
++
++	/* set up the MCR register and send it to the mos7720 */
++
++	mos7720_port->shadowMCR = UART_MCR_OUT2;
++	if (cflag & CBAUD)
++		mos7720_port->shadowMCR |= (UART_MCR_DTR | UART_MCR_RTS);
++
++
++	if (cflag & CRTSCTS) {
++		mos7720_port->shadowMCR |= (UART_MCR_XONANY);
++
++                /* To set hardware flow control to the specified *
++                 * serial port, in SP1/2_CONTROL_REG             */
++
++		if (port->number) {
++			data = 0x001;
++			SendMosCmd(port->serial, MOS_WRITE, MOS_MAX_PORT, 0x08, &data);
++		} else {
++			data = 0x002;
++			SendMosCmd(port->serial,MOS_WRITE,MOS_MAX_PORT,0x08, &data);
++		}
++	} else {
++		mos7720_port->shadowMCR &= ~(UART_MCR_XONANY);
++	}
++
++	data = mos7720_port->shadowMCR;
++	SendMosCmd(mos7720_port->port->serial,MOS_WRITE,port->number - port->serial->minor, UART_MCR, &data);
++
++	/* Determine divisor based on baud rate */
++	baud = tty_get_baud_rate(tty);
++	if (!baud) {
++		/* pick a default, any default... */
++        	dbg("Picked default baud...");
++		baud = 9600;
++	}
++
++	if (baud >= 230400) {
++		set_higher_rates(mos7720_port, baud);
++	        /* Enable Interrupts */
++		data = 0x0c;
++		SendMosCmd(mos7720_port->port->serial, MOS_WRITE,port->number - port->serial->minor, UART_IER, &data);
++		return;
++	}
++
++	dbg("%s - baud rate = %d", __FUNCTION__, baud);
++	status = send_cmd_write_baud_rate (mos7720_port, baud);
++
++	/* Enable Interrupts */
++	data = 0x0c;
++	SendMosCmd(mos7720_port->port->serial, MOS_WRITE,port->number - port->serial->minor, UART_IER, &data);
++
++	if (port->read_urb->status != -EINPROGRESS) {
++		port->read_urb->dev = serial->dev;
++
++		status = usb_submit_urb(port->read_urb, GFP_ATOMIC);
++		if (status)
++			dbg("usb_submit_urb(read bulk) failed, status = %d", status);
++	}
 +	return;
 +}
 +
@@ -1221,89 +1549,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return -ENOIOCTLCMD;
 +}
 +/*****************************************************************************
-+ * set_higher_rates
-+ *      function to set for Higher rates
-+ *****************************************************************************/
-+
-+static int set_higher_rates(struct moschip_port *mos7720_port, unsigned int baud)
-+{
-+	unsigned char data;
-+
-+	struct usb_serial_port *port;
-+	struct usb_serial *serial;
-+
-+
-+	if (mos7720_port == NULL)
-+		return -1;
-+
-+	port = (struct usb_serial_port*)mos7720_port->port;
-+
-+	serial = (struct usb_serial*)port->serial;
-+
-+        /***********************************************
-+         *      Init Sequence for higher rates
-+         ***********************************************/
-+
-+	DPRINTK("%s", "Sending Setting Commands .......... \n");
-+
-+	data = 0x000;
-+	SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x01, &data);
-+	data = 0x000;
-+	SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x02, &data);
-+	data = 0x0CF;
-+	SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x02, &data);
-+	data = 0x00b;
-+        mos7720_port->shadowMCR  = data;
-+	SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x04, &data);
-+	data = 0x00b;
-+	SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x04, &data);
-+
-+	data = 0x000;
-+	SendMosCmd(port->serial,MOS_READ,MOS_MAX_PORT,0x08, &data);
-+	data = 0x000;
-+	SendMosCmd(port->serial,MOS_WRITE,MOS_MAX_PORT,0x08, &data);
-+
-+
-+        /***********************************************
-+         *              Set for higher rates           *
-+         ***********************************************/
-+
-+	data = baud * 0x10;
-+	SendMosCmd(port->serial,MOS_WRITE,MOS_MAX_PORT,port->number - port->serial->minor + 1,&data);
-+
-+	data = 0x003;
-+	SendMosCmd(port->serial,MOS_READ,MOS_MAX_PORT,0x08, &data);
-+	data = 0x003;
-+	SendMosCmd(port->serial,MOS_WRITE,MOS_MAX_PORT,0x08, &data);
-+
-+	data = 0x02b;
-+        mos7720_port->shadowMCR  = data;
-+	SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x04, &data);
-+	data = 0x02b;
-+	SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x04, &data);
-+
-+        /***********************************************
-+         *              Set DLL/DLM
-+         ***********************************************/
-+
-+	data = mos7720_port->shadowLCR | UART_LCR_DLAB;
-+        mos7720_port->shadowLCR  = data;
-+	SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x03, &data);
-+
-+	data =  0x001; /* DLL */
-+        SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x00, &data);
-+	data =  0x000; /* DLM */
-+        SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x01, &data);
-+
-+	data = mos7720_port->shadowLCR & ~UART_LCR_DLAB;
-+        mos7720_port->shadowLCR  = data;
-+	SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x03, &data);
-+
-+
-+	return 0;
-+}
-+
-+/*****************************************************************************
 + * set_modem_info
 + *      function to set modem info
 + *****************************************************************************/
@@ -1364,12 +1609,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return 0;
 +}
 +
-+/*****************************************************************************
-+ * get_modem_info
-+ *      function to get modem info
-+ *****************************************************************************/
-+
-+static int get_modem_info(struct moschip_port *mos7720_port, unsigned int __user *value)
++static int get_modem_info(struct moschip_port *mos7720_port,
++			  unsigned int __user *value)
 +{
 +	unsigned int result = 0;
 +	unsigned int msr = mos7720_port->shadowMSR;
@@ -1390,18 +1631,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return 0;
 +}
 +
-+/*****************************************************************************
-+ * get_serial_info
-+ *      function to get information about serial port
-+ *****************************************************************************/
-+
-+static int get_serial_info(struct moschip_port *mos7720_port, struct serial_struct __user *retinfo)
++static int get_serial_info(struct moschip_port *mos7720_port,
++			   struct serial_struct __user *retinfo)
 +{
 +	struct serial_struct tmp;
-+
-+	if (mos7720_port == NULL)
-+		return -1;
-+
 +
 +	if (!retinfo)
 +		return -EFAULT;
@@ -1413,433 +1646,106 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	tmp.port		= mos7720_port->port->number;
 +	tmp.irq			= 0;
 +	tmp.flags		= ASYNC_SKIP_TEST | ASYNC_AUTO_IRQ;
-+        tmp.xmit_fifo_size      = NUM_URBS * URB_TRANSFER_BUFFER_SIZE;
++        tmp.xmit_fifo_size	= NUM_URBS * URB_TRANSFER_BUFFER_SIZE;
 +	tmp.baud_base		= 9600;
 +	tmp.close_delay		= 5*HZ;
 +	tmp.closing_wait	= 30*HZ;
-+
 +
 +	if (copy_to_user(retinfo, &tmp, sizeof(*retinfo)))
 +		return -EFAULT;
 +	return 0;
 +}
 +
-+/*****************************************************************************
-+ * SerialIoctl
-+ *	this function handles any ioctl calls to the driver
-+ *****************************************************************************/
-+
-+static int mos7720_ioctl (struct usb_serial_port *port, struct file *file, unsigned int cmd, unsigned long arg)
++static int mos7720_ioctl(struct usb_serial_port *port, struct file *file,
++			 unsigned int cmd, unsigned long arg)
 +{
 +	struct moschip_port *mos7720_port;
-+
 +	struct async_icount cnow;
 +	struct async_icount cprev;
 +	struct serial_icounter_struct icount;
 +
 +	mos7720_port = usb_get_serial_port_data(port);
 +	if (mos7720_port == NULL)
-+		return -1;
++		return -ENODEV;
 +
 +	dbg("%s - port %d, cmd = 0x%x", __FUNCTION__, port->number, cmd);
 +
-+	switch (cmd)
-+	{
-+                /* return number of bytes available */
++	switch (cmd) {
++	case TIOCINQ:
++		/* return number of bytes available */
++		dbg("%s (%d) TIOCINQ", __FUNCTION__,  port->number);
++		return get_number_bytes_avail(mos7720_port, (unsigned int __user *)arg);
++		break;
 +
-+		case TIOCINQ:
-+			dbg("%s (%d) TIOCINQ", __FUNCTION__,  port->number);
-+			return get_number_bytes_avail(mos7720_port, (unsigned int __user *)arg);
-+			break;
++	case TIOCSERGETLSR:
++		dbg("%s (%d) TIOCSERGETLSR", __FUNCTION__,  port->number);
++		return get_lsr_info(mos7720_port, (unsigned int __user *)arg);
++		return 0;
 +
-+		case TIOCSERGETLSR:
-+			dbg("%s (%d) TIOCSERGETLSR", __FUNCTION__,  port->number);
-+			return get_lsr_info(mos7720_port, (unsigned int __user *)arg);
-+			return 0;
++	case TIOCMBIS:
++	case TIOCMBIC:
++	case TIOCMSET:
++		dbg("%s (%d) TIOCMSET/TIOCMBIC/TIOCMSET", __FUNCTION__,  port->number);
++		return set_modem_info(mos7720_port, cmd, (unsigned int __user *)arg);
 +
-+		case TIOCMBIS:
-+		case TIOCMBIC:
-+		case TIOCMSET:
-+			dbg("%s (%d) TIOCMSET/TIOCMBIC/TIOCMSET", __FUNCTION__,  port->number);
-+			return set_modem_info(mos7720_port, cmd, (unsigned int __user *)arg);
++	case TIOCMGET:
++		dbg("%s (%d) TIOCMGET", __FUNCTION__,  port->number);
++		return get_modem_info(mos7720_port, (unsigned int __user *) arg);
 +
-+		case TIOCMGET:
-+			dbg("%s (%d) TIOCMGET", __FUNCTION__,  port->number);
-+			return get_modem_info(mos7720_port, (unsigned int __user *) arg);
++	case TIOCGSERIAL:
++		dbg("%s (%d) TIOCGSERIAL", __FUNCTION__,  port->number);
++		return get_serial_info(mos7720_port, (struct serial_struct __user *) arg);
 +
-+		case TIOCGSERIAL:
-+			dbg("%s (%d) TIOCGSERIAL", __FUNCTION__,  port->number);
-+			return get_serial_info(mos7720_port, (struct serial_struct __user *) arg);
++	case TIOCSSERIAL:
++		dbg("%s (%d) TIOCSSERIAL", __FUNCTION__,  port->number);
++		break;
 +
-+		case TIOCSSERIAL:
-+			dbg("%s (%d) TIOCSSERIAL", __FUNCTION__,  port->number);
-+			break;
-+
-+		case TIOCMIWAIT:
-+			dbg("%s (%d) TIOCMIWAIT", __FUNCTION__,  port->number);
-+			cprev = mos7720_port->icount;
-+			while (1) {
-+				interruptible_sleep_on(&mos7720_port->delta_msr_wait);
-+				/* see if a signal did it */
-+				if (signal_pending(current))
-+					return -ERESTARTSYS;
-+				cnow = mos7720_port->icount;
-+				if (cnow.rng == cprev.rng && cnow.dsr == cprev.dsr &&
-+				    cnow.dcd == cprev.dcd && cnow.cts == cprev.cts)
-+					return -EIO; /* no change => error */
-+				if (((arg & TIOCM_RNG) && (cnow.rng != cprev.rng)) ||
-+				    ((arg & TIOCM_DSR) && (cnow.dsr != cprev.dsr)) ||
-+				    ((arg & TIOCM_CD)  && (cnow.dcd != cprev.dcd)) ||
-+				    ((arg & TIOCM_CTS) && (cnow.cts != cprev.cts)) ) {
-+					return 0;
-+				}
-+				cprev = cnow;
-+			}
-+			/* NOTREACHED */
-+			break;
-+
-+		case TIOCGICOUNT:
++	case TIOCMIWAIT:
++		dbg("%s (%d) TIOCMIWAIT", __FUNCTION__,  port->number);
++		cprev = mos7720_port->icount;
++		while (1) {
++			interruptible_sleep_on(&mos7720_port->delta_msr_wait);
++			/* see if a signal did it */
++			if (signal_pending(current))
++				return -ERESTARTSYS;
 +			cnow = mos7720_port->icount;
-+			icount.cts = cnow.cts;
-+			icount.dsr = cnow.dsr;
-+			icount.rng = cnow.rng;
-+			icount.dcd = cnow.dcd;
-+			icount.rx = cnow.rx;
-+			icount.tx = cnow.tx;
-+			icount.frame = cnow.frame;
-+			icount.overrun = cnow.overrun;
-+			icount.parity = cnow.parity;
-+			icount.brk = cnow.brk;
-+			icount.buf_overrun = cnow.buf_overrun;
++			if (cnow.rng == cprev.rng && cnow.dsr == cprev.dsr &&
++			    cnow.dcd == cprev.dcd && cnow.cts == cprev.cts)
++				return -EIO; /* no change => error */
++			if (((arg & TIOCM_RNG) && (cnow.rng != cprev.rng)) ||
++			    ((arg & TIOCM_DSR) && (cnow.dsr != cprev.dsr)) ||
++			    ((arg & TIOCM_CD)  && (cnow.dcd != cprev.dcd)) ||
++			    ((arg & TIOCM_CTS) && (cnow.cts != cprev.cts)) ) {
++				return 0;
++			}
++			cprev = cnow;
++		}
++		/* NOTREACHED */
++		break;
 +
-+			dbg("%s (%d) TIOCGICOUNT RX=%d, TX=%d", __FUNCTION__,  port->number, icount.rx, icount.tx );
-+			if (copy_to_user((void __user *)arg, &icount, sizeof(icount)))
-+				return -EFAULT;
-+			return 0;
++	case TIOCGICOUNT:
++		cnow = mos7720_port->icount;
++		icount.cts = cnow.cts;
++		icount.dsr = cnow.dsr;
++		icount.rng = cnow.rng;
++		icount.dcd = cnow.dcd;
++		icount.rx = cnow.rx;
++		icount.tx = cnow.tx;
++		icount.frame = cnow.frame;
++		icount.overrun = cnow.overrun;
++		icount.parity = cnow.parity;
++		icount.brk = cnow.brk;
++		icount.buf_overrun = cnow.buf_overrun;
++
++		dbg("%s (%d) TIOCGICOUNT RX=%d, TX=%d", __FUNCTION__,  port->number, icount.rx, icount.tx );
++		if (copy_to_user((void __user *)arg, &icount, sizeof(icount)))
++			return -EFAULT;
++		return 0;
 +	}
 +
 +	return -ENOIOCTLCMD;
 +}
 +
-+
-+/*****************************************************************************
-+ * send_cmd_write_baud_rate
-+ *	this function sends the proper command to change the baud rate of the
-+ *	specified port.
-+ *****************************************************************************/
-+
-+static int send_cmd_write_baud_rate (struct moschip_port *mos7720_port, int baudrate)
-+{
-+	int divisor;
-+	int status;
-+	unsigned char data;
-+	unsigned char number ;
-+
-+	struct usb_serial_port *port;
-+
-+	if (mos7720_port == NULL)
-+		return -1;
-+
-+	port = mos7720_port->port;
-+
-+	DPRINTK("%s","Entering .......... \n");
-+
-+	number = mos7720_port->port->number - mos7720_port->port->serial->minor;
-+	dbg("%s - port = %d, baud = %d", __FUNCTION__, mos7720_port->port->number, baudrate);
-+
-+        /* Calculate the Divisor */
-+	status = calc_baud_rate_divisor (baudrate, &divisor);
-+	if (status)
-+	{
-+		err("%s - bad baud rate", __FUNCTION__);
-+		DPRINTK("%s\n","bad baud rate");
-+		return status;
-+	}
-+
-+        /* Enable access to divisor latch */
-+        data = mos7720_port->shadowLCR | UART_LCR_DLAB;
-+        mos7720_port->shadowLCR  = data;
-+        SendMosCmd(mos7720_port->port->serial,MOS_WRITE,port->number - port->serial->minor, UART_LCR, &data);
-+
-+	/* Write the divisor */
-+	data = ((unsigned char)(divisor & 0xff));
-+        SendMosCmd(mos7720_port->port->serial,MOS_WRITE,port->number - port->serial->minor,0x00, &data);
-+
-+	data = ((unsigned char)((divisor & 0xff00) >> 8));
-+        SendMosCmd(mos7720_port->port->serial,MOS_WRITE,port->number - port->serial->minor,0x01, &data);
-+
-+        /* Disable access to divisor latch */
-+        data = mos7720_port->shadowLCR & ~UART_LCR_DLAB;
-+        mos7720_port->shadowLCR = data;
-+        SendMosCmd(mos7720_port->port->serial,MOS_WRITE,port->number - port->serial->minor,0x03, &data);
-+
-+	return status;
-+}
-+
-+/* baud rate information */
-+struct divisor_table_entry
-+{
-+	__u32  baudrate;
-+	__u16  divisor;
-+};
-+
-+/* Define table of divisors for moschip 7720 hardware	   *
-+ * These assume a 3.6864MHz crystal, the standard /16, and *
-+ * MCR.7 = 0.						   */
-+static struct divisor_table_entry divisor_table[] = {
-+	{   50,		2304},
-+	{   110,	1047},	/* 2094.545455 => 230450   => .0217 % over */
-+	{   134,	857},	/* 1713.011152 => 230398.5 => .00065% under */
-+	{   150,	768},
-+	{   300,	384},
-+	{   600,	192},
-+	{   1200,	96},
-+	{   1800,	64},
-+	{   2400,	48},
-+	{   4800,	24},
-+	{   7200,	16},
-+	{   9600,	12},
-+	{   19200,	6},
-+	{   38400,	3},
-+	{   57600,	2},
-+	{   115200,	1},
-+};
-+
-+/*****************************************************************************
-+ * calc_baud_rate_divisor
-+ *	this function calculates the proper baud rate divisor for the specified
-+ *	baud rate.
-+ *****************************************************************************/
-+static int calc_baud_rate_divisor(int baudrate, int *divisor)
-+{
-+	int i;
-+	__u16 custom;
-+	__u16 round1;
-+	__u16 round;
-+
-+
-+	dbg("%s - %d", __FUNCTION__, baudrate);
-+
-+	for (i = 0; i < ARRAY_SIZE(divisor_table); i++) {
-+		if (divisor_table[i].baudrate == baudrate) {
-+			*divisor = divisor_table[i].divisor;
-+			return 0;
-+		}
-+	}
-+
-+        /* After trying for all the standard baud rates    *
-+         * Try calculating the divisor for this baud rate  */
-+	if (baudrate > 75 &&  baudrate < 230400) {
-+		/* get the divisor */
-+		custom = (__u16)(230400L  / baudrate);
-+
-+		/* Check for round off */
-+		round1 = (__u16)(2304000L / baudrate);
-+		round = (__u16)(round1 - (custom * 10));
-+		if (round > 4)
-+			custom++;
-+		*divisor = custom;
-+
-+		DPRINTK(" Baud %d = %d\n",baudrate, custom);
-+		return 0;
-+	}
-+
-+	DPRINTK("%s\n"," Baud calculation Failed...");
-+	return -EINVAL;
-+}
-+
-+
-+
-+/*****************************************************************************
-+ * change_port_settings
-+ *	This routine is called to set the UART on the device to match
-+ *      the specified new settings.
-+ *****************************************************************************/
-+
-+static void change_port_settings (struct moschip_port *mos7720_port, struct termios *old_termios)
-+{
-+	struct tty_struct *tty;
-+	int baud;
-+	unsigned cflag;
-+	unsigned iflag;
-+	__u8 mask = 0xff;
-+	__u8 lData;
-+	__u8 lParity;
-+	__u8 lStop;
-+	int status;
-+	char data;
-+
-+	struct usb_serial_port *port;
-+	struct usb_serial *serial;
-+
-+	if (mos7720_port == NULL)
-+		return ;
-+
-+	port = (struct usb_serial_port *)mos7720_port->port;
-+
-+	serial = port->serial;
-+
-+	dbg("%s - port %d", __FUNCTION__, mos7720_port->port->number);
-+
-+	if (!mos7720_port->open) {
-+		dbg("%s - port not opened", __FUNCTION__);
-+		return;
-+	}
-+
-+	tty = mos7720_port->port->tty;
-+
-+	if ((!tty) || (!tty->termios))
-+	{
-+		dbg("%s - no tty structures", __FUNCTION__);
-+		return;
-+	}
-+
-+	DPRINTK("%s","Entering .......... \n");
-+
-+	lData = UART_LCR_WLEN8;
-+	lStop = 0x00;	/* 1 stop bit */
-+	lParity = 0x00;	/* No parity */
-+
-+	cflag = tty->termios->c_cflag;
-+	iflag = tty->termios->c_iflag;
-+
-+	/* Change the number of bits */
-+	switch (cflag & CSIZE)
-+	{
-+		case CS5:	lData = UART_LCR_WLEN5;
-+				mask = 0x1f;
-+			    	break;
-+
-+		case CS6:   	lData = UART_LCR_WLEN6;
-+				mask = 0x3f;
-+			    	break;
-+
-+		case CS7:   	lData = UART_LCR_WLEN7;
-+				mask = 0x7f;
-+			    	break;
-+		default:
-+		case CS8:   	lData = UART_LCR_WLEN8;
-+			    	break;
-+	}
-+
-+	/* Change the Parity bit */
-+	if (cflag & PARENB) {
-+		if (cflag & PARODD) {
-+			lParity = UART_LCR_PARITY;
-+			dbg("%s - parity = odd", __FUNCTION__);
-+		} else {
-+			lParity = (UART_LCR_EPAR | UART_LCR_PARITY);
-+			dbg("%s - parity = even", __FUNCTION__);
-+		}
-+
-+	} else {
-+		dbg("%s - parity = none", __FUNCTION__);
-+	}
-+
-+	if (cflag & CMSPAR)
-+		lParity = lParity | 0x20;
-+
-+	/* Change the Stop bit */
-+	if (cflag & CSTOPB) {
-+		lStop = UART_LCR_STOP;
-+		dbg("%s - stop bits = 2", __FUNCTION__);
-+	} else {
-+		lStop = 0x00;
-+		dbg("%s - stop bits = 1", __FUNCTION__);
-+	}
-+
-+#define LCR_BITS_MASK		0x03	/* Mask for bits/char field */
-+#define LCR_STOP_MASK		0x04	/* Mask for stop bits field */
-+#define LCR_PAR_MASK		0x38	/* Mask for parity field */
-+
-+	/* Update the LCR with the correct value */
-+	mos7720_port->shadowLCR &= ~(LCR_BITS_MASK | LCR_STOP_MASK | LCR_PAR_MASK);
-+	mos7720_port->shadowLCR |= (lData | lParity | lStop);
-+
-+	mos7720_port->validDataMask = mask;
-+
-+	/* Disable Interrupts */
-+	data = 0x00;
-+        SendMosCmd(mos7720_port->port->serial,MOS_WRITE,port->number - port->serial->minor, UART_IER, &data);
-+
-+	data = 0x00;
-+        SendMosCmd(mos7720_port->port->serial,MOS_WRITE,port->number - port->serial->minor, UART_FCR, &data);
-+
-+	data = 0xcf;
-+        SendMosCmd(mos7720_port->port->serial,MOS_WRITE,port->number - port->serial->minor, UART_FCR, &data);
-+
-+	/* Send the updated LCR value to the mos7720 */
-+	data = mos7720_port->shadowLCR;
-+        SendMosCmd(mos7720_port->port->serial,MOS_WRITE,port->number - port->serial->minor, UART_LCR, &data);
-+
-+        data = 0x00b;
-+        mos7720_port->shadowMCR = data;
-+        SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x04, &data);
-+        data = 0x00b;
-+        SendMosCmd(port->serial,MOS_WRITE,port->number - port->serial->minor,0x04, &data);
-+
-+	/* set up the MCR register and send it to the mos7720 */
-+
-+	mos7720_port->shadowMCR = UART_MCR_OUT2;
-+	if (cflag & CBAUD)
-+		mos7720_port->shadowMCR |= (UART_MCR_DTR | UART_MCR_RTS);
-+
-+
-+	if (cflag & CRTSCTS) {
-+		mos7720_port->shadowMCR |= (UART_MCR_XONANY);
-+
-+                /* To set hardware flow control to the specified *
-+                 * serial port, in SP1/2_CONTROL_REG             */
-+
-+		if (port->number) {
-+			data = 0x001;
-+			SendMosCmd(port->serial, MOS_WRITE, MOS_MAX_PORT, 0x08, &data);
-+		} else {
-+			data = 0x002;
-+			SendMosCmd(port->serial,MOS_WRITE,MOS_MAX_PORT,0x08, &data);
-+		}
-+	} else {
-+		mos7720_port->shadowMCR &= ~(UART_MCR_XONANY);
-+	}
-+
-+	data = mos7720_port->shadowMCR;
-+	SendMosCmd(mos7720_port->port->serial,MOS_WRITE,port->number - port->serial->minor, UART_MCR, &data);
-+
-+	/* Determine divisor based on baud rate */
-+	baud = tty_get_baud_rate(tty);
-+	if (!baud) {
-+		/* pick a default, any default... */
-+        	DPRINTK("%s\n","Picked default baud...");
-+		baud = 9600;
-+	}
-+
-+	if (baud >= 230400) {
-+		set_higher_rates(mos7720_port, baud);
-+	        /* Enable Interrupts */
-+		data = 0x0c;
-+		SendMosCmd(mos7720_port->port->serial, MOS_WRITE,port->number - port->serial->minor, UART_IER, &data);
-+		return;
-+	}
-+
-+	dbg("%s - baud rate = %d", __FUNCTION__, baud);
-+	status = send_cmd_write_baud_rate (mos7720_port, baud);
-+
-+	/* Enable Interrupts */
-+	data = 0x0c;
-+	SendMosCmd(mos7720_port->port->serial, MOS_WRITE,port->number - port->serial->minor, UART_IER, &data);
-+
-+	if (port->read_urb->status != -EINPROGRESS) {
-+		port->read_urb->dev = serial->dev;
-+
-+		status = usb_submit_urb(port->read_urb, GFP_ATOMIC);
-+
-+		if (status)
-+		{
-+			DPRINTK(" usb_submit_urb(read bulk) failed, status = %d", status);
-+		}
-+	}
-+	return;
-+}
 +
 +/****************************************************************************
 + * mos7720_startup
@@ -1853,17 +1759,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	int i;
 +	char data;
 +
-+//	DPRINTK("%s \n"," mos7720_startup :entering..........");
++	dbg("%s: Entering ..........", __FUNCTION__);
 +
-+	if(!serial)
-+	{
-+		DPRINTK("%s\n","Invalid Handler");
-+		return -1;
++	if (!serial) {
++		dbg("Invalid Handler");
++		return -ENODEV;
 +	}
 +
 +	dev = serial->dev;
-+
-+	DPRINTK("%s\n","Entering...");
 +
 +	/* create our private serial structure */
 +	mos7720_serial = kzalloc(sizeof(struct moschip_serial), GFP_KERNEL);
@@ -1904,10 +1807,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	usb_control_msg(serial->dev, usb_sndctrlpipe(serial->dev, 0), (__u8)0x03, 0x00,0x01,0x00, NULL, 0x00, 5*HZ);
 +
 +	SendMosCmd(serial,MOS_READ,0x00, UART_LSR, &data);  // LSR For Port 1
-+	DPRINTK("LSR:%x\n",data);
++	dbg("LSR:%x",data);
 +
 +	SendMosCmd(serial,MOS_READ,0x01, UART_LSR, &data);  // LSR For Port 2
-+	DPRINTK("LSR:%x\n",data);
++	dbg("LSR:%x",data);
 +
 +	return 0;
 +}
@@ -1916,13 +1819,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +{
 +	int i;
 +
-+	dbg("%s \n"," shutdown :entering..........");
-+
-+	/* check for the ports to be closed,close the ports and disconnect */
-+
-+	/* free private structure allocated for serial port  *
-+	 * stop reads and writes on all ports   	     */
-+
++	/* free private structure allocated for serial port */
 +	for (i=0; i < serial->num_ports; ++i) {
 +		kfree(usb_get_serial_port_data(serial->port[i]));
 +		usb_set_serial_port_data(serial->port[i], NULL);
@@ -1931,8 +1828,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	/* free private structure allocated for serial device */
 +	kfree(usb_get_serial_data(serial));
 +	usb_set_serial_data(serial, NULL);
-+
-+	dbg("%s\n","Thank u :: ASPIRE COMMUNICATIONS");
 +}
 +
 +static struct usb_serial_driver moschip7720_2port_driver = {
@@ -1972,7 +1867,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +{
 +	int retval;
 +
-+	DPRINTK("%s \n"," mos7720_init :entering..........");
++	dbg("%s: Entering ..........", __FUNCTION__);
 +
 +	/* Register with the usb serial */
 +	retval = usb_serial_register (&moschip7720_2port_driver);
@@ -1980,7 +1875,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	if(retval)
 +		goto failed_port_device_register;
 +
-+	DPRINTK("%s\n","Entring...");
 +	info(DRIVER_DESC " " DRIVER_VERSION);
 +
 +	/* Register with the usb */
@@ -2011,4 +1905,5 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +MODULE_DESCRIPTION( DRIVER_DESC );
 +MODULE_LICENSE("GPL");
 +
++module_param(debug, bool, S_IRUGO | S_IWUSR);
 +MODULE_PARM_DESC(debug, "Debug enabled or not");
