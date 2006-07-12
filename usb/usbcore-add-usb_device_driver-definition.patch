@@ -22,12 +22,12 @@ Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
- drivers/usb/core/driver.c  |  215 ++++++++++++++++++++++++++++++++++-----------
+ drivers/usb/core/driver.c  |  219 +++++++++++++++++++++++++++++++++------------
  drivers/usb/core/generic.c |   17 ---
  drivers/usb/core/usb.c     |   15 +--
  drivers/usb/core/usb.h     |   20 +++-
- include/linux/usb.h        |   58 ++++++++++--
- 5 files changed, 245 insertions(+), 80 deletions(-)
+ include/linux/usb.h        |   58 ++++++++++-
+ 5 files changed, 245 insertions(+), 84 deletions(-)
 
 --- gregkh-2.6.orig/drivers/usb/core/driver.c
 +++ gregkh-2.6/drivers/usb/core/driver.c
@@ -202,7 +202,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	return 0;
  }
  
-@@ -481,10 +530,13 @@ static int usb_uevent(struct device *dev
+@@ -481,14 +530,13 @@ static int usb_uevent(struct device *dev
  	/* driver is often null here; dev_dbg() would oops */
  	pr_debug ("usb %s: uevent\n", dev->bus_id);
  
@@ -211,15 +211,19 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -	    (dev->driver_data == &usb_generic_driver_data))
 +	if (is_usb_device(dev))
  		return 0;
+-
+-	intf = to_usb_interface(dev);
+-	usb_dev = interface_to_usbdev (intf);
+-	alt = intf->cur_altsetting;
 +	else {
 +		intf = to_usb_interface(dev);
 +		usb_dev = interface_to_usbdev(intf);
 +		alt = intf->cur_altsetting;
 +	}
  
- 	intf = to_usb_interface(dev);
- 	usb_dev = interface_to_usbdev (intf);
-@@ -569,13 +621,71 @@ static int usb_uevent(struct device *dev
+ 	if (usb_dev->devnum < 0) {
+ 		pr_debug ("usb %s: already deleted?\n", dev->bus_id);
+@@ -569,13 +617,71 @@ static int usb_uevent(struct device *dev
  #endif	/* CONFIG_HOTPLUG */
  
  /**
@@ -227,11 +231,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 - * @new_driver: USB operations for the driver
 + * usb_register_device_driver - register a USB device (not interface) driver
 + * @new_udriver: USB operations for the device driver
-  * @owner: module owner of this driver.
-  *
-- * Registers a USB driver with the USB core.  The list of unattached
-- * interfaces will be rescanned whenever a new driver is added, allowing
-- * the new driver to attach to any recognized devices.
++ * @owner: module owner of this driver.
++ *
 + * Registers a USB device driver with the USB core.  The list of
 + * unattached devices will be rescanned whenever a new driver is
 + * added, allowing the new driver to attach to any recognized devices.
@@ -288,15 +289,18 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +/**
 + * usb_register_driver - register a USB interface driver
 + * @new_driver: USB operations for the interface driver
-+ * @owner: module owner of this driver.
-+ *
+  * @owner: module owner of this driver.
+  *
+- * Registers a USB driver with the USB core.  The list of unattached
+- * interfaces will be rescanned whenever a new driver is added, allowing
+- * the new driver to attach to any recognized devices.
 + * Registers a USB interface driver with the USB core.  The list of
 + * unattached interfaces will be rescanned whenever a new driver is
 + * added, allowing the new driver to attach to any recognized interfaces.
   * Returns a negative error code on failure and 0 on success.
   *
   * NOTE: if you want your driver to use the USB major number, you must call
-@@ -589,23 +699,25 @@ int usb_register_driver(struct usb_drive
+@@ -589,23 +695,25 @@ int usb_register_driver(struct usb_drive
  	if (usb_disabled())
  		return -ENODEV;
  
@@ -330,7 +334,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  			usbcore_name, retval, new_driver->name);
  	}
  
-@@ -614,8 +726,8 @@ int usb_register_driver(struct usb_drive
+@@ -614,8 +722,8 @@ int usb_register_driver(struct usb_drive
  EXPORT_SYMBOL_GPL_FUTURE(usb_register_driver);
  
  /**
@@ -341,7 +345,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
   * Context: must be able to sleep
   *
   * Unlinks the specified driver from the internal USB driver list.
-@@ -626,11 +738,12 @@ EXPORT_SYMBOL_GPL_FUTURE(usb_register_dr
+@@ -626,11 +734,12 @@ EXPORT_SYMBOL_GPL_FUTURE(usb_register_dr
   */
  void usb_deregister(struct usb_driver *driver)
  {
@@ -356,7 +360,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  	usbfs_update_special();
  }
-@@ -655,7 +768,7 @@ static int usb_generic_suspend(struct de
+@@ -655,7 +764,7 @@ static int usb_generic_suspend(struct de
  	 * marked for FREEZE as soon as their children are already idled.
  	 * But those semantics are useless, so we equate the two (sigh).
  	 */
@@ -365,7 +369,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		if (dev->power.power_state.event == message.event)
  			return 0;
  		/* we need to rule out bogus requests through sysfs */
-@@ -665,8 +778,7 @@ static int usb_generic_suspend(struct de
+@@ -665,8 +774,7 @@ static int usb_generic_suspend(struct de
   		return usb_port_suspend(to_usb_device(dev));
  	}
  
@@ -375,7 +379,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		return 0;
  
  	intf = to_usb_interface(dev);
-@@ -705,15 +817,14 @@ static int usb_generic_resume(struct dev
+@@ -705,15 +813,14 @@ static int usb_generic_resume(struct dev
  	dev->power.power_state.event = PM_EVENT_ON;
  
  	/* devices resume through their hubs */
