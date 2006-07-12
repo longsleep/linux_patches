@@ -1,11 +1,9 @@
-From david-b@pacbell.net Mon Jun 19 14:31:06 2006
+From david-b@pacbell.net Wed Jul  5 02:39:54 2006
 From: David Brownell <david-b@pacbell.net>
 To: Greg KH <greg@kroah.com>
 Subject: USB: AT91 UDC updates, mostly power management
-Date: Mon, 19 Jun 2006 14:25:11 -0700
-Cc: Andrew Victor <andrew@sanpeople.com>
-Message-Id: <200606191425.11737.david-b@pacbell.net>
-
+Date: Wed, 5 Jul 2006 02:38:56 -0700
+Message-Id: <200607050238.56968.david-b@pacbell.net>
 
 UDC updates for AT91 series processors:
 
@@ -16,24 +14,45 @@ UDC updates for AT91 series processors:
  - In "standby" mode, UDC can be a source of system wakeup events
    (host resume, device connect/disconnect, etc)
 
- - Fix a startup problem that crept in with the initial merge
+ - Fix IRQ storming issues, seemingly related to clock disabling
+   changes that went in a while back
 
 And minor cleanups, especially whitespace.
 
 Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
-Signed-off-by: Andrew Victor <andrew@sanpeople.com>
+Signed-off-by: Andrew Victor  <andrew@sanpeople.com>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 
 ---
- drivers/usb/gadget/at91_udc.c |  157 +++++++++++++++++++++++++-----------------
+ drivers/usb/gadget/at91_udc.c |  176 ++++++++++++++++++++++++++----------------
  drivers/usb/gadget/at91_udc.h |    1 
- 2 files changed, 98 insertions(+), 60 deletions(-)
+ 2 files changed, 113 insertions(+), 64 deletions(-)
 
 --- gregkh-2.6.orig/drivers/usb/gadget/at91_udc.c
 +++ gregkh-2.6/drivers/usb/gadget/at91_udc.c
-@@ -69,7 +69,7 @@
-  * power.  During USB suspend, the 48 MHz clock is gated off.
+@@ -57,19 +57,23 @@
+ 
+ /*
+  * This controller is simple and PIO-only.  It's used in many AT91-series
+- * ARMv4T controllers, including the at91rm9200 (arm920T, with MMU),
+- * at91sam9261 (arm926ejs, with MMU), and several no-mmu versions.
++ * full speed USB controllers, including the at91rm9200 (arm920T, with MMU),
++ * at91sam926x (arm926ejs, with MMU), and several no-mmu versions.
+  *
+  * This driver expects the board has been wired with two GPIOs suppporting
+  * a VBUS sensing IRQ, and a D+ pullup.  (They may be omitted, but the
+- * testing hasn't covered such cases.)  The pullup is most important; it
++ * testing hasn't covered such cases.)
++ *
++ * The pullup is most important (so it's integrated on sam926x parts).  It
+  * provides software control over whether the host enumerates the device.
++ *
+  * The VBUS sensing helps during enumeration, and allows both USB clocks
+  * (and the transceiver) to stay gated off until they're necessary, saving
+- * power.  During USB suspend, the 48 MHz clock is gated off.
++ * power.  During USB suspend, the 48 MHz clock is gated off in hardware;
++ * it may also be gated off by software during some Linux sleep states.
   */
  
 -#define	DRIVER_VERSION	"8 March 2005"
@@ -41,8 +60,15 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  static const char driver_name [] = "at91_udc";
  static const char ep0name[] = "ep0";
-@@ -318,7 +318,8 @@ static void done(struct at91_ep *ep, str
+@@ -316,9 +320,15 @@ static void done(struct at91_ep *ep, str
+  *
+  * There are also state bits like FORCESTALL, EPEDS, DIR, and EPTYPE
   * that shouldn't normally be changed.
++ *
++ * NOTE at91sam9260 docs mention synch between UDPCK and MCK clock domains,
++ * implying a need to wait for one write to complete (test relevant bits)
++ * before starting the next write.  This shouldn't be an issue given how
++ * infrequently we write, except maybe for write-then-read idioms.
   */
  #define	SET_FX	(AT91_UDP_TXPKTRDY)
 -#define	CLR_FX	(RX_DATA_READY | AT91_UDP_RXSETUP | AT91_UDP_STALLSENT | AT91_UDP_TXCOMP)
@@ -51,7 +77,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  /* pull OUT packet data from the endpoint's fifo */
  static int read_fifo (struct at91_ep *ep, struct at91_request *req)
-@@ -472,7 +473,8 @@ static void nuke(struct at91_ep *ep, int
+@@ -472,7 +482,8 @@ static void nuke(struct at91_ep *ep, int
  
  /*-------------------------------------------------------------------------*/
  
@@ -61,7 +87,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  {
  	struct at91_ep	*ep = container_of(_ep, struct at91_ep, ep);
  	struct at91_udc	*dev = ep->udc;
-@@ -582,11 +584,12 @@ static int at91_ep_disable (struct usb_e
+@@ -582,11 +593,12 @@ static int at91_ep_disable (struct usb_e
   * interesting for request or buffer allocation.
   */
  
@@ -76,7 +102,15 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	if (!req)
  		return NULL;
  
-@@ -889,8 +892,8 @@ static void clk_off(struct at91_udc *udc
+@@ -862,6 +874,7 @@ static void stop_activity(struct at91_ud
+ 	if (udc->gadget.speed == USB_SPEED_UNKNOWN)
+ 		driver = NULL;
+ 	udc->gadget.speed = USB_SPEED_UNKNOWN;
++	udc->suspended = 0;
+ 
+ 	for (i = 0; i < NUM_ENDPOINTS; i++) {
+ 		struct at91_ep *ep = &udc->ep[i];
+@@ -889,8 +902,8 @@ static void clk_off(struct at91_udc *udc
  		return;
  	udc->clocked = 0;
  	udc->gadget.speed = USB_SPEED_UNKNOWN;
@@ -86,7 +120,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  }
  
  /*
-@@ -911,9 +914,6 @@ static void pullup(struct at91_udc *udc,
+@@ -911,9 +924,6 @@ static void pullup(struct at91_udc *udc,
  		at91_udp_write(AT91_UDP_TXVC, AT91_UDP_TXVC_TXVDIS);
  		at91_set_gpio_value(udc->board.pullup_pin, 0);
  		clk_off(udc);
@@ -96,7 +130,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	}
  }
  
-@@ -1290,7 +1290,8 @@ static void handle_ep0(struct at91_udc *
+@@ -1290,7 +1300,8 @@ static void handle_ep0(struct at91_udc *
  			if (udc->wait_for_addr_ack) {
  				u32	tmp;
  
@@ -106,7 +140,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  				tmp = at91_udp_read(AT91_UDP_GLB_STAT);
  				tmp &= ~AT91_UDP_FADDEN;
  				if (udc->addr)
-@@ -1361,9 +1362,10 @@ static irqreturn_t at91_udc_irq (int irq
+@@ -1361,9 +1372,10 @@ static irqreturn_t at91_udc_irq (int irq
  	u32			rescans = 5;
  
  	while (rescans--) {
@@ -119,7 +153,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		if (!status)
  			break;
  
-@@ -1379,18 +1381,17 @@ static irqreturn_t at91_udc_irq (int irq
+@@ -1379,18 +1391,17 @@ static irqreturn_t at91_udc_irq (int irq
  			stop_activity(udc);
  
  			/* enable ep0 */
@@ -143,7 +177,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  			 */
  
  		/* host initiated suspend (3+ms bus idle) */
-@@ -1452,13 +1453,19 @@ static irqreturn_t at91_udc_irq (int irq
+@@ -1452,13 +1463,19 @@ static irqreturn_t at91_udc_irq (int irq
  
  /*-------------------------------------------------------------------------*/
  
@@ -168,7 +202,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		}
  	},
  	.ep[0] = {
-@@ -1468,7 +1475,8 @@ static struct at91_udc controller = {
+@@ -1468,7 +1485,8 @@ static struct at91_udc controller = {
  		},
  		.udc		= &controller,
  		.maxpacket	= 8,
@@ -178,7 +212,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		.int_mask	= 1 << 0,
  	},
  	.ep[1] = {
-@@ -1479,7 +1487,8 @@ static struct at91_udc controller = {
+@@ -1479,7 +1497,8 @@ static struct at91_udc controller = {
  		.udc		= &controller,
  		.is_pingpong	= 1,
  		.maxpacket	= 64,
@@ -188,7 +222,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		.int_mask	= 1 << 1,
  	},
  	.ep[2] = {
-@@ -1490,7 +1499,8 @@ static struct at91_udc controller = {
+@@ -1490,7 +1509,8 @@ static struct at91_udc controller = {
  		.udc		= &controller,
  		.is_pingpong	= 1,
  		.maxpacket	= 64,
@@ -198,7 +232,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		.int_mask	= 1 << 2,
  	},
  	.ep[3] = {
-@@ -1501,7 +1511,8 @@ static struct at91_udc controller = {
+@@ -1501,7 +1521,8 @@ static struct at91_udc controller = {
  		},
  		.udc		= &controller,
  		.maxpacket	= 8,
@@ -208,7 +242,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		.int_mask	= 1 << 3,
  	},
  	.ep[4] = {
-@@ -1512,7 +1523,8 @@ static struct at91_udc controller = {
+@@ -1512,7 +1533,8 @@ static struct at91_udc controller = {
  		.udc		= &controller,
  		.is_pingpong	= 1,
  		.maxpacket	= 256,
@@ -218,7 +252,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		.int_mask	= 1 << 4,
  	},
  	.ep[5] = {
-@@ -1523,10 +1535,11 @@ static struct at91_udc controller = {
+@@ -1523,10 +1545,11 @@ static struct at91_udc controller = {
  		.udc		= &controller,
  		.is_pingpong	= 1,
  		.maxpacket	= 256,
@@ -232,7 +266,15 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  };
  
  static irqreturn_t at91_vbus_irq(int irq, void *_udc, struct pt_regs *r)
-@@ -1624,6 +1637,16 @@ static int __devinit at91udc_probe(struc
+@@ -1593,6 +1616,7 @@ int usb_gadget_unregister_driver (struct
+ 
+ 	local_irq_disable();
+ 	udc->enabled = 0;
++	at91_udp_write(AT91_UDP_IDR, ~0);
+ 	pullup(udc, 0);
+ 	local_irq_enable();
+ 
+@@ -1624,6 +1648,16 @@ static int __devinit at91udc_probe(struc
  		return -ENODEV;
  	}
  
@@ -249,7 +291,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	if (!request_mem_region(AT91_BASE_UDP, SZ_16K, driver_name)) {
  		DBG("someone's using UDC memory\n");
  		return -EBUSY;
-@@ -1649,19 +1672,26 @@ static int __devinit at91udc_probe(struc
+@@ -1649,19 +1683,26 @@ static int __devinit at91udc_probe(struc
  	if (retval < 0)
  		goto fail0;
  
@@ -283,7 +325,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  			retval = -EBUSY;
  			goto fail1;
  		}
-@@ -1670,6 +1700,7 @@ static int __devinit at91udc_probe(struc
+@@ -1670,6 +1711,7 @@ static int __devinit at91udc_probe(struc
  		udc->vbus = 1;
  	}
  	dev_set_drvdata(dev, udc);
@@ -291,7 +333,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	create_debug_file(udc);
  
  	INFO("%s version %s\n", driver_name, DRIVER_VERSION);
-@@ -1678,14 +1709,14 @@ static int __devinit at91udc_probe(struc
+@@ -1678,14 +1720,14 @@ static int __devinit at91udc_probe(struc
  fail1:
  	device_unregister(&udc->gadget.dev);
  fail0:
@@ -309,7 +351,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  	DBG("remove\n");
  
-@@ -1694,10 +1725,11 @@ static int __devexit at91udc_remove(stru
+@@ -1694,10 +1736,11 @@ static int __devexit at91udc_remove(stru
  	if (udc->driver != 0)
  		usb_gadget_unregister_driver(udc->driver);
  
@@ -322,7 +364,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	device_unregister(&udc->gadget.dev);
  	release_mem_region(AT91_BASE_UDP, SZ_16K);
  
-@@ -1708,31 +1740,36 @@ static int __devexit at91udc_remove(stru
+@@ -1708,31 +1751,36 @@ static int __devexit at91udc_remove(stru
  }
  
  #ifdef CONFIG_PM
@@ -376,7 +418,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  	/* maybe reconnect to host; if so, clocks on */
  	pullup(udc, 1);
-@@ -1748,7 +1785,7 @@ static struct platform_driver at91_udc =
+@@ -1748,7 +1796,7 @@ static struct platform_driver at91_udc =
  	.remove		= __devexit_p(at91udc_remove),
  	.shutdown	= at91udc_shutdown,
  	.suspend	= at91udc_suspend,
@@ -385,7 +427,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	.driver		= {
  		.name	= (char *) driver_name,
  		.owner	= THIS_MODULE,
-@@ -1767,6 +1804,6 @@ static void __devexit udc_exit_module(vo
+@@ -1767,6 +1815,6 @@ static void __devexit udc_exit_module(vo
  }
  module_exit(udc_exit_module);
  
