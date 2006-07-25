@@ -4,19 +4,26 @@ To: Greg KH <greg@kroah.com>
 From: Greg Kroah-Hartman <gregkh@suse.de>
 Subject: Driver Core: add ability for drivers to do a threaded probe
 
-NOTE!  This turns on multhreaded probe for all PCI drivers.
+This adds the infrastructure for drivers to do a threaded probe.
 
-It has NOT been tested on a multi-processor machine yet, use at your own risk.
+A new kernel thread will be created when the probe() function for the
+driver is called, if the multithread_probe bit is set in the driver
+saying it can support this kind of operation.
 
+I have tested this with USB and PCI, and it works, and shaves off a lot
+of time in the boot process, but there are issues with finding root boot
+disks, and some USB drivers assume that this can never happen, so it is
+currently not enabled for any bus type.  Individual drivers can enable
+this right now if they wish, and bus authors can selectivly turn it on
+as well, once they determine that their subsystem will work properly
+with it.
 
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
- drivers/base/dd.c        |  101 ++++++++++++++++++++++++++++++++++-------------
- drivers/pci/pci-driver.c |    1 
- drivers/scsi/ata_piix.c  |    5 +-
- include/linux/device.h   |    2 
- 4 files changed, 82 insertions(+), 27 deletions(-)
+ drivers/base/dd.c      |   91 +++++++++++++++++++++++++++++++++----------------
+ include/linux/device.h |    2 +
+ 2 files changed, 65 insertions(+), 28 deletions(-)
 
 --- gregkh-2.6.orig/drivers/base/dd.c
 +++ gregkh-2.6/drivers/base/dd.c
@@ -28,7 +35,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  #include "base.h"
  #include "power/power.h"
-@@ -51,32 +52,23 @@ void device_bind_driver(struct device * 
+@@ -51,53 +52,41 @@ void device_bind_driver(struct device * 
  	sysfs_create_link(&dev->kobj, &dev->driver->kobj, "driver");
  }
  
@@ -55,8 +62,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	struct device *dev;
 +};
 +
-+static atomic_t count = ATOMIC_INIT(0);
-+
 +static int really_probe(void *void_data)
  {
 +	struct stupid_thread_structure *data = void_data;
@@ -69,64 +74,62 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -
 -	pr_debug("%s: Matched Device %s with Driver %s\n",
 -		 drv->bus->name, dev->bus_id, drv->name);
-+	atomic_inc(&count);
-+	printk("GREG: %s: enter: count = %d driver = %s device = %s\n",
-+		__FUNCTION__, count.counter, drv->name, dev->bus_id);
++	pr_debug("%s: Probing driver %s with device %s\n",
++		 drv->bus->name, drv->name, dev->bus_id);
  	dev->driver = drv;
  	if (dev->bus->probe) {
  		ret = dev->bus->probe(dev);
-@@ -93,11 +85,12 @@ int driver_probe_device(struct device_dr
+ 		if (ret) {
+ 			dev->driver = NULL;
+-			goto ProbeFailed;
++			goto probe_failed;
+ 		}
+ 	} else if (drv->probe) {
+ 		ret = drv->probe(dev);
+ 		if (ret) {
+ 			dev->driver = NULL;
+-			goto ProbeFailed;
++			goto probe_failed;
+ 		}
  	}
  	device_bind_driver(dev);
  	ret = 1;
--	pr_debug("%s: Bound Device %s to Driver %s\n",
-+//	pr_debug("%s: Bound Device %s to Driver %s\n",  FIXME
-+	printk("%s: Bound Device %s to Driver %s\n",
+ 	pr_debug("%s: Bound Device %s to Driver %s\n",
  		 drv->bus->name, dev->bus_id, drv->name);
- 	goto Done;
+-	goto Done;
++	goto done;
  
 - ProbeFailed:
-+ProbeFailed:
++probe_failed:
  	if (ret == -ENODEV || ret == -ENXIO) {
  		/* Driver matched, but didn't support device
  		 * or device not found.
-@@ -110,7 +103,63 @@ int driver_probe_device(struct device_dr
+@@ -110,7 +99,53 @@ int driver_probe_device(struct device_dr
  		       "%s: probe of %s failed with error %d\n",
  		       drv->name, dev->bus_id, ret);
  	}
 - Done:
-+Done:
++done:
 +	kfree(data);
-+	printk("GREG: %s:  exit: count = %d driver = %s device = %s\n",
-+		__FUNCTION__, count.counter, drv->name, dev->bus_id);
-+	atomic_dec(&count);
 +	return ret;
 +}
 +
-+int driver_probe_done(void)
-+{
-+	printk("GREG: %s: count = %d\n", __FUNCTION__, count.counter);
-+	if (atomic_read(&count))
-+		return -EBUSY;
-+	return 0;
-+}
-+
 +/**
-+ *	driver_probe_device - attempt to bind device & driver.
-+ *	@drv:	driver.
-+ *	@dev:	device.
++ * driver_probe_device - attempt to bind device & driver together
++ * @drv: driver to bind a device to
++ * @dev: device to try to bind to the driver
 + *
-+ *	First, we call the bus's match function, if one present, which
-+ *	should compare the device IDs the driver supports with the
-+ *	device IDs of the device. Note we don't do this ourselves
-+ *	because we don't know the format of the ID structures, nor what
-+ *	is to be considered a match and what is not.
++ * First, we call the bus's match function, if one present, which should
++ * compare the device IDs the driver supports with the device IDs of the
++ * device. Note we don't do this ourselves because we don't know the
++ * format of the ID structures, nor what is to be considered a match and
++ * what is not.
 + *
-+ *	This function returns 1 if a match is found, an error if one
-+ *	occurs (that is not -ENODEV or -ENXIO), and 0 otherwise.
++ * This function returns 1 if a match is found, an error if one occurs
++ * (that is not -ENODEV or -ENXIO), and 0 otherwise.
 + *
-+ *	This function must be called with @dev->sem held.  When called
-+ *	for a USB interface, @dev->parent->sem must be held as well.
++ * This function must be called with @dev->sem held.  When called for a
++ * USB interface, @dev->parent->sem must be held as well.
 + */
 +int driver_probe_device(struct device_driver * drv, struct device * dev)
 +{
@@ -135,7 +138,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	int ret = 0;
 +
 +	if (drv->bus->match && !drv->bus->match(dev, drv))
-+		goto Done;
++		goto done;
 +
 +	pr_debug("%s: Matched Device %s with Driver %s\n",
 +		 drv->bus->name, dev->bus_id, drv->name);
@@ -145,47 +148,17 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	data->dev = dev;
 +
 +	if (drv->multithread_probe) {
-+		probe_task = kthread_run(really_probe, data, "probe");
++		probe_task = kthread_run(really_probe, data,
++					 "probe-%s", dev->bus_id);
 +		if (IS_ERR(probe_task))
 +			ret = PTR_ERR(probe_task);
 +	} else
 +		ret = really_probe(data);
 +
-+Done:
++done:
  	return ret;
  }
  
---- gregkh-2.6.orig/drivers/pci/pci-driver.c
-+++ gregkh-2.6/drivers/pci/pci-driver.c
-@@ -422,6 +422,7 @@ int __pci_register_driver(struct pci_dri
- 	drv->driver.bus = &pci_bus_type;
- 	drv->driver.owner = owner;
- 	drv->driver.kobj.ktype = &pci_driver_kobj_type;
-+	drv->driver.multithread_probe = 1;
- 
- 	spin_lock_init(&drv->dynids.lock);
- 	INIT_LIST_HEAD(&drv->dynids.list);
---- gregkh-2.6.orig/drivers/scsi/ata_piix.c
-+++ gregkh-2.6/drivers/scsi/ata_piix.c
-@@ -208,6 +208,9 @@ static struct pci_driver piix_pci_driver
- 	.remove			= ata_pci_remove_one,
- 	.suspend		= ata_pci_device_suspend,
- 	.resume			= ata_pci_device_resume,
-+	.driver	= {
-+		.multithread_probe = 1,
-+	},
- };
- 
- static struct scsi_host_template piix_sht = {
-@@ -945,7 +948,7 @@ static int __init piix_init(void)
- 	if (rc)
- 		return rc;
- 
--	in_module_init = 0;
-+	//in_module_init = 0;
- 
- 	DPRINTK("done\n");
- 	return 0;
 --- gregkh-2.6.orig/include/linux/device.h
 +++ gregkh-2.6/include/linux/device.h
 @@ -105,6 +105,8 @@ struct device_driver {
