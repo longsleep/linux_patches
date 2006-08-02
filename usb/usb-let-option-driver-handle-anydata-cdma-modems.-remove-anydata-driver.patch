@@ -1,0 +1,233 @@
+From smurf@smurf.noris.de Tue Jul 11 23:37:44 2006
+From: Matthias Urlichs <smurf@smurf.noris.de>
+To: gregkh@suse.de
+Cc: Matthias Urlichs <smurf@smurf.noris.de>, Jon K Hellan <hellan@acm.org>
+Subject: USB: Let option driver handle Anydata CDMA modems. Remove anydata driver.
+Date: Mi, 12 Jul 2006 08:35:29 +0200
+Message-Id: <1152686129552-git-send-email-smurf@smurf.noris.de>
+
+Signed-off-by: Jon K Hellan <hellan@acm.org>
+Signed-Off-By: Matthias Urlichs <smurf@smurf.noris.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/serial/Kconfig   |   26 +++------
+ drivers/usb/serial/Makefile  |    1 
+ drivers/usb/serial/anydata.c |  123 -------------------------------------------
+ drivers/usb/serial/option.c  |    4 +
+ 4 files changed, 14 insertions(+), 140 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/serial/Kconfig
++++ gregkh-2.6/drivers/usb/serial/Kconfig
+@@ -62,15 +62,6 @@ config USB_SERIAL_AIRPRIME
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called airprime.
+ 
+-config USB_SERIAL_ANYDATA
+-	tristate "USB AnyData CDMA Wireless Driver"
+-	depends on USB_SERIAL
+-	help
+-	  Say Y here if you want to use a AnyData CDMA device.
+-
+-	  To compile this driver as a module, choose M here: the
+-	  module will be called anydata.
+-
+ config USB_SERIAL_ARK3116
+ 	tristate "USB ARK Micro 3116 USB Serial Driver (EXPERIMENTAL)"
+ 	depends on USB_SERIAL && EXPERIMENTAL
+@@ -502,15 +493,18 @@ config USB_SERIAL_XIRCOM
+ 	  module will be called keyspan_pda.
+ 
+ config USB_SERIAL_OPTION
+-	tristate "USB driver for GSM modems"
++	tristate "USB driver for GSM and CDMA modems"
+ 	depends on USB_SERIAL
+ 	help
+-	  Say Y here if you have an "Option" GSM PCMCIA card
+-	  (or an OEM version: branded Huawei, Audiovox, or Novatel).
+-
+-	  These cards feature a built-in OHCI-USB adapter and an
+-	  internally-connected GSM modem. The USB bus is not
+-	  accessible externally.
++	  Say Y here if you have a GSM or CDMA modem that's connected to USB.
++
++	  This driver also supports several PCMCIA cards which have a
++	  built-in OHCI-USB adapter and an internally-connected GSM modem.
++	  The USB bus on these cards is not accessible externally.
++
++	  Supported devices include (some of?) those made by:
++	  Option, Huawei, Audiovox, Sierra Wireless, Novatel Wireless, or
++	  Anydata.
+ 
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called option.
+--- gregkh-2.6.orig/drivers/usb/serial/Makefile
++++ gregkh-2.6/drivers/usb/serial/Makefile
+@@ -12,7 +12,6 @@ usbserial-obj-$(CONFIG_USB_EZUSB)		+= ez
+ usbserial-objs	:= usb-serial.o generic.o bus.o $(usbserial-obj-y)
+ 
+ obj-$(CONFIG_USB_SERIAL_AIRPRIME)		+= airprime.o
+-obj-$(CONFIG_USB_SERIAL_ANYDATA)		+= anydata.o
+ obj-$(CONFIG_USB_SERIAL_ARK3116)		+= ark3116.o
+ obj-$(CONFIG_USB_SERIAL_BELKIN)			+= belkin_sa.o
+ obj-$(CONFIG_USB_SERIAL_CP2101)			+= cp2101.o
+--- gregkh-2.6.orig/drivers/usb/serial/anydata.c
++++ /dev/null
+@@ -1,123 +0,0 @@
+-/*
+- * AnyData CDMA Serial USB driver
+- *
+- * Copyright (C) 2005 Greg Kroah-Hartman <gregkh@suse.de>
+- *
+- *	This program is free software; you can redistribute it and/or
+- *	modify it under the terms of the GNU General Public License version
+- *	2 as published by the Free Software Foundation.
+- */
+-
+-#include <linux/kernel.h>
+-#include <linux/init.h>
+-#include <linux/tty.h>
+-#include <linux/module.h>
+-#include <linux/usb.h>
+-#include <linux/usb/serial.h>
+-
+-static struct usb_device_id id_table [] = {
+-	{ USB_DEVICE(0x16d5, 0x6501) },	/* AirData CDMA device */
+-	{ },
+-};
+-MODULE_DEVICE_TABLE(usb, id_table);
+-
+-/* if overridden by the user, then use their value for the size of the
+- * read and write urbs */
+-static int buffer_size;
+-static int debug;
+-
+-static struct usb_driver anydata_driver = {
+-	.name =		"anydata",
+-	.probe =	usb_serial_probe,
+-	.disconnect =	usb_serial_disconnect,
+-	.id_table =	id_table,
+-	.no_dynamic_id = 	1,
+-};
+-
+-static int anydata_open(struct usb_serial_port *port, struct file *filp)
+-{
+-	char *buffer;
+-	int result = 0;
+-
+-	dbg("%s - port %d", __FUNCTION__, port->number);
+-
+-	if (buffer_size) {
+-		/* override the default buffer sizes */
+-		buffer = kmalloc(buffer_size, GFP_KERNEL);
+-		if (!buffer) {
+-			dev_err(&port->dev, "%s - out of memory.\n",
+-				__FUNCTION__);
+-			return -ENOMEM;
+-		}
+-		kfree (port->read_urb->transfer_buffer);
+-		port->read_urb->transfer_buffer = buffer;
+-		port->read_urb->transfer_buffer_length = buffer_size;
+-
+-		buffer = kmalloc(buffer_size, GFP_KERNEL);
+-		if (!buffer) {
+-			dev_err(&port->dev, "%s - out of memory.\n",
+-				__FUNCTION__);
+-			return -ENOMEM;
+-		}
+-		kfree (port->write_urb->transfer_buffer);
+-		port->write_urb->transfer_buffer = buffer;
+-		port->write_urb->transfer_buffer_length = buffer_size;
+-		port->bulk_out_size = buffer_size;
+-	}
+-
+-	/* Start reading from the device */
+-	usb_fill_bulk_urb(port->read_urb, port->serial->dev,
+-			  usb_rcvbulkpipe(port->serial->dev,
+-				  	  port->bulk_in_endpointAddress),
+-			  port->read_urb->transfer_buffer,
+-			  port->read_urb->transfer_buffer_length,
+-			  usb_serial_generic_read_bulk_callback, port);
+-	result = usb_submit_urb(port->read_urb, GFP_KERNEL);
+-	if (result)
+-		dev_err(&port->dev,
+-			"%s - failed submitting read urb, error %d\n",
+-			__FUNCTION__, result);
+-
+-	return result;
+-}
+-
+-static struct usb_serial_driver anydata_device = {
+-	.driver = {
+-		.owner =	THIS_MODULE,
+-		.name =		"anydata",
+-	},
+-	.id_table =		id_table,
+-	.num_interrupt_in =	NUM_DONT_CARE,
+-	.num_bulk_in =		NUM_DONT_CARE,
+-	.num_bulk_out =		NUM_DONT_CARE,
+-	.num_ports =		1,
+-	.open =			anydata_open,
+-};
+-
+-static int __init anydata_init(void)
+-{
+-	int retval;
+-
+-	retval = usb_serial_register(&anydata_device);
+-	if (retval)
+-		return retval;
+-	retval = usb_register(&anydata_driver);
+-	if (retval)
+-		usb_serial_deregister(&anydata_device);
+-	return retval;
+-}
+-
+-static void __exit anydata_exit(void)
+-{
+-	usb_deregister(&anydata_driver);
+-	usb_serial_deregister(&anydata_device);
+-}
+-
+-module_init(anydata_init);
+-module_exit(anydata_exit);
+-MODULE_LICENSE("GPL");
+-
+-module_param(debug, bool, S_IRUGO | S_IWUSR);
+-MODULE_PARM_DESC(debug, "Debug enabled or not");
+-module_param(buffer_size, int, 0);
+-MODULE_PARM_DESC(buffer_size, "Size of the transfer buffers");
+--- gregkh-2.6.orig/drivers/usb/serial/option.c
++++ gregkh-2.6/drivers/usb/serial/option.c
+@@ -72,6 +72,7 @@ static int  option_send_setup(struct usb
+ #define AUDIOVOX_VENDOR_ID              0x0F3D
+ #define SIERRAWIRELESS_VENDOR_ID        0x1199
+ #define NOVATELWIRELESS_VENDOR_ID       0x1410
++#define ANYDATA_VENDOR_ID               0x16d5
+ 
+ #define OPTION_PRODUCT_OLD              0x5000
+ #define OPTION_PRODUCT_FUSION           0x6000
+@@ -82,6 +83,7 @@ static int  option_send_setup(struct usb
+ #define AUDIOVOX_PRODUCT_AIRCARD        0x0112
+ #define SIERRAWIRELESS_PRODUCT_MC8755   0x6802
+ #define NOVATELWIRELESS_PRODUCT_U740    0x1400
++#define ANYDATA_PRODUCT_ID              0x6501
+ 
+ static struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE(OPTION_VENDOR_ID, OPTION_PRODUCT_OLD) },
+@@ -93,6 +95,7 @@ static struct usb_device_id option_ids[]
+ 	{ USB_DEVICE(AUDIOVOX_VENDOR_ID, AUDIOVOX_PRODUCT_AIRCARD) },
+ 	{ USB_DEVICE(SIERRAWIRELESS_VENDOR_ID, SIERRAWIRELESS_PRODUCT_MC8755) },
+ 	{ USB_DEVICE(NOVATELWIRELESS_VENDOR_ID,NOVATELWIRELESS_PRODUCT_U740) },
++	{ USB_DEVICE(ANYDATA_VENDOR_ID, ANYDATA_PRODUCT_ID) },
+ 	{ } /* Terminating entry */
+ };
+ 
+@@ -105,6 +108,7 @@ static struct usb_device_id option_ids1[
+ 	{ USB_DEVICE(HUAWEI_VENDOR_ID, HUAWEI_PRODUCT_E600) },
+ 	{ USB_DEVICE(AUDIOVOX_VENDOR_ID, AUDIOVOX_PRODUCT_AIRCARD) },
+ 	{ USB_DEVICE(NOVATELWIRELESS_VENDOR_ID,NOVATELWIRELESS_PRODUCT_U740) },
++	{ USB_DEVICE(ANYDATA_VENDOR_ID, ANYDATA_PRODUCT_ID) },
+ 	{ } /* Terminating entry */
+ };
+ static struct usb_device_id option_ids3[] = {
