@@ -1,0 +1,123 @@
+From owner-linux-pci@atrey.karlin.mff.cuni.cz Thu Jul 13 11:00:49 2006
+Message-Id: <20060713165608.697462000@myri.com>
+Date: Thu, 13 Jul 2006 12:56:11 -0400
+From: Brice Goglin <brice@myri.com>
+To: linux-pci@atrey.karlin.mff.cuni.cz
+Cc: Brice Goglin <brice@myri.com>
+Subject: MSI: Add pci_device_exp_type
+Content-Disposition: inline; filename=msi-03-add_pci_device_exp_type.patch
+
+Add pci_device_exp_type() to help checking whether a PCI device
+is a root port, a legacy endpoint, ...
+
+Signed-off-by: Brice Goglin <brice@myri.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/net/myri10ge/myri10ge.c |   17 +++++------------
+ drivers/pci/pci.c               |   15 +++++++++++++++
+ drivers/pci/probe.c             |    7 ++++---
+ include/linux/pci.h             |    2 ++
+ 4 files changed, 26 insertions(+), 15 deletions(-)
+
+--- gregkh-2.6.orig/drivers/net/myri10ge/myri10ge.c
++++ gregkh-2.6/drivers/net/myri10ge/myri10ge.c
+@@ -2203,18 +2203,15 @@ static void myri10ge_enable_ecrc(struct 
+ 	struct device *dev = &mgp->pdev->dev;
+ 	unsigned cap;
+ 	unsigned err_cap;
+-	u16 val;
+-	u8 ext_type;
++	u8 exp_type;
+ 	int ret;
+ 
+ 	if (!myri10ge_ecrc_enable || !bridge)
+ 		return;
+ 
+ 	/* check that the bridge is a root port */
+-	cap = pci_find_capability(bridge, PCI_CAP_ID_EXP);
+-	pci_read_config_word(bridge, cap + PCI_CAP_FLAGS, &val);
+-	ext_type = (val & PCI_EXP_FLAGS_TYPE) >> 4;
+-	if (ext_type != PCI_EXP_TYPE_ROOT_PORT) {
++	if (pci_device_exp_type(bridge, &exp_type)
++	    && exp_type != PCI_EXP_TYPE_ROOT_PORT) {
+ 		if (myri10ge_ecrc_enable > 1) {
+ 			struct pci_dev *old_bridge = bridge;
+ 
+@@ -2228,12 +2225,8 @@ static void myri10ge_enable_ecrc(struct 
+ 						" to force ECRC\n");
+ 					return;
+ 				}
+-				cap =
+-				    pci_find_capability(bridge, PCI_CAP_ID_EXP);
+-				pci_read_config_word(bridge,
+-						     cap + PCI_CAP_FLAGS, &val);
+-				ext_type = (val & PCI_EXP_FLAGS_TYPE) >> 4;
+-			} while (ext_type != PCI_EXP_TYPE_ROOT_PORT);
++				pci_device_exp_type(bridge, &exp_type);
++			} while (exp_type != PCI_EXP_TYPE_ROOT_PORT);
+ 
+ 			dev_info(dev,
+ 				 "Forcing ECRC on non-root port %s"
+--- gregkh-2.6.orig/drivers/pci/pci.c
++++ gregkh-2.6/drivers/pci/pci.c
+@@ -214,6 +214,21 @@ int pci_find_ext_capability(struct pci_d
+ }
+ EXPORT_SYMBOL_GPL(pci_find_ext_capability);
+ 
++int pci_device_exp_type(struct pci_dev *dev, u8 *type)
++{
++	unsigned cap;
++	u16 val;
++
++	cap = pci_find_capability(dev, PCI_CAP_ID_EXP);
++	if (!cap)
++		return -1;
++
++	pci_read_config_word(dev, cap + PCI_CAP_FLAGS, &val);
++	*type = (val & PCI_EXP_FLAGS_TYPE) >> 4;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(pci_device_exp_type);
++
+ /**
+  * pci_find_parent_resource - return resource region of parent bus of given region
+  * @dev: PCI device structure contains resources to be searched
+--- gregkh-2.6.orig/drivers/pci/probe.c
++++ gregkh-2.6/drivers/pci/probe.c
+@@ -392,13 +392,14 @@ struct pci_bus * __devinit pci_add_new_b
+ 
+ static void pci_enable_crs(struct pci_dev *dev)
+ {
+-	u16 cap, rpctl;
++	u16 rpctl;
++	u8 exp_type;
+ 	int rpcap = pci_find_capability(dev, PCI_CAP_ID_EXP);
+ 	if (!rpcap)
+ 		return;
+ 
+-	pci_read_config_word(dev, rpcap + PCI_CAP_FLAGS, &cap);
+-	if (((cap & PCI_EXP_FLAGS_TYPE) >> 4) != PCI_EXP_TYPE_ROOT_PORT)
++	if (pci_device_exp_type(dev, &exp_type)
++	    || exp_type != PCI_EXP_TYPE_ROOT_PORT)
+ 		return;
+ 
+ 	pci_read_config_word(dev, rpcap + PCI_EXP_RTCTL, &rpctl);
+--- gregkh-2.6.orig/include/linux/pci.h
++++ gregkh-2.6/include/linux/pci.h
+@@ -448,6 +448,7 @@ struct pci_dev *pci_find_device_reverse 
+ struct pci_dev *pci_find_slot (unsigned int bus, unsigned int devfn);
+ int pci_find_capability (struct pci_dev *dev, int cap);
+ int pci_find_next_capability (struct pci_dev *dev, u8 pos, int cap);
++int pci_device_exp_type (struct pci_dev *dev, u8 *type);
+ int pci_find_ext_capability (struct pci_dev *dev, int cap);
+ struct pci_bus * pci_find_next_bus(const struct pci_bus *from);
+ 
+@@ -670,6 +671,7 @@ static inline int pci_register_driver(st
+ static inline void pci_unregister_driver(struct pci_driver *drv) { }
+ static inline int pci_find_capability (struct pci_dev *dev, int cap) {return 0; }
+ static inline int pci_find_next_capability (struct pci_dev *dev, u8 post, int cap) { return 0; }
++static inline int pci_device_exp_type (struct pci_dev *dev, u8 *type) { return -1; }
+ static inline int pci_find_ext_capability (struct pci_dev *dev, int cap) {return 0; }
+ static inline const struct pci_device_id *pci_match_device(const struct pci_device_id *ids, const struct pci_dev *dev) { return NULL; }
+ 
