@@ -1,10 +1,23 @@
+From foo@baz Tue Apr  9 12:12:43 2002
+Date: Mon, 7 Aug 2006 22:19:37 -0700
+To: Greg KH <greg@kroah.com>
+From: Greg Kroah-Hartman <gregkh@suse.de>
+Subject: Driver core: create devices/virtual/ tree
+
+This change creates a devices/virtual/CLASS_NAME tree for struct devices
+that belong to a class, yet do not have a "real" struct device for a
+parent.  It automatically creates the directories on the fly as needed.
+
+
+Cc: Kay Sievers <kay.sievers@vrfy.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
 ---
- drivers/base/Makefile  |    3 -
- drivers/base/base.h    |    1 
- drivers/base/core.c    |   11 +++
- drivers/base/virtual.c |  142 +++++++++++++++++++++++++++++++++++++++++++++++++
- include/linux/device.h |    1 
- 5 files changed, 155 insertions(+), 3 deletions(-)
+ drivers/base/Makefile  |    3 
+ drivers/base/base.h    |    2 
+ drivers/base/core.c    |   11 ++-
+ drivers/base/virtual.c |  157 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 170 insertions(+), 3 deletions(-)
 
 --- gregkh-2.6.orig/drivers/base/Makefile
 +++ gregkh-2.6/drivers/base/Makefile
@@ -20,11 +33,12 @@
  obj-$(CONFIG_FW_LOADER)	+= firmware_class.o
 --- gregkh-2.6.orig/drivers/base/base.h
 +++ gregkh-2.6/drivers/base/base.h
-@@ -43,4 +43,5 @@ struct class_device_attribute *to_class_
+@@ -43,4 +43,6 @@ struct class_device_attribute *to_class_
  }
  
  extern char *make_class_name(const char *name, struct kobject *kobj);
 +extern int virtual_device_parent(struct device *dev);
++extern int device_is_virtual(struct device *dev);
  
 --- gregkh-2.6.orig/drivers/base/core.c
 +++ gregkh-2.6/drivers/base/core.c
@@ -47,22 +61,22 @@
  		sysfs_create_link(&dev->class->subsys.kset.kobj, &dev->kobj,
  				  dev->bus_id);
 -		if (parent) {
-+		if ((parent) && (!dev->virtual)) {
++		if ((parent) && (!device_is_virtual(dev))) {
  			sysfs_create_link(&dev->kobj, &dev->parent->kobj, "device");
  			class_name = make_class_name(dev->class->name, &dev->kobj);
  			sysfs_create_link(&dev->parent->kobj, &dev->kobj, class_name);
-@@ -547,7 +554,7 @@ void device_del(struct device * dev)
+@@ -546,7 +553,7 @@ void device_del(struct device * dev)
  		sysfs_remove_link(&dev->kobj, "subsystem");
  		sysfs_remove_link(&dev->class->subsys.kset.kobj, dev->bus_id);
  		class_name = make_class_name(dev->class->name, &dev->kobj);
 -		if (parent) {
-+		if ((parent) && (!dev->virtual)) {
++		if ((parent) && (!device_is_virtual(dev))) {
  			sysfs_remove_link(&dev->kobj, "device");
  			sysfs_remove_link(&dev->parent->kobj, class_name);
  		}
 --- /dev/null
 +++ gregkh-2.6/drivers/base/virtual.c
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,157 @@
 +/*
 + * virtual.c
 + *
@@ -80,8 +94,8 @@
 +#include <linux/err.h>
 +#include "base.h"
 +
-+
 +static struct device *virtual_dev;
++static int i_am_a_virtual_dev;
 +
 +static void virtual_dev_release(struct device *dev)
 +{
@@ -117,7 +131,6 @@
 +	return retval;
 +}
 +
-+
 +static struct device *next_device(struct klist_iter *i)
 +{
 +	struct klist_node *n = klist_next(i);
@@ -133,7 +146,7 @@
 +	klist_iter_init(&dev->klist_children, &i);
 +	while ((child = next_device(&i)) && !found_device) {
 +		if (strcmp(child->bus_id, name) == 0)
-+			found_device = get_device(child);
++			found_device = child;
 +	}
 +	klist_iter_exit(&i);
 +	return found_device;
@@ -159,6 +172,7 @@
 +	dev->parent = virtual_dev;
 +	dev->release = virtual_dev_release;
 +	snprintf(dev->bus_id, BUS_ID_SIZE, class_name);
++	dev_set_drvdata(dev, &i_am_a_virtual_dev);
 +	retval = device_register(dev);
 +	if (retval)
 +		goto error;
@@ -170,7 +184,6 @@
 +	kfree(dev);
 +	return ERR_PTR(retval);
 +}
-+
 +
 +/**
 + * virtual_device_parent - create a proper parent for virtual devices
@@ -200,18 +213,24 @@
 +	}
 +
 +	dev->parent = parent;
-+	dev->virtual = 1;
 +
 +exit:
 +	return retval;
 +}
---- gregkh-2.6.orig/include/linux/device.h
-+++ gregkh-2.6/include/linux/device.h
-@@ -351,6 +351,7 @@ struct device {
- 	struct class		*class;		/* optional*/
- 	dev_t			devt;		/* dev_t, creates the sysfs "dev" */
- 	struct attribute_group	**groups;	/* optional groups */
-+	unsigned int		virtual:1;	/* if this is a "virtual" device or not */
- 
- 	void	(*release)(struct device * dev);
- };
++
++/**
++ * dev_is_virtual - determine if this struct device is virtual or not
++ *
++ * returns 1 if a virtual device, 0 if not.
++ */
++int device_is_virtual(struct device *dev)
++{
++	int *test;
++
++	if (dev->parent) {
++		test = dev_get_drvdata(dev->parent);
++		if (test == &i_am_a_virtual_dev)
++			return 1;
++	}
++	return 0;
++}
