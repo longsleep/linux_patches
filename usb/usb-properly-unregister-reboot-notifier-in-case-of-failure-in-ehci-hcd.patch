@@ -1,0 +1,486 @@
+From dared1st@yahoo.com Tue Aug  8 17:24:36 2006
+Message-ID: <20060809002408.40143.qmail@web83103.mail.mud.yahoo.com>
+Date: Tue, 8 Aug 2006 17:24:08 -0700 (PDT)
+From: Aleksey Gorelov <dared1st@yahoo.com>
+Subject: USB: Properly unregister reboot notifier in case of failure in ehci hcd
+To: Greg KH <gregkh@suse.de>, David Brownell <david-b@pacbell.net>
+
+
+From: Aleksey Gorelov <dared1st@yahoo.com>
+
+If some problem occurs during ehci startup, for instance, request_irq fails,
+echi hcd driver tries it best to cleanup, but fails to unregister reboot
+notifier, which in turn leads to crash on reboot/poweroff.
+
+The following patch resolves this problem by not using reboot notifiers
+anymore, but instead making ehci/ohci driver get its own shutdown method.  For
+PCI, it is done through pci glue, for everything else through platform driver
+glue.
+
+One downside: sa1111 does not use platform driver stuff, and does not have its
+own shutdown hook, so no 'shutdown' is called for it now.  I'm not sure if it
+is really necessary on that platform, though.
+
+Signed-off-by: Aleks Gorelov <dared1st@yahoo.com>
+Cc: Alan Stern <stern@rowland.harvard.edu>
+Cc: David Brownell <david-b@pacbell.net>
+Signed-off-by: Andrew Morton <akpm@osdl.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/hcd-pci.c      |   16 ++++++++++++++++
+ drivers/usb/core/hcd.c          |   11 +++++++++++
+ drivers/usb/core/hcd.h          |    8 ++++++++
+ drivers/usb/host/ehci-au1xxx.c  |    2 ++
+ drivers/usb/host/ehci-fsl.c     |    2 ++
+ drivers/usb/host/ehci-hcd.c     |   16 +++++-----------
+ drivers/usb/host/ehci-pci.c     |    2 ++
+ drivers/usb/host/ehci.h         |    1 -
+ drivers/usb/host/ohci-at91.c    |    2 ++
+ drivers/usb/host/ohci-au1xxx.c  |    2 ++
+ drivers/usb/host/ohci-ep93xx.c  |    2 ++
+ drivers/usb/host/ohci-hcd.c     |   12 ++++--------
+ drivers/usb/host/ohci-lh7a404.c |    2 ++
+ drivers/usb/host/ohci-mem.c     |    1 -
+ drivers/usb/host/ohci-omap.c    |    2 ++
+ drivers/usb/host/ohci-pci.c     |    3 +++
+ drivers/usb/host/ohci-ppc-soc.c |    2 ++
+ drivers/usb/host/ohci-pxa27x.c  |    2 ++
+ drivers/usb/host/ohci-s3c2410.c |    2 ++
+ drivers/usb/host/ohci.h         |    2 --
+ 20 files changed, 69 insertions(+), 23 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/core/hcd-pci.c
++++ gregkh-2.6/drivers/usb/core/hcd-pci.c
+@@ -413,4 +413,20 @@ EXPORT_SYMBOL (usb_hcd_pci_resume);
+ 
+ #endif	/* CONFIG_PM */
+ 
++/**
++ * usb_hcd_pci_shutdown - shutdown host controller
++ * @dev: USB Host Controller being shutdown
++ */
++void usb_hcd_pci_shutdown (struct pci_dev *dev)
++{
++	struct usb_hcd		*hcd;
++
++	hcd = pci_get_drvdata(dev);
++	if (!hcd)
++		return;
++
++	if (hcd->driver->shutdown)
++		hcd->driver->shutdown(hcd);
++}
++EXPORT_SYMBOL (usb_hcd_pci_shutdown);
+ 
+--- gregkh-2.6.orig/drivers/usb/core/hcd.c
++++ gregkh-2.6/drivers/usb/core/hcd.c
+@@ -36,6 +36,7 @@
+ #include <linux/mutex.h>
+ #include <asm/irq.h>
+ #include <asm/byteorder.h>
++#include <linux/platform_device.h>
+ 
+ #include <linux/usb.h>
+ 
+@@ -1915,6 +1916,16 @@ void usb_remove_hcd(struct usb_hcd *hcd)
+ }
+ EXPORT_SYMBOL (usb_remove_hcd);
+ 
++void
++usb_hcd_platform_shutdown(struct platform_device* dev)
++{
++	struct usb_hcd *hcd = platform_get_drvdata(dev);
++
++	if (hcd->driver->shutdown)
++		hcd->driver->shutdown(hcd);
++}
++EXPORT_SYMBOL (usb_hcd_platform_shutdown);
++
+ /*-------------------------------------------------------------------------*/
+ 
+ #if defined(CONFIG_USB_MON)
+--- gregkh-2.6.orig/drivers/usb/core/hcd.h
++++ gregkh-2.6/drivers/usb/core/hcd.h
+@@ -192,6 +192,9 @@ struct hc_driver {
+ 	/* cleanly make HCD stop writing memory and doing I/O */
+ 	void	(*stop) (struct usb_hcd *hcd);
+ 
++	/* shutdown HCD */
++	void	(*shutdown) (struct usb_hcd *hcd);
++
+ 	/* return current frame number */
+ 	int	(*get_frame_number) (struct usb_hcd *hcd);
+ 
+@@ -227,6 +230,9 @@ extern int usb_add_hcd(struct usb_hcd *h
+ 		unsigned int irqnum, unsigned long irqflags);
+ extern void usb_remove_hcd(struct usb_hcd *hcd);
+ 
++struct platform_device;
++extern void usb_hcd_platform_shutdown(struct platform_device* dev);
++
+ #ifdef CONFIG_PCI
+ struct pci_dev;
+ struct pci_device_id;
+@@ -239,6 +245,8 @@ extern int usb_hcd_pci_suspend (struct p
+ extern int usb_hcd_pci_resume (struct pci_dev *dev);
+ #endif /* CONFIG_PM */
+ 
++extern void usb_hcd_pci_shutdown (struct pci_dev *dev);
++
+ #endif /* CONFIG_PCI */
+ 
+ /* pci-ish (pdev null is ok) buffer alloc/mapping support */
+--- gregkh-2.6.orig/drivers/usb/host/ehci-au1xxx.c
++++ gregkh-2.6/drivers/usb/host/ehci-au1xxx.c
+@@ -200,6 +200,7 @@ static const struct hc_driver ehci_au1xx
+ 	.reset = ehci_init,
+ 	.start = ehci_run,
+ 	.stop = ehci_stop,
++	.shutdown = ehci_shutdown,
+ 
+ 	/*
+ 	 * managing i/o requests and associated device resources
+@@ -268,6 +269,7 @@ MODULE_ALIAS("au1xxx-ehci");
+ static struct platform_driver ehci_hcd_au1xxx_driver = {
+ 	.probe = ehci_hcd_au1xxx_drv_probe,
+ 	.remove = ehci_hcd_au1xxx_drv_remove,
++	.shutdown = usb_hcd_platform_shutdown,
+ 	/*.suspend      = ehci_hcd_au1xxx_drv_suspend, */
+ 	/*.resume       = ehci_hcd_au1xxx_drv_resume, */
+ 	.driver = {
+--- gregkh-2.6.orig/drivers/usb/host/ehci-fsl.c
++++ gregkh-2.6/drivers/usb/host/ehci-fsl.c
+@@ -285,6 +285,7 @@ static const struct hc_driver ehci_fsl_h
+ 	.resume = ehci_bus_resume,
+ #endif
+ 	.stop = ehci_stop,
++	.shutdown = ehci_shutdown,
+ 
+ 	/*
+ 	 * managing i/o requests and associated device resources
+@@ -329,6 +330,7 @@ MODULE_ALIAS("fsl-ehci");
+ static struct platform_driver ehci_fsl_driver = {
+ 	.probe = ehci_fsl_drv_probe,
+ 	.remove = ehci_fsl_drv_remove,
++	.shutdown = usb_hcd_platform_shutdown,
+ 	.driver = {
+ 		   .name = "fsl-ehci",
+ 		   },
+--- gregkh-2.6.orig/drivers/usb/host/ehci-hcd.c
++++ gregkh-2.6/drivers/usb/host/ehci-hcd.c
+@@ -292,21 +292,20 @@ static void ehci_watchdog (unsigned long
+ 	spin_unlock_irqrestore (&ehci->lock, flags);
+ }
+ 
+-/* Reboot notifiers kick in for silicon on any bus (not just pci, etc).
++/* ehci_shutdown kick in for silicon on any bus (not just pci, etc).
+  * This forcibly disables dma and IRQs, helping kexec and other cases
+  * where the next system software may expect clean state.
+  */
+-static int
+-ehci_reboot (struct notifier_block *self, unsigned long code, void *null)
++static void
++ehci_shutdown (struct usb_hcd *hcd)
+ {
+-	struct ehci_hcd		*ehci;
++	struct ehci_hcd	*ehci;
+ 
+-	ehci = container_of (self, struct ehci_hcd, reboot_notifier);
++	ehci = hcd_to_ehci (hcd);
+ 	(void) ehci_halt (ehci);
+ 
+ 	/* make BIOS/etc use companion controller during reboot */
+ 	writel (0, &ehci->regs->configured_flag);
+-	return 0;
+ }
+ 
+ static void ehci_port_power (struct ehci_hcd *ehci, int is_on)
+@@ -381,7 +380,6 @@ static void ehci_stop (struct usb_hcd *h
+ 
+ 	/* let companion controllers work when we aren't */
+ 	writel (0, &ehci->regs->configured_flag);
+-	unregister_reboot_notifier (&ehci->reboot_notifier);
+ 
+ 	remove_debug_files (ehci);
+ 
+@@ -483,9 +481,6 @@ static int ehci_init(struct usb_hcd *hcd
+ 	}
+ 	ehci->command = temp;
+ 
+-	ehci->reboot_notifier.notifier_call = ehci_reboot;
+-	register_reboot_notifier(&ehci->reboot_notifier);
+-
+ 	return 0;
+ }
+ 
+@@ -499,7 +494,6 @@ static int ehci_run (struct usb_hcd *hcd
+ 
+ 	/* EHCI spec section 4.1 */
+ 	if ((retval = ehci_reset(ehci)) != 0) {
+-		unregister_reboot_notifier(&ehci->reboot_notifier);
+ 		ehci_mem_cleanup(ehci);
+ 		return retval;
+ 	}
+--- gregkh-2.6.orig/drivers/usb/host/ehci-pci.c
++++ gregkh-2.6/drivers/usb/host/ehci-pci.c
+@@ -332,6 +332,7 @@ static const struct hc_driver ehci_pci_h
+ 	.resume =		ehci_pci_resume,
+ #endif
+ 	.stop =			ehci_stop,
++	.shutdown =		ehci_shutdown,
+ 
+ 	/*
+ 	 * managing i/o requests and associated device resources
+@@ -378,4 +379,5 @@ static struct pci_driver ehci_pci_driver
+ 	.suspend =	usb_hcd_pci_suspend,
+ 	.resume =	usb_hcd_pci_resume,
+ #endif
++	.shutdown = 	usb_hcd_pci_shutdown,
+ };
+--- gregkh-2.6.orig/drivers/usb/host/ehci.h
++++ gregkh-2.6/drivers/usb/host/ehci.h
+@@ -82,7 +82,6 @@ struct ehci_hcd {			/* one per controlle
+ 	struct dma_pool		*sitd_pool;	/* sitd per split iso urb */
+ 
+ 	struct timer_list	watchdog;
+-	struct notifier_block	reboot_notifier;
+ 	unsigned long		actions;
+ 	unsigned		stamp;
+ 	unsigned long		next_statechange;
+--- gregkh-2.6.orig/drivers/usb/host/ohci-at91.c
++++ gregkh-2.6/drivers/usb/host/ohci-at91.c
+@@ -221,6 +221,7 @@ static const struct hc_driver ohci_at91_
+ 	 */
+ 	.start =		ohci_at91_start,
+ 	.stop =			ohci_stop,
++	.shutdown = 		ohci_shutdown,
+ 
+ 	/*
+ 	 * managing i/o requests and associated device resources
+@@ -310,6 +311,7 @@ MODULE_ALIAS("at91_ohci");
+ static struct platform_driver ohci_hcd_at91_driver = {
+ 	.probe		= ohci_hcd_at91_drv_probe,
+ 	.remove		= ohci_hcd_at91_drv_remove,
++	.shutdown	= usb_hcd_platform_shutdown,
+ 	.suspend	= ohci_hcd_at91_drv_suspend,
+ 	.resume		= ohci_hcd_at91_drv_resume,
+ 	.driver		= {
+--- gregkh-2.6.orig/drivers/usb/host/ohci-au1xxx.c
++++ gregkh-2.6/drivers/usb/host/ohci-au1xxx.c
+@@ -269,6 +269,7 @@ static const struct hc_driver ohci_au1xx
+ 	 */
+ 	.start =		ohci_au1xxx_start,
+ 	.stop =			ohci_stop,
++	.shutdown = 		ohci_shutdown,
+ 
+ 	/*
+ 	 * managing i/o requests and associated device resources
+@@ -335,6 +336,7 @@ static int ohci_hcd_au1xxx_drv_resume(st
+ static struct platform_driver ohci_hcd_au1xxx_driver = {
+ 	.probe		= ohci_hcd_au1xxx_drv_probe,
+ 	.remove		= ohci_hcd_au1xxx_drv_remove,
++	.shutdown 	= usb_hcd_platform_shutdown,
+ 	/*.suspend	= ohci_hcd_au1xxx_drv_suspend, */
+ 	/*.resume	= ohci_hcd_au1xxx_drv_resume, */
+ 	.driver		= {
+--- gregkh-2.6.orig/drivers/usb/host/ohci-ep93xx.c
++++ gregkh-2.6/drivers/usb/host/ohci-ep93xx.c
+@@ -128,6 +128,7 @@ static struct hc_driver ohci_ep93xx_hc_d
+ 	.flags			= HCD_USB11 | HCD_MEMORY,
+ 	.start			= ohci_ep93xx_start,
+ 	.stop			= ohci_stop,
++	.shutdown		= ohci_shutdown,
+ 	.urb_enqueue		= ohci_urb_enqueue,
+ 	.urb_dequeue		= ohci_urb_dequeue,
+ 	.endpoint_disable	= ohci_endpoint_disable,
+@@ -203,6 +204,7 @@ static int ohci_hcd_ep93xx_drv_resume(st
+ static struct platform_driver ohci_hcd_ep93xx_driver = {
+ 	.probe		= ohci_hcd_ep93xx_drv_probe,
+ 	.remove		= ohci_hcd_ep93xx_drv_remove,
++	.shutdown 	= usb_hcd_platform_shutdown,
+ #ifdef CONFIG_PM
+ 	.suspend	= ohci_hcd_ep93xx_drv_suspend,
+ 	.resume		= ohci_hcd_ep93xx_drv_resume,
+--- gregkh-2.6.orig/drivers/usb/host/ohci-hcd.c
++++ gregkh-2.6/drivers/usb/host/ohci-hcd.c
+@@ -136,7 +136,6 @@ static const char	hcd_name [] = "ohci_hc
+ static void ohci_dump (struct ohci_hcd *ohci, int verbose);
+ static int ohci_init (struct ohci_hcd *ohci);
+ static void ohci_stop (struct usb_hcd *hcd);
+-static int ohci_reboot (struct notifier_block *, unsigned long , void *);
+ 
+ #include "ohci-hub.c"
+ #include "ohci-dbg.c"
+@@ -419,21 +418,20 @@ static void ohci_usb_reset (struct ohci_
+ 	ohci_writel (ohci, ohci->hc_control, &ohci->regs->control);
+ }
+ 
+-/* reboot notifier forcibly disables IRQs and DMA, helping kexec and
++/* ohci_shutdown forcibly disables IRQs and DMA, helping kexec and
+  * other cases where the next software may expect clean state from the
+  * "firmware".  this is bus-neutral, unlike shutdown() methods.
+  */
+-static int
+-ohci_reboot (struct notifier_block *block, unsigned long code, void *null)
++static void
++ohci_shutdown (struct usb_hcd *hcd)
+ {
+ 	struct ohci_hcd *ohci;
+ 
+-	ohci = container_of (block, struct ohci_hcd, reboot_notifier);
++	ohci = hcd_to_ohci (hcd);
+ 	ohci_writel (ohci, OHCI_INTR_MIE, &ohci->regs->intrdisable);
+ 	ohci_usb_reset (ohci);
+ 	/* flush the writes */
+ 	(void) ohci_readl (ohci, &ohci->regs->control);
+-	return 0;
+ }
+ 
+ /*-------------------------------------------------------------------------*
+@@ -504,7 +502,6 @@ static int ohci_init (struct ohci_hcd *o
+ 	if ((ret = ohci_mem_init (ohci)) < 0)
+ 		ohci_stop (hcd);
+ 	else {
+-		register_reboot_notifier (&ohci->reboot_notifier);
+ 		create_debug_files (ohci);
+ 	}
+ 
+@@ -800,7 +797,6 @@ static void ohci_stop (struct usb_hcd *h
+ 	ohci_writel (ohci, OHCI_INTR_MIE, &ohci->regs->intrdisable);
+ 	
+ 	remove_debug_files (ohci);
+-	unregister_reboot_notifier (&ohci->reboot_notifier);
+ 	ohci_mem_cleanup (ohci);
+ 	if (ohci->hcca) {
+ 		dma_free_coherent (hcd->self.controller, 
+--- gregkh-2.6.orig/drivers/usb/host/ohci-lh7a404.c
++++ gregkh-2.6/drivers/usb/host/ohci-lh7a404.c
+@@ -174,6 +174,7 @@ static const struct hc_driver ohci_lh7a4
+ 	 */
+ 	.start =		ohci_lh7a404_start,
+ 	.stop =			ohci_stop,
++	.shutdown = 		ohci_shutdown,
+ 
+ 	/*
+ 	 * managing i/o requests and associated device resources
+@@ -241,6 +242,7 @@ static int ohci_hcd_lh7a404_drv_resume(s
+ static struct platform_driver ohci_hcd_lh7a404_driver = {
+ 	.probe		= ohci_hcd_lh7a404_drv_probe,
+ 	.remove		= ohci_hcd_lh7a404_drv_remove,
++	.shutdown 	= usb_hcd_platform_shutdown,
+ 	/*.suspend	= ohci_hcd_lh7a404_drv_suspend, */
+ 	/*.resume	= ohci_hcd_lh7a404_drv_resume, */
+ 	.driver		= {
+--- gregkh-2.6.orig/drivers/usb/host/ohci-mem.c
++++ gregkh-2.6/drivers/usb/host/ohci-mem.c
+@@ -28,7 +28,6 @@ static void ohci_hcd_init (struct ohci_h
+ 	ohci->next_statechange = jiffies;
+ 	spin_lock_init (&ohci->lock);
+ 	INIT_LIST_HEAD (&ohci->pending);
+-	ohci->reboot_notifier.notifier_call = ohci_reboot;
+ }
+ 
+ /*-------------------------------------------------------------------------*/
+--- gregkh-2.6.orig/drivers/usb/host/ohci-omap.c
++++ gregkh-2.6/drivers/usb/host/ohci-omap.c
+@@ -447,6 +447,7 @@ static const struct hc_driver ohci_omap_
+ 	.reset =		ohci_omap_init,
+ 	.start =		ohci_omap_start,
+ 	.stop =			ohci_omap_stop,
++	.shutdown = 		ohci_shutdown,
+ 
+ 	/*
+ 	 * managing i/o requests and associated device resources
+@@ -532,6 +533,7 @@ static int ohci_omap_resume(struct platf
+ static struct platform_driver ohci_hcd_omap_driver = {
+ 	.probe		= ohci_hcd_omap_drv_probe,
+ 	.remove		= ohci_hcd_omap_drv_remove,
++	.shutdown 	= usb_hcd_platform_shutdown,
+ #ifdef	CONFIG_PM
+ 	.suspend	= ohci_omap_suspend,
+ 	.resume		= ohci_omap_resume,
+--- gregkh-2.6.orig/drivers/usb/host/ohci-pci.c
++++ gregkh-2.6/drivers/usb/host/ohci-pci.c
+@@ -172,6 +172,7 @@ static const struct hc_driver ohci_pci_h
+ 	.reset =		ohci_pci_reset,
+ 	.start =		ohci_pci_start,
+ 	.stop =			ohci_stop,
++	.shutdown =		ohci_shutdown,
+ 
+ #ifdef	CONFIG_PM
+ 	/* these suspend/resume entries are for upstream PCI glue ONLY */
+@@ -227,6 +228,8 @@ static struct pci_driver ohci_pci_driver
+ 	.suspend =	usb_hcd_pci_suspend,
+ 	.resume =	usb_hcd_pci_resume,
+ #endif
++
++	.shutdown =	usb_hcd_pci_shutdown,
+ };
+ 
+  
+--- gregkh-2.6.orig/drivers/usb/host/ohci-ppc-soc.c
++++ gregkh-2.6/drivers/usb/host/ohci-ppc-soc.c
+@@ -148,6 +148,7 @@ static const struct hc_driver ohci_ppc_s
+ 	 */
+ 	.start =		ohci_ppc_soc_start,
+ 	.stop =			ohci_stop,
++	.shutdown = 		ohci_shutdown,
+ 
+ 	/*
+ 	 * managing i/o requests and associated device resources
+@@ -196,6 +197,7 @@ static int ohci_hcd_ppc_soc_drv_remove(s
+ static struct platform_driver ohci_hcd_ppc_soc_driver = {
+ 	.probe		= ohci_hcd_ppc_soc_drv_probe,
+ 	.remove		= ohci_hcd_ppc_soc_drv_remove,
++	.shutdown 	= usb_hcd_platform_shutdown,
+ #ifdef	CONFIG_PM
+ 	/*.suspend	= ohci_hcd_ppc_soc_drv_suspend,*/
+ 	/*.resume	= ohci_hcd_ppc_soc_drv_resume,*/
+--- gregkh-2.6.orig/drivers/usb/host/ohci-pxa27x.c
++++ gregkh-2.6/drivers/usb/host/ohci-pxa27x.c
+@@ -270,6 +270,7 @@ static const struct hc_driver ohci_pxa27
+ 	 */
+ 	.start =		ohci_pxa27x_start,
+ 	.stop =			ohci_stop,
++	.shutdown = 		ohci_shutdown,
+ 
+ 	/*
+ 	 * managing i/o requests and associated device resources
+@@ -358,6 +359,7 @@ static int ohci_hcd_pxa27x_drv_resume(st
+ static struct platform_driver ohci_hcd_pxa27x_driver = {
+ 	.probe		= ohci_hcd_pxa27x_drv_probe,
+ 	.remove		= ohci_hcd_pxa27x_drv_remove,
++	.shutdown 	= usb_hcd_platform_shutdown,
+ #ifdef CONFIG_PM
+ 	.suspend	= ohci_hcd_pxa27x_drv_suspend, 
+ 	.resume		= ohci_hcd_pxa27x_drv_resume,
+--- gregkh-2.6.orig/drivers/usb/host/ohci-s3c2410.c
++++ gregkh-2.6/drivers/usb/host/ohci-s3c2410.c
+@@ -447,6 +447,7 @@ static const struct hc_driver ohci_s3c24
+ 	 */
+ 	.start =		ohci_s3c2410_start,
+ 	.stop =			ohci_stop,
++	.shutdown = 		ohci_shutdown,
+ 
+ 	/*
+ 	 * managing i/o requests and associated device resources
+@@ -491,6 +492,7 @@ static int ohci_hcd_s3c2410_drv_remove(s
+ static struct platform_driver ohci_hcd_s3c2410_driver = {
+ 	.probe		= ohci_hcd_s3c2410_drv_probe,
+ 	.remove		= ohci_hcd_s3c2410_drv_remove,
++	.shutdown 	= usb_hcd_platform_shutdown,
+ 	/*.suspend	= ohci_hcd_s3c2410_drv_suspend, */
+ 	/*.resume	= ohci_hcd_s3c2410_drv_resume, */
+ 	.driver		= {
+--- gregkh-2.6.orig/drivers/usb/host/ohci.h
++++ gregkh-2.6/drivers/usb/host/ohci.h
+@@ -389,8 +389,6 @@ struct ohci_hcd {
+ 	unsigned long		next_statechange;	/* suspend/resume */
+ 	u32			fminterval;		/* saved register */
+ 
+-	struct notifier_block	reboot_notifier;
+-
+ 	unsigned long		flags;		/* for HC bugs */
+ #define	OHCI_QUIRK_AMD756	0x01			/* erratum #4 */
+ #define	OHCI_QUIRK_SUPERIO	0x02			/* natsemi */
