@@ -3,42 +3,146 @@ Date: Fri, 11 Aug 2006 01:55:12 -0700
 From: Greg Kroah-Hartman <gregkh@suse.de>
 Subject: USB: create a new thread for every USB device found during the probe sequence
 
-
 Might speed up some systems.  If nothing else, a bad driver should not
 take the whole USB subsystem down with it.
 
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
- drivers/usb/core/hub.c |   14 +++++++++++++-
- 1 file changed, 13 insertions(+), 1 deletion(-)
+ drivers/usb/core/Kconfig |   14 ++++++++
+ drivers/usb/core/hub.c   |   81 ++++++++++++++++++++++++++++++++++-------------
+ 2 files changed, 73 insertions(+), 22 deletions(-)
 
+--- gregkh-2.6.orig/drivers/usb/core/Kconfig
++++ gregkh-2.6/drivers/usb/core/Kconfig
+@@ -72,6 +72,20 @@ config USB_SUSPEND
+ 
+ 	  If you are unsure about this, say N here.
+ 
++config USB_MULTITHREAD_PROBE
++	bool "USB Multi-threaded probe (EXPERIMENTAL)"
++	depends on USB && EXPERIMENTAL
++	help
++	  Say Y here if you want the USB core to spawn a new thread for
++	  every USB device that is probed.  This can cause a small speedup
++	  in boot times on systems with a lot of different USB devices.
++
++	  This option should be safe to enable, but if any odd probing
++	  problems are found, please disable it, or dynamically turn it
++	  off in the /sys/module/usbcore/parameters/multithread_probe
++	  file
++
++	  When in doubt, say N.
+ 
+ config USB_OTG
+ 	bool
 --- gregkh-2.6.orig/drivers/usb/core/hub.c
 +++ gregkh-2.6/drivers/usb/core/hub.c
-@@ -1199,8 +1199,9 @@ static void show_string(struct usb_devic
-  *
-  * Only the hub driver or root-hub registrar should ever call this.
-  */
+@@ -45,6 +45,16 @@ static DECLARE_WAIT_QUEUE_HEAD(khubd_wai
+ 
+ static struct task_struct *khubd_task;
+ 
++/* multithreaded probe logic */
++static int multithread_probe =
++#ifdef CONFIG_USB_MULTITHREAD_PROBE
++	1;
++#else
++	0;
++#endif
++module_param(multithread_probe, bool, S_IRUGO);
++MODULE_PARM_DESC(multithread_probe, "Run each USB device probe in a new thread");
++
+ /* cycle leds on hubs that aren't blinking for attention */
+ static int blinkenlights = 0;
+ module_param (blinkenlights, bool, S_IRUGO);
+@@ -1185,29 +1195,17 @@ static inline void show_string(struct us
+ #include "otg_whitelist.h"
+ #endif
+ 
+-/**
+- * usb_new_device - perform initial device setup (usbcore-internal)
+- * @udev: newly addressed device (in ADDRESS state)
+- *
+- * This is called with devices which have been enumerated, but not yet
+- * configured.  The device descriptor is available, but not descriptors
+- * for any device configuration.  The caller must have locked either
+- * the parent hub (if udev is a normal device) or else the
+- * usb_bus_list_lock (if udev is a root hub).  The parent's pointer to
+- * udev has already been installed, but udev is not yet visible through
+- * sysfs or other filesystem code.
+- *
+- * Returns 0 for success (device is configured and listed, with its
+- * interfaces, in sysfs); else a negative errno value.
+- *
+- * This call is synchronous, and may not be used in an interrupt context.
+- *
+- * Only the hub driver or root-hub registrar should ever call this.
+- */
 -int usb_new_device(struct usb_device *udev)
 +static int __usb_new_device(void *void_data)
  {
 +	struct usb_device *udev = void_data;
  	int err;
  
++	/* Lock ourself into memory in order to keep a probe sequence
++	 * sleeping in a new thread from allowing us to be unloaded.
++	 */
++	if (!try_module_get(THIS_MODULE))
++		return -EINVAL;
++
  	err = usb_get_configuration(udev);
-@@ -1311,6 +1312,17 @@ fail:
- 	return err;
+ 	if (err < 0) {
+ 		dev_err(&udev->dev, "can't read configurations, error %d\n",
+@@ -1306,13 +1304,52 @@ int usb_new_device(struct usb_device *ud
+ 		goto fail;
+ 	}
+ 
+-	return 0;
++exit:
++	module_put(THIS_MODULE);
++	return err;
+ 
+ fail:
+ 	usb_set_device_state(udev, USB_STATE_NOTATTACHED);
+-	return err;
++	goto exit;
  }
  
++/**
++ * usb_new_device - perform initial device setup (usbcore-internal)
++ * @udev: newly addressed device (in ADDRESS state)
++ *
++ * This is called with devices which have been enumerated, but not yet
++ * configured.  The device descriptor is available, but not descriptors
++ * for any device configuration.  The caller must have locked either
++ * the parent hub (if udev is a normal device) or else the
++ * usb_bus_list_lock (if udev is a root hub).  The parent's pointer to
++ * udev has already been installed, but udev is not yet visible through
++ * sysfs or other filesystem code.
++ *
++ * The return value for this function depends on if the
++ * multithread_probe variable is set or not.  If it's set, it will
++ * return a if the probe thread was successfully created or not.  If the
++ * variable is not set, it will return if the device is configured
++ * properly or not.  interfaces, in sysfs); else a negative errno value.
++ *
++ * This call is synchronous, and may not be used in an interrupt context.
++ *
++ * Only the hub driver or root-hub registrar should ever call this.
++ */
 +int usb_new_device(struct usb_device *udev)
 +{
 +	struct task_struct *probe_task;
 +	int ret = 0;
 +
-+	probe_task = kthread_run(__usb_new_device, udev,
-+				 "usb-probe-%s", udev->devnum);
-+	if (IS_ERR(probe_task))
-+		ret = PTR_ERR(probe_task);
++	if (multithread_probe) {
++		probe_task = kthread_run(__usb_new_device, udev,
++					 "usb-probe-%s", udev->devnum);
++		if (IS_ERR(probe_task))
++			ret = PTR_ERR(probe_task);
++	} else
++		ret = __usb_new_device(udev);
++
 +	return ret;
 +}
  
