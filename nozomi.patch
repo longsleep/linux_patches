@@ -1,7 +1,7 @@
 ---
  drivers/usb/serial/Makefile |    2 
- drivers/usb/serial/nozomi.c | 2164 ++++++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 2166 insertions(+)
+ drivers/usb/serial/nozomi.c | 2196 ++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 2198 insertions(+)
 
 --- gregkh-2.6.orig/drivers/usb/serial/Makefile
 +++ gregkh-2.6/drivers/usb/serial/Makefile
@@ -13,7 +13,7 @@
 +
 --- /dev/null
 +++ gregkh-2.6/drivers/usb/serial/nozomi.c
-@@ -0,0 +1,2164 @@
+@@ -0,0 +1,2196 @@
 +
 +/* nozomi.c  -- HSDPA driver Broadband Wireless Data Card - Globe Trotter
 +*
@@ -130,7 +130,6 @@
 +      printk( _err_flag_ "[%d] %s(): %s\n", __LINE__, __FUNCTION__, t_m_p_); \
 +} while(0)
 +
-+#define INFO(args...) NFO(KERN_INFO, ##args)
 +#define ERR(args...)  NFO( KERN_ERR, ##args)
 +
 +#define D1(args...) D_(0x01, ##args)
@@ -182,12 +181,14 @@
 +
 +#define GET_MEM(value__, addr__, length__) \
 +  do {  \
-+    read_mem32( (u32*) (value__), (u32) (addr__), (length__));\
++/*    read_mem32( (u32*) (value__), (u32) (addr__), (length__)); */\
++    read_mem32( (u32*) (value__), (addr__), (length__));\
 +} while(0)
 +
 +#define GET_MEM_BUF(value__, addr__, length__) \
 +  do {  \
-+    read_mem32_buf( (u32*) (value__), (u32) (addr__), (length__));\
++/*    read_mem32_buf( (u32*) (value__), (u32) (addr__), (length__)); */\
++    read_mem32_buf( (u32*) (value__), (addr__), (length__));\
 +} while(0)
 +
 +#define SET_MEM(addr__, value__, length__) \
@@ -297,20 +298,20 @@
 +};
 +
 +/* Two different toggle channels exist */
-+typedef enum {
-+    CH_A=0,
-+    CH_B=1,
-+} channel_t;
++enum channel_type {
++	CH_A = 0,
++	CH_B = 1,
++};
 +
 +/* Port definition for the card regarding flow control */
-+typedef enum {
++enum ctrl_port_type {
 +    CTRL_CMD  = 0x00,
 +    CTRL_MDM  = 0x01,
 +    CTRL_DIAG = 0x02,
 +    CTRL_APP1 = 0x03,
 +    CTRL_APP2 = 0x04,
 +    CTRL_ERROR = -1,
-+} ctrl_port_t;
++};
 +
 +/* Ports that the nozomi has */
 +typedef enum {
@@ -442,10 +443,12 @@
 +    ctrl_ul_t	         ctrl_ul;
 +    ctrl_dl_t	         ctrl_dl;
 +    struct kfifo        *fifo_ul;
-+    u32			         dl_addr[2];
++//    u32			         dl_addr[2];
++	void __iomem *dl_addr[2];
 +    u32			         dl_size[2];
 +    u8			         toggle_dl;
-+    u32			         ul_addr[2];
++//    u32			         ul_addr[2];
++	void __iomem *ul_addr[2];
 +    u32			         ul_size[2];
 +    u8			         toggle_ul;
 +    u16					 token_dl;
@@ -463,13 +466,15 @@
 +
 +/* Private data one for each card in the system */
 +typedef struct {
-+    u32				     base_addr;
++//    u32				     base_addr;
++	void __iomem *base_addr;
 +    u8				     closing;
 +
-+  /* Pointers to registers ( register is tagged volatile, not pointer ) */
-+    volatile u16 * REG_IIR;
-+    volatile u16 * REG_FCR;
-+    volatile u16 * REG_IER;
++	/* Pointers to registers */
++	void __iomem *REG_IIR;
++	void __iomem *REG_FCR;
++//	volatile u16 * REG_IER;
++	void __iomem *REG_IER;
 +
 +    u16		 ier_last_written;
 +    enum card_type	card_type;
@@ -548,15 +553,16 @@
 +/* TODO: */
 +/* -Optimize */
 +/* -Rewrite cleaner */
-+static void read_mem32(u32 *buf, u32 mem_addr_start, u32 size_bytes) {
++//static void read_mem32(u32 *buf, u32 mem_addr_start, u32 size_bytes) {
++static void read_mem32(u32 *buf, void __iomem *mem_addr_start, u32 size_bytes) {
 +    u32 i = 0;
-+    u32* ptr =  (u32*) mem_addr_start;
++    u32* ptr =  (__force u32 *)mem_addr_start;
 +    u16* buf16;
 +
 +    /* 2 bytes */
 +    if (size_bytes == 2) {
 +        buf16 = (u16*) buf;
-+        *buf16 = readw( ptr );
++        *buf16 = readw((void __iomem *)ptr);
 +        return;
 +    }
 +
@@ -564,11 +570,11 @@
 +        if ( size_bytes - i == 2) {
 +            /* Handle 2 bytes in the end */
 +            buf16 = (u16*) buf;
-+            *(buf16) = readw( ptr );
++            *(buf16) = readw((void __iomem *)ptr);
 +            i+=2;
 +        } else {
 +            /* Read 4 bytes */
-+            *(buf) = readl( ptr );
++            *(buf) = readl((void __iomem *)ptr);
 +            i+=4;
 +        }
 +        buf++; ptr++;
@@ -578,7 +584,8 @@
 +/* TODO: */
 +/* - Rewrite cleaner */
 +/* - merge with read_mem32() */
-+static void read_mem32_buf(u32 *buf, u32 mem_addr_start, u32 size_bytes) {
++//static void read_mem32_buf(u32 *buf, u32 mem_addr_start, u32 size_bytes) {
++static void read_mem32_buf(u32 *buf, void __iomem * mem_addr_start, u32 size_bytes) {
 +#ifdef __ARMEB__
 +    u32 i = 0;
 +    u32* ptr =  (u32*) mem_addr_start;
@@ -612,15 +619,16 @@
 +/* TODO: */
 +/* -Optimize */
 +/* -Rewrite cleaner */
-+static u32 write_mem32(u32 mem_addr_start, u32 *buf, u32 size_bytes) {
++//static u32 write_mem32(u32 mem_addr_start, u32 *buf, u32 size_bytes) {
++static u32 write_mem32(void __iomem *mem_addr_start, u32 *buf, u32 size_bytes) {
 +    u32 i = 0;
-+    u32* ptr = (u32*) mem_addr_start;
++    u32* ptr = (__force u32*) mem_addr_start;
 +    u16* buf16;
 +
 +    /* 2 bytes */
 +    if (size_bytes == 2) {
 +        buf16 = (u16*) buf;
-+        writew( *buf16, ptr);
++        writew( *buf16, (void __iomem *)ptr);
 +        return 2;
 +    }
 +
@@ -628,11 +636,11 @@
 +        if ( size_bytes - i == 2) {
 +            /* 2 bytes */
 +            buf16 = (u16*) buf;
-+            writew( *buf16, ptr);
++            writew( *buf16, (void __iomem *)ptr);
 +            i+=2;
 +        } else {
 +            /* 4 bytes */
-+            writel( *buf, ptr );
++            writel( *buf, (void __iomem *)ptr );
 +            i += 4;
 +        }
 +        buf++; ptr++;
@@ -642,7 +650,8 @@
 +
 +/* Todo: */
 +/* - Merge with write_mem32() */
-+static u32 write_mem32_buf(u32 mem_addr_start, u32 *buf, u32 size_bytes) {
++//static u32 write_mem32_buf(u32 mem_addr_start, u32 *buf, u32 size_bytes) {
++static u32 write_mem32_buf(void __iomem *mem_addr_start, u32 *buf, u32 size_bytes) {
 +#ifdef __ARMEB__
 +    u32 i = 0;
 +    u32* ptr = (u32*) mem_addr_start;
@@ -675,9 +684,9 @@
 +}
 +
 +/* Setup pointers to different channels and also setup buffer sizes. */
-+static void setup_memory(dc_t *dc) {
-+
-+    u32 offset = dc->base_addr + dc->config_table.dl_start;
++static void setup_memory(dc_t *dc)
++{
++    void __iomem *offset = dc->base_addr + dc->config_table.dl_start;
 +    /* The length reported is including the length field of 4 bytes, hence subtract with 4. */
 +    u16 buff_offset = 4;
 +
@@ -727,7 +736,7 @@
 +    /* Ctrl ul configuration */
 +    dc->port[PORT_CTRL].ul_addr[CH_A] = (offset += dc->config_table.ul_app2_len);
 +    dc->port[PORT_CTRL].ul_size[CH_A] = dc->config_table.ul_ctrl_len - buff_offset;
-+    offset = dc->config_table.ul_start;
++//    offset = dc->config_table.ul_start;
 +}
 +
 +/* Dump config table under initalization phase */
@@ -767,10 +776,11 @@
 +
 +    /* D1( "0x%08X == 0x%08X ", dc->config_table.signature, CONFIG_MAGIC); */
 +
-+    if( dc->config_table.signature != CONFIG_MAGIC ) {
-+        ERR("ConfigTable Bad! 0x%08X != 0x%08X", dc->config_table.signature, CONFIG_MAGIC);
-+        return 0;
-+    }
++	if (dc->config_table.signature != CONFIG_MAGIC ) {
++		dev_err(&dc->pdev->dev, "ConfigTable Bad! 0x%08X != 0x%08X\n",
++			dc->config_table.signature, CONFIG_MAGIC);
++		return 0;
++	}
 +
 +    if( (dc->config_table.version == 0) || (dc->config_table.toggle.enabled == TOGGLE_VALID) ) {
 +        int i;
@@ -798,7 +808,7 @@
 +        /* Enable control channel */
 +        SET_IER( CTRL_DL, CTRL_DL );
 +
-+        INFO("Initialization OK!");
++        dev_info(&dc->pdev->dev, "Initialization OK!\n");
 +        return 1;
 +    }
 +
@@ -806,7 +816,7 @@
 +        u32 offset = 0;
 +        D1( "First phase: pushing upload buffers, clearing download");
 +
-+        INFO("Version of card: %d", dc->config_table.version);
++        dev_info(&dc->pdev->dev, "Version of card: %d\n", dc->config_table.version);
 +
 +        /* Here we should disable all I/O over F32. */
 +        setup_memory(dc);
@@ -835,54 +845,74 @@
 +        case PORT_APP2: SET_IER( APP2_UL, APP2_UL ); break;
 +        case PORT_CTRL: SET_IER( CTRL_UL, CTRL_UL ); break;
 +    default:
-+        ERR("Called with wrong port?");
++        dev_err(&dc->pdev->dev, "Called with wrong port?\n");
 +        break;
 +    };
 +}
 +
 +/* Disable uplink interrupts  */
-+static void disable_transmit_ul( port_type_t port , dc_t *dc ) {
-+
-+    switch( port ) {
-+        case PORT_MDM:  SET_IER( 0 ,MDM_UL  ); break;
-+        case PORT_DIAG: SET_IER( 0, DIAG_UL ); break;
-+        case PORT_APP1: SET_IER( 0, APP1_UL ); break;
-+        case PORT_APP2: SET_IER( 0, APP2_UL ); break;
-+        case PORT_CTRL: SET_IER( 0, CTRL_UL ); break;
-+    default:
-+        ERR("Called with wrong port?");
-+        break;
-+    };
++static void disable_transmit_ul(port_type_t port, dc_t *dc)
++{
++	switch (port) {
++	case PORT_MDM:
++		SET_IER(0 ,MDM_UL);
++		break;
++	case PORT_DIAG:
++		SET_IER(0, DIAG_UL);
++		break;
++	case PORT_APP1:
++		SET_IER(0, APP1_UL);
++		break;
++	case PORT_APP2:
++		SET_IER(0, APP2_UL);
++		break;
++	case PORT_CTRL:
++		SET_IER(0, CTRL_UL);
++		break;
++	default:
++		dev_err(&dc->pdev->dev, "Called with wrong port?\n");
++		break;
++	};
 +}
 +
 +/* Enable downlink interrupts */
-+static void enable_transmit_dl( port_type_t port , dc_t *dc ) {
-+
-+    switch( port ) {
-+        case PORT_MDM:  SET_IER( MDM_DL , MDM_DL  ); break;
-+        case PORT_DIAG: SET_IER( DIAG_DL, DIAG_DL ); break;
-+        case PORT_APP1: SET_IER( APP1_DL, APP1_DL ); break;
-+        case PORT_APP2: SET_IER( APP2_DL, APP2_DL ); break;
-+        case PORT_CTRL: SET_IER( CTRL_DL, CTRL_DL ); break;
-+    default:
-+        ERR("Called with wrong port?");
-+        break;
-+    };
++static void enable_transmit_dl(port_type_t port, dc_t *dc)
++{
++	switch(port) {
++	case PORT_MDM:
++		SET_IER(MDM_DL, MDM_DL);
++		break;
++	case PORT_DIAG:
++		SET_IER(DIAG_DL, DIAG_DL);
++		break;
++	case PORT_APP1:
++		SET_IER(APP1_DL, APP1_DL);
++		break;
++	case PORT_APP2:
++		SET_IER(APP2_DL, APP2_DL);
++		break;
++	case PORT_CTRL:
++		SET_IER(CTRL_DL, CTRL_DL);
++		break;
++	default:
++		dev_err(&dc->pdev->dev, "Called with wrong port?\n");
++		break;
++	};
 +}
 +
 +/* Disable downlink interrupts */
-+static void disable_transmit_dl( port_type_t port , dc_t *dc ) {
-+
-+    switch( port ) {
-+        case PORT_MDM:  SET_IER( 0 ,MDM_DL  ); break;
-+        case PORT_DIAG: SET_IER( 0, DIAG_DL ); break;
-+        case PORT_APP1: SET_IER( 0, APP1_DL ); break;
-+        case PORT_APP2: SET_IER( 0, APP2_DL ); break;
-+        case PORT_CTRL: SET_IER( 0, CTRL_DL ); break;
-+    default:
-+        ERR("Called with wrong port?");
-+        break;
-+    };
++static void disable_transmit_dl(port_type_t port, dc_t *dc)
++{
++	switch (port) {
++	case PORT_MDM:  SET_IER( 0 ,MDM_DL  ); break;
++	case PORT_DIAG: SET_IER( 0, DIAG_DL ); break;
++	case PORT_APP1: SET_IER( 0, APP1_DL ); break;
++	case PORT_APP2: SET_IER( 0, APP2_DL ); break;
++	case PORT_CTRL: SET_IER( 0, CTRL_DL ); break;
++	default:
++		dev_err(&dc->pdev->dev, "Called with wrong port?\n");
++		break;
++	};
 +}
 +
 +/* Return 1 - send buffer to card and ack. */
@@ -891,12 +921,12 @@
 +    u32	 size				 = 0;
 +    port_t *port			 = &dc->port[index];
 +    u8	 toggle				 = port->toggle_ul;
-+    u32	 addr				 = port->ul_addr[toggle];
++    void __iomem *addr				 = port->ul_addr[toggle];
 +    u32	 ul_size			 = port->ul_size[toggle];
 +    struct tty_struct *tty   = port->tty;
 +
 +    if (index >= NTTY_TTY_MINORS) {
-+        ERR("Called with wrong index?");
++	dev_err(&dc->pdev->dev, "Called with wrong index?\n");
 +        return 0;
 +    }
 +
@@ -933,7 +963,7 @@
 +    u32                offset        = 4;
 +    port_t			   *port		 = &dc->port[index];
 +    u8                 toggle        = port->toggle_dl;
-+    u32                addr          = port->dl_addr[toggle];
++    void __iomem *                addr          = port->dl_addr[toggle];
 +    struct tty_struct *tty           = port->tty;
 +    int                i;
 +
@@ -954,7 +984,7 @@
 +    }
 +
 +    if (size == 0) {
-+        ERR("size == 0?");
++	dev_err(&dc->pdev->dev, "size == 0?\n");
 +        return 1;
 +    }
 +
@@ -1033,7 +1063,7 @@
 +    case CTRL_APP1: port = PORT_APP1; enable_ier = APP1_DL; break;
 +    case CTRL_APP2: port = PORT_APP2; enable_ier = APP2_DL; break;
 +    default:
-+        ERR("ERROR: flow control received for non-existing port");
++	dev_err(&dc->pdev->dev, "ERROR: flow control received for non-existing port\n");
 +        return 0;
 +    };
 +
@@ -1084,22 +1114,22 @@
 +}
 +
 +/* TODO:  */
-+/* - return ctrl_port_t */
-+static u8 port2ctrl(port_type_t port) {
-+    switch( port ) {
-+    case PORT_MDM:
-+        return CTRL_MDM;
-+    case PORT_DIAG:
-+        return CTRL_DIAG;
-+    case PORT_APP1:
-+        return CTRL_APP1;
-+    case PORT_APP2:
-+        return CTRL_APP2;
-+    default:
-+        ERR("ERROR: send flow control received for non-existing port");
-+        return -1;
-+    };
-+    return -1;
++/* - return enum ctrl_port_type */
++static u8 port2ctrl (port_type_t port, dc_t *dc)
++{
++	switch(port) {
++	case PORT_MDM:
++		return CTRL_MDM;
++	case PORT_DIAG:
++		return CTRL_DIAG;
++	case PORT_APP1:
++		return CTRL_APP1;
++	case PORT_APP2:
++		return CTRL_APP2;
++	default:
++		dev_err(&dc->pdev->dev, "ERROR: send flow control received for non-existing port\n");
++	};
++	return -1;
 +}
 +
 +/* Send flow control, can only update one channel at a time */
@@ -1115,7 +1145,7 @@
 +                /* We have more flow control to be updated */
 +                return 1;
 +            }
-+            dc->port[i].ctrl_ul.port = port2ctrl(i);
++            dc->port[i].ctrl_ul.port = port2ctrl(i, dc);
 +            ctrl = (u16*) &dc->port[i].ctrl_ul;
 +            /* D1( "sending flow control 0x%04X for port %d, %d", (u16) *ctrl, i, dc->port[i].ctrl_ul.port ); */
 +            SET_MEM( dc->port[PORT_CTRL].ul_addr[0], (u32*) ctrl, 2 );
@@ -1333,7 +1363,7 @@
 +static void nozomi_get_card_type(dc_t *dc)
 +{
 +	int i;
-+	u32 size=0;
++	u32 size = 0;
 +
 +	for (i=0; i<6; i++)
 +		size += pci_resource_len(dc->pdev, i);
@@ -1341,16 +1371,16 @@
 +	/* Assume card type F32_8 if no match */
 +	dc->card_type = size == 2048 ? F32_2 : F32_8;
 +
-+	INFO("Card type is: %d", dc->card_type );
++	dev_info(&dc->pdev->dev, "Card type is: %d\n", dc->card_type);
 +}
 +
 +void nozomi_setup_private_data(dc_t *dc) {
-+    u32 offset = dc->base_addr + dc->card_type/2;
++    void __iomem *offset = dc->base_addr + dc->card_type/2;
 +    int i;
 +
-+    dc->REG_FCR = (u16 *) (offset + R_FCR);
-+    dc->REG_IIR = (u16 *) (offset + R_IIR);
-+    dc->REG_IER = (u16 *) (offset + R_IER);
++    dc->REG_FCR = (void __iomem *)(offset + R_FCR);
++    dc->REG_IIR = (void __iomem *)(offset + R_IIR);
++    dc->REG_IER = (void __iomem *)(offset + R_IER);
 +    dc->ier_last_written = 0;
 +    dc->closing = 0;
 +
@@ -1452,11 +1482,12 @@
 +/* Allocate memory for one device */
 +static int __devinit nozomi_card_init(struct pci_dev *pdev, const struct pci_device_id *ent)
 +{
++	resource_size_t	start;
 +	int ret = -EIO;
 +	dc_t *dc = NULL;
 +
 +	cards_found++;
-+	INFO("Init, cards_found: %d", cards_found);
++	dev_info(&pdev->dev, "Init, cards_found: %d\n", cards_found);
 +
 +	if (!(my_dev = kmalloc(sizeof(dc_t), GFP_KERNEL))) {
 +		D1( "Could not allocate memory");
@@ -1466,7 +1497,7 @@
 +	memset(my_dev, 0, sizeof( dc_t ));
 +
 +	if (cards_found > 1) {
-+		ERR("This driver only supports 1 device");
++		dev_err(&pdev->dev, "This driver only supports 1 device\n");
 +		return -ENODEV;
 +	}
 +
@@ -1476,56 +1507,59 @@
 +	/* Find out what card type it is */
 +	nozomi_get_card_type(dc);
 +
-+    if (pci_enable_device(dc->pdev)) {
-+        ERR("Not possible to enable PCI Device");
-+        return -ENODEV;
-+    }
++	if (pci_enable_device(dc->pdev)) {
++		dev_err(&pdev->dev, "Not possible to enable PCI Device\n");
++		return -ENODEV;
++	}
 +
-+    if ( (dc->base_addr = pci_resource_start(dc->pdev, 0)) == 0x0000) {
-+        ERR("No I/O-Address for card detected");
-+        ret = -ENODEV;
-+        goto err_disable_device;
-+    }
++	start = pci_resource_start(dc->pdev, 0);
++	if (start == 0x0000) {
++		dev_err(&pdev->dev, "No I/O-Address for card detected\n");
++		ret = -ENODEV;
++		goto err_disable_device;
++	}
 +
-+    if (!(dc->base_addr = (u32) ioremap(dc->base_addr, dc->card_type))) {
-+        ERR("No I/O-Address for card detected");
-+        ret = -ENODEV;
-+        goto err_disable_device;
-+    }
++	dc->base_addr = ioremap(start, dc->card_type);
++	if (!dc->base_addr) {
++		dev_err(&pdev->dev, "No I/O-Address for card detected\n");
++		ret = -ENODEV;
++		goto err_disable_device;
++	}
 +
-+    dc->open_ttys=0;
++	dc->open_ttys = 0;
 +
-+    nozomi_setup_private_data(dc);
++	nozomi_setup_private_data(dc);
 +
-+    if (pci_request_regions(dc->pdev, NOZOMI_NAME)) {
-+        ERR("I/O address 0x%04x already in use",
-+            (int) /* nozomi_private.io_addr */ 0);
-+        ret = -EIO;
-+        goto err_disable_regions;
-+    }
++	if (pci_request_regions(dc->pdev, NOZOMI_NAME)) {
++		dev_err(&pdev->dev, "I/O address 0x%04x already in use\n",
++			(int) /* nozomi_private.io_addr */ 0);
++		ret = -EIO;
++		goto err_disable_regions;
++	}
 +
-+    if ( !(dc->send_buf = kmalloc(SEND_BUF_MAX, GFP_KERNEL))) {
-+        ERR("Could not allocate send buffer?");
-+        goto err_disable_regions;
-+    }
++	dc->send_buf = kmalloc(SEND_BUF_MAX, GFP_KERNEL);
++	if (!dc->send_buf) {
++		dev_err(&pdev->dev, "Could not allocate send buffer?\n");
++		goto err_disable_regions;
++	}
 +
-+    /* Disable all interrupts */
-+    SET_IER( 0 , 0xFFFF );
++	/* Disable all interrupts */
++	SET_IER(0, 0xFFFF);
 +
-+    /* Setup interrupt handler */
-+    if (nozomi_setup_interrupt(dc->pdev)) {
-+        ret = -EIO;
-+        goto err_disable_regions;
-+    }
++	/* Setup interrupt handler */
++	if (nozomi_setup_interrupt(dc->pdev)) {
++		ret = -EIO;
++		goto err_disable_regions;
++	}
 +
-+    D1( "base_addr: 0x%08X", dc->base_addr);
++	D1("base_addr: 0x%08X", dc->base_addr);
 +
-+    if ( !(dc->tty_flip_wq = create_singlethread_workqueue(NOZOMI_NAME )) ) {
-+        ERR("Could not create workqueue?");
-+        BUG_ON(!dc->tty_flip_wq);
-+        return -ENOMEM;
-+    }
-+    INIT_WORK( &dc->tty_flip_wq_struct, tty_flip_queue_function, (void*) dc);
++	if ( !(dc->tty_flip_wq = create_singlethread_workqueue(NOZOMI_NAME )) ) {
++		ERR("Could not create workqueue?");
++		BUG_ON(!dc->tty_flip_wq);
++		return -ENOMEM;
++	}
++	INIT_WORK(&dc->tty_flip_wq_struct, tty_flip_queue_function, dc);
 +
 +    spin_lock_init(&dc->spin_mutex);
 +
@@ -1539,16 +1573,14 @@
 +    return 0;
 +
 +err_disable_regions:
-+    pci_release_regions(pdev);
-+    iounmap((void *)dc->base_addr );
-+    dc->base_addr = 0;
++	pci_release_regions(pdev);
++	iounmap(dc->base_addr);
++	dc->base_addr = NULL;
 +
 +err_disable_device:
-+    pci_disable_device(pdev);
-+    if(my_dev) {
-+        kfree( my_dev );
-+    }
-+    return ret;
++	pci_disable_device(pdev);
++	kfree( my_dev );
++	return ret;
 +}
 +
 +static void tty_do_close(dc_t *dc, port_t *port) {
@@ -1621,7 +1653,7 @@
 +    pci_release_regions(pdev);
 +
 +    if(dc->base_addr)
-+        iounmap((void *)dc->base_addr);
++        iounmap(dc->base_addr);
 +
 +    D1( "pci_disable_device");
 +    pci_disable_device(pdev);
@@ -1939,7 +1971,7 @@
 +    return -ENOIOCTLCMD;
 +}
 +
-+static int ntty_ioctl_tiocgicount(struct tty_struct *tty, struct file *file, unsigned int cmd, unsigned long arg) {
++static int ntty_ioctl_tiocgicount(struct tty_struct *tty, struct file *file, unsigned int cmd, void __user *arg) {
 +    port_t *port = (port_t *) tty->driver_data;
 +
 +    if (cmd == TIOCGICOUNT) {
@@ -1958,7 +1990,7 @@
 +        icount.brk	= cnow.brk;
 +        icount.buf_overrun = cnow.buf_overrun;
 +
-+        if (copy_to_user((void *)arg, &icount, sizeof(icount)))
++        if (copy_to_user(arg, &icount, sizeof(icount)))
 +            return -EFAULT;
 +        return 0;
 +    }
@@ -1988,7 +2020,7 @@
 +        rval = ntty_ioctl_tiocmiwait(tty, file, cmd, arg);
 +        break;
 +    case TIOCGICOUNT:
-+        rval =  ntty_ioctl_tiocgicount(tty, file, cmd, arg);
++        rval =  ntty_ioctl_tiocgicount(tty, file, cmd, (void __user *)arg);
 +        break;
 +    case TIOCMGET:
 +      spin_lock_irqsave(&dc->spin_mutex, flags);
@@ -1999,7 +2031,7 @@
 +        rval = ntty_tiocmset(tty, file, arg);
 +        break;
 +    case TIOCMBIC:
-+        if (get_user(mask, (unsigned long *) arg))
++        if (get_user(mask, (unsigned long __user *)arg))
 +            return -EFAULT;
 +
 +      spin_lock_irqsave(&dc->spin_mutex, flags);
@@ -2011,7 +2043,7 @@
 +        rval = 0;
 +        break;
 +    case TIOCMBIS:
-+        if (get_user(mask, (unsigned long *) arg))
++        if (get_user(mask, (unsigned long __user *)arg))
 +            return -EFAULT;
 +
 +      spin_lock_irqsave(&dc->spin_mutex, flags);
