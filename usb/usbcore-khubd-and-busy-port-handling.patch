@@ -1,0 +1,79 @@
+From stern@rowland.harvard.edu Fri Aug 11 13:52:49 2006
+Date: Fri, 11 Aug 2006 16:52:39 -0400 (EDT)
+From: Alan Stern <stern@rowland.harvard.edu>
+To: Greg KH <greg@kroah.com>
+Subject: usbcore: khubd and busy-port handling
+Message-ID: <Pine.LNX.4.44L0.0608111649580.5685-100000@iolanthe.rowland.org>
+
+We don't want khubd to start interfering in the device-resume process
+merely because the PORT_STATUS_C_SUSPEND feature happens to be set.
+Ports need to be marked as busy while a resume is taking place.
+
+In addition, so long as ports are marked as busy, khubd won't be able to
+clear their various status-change features.  On an interrupt-driven root
+hub this could lead to an interrupt storm.  Root hub IRQs should not be
+re-enabled until the busy_bits value is equal to 0.
+
+This patch (as765) fixes these two potential problems.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/hub.c |   11 ++++++++++-
+ drivers/usb/core/hub.h |    3 ++-
+ 2 files changed, 12 insertions(+), 2 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/core/hub.c
++++ gregkh-2.6/drivers/usb/core/hub.c
+@@ -1658,6 +1658,8 @@ hub_port_resume(struct usb_hub *hub, int
+ 
+ 	// dev_dbg(hub->intfdev, "resume port %d\n", port1);
+ 
++	set_bit(port1, hub->busy_bits);
++
+ 	/* see 7.1.7.7; affects power usage, but not budgeting */
+ 	status = clear_port_feature(hub->hdev,
+ 			port1, USB_PORT_FEAT_SUSPEND);
+@@ -1707,6 +1709,10 @@ hub_port_resume(struct usb_hub *hub, int
+ 	if (status < 0)
+ 		hub_port_logical_disconnect(hub, port1);
+ 
++	clear_bit(port1, hub->busy_bits);
++	if (!hub->hdev->parent && !hub->busy_bits[0])
++		usb_enable_root_hub_irq(hub->hdev->bus);
++
+ 	return status;
+ }
+ 
+@@ -2690,7 +2696,7 @@ static void hub_events(void)
+ 
+ 		/* If this is a root hub, tell the HCD it's okay to
+ 		 * re-enable port-change interrupts now. */
+-		if (!hdev->parent)
++		if (!hdev->parent && !hub->busy_bits[0])
+ 			usb_enable_root_hub_irq(hdev->bus);
+ 
+ loop:
+@@ -2865,6 +2871,9 @@ int usb_reset_device(struct usb_device *
+ 			break;
+ 	}
+ 	clear_bit(port1, parent_hub->busy_bits);
++	if (!parent_hdev->parent && !parent_hub->busy_bits[0])
++		usb_enable_root_hub_irq(parent_hdev->bus);
++
+ 	if (ret < 0)
+ 		goto re_enumerate;
+  
+--- gregkh-2.6.orig/drivers/usb/core/hub.h
++++ gregkh-2.6/drivers/usb/core/hub.h
+@@ -212,7 +212,8 @@ struct usb_hub {
+ 	unsigned long		event_bits[1];	/* status change bitmask */
+ 	unsigned long		change_bits[1];	/* ports with logical connect
+ 							status change */
+-	unsigned long		busy_bits[1];	/* ports being reset */
++	unsigned long		busy_bits[1];	/* ports being reset or
++							resumed */
+ #if USB_MAXCHILDREN > 31 /* 8*sizeof(unsigned long) - 1 */
+ #error event_bits[] is too short!
+ #endif
