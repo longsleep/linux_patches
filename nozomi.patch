@@ -1,20 +1,41 @@
 ---
- drivers/usb/serial/Makefile |    2 
- drivers/usb/serial/nozomi.c | 2196 ++++++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 2198 insertions(+)
+ drivers/char/Kconfig  |   10 
+ drivers/char/Makefile |    1 
+ drivers/char/nozomi.c | 2194 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 2205 insertions(+)
 
---- gregkh-2.6.orig/drivers/usb/serial/Makefile
-+++ gregkh-2.6/drivers/usb/serial/Makefile
-@@ -47,3 +47,5 @@ obj-$(CONFIG_USB_SERIAL_VISOR)			+= viso
- obj-$(CONFIG_USB_SERIAL_WHITEHEAT)		+= whiteheat.o
- obj-$(CONFIG_USB_SERIAL_XIRCOM)			+= keyspan_pda.o
+--- gregkh-2.6.orig/drivers/char/Kconfig
++++ gregkh-2.6/drivers/char/Kconfig
+@@ -357,6 +357,16 @@ config ISTALLION
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called istallion.
  
-+obj-$(CONFIG_USB_SERIAL_XIRCOM)			+= nozomi.o
++config NOZOMI
++	tristate "HSDPA Broadband Wireless Data Card - Globe Trotter"
++	depends on PCI && EXPERIMENTAL
++	help
++	  If you have a HSDPA driver Broadband Wireless Data Card -
++	  Globe Trotter PCMCIA card, say Y here.
 +
++	  To compile this driver as a module, choose M here, the module
++	  will be called nozomi.
++
+ config AU1000_UART
+ 	bool "Enable Au1000 UART Support"
+ 	depends on SERIAL_NONSTANDARD && MIPS
+--- gregkh-2.6.orig/drivers/char/Makefile
++++ gregkh-2.6/drivers/char/Makefile
+@@ -25,6 +25,7 @@ obj-$(CONFIG_SERIAL167)		+= serial167.o
+ obj-$(CONFIG_CYCLADES)		+= cyclades.o
+ obj-$(CONFIG_STALLION)		+= stallion.o
+ obj-$(CONFIG_ISTALLION)		+= istallion.o
++obj-$(CONFIG_NOZOMI)		+= nozomi.o
+ obj-$(CONFIG_DIGIEPCA)		+= epca.o
+ obj-$(CONFIG_SPECIALIX)		+= specialix.o
+ obj-$(CONFIG_MOXA_INTELLIO)	+= moxa.o
 --- /dev/null
-+++ gregkh-2.6/drivers/usb/serial/nozomi.c
-@@ -0,0 +1,2196 @@
-+
++++ gregkh-2.6/drivers/char/nozomi.c
+@@ -0,0 +1,2194 @@
 +/* nozomi.c  -- HSDPA driver Broadband Wireless Data Card - Globe Trotter
 +*
 +* Written by: Ulf Jakobsson,
@@ -483,7 +504,7 @@
 +    port_t 			     port[NOZOMI_MAX_PORTS];
 +    u8                  *send_buf;
 +
-+    struct tty_driver    tty_driver;
++    struct tty_driver    *tty_driver;
 +
 +    struct workqueue_struct *tty_flip_wq;
 +    struct work_struct	tty_flip_wq_struct;
@@ -1610,24 +1631,24 @@
 +}
 +
 +
-+static void __devexit tty_exit(void) {
-+    int     i;
-+    dc_t   *dc = my_dev;
++static void __devexit tty_exit(void)
++{
++	dc_t *dc = my_dev;
++	int i;
 +
-+    D1( " ");
++	D1( " ");
 +
-+    for (i = 0; i < NTTY_TTY_MINORS; ++i)
-+        tty_unregister_device(&dc->tty_driver, i);
++	for (i = 0; i < NTTY_TTY_MINORS; i++) {
++		while (dc->port[i].tty_open_count)
++			tty_do_close(dc, &dc->port[i]);
++		dc->port[i].tty = NULL;
++	}
 +
-+    tty_unregister_driver(&dc->tty_driver);
++	for (i = 0; i < NTTY_TTY_MINORS; ++i)
++		tty_unregister_device(dc->tty_driver, i);
 +
-+    for (i = 0; i < NTTY_TTY_MINORS; i++) {
-+        while (dc->port[i].tty_open_count) {
-+            tty_do_close(dc, &dc->port[i]);
-+        }
-+
-+        dc->port[i].tty = NULL;
-+    }
++	tty_unregister_driver(dc->tty_driver);
++	put_tty_driver(dc->tty_driver);
 +}
 +
 +/* Deallocate memory for one device */
@@ -2121,61 +2142,60 @@
 +    return rval;
 +}
 +
++static struct tty_operations tty_ops = {
++	.ioctl =		ntty_ioctl,
++	.open =			ntty_open,
++	.close =		ntty_close,
++	.write =		ntty_write,
++	.write_room =		ntty_write_room,
++	.unthrottle =		ntty_unthrottle,
++	.throttle =		ntty_throttle,
++	.set_termios =		ntty_set_termios,
++	.chars_in_buffer=	ntty_chars_in_buffer,
++	.put_char =		ntty_put_char,
++};
++
++
 +/* Initializes the tty */
-+static int ntty_tty_init(dc_t *dc) {
-+    struct tty_driver  *td = &dc->tty_driver;
-+    int                 rval;
-+    int                 i;
++static int ntty_tty_init(dc_t *dc)
++{
++	struct tty_driver *td;
++	int rval;
++	int i;
 +
-+    memset(td, 0, sizeof(struct tty_driver));
++	dc->tty_driver = alloc_tty_driver(NTTY_TTY_MINORS);
++	if (!dc->tty_driver)
++		return -ENOMEM;
++	td = dc->tty_driver;
++	td->owner = THIS_MODULE;
++	td->driver_name = NOZOMI_NAME_TTY;
++	td->name = "noz";
++	td->major = NTTY_TTY_MAJOR;
++	td->type = TTY_DRIVER_TYPE_SERIAL;
++	td->subtype = SERIAL_TYPE_NORMAL;
++	td->flags = TTY_DRIVER_REAL_RAW | TTY_DRIVER_DYNAMIC_DEV;
++	td->init_termios = tty_std_termios;
++	td->init_termios.c_cflag = B115200 | CS8 | CREAD | HUPCL | CLOCAL;
 +
-+    td->magic                 = TTY_DRIVER_MAGIC;
-+    td->driver_name           = NOZOMI_NAME_TTY;
-+    td->name                  = "noz";
-+    td->major                 = NTTY_TTY_MAJOR,
-+    td->type                  = TTY_DRIVER_TYPE_SERIAL,
-+    td->subtype               = SERIAL_TYPE_NORMAL,
-+    td->flags                 = TTY_DRIVER_REAL_RAW | TTY_DRIVER_DYNAMIC_DEV,
-+    td->init_termios          = tty_std_termios;
-+    td->init_termios.c_cflag  = B115200 | CS8 | CREAD | HUPCL | CLOCAL;
++	td->termios               = dc->tty_termios;
++	td->termios_locked        = dc->tty_termios_locked;
++	tty_set_operations(dc->tty_driver, &tty_ops);
 +
-+    td->num                   = MAX_PORT;
-+    td->name_base             = 0;
-+    td->minor_start           = 0;
++	rval = tty_register_driver(td);
++	if (rval) {
++		dev_err(&dc->pdev->dev, "failed to register ntty tty driver\n");
++		return rval;
++	}
 +
-+    td->termios               = dc->tty_termios;
-+    td->termios_locked        = dc->tty_termios_locked;
++	for (i = 0; i < NTTY_TTY_MINORS; i++) {
++		init_MUTEX(&dc->port[i].tty_sem);
++		dc->port[i].tty_open_count = 0;
++		dc->port[i].tty = NULL;
++		tty_register_device(td, i, &dc->pdev->dev);
++	}
 +
-+    td->ioctl                 = ntty_ioctl;
-+    td->open                  = ntty_open;
-+    td->close                 = ntty_close;
-+    td->write                 = ntty_write;
-+    td->write_room            = ntty_write_room;
-+    td->unthrottle            = ntty_unthrottle;
-+    td->throttle              = ntty_throttle;
-+    td->set_termios           = ntty_set_termios;
-+    td->chars_in_buffer       = ntty_chars_in_buffer;
-+    td->put_char              = ntty_put_char;
-+
-+    rval = tty_register_driver(td);
-+
-+    if (rval) {
-+        printk(KERN_ERR "failed to register ntty tty driver");
-+        D1( "failed to register ntty tty driver");
-+        return rval;
-+    }
-+
-+    for (i = 0; i < NTTY_TTY_MINORS; i++) {
-+        init_MUTEX(&dc->port[i].tty_sem);
-+        dc->port[i].tty_open_count = 0;
-+        dc->port[i].tty = NULL;
-+
-+        tty_register_device(td, i, NULL);
-+    }
-+
-+    printk(KERN_INFO DRIVER_DESC " " NOZOMI_NAME_TTY);
-+    D1( " ");
-+    return rval;
++	dev_info(&dc->pdev->dev, DRIVER_DESC " " NOZOMI_NAME_TTY);
++	return rval;
 +}
 +
 +/* Module initialization */
