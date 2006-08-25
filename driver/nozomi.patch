@@ -1,8 +1,22 @@
+From foo@baz Tue Apr  9 12:12:43 2002
+Date: Thu, 24 Aug 2006 01:25:46 -0700
+To: Greg KH <greg@kroah.com>
+From: Greg Kroah-Hartman <gregkh@suse.de>
+Subject: Add nozomi driver to the tree
+
+This is a driver to control the cardbus wireless data card that works on 3g
+networks.
+
+It still needs a lot of cleanup, but is getting there...
+at least it builds with no warnings on i386 now...
+
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
 ---
  drivers/char/Kconfig  |   10 
  drivers/char/Makefile |    1 
- drivers/char/nozomi.c | 2194 ++++++++++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 2205 insertions(+)
+ drivers/char/nozomi.c | 2192 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 2203 insertions(+)
 
 --- gregkh-2.6.orig/drivers/char/Kconfig
 +++ gregkh-2.6/drivers/char/Kconfig
@@ -35,7 +49,7 @@
  obj-$(CONFIG_MOXA_INTELLIO)	+= moxa.o
 --- /dev/null
 +++ gregkh-2.6/drivers/char/nozomi.c
-@@ -0,0 +1,2194 @@
+@@ -0,0 +1,2192 @@
 +/* nozomi.c  -- HSDPA driver Broadband Wireless Data Card - Globe Trotter
 +*
 +* Written by: Ulf Jakobsson,
@@ -335,14 +349,14 @@
 +};
 +
 +/* Ports that the nozomi has */
-+typedef enum {
++enum port_type {
 +    PORT_MDM = 0,
 +    PORT_DIAG= 1,
 +    PORT_APP1= 2,
 +    PORT_APP2= 3,
 +    PORT_CTRL= 4,
 +    PORT_ERROR=-1,
-+} port_type_t;
++};
 +
 +#ifdef __ARMEB__
 +/* Big endian */
@@ -459,7 +473,7 @@
 +#endif
 +
 +/* This holds all information that is needed regarding a port */
-+typedef struct {
++struct port {
 +    u8			         update_flow_control;
 +    ctrl_ul_t	         ctrl_ul;
 +    ctrl_dl_t	         ctrl_dl;
@@ -483,7 +497,7 @@
 +    u32					 rx_data, tx_data;
 +    u8					 tty_dont_flip;
 +
-+} port_t;
++};
 +
 +/* Private data one for each card in the system */
 +typedef struct {
@@ -501,7 +515,7 @@
 +    enum card_type	card_type;
 +    config_table_t 	     config_table; /* Configuration table */
 +    struct pci_dev 	    *pdev;
-+    port_t 			     port[NOZOMI_MAX_PORTS];
++    struct port 			     port[NOZOMI_MAX_PORTS];
 +    u8                  *send_buf;
 +
 +    struct tty_driver    *tty_driver;
@@ -526,7 +540,6 @@
 +
 +/*    Function declarations */
 +static int ntty_tty_init(dc_t *dc);
-+
 +static void tty_flip_queue_function(void *tmp_dc);
 +
 +/*    Global variables */
@@ -544,9 +557,8 @@
 +
 +/* Representing the pci device of interest */
 +static int cards_found;
-+dc_t* my_dev = NULL;
-+struct pci_dev *my_pdev = NULL;
-+irq_t my_irq;
++static dc_t* my_dev = NULL;
++static irq_t my_irq;
 +
 +
 +
@@ -562,7 +574,7 @@
 +    return tty->index;
 +}
 +
-+static inline port_t* get_port_by_tty(struct tty_struct *tty) {
++static inline struct port* get_port_by_tty(struct tty_struct *tty) {
 +    return &my_dev->port[ get_index(tty) ];
 +}
 +
@@ -857,7 +869,7 @@
 +}
 +
 +/* Enable uplink interrupts  */
-+static void enable_transmit_ul( port_type_t port , dc_t *dc ) {
++static void enable_transmit_ul( enum port_type port , dc_t *dc ) {
 +
 +    switch( port ) {
 +        case PORT_MDM:  SET_IER( MDM_UL , MDM_UL  ); break;
@@ -872,7 +884,7 @@
 +}
 +
 +/* Disable uplink interrupts  */
-+static void disable_transmit_ul(port_type_t port, dc_t *dc)
++static void disable_transmit_ul(enum port_type port, dc_t *dc)
 +{
 +	switch (port) {
 +	case PORT_MDM:
@@ -897,7 +909,7 @@
 +}
 +
 +/* Enable downlink interrupts */
-+static void enable_transmit_dl(port_type_t port, dc_t *dc)
++static void enable_transmit_dl(enum port_type port, dc_t *dc)
 +{
 +	switch(port) {
 +	case PORT_MDM:
@@ -922,7 +934,7 @@
 +}
 +
 +/* Disable downlink interrupts */
-+static void disable_transmit_dl(port_type_t port, dc_t *dc)
++static void disable_transmit_dl(enum port_type port, dc_t *dc)
 +{
 +	switch (port) {
 +	case PORT_MDM:  SET_IER( 0 ,MDM_DL  ); break;
@@ -938,9 +950,9 @@
 +
 +/* Return 1 - send buffer to card and ack. */
 +/* Return 0 - don't ack, don't send buffer to card. */
-+int send_data( port_type_t index, dc_t *dc ) {
++static int send_data( enum port_type index, dc_t *dc ) {
 +    u32	 size				 = 0;
-+    port_t *port			 = &dc->port[index];
++    struct port *port			 = &dc->port[index];
 +    u8	 toggle				 = port->toggle_ul;
 +    void __iomem *addr				 = port->ul_addr[toggle];
 +    u32	 ul_size			 = port->ul_size[toggle];
@@ -978,11 +990,11 @@
 +}
 +
 +/* If all data has been read, return 1, else 0 */
-+static int receive_data( port_type_t index, dc_t* dc ) {
++static int receive_data( enum port_type index, dc_t* dc ) {
 +    u8 buf[RECEIVE_BUF_MAX]			 = {0};
 +    int                size;
 +    u32                offset        = 4;
-+    port_t			   *port		 = &dc->port[index];
++    struct port			   *port		 = &dc->port[index];
 +    u8                 toggle        = port->toggle_dl;
 +    void __iomem *                addr          = port->dl_addr[toggle];
 +    struct tty_struct *tty           = port->tty;
@@ -1067,7 +1079,7 @@
 +/* Receive flow control */
 +/* Return 1 - If ok, else 0 */
 +static int receive_flow_control( dc_t *dc, irq_t *m) {
-+    port_type_t port = PORT_MDM;
++    enum port_type port = PORT_MDM;
 +    ctrl_dl_t ctrl_dl;
 +    ctrl_dl_t old_ctrl;
 +    u16 enable_ier = 0;
@@ -1136,7 +1148,7 @@
 +
 +/* TODO:  */
 +/* - return enum ctrl_port_type */
-+static u8 port2ctrl (port_type_t port, dc_t *dc)
++static u8 port2ctrl (enum port_type port, dc_t *dc)
 +{
 +	switch(port) {
 +	case PORT_MDM:
@@ -1180,7 +1192,7 @@
 +/* Handle donlink data, ports that are handled are modem and diagnostics */
 +/* Return 1 - ok */
 +/* Return 0 - toggle fields are out of sync */
-+static int handle_data_dl(dc_t *dc, irq_t *m, port_type_t port, u8 *toggle, u16 mask1, u16 mask2) {
++static int handle_data_dl(dc_t *dc, irq_t *m, enum port_type port, u8 *toggle, u16 mask1, u16 mask2) {
 +
 +    if ( *toggle == 0 && m->read_iir & mask1 ) {
 +        if (receive_data( port, dc )) {
@@ -1216,7 +1228,7 @@
 +/* Handle uplink data, this is currently for the modem port */
 +/* Return 1 - ok */
 +/* Return 0 - toggle field are out of sync */
-+static int handle_data_ul(dc_t *dc, irq_t *m, port_type_t port) {
++static int handle_data_ul(dc_t *dc, irq_t *m, enum port_type port) {
 +
 +    u8 *toggle = &(dc->port[port].toggle_ul);
 +
@@ -1395,7 +1407,7 @@
 +	dev_info(&dc->pdev->dev, "Card type is: %d\n", dc->card_type);
 +}
 +
-+void nozomi_setup_private_data(dc_t *dc) {
++static void nozomi_setup_private_data(dc_t *dc) {
 +    void __iomem *offset = dc->base_addr + dc->card_type/2;
 +    int i;
 +
@@ -1604,7 +1616,7 @@
 +	return ret;
 +}
 +
-+static void tty_do_close(dc_t *dc, port_t *port) {
++static void tty_do_close(dc_t *dc, struct port *port) {
 +
 +    u32      flags;
 +
@@ -1728,7 +1740,7 @@
 +static int ntty_open(struct tty_struct *tty, struct file *file) {
 +
 +    s32 index = get_index(tty);
-+    port_t *port = get_port_by_tty(tty);
++    struct port *port = get_port_by_tty(tty);
 +    dc_t *dc = get_dc_by_tty(tty);
 +    u32      flags;
 +
@@ -1761,7 +1773,7 @@
 +/* Called when the userspace process close the tty, /dev/noz*. */
 +static void ntty_close(struct tty_struct *tty, struct file *file) {
 +    dc_t *dc = get_dc_by_tty(tty);
-+    tty_do_close(dc, (port_t *) tty->driver_data);
++    tty_do_close(dc, (struct port *) tty->driver_data);
 +}
 +
 +/* called when the userspace process writes to the tty (/dev/noz*).  */
@@ -1769,7 +1781,7 @@
 +static int ntty_write(struct tty_struct *tty, const unsigned char *buffer, int count) {
 +    int                  rval = -EINVAL;
 +    dc_t                *dc = get_dc_by_tty(tty);
-+    port_t              *port = (port_t *) tty->driver_data;
++    struct port              *port = (struct port *) tty->driver_data;
 +    u32      flags;
 +
 +    /* D1( "WRITEx: %d, index = %d", count, index); */
@@ -1819,7 +1831,7 @@
 +/* This method is called by the upper tty layer. */
 +/*   #according to sources N_TTY.c it expects a value >= 0 and does not check for negative values. */
 +static int ntty_write_room(struct tty_struct *tty) {
-+    port_t  *port = (port_t *) tty->driver_data;
++    struct port  *port = (struct port *) tty->driver_data;
 +    int      room = 0;
 +//	u32      flags = 0;
 +//	dc_t *dc = get_dc_by_tty(tty);
@@ -1933,7 +1945,7 @@
 +
 +/* Gets io control parameters */
 +static int ntty_tiocmget(struct tty_struct *tty, struct file *file) {
-+    port_t *port = tty->driver_data;
++    struct port *port = tty->driver_data;
 +    ctrl_dl_t *ctrl_dl = &port->ctrl_dl;
 +    ctrl_ul_t *ctrl_ul = &port->ctrl_ul;
 +
@@ -1948,7 +1960,7 @@
 +
 +/* Sets io controls parameters */
 +static int ntty_tiocmset(struct tty_struct *tty, struct file *file, u32 arg) {
-+    port_t *port = (port_t *) tty->driver_data;
++    struct port *port = (struct port *) tty->driver_data;
 +
 +    set_rts(port->tty_index, (arg & TIOCM_RTS) ? 1 : 0);
 +    set_dtr(port->tty_index, (arg & TIOCM_DTR) ? 1 : 0);
@@ -1957,7 +1969,7 @@
 +}
 +
 +static int ntty_ioctl_tiocmiwait(struct tty_struct *tty, struct file *file, unsigned int cmd, unsigned long arg) {
-+    port_t *port = (port_t *) tty->driver_data;
++    struct port *port = (struct port *) tty->driver_data;
 +
 +    if (cmd == TIOCMIWAIT) {
 +        DECLARE_WAITQUEUE(wait, current);
@@ -1993,7 +2005,7 @@
 +}
 +
 +static int ntty_ioctl_tiocgicount(struct tty_struct *tty, struct file *file, unsigned int cmd, void __user *arg) {
-+    port_t *port = (port_t *) tty->driver_data;
++    struct port *port = (struct port *) tty->driver_data;
 +
 +    if (cmd == TIOCGICOUNT) {
 +        struct async_icount cnow = port->tty_icount;
@@ -2019,7 +2031,7 @@
 +}
 +
 +static int ntty_ioctl(struct tty_struct *tty, struct file *file, unsigned int cmd, unsigned long arg) {
-+    port_t *port = tty->driver_data;
++    struct port *port = tty->driver_data;
 +    dc_t    *dc = get_dc_by_tty(tty);
 +    u32      flags;
 +    int mask;
@@ -2091,7 +2103,7 @@
 +/* Called by the upper tty layer when tty buffers are ready */
 +/* to receive data again after a call to throttle. */
 +static void ntty_unthrottle(struct tty_struct *tty) {
-+    port_t  *port = (port_t *) tty->driver_data;
++    struct port  *port = (struct port *) tty->driver_data;
 +    dc_t    *dc = get_dc_by_tty(tty);
 +    u32      flags;
 +
@@ -2106,7 +2118,7 @@
 +/* Called by the upper tty layer when the tty buffers are almost full. */
 +/* The driver should stop send more data. */
 +static void ntty_throttle(struct tty_struct *tty) {
-+    port_t  *port = (port_t *) tty->driver_data;
++    struct port  *port = (struct port *) tty->driver_data;
 +    dc_t    *dc = get_dc_by_tty(tty);
 +    u32      flags;
 +
@@ -2122,7 +2134,7 @@
 +
 +/* Returns number of chars in buffer, called by tty layer */
 +static s32 ntty_chars_in_buffer(struct tty_struct *tty) {
-+    port_t *port = (port_t *) tty->driver_data;
++    struct port *port = (struct port *) tty->driver_data;
 +    s32 rval;
 +
 +    if (! port) {
@@ -2194,7 +2206,7 @@
 +		tty_register_device(td, i, &dc->pdev->dev);
 +	}
 +
-+	dev_info(&dc->pdev->dev, DRIVER_DESC " " NOZOMI_NAME_TTY);
++	dev_info(&dc->pdev->dev, DRIVER_DESC " " NOZOMI_NAME_TTY "\n");
 +	return rval;
 +}
 +
