@@ -1,0 +1,102 @@
+From akpm@osdl.org Mon Aug 14 23:11:20 2006
+Message-Id: <200608150611.k7F6B6xH013384@shell0.pdx.osdl.net>
+From: David Brownell <david-b@pacbell.net>
+Subject: [patch 6/9] PM: USB HCDs use PM_EVENT_PRETHAW
+To: greg@kroah.com
+Cc: linux-usb-devel@lists.sourceforge.net, akpm@osdl.org, david-b@pacbell.net,
+   dbrownell@users.sourceforge.net, pavel@ucw.cz, rjw@sisk.pl
+Date: Mon, 14 Aug 2006 23:11:06 -0700
+
+From: David Brownell <david-b@pacbell.net>
+
+This teaches several USB host controller drivers to treat PRETHAW as a chip
+reset since the controller, and all devices connected to it, are no longer in
+states compatible with how the snapshotted suspend() left them.
+
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Cc: "Rafael J. Wysocki" <rjw@sisk.pl>
+Cc: Pavel Machek <pavel@ucw.cz>
+Signed-off-by: Andrew Morton <akpm@osdl.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/hcd-pci.c   |    2 +-
+ drivers/usb/host/ehci-pci.c  |    6 ++++++
+ drivers/usb/host/ohci-pci.c  |    5 +++++
+ drivers/usb/host/sl811-hcd.c |    9 +++++++--
+ drivers/usb/host/uhci-hcd.c  |    4 ++++
+ 5 files changed, 23 insertions(+), 3 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/core/hcd-pci.c
++++ gregkh-2.6/drivers/usb/core/hcd-pci.c
+@@ -281,7 +281,7 @@ int usb_hcd_pci_suspend (struct pci_dev 
+ 			(void) usb_hcd_pci_resume (dev);
+ 		}
+ 
+-	} else {
++	} else if (hcd->state != HC_STATE_HALT) {
+ 		dev_dbg (hcd->self.controller, "hcd state %d; not suspended\n",
+ 			hcd->state);
+ 		WARN_ON(1);
+--- gregkh-2.6.orig/drivers/usb/host/ehci-pci.c
++++ gregkh-2.6/drivers/usb/host/ehci-pci.c
+@@ -238,6 +238,12 @@ static int ehci_pci_suspend(struct usb_h
+ 	writel (0, &ehci->regs->intr_enable);
+ 	(void)readl(&ehci->regs->intr_enable);
+ 
++	/* make sure snapshot being resumed re-enumerates everything */
++	if (message.event == PM_EVENT_PRETHAW) {
++		ehci_halt(ehci);
++		ehci_reset(ehci);
++	}
++
+ 	clear_bit(HCD_FLAG_HW_ACCESSIBLE, &hcd->flags);
+  bail:
+ 	spin_unlock_irqrestore (&ehci->lock, flags);
+--- gregkh-2.6.orig/drivers/usb/host/ohci-pci.c
++++ gregkh-2.6/drivers/usb/host/ohci-pci.c
+@@ -135,6 +135,11 @@ static int ohci_pci_suspend (struct usb_
+ 	}
+ 	ohci_writel(ohci, OHCI_INTR_MIE, &ohci->regs->intrdisable);
+ 	(void)ohci_readl(ohci, &ohci->regs->intrdisable);
++
++	/* make sure snapshot being resumed re-enumerates everything */
++	if (message.event == PM_EVENT_PRETHAW)
++		ohci_usb_reset(ohci);
++
+ 	clear_bit(HCD_FLAG_HW_ACCESSIBLE, &hcd->flags);
+  bail:
+ 	spin_unlock_irqrestore (&ohci->lock, flags);
+--- gregkh-2.6.orig/drivers/usb/host/sl811-hcd.c
++++ gregkh-2.6/drivers/usb/host/sl811-hcd.c
+@@ -1783,10 +1783,15 @@ sl811h_suspend(struct platform_device *d
+ 	struct sl811	*sl811 = hcd_to_sl811(hcd);
+ 	int		retval = 0;
+ 
+-	if (state.event == PM_EVENT_FREEZE)
++	switch (state.event) {
++	case PM_EVENT_FREEZE:
+ 		retval = sl811h_bus_suspend(hcd);
+-	else if (state.event == PM_EVENT_SUSPEND)
++		break;
++	case PM_EVENT_SUSPEND:
++	case PM_EVENT_PRETHAW:		/* explicitly discard hw state */
+ 		port_power(sl811, 0);
++		break;
++	}
+ 	if (retval == 0)
+ 		dev->dev.power.power_state = state;
+ 	return retval;
+--- gregkh-2.6.orig/drivers/usb/host/uhci-hcd.c
++++ gregkh-2.6/drivers/usb/host/uhci-hcd.c
+@@ -734,6 +734,10 @@ static int uhci_suspend(struct usb_hcd *
+ 
+ 	/* FIXME: Enable non-PME# remote wakeup? */
+ 
++	/* make sure snapshot being resumed re-enumerates everything */
++	if (message.event == PM_EVENT_PRETHAW)
++		uhci_hc_died(uhci);
++
+ done_okay:
+ 	clear_bit(HCD_FLAG_HW_ACCESSIBLE, &hcd->flags);
+ done:
