@@ -1,0 +1,161 @@
+From stern@rowland.harvard.edu Wed Aug 30 12:47:21 2006
+Date: Wed, 30 Aug 2006 15:47:11 -0400 (EDT)
+From: Alan Stern <stern@rowland.harvard.edu>
+To: Greg KH <greg@kroah.com>
+cc: USB development list <linux-usb-devel@lists.sourceforge.net>
+Subject: [PATCH 3/6] usbcore: remove usb_suspend_root_hub
+Message-ID: <Pine.LNX.4.44L0.0608301531370.5858-100000@iolanthe.rowland.org>
+
+This patch (as740) removes the existing support for autosuspend of
+root hubs.  That support fit in rather awkwardly with the rest of
+usbcore and it was used only by ohci-hcd.  It won't be needed any more
+since the hub driver will take care of autosuspending all hubs, root
+or external.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/hcd.c      |   44 --------------------------------------------
+ drivers/usb/core/hcd.h      |    6 ------
+ drivers/usb/core/hub.c      |   18 +-----------------
+ drivers/usb/core/usb.h      |    1 -
+ drivers/usb/host/ohci-hub.c |    3 ---
+ 5 files changed, 1 insertion(+), 71 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/core/hcd.c
++++ gregkh-2.6/drivers/usb/core/hcd.c
+@@ -1431,50 +1431,6 @@ int hcd_bus_resume (struct usb_bus *bus)
+ 	return status;
+ }
+ 
+-/*
+- * usb_hcd_suspend_root_hub - HCD autosuspends downstream ports
+- * @hcd: host controller for this root hub
+- *
+- * This call arranges that usb_hcd_resume_root_hub() is safe to call later;
+- * that the HCD's root hub polling is deactivated; and that the root's hub
+- * driver is suspended.  HCDs may call this to autosuspend when their root
+- * hub's downstream ports are all inactive:  unpowered, disconnected,
+- * disabled, or suspended.
+- *
+- * The HCD will autoresume on device connect change detection (using SRP
+- * or a D+/D- pullup).  The HCD also autoresumes on remote wakeup signaling
+- * from any ports that are suspended (if that is enabled).  In most cases,
+- * overcurrent signaling (on powered ports) will also start autoresume.
+- *
+- * Always called with IRQs blocked.
+- */
+-void usb_hcd_suspend_root_hub (struct usb_hcd *hcd)
+-{
+-	struct urb	*urb;
+-
+-	spin_lock (&hcd_root_hub_lock);
+-	usb_suspend_root_hub (hcd->self.root_hub);
+-
+-	/* force status urb to complete/unlink while suspended */
+-	if (hcd->status_urb) {
+-		urb = hcd->status_urb;
+-		urb->status = -ECONNRESET;
+-		urb->hcpriv = NULL;
+-		urb->actual_length = 0;
+-
+-		del_timer (&hcd->rh_timer);
+-		hcd->poll_pending = 0;
+-		hcd->status_urb = NULL;
+-	} else
+-		urb = NULL;
+-	spin_unlock (&hcd_root_hub_lock);
+-	hcd->state = HC_STATE_SUSPENDED;
+-
+-	if (urb)
+-		usb_hcd_giveback_urb (hcd, urb, NULL);
+-}
+-EXPORT_SYMBOL_GPL(usb_hcd_suspend_root_hub);
+-
+ /**
+  * usb_hcd_resume_root_hub - called by HCD to resume its root hub 
+  * @hcd: host controller for this root hub
+--- gregkh-2.6.orig/drivers/usb/core/hcd.h
++++ gregkh-2.6/drivers/usb/core/hcd.h
+@@ -368,17 +368,11 @@ extern int usb_find_interface_driver (st
+ #define usb_endpoint_out(ep_dir)	(!((ep_dir) & USB_DIR_IN))
+ 
+ #ifdef CONFIG_PM
+-extern void usb_hcd_suspend_root_hub (struct usb_hcd *hcd);
+ extern void usb_hcd_resume_root_hub (struct usb_hcd *hcd);
+ extern void usb_root_hub_lost_power (struct usb_device *rhdev);
+ extern int hcd_bus_suspend (struct usb_bus *bus);
+ extern int hcd_bus_resume (struct usb_bus *bus);
+ #else
+-static inline void usb_hcd_suspend_root_hub(struct usb_hcd *hcd)
+-{
+-	return;
+-}
+-
+ static inline void usb_hcd_resume_root_hub(struct usb_hcd *hcd)
+ {
+ 	return;
+--- gregkh-2.6.orig/drivers/usb/core/hub.c
++++ gregkh-2.6/drivers/usb/core/hub.c
+@@ -452,18 +452,14 @@ static void hub_power_on(struct usb_hub 
+ 	msleep(max(pgood_delay, (unsigned) 100));
+ }
+ 
+-static inline void __hub_quiesce(struct usb_hub *hub)
++static void hub_quiesce(struct usb_hub *hub)
+ {
+ 	/* (nonblocking) khubd and related activity won't re-trigger */
+ 	hub->quiescing = 1;
+ 	hub->activating = 0;
+ 	hub->resume_root_hub = 0;
+-}
+ 
+-static void hub_quiesce(struct usb_hub *hub)
+-{
+ 	/* (blocking) stop khubd and related activity */
+-	__hub_quiesce(hub);
+ 	usb_kill_urb(hub->urb);
+ 	if (hub->has_indicators)
+ 		cancel_delayed_work(&hub->leds);
+@@ -1914,18 +1910,6 @@ static inline int remote_wakeup(struct u
+ #define hub_resume NULL
+ #endif
+ 
+-void usb_suspend_root_hub(struct usb_device *hdev)
+-{
+-	struct usb_hub *hub = hdev_to_hub(hdev);
+-
+-	/* This also makes any led blinker stop retriggering.  We're called
+-	 * from irq, so the blinker might still be scheduled.  Caller promises
+-	 * that the root hub status URB will be canceled.
+-	 */
+-	__hub_quiesce(hub);
+-	mark_quiesced(to_usb_interface(hub->intfdev));
+-}
+-
+ void usb_resume_root_hub(struct usb_device *hdev)
+ {
+ 	struct usb_hub *hub = hdev_to_hub(hdev);
+--- gregkh-2.6.orig/drivers/usb/core/usb.h
++++ gregkh-2.6/drivers/usb/core/usb.h
+@@ -20,7 +20,6 @@ extern char *usb_cache_string(struct usb
+ extern int usb_set_configuration(struct usb_device *dev, int configuration);
+ 
+ extern void usb_kick_khubd(struct usb_device *dev);
+-extern void usb_suspend_root_hub(struct usb_device *hdev);
+ extern void usb_resume_root_hub(struct usb_device *dev);
+ 
+ extern int  usb_hub_init(void);
+--- gregkh-2.6.orig/drivers/usb/host/ohci-hub.c
++++ gregkh-2.6/drivers/usb/host/ohci-hub.c
+@@ -135,9 +135,6 @@ static int ohci_bus_suspend (struct usb_
+ 	hcd->poll_rh = 0;
+ 
+ done:
+-	/* external suspend vs self autosuspend ... same effect */
+-	if (status == 0)
+-		usb_hcd_suspend_root_hub(hcd);
+ 	spin_unlock_irqrestore (&ohci->lock, flags);
+ 	return status;
+ }

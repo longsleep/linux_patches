@@ -1,0 +1,173 @@
+From stern@rowland.harvard.edu Wed Aug 30 12:47:30 2006
+Date: Wed, 30 Aug 2006 15:47:23 -0400 (EDT)
+From: Alan Stern <stern@rowland.harvard.edu>
+To: Greg KH <greg@kroah.com>
+cc: USB development list <linux-usb-devel@lists.sourceforge.net>
+Subject: [PATCH 5/6] USB hub driver: perform autosuspend
+Message-ID: <Pine.LNX.4.44L0.0608301535450.5858-100000@iolanthe.rowland.org>
+
+This patch (as742) adds autosuspend/autoresume support to the USB hub
+driver.  The largest aspect of the change is that we no longer need a
+special flag for root hubs that want to be resumed.  Now every hub is
+autoresumed whenever khubd needs to access it.
+
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/hub.c |   45 +++++++++++++++++++++++++++------------------
+ drivers/usb/core/hub.h |    1 -
+ 2 files changed, 27 insertions(+), 19 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/core/hub.c
++++ gregkh-2.6/drivers/usb/core/hub.c
+@@ -276,6 +276,9 @@ static void kick_khubd(struct usb_hub *h
+ {
+ 	unsigned long	flags;
+ 
++	/* Suppress autosuspend until khubd runs */
++	to_usb_interface(hub->intfdev)->pm_usage_cnt = 1;
++
+ 	spin_lock_irqsave(&hub_event_lock, flags);
+ 	if (list_empty(&hub->event_list)) {
+ 		list_add_tail(&hub->event_list, &hub_event_list);
+@@ -457,7 +460,6 @@ static void hub_quiesce(struct usb_hub *
+ 	/* (nonblocking) khubd and related activity won't re-trigger */
+ 	hub->quiescing = 1;
+ 	hub->activating = 0;
+-	hub->resume_root_hub = 0;
+ 
+ 	/* (blocking) stop khubd and related activity */
+ 	usb_kill_urb(hub->urb);
+@@ -473,7 +475,7 @@ static void hub_activate(struct usb_hub 
+ 
+ 	hub->quiescing = 0;
+ 	hub->activating = 1;
+-	hub->resume_root_hub = 0;
++
+ 	status = usb_submit_urb(hub->urb, GFP_NOIO);
+ 	if (status < 0)
+ 		dev_err(hub->intfdev, "activate --> %d\n", status);
+@@ -883,6 +885,7 @@ descriptor_error:
+ 	INIT_WORK(&hub->leds, led_work, hub);
+ 
+ 	usb_set_intfdata (intf, hub);
++	intf->needs_remote_wakeup = 1;
+ 
+ 	if (hdev->speed == USB_SPEED_HIGH)
+ 		highspeed_hubs++;
+@@ -1850,6 +1853,8 @@ static int hub_suspend(struct usb_interf
+ 		}
+ 	}
+ 
++	dev_dbg(&intf->dev, "%s\n", __FUNCTION__);
++
+ 	/* "global suspend" of the downstream HC-to-USB interface */
+ 	if (!hdev->parent) {
+ 		struct usb_bus	*bus = hdev->bus;
+@@ -1872,10 +1877,12 @@ static int hub_suspend(struct usb_interf
+ 
+ static int hub_resume(struct usb_interface *intf)
+ {
+-	struct usb_device	*hdev = interface_to_usbdev(intf);
+ 	struct usb_hub		*hub = usb_get_intfdata (intf);
++	struct usb_device	*hdev = hub->hdev;
+ 	int			status;
+ 
++	dev_dbg(&intf->dev, "%s\n", __FUNCTION__);
++
+ 	/* "global resume" of the downstream HC-to-USB interface */
+ 	if (!hdev->parent) {
+ 		struct usb_bus	*bus = hdev->bus;
+@@ -1914,7 +1921,6 @@ void usb_resume_root_hub(struct usb_devi
+ {
+ 	struct usb_hub *hub = hdev_to_hub(hdev);
+ 
+-	hub->resume_root_hub = 1;
+ 	kick_khubd(hub);
+ }
+ 
+@@ -2551,16 +2557,13 @@ static void hub_events(void)
+ 		intf = to_usb_interface(hub->intfdev);
+ 		hub_dev = &intf->dev;
+ 
+-		i = hub->resume_root_hub;
+-
+-		dev_dbg(hub_dev, "state %d ports %d chg %04x evt %04x%s\n",
++		dev_dbg(hub_dev, "state %d ports %d chg %04x evt %04x\n",
+ 				hdev->state, hub->descriptor
+ 					? hub->descriptor->bNbrPorts
+ 					: 0,
+ 				/* NOTE: expects max 15 ports... */
+ 				(u16) hub->change_bits[0],
+-				(u16) hub->event_bits[0],
+-				i ? ", resume root" : "");
++				(u16) hub->event_bits[0]);
+ 
+ 		usb_get_intf(intf);
+ 		spin_unlock_irq(&hub_event_lock);
+@@ -2581,16 +2584,16 @@ static void hub_events(void)
+ 			goto loop;
+ 		}
+ 
+-		/* Is this is a root hub wanting to reactivate the downstream
+-		 * ports?  If so, be sure the interface resumes even if its
+-		 * stub "device" node was never suspended.
+-		 */
+-		if (i)
+-			usb_autoresume_device(hdev, 0);
++		/* Autoresume */
++		ret = usb_autopm_get_interface(intf);
++		if (ret) {
++			dev_dbg(hub_dev, "Can't autoresume: %d\n", ret);
++			goto loop;
++		}
+ 
+-		/* If this is an inactive or suspended hub, do nothing */
++		/* If this is an inactive hub, do nothing */
+ 		if (hub->quiescing)
+-			goto loop;
++			goto loop_autopm;
+ 
+ 		if (hub->error) {
+ 			dev_dbg (hub_dev, "resetting for error %d\n",
+@@ -2600,7 +2603,7 @@ static void hub_events(void)
+ 			if (ret) {
+ 				dev_dbg (hub_dev,
+ 					"error resetting hub: %d\n", ret);
+-				goto loop;
++				goto loop_autopm;
+ 			}
+ 
+ 			hub->nerrors = 0;
+@@ -2728,6 +2731,11 @@ static void hub_events(void)
+ 		if (!hdev->parent && !hub->busy_bits[0])
+ 			usb_enable_root_hub_irq(hdev->bus);
+ 
++loop_autopm:
++		/* Allow autosuspend if we're not going to run again */
++		intf->pm_usage_cnt = 1;
++		if (list_empty(&hub->event_list))
++			usb_autopm_put_interface(intf);
+ loop:
+ 		usb_unlock_device(hdev);
+ 		usb_put_intf(intf);
+@@ -2769,6 +2777,7 @@ static struct usb_driver hub_driver = {
+ 	.post_reset =	hub_post_reset,
+ 	.ioctl =	hub_ioctl,
+ 	.id_table =	hub_id_table,
++	.supports_autosuspend =	1,
+ };
+ 
+ int usb_hub_init(void)
+--- gregkh-2.6.orig/drivers/usb/core/hub.h
++++ gregkh-2.6/drivers/usb/core/hub.h
+@@ -226,7 +226,6 @@ struct usb_hub {
+ 	unsigned		limited_power:1;
+ 	unsigned		quiescing:1;
+ 	unsigned		activating:1;
+-	unsigned		resume_root_hub:1;
+ 
+ 	unsigned		has_indicators:1;
+ 	enum hub_led_mode	indicator[USB_MAXCHILDREN];
