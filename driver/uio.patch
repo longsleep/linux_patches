@@ -3,7 +3,7 @@ Date: Fri, 21 Jul 2006 00:33:11 +0200
 Message-ID: <874pxb52l4.wl%tglx@linutronix.de>
 From: Thomas Gleixner <tglx@linutronix.de>
 To: Greg KH <gregkh@suse.de>
-Subject: IIO subsystem
+Subject: UIO subsystem
 
 From: Thomas Gleixner <tglx@linutronix.de>
 
@@ -16,14 +16,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  Documentation/DocBook/kernel-api.tmpl |    5 
  drivers/Kconfig                       |    2 
  drivers/Makefile                      |    1 
- drivers/iio/Kconfig                   |   11 
- drivers/iio/Makefile                  |    4 
- drivers/iio/iio_base.c                |  438 ++++++++++++++++++++++++++++++++++
- drivers/iio/iio_dev.c                 |  366 ++++++++++++++++++++++++++++
- drivers/iio/iio_dummy.c               |  269 ++++++++++++++++++++
- include/linux/iio.h                   |  108 ++++++++
- kernel/signal.c                       |    4 
- 10 files changed, 1208 insertions(+)
+ drivers/uio/Kconfig                   |   15 +
+ drivers/uio/Makefile                  |    4 
+ drivers/uio/uio_base.c                |  438 ++++++++++++++++++++++++++++++++++
+ drivers/uio/uio_dev.c                 |  366 ++++++++++++++++++++++++++++
+ drivers/uio/uio_dummy.c               |  269 ++++++++++++++++++++
+ include/linux/uio_driver.h            |  106 ++++++++
+ 9 files changed, 1206 insertions(+)
 
 --- gregkh-2.6.orig/Documentation/DocBook/kernel-api.tmpl
 +++ gregkh-2.6/Documentation/DocBook/kernel-api.tmpl
@@ -32,9 +31,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  !Edrivers/pnp/support.c
       </sect1>
 +     <sect1><title>Industrial IO device driver</title>
-+!Edrivers/iio/iio_base.c
-+!Edrivers/iio/iio_dev.c
-+!Iinclude/linux/iio.h
++!Edrivers/uio/uio_base.c
++!Edrivers/uio/uio_dev.c
++!Iinclude/linux/uio.h
 +     </sect1>
    </chapter>
  
@@ -45,7 +44,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  source "drivers/dma/Kconfig"
  
-+source "drivers/iio/Kconfig"
++source "drivers/uio/Kconfig"
 +
  endmenu
 --- gregkh-2.6.orig/drivers/Makefile
@@ -54,36 +53,40 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  obj-$(CONFIG_SCSI)		+= scsi/
  obj-$(CONFIG_FUSION)		+= message/
  obj-$(CONFIG_IEEE1394)		+= ieee1394/
-+obj-$(CONFIG_IIO)		+= iio/
++obj-$(CONFIG_UIO)		+= uio/
  obj-y				+= cdrom/
  obj-$(CONFIG_MTD)		+= mtd/
  obj-$(CONFIG_SPI)		+= spi/
 --- /dev/null
-+++ gregkh-2.6/drivers/iio/Kconfig
-@@ -0,0 +1,11 @@
-+menu "Industrial IO"
-+config IIO
-+	tristate "Industrial IO"
++++ gregkh-2.6/drivers/uio/Kconfig
+@@ -0,0 +1,15 @@
++menu "Userspace I/O"
++config UIO
++	tristate "Userspace I/O drivers"
 +	help
-+	  base driver for industrial IO
++	  Enable this to allow the userspace driver core code to be
++	  built.  This code allows userspace programs easy access to
++	  kernel interrupts and memory locations, allowing some drivers
++	  to be written in userspace.  Note that a small kernel driver
++	  is also required for interrupt handling to work properly.
 +
-+config IIO_DUMMY
-+	tristate "Industrial IO dummy driver"
-+	help
-+	  example/dummy driver for industrial IO
++#config UIO_DUMMY
++#	tristate "Industrial IO dummy driver"
++#	help
++#	  example/dummy driver for industrial IO
 +endmenu
 --- /dev/null
-+++ gregkh-2.6/drivers/iio/Makefile
++++ gregkh-2.6/drivers/uio/Makefile
 @@ -0,0 +1,4 @@
-+obj-$(CONFIG_IIO) += iio.o
-+obj-$(CONFIG_IIO_DUMMY) += iio_dummy.o
++obj-$(CONFIG_UIO) += uio.o
++obj-$(CONFIG_UIO_DUMMY) += uio_dummy.o
 +
-+iio-objs := iio_base.o iio_dev.o
++uio-objs := uio_base.o uio_dev.o
 --- /dev/null
-+++ gregkh-2.6/drivers/iio/iio_base.c
++++ gregkh-2.6/drivers/uio/uio_base.c
 @@ -0,0 +1,438 @@
 +/*
-+ * driver/iio/iio_base.c
++ * driver/uio/uio_base.c
 + *
 + * Copyright(C) 2005, Benedikt Spranger <b.spranger@linutronix.de>
 + * Copyright(C) 2005, Thomas Gleixner <tglx@linutronix.de>
@@ -102,49 +105,49 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#include <linux/kernel.h>
 +#include <linux/device.h>
 +#include <linux/fs.h>
-+#include <linux/iio.h>
++#include <linux/uio_driver.h>
 +#include <linux/hrtimer.h>
 +
 +/*
-+ * The iio class.
++ * The uio class.
 + */
 +
-+static struct class *iio_class;
++static struct class *uio_class;
 +
 +static const char version[] = "0.00";
-+static struct list_head iio_devices = LIST_HEAD_INIT(iio_devices);
-+static struct rw_semaphore iio_list_sem;
++static struct list_head uio_devices = LIST_HEAD_INIT(uio_devices);
++static struct rw_semaphore uio_list_sem;
 +
-+static const char *iio_dev_ext[] = {
++static const char *uio_dev_ext[] = {
 +	"",
 +	"_in",
 +	"_out",
 +	"_event"
 +};
 +
-+struct iio_class_dev {
++struct uio_class_dev {
 +	struct list_head list;
 +	int dev_nr;
 +	struct class_device *cdev [4];
 +	dev_t dev;
 +};
 +
-+extern struct file_operations iio_event_fops;
++extern struct file_operations uio_event_fops;
 +
 +/*
 + * attributes
 + */
-+static ssize_t show_iio_version(struct class *cd, char *buf)
++static ssize_t show_uio_version(struct class *cd, char *buf)
 +{
 +	sprintf(buf, "%s\n", version);
 +	return strlen(buf) + 1;
 +}
-+static CLASS_ATTR(version, S_IRUGO, show_iio_version, NULL);
++static CLASS_ATTR(version, S_IRUGO, show_uio_version, NULL);
 +
 +static ssize_t show_addr(struct device *dev,
 +			 struct device_attribute *attr, char *buf)
 +{
-+	struct iio_device *idev = to_iio_device(dev);
++	struct uio_device *idev = to_uio_device(dev);
 +	return sprintf(buf, "0x%lx\n", idev->physaddr);
 +}
 +static DEVICE_ATTR(physaddr, S_IRUGO, show_addr, NULL);
@@ -152,7 +155,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static ssize_t show_name(struct device *dev,
 +			 struct device_attribute *attr, char *buf)
 +{
-+	struct iio_device *idev = to_iio_device(dev);
++	struct uio_device *idev = to_uio_device(dev);
 +	return sprintf(buf, "%s\n", idev->name);
 +}
 +static DEVICE_ATTR(name, S_IRUGO, show_name, NULL);
@@ -160,7 +163,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static ssize_t show_read_offset(struct device *dev,
 +				struct device_attribute *attr, char *buf)
 +{
-+	struct iio_device *idev = to_iio_device(dev);
++	struct uio_device *idev = to_uio_device(dev);
 +	return sprintf(buf, "0x%lx\n", idev->read_offset);
 +}
 +static DEVICE_ATTR(read_offset, S_IRUGO, show_read_offset, NULL);
@@ -168,7 +171,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static ssize_t show_size(struct device *dev,
 +			 struct device_attribute *attr, char *buf)
 +{
-+	struct iio_device *idev = to_iio_device(dev);
++	struct uio_device *idev = to_uio_device(dev);
 +	return sprintf(buf, "0x%lx\n", idev->size);
 +}
 +static DEVICE_ATTR(size, S_IRUGO, show_size, NULL);
@@ -176,7 +179,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static ssize_t show_version(struct device *dev,
 +			    struct device_attribute *attr, char *buf)
 +{
-+	struct iio_device *idev = to_iio_device(dev);
++	struct uio_device *idev = to_uio_device(dev);
 +	return sprintf(buf, "%s\n", idev->version);
 +}
 +static DEVICE_ATTR(version, S_IRUGO, show_version, NULL);
@@ -184,7 +187,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static ssize_t show_write_offset(struct device *dev,
 +				 struct device_attribute *attr, char *buf)
 +{
-+	struct iio_device *idev = to_iio_device(dev);
++	struct uio_device *idev = to_uio_device(dev);
 +	return sprintf(buf, "0x%lx\n", idev->write_offset);
 +}
 +static DEVICE_ATTR(write_offset, S_IRUGO, show_write_offset, NULL);
@@ -192,7 +195,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static ssize_t show_listener(struct device *dev,
 +			     struct device_attribute *attr, char *buf)
 +{
-+	struct iio_device *idev = to_iio_device(dev);
++	struct uio_device *idev = to_uio_device(dev);
 +	return sprintf(buf, "%ld\n", idev->event_listener);
 +}
 +static DEVICE_ATTR(listener, S_IRUGO, show_listener, NULL);
@@ -200,7 +203,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static ssize_t show_event(struct device *dev,
 +			  struct device_attribute *attr, char *buf)
 +{
-+	struct iio_device *idev = to_iio_device(dev);
++	struct uio_device *idev = to_uio_device(dev);
 +	return sprintf(buf, "%d\n", atomic_read(&idev->event));
 +}
 +static DEVICE_ATTR(event, S_IRUGO, show_event, NULL);
@@ -208,12 +211,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +/*
 + * device functions
 + */
-+static void iio_dev_release(struct device *dev)
++static void uio_dev_release(struct device *dev)
 +{
 +	pr_debug("%s\n", __FUNCTION__);
 +}
 +
-+static void iio_dev_create(dev_t dev, struct iio_device *idev)
++static void uio_dev_create(dev_t dev, struct uio_device *idev)
 +{
 +	int ret;
 +	pr_debug("%s\n", __FUNCTION__);
@@ -225,15 +228,15 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	if (ret)
 +		printk(KERN_ERR "%s: cdev_add failed (%d)\n", __FUNCTION__, ret);
 +
-+	cdev_init(&idev->event_cdev, &iio_event_fops);
++	cdev_init(&idev->event_cdev, &uio_event_fops);
 +	idev->event_cdev.owner = THIS_MODULE;
-+	idev->event_cdev.ops = &iio_event_fops;
++	idev->event_cdev.ops = &uio_event_fops;
 +	ret = cdev_add(&idev->event_cdev, dev + 3, 1);
 +	if (ret)
 +		printk(KERN_ERR "%s: cdev_add failed (%d)\n", __FUNCTION__, ret);
 +}
 +
-+static void iio_dev_remove(struct iio_device *idev)
++static void uio_dev_remove(struct uio_device *idev)
 +{
 +	pr_debug("%s\n", __FUNCTION__);
 +
@@ -241,7 +244,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	cdev_del(&idev->event_cdev);
 +}
 +
-+static void iio_dev_add_attributes(struct iio_device *idev)
++static void uio_dev_add_attributes(struct uio_device *idev)
 +{
 +	int ret;
 +
@@ -263,7 +266,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		pr_debug("%s: error creating sysfs files\n", __FUNCTION__);
 +}
 +
-+static void iio_dev_del_attributes(struct iio_device *idev)
++static void uio_dev_del_attributes(struct uio_device *idev)
 +{
 +	pr_debug("%s\n", __FUNCTION__);
 +
@@ -285,11 +288,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + * polling mode
 + */
 +
-+static void iio_do_poll(unsigned long data)
++static void uio_do_poll(unsigned long data)
 +{
-+	struct iio_device *idev = (struct iio_device *)data;
++	struct uio_device *idev = (struct uio_device *)data;
 +
-+	iio_interrupt(-1, idev, NULL);
++	uio_interrupt(-1, idev, NULL);
 +	mod_timer(&idev->poll_timer, jiffies + idev->freq);
 +}
 +
@@ -299,13 +302,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + * one shot mode
 + */
 +
-+int iio_do_oneshot(void *data)
++int uio_do_oneshot(void *data)
 +{
-+	struct iio_device *idev = (struct iio_device *)data;
++	struct uio_device *idev = (struct uio_device *)data;
 +//	struct timespec next;
 +
 +	atomic_inc(&idev->running);
-+	daemonize("iio_oneshot");
++	daemonize("uio_oneshot");
 +	set_user_nice(current, -10);
 +	current->flags |= PF_NOFREEZE;
 +//FIXME: Bene: new API
@@ -316,7 +319,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		ktime_to_timespec(&next, idev->next_event);
 +		ktimer_nanosleep(&next, NULL, KTIMER_ABS);
 +		ktime_set_scalar(idev->next_event, KTIME_ZERO);
-+		iio_interrupt(-2, idev, NULL);
++		uio_interrupt(-2, idev, NULL);
 +	}
 +# endif
 +	atomic_dec(&idev->running);
@@ -327,17 +330,17 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + * class device functions
 + */
 +
-+static int iio_assign_free_devnr(void)
++static int uio_assign_free_devnr(void)
 +{
 +	int dev_nr = 0;
-+	struct iio_class_dev *entry;
++	struct uio_class_dev *entry;
 +
 +	pr_debug("%s\n", __FUNCTION__);
 +
-+	if (list_empty(&iio_devices))
++	if (list_empty(&uio_devices))
 +		goto out;
 +
-+	list_for_each_entry(entry, &iio_devices, list) {
++	list_for_each_entry(entry, &uio_devices, list) {
 +		if ((entry->dev_nr > dev_nr + 1) && (dev_nr != 0))
 +			break;
 +		dev_nr = entry->dev_nr;
@@ -347,25 +350,25 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +}
 +
 +/**
-+ * iio_register_device - register a new industrial IO device
++ * uio_register_device - register a new industrial IO device
 + *
 + * @parent:	parent device
 + * @idev:	device capabilities
 + *
-+ * returns IIO device driver identifier
++ * returns UIO device driver identifier
 + */
 +
-+int __devinit iio_register_device(struct device *parent,
-+				  struct iio_device *idev) {
++int __devinit uio_register_device(struct device *parent,
++				  struct uio_device *idev) {
 +	int i, ret = -ENOMEM;
-+	struct iio_class_dev *cdev;
++	struct uio_class_dev *cdev;
 +
 +	pr_debug("%s\n", __FUNCTION__);
 +
 +	if (!idev->name || !idev->version)
 +		return -EINVAL;
 +
-+	cdev = kmalloc(sizeof(struct iio_class_dev), GFP_KERNEL);
++	cdev = kmalloc(sizeof(struct uio_class_dev), GFP_KERNEL);
 +	if (!cdev)
 +		goto out;
 +
@@ -373,29 +376,29 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		idev->dev.bus = parent->bus;
 +		idev->dev.parent = parent;
 +	}
-+	idev->dev.release = iio_dev_release;
++	idev->dev.release = uio_dev_release;
 +
-+	down_write(&iio_list_sem);
-+	cdev->dev_nr = iio_assign_free_devnr();
++	down_write(&uio_list_sem);
++	cdev->dev_nr = uio_assign_free_devnr();
 +
-+	sprintf(idev->dev.bus_id, "iio%d", cdev->dev_nr);
++	sprintf(idev->dev.bus_id, "uio%d", cdev->dev_nr);
 +	if ((ret = device_register(&idev->dev)))
 +		goto no_dev;
 +
 +	alloc_chrdev_region(&cdev->dev, 0, 4, idev->dev.bus_id);
-+	iio_dev_create(cdev->dev, idev);
-+	iio_dev_add_attributes(idev);
-+	list_add_tail(&cdev->list, &iio_devices);
++	uio_dev_create(cdev->dev, idev);
++	uio_dev_add_attributes(idev);
++	list_add_tail(&cdev->list, &uio_devices);
 +
 +	for (i = 0; i < 4; i++) {
-+		cdev->cdev [i] = class_device_create(iio_class, NULL,
++		cdev->cdev [i] = class_device_create(uio_class, NULL,
 +						     cdev->dev + i,
-+						     &idev->dev, "iio%d%s",
-+						     cdev->dev_nr, iio_dev_ext [i]);
++						     &idev->dev, "uio%d%s",
++						     cdev->dev_nr, uio_dev_ext [i]);
 +		if (IS_ERR(cdev->cdev [i])) {
-+			printk(KERN_ERR "IIO: device register_failed\n");
++			printk(KERN_ERR "UIO: device register_failed\n");
 +			device_unregister(&idev->dev);
-+			iio_dev_remove(idev);
++			uio_dev_remove(idev);
 +			unregister_chrdev_region(cdev->dev, 4);
 +			ret = PTR_ERR(cdev->cdev [i]);
 +			kfree(cdev);
@@ -404,7 +407,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	}
 +
 +no_dev:
-+	up_write(&iio_list_sem);
++	up_write(&uio_list_sem);
 +
 +	idev->dev.driver_data = (void *)cdev->dev_nr;
 +	atomic_set(&idev->running, 0);
@@ -417,19 +420,19 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		switch (idev->irq) {
 +#ifdef CONFIG_HIGH_RES_TIMERS
 +		case -2: /* one shot mode */
-+			kernel_thread(iio_do_oneshot, idev, CLONE_KERNEL);
++			kernel_thread(uio_do_oneshot, idev, CLONE_KERNEL);
 +			break;
 +#endif
 +		case -1: /* cyclic */
 +			init_timer(&idev->poll_timer);
 +			idev->poll_timer.data = (unsigned long)idev;
-+			idev->poll_timer.function = iio_do_poll;
++			idev->poll_timer.function = uio_do_poll;
 +			mod_timer(&idev->poll_timer, jiffies + idev->freq);
 +			break;
 +
 +		default:
 +			/* Make this configurable !!! */
-+			ret = request_irq(idev->irq, iio_interrupt,
++			ret = request_irq(idev->irq, uio_interrupt,
 +					  IRQF_SHARED, idev->name, idev);
 +		}
 +	}
@@ -439,29 +442,29 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +out:
 +	return ret;
 +}
-+EXPORT_SYMBOL_GPL(iio_register_device);
++EXPORT_SYMBOL_GPL(uio_register_device);
 +
 +/**
-+ * iio_unregister_device - unregister a industrial IO device
-+ * @dev_nr:	IIO device driver identifier
++ * uio_unregister_device - unregister a industrial IO device
++ * @dev_nr:	UIO device driver identifier
 + *
 + * returns 0 on success
 + */
 +
-+int __devexit iio_unregister_device(int dev_nr)
++int __devexit uio_unregister_device(int dev_nr)
 +{
 +	int i, ret = -ENODEV;
-+	struct iio_class_dev *entry, *tmp;
-+	struct iio_device *idev;
++	struct uio_class_dev *entry, *tmp;
++	struct uio_device *idev;
 +
 +	pr_debug("%s (%d)\n", __FUNCTION__, dev_nr);
 +
-+	down_write(&iio_list_sem);
++	down_write(&uio_list_sem);
 +
-+	list_for_each_entry_safe(entry, tmp, &iio_devices, list) {
++	list_for_each_entry_safe(entry, tmp, &uio_devices, list) {
 +		if (entry->dev_nr == dev_nr) {
 +
-+			idev = to_iio_device(entry->cdev [0]->dev);
++			idev = to_uio_device(entry->cdev [0]->dev);
 +
 +			atomic_inc(&idev->terminate);
 +			while (atomic_read(&idev->running))
@@ -470,9 +473,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			if (idev->irq == -1)
 +				del_timer_sync(&idev->poll_timer);
 +
-+			iio_dev_remove(idev);
++			uio_dev_remove(idev);
 +			unregister_chrdev_region(entry->dev, 4);
-+			iio_dev_del_attributes(idev);
++			uio_dev_del_attributes(idev);
 +			for (i = 0; i < 4; i++) {
 +				class_device_unregister(entry->cdev [i]);
 +			}
@@ -484,47 +487,47 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		}
 +	}
 +
-+	up_write(&iio_list_sem);
++	up_write(&uio_list_sem);
 +	return ret;
 +}
-+EXPORT_SYMBOL_GPL(iio_unregister_device);
++EXPORT_SYMBOL_GPL(uio_unregister_device);
 +
 +/*
 + * module
 + */
 +
-+static int __init iio_init(void)
++static int __init uio_init(void)
 +{
 +	int ret;
 +
-+	init_rwsem(&iio_list_sem);
-+	iio_class = class_create(THIS_MODULE, "iio");
++	init_rwsem(&uio_list_sem);
++	uio_class = class_create(THIS_MODULE, "uio");
 +
-+	if (IS_ERR(iio_class))
-+		return PTR_ERR(iio_class);
++	if (IS_ERR(uio_class))
++		return PTR_ERR(uio_class);
 +
-+	ret = class_create_file(iio_class, &class_attr_version);
++	ret = class_create_file(uio_class, &class_attr_version);
 +	if (ret)
-+		class_destroy(iio_class);
++		class_destroy(uio_class);
 +	return ret;
 +}
 +
-+void __exit iio_exit(void)
++void __exit uio_exit(void)
 +{
-+	class_remove_file(iio_class, &class_attr_version);
-+	class_destroy(iio_class);
++	class_remove_file(uio_class, &class_attr_version);
++	class_destroy(uio_class);
 +}
 +
-+module_init(iio_init)
-+module_exit(iio_exit)
++module_init(uio_init)
++module_exit(uio_exit)
 +
 +MODULE_LICENSE("GPL v2");
 +MODULE_AUTHOR("Benedikt Spranger");
 --- /dev/null
-+++ gregkh-2.6/drivers/iio/iio_dev.c
++++ gregkh-2.6/drivers/uio/uio_dev.c
 @@ -0,0 +1,366 @@
 +/*
-+ * drivers/iio/iio_dev.c
++ * drivers/uio/uio_dev.c
 + *
 + * Copyright(C) 2005, Benedikt Spranger <b.spranger@linutronix.de>
 + * Copyright(C) 2005, Thomas Gleixner <tglx@linutronix.de>
@@ -544,18 +547,18 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#include <linux/kernel.h>
 +#include <linux/mman.h>
 +#include <linux/poll.h>
-+#include <linux/iio.h>
++#include <linux/uio_driver.h>
 +
 +#include <asm/io.h>
 +#include <asm/uaccess.h>
 +
 +/**
-+ * iio_lseek - IIO framework lseek implementation
++ * uio_lseek - UIO framework lseek implementation
 + *
 + */
-+loff_t iio_lseek(struct file *filep, loff_t offset, int orig)
++loff_t uio_lseek(struct file *filep, loff_t offset, int orig)
 +{
-+	struct iio_device *idev = filep->private_data;
++	struct uio_device *idev = filep->private_data;
 +
 +	pr_debug("%s\n", __FUNCTION__);
 +
@@ -573,17 +576,17 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	return (filep->f_pos >= idev->size) ? -EINVAL : filep->f_pos;
 +}
-+EXPORT_SYMBOL_GPL(iio_lseek);
++EXPORT_SYMBOL_GPL(uio_lseek);
 +
 +/**
-+ * iio_read - IIO framework read implementation
++ * uio_read - UIO framework read implementation
 + *
 + */
-+ssize_t iio_read(struct file *filep, char __user *buf,
++ssize_t uio_read(struct file *filep, char __user *buf,
 +		 size_t count, loff_t *ppos)
 +{
 +	unsigned int minor = iminor(filep->f_dentry->d_inode);
-+	struct iio_device *idev = filep->private_data;
++	struct uio_device *idev = filep->private_data;
 +	int offset;
 +
 +	pr_debug("%s\n", __FUNCTION__);
@@ -625,17 +628,17 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	*ppos += count;
 +	return count;
 +}
-+EXPORT_SYMBOL_GPL(iio_read);
++EXPORT_SYMBOL_GPL(uio_read);
 +
 +/**
-+ * iio_write - IIO framework write implementation
++ * uio_write - UIO framework write implementation
 + *
 + */
-+ssize_t iio_write(struct file *filep, const char __user * buf, size_t count,
++ssize_t uio_write(struct file *filep, const char __user * buf, size_t count,
 +		  loff_t *ppos)
 +{
 +	unsigned int minor = iminor(filep->f_dentry->d_inode);
-+	struct iio_device *idev = filep->private_data;
++	struct uio_device *idev = filep->private_data;
 +	int offset;
 +
 +	pr_debug("%s\n", __FUNCTION__);
@@ -679,33 +682,33 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	*ppos += count;
 +	return count;
 +}
-+EXPORT_SYMBOL_GPL(iio_write);
++EXPORT_SYMBOL_GPL(uio_write);
 +
 +/**
-+ * iio_open - IIO framework open implementation
++ * uio_open - UIO framework open implementation
 + *
 + */
-+int iio_open(struct inode *inode, struct file *filep)
++int uio_open(struct inode *inode, struct file *filep)
 +{
-+	struct iio_device *idev;
++	struct uio_device *idev;
 +
 +	pr_debug("%s\n", __FUNCTION__);
 +
-+	idev = container_of(inode->i_cdev, struct iio_device, cdev);
++	idev = container_of(inode->i_cdev, struct uio_device, cdev);
 +	filep->private_data = idev;
 +
 +	return 0;
 +}
-+EXPORT_SYMBOL_GPL(iio_open);
++EXPORT_SYMBOL_GPL(uio_open);
 +
 +/**
-+ * iio_mmap - IIO framework mmap implementation
++ * uio_mmap - UIO framework mmap implementation
 + *
 + */
-+int iio_mmap(struct file *filep, struct vm_area_struct *vma)
++int uio_mmap(struct file *filep, struct vm_area_struct *vma)
 +{
 +	unsigned int minor = iminor(filep->f_dentry->d_inode);
-+	struct iio_device *idev = filep->private_data;
++	struct uio_device *idev = filep->private_data;
 +	unsigned long size = (unsigned long)(vma->vm_end - vma->vm_start);
 +
 +	pr_debug("%s\n", __FUNCTION__);
@@ -734,40 +737,40 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			       vma->vm_end - vma->vm_start,
 +			       vma->vm_page_prot);
 +}
-+EXPORT_SYMBOL_GPL(iio_mmap);
++EXPORT_SYMBOL_GPL(uio_mmap);
 +
 +/**
-+ * iio_release - IIO framework release implementation
++ * uio_release - UIO framework release implementation
 + *
 + */
-+int iio_release(struct inode *inode, struct file *filep)
++int uio_release(struct inode *inode, struct file *filep)
 +{
 +	pr_debug("%s\n", __FUNCTION__);
 +
 +	return 0;
 +}
-+EXPORT_SYMBOL_GPL(iio_release);
++EXPORT_SYMBOL_GPL(uio_release);
 +
 +
 +/*
 + * event interface
 + */
-+int iio_event_open(struct inode *inode, struct file *filep)
++int uio_event_open(struct inode *inode, struct file *filep)
 +{
-+	struct iio_device *idev;
++	struct uio_device *idev;
 +
 +	pr_debug("%s\n", __FUNCTION__);
 +
-+	idev = container_of(inode->i_cdev, struct iio_device, event_cdev);
++	idev = container_of(inode->i_cdev, struct uio_device, event_cdev);
 +	filep->private_data = idev;
 +	idev->event_listener++;
 +
 +	return 0;
 +}
 +
-+int iio_event_release(struct inode *inode, struct file *filep)
++int uio_event_release(struct inode *inode, struct file *filep)
 +{
-+	struct iio_device *idev = filep->private_data;
++	struct uio_device *idev = filep->private_data;
 +
 +	pr_debug("%s\n", __FUNCTION__);
 +
@@ -780,9 +783,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return 0;
 +}
 +
-+irqreturn_t iio_interrupt(int irq, void *dev_id, struct pt_regs *regs)
++irqreturn_t uio_interrupt(int irq, void *dev_id, struct pt_regs *regs)
 +{
-+	struct iio_device *idev = (struct iio_device *)dev_id;
++	struct uio_device *idev = (struct uio_device *)dev_id;
 +
 +	if (idev->handler)
 +		idev->handler(irq, dev_id, regs);
@@ -796,16 +799,16 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return IRQ_HANDLED;
 +}
 +
-+static int iio_event_fasync(int fd, struct file *filep, int on)
++static int uio_event_fasync(int fd, struct file *filep, int on)
 +{
-+	struct iio_device *idev = filep->private_data;
++	struct uio_device *idev = filep->private_data;
 +
 +	return fasync_helper(fd, filep, on, &idev->async_queue);
 +}
 +
-+static unsigned int iio_event_poll(struct file *filep, poll_table *wait)
++static unsigned int uio_event_poll(struct file *filep, poll_table *wait)
 +{
-+	struct iio_device *idev = filep->private_data;
++	struct uio_device *idev = filep->private_data;
 +
 +	pr_debug("%s\n", __FUNCTION__);
 +
@@ -817,10 +820,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return POLLIN | POLLRDNORM;
 +}
 +
-+static ssize_t iio_event_read(struct file *filep, char __user *buf,
++static ssize_t uio_event_read(struct file *filep, char __user *buf,
 +			      size_t count, loff_t *ppos)
 +{
-+	struct iio_device *idev = filep->private_data;
++	struct uio_device *idev = filep->private_data;
 +	DECLARE_WAITQUEUE(wait, current);
 +	ssize_t retval;
 +	int event_count;
@@ -866,10 +869,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return retval;
 +}
 +
-+ssize_t iio_event_write(struct file *filep, const char __user * buf,
++ssize_t uio_event_write(struct file *filep, const char __user * buf,
 +			size_t count, loff_t *ppos)
 +{
-+	struct iio_device *idev = filep->private_data;
++	struct uio_device *idev = filep->private_data;
 +
 +	pr_debug("%s\n", __FUNCTION__);
 +
@@ -879,21 +882,21 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return idev->event_write(filep, buf, count, ppos);
 +}
 +
-+struct file_operations iio_event_fops = {
++struct file_operations uio_event_fops = {
 +	.owner		= THIS_MODULE,
 +	.llseek		= no_llseek,
-+	.read		= iio_event_read,
-+	.write		= iio_event_write,
-+	.poll		= iio_event_poll,
-+	.open		= iio_event_open,
-+	.release	= iio_event_release,
-+	.fasync		= iio_event_fasync,
++	.read		= uio_event_read,
++	.write		= uio_event_write,
++	.poll		= uio_event_poll,
++	.open		= uio_event_open,
++	.release	= uio_event_release,
++	.fasync		= uio_event_fasync,
 +};
 --- /dev/null
-+++ gregkh-2.6/drivers/iio/iio_dummy.c
++++ gregkh-2.6/drivers/uio/uio_dummy.c
 @@ -0,0 +1,269 @@
 +/*
-+ * IIO dummy driver
++ * UIO dummy driver
 + *
 + * GPLv2 only.
 + */
@@ -902,28 +905,28 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +#include <linux/platform_device.h>
 +#include <linux/module.h>
-+#include <linux/iio.h>
++#include <linux/uio_driver.h>
 +
 +#include <asm/io.h>
 +
 +#define MEMSIZE 8192
 +
-+static irqreturn_t iio_dummy_handler(int irq, void *dev_id,
++static irqreturn_t uio_dummy_handler(int irq, void *dev_id,
 +				     struct pt_regs *reg);
 +
-+static struct file_operations iio_dummy_fops = {
-+	.open = iio_open,
-+	.release = iio_release,
-+	.read = iio_read,
-+	.write = iio_write,
-+	.llseek = iio_lseek,
-+	.mmap = iio_mmap,
++static struct file_operations uio_dummy_fops = {
++	.open = uio_open,
++	.release = uio_release,
++	.read = uio_read,
++	.write = uio_write,
++	.llseek = uio_lseek,
++	.mmap = uio_mmap,
 +};
 +
-+static struct iio_device iio_dummy_idev = {
-+	.name = "IIO dummy",
++static struct uio_device uio_dummy_idev = {
++	.name = "UIO_dummy",
 +	.version = "0.00",
-+	.fops = &iio_dummy_fops,
++	.fops = &uio_dummy_fops,
 +	.size = MEMSIZE,
 +	.read_offset = 0,
 +	.read_len = MEMSIZE/2,
@@ -931,11 +934,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	.write_len = MEMSIZE/2,
 +	.irq = -1,		/* cyclic timer */
 +	.freq = HZ,
-+	.irq_type = IIO_EVENT,
-+	.handler = iio_dummy_handler,
++	.irq_type = UIO_EVENT,
++	.handler = uio_dummy_handler,
 +};
 +
-+struct iio_dummy_sig {
++struct uio_dummy_sig {
 +	long pid;
 +	int it_sigev_notify;		/* notify word of sigevent struct */
 +	int it_sigev_signo;		/* signo word of sigevent struct */
@@ -944,19 +947,19 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	struct sigqueue *sigq;		/* signal queue entry. */
 +};
 +
-+static struct iio_dummy_sig iio_dummy_signal;
-+static long iio_dummy_count;
++static struct uio_dummy_sig uio_dummy_signal;
++static long uio_dummy_count;
 +
 +static ssize_t show_count(struct device *dev, struct device_attribute *attr,
 +			  char *buf)
 +{
-+	return sprintf(buf, "%ld\n", iio_dummy_count);
++	return sprintf(buf, "%ld\n", uio_dummy_count);
 +}
 +
 +static ssize_t store_count(struct device *dev, struct device_attribute *attr,
 +			   const char *buf, size_t count)
 +{
-+	iio_dummy_count = simple_strtol(buf, NULL, 10);
++	uio_dummy_count = simple_strtol(buf, NULL, 10);
 +	return count;
 +}
 +static DEVICE_ATTR(count, S_IRUGO|S_IWUSR|S_IWGRP, show_count, store_count);
@@ -964,12 +967,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static ssize_t show_freq(struct device *dev, struct device_attribute *attr,
 +			 char *buf)
 +{
-+	return sprintf(buf, "%ld\n", iio_dummy_idev.freq);
++	return sprintf(buf, "%ld\n", uio_dummy_idev.freq);
 +}
 +static ssize_t store_freq(struct device *dev, struct device_attribute *attr,
 +			   const char *buf, size_t count)
 +{
-+	iio_dummy_idev.freq = simple_strtol(buf, NULL, 10);
++	uio_dummy_idev.freq = simple_strtol(buf, NULL, 10);
 +	return count;
 +}
 +static DEVICE_ATTR(freq, S_IRUGO|S_IWUSR|S_IWGRP, show_freq, store_freq);
@@ -977,43 +980,43 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static ssize_t show_sig_pid(struct device *dev, struct device_attribute *attr,
 +			    char *buf)
 +{
-+		return sprintf(buf, "%ld\n", iio_dummy_signal.pid);
++		return sprintf(buf, "%ld\n", uio_dummy_signal.pid);
 +}
 +
 +static ssize_t store_sig_pid(struct device *dev, struct device_attribute *attr,
 +			     const char *buf, size_t count)
 +{
-+	iio_dummy_signal.pid = simple_strtol(buf, NULL, 10);
-+	if (iio_dummy_signal.pid == 0) {
-+		if (iio_dummy_signal.it_process) {
-+			put_task_struct(iio_dummy_signal.it_process);
-+			iio_dummy_signal.it_process = NULL;
++	uio_dummy_signal.pid = simple_strtol(buf, NULL, 10);
++	if (uio_dummy_signal.pid == 0) {
++		if (uio_dummy_signal.it_process) {
++			put_task_struct(uio_dummy_signal.it_process);
++			uio_dummy_signal.it_process = NULL;
 +		}
 +
-+		iio_dummy_signal.pid = 0;
++		uio_dummy_signal.pid = 0;
 +		return count;
 +	}
 +
-+	if (iio_dummy_signal.pid == 1)
++	if (uio_dummy_signal.pid == 1)
 +		goto out;
 +
-+	iio_dummy_signal.it_process = find_task_by_pid(iio_dummy_signal.pid);
-+	if (iio_dummy_signal.it_process) {
-+		get_task_struct(iio_dummy_signal.it_process);
-+		iio_dummy_signal.it_sigev_notify = SIGEV_SIGNAL;
-+		iio_dummy_signal.it_sigev_signo = SIGALRM;
-+		iio_dummy_signal.it_sigev_value.sival_int = 0;
++	uio_dummy_signal.it_process = find_task_by_pid(uio_dummy_signal.pid);
++	if (uio_dummy_signal.it_process) {
++		get_task_struct(uio_dummy_signal.it_process);
++		uio_dummy_signal.it_sigev_notify = SIGEV_SIGNAL;
++		uio_dummy_signal.it_sigev_signo = SIGALRM;
++		uio_dummy_signal.it_sigev_value.sival_int = 0;
 +
 +		return count;
 +	}
 +out:
-+	iio_dummy_signal.pid = 0;
++	uio_dummy_signal.pid = 0;
 +	return -EINVAL;
 +}
 +
 +static DEVICE_ATTR(sig_pid, S_IRUGO|S_IWUSR|S_IWGRP, show_sig_pid, store_sig_pid);
 +
-+static int iio_dummy_irqsig(struct iio_dummy_sig *io_sig, int si_private)
++static int uio_dummy_irqsig(struct uio_dummy_sig *io_sig, int si_private)
 +{
 +	int ret;
 +	struct task_struct *leader;
@@ -1047,138 +1050,136 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +				   io_sig->it_process);
 +}
 +
-+static irqreturn_t iio_dummy_handler(int irq, void *dev_id, struct pt_regs *reg)
++static irqreturn_t uio_dummy_handler(int irq, void *dev_id, struct pt_regs *reg)
 +{
-+	struct iio_device *idev = (struct iio_device *)dev_id;
-+	iio_dummy_count++;
++	struct uio_device *idev = (struct uio_device *)dev_id;
++	uio_dummy_count++;
 +
-+	*((long *) idev->physaddr) = iio_dummy_count;
-+	iio_dummy_irqsig(&iio_dummy_signal, 0);
++	*((long *) idev->physaddr) = uio_dummy_count;
++	uio_dummy_irqsig(&uio_dummy_signal, 0);
 +
 +	return IRQ_HANDLED;
 +}
 +
-+static int __devinit iio_dummy_probe(struct device *dev)
++static int __devinit uio_dummy_probe(struct device *dev)
 +{
 +	struct platform_device *pdev = to_platform_device(dev);
 +
 +	pr_debug("%s\n", __FUNCTION__);
 +
-+	iio_dummy_idev.physaddr = (unsigned long)kmalloc(MEMSIZE, GFP_KERNEL);
-+	if (!iio_dummy_idev.physaddr)
++	uio_dummy_idev.physaddr = (unsigned long)kmalloc(MEMSIZE, GFP_KERNEL);
++	if (!uio_dummy_idev.physaddr)
 +		return -ENOMEM;
 +
-+	pdev->dev.driver_data = (void *)iio_register_device(NULL, &iio_dummy_idev);
++	pdev->dev.driver_data = (void *)uio_register_device(NULL, &uio_dummy_idev);
 +
-+	iio_dummy_signal.sigq = sigqueue_alloc();
++	uio_dummy_signal.sigq = sigqueue_alloc();
 +
 +	return (pdev->dev.driver_data) ? 0 : -ENODEV;
 +}
 +
-+static int __devexit iio_dummy_remove(struct device *dev)
++static int __devexit uio_dummy_remove(struct device *dev)
 +{
 +	pr_debug("%s\n", __FUNCTION__);
-+	sigqueue_free(iio_dummy_signal.sigq);
-+	iio_dummy_signal.sigq = NULL;
++	sigqueue_free(uio_dummy_signal.sigq);
++	uio_dummy_signal.sigq = NULL;
 +
 +	return 0;
 +}
 +
-+static void iio_dummy_shutdown(struct device *dev)
++static void uio_dummy_shutdown(struct device *dev)
 +{
 +	pr_debug("%s\n", __FUNCTION__);
 +}
 +
-+struct platform_device *iio_dummy_device;
++struct platform_device *uio_dummy_device;
 +
-+static struct device_driver iio_dummy_driver = {
-+	.name		= "iio_dummy",
++static struct device_driver uio_dummy_driver = {
++	.name		= "uio_dummy",
 +	.bus		= &platform_bus_type,
-+	.probe		= iio_dummy_probe,
-+	.remove		= __devexit_p(iio_dummy_remove),
-+	.shutdown	= iio_dummy_shutdown,
++	.probe		= uio_dummy_probe,
++	.remove		= __devexit_p(uio_dummy_remove),
++	.shutdown	= uio_dummy_shutdown,
 +};
 +
 +/*
 + * Main initialization/remove routines
 + */
 +
-+static int __init iio_dummy_init(void)
++static int __init uio_dummy_init(void)
 +{
 +	int ret;
 +
 +	pr_debug("%s\n", __FUNCTION__);
 +
-+	iio_dummy_device = platform_device_register_simple("iio_dummy", -1,
++	uio_dummy_device = platform_device_register_simple("uio_dummy", -1,
 +							   NULL, 0);
-+	if (IS_ERR(iio_dummy_device)) {
-+		ret = PTR_ERR(iio_dummy_device);
++	if (IS_ERR(uio_dummy_device)) {
++		ret = PTR_ERR(uio_dummy_device);
 +		goto out;
 +	}
 +
-+	ret = device_create_file(&iio_dummy_device->dev, &dev_attr_count);
++	ret = device_create_file(&uio_dummy_device->dev, &dev_attr_count);
 +	if (ret)
 +		goto error_register;
-+	ret = device_create_file(&iio_dummy_device->dev, &dev_attr_freq);
++	ret = device_create_file(&uio_dummy_device->dev, &dev_attr_freq);
 +	if (ret)
 +		goto error_file_count;
-+	ret = device_create_file(&iio_dummy_device->dev, &dev_attr_sig_pid);
++	ret = device_create_file(&uio_dummy_device->dev, &dev_attr_sig_pid);
 +	if (ret)
 +		goto error_file_freq;
 +
-+	ret = driver_register(&iio_dummy_driver);
++	ret = driver_register(&uio_dummy_driver);
 +	if (ret)
 +		goto error_file_sig;
 +
 +	goto out;
 +
 +error_file_sig:
-+	device_remove_file(&iio_dummy_device->dev, &dev_attr_sig_pid);
++	device_remove_file(&uio_dummy_device->dev, &dev_attr_sig_pid);
 +error_file_freq:
-+	device_remove_file(&iio_dummy_device->dev, &dev_attr_freq);
++	device_remove_file(&uio_dummy_device->dev, &dev_attr_freq);
 +error_file_count:
-+	device_remove_file(&iio_dummy_device->dev, &dev_attr_count);
++	device_remove_file(&uio_dummy_device->dev, &dev_attr_count);
 +error_register:
-+	platform_device_unregister(iio_dummy_device);
++	platform_device_unregister(uio_dummy_device);
 +out:
 +	return ret;
 +}
 +
-+void __exit iio_dummy_exit(void)
++void __exit uio_dummy_exit(void)
 +{
 +	pr_debug("%s\n", __FUNCTION__);
 +
-+	iio_unregister_device((int) iio_dummy_device->dev.driver_data);
-+	kfree((void *) iio_dummy_idev.physaddr);
++	uio_unregister_device((int) uio_dummy_device->dev.driver_data);
++	kfree((void *) uio_dummy_idev.physaddr);
 +
-+	platform_device_unregister(iio_dummy_device);
-+	driver_unregister(&iio_dummy_driver);
++	platform_device_unregister(uio_dummy_device);
++	driver_unregister(&uio_dummy_driver);
 +}
 +
-+module_init(iio_dummy_init);
-+module_exit(iio_dummy_exit);
++module_init(uio_dummy_init);
++module_exit(uio_dummy_exit);
 +
 +MODULE_LICENSE("GPL");
 +MODULE_AUTHOR("Benedikt Spranger");
-+MODULE_DESCRIPTION("IIO dummy driver");
++MODULE_DESCRIPTION("UIO dummy driver");
 --- /dev/null
-+++ gregkh-2.6/include/linux/iio.h
-@@ -0,0 +1,108 @@
++++ gregkh-2.6/include/linux/uio_driver.h
+@@ -0,0 +1,106 @@
 +/*
-+ * include/linux/iio.h
++ * include/linux/uio_driver.h
 + *
 + * Copyright(C) 2005, Benedikt Spranger <b.spranger@linutronix.de>
 + * Copyright(C) 2005, Thomas Gleixner <tglx@linutronix.de>
 + *
-+ * Industrial IO
-+ *
-+ * header
++ * Userspace IO driver.
 + *
 + * Licensed under the GPLv2 only.
 + */
 +
-+#ifndef _LINUX_IIO_H_
-+#define _LINUX_IIO_H_
++#ifndef _UIO_DRIVER_H_
++#define _UIO_DRIVER_H_
 +#include <linux/fs.h>
 +#include <linux/cdev.h>
 +#include <linux/device.h>
@@ -1186,14 +1187,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#include <linux/timer.h>
 +#include <linux/wait.h>
 +
-+enum iio_irq_type {
-+	IIO_EVENT,
-+	IIO_THREADED,
-+	IIO_NODELAY,
++enum uio_irq_type {
++	UIO_EVENT,
++	UIO_THREADED,
++	UIO_NODELAY,
 +};
 +
 +/*
-+ * iio_device - IIO device capabilities
++ * uio_device - UIO device capabilities
 + *
 + * @name:		device name
 + * @version:		device driver version
@@ -1210,7 +1211,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + * irq_type:		interrupt type
 + */
 +
-+struct iio_device {
++struct uio_device {
 +	/* internals */
 +	struct device           dev;
 +	struct cdev		cdev;
@@ -1238,7 +1239,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	long			irq;
 +	long			freq;
 +	ktime_t			next_event;
-+	enum iio_irq_type	irq_type;
++	enum uio_irq_type	irq_type;
 +
 +	/* callbacks */
 +	irqreturn_t (*handler)(int irq, void *dev_id, struct pt_regs *regs);
@@ -1252,57 +1253,23 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	void			*priv;
 +};
 +
-+int iio_register_device(struct device *parent, struct iio_device *idev);
-+int iio_unregister_device(int dev_nr);
++int uio_register_device(struct device *parent, struct uio_device *idev);
++int uio_unregister_device(int dev_nr);
 +
-+#define to_iio_device(n) container_of(n, struct iio_device, dev)
++#define to_uio_device(n) container_of(n, struct uio_device, dev)
 +
 +/* char device funktions */
 +
-+loff_t iio_lseek(struct file *filep, loff_t offset, int orig);
-+ssize_t iio_read(struct file *filep, char __user *buf, size_t count, loff_t *ppos);
-+ssize_t iio_write(struct file *filep, const char __user * buf, size_t count,
++loff_t uio_lseek(struct file *filep, loff_t offset, int orig);
++ssize_t uio_read(struct file *filep, char __user *buf, size_t count, loff_t *ppos);
++ssize_t uio_write(struct file *filep, const char __user * buf, size_t count,
 +		   loff_t *ppos);
-+int iio_open(struct inode *inode, struct file *filep);
-+int iio_mmap(struct file *filep, struct vm_area_struct *vma);
-+int iio_release(struct inode *inode, struct file *filep);
++int uio_open(struct inode *inode, struct file *filep);
++int uio_mmap(struct file *filep, struct vm_area_struct *vma);
++int uio_release(struct inode *inode, struct file *filep);
 +
 +/* event */
-+irqreturn_t iio_interrupt(int irq, void *dev_id, struct pt_regs *regs);
-+extern struct file_operations iio_event_fops;
++irqreturn_t uio_interrupt(int irq, void *dev_id, struct pt_regs *regs);
++extern struct file_operations uio_event_fops;
 +
-+#endif /* _LINUX_IIO_H_ */
---- gregkh-2.6.orig/kernel/signal.c
-+++ gregkh-2.6/kernel/signal.c
-@@ -1296,6 +1296,7 @@ struct sigqueue *sigqueue_alloc(void)
- 		q->flags |= SIGQUEUE_PREALLOC;
- 	return(q);
- }
-+EXPORT_SYMBOL_GPL(sigqueue_alloc);
- 
- void sigqueue_free(struct sigqueue *q)
- {
-@@ -1317,6 +1318,7 @@ void sigqueue_free(struct sigqueue *q)
- 	q->flags &= ~SIGQUEUE_PREALLOC;
- 	__sigqueue_free(q);
- }
-+EXPORT_SYMBOL_GPL(sigqueue_free);
- 
- int send_sigqueue(int sig, struct sigqueue *q, struct task_struct *p)
- {
-@@ -1367,6 +1369,7 @@ out_err:
- 
- 	return ret;
- }
-+EXPORT_SYMBOL_GPL(send_sigqueue);
- 
- int
- send_group_sigqueue(int sig, struct sigqueue *q, struct task_struct *p)
-@@ -1412,6 +1415,7 @@ out:
- 	read_unlock(&tasklist_lock);
- 	return ret;
- }
-+EXPORT_SYMBOL_GPL(send_group_sigqueue);
- 
- /*
-  * Wake up any threads in the parent blocked in wait* syscalls.
++#endif /* _LINUX_UIO_DRIVER_H_ */
