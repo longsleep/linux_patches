@@ -1,0 +1,367 @@
+From kay.sievers@vrfy.org  Thu Sep 14 02:27:10 2006
+Subject: CONFIG_SYSFS_DEPRECATED
+From: Kay Sievers <kay.sievers@vrfy.org>
+To: greg@kroah.com
+Date: Thu, 14 Sep 2006 11:23:28 +0200
+Message-Id: <1158225809.3167.8.camel@min.off.vrfy.org>
+
+Provide a way to turn off the compatible symlink stuff
+
+
+Signed-off-by: Kay Sievers <kay.sievers@vrfy.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/base/bus.c   |   20 +++++++++-
+ drivers/base/class.c |   93 +++++++++++++++++++++++++++++++--------------------
+ drivers/base/core.c  |   28 +++++++++++++--
+ init/Kconfig         |   11 ++++++
+ 4 files changed, 110 insertions(+), 42 deletions(-)
+
+--- gregkh-2.6.orig/drivers/base/bus.c
++++ gregkh-2.6/drivers/base/bus.c
+@@ -355,6 +355,21 @@ static void device_remove_attrs(struct b
+ 	}
+ }
+ 
++#ifdef CONFIG_SYSFS_DEPRECATED
++static int make_deprecated_bus_links(struct device *dev)
++{
++	return sysfs_create_link(&dev->kobj,
++				 &dev->bus->subsys.kset.kobj, "bus");
++}
++
++static int remove_deprecated_bus_links(struct device *dev)
++{
++		sysfs_remove_link(&dev->kobj, "bus");
++}
++#else
++static inline int make_deprecated_bus_links(struct device *dev) { return 0; }
++static inline int remove_deprecated_bus_links(struct device *dev) { return 0; }
++#endif
+ 
+ /**
+  *	bus_add_device - add device to bus
+@@ -381,8 +396,7 @@ int bus_add_device(struct device * dev)
+ 				&dev->bus->subsys.kset.kobj, "subsystem");
+ 		if (error)
+ 			goto out;
+-		error = sysfs_create_link(&dev->kobj,
+-				&dev->bus->subsys.kset.kobj, "bus");
++		error = make_deprecated_bus_links(dev);
+ 	}
+ out:
+ 	return error;
+@@ -422,7 +436,7 @@ void bus_remove_device(struct device * d
+ {
+ 	if (dev->bus) {
+ 		sysfs_remove_link(&dev->kobj, "subsystem");
+-		sysfs_remove_link(&dev->kobj, "bus");
++		remove_deprecated_bus_links(dev);
+ 		sysfs_remove_link(&dev->bus->devices.kobj, dev->bus_id);
+ 		device_remove_attrs(dev->bus, dev);
+ 		klist_remove(&dev->knode_bus);
+--- gregkh-2.6.orig/drivers/base/class.c
++++ gregkh-2.6/drivers/base/class.c
+@@ -350,16 +350,26 @@ static const char *class_uevent_name(str
+ 	return class_dev->class->name;
+ }
+ 
+-static int class_uevent(struct kset *kset, struct kobject *kobj, char **envp,
+-			 int num_envp, char *buffer, int buffer_size)
++#ifdef CONFIG_SYSFS_DEPRECATED
++char *make_class_name(const char *name, struct kobject *kobj)
+ {
+-	struct class_device *class_dev = to_class_dev(kobj);
+-	int i = 0;
+-	int length = 0;
+-	int retval = 0;
++	char *class_name;
++	int size;
+ 
+-	pr_debug("%s - name = %s\n", __FUNCTION__, class_dev->class_id);
++	size = strlen(name) + strlen(kobject_name(kobj)) + 2;
+ 
++	class_name = kmalloc(size, GFP_KERNEL);
++	if (!class_name)
++		return ERR_PTR(-ENOMEM);
++
++	strcpy(class_name, name);
++	strcat(class_name, ":");
++	strcat(class_name, kobject_name(kobj));
++	return class_name;
++}
++
++static void deprecated_class_uevent(struct class_device *class_dev)
++{
+ 	if (class_dev->dev) {
+ 		/* add device, backing this class device (deprecated) */
+ 		struct device *dev = class_dev->dev;
+@@ -379,6 +389,39 @@ static int class_uevent(struct kset *kse
+ 				       buffer, buffer_size, &length,
+ 				       "PHYSDEVDRIVER=%s", dev->driver->name);
+ 	}
++}
++
++static int make_deprecated_class_device_links(struct class_device *class_dev)
++{
++	char *class_name;
++	int error;
++
++	if (!class_dev->dev)
++		return 0;
++
++	class_name = make_class_name(class_dev->class->name, &class_dev->kobj);
++	error = sysfs_create_link(&class_dev->dev->kobj, &class_dev->kobj,
++				  class_name);
++	kfree(class_name);
++	return error;
++}
++#else
++static inline void deprecated_class_uevent(struct class_device *class_dev) { }
++static inline int make_deprecated_class_device_links(struct class_device *cd)
++{ return 0; }
++#endif
++
++static int class_uevent(struct kset *kset, struct kobject *kobj, char **envp,
++			 int num_envp, char *buffer, int buffer_size)
++{
++	struct class_device *class_dev = to_class_dev(kobj);
++	int i = 0;
++	int length = 0;
++	int retval = 0;
++
++	pr_debug("%s - name = %s\n", __FUNCTION__, class_dev->class_id);
++
++	deprecated_class_uevent(class_dev);
+ 
+ 	if (MAJOR(class_dev->devt)) {
+ 		add_uevent_var(envp, num_envp, &i,
+@@ -504,29 +547,11 @@ void class_device_initialize(struct clas
+ 	INIT_LIST_HEAD(&class_dev->node);
+ }
+ 
+-char *make_class_name(const char *name, struct kobject *kobj)
+-{
+-	char *class_name;
+-	int size;
+-
+-	size = strlen(name) + strlen(kobject_name(kobj)) + 2;
+-
+-	class_name = kmalloc(size, GFP_KERNEL);
+-	if (!class_name)
+-		return ERR_PTR(-ENOMEM);
+-
+-	strcpy(class_name, name);
+-	strcat(class_name, ":");
+-	strcat(class_name, kobject_name(kobj));
+-	return class_name;
+-}
+-
+ int class_device_add(struct class_device *class_dev)
+ {
+ 	struct class *parent_class = NULL;
+ 	struct class_device *parent_class_dev = NULL;
+ 	struct class_interface *class_intf;
+-	char *class_name = NULL;
+ 	int error = -EINVAL;
+ 
+ 	class_dev = class_device_get(class_dev);
+@@ -594,20 +619,18 @@ int class_device_add(struct class_device
+ 		goto out5;
+ 
+ 	if (class_dev->dev) {
+-		class_name = make_class_name(class_dev->class->name,
+-					     &class_dev->kobj);
+ 		error = sysfs_create_link(&class_dev->kobj,
+ 					  &class_dev->dev->kobj, "device");
+ 		if (error)
+ 			goto out6;
+-		error = sysfs_create_link(&class_dev->dev->kobj, &class_dev->kobj,
+-					  class_name);
+-		if (error)
+-			goto out7;
+ 	}
+ 
+ 	error = class_device_add_groups(class_dev);
+ 	if (error)
++		goto out7;
++
++	error = make_deprecated_class_device_links(class_dev);
++	if (error)
+ 		goto out8;
+ 
+ 	kobject_uevent(&class_dev->kobj, KOBJ_ADD);
+@@ -624,8 +647,7 @@ int class_device_add(struct class_device
+ 	goto out1;
+ 
+  out8:
+-	if (class_dev->dev)
+-		sysfs_remove_link(&class_dev->kobj, class_name);
++	class_device_remove_groups(class_dev);
+  out7:
+ 	if (class_dev->dev)
+ 		sysfs_remove_link(&class_dev->kobj, "device");
+@@ -644,7 +666,6 @@ int class_device_add(struct class_device
+ 	class_put(parent_class);
+  out1:
+ 	class_device_put(class_dev);
+-	kfree(class_name);
+ 	return error;
+ }
+ 
+@@ -733,10 +754,12 @@ void class_device_del(struct class_devic
+ 	}
+ 
+ 	if (class_dev->dev) {
++#ifdef CONFIG_SYSFS_DEPRECATED
+ 		class_name = make_class_name(class_dev->class->name,
+ 					     &class_dev->kobj);
+-		sysfs_remove_link(&class_dev->kobj, "device");
+ 		sysfs_remove_link(&class_dev->dev->kobj, class_name);
++#endif
++		sysfs_remove_link(&class_dev->kobj, "device");
+ 	}
+ 	sysfs_remove_link(&class_dev->kobj, "subsystem");
+ 	class_device_remove_file(class_dev, &class_dev->uevent_attr);
+--- gregkh-2.6.orig/drivers/base/core.c
++++ gregkh-2.6/drivers/base/core.c
+@@ -153,20 +153,24 @@ static int dev_uevent(struct kset *kset,
+ 			       "MINOR=%u", MINOR(dev->devt));
+ 	}
+ 
++#ifdef CONFIG_SYSFS_DEPRECATED
+ 	/* add bus name (same as SUBSYSTEM, deprecated) */
+ 	if (dev->bus)
+ 		add_uevent_var(envp, num_envp, &i,
+ 			       buffer, buffer_size, &length,
+ 			       "PHYSDEVBUS=%s", dev->bus->name);
++#endif
+ 
+ 	/* add driver name (PHYSDEV* values are deprecated)*/
+ 	if (dev->driver) {
+ 		add_uevent_var(envp, num_envp, &i,
+ 			       buffer, buffer_size, &length,
+ 			       "DRIVER=%s", dev->driver->name);
++#ifdef CONFIG_SYSFS_DEPRECATED
+ 		add_uevent_var(envp, num_envp, &i,
+ 			       buffer, buffer_size, &length,
+ 			       "PHYSDEVDRIVER=%s", dev->driver->name);
++#endif
+ 	}
+ 
+ 	/* terminate, set to next free slot, shrink available space */
+@@ -435,11 +439,13 @@ int device_add(struct device *dev)
+ 				  "subsystem");
+ 		sysfs_create_link(&dev->class->subsys.kset.kobj, &dev->kobj,
+ 				  dev->bus_id);
++#ifdef CONFIG_SYSFS_DEPRECATED
+ 		if ((parent) && (!device_is_virtual(dev))) {
+ 			sysfs_create_link(&dev->kobj, &dev->parent->kobj, "device");
+ 			class_name = make_class_name(dev->class->name, &dev->kobj);
+ 			sysfs_create_link(&dev->parent->kobj, &dev->kobj, class_name);
+ 		}
++#endif
+ 	}
+ 
+ 	if ((error = device_add_attrs(dev)))
+@@ -553,7 +559,6 @@ void put_device(struct device * dev)
+ void device_del(struct device * dev)
+ {
+ 	struct device * parent = dev->parent;
+-	char *class_name = NULL;
+ 	struct class_interface *class_intf;
+ 
+ 	if (parent)
+@@ -563,12 +568,18 @@ void device_del(struct device * dev)
+ 	if (dev->class) {
+ 		sysfs_remove_link(&dev->kobj, "subsystem");
+ 		sysfs_remove_link(&dev->class->subsys.kset.kobj, dev->bus_id);
+-		class_name = make_class_name(dev->class->name, &dev->kobj);
+ 		if ((parent) && (!device_is_virtual(dev))) {
+-			sysfs_remove_link(&dev->kobj, "device");
++#ifdef CONFIG_SYSFS_DEPRECATED
++			char *class_name = NULL;
++
++			class_name = make_class_name(dev->class->name, &dev->kobj);
+ 			sysfs_remove_link(&dev->parent->kobj, class_name);
++			kfree(class_name);
++#endif
++			sysfs_remove_link(&dev->kobj, "device");
+ 		}
+-		kfree(class_name);
++		sysfs_remove_link(&dev->kobj, "subsystem");
++		sysfs_remove_link(&dev->class->subsys.kset.kobj, dev->bus_id);
+ 		down(&dev->class->sem);
+ 		/* notify any interfaces that the device is now gone */
+ 		list_for_each_entry(class_intf, &dev->class->interfaces, node)
+@@ -763,8 +774,10 @@ EXPORT_SYMBOL_GPL(device_destroy);
+  */
+ int device_rename(struct device *dev, char *new_name)
+ {
++#ifdef CONFIG_SYSFS_DEPRECATED
+ 	char *old_class_name = NULL;
+ 	char *new_class_name = NULL;
++#endif
+ 	char *old_symlink_name = NULL;
+ 	int error;
+ 
+@@ -774,8 +787,10 @@ int device_rename(struct device *dev, ch
+ 
+ 	pr_debug("DEVICE: renaming '%s' to '%s'\n", dev->bus_id, new_name);
+ 
++#ifdef CONFIG_SYSFS_DEPRECATED
+ 	if ((dev->class) && (dev->parent))
+ 		old_class_name = make_class_name(dev->class->name, &dev->kobj);
++#endif
+ 
+ 	if (dev->class) {
+ 		old_symlink_name = kmalloc(BUS_ID_SIZE, GFP_KERNEL);
+@@ -788,6 +803,7 @@ int device_rename(struct device *dev, ch
+ 
+ 	error = kobject_rename(&dev->kobj, new_name);
+ 
++#ifdef CONFIG_SYSFS_DEPRECATED
+ 	if (old_class_name) {
+ 		new_class_name = make_class_name(dev->class->name, &dev->kobj);
+ 		if (new_class_name) {
+@@ -796,6 +812,8 @@ int device_rename(struct device *dev, ch
+ 			sysfs_remove_link(&dev->parent->kobj, old_class_name);
+ 		}
+ 	}
++#endif
++
+ 	if (dev->class) {
+ 		sysfs_remove_link(&dev->class->subsys.kset.kobj,
+ 				  old_symlink_name);
+@@ -804,8 +822,10 @@ int device_rename(struct device *dev, ch
+ 	}
+ 	put_device(dev);
+ 
++#ifdef CONFIG_SYSFS_DEPRECATED
+ 	kfree(old_class_name);
+ 	kfree(new_class_name);
++#endif
+ 	kfree(old_symlink_name);
+ 
+ 	return error;
+--- gregkh-2.6.orig/init/Kconfig
++++ gregkh-2.6/init/Kconfig
+@@ -248,6 +248,17 @@ config CPUSETS
+ 
+ 	  Say N if unsure.
+ 
++config SYSFS_DEPRECATED
++	bool "Include deprecated sysfs files and driver core features"
++	help
++	  This option lets the kernel create deprecated symlinks such
++	  as the "device"-link, the <subsystem>:<name>-link, and the
++	  "bus"-link. It may also inlcude deprecated properties in the
++	  uevent environment.
++	  None of these features or values should be used today, as
++	  they export driver core implementation details or export
++	  properties which can't be kept stable across kernel releases.
++
+ config RELAY
+ 	bool "Kernel->user space relay support (formerly relayfs)"
+ 	help
