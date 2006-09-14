@@ -1,0 +1,754 @@
+From kay.sievers@vrfy.org  Wed Sep 13 22:59:01 2006
+Date: Wed, 13 Sep 2006 16:11:35 +0200
+From: Kay Sievers <kay.sievers@vrfy.org>
+To: Greg KH <greg@kroah.com>
+Subject: Driver core: convert input core to use struct device
+
+From: Kay Sievers <kay.sievers@vrfy.org>
+
+Converts from using struct "class_device" to "struct device" making
+everything show up properly in /sys/devices/ with symlinks from the
+/sys/class directory.
+
+Signed-off-by: Kay Sievers <kay.sievers@vrfy.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/hwmon/hdaps.c              |    2 
+ drivers/input/evdev.c              |   12 +---
+ drivers/input/input.c              |  111 +++++++++++++++++++++----------------
+ drivers/input/joydev.c             |   12 +---
+ drivers/input/keyboard/atkbd.c     |    2 
+ drivers/input/misc/pcspkr.c        |    2 
+ drivers/input/misc/wistron_btns.c  |    2 
+ drivers/input/mouse/psmouse-base.c |    2 
+ drivers/input/mousedev.c           |   18 ++----
+ drivers/input/tsdev.c              |   12 +---
+ drivers/usb/input/acecad.c         |    2 
+ drivers/usb/input/aiptek.c         |    2 
+ drivers/usb/input/appletouch.c     |    2 
+ drivers/usb/input/ati_remote.c     |    2 
+ drivers/usb/input/ati_remote2.c    |    2 
+ drivers/usb/input/hid-input.c      |    2 
+ drivers/usb/input/itmtouch.c       |    2 
+ drivers/usb/input/kbtab.c          |    2 
+ drivers/usb/input/keyspan_remote.c |    2 
+ drivers/usb/input/mtouchusb.c      |    2 
+ drivers/usb/input/powermate.c      |    2 
+ drivers/usb/input/touchkitusb.c    |    2 
+ drivers/usb/input/usbkbd.c         |    2 
+ drivers/usb/input/usbmouse.c       |    2 
+ drivers/usb/input/usbtouchscreen.c |    2 
+ drivers/usb/input/xpad.c           |    2 
+ drivers/usb/input/yealink.c        |    2 
+ include/linux/input.h              |    9 +--
+ 28 files changed, 104 insertions(+), 114 deletions(-)
+
+--- gregkh-2.6.orig/drivers/hwmon/hdaps.c
++++ gregkh-2.6/drivers/hwmon/hdaps.c
+@@ -580,7 +580,7 @@ static int __init hdaps_init(void)
+ 
+ 	/* initialize the input class */
+ 	hdaps_idev->name = "hdaps";
+-	hdaps_idev->cdev.dev = &pdev->dev;
++	hdaps_idev->d.parent = &pdev->dev;
+ 	hdaps_idev->evbit[0] = BIT(EV_ABS);
+ 	input_set_abs_params(hdaps_idev, ABS_X,
+ 			-256, 256, HDAPS_INPUT_FUZZ, HDAPS_INPUT_FLAT);
+--- gregkh-2.6.orig/drivers/input/evdev.c
++++ gregkh-2.6/drivers/input/evdev.c
+@@ -622,7 +622,6 @@ static struct file_operations evdev_fops
+ static struct input_handle *evdev_connect(struct input_handler *handler, struct input_dev *dev, struct input_device_id *id)
+ {
+ 	struct evdev *evdev;
+-	struct class_device *cdev;
+ 	int minor;
+ 
+ 	for (minor = 0; minor < EVDEV_MINORS && evdev_table[minor]; minor++);
+@@ -647,13 +646,9 @@ static struct input_handle *evdev_connec
+ 
+ 	evdev_table[minor] = evdev;
+ 
+-	cdev = class_device_create(&input_class, &dev->cdev,
++	device_create(&input_class, &dev->d,
+ 			MKDEV(INPUT_MAJOR, EVDEV_MINOR_BASE + minor),
+-			dev->cdev.dev, evdev->name);
+-
+-	/* temporary symlink to keep userspace happy */
+-	sysfs_create_link(&input_class.subsys.kset.kobj, &cdev->kobj,
+-			  evdev->name);
++			evdev->name);
+ 
+ 	return &evdev->handle;
+ }
+@@ -663,8 +658,7 @@ static void evdev_disconnect(struct inpu
+ 	struct evdev *evdev = handle->private;
+ 	struct evdev_list *list;
+ 
+-	sysfs_remove_link(&input_class.subsys.kset.kobj, evdev->name);
+-	class_device_destroy(&input_class,
++	device_destroy(&input_class,
+ 			MKDEV(INPUT_MAJOR, EVDEV_MINOR_BASE + evdev->minor));
+ 	evdev->exist = 0;
+ 
+--- gregkh-2.6.orig/drivers/input/input.c
++++ gregkh-2.6/drivers/input/input.c
+@@ -426,7 +426,7 @@ static void input_seq_print_bitmap(struc
+ static int input_devices_seq_show(struct seq_file *seq, void *v)
+ {
+ 	struct input_dev *dev = container_of(v, struct input_dev, node);
+-	const char *path = kobject_get_path(&dev->cdev.kobj, GFP_KERNEL);
++	const char *path = kobject_get_path(&dev->d.kobj, GFP_KERNEL);
+ 	struct input_handle *handle;
+ 
+ 	seq_printf(seq, "I: Bus=%04x Vendor=%04x Product=%04x Version=%04x\n",
+@@ -581,7 +581,9 @@ static inline void input_proc_exit(void)
+ #endif
+ 
+ #define INPUT_DEV_STRING_ATTR_SHOW(name)					\
+-static ssize_t input_dev_show_##name(struct class_device *dev, char *buf)	\
++static ssize_t input_dev_show_##name(struct device *dev,			\
++				     struct device_attribute *attr,		\
++				     char *buf)					\
+ {										\
+ 	struct input_dev *input_dev = to_input_dev(dev);			\
+ 	int retval;								\
+@@ -597,7 +599,7 @@ static ssize_t input_dev_show_##name(str
+ 										\
+ 	return retval;								\
+ }										\
+-static CLASS_DEVICE_ATTR(name, S_IRUGO, input_dev_show_##name, NULL);
++static DEVICE_ATTR(name, S_IRUGO, input_dev_show_##name, NULL);
+ 
+ INPUT_DEV_STRING_ATTR_SHOW(name);
+ INPUT_DEV_STRING_ATTR_SHOW(phys);
+@@ -651,7 +653,9 @@ static int input_print_modalias(char *bu
+ 	return len;
+ }
+ 
+-static ssize_t input_dev_show_modalias(struct class_device *dev, char *buf)
++static ssize_t input_dev_show_modalias(struct device *dev,
++				       struct device_attribute *attr,
++				       char *buf)
+ {
+ 	struct input_dev *id = to_input_dev(dev);
+ 	ssize_t len;
+@@ -660,13 +664,13 @@ static ssize_t input_dev_show_modalias(s
+ 
+ 	return min_t(int, len, PAGE_SIZE);
+ }
+-static CLASS_DEVICE_ATTR(modalias, S_IRUGO, input_dev_show_modalias, NULL);
++static DEVICE_ATTR(modalias, S_IRUGO, input_dev_show_modalias, NULL);
+ 
+ static struct attribute *input_dev_attrs[] = {
+-	&class_device_attr_name.attr,
+-	&class_device_attr_phys.attr,
+-	&class_device_attr_uniq.attr,
+-	&class_device_attr_modalias.attr,
++	&dev_attr_name.attr,
++	&dev_attr_phys.attr,
++	&dev_attr_uniq.attr,
++	&dev_attr_modalias.attr,
+ 	NULL
+ };
+ 
+@@ -675,12 +679,14 @@ static struct attribute_group input_dev_
+ };
+ 
+ #define INPUT_DEV_ID_ATTR(name)							\
+-static ssize_t input_dev_show_id_##name(struct class_device *dev, char *buf)	\
++static ssize_t input_dev_show_id_##name(struct device *dev,			\
++					struct device_attribute *attr,		\
++					char *buf)				\
+ {										\
+ 	struct input_dev *input_dev = to_input_dev(dev);			\
+ 	return scnprintf(buf, PAGE_SIZE, "%04x\n", input_dev->id.name);		\
+ }										\
+-static CLASS_DEVICE_ATTR(name, S_IRUGO, input_dev_show_id_##name, NULL);
++static DEVICE_ATTR(name, S_IRUGO, input_dev_show_id_##name, NULL);
+ 
+ INPUT_DEV_ID_ATTR(bustype);
+ INPUT_DEV_ID_ATTR(vendor);
+@@ -688,10 +694,10 @@ INPUT_DEV_ID_ATTR(product);
+ INPUT_DEV_ID_ATTR(version);
+ 
+ static struct attribute *input_dev_id_attrs[] = {
+-	&class_device_attr_bustype.attr,
+-	&class_device_attr_vendor.attr,
+-	&class_device_attr_product.attr,
+-	&class_device_attr_version.attr,
++	&dev_attr_bustype.attr,
++	&dev_attr_vendor.attr,
++	&dev_attr_product.attr,
++	&dev_attr_version.attr,
+ 	NULL
+ };
+ 
+@@ -721,14 +727,16 @@ static int input_print_bitmap(char *buf,
+ }
+ 
+ #define INPUT_DEV_CAP_ATTR(ev, bm)						\
+-static ssize_t input_dev_show_cap_##bm(struct class_device *dev, char *buf)	\
++static ssize_t input_dev_show_cap_##bm(struct device *dev,			\
++				       struct device_attribute *attr,		\
++				       char *buf)				\
+ {										\
+ 	struct input_dev *input_dev = to_input_dev(dev);			\
+ 	int len = input_print_bitmap(buf, PAGE_SIZE,				\
+ 				     input_dev->bm##bit, ev##_MAX, 1);		\
+ 	return min_t(int, len, PAGE_SIZE);					\
+ }										\
+-static CLASS_DEVICE_ATTR(bm, S_IRUGO, input_dev_show_cap_##bm, NULL);
++static DEVICE_ATTR(bm, S_IRUGO, input_dev_show_cap_##bm, NULL);
+ 
+ INPUT_DEV_CAP_ATTR(EV, ev);
+ INPUT_DEV_CAP_ATTR(KEY, key);
+@@ -741,15 +749,15 @@ INPUT_DEV_CAP_ATTR(FF, ff);
+ INPUT_DEV_CAP_ATTR(SW, sw);
+ 
+ static struct attribute *input_dev_caps_attrs[] = {
+-	&class_device_attr_ev.attr,
+-	&class_device_attr_key.attr,
+-	&class_device_attr_rel.attr,
+-	&class_device_attr_abs.attr,
+-	&class_device_attr_msc.attr,
+-	&class_device_attr_led.attr,
+-	&class_device_attr_snd.attr,
+-	&class_device_attr_ff.attr,
+-	&class_device_attr_sw.attr,
++	&dev_attr_ev.attr,
++	&dev_attr_key.attr,
++	&dev_attr_rel.attr,
++	&dev_attr_abs.attr,
++	&dev_attr_msc.attr,
++	&dev_attr_led.attr,
++	&dev_attr_snd.attr,
++	&dev_attr_ff.attr,
++	&dev_attr_sw.attr,
+ 	NULL
+ };
+ 
+@@ -758,9 +766,9 @@ static struct attribute_group input_dev_
+ 	.attrs	= input_dev_caps_attrs,
+ };
+ 
+-static void input_dev_release(struct class_device *class_dev)
++static void input_dev_release(struct device *d)
+ {
+-	struct input_dev *dev = to_input_dev(class_dev);
++	struct input_dev *dev = to_input_dev(d);
+ 
+ 	kfree(dev);
+ 	module_put(THIS_MODULE);
+@@ -845,16 +853,23 @@ static int input_add_uevent_modalias_var
+ 			return err;					\
+ 	} while (0)
+ 
+-static int input_dev_uevent(struct class_device *cdev, char **envp,
++static int input_dev_uevent(struct device *d, char **envp,
+ 			    int num_envp, char *buffer, int buffer_size)
+ {
+-	struct input_dev *dev = to_input_dev(cdev);
++	struct input_dev *dev;
+ 	int i = 0;
+ 	int len = 0;
+ 
++	/* input is a single class, this is only valid for input_dev's */
++	if (strncmp("input", kobject_name(&d->kobj), 5) != 0)
++		return 0;
++
++	dev = to_input_dev(d);
++
+ 	INPUT_ADD_HOTPLUG_VAR("PRODUCT=%x/%x/%x/%x",
+ 				dev->id.bustype, dev->id.vendor,
+ 				dev->id.product, dev->id.version);
++
+ 	if (dev->name)
+ 		INPUT_ADD_HOTPLUG_VAR("NAME=\"%s\"", dev->name);
+ 	if (dev->phys)
+@@ -888,8 +903,8 @@ static int input_dev_uevent(struct class
+ 
+ struct class input_class = {
+ 	.name			= "input",
+-	.release		= input_dev_release,
+-	.uevent			= input_dev_uevent,
++	.dev_release		= input_dev_release,
++	.dev_uevent		= input_dev_uevent,
+ };
+ EXPORT_SYMBOL_GPL(input_class);
+ 
+@@ -900,8 +915,8 @@ struct input_dev *input_allocate_device(
+ 	dev = kzalloc(sizeof(struct input_dev), GFP_KERNEL);
+ 	if (dev) {
+ 		dev->dynalloc = 1;
+-		dev->cdev.class = &input_class;
+-		class_device_initialize(&dev->cdev);
++		device_initialize(&dev->d);
++		dev->d.class = &input_class;
+ 		mutex_init(&dev->mutex);
+ 		INIT_LIST_HEAD(&dev->h_list);
+ 		INIT_LIST_HEAD(&dev->node);
+@@ -958,29 +973,29 @@ int input_register_device(struct input_d
+ 	INIT_LIST_HEAD(&dev->h_list);
+ 	list_add_tail(&dev->node, &input_dev_list);
+ 
+-	dev->cdev.class = &input_class;
+-	snprintf(dev->cdev.class_id, sizeof(dev->cdev.class_id),
++	dev->d.class = &input_class;
++	snprintf(dev->d.bus_id, sizeof(dev->d.bus_id),
+ 		 "input%ld", (unsigned long) atomic_inc_return(&input_no) - 1);
+ 
+-	error = class_device_add(&dev->cdev);
++	error = device_add(&dev->d);
+ 	if (error)
+ 		return error;
+ 
+-	error = sysfs_create_group(&dev->cdev.kobj, &input_dev_attr_group);
++	error = sysfs_create_group(&dev->d.kobj, &input_dev_attr_group);
+ 	if (error)
+ 		goto fail1;
+ 
+-	error = sysfs_create_group(&dev->cdev.kobj, &input_dev_id_attr_group);
++	error = sysfs_create_group(&dev->d.kobj, &input_dev_id_attr_group);
+ 	if (error)
+ 		goto fail2;
+ 
+-	error = sysfs_create_group(&dev->cdev.kobj, &input_dev_caps_attr_group);
++	error = sysfs_create_group(&dev->d.kobj, &input_dev_caps_attr_group);
+ 	if (error)
+ 		goto fail3;
+ 
+ 	__module_get(THIS_MODULE);
+ 
+-	path = kobject_get_path(&dev->cdev.kobj, GFP_KERNEL);
++	path = kobject_get_path(&dev->d.kobj, GFP_KERNEL);
+ 	printk(KERN_INFO "input: %s as %s\n",
+ 		dev->name ? dev->name : "Unspecified device", path ? path : "N/A");
+ 	kfree(path);
+@@ -998,9 +1013,9 @@ int input_register_device(struct input_d
+ 
+ 	return 0;
+ 
+- fail3:	sysfs_remove_group(&dev->cdev.kobj, &input_dev_id_attr_group);
+- fail2:	sysfs_remove_group(&dev->cdev.kobj, &input_dev_attr_group);
+- fail1:	class_device_del(&dev->cdev);
++ fail3:	sysfs_remove_group(&dev->d.kobj, &input_dev_id_attr_group);
++ fail2:	sysfs_remove_group(&dev->d.kobj, &input_dev_attr_group);
++ fail1:	device_del(&dev->d);
+ 	return error;
+ }
+ EXPORT_SYMBOL(input_register_device);
+@@ -1023,15 +1038,15 @@ void input_unregister_device(struct inpu
+ 
+ 	list_del_init(&dev->node);
+ 
+-	sysfs_remove_group(&dev->cdev.kobj, &input_dev_caps_attr_group);
+-	sysfs_remove_group(&dev->cdev.kobj, &input_dev_id_attr_group);
+-	sysfs_remove_group(&dev->cdev.kobj, &input_dev_attr_group);
++	sysfs_remove_group(&dev->d.kobj, &input_dev_caps_attr_group);
++	sysfs_remove_group(&dev->d.kobj, &input_dev_id_attr_group);
++	sysfs_remove_group(&dev->d.kobj, &input_dev_attr_group);
+ 
+ 	mutex_lock(&dev->mutex);
+ 	dev->name = dev->phys = dev->uniq = NULL;
+ 	mutex_unlock(&dev->mutex);
+ 
+-	class_device_unregister(&dev->cdev);
++	device_unregister(&dev->d);
+ 
+ 	input_wakeup_procfs_readers();
+ }
+--- gregkh-2.6.orig/drivers/input/joydev.c
++++ gregkh-2.6/drivers/input/joydev.c
+@@ -468,7 +468,6 @@ static struct file_operations joydev_fop
+ static struct input_handle *joydev_connect(struct input_handler *handler, struct input_dev *dev, struct input_device_id *id)
+ {
+ 	struct joydev *joydev;
+-	struct class_device *cdev;
+ 	int i, j, t, minor;
+ 
+ 	for (minor = 0; minor < JOYDEV_MINORS && joydev_table[minor]; minor++);
+@@ -533,13 +532,9 @@ static struct input_handle *joydev_conne
+ 
+ 	joydev_table[minor] = joydev;
+ 
+-	cdev = class_device_create(&input_class, &dev->cdev,
++	device_create(&input_class, &dev->d,
+ 			MKDEV(INPUT_MAJOR, JOYDEV_MINOR_BASE + minor),
+-			dev->cdev.dev, joydev->name);
+-
+-	/* temporary symlink to keep userspace happy */
+-	sysfs_create_link(&input_class.subsys.kset.kobj, &cdev->kobj,
+-			  joydev->name);
++			joydev->name);
+ 
+ 	return &joydev->handle;
+ }
+@@ -549,8 +544,7 @@ static void joydev_disconnect(struct inp
+ 	struct joydev *joydev = handle->private;
+ 	struct joydev_list *list;
+ 
+-	sysfs_remove_link(&input_class.subsys.kset.kobj, joydev->name);
+-	class_device_destroy(&input_class, MKDEV(INPUT_MAJOR, JOYDEV_MINOR_BASE + joydev->minor));
++	device_destroy(&input_class, MKDEV(INPUT_MAJOR, JOYDEV_MINOR_BASE + joydev->minor));
+ 	joydev->exist = 0;
+ 
+ 	if (joydev->open) {
+--- gregkh-2.6.orig/drivers/input/keyboard/atkbd.c
++++ gregkh-2.6/drivers/input/keyboard/atkbd.c
+@@ -865,7 +865,7 @@ static void atkbd_set_device_attrs(struc
+ 	input_dev->id.version = atkbd->id;
+ 	input_dev->event = atkbd_event;
+ 	input_dev->private = atkbd;
+-	input_dev->cdev.dev = &atkbd->ps2dev.serio->dev;
++	input_dev->d.parent = &atkbd->ps2dev.serio->dev;
+ 
+ 	input_dev->evbit[0] = BIT(EV_KEY) | BIT(EV_REP) | BIT(EV_MSC);
+ 
+--- gregkh-2.6.orig/drivers/input/misc/pcspkr.c
++++ gregkh-2.6/drivers/input/misc/pcspkr.c
+@@ -78,7 +78,7 @@ static int __devinit pcspkr_probe(struct
+ 	pcspkr_dev->id.vendor = 0x001f;
+ 	pcspkr_dev->id.product = 0x0001;
+ 	pcspkr_dev->id.version = 0x0100;
+-	pcspkr_dev->cdev.dev = &dev->dev;
++	pcspkr_dev->d.parent = &dev->dev;
+ 
+ 	pcspkr_dev->evbit[0] = BIT(EV_SND);
+ 	pcspkr_dev->sndbit[0] = BIT(SND_BELL) | BIT(SND_TONE);
+--- gregkh-2.6.orig/drivers/input/misc/wistron_btns.c
++++ gregkh-2.6/drivers/input/misc/wistron_btns.c
+@@ -447,7 +447,7 @@ static int __devinit setup_input_dev(voi
+ 	input_dev->name = "Wistron laptop buttons";
+ 	input_dev->phys = "wistron/input0";
+ 	input_dev->id.bustype = BUS_HOST;
+-	input_dev->cdev.dev = &wistron_device->dev;
++	input_dev->d.parent = &wistron_device->dev;
+ 
+ 	for (key = keymap; key->type != KE_END; key++) {
+ 		if (key->type == KE_KEY) {
+--- gregkh-2.6.orig/drivers/input/mouse/psmouse-base.c
++++ gregkh-2.6/drivers/input/mouse/psmouse-base.c
+@@ -1036,7 +1036,7 @@ static int psmouse_switch_protocol(struc
+ 	struct input_dev *input_dev = psmouse->dev;
+ 
+ 	input_dev->private = psmouse;
+-	input_dev->cdev.dev = &psmouse->ps2dev.serio->dev;
++	input_dev->d.parent = &psmouse->ps2dev.serio->dev;
+ 
+ 	input_dev->evbit[0] = BIT(EV_KEY) | BIT(EV_REL);
+ 	input_dev->keybit[LONG(BTN_MOUSE)] = BIT(BTN_LEFT) | BIT(BTN_MIDDLE) | BIT(BTN_RIGHT);
+--- gregkh-2.6.orig/drivers/input/mousedev.c
++++ gregkh-2.6/drivers/input/mousedev.c
+@@ -627,7 +627,6 @@ static struct file_operations mousedev_f
+ static struct input_handle *mousedev_connect(struct input_handler *handler, struct input_dev *dev, struct input_device_id *id)
+ {
+ 	struct mousedev *mousedev;
+-	struct class_device *cdev;
+ 	int minor = 0;
+ 
+ 	for (minor = 0; minor < MOUSEDEV_MINORS && mousedev_table[minor]; minor++);
+@@ -655,13 +654,9 @@ static struct input_handle *mousedev_con
+ 
+ 	mousedev_table[minor] = mousedev;
+ 
+-	cdev = class_device_create(&input_class, &dev->cdev,
++	device_create(&input_class, &dev->d,
+ 			MKDEV(INPUT_MAJOR, MOUSEDEV_MINOR_BASE + minor),
+-			dev->cdev.dev, mousedev->name);
+-
+-	/* temporary symlink to keep userspace happy */
+-	sysfs_create_link(&input_class.subsys.kset.kobj, &cdev->kobj,
+-			  mousedev->name);
++			mousedev->name);
+ 
+ 	return &mousedev->handle;
+ }
+@@ -671,8 +666,7 @@ static void mousedev_disconnect(struct i
+ 	struct mousedev *mousedev = handle->private;
+ 	struct mousedev_list *list;
+ 
+-	sysfs_remove_link(&input_class.subsys.kset.kobj, mousedev->name);
+-	class_device_destroy(&input_class,
++	device_destroy(&input_class,
+ 			MKDEV(INPUT_MAJOR, MOUSEDEV_MINOR_BASE + mousedev->minor));
+ 	mousedev->exist = 0;
+ 
+@@ -746,8 +740,8 @@ static int __init mousedev_init(void)
+ 	mousedev_mix.exist = 1;
+ 	mousedev_mix.minor = MOUSEDEV_MIX;
+ 
+-	class_device_create(&input_class, NULL,
+-			MKDEV(INPUT_MAJOR, MOUSEDEV_MINOR_BASE + MOUSEDEV_MIX), NULL, "mice");
++	device_create(&input_class, NULL,
++			MKDEV(INPUT_MAJOR, MOUSEDEV_MINOR_BASE + MOUSEDEV_MIX), "mice");
+ 
+ #ifdef CONFIG_INPUT_MOUSEDEV_PSAUX
+ 	if (!(psaux_registered = !misc_register(&psaux_mouse)))
+@@ -765,7 +759,7 @@ static void __exit mousedev_exit(void)
+ 	if (psaux_registered)
+ 		misc_deregister(&psaux_mouse);
+ #endif
+-	class_device_destroy(&input_class,
++	device_destroy(&input_class,
+ 			MKDEV(INPUT_MAJOR, MOUSEDEV_MINOR_BASE + MOUSEDEV_MIX));
+ 	input_unregister_handler(&mousedev_handler);
+ }
+--- gregkh-2.6.orig/drivers/input/tsdev.c
++++ gregkh-2.6/drivers/input/tsdev.c
+@@ -373,7 +373,6 @@ static struct input_handle *tsdev_connec
+ 					  struct input_device_id *id)
+ {
+ 	struct tsdev *tsdev;
+-	struct class_device *cdev;
+ 	int minor, delta;
+ 
+ 	for (minor = 0; minor < TSDEV_MINORS / 2 && tsdev_table[minor]; minor++);
+@@ -413,13 +412,9 @@ static struct input_handle *tsdev_connec
+ 
+ 	tsdev_table[minor] = tsdev;
+ 
+-	cdev = class_device_create(&input_class, &dev->cdev,
++	device_create(&input_class, &dev->d,
+ 			MKDEV(INPUT_MAJOR, TSDEV_MINOR_BASE + minor),
+-			dev->cdev.dev, tsdev->name);
+-
+-	/* temporary symlink to keep userspace happy */
+-	sysfs_create_link(&input_class.subsys.kset.kobj, &cdev->kobj,
+-			  tsdev->name);
++			tsdev->name);
+ 
+ 	return &tsdev->handle;
+ }
+@@ -429,8 +424,7 @@ static void tsdev_disconnect(struct inpu
+ 	struct tsdev *tsdev = handle->private;
+ 	struct tsdev_list *list;
+ 
+-	sysfs_remove_link(&input_class.subsys.kset.kobj, tsdev->name);
+-	class_device_destroy(&input_class,
++	device_destroy(&input_class,
+ 			MKDEV(INPUT_MAJOR, TSDEV_MINOR_BASE + tsdev->minor));
+ 	tsdev->exist = 0;
+ 
+--- gregkh-2.6.orig/drivers/usb/input/acecad.c
++++ gregkh-2.6/drivers/usb/input/acecad.c
+@@ -181,7 +181,7 @@ static int usb_acecad_probe(struct usb_i
+ 	input_dev->name = acecad->name;
+ 	input_dev->phys = acecad->phys;
+ 	usb_to_input_id(dev, &input_dev->id);
+-	input_dev->cdev.dev = &intf->dev;
++	input_dev->d.parent = &intf->dev;
+ 	input_dev->private = acecad;
+ 
+ 	input_dev->open = usb_acecad_open;
+--- gregkh-2.6.orig/drivers/usb/input/aiptek.c
++++ gregkh-2.6/drivers/usb/input/aiptek.c
+@@ -2055,7 +2055,7 @@ aiptek_probe(struct usb_interface *intf,
+ 	inputdev->name = "Aiptek";
+ 	inputdev->phys = aiptek->features.usbPath;
+ 	usb_to_input_id(usbdev, &inputdev->id);
+-	inputdev->cdev.dev = &intf->dev;
++	inputdev->d.parent = &intf->dev;
+ 	inputdev->private = aiptek;
+ 	inputdev->open = aiptek_open;
+ 	inputdev->close = aiptek_close;
+--- gregkh-2.6.orig/drivers/usb/input/appletouch.c
++++ gregkh-2.6/drivers/usb/input/appletouch.c
+@@ -529,7 +529,7 @@ static int atp_probe(struct usb_interfac
+ 	input_dev->name = "appletouch";
+ 	input_dev->phys = dev->phys;
+ 	usb_to_input_id(dev->udev, &input_dev->id);
+-	input_dev->cdev.dev = &iface->dev;
++	input_dev->d.parent = &iface->dev;
+ 
+ 	input_dev->private = dev;
+ 	input_dev->open = atp_open;
+--- gregkh-2.6.orig/drivers/usb/input/ati_remote.c
++++ gregkh-2.6/drivers/usb/input/ati_remote.c
+@@ -669,7 +669,7 @@ static void ati_remote_input_init(struct
+ 	idev->phys = ati_remote->phys;
+ 
+ 	usb_to_input_id(ati_remote->udev, &idev->id);
+-	idev->cdev.dev = &ati_remote->udev->dev;
++	idev->d.parent = &ati_remote->udev->dev;
+ }
+ 
+ static int ati_remote_initialize(struct ati_remote *ati_remote)
+--- gregkh-2.6.orig/drivers/usb/input/ati_remote2.c
++++ gregkh-2.6/drivers/usb/input/ati_remote2.c
+@@ -332,7 +332,7 @@ static int ati_remote2_input_init(struct
+ 	idev->phys = ar2->phys;
+ 
+ 	usb_to_input_id(ar2->udev, &idev->id);
+-	idev->cdev.dev = &ar2->udev->dev;
++	idev->d.parent = &ar2->udev->dev;
+ 
+ 	i = input_register_device(idev);
+ 	if (i)
+--- gregkh-2.6.orig/drivers/usb/input/hid-input.c
++++ gregkh-2.6/drivers/usb/input/hid-input.c
+@@ -826,7 +826,7 @@ int hidinput_connect(struct hid_device *
+ 				input_dev->phys = hid->phys;
+ 				input_dev->uniq = hid->uniq;
+ 				usb_to_input_id(dev, &input_dev->id);
+-				input_dev->cdev.dev = &hid->intf->dev;
++				input_dev->d.parent = &hid->intf->dev;
+ 
+ 				hidinput->input = input_dev;
+ 				list_add_tail(&hidinput->list, &hid->inputs);
+--- gregkh-2.6.orig/drivers/usb/input/itmtouch.c
++++ gregkh-2.6/drivers/usb/input/itmtouch.c
+@@ -184,7 +184,7 @@ static int itmtouch_probe(struct usb_int
+ 	input_dev->name = itmtouch->name;
+ 	input_dev->phys = itmtouch->phys;
+ 	usb_to_input_id(udev, &input_dev->id);
+-	input_dev->cdev.dev = &intf->dev;
++	input_dev->d.parent = &intf->dev;
+ 	input_dev->private = itmtouch;
+ 
+ 	input_dev->open = itmtouch_open;
+--- gregkh-2.6.orig/drivers/usb/input/kbtab.c
++++ gregkh-2.6/drivers/usb/input/kbtab.c
+@@ -145,7 +145,7 @@ static int kbtab_probe(struct usb_interf
+ 	input_dev->name = "KB Gear Tablet";
+ 	input_dev->phys = kbtab->phys;
+ 	usb_to_input_id(dev, &input_dev->id);
+-	input_dev->cdev.dev = &intf->dev;
++	input_dev->d.parent = &intf->dev;
+ 	input_dev->private = kbtab;
+ 
+ 	input_dev->open = kbtab_open;
+--- gregkh-2.6.orig/drivers/usb/input/keyspan_remote.c
++++ gregkh-2.6/drivers/usb/input/keyspan_remote.c
+@@ -497,7 +497,7 @@ static int keyspan_probe(struct usb_inte
+ 	input_dev->name = remote->name;
+ 	input_dev->phys = remote->phys;
+ 	usb_to_input_id(udev, &input_dev->id);
+-	input_dev->cdev.dev = &interface->dev;
++	input_dev->d.parent = &interface->dev;
+ 
+ 	input_dev->evbit[0] = BIT(EV_KEY);		/* We will only report KEY events. */
+ 	for (i = 0; i < ARRAY_SIZE(keyspan_key_table); i++)
+--- gregkh-2.6.orig/drivers/usb/input/mtouchusb.c
++++ gregkh-2.6/drivers/usb/input/mtouchusb.c
+@@ -234,7 +234,7 @@ static int mtouchusb_probe(struct usb_in
+ 	input_dev->name = mtouch->name;
+ 	input_dev->phys = mtouch->phys;
+ 	usb_to_input_id(udev, &input_dev->id);
+-	input_dev->cdev.dev = &intf->dev;
++	input_dev->d.parent = &intf->dev;
+ 	input_dev->private = mtouch;
+ 
+ 	input_dev->open = mtouchusb_open;
+--- gregkh-2.6.orig/drivers/usb/input/powermate.c
++++ gregkh-2.6/drivers/usb/input/powermate.c
+@@ -362,7 +362,7 @@ static int powermate_probe(struct usb_in
+ 
+ 	input_dev->phys = pm->phys;
+ 	usb_to_input_id(udev, &input_dev->id);
+-	input_dev->cdev.dev = &intf->dev;
++	input_dev->d.parent = &intf->dev;
+ 	input_dev->private = pm;
+ 
+ 	input_dev->event = powermate_input_event;
+--- gregkh-2.6.orig/drivers/usb/input/touchkitusb.c
++++ gregkh-2.6/drivers/usb/input/touchkitusb.c
+@@ -317,7 +317,7 @@ static int touchkit_probe(struct usb_int
+ 	input_dev->name = touchkit->name;
+ 	input_dev->phys = touchkit->phys;
+ 	usb_to_input_id(udev, &input_dev->id);
+-	input_dev->cdev.dev = &intf->dev;
++	input_dev->d.parent = &intf->dev;
+ 	input_dev->private = touchkit;
+ 	input_dev->open = touchkit_open;
+ 	input_dev->close = touchkit_close;
+--- gregkh-2.6.orig/drivers/usb/input/usbkbd.c
++++ gregkh-2.6/drivers/usb/input/usbkbd.c
+@@ -278,7 +278,7 @@ static int usb_kbd_probe(struct usb_inte
+ 	input_dev->name = kbd->name;
+ 	input_dev->phys = kbd->phys;
+ 	usb_to_input_id(dev, &input_dev->id);
+-	input_dev->cdev.dev = &iface->dev;
++	input_dev->d.parent = &iface->dev;
+ 	input_dev->private = kbd;
+ 
+ 	input_dev->evbit[0] = BIT(EV_KEY) | BIT(EV_LED) | BIT(EV_REP);
+--- gregkh-2.6.orig/drivers/usb/input/usbmouse.c
++++ gregkh-2.6/drivers/usb/input/usbmouse.c
+@@ -173,7 +173,7 @@ static int usb_mouse_probe(struct usb_in
+ 	input_dev->name = mouse->name;
+ 	input_dev->phys = mouse->phys;
+ 	usb_to_input_id(dev, &input_dev->id);
+-	input_dev->cdev.dev = &intf->dev;
++	input_dev->d.parent = &intf->dev;
+ 
+ 	input_dev->evbit[0] = BIT(EV_KEY) | BIT(EV_REL);
+ 	input_dev->keybit[LONG(BTN_MOUSE)] = BIT(BTN_LEFT) | BIT(BTN_RIGHT) | BIT(BTN_MIDDLE);
+--- gregkh-2.6.orig/drivers/usb/input/usbtouchscreen.c
++++ gregkh-2.6/drivers/usb/input/usbtouchscreen.c
+@@ -508,7 +508,7 @@ static int usbtouch_probe(struct usb_int
+ 	input_dev->name = usbtouch->name;
+ 	input_dev->phys = usbtouch->phys;
+ 	usb_to_input_id(udev, &input_dev->id);
+-	input_dev->cdev.dev = &intf->dev;
++	input_dev->d.parent = &intf->dev;
+ 	input_dev->private = usbtouch;
+ 	input_dev->open = usbtouch_open;
+ 	input_dev->close = usbtouch_close;
+--- gregkh-2.6.orig/drivers/usb/input/xpad.c
++++ gregkh-2.6/drivers/usb/input/xpad.c
+@@ -244,7 +244,7 @@ static int xpad_probe(struct usb_interfa
+ 	input_dev->name = xpad_device[i].name;
+ 	input_dev->phys = xpad->phys;
+ 	usb_to_input_id(udev, &input_dev->id);
+-	input_dev->cdev.dev = &intf->dev;
++	input_dev->d.parent = &intf->dev;
+ 	input_dev->private = xpad;
+ 	input_dev->open = xpad_open;
+ 	input_dev->close = xpad_close;
+--- gregkh-2.6.orig/drivers/usb/input/yealink.c
++++ gregkh-2.6/drivers/usb/input/yealink.c
+@@ -940,7 +940,7 @@ static int usb_probe(struct usb_interfac
+ 	input_dev->name = nfo->name;
+ 	input_dev->phys = yld->phys;
+ 	usb_to_input_id(udev, &input_dev->id);
+-	input_dev->cdev.dev = &intf->dev;
++	input_dev->d.parent = &intf->dev;
+ 
+ 	input_dev->private = yld;
+ 	input_dev->open = input_open;
+--- gregkh-2.6.orig/include/linux/input.h
++++ gregkh-2.6/include/linux/input.h
+@@ -903,15 +903,14 @@ struct input_dev {
+ 	struct mutex mutex;	/* serializes open and close operations */
+ 	unsigned int users;
+ 
+-	struct class_device cdev;
+-	struct device *dev;	/* will be removed soon */
++	struct device d;
+ 
+ 	int dynalloc;	/* temporarily */
+ 
+ 	struct list_head	h_list;
+ 	struct list_head	node;
+ };
+-#define to_input_dev(d) container_of(d, struct input_dev, cdev)
++#define to_input_dev(dev) container_of(dev, struct input_dev, d)
+ 
+ /*
+  * Verify that we are in sync with input_device_id mod_devicetable.h #defines
+@@ -1030,12 +1029,12 @@ void input_free_device(struct input_dev 
+ 
+ static inline struct input_dev *input_get_device(struct input_dev *dev)
+ {
+-	return to_input_dev(class_device_get(&dev->cdev));
++	return to_input_dev(get_device(&dev->d));
+ }
+ 
+ static inline void input_put_device(struct input_dev *dev)
+ {
+-	class_device_put(&dev->cdev);
++	put_device(&dev->d);
+ }
+ 
+ int input_register_device(struct input_dev *);
