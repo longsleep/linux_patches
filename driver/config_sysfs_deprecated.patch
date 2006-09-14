@@ -12,11 +12,11 @@ Signed-off-by: Kay Sievers <kay.sievers@vrfy.org>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
- drivers/base/bus.c   |   20 +++++++++-
- drivers/base/class.c |   93 +++++++++++++++++++++++++++++++--------------------
- drivers/base/core.c  |   28 +++++++++++++--
- init/Kconfig         |   11 ++++++
- 4 files changed, 110 insertions(+), 42 deletions(-)
+ drivers/base/bus.c   |   20 ++++++-
+ drivers/base/class.c |  129 ++++++++++++++++++++++++++++++++-------------------
+ drivers/base/core.c  |   28 +++++++++--
+ init/Kconfig         |   11 ++++
+ 4 files changed, 134 insertions(+), 54 deletions(-)
 
 --- gregkh-2.6.orig/drivers/base/bus.c
 +++ gregkh-2.6/drivers/base/bus.c
@@ -31,13 +31,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +				 &dev->bus->subsys.kset.kobj, "bus");
 +}
 +
-+static int remove_deprecated_bus_links(struct device *dev)
++static void remove_deprecated_bus_links(struct device *dev)
 +{
-+		sysfs_remove_link(&dev->kobj, "bus");
++	sysfs_remove_link(&dev->kobj, "bus");
 +}
 +#else
 +static inline int make_deprecated_bus_links(struct device *dev) { return 0; }
-+static inline int remove_deprecated_bus_links(struct device *dev) { return 0; }
++static inline void remove_deprecated_bus_links(struct device *dev) { }
 +#endif
  
  /**
@@ -63,25 +63,18 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		klist_remove(&dev->knode_bus);
 --- gregkh-2.6.orig/drivers/base/class.c
 +++ gregkh-2.6/drivers/base/class.c
-@@ -350,16 +350,26 @@ static const char *class_uevent_name(str
+@@ -350,6 +350,78 @@ static const char *class_uevent_name(str
  	return class_dev->class->name;
  }
  
--static int class_uevent(struct kset *kset, struct kobject *kobj, char **envp,
--			 int num_envp, char *buffer, int buffer_size)
 +#ifdef CONFIG_SYSFS_DEPRECATED
 +char *make_class_name(const char *name, struct kobject *kobj)
- {
--	struct class_device *class_dev = to_class_dev(kobj);
--	int i = 0;
--	int length = 0;
--	int retval = 0;
++{
 +	char *class_name;
 +	int size;
- 
--	pr_debug("%s - name = %s\n", __FUNCTION__, class_dev->class_id);
++
 +	size = strlen(name) + strlen(kobject_name(kobj)) + 2;
- 
++
 +	class_name = kmalloc(size, GFP_KERNEL);
 +	if (!class_name)
 +		return ERR_PTR(-ENOMEM);
@@ -92,15 +85,34 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return class_name;
 +}
 +
-+static void deprecated_class_uevent(struct class_device *class_dev)
++static int deprecated_class_uevent(char **envp, int num_envp, int *cur_index,
++				   char *buffer, int buffer_size,
++				   int *cur_len,
++				   struct class_device *class_dev)
 +{
- 	if (class_dev->dev) {
- 		/* add device, backing this class device (deprecated) */
- 		struct device *dev = class_dev->dev;
-@@ -379,6 +389,39 @@ static int class_uevent(struct kset *kse
- 				       buffer, buffer_size, &length,
- 				       "PHYSDEVDRIVER=%s", dev->driver->name);
- 	}
++	struct device *dev = class_dev->dev;
++	char *path;
++
++	if (!dev)
++		return 0;
++
++	/* add device, backing this class device (deprecated) */
++	path = kobject_get_path(&dev->kobj, GFP_KERNEL);
++
++	add_uevent_var(envp, num_envp, cur_index, buffer, buffer_size,
++		       cur_len, "PHYSDEVPATH=%s", path);
++	kfree(path);
++
++	if (dev->bus)
++		add_uevent_var(envp, num_envp, cur_index,
++			       buffer, buffer_size, cur_len,
++			       "PHYSDEVBUS=%s", dev->bus->name);
++
++	if (dev->driver)
++		add_uevent_var(envp, num_envp, cur_index,
++			       buffer, buffer_size, cur_len,
++			       "PHYSDEVDRIVER=%s", dev->driver->name);
++	return 0;
 +}
 +
 +static int make_deprecated_class_device_links(struct class_device *class_dev)
@@ -118,26 +130,47 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return error;
 +}
 +#else
-+static inline void deprecated_class_uevent(struct class_device *class_dev) { }
++static inline int deprecated_class_uevent(char **envp, int num_envp,
++					  int *cur_index, char *buffer,
++					  int buffer_size, int *cur_len,
++					  struct class_device *class_dev)
++{ return 0; }
 +static inline int make_deprecated_class_device_links(struct class_device *cd)
 +{ return 0; }
 +#endif
 +
-+static int class_uevent(struct kset *kset, struct kobject *kobj, char **envp,
-+			 int num_envp, char *buffer, int buffer_size)
-+{
-+	struct class_device *class_dev = to_class_dev(kobj);
-+	int i = 0;
-+	int length = 0;
-+	int retval = 0;
-+
-+	pr_debug("%s - name = %s\n", __FUNCTION__, class_dev->class_id);
-+
-+	deprecated_class_uevent(class_dev);
+ static int class_uevent(struct kset *kset, struct kobject *kobj, char **envp,
+ 			 int num_envp, char *buffer, int buffer_size)
+ {
+@@ -360,25 +432,8 @@ static int class_uevent(struct kset *kse
+ 
+ 	pr_debug("%s - name = %s\n", __FUNCTION__, class_dev->class_id);
+ 
+-	if (class_dev->dev) {
+-		/* add device, backing this class device (deprecated) */
+-		struct device *dev = class_dev->dev;
+-		char *path = kobject_get_path(&dev->kobj, GFP_KERNEL);
+-
+-		add_uevent_var(envp, num_envp, &i, buffer, buffer_size,
+-			       &length, "PHYSDEVPATH=%s", path);
+-		kfree(path);
+-
+-		if (dev->bus)
+-			add_uevent_var(envp, num_envp, &i,
+-				       buffer, buffer_size, &length,
+-				       "PHYSDEVBUS=%s", dev->bus->name);
+-
+-		if (dev->driver)
+-			add_uevent_var(envp, num_envp, &i,
+-				       buffer, buffer_size, &length,
+-				       "PHYSDEVDRIVER=%s", dev->driver->name);
+-	}
++	deprecated_class_uevent(envp, num_envp, &i, buffer, buffer_size,
++				&length, class_dev);
  
  	if (MAJOR(class_dev->devt)) {
  		add_uevent_var(envp, num_envp, &i,
-@@ -504,29 +547,11 @@ void class_device_initialize(struct clas
+@@ -504,29 +559,11 @@ void class_device_initialize(struct clas
  	INIT_LIST_HEAD(&class_dev->node);
  }
  
@@ -167,7 +200,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	int error = -EINVAL;
  
  	class_dev = class_device_get(class_dev);
-@@ -594,20 +619,18 @@ int class_device_add(struct class_device
+@@ -594,20 +631,18 @@ int class_device_add(struct class_device
  		goto out5;
  
  	if (class_dev->dev) {
@@ -192,7 +225,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		goto out8;
  
  	kobject_uevent(&class_dev->kobj, KOBJ_ADD);
-@@ -624,8 +647,7 @@ int class_device_add(struct class_device
+@@ -624,8 +659,7 @@ int class_device_add(struct class_device
  	goto out1;
  
   out8:
@@ -202,7 +235,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
   out7:
  	if (class_dev->dev)
  		sysfs_remove_link(&class_dev->kobj, "device");
-@@ -644,7 +666,6 @@ int class_device_add(struct class_device
+@@ -644,7 +678,6 @@ int class_device_add(struct class_device
  	class_put(parent_class);
   out1:
  	class_device_put(class_dev);
@@ -210,7 +243,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	return error;
  }
  
-@@ -733,10 +754,12 @@ void class_device_del(struct class_devic
+@@ -733,10 +766,12 @@ void class_device_del(struct class_devic
  	}
  
  	if (class_dev->dev) {
