@@ -13,33 +13,45 @@ Cc: Kay Sievers <kay.sievers@vrfy.org>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
- drivers/base/Makefile  |    3 
- drivers/base/base.h    |    2 
- drivers/base/core.c    |   11 ++-
- drivers/base/virtual.c |  157 +++++++++++++++++++++++++++++++++++++++++++++++++
- 4 files changed, 170 insertions(+), 3 deletions(-)
+ drivers/base/class.c   |   17 +++++++++++++++++
+ drivers/base/core.c    |    7 +++++++
+ include/linux/device.h |    5 ++++-
+ 3 files changed, 28 insertions(+), 1 deletion(-)
 
---- gregkh-2.6.orig/drivers/base/Makefile
-+++ gregkh-2.6/drivers/base/Makefile
-@@ -3,7 +3,8 @@
- obj-y			:= core.o sys.o bus.o dd.o \
- 			   driver.o class.o platform.o \
- 			   cpu.o firmware.o init.o map.o dmapool.o \
--			   attribute_container.o transport_class.o
-+			   attribute_container.o transport_class.o \
-+			   virtual.o
- obj-y			+= power/
- obj-$(CONFIG_ISA)	+= isa.o
- obj-$(CONFIG_FW_LOADER)	+= firmware_class.o
---- gregkh-2.6.orig/drivers/base/base.h
-+++ gregkh-2.6/drivers/base/base.h
-@@ -43,4 +43,6 @@ struct class_device_attribute *to_class_
+--- gregkh-2.6.orig/drivers/base/class.c
++++ gregkh-2.6/drivers/base/class.c
+@@ -19,6 +19,8 @@
+ #include <linux/slab.h>
+ #include "base.h"
+ 
++extern struct subsystem devices_subsys;
++
+ #define to_class_attr(_attr) container_of(_attr, struct class_attribute, attr)
+ #define to_class(obj) container_of(obj, struct class, subsys.kset.kobj)
+ 
+@@ -878,7 +880,22 @@ void class_interface_unregister(struct c
+ 	class_put(parent);
  }
  
- extern char *make_class_name(const char *name, struct kobject *kobj);
-+extern int virtual_device_parent(struct device *dev);
-+extern int device_is_virtual(struct device *dev);
++int virtual_device_parent(struct device *dev)
++{
++	if (!dev->class)
++		return -ENODEV;
++
++	if (!dev->class->virtual_dir) {
++		static struct kobject *virtual_dir = NULL;
  
++		if (!virtual_dir)
++			virtual_dir = kobject_add_dir(&devices_subsys.kset.kobj, "virtual");
++		dev->class->virtual_dir = kobject_add_dir(virtual_dir, dev->class->name);
++	}
++
++	dev->kobj.parent = dev->class->virtual_dir;
++	return 0;
++}
+ 
+ int __init classes_init(void)
+ {
 --- gregkh-2.6.orig/drivers/base/core.c
 +++ gregkh-2.6/drivers/base/core.c
 @@ -378,6 +378,13 @@ int device_add(struct device *dev)
@@ -56,181 +68,31 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	parent = get_device(dev->parent);
  
  	pr_debug("DEV: registering device: ID = '%s'\n", dev->bus_id);
-@@ -423,7 +430,7 @@ int device_add(struct device *dev)
- 				  "subsystem");
- 		sysfs_create_link(&dev->class->subsys.kset.kobj, &dev->kobj,
- 				  dev->bus_id);
--		if (parent) {
-+		if ((parent) && (!device_is_virtual(dev))) {
- 			sysfs_create_link(&dev->kobj, &dev->parent->kobj, "device");
- 			class_name = make_class_name(dev->class->name, &dev->kobj);
- 			sysfs_create_link(&dev->parent->kobj, &dev->kobj, class_name);
-@@ -550,7 +557,7 @@ void device_del(struct device * dev)
- 		sysfs_remove_link(&dev->kobj, "subsystem");
- 		sysfs_remove_link(&dev->class->subsys.kset.kobj, dev->bus_id);
- 		class_name = make_class_name(dev->class->name, &dev->kobj);
--		if (parent) {
-+		if ((parent) && (!device_is_virtual(dev))) {
- 			sysfs_remove_link(&dev->kobj, "device");
- 			sysfs_remove_link(&dev->parent->kobj, class_name);
- 		}
---- /dev/null
-+++ gregkh-2.6/drivers/base/virtual.c
-@@ -0,0 +1,157 @@
-+/*
-+ * virtual.c
-+ *
-+ * (C) Copyright 2006 Greg Kroah-Hartman
-+ * (C) Copyright 2006 Novell Inc.
-+ *
-+ * Creates and manages the sysfs devices/virtual/ interface for devices
-+ * that are associated with classes, yet do not have a "real" device as
-+ * a parent.
-+ *
-+ * Licensed under the GPL version 2.
-+ *
-+ */
-+#include <linux/device.h>
-+#include <linux/err.h>
-+#include "base.h"
+--- gregkh-2.6.orig/include/linux/device.h
++++ gregkh-2.6/include/linux/device.h
+@@ -149,6 +149,8 @@ struct class {
+ 	struct list_head	interfaces;
+ 	struct semaphore	sem;	/* locks both the children and interfaces lists */
+ 
++	struct kobject		*virtual_dir;
 +
-+static struct device *virtual_dev;
-+static int i_am_a_virtual_dev;
+ 	struct class_attribute		* class_attrs;
+ 	struct class_device_attribute	* class_dev_attrs;
+ 	struct device_attribute		* dev_attrs;
+@@ -291,7 +293,6 @@ extern struct class_device *class_device
+ 					__attribute__((format(printf,5,6)));
+ extern void class_device_destroy(struct class *cls, dev_t devt);
+ 
+-
+ /* interface for exporting device attributes */
+ struct device_attribute {
+ 	struct attribute	attr;
+@@ -400,6 +401,8 @@ extern struct device *device_create(stru
+ 				    __attribute__((format(printf,4,5)));
+ extern void device_destroy(struct class *cls, dev_t devt);
+ 
++extern int virtual_device_parent(struct device *dev);
 +
-+static void virtual_dev_release(struct device *dev)
-+{
-+	pr_debug("%s called for %s\n", __FUNCTION__, dev->bus_id);
-+	kfree(dev);
-+}
-+
-+static int init_virtual_device(void)
-+{
-+	int retval = 0;
-+
-+	if (virtual_dev != NULL)
-+		goto exit;
-+
-+	virtual_dev = kzalloc(sizeof(*virtual_dev), GFP_KERNEL);
-+	if (!virtual_dev) {
-+		retval = -ENOMEM;
-+		goto exit;
-+	}
-+	snprintf(virtual_dev->bus_id, BUS_ID_SIZE, "virtual");
-+	virtual_dev->release = virtual_dev_release;
-+
-+	retval = device_register(virtual_dev);
-+	if (retval)
-+		goto error;
-+
-+exit:
-+	return retval;
-+
-+error:
-+	kfree(virtual_dev);
-+	virtual_dev = NULL;
-+	return retval;
-+}
-+
-+static struct device *next_device(struct klist_iter *i)
-+{
-+	struct klist_node *n = klist_next(i);
-+	return n ? container_of(n, struct device, knode_parent) : NULL;
-+}
-+
-+static struct device *find_child_device(struct device *dev, const char *name)
-+{
-+	struct klist_iter i;
-+	struct device *found_device = NULL;
-+	struct device *child;
-+
-+	klist_iter_init(&dev->klist_children, &i);
-+	while ((child = next_device(&i)) && !found_device) {
-+		if (strcmp(child->bus_id, name) == 0)
-+			found_device = child;
-+	}
-+	klist_iter_exit(&i);
-+	return found_device;
-+}
-+
-+static struct device *find_device_for_class(const char *class_name)
-+{
-+	struct device *dev = NULL;
-+	int retval;
-+
-+	/* create a struct device for this name, if we can't find it
-+	 * in the list of children for the virtual device.
-+	 */
-+
-+	dev = find_child_device(virtual_dev, class_name);
-+	if (dev)
-+		goto exit;
-+
-+	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
-+	if (!dev)
-+		goto exit;
-+
-+	dev->parent = virtual_dev;
-+	dev->release = virtual_dev_release;
-+	snprintf(dev->bus_id, BUS_ID_SIZE, class_name);
-+	dev_set_drvdata(dev, &i_am_a_virtual_dev);
-+	retval = device_register(dev);
-+	if (retval)
-+		goto error;
-+
-+exit:
-+	return dev;
-+
-+error:
-+	kfree(dev);
-+	return ERR_PTR(retval);
-+}
-+
-+/**
-+ * virtual_device_parent - create a proper parent for virtual devices
-+ * dev: the struct device that the parent should be set for
-+ *
-+ * This function is used for devices that are associated with a class,
-+ * yet has no "real" parent associated with them.  It will create a
-+ * device/virtual/CLASS_NAME directory for them to be placed into,
-+ * creating that directory if needed.
-+ */
-+int virtual_device_parent(struct device *dev)
-+{
-+	int retval;
-+	struct device *parent;
-+
-+	if (!dev->class)
-+		return -ENODEV;
-+
-+	retval = init_virtual_device();
-+	if (retval)
-+		goto exit;
-+
-+	parent = find_device_for_class(dev->class->name);
-+	if (IS_ERR(parent)) {
-+		retval = PTR_ERR(parent);
-+		goto exit;
-+	}
-+
-+	dev->parent = parent;
-+
-+exit:
-+	return retval;
-+}
-+
-+/**
-+ * dev_is_virtual - determine if this struct device is virtual or not
-+ *
-+ * returns 1 if a virtual device, 0 if not.
-+ */
-+int device_is_virtual(struct device *dev)
-+{
-+	int *test;
-+
-+	if (dev->parent) {
-+		test = dev_get_drvdata(dev->parent);
-+		if (test == &i_am_a_virtual_dev)
-+			return 1;
-+	}
-+	return 0;
-+}
+ /*
+  * Platform "fixup" functions - allow the platform to have their say
+  * about devices and actions that the general device layer doesn't
