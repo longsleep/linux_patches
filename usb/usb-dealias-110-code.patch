@@ -1,0 +1,430 @@
+From zaitcev@redhat.com Mon Sep 18 22:51:19 2006
+Date: Mon, 18 Sep 2006 22:49:02 -0700
+From: Pete Zaitcev <zaitcev@redhat.com>
+To: greg@kroah.com
+Cc: zaitcev@redhat.com, linux-usb-devel@lists.sourceforge.net, <hjlipp@web.de>
+Subject: USB: Dealias -110 code (more complete)
+Message-Id: <20060918224902.555f05d3.zaitcev@redhat.com>
+
+The purpose of this patch is to split off the case when a device does
+not reply on the lower level (which is reported by HC hardware), and
+a case when the device accepted the request, but does not reply at
+upper level. This redefinition allows to diagnose issues easier,
+without asking the user if the -110 happened "immediately".
+
+The usbmon splits such cases already thanks to its timestamp, but
+it's not always available.
+
+I adjusted all drivers which I found affected (by searching for "urb").
+Out of tree drivers may suffer a little bit, but I do not expect much
+breakage. At worst they may print a few messages.
+
+Signed-off-by: Pete Zaitcev <zaitcev@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ Documentation/usb/error-codes.txt       |   11 ++++-------
+ drivers/isdn/gigaset/bas-gigaset.c      |    2 +-
+ drivers/isdn/hisax/hfc_usb.h            |    6 +++---
+ drivers/media/dvb/dvb-usb/dvb-usb-urb.c |    1 -
+ drivers/media/dvb/ttusb-dec/ttusb_dec.c |    2 +-
+ drivers/media/video/ov511.c             |    7 ++++---
+ drivers/media/video/pwc/pwc-if.c        |    2 +-
+ drivers/media/video/w9968cf.c           |    7 +++----
+ drivers/net/irda/irda-usb.c             |   18 +++++++-----------
+ drivers/net/wireless/zd1201.c           |    4 ++--
+ drivers/usb/host/isp116x.h              |    2 +-
+ drivers/usb/host/ohci.h                 |    2 +-
+ drivers/usb/host/sl811-hcd.c            |    2 +-
+ drivers/usb/input/hid-core.c            |    3 ++-
+ drivers/usb/input/itmtouch.c            |    2 +-
+ drivers/usb/input/mtouchusb.c           |    2 +-
+ drivers/usb/input/touchkitusb.c         |    2 +-
+ drivers/usb/input/usbtouchscreen.c      |    2 +-
+ drivers/usb/misc/auerswald.c            |    4 ++--
+ drivers/usb/net/pegasus.c               |    2 +-
+ drivers/usb/net/rtl8150.c               |    2 +-
+ drivers/usb/net/usbnet.c                |   12 ++++++------
+ drivers/usb/storage/transport.c         |    5 -----
+ sound/usb/usbmidi.c                     |    6 +++---
+ 24 files changed, 48 insertions(+), 60 deletions(-)
+
+--- gregkh-2.6.orig/Documentation/usb/error-codes.txt
++++ gregkh-2.6/Documentation/usb/error-codes.txt
+@@ -98,13 +98,13 @@ one or more packets could finish before 
+ 			error, a failure to respond (often caused by
+ 			device disconnect), or some other fault.
+ 
+--ETIMEDOUT (**)		No response packet received within the prescribed
++-ETIME (**)		No response packet received within the prescribed
+ 			bus turn-around time.  This error may instead be
+ 			reported as -EPROTO or -EILSEQ.
+ 
+-			Note that the synchronous USB message functions
+-			also use this code to indicate timeout expired
+-			before the transfer completed.
++-ETIMEDOUT		Synchronous USB message functions use this code
++			to indicate timeout expired before the transfer
++			completed, and no other error was reported by HC.
+ 
+ -EPIPE (**)		Endpoint stalled.  For non-control endpoints,
+ 			reset this status with usb_clear_halt().
+@@ -163,6 +163,3 @@ usb_get_*/usb_set_*():
+ usb_control_msg():
+ usb_bulk_msg():
+ -ETIMEDOUT		Timeout expired before the transfer completed.
+-			In the future this code may change to -ETIME,
+-			whose definition is a closer match to this sort
+-			of error.
+--- gregkh-2.6.orig/drivers/isdn/gigaset/bas-gigaset.c
++++ gregkh-2.6/drivers/isdn/gigaset/bas-gigaset.c
+@@ -192,7 +192,7 @@ static char *get_usb_statmsg(int status)
+ 		return "bit stuffing error, timeout, or unknown USB error";
+ 	case -EILSEQ:
+ 		return "CRC mismatch, timeout, or unknown USB error";
+-	case -ETIMEDOUT:
++	case -ETIME:
+ 		return "timed out";
+ 	case -EPIPE:
+ 		return "endpoint stalled";
+--- gregkh-2.6.orig/drivers/isdn/hisax/hfc_usb.h
++++ gregkh-2.6/drivers/isdn/hisax/hfc_usb.h
+@@ -137,11 +137,11 @@ static struct hfcusb_symbolic_list urb_e
+ 	{-ENXIO, "URB already queued"},
+ 	{-EFBIG, "Too much ISO frames requested"},
+ 	{-ENOSR, "Buffer error (overrun)"},
+-	{-EPIPE, "Specified endpoint is stalled (device not responding)"},
++	{-EPIPE, "Specified endpoint is stalled"},
+ 	{-EOVERFLOW, "Babble (bad cable?)"},
+ 	{-EPROTO, "Bit-stuff error (bad cable?)"},
+-	{-EILSEQ, "CRC/Timeout"},
+-	{-ETIMEDOUT, "NAK (device does not respond)"},
++	{-EILSEQ, "CRC or missing token"},
++	{-ETIME, "Device did not respond"},
+ 	{-ESHUTDOWN, "Device unplugged"},
+ 	{-1, NULL}
+ };
+--- gregkh-2.6.orig/drivers/media/dvb/dvb-usb/dvb-usb-urb.c
++++ gregkh-2.6/drivers/media/dvb/dvb-usb/dvb-usb-urb.c
+@@ -80,7 +80,6 @@ static void dvb_usb_urb_complete(struct 
+ 
+ 	switch (urb->status) {
+ 		case 0:         /* success */
+-		case -ETIMEDOUT:    /* NAK */
+ 			break;
+ 		case -ECONNRESET:   /* kill */
+ 		case -ENOENT:
+--- gregkh-2.6.orig/drivers/media/dvb/ttusb-dec/ttusb_dec.c
++++ gregkh-2.6/drivers/media/dvb/ttusb-dec/ttusb_dec.c
+@@ -215,7 +215,7 @@ static void ttusb_dec_handle_irq( struct
+ 		case -ECONNRESET:
+ 		case -ENOENT:
+ 		case -ESHUTDOWN:
+-		case -ETIMEDOUT:
++		case -ETIME:
+ 			/* this urb is dead, cleanup */
+ 			dprintk("%s:urb shutting down with status: %d\n",
+ 					__FUNCTION__, urb->status);
+--- gregkh-2.6.orig/drivers/media/video/ov511.c
++++ gregkh-2.6/drivers/media/video/ov511.c
+@@ -301,10 +301,11 @@ static struct symbolic_list senlist[] = 
+ static struct symbolic_list urb_errlist[] = {
+ 	{ -ENOSR,	"Buffer error (overrun)" },
+ 	{ -EPIPE,	"Stalled (device not responding)" },
+-	{ -EOVERFLOW,	"Babble (bad cable?)" },
++	{ -EOVERFLOW,	"Babble (device sends too much data)" },
+ 	{ -EPROTO,	"Bit-stuff error (bad cable?)" },
+-	{ -EILSEQ,	"CRC/Timeout" },
+-	{ -ETIMEDOUT,	"NAK (device does not respond)" },
++	{ -EILSEQ,	"CRC/Timeout (bad cable?)" },
++	{ -ETIME,	"Device does not respond to token" },
++	{ -ETIMEDOUT,	"Device does not respond to command" },
+ 	{ -1, NULL }
+ };
+ 
+--- gregkh-2.6.orig/drivers/media/video/pwc/pwc-if.c
++++ gregkh-2.6/drivers/media/video/pwc/pwc-if.c
+@@ -711,7 +711,7 @@ static void pwc_isoc_handler(struct urb 
+ 			case -EOVERFLOW:	errmsg = "Babble (bad cable?)"; break;
+ 			case -EPROTO:		errmsg = "Bit-stuff error (bad cable?)"; break;
+ 			case -EILSEQ:		errmsg = "CRC/Timeout (could be anything)"; break;
+-			case -ETIMEDOUT:	errmsg = "NAK (device does not respond)"; break;
++			case -ETIME:		errmsg = "Device does not respond"; break;
+ 		}
+ 		PWC_DEBUG_FLOW("pwc_isoc_handler() called with status %d [%s].\n", urb->status, errmsg);
+ 		/* Give up after a number of contiguous errors on the USB bus.
+--- gregkh-2.6.orig/drivers/media/video/w9968cf.c
++++ gregkh-2.6/drivers/media/video/w9968cf.c
+@@ -586,15 +586,14 @@ static struct w9968cf_symbolic_list urb_
+ 	{ -EFBIG,     "Too much ISO frames requested" },
+ 	{ -ENOSR,     "Buffer error (overrun)" },
+ 	{ -EPIPE,     "Specified endpoint is stalled (device not responding)"},
+-	{ -EOVERFLOW, "Babble (bad cable?)" },
++	{ -EOVERFLOW, "Babble (too much data)" },
+ 	{ -EPROTO,    "Bit-stuff error (bad cable?)" },
+ 	{ -EILSEQ,    "CRC/Timeout" },
+-	{ -ETIMEDOUT, "NAK (device does not respond)" },
++	{ -ETIME,     "Device does not respond to token" },
++	{ -ETIMEDOUT, "Device does not respond to command" },
+ 	{ -1, NULL }
+ };
+ 
+-
+-
+ /****************************************************************************
+  * Memory management functions                                              *
+  ****************************************************************************/
+--- gregkh-2.6.orig/drivers/net/irda/irda-usb.c
++++ gregkh-2.6/drivers/net/irda/irda-usb.c
+@@ -671,10 +671,8 @@ static void irda_usb_net_timeout(struct 
+ 			 * Jean II */
+ 			done = 1;
+ 			break;
+-		case -ECONNABORTED:		/* -103 */
+-		case -ECONNRESET:		/* -104 */
+-		case -ETIMEDOUT:		/* -110 */
+-		case -ENOENT:			/* -2 (urb unlinked by us)  */
++		case -ECONNRESET:
++		case -ENOENT:			/* urb unlinked by us */
+ 		default:			/* ??? - Play safe */
+ 			urb->status = 0;
+ 			netif_wake_queue(self->netdev);
+@@ -712,10 +710,8 @@ static void irda_usb_net_timeout(struct 
+ 			 * Jean II */
+ 			done = 1;
+ 			break;
+-		case -ECONNABORTED:		/* -103 */
+-		case -ECONNRESET:		/* -104 */
+-		case -ETIMEDOUT:		/* -110 */
+-		case -ENOENT:			/* -2 (urb unlinked by us)  */
++		case -ECONNRESET:
++		case -ENOENT:			/* urb unlinked by us */
+ 		default:			/* ??? - Play safe */
+ 			if(skb != NULL) {
+ 				dev_kfree_skb_any(skb);
+@@ -845,14 +841,14 @@ static void irda_usb_receive(struct urb 
+ 			self->stats.rx_crc_errors++;	
+ 			/* Also precursor to a hot-unplug on UHCI. */
+ 			/* Fallthrough... */
+-		case -ECONNRESET:		/* -104 */
++		case -ECONNRESET:
+ 			/* Random error, if I remember correctly */
+ 			/* uhci_cleanup_unlink() is going to kill the Rx
+ 			 * URB just after we return. No problem, at this
+ 			 * point the URB will be idle ;-) - Jean II */
+-		case -ESHUTDOWN:		/* -108 */
++		case -ESHUTDOWN:
+ 			/* That's usually a hot-unplug. Submit will fail... */
+-		case -ETIMEDOUT:		/* -110 */
++		case -ETIME:
+ 			/* Usually precursor to a hot-unplug on OHCI. */
+ 		default:
+ 			self->stats.rx_errors++;
+--- gregkh-2.6.orig/drivers/net/wireless/zd1201.c
++++ gregkh-2.6/drivers/net/wireless/zd1201.c
+@@ -119,7 +119,7 @@ static void zd1201_usbfree(struct urb *u
+ 	switch(urb->status) {
+ 		case -EILSEQ:
+ 		case -ENODEV:
+-		case -ETIMEDOUT:
++		case -ETIME:
+ 		case -ENOENT:
+ 		case -EPIPE:
+ 		case -EOVERFLOW:
+@@ -201,7 +201,7 @@ static void zd1201_usbrx(struct urb *urb
+ 	switch(urb->status) {
+ 		case -EILSEQ:
+ 		case -ENODEV:
+-		case -ETIMEDOUT:
++		case -ETIME:
+ 		case -ENOENT:
+ 		case -EPIPE:
+ 		case -EOVERFLOW:
+--- gregkh-2.6.orig/drivers/usb/host/isp116x.h
++++ gregkh-2.6/drivers/usb/host/isp116x.h
+@@ -233,7 +233,7 @@ static const int cc_to_error[16] = {
+ 	/* Bit Stuff  */ -EPROTO,
+ 	/* Data Togg  */ -EILSEQ,
+ 	/* Stall      */ -EPIPE,
+-	/* DevNotResp */ -ETIMEDOUT,
++	/* DevNotResp */ -ETIME,
+ 	/* PIDCheck   */ -EPROTO,
+ 	/* UnExpPID   */ -EPROTO,
+ 	/* DataOver   */ -EOVERFLOW,
+--- gregkh-2.6.orig/drivers/usb/host/ohci.h
++++ gregkh-2.6/drivers/usb/host/ohci.h
+@@ -159,7 +159,7 @@ static const int cc_to_error [16] = { 
+ 	/* Bit Stuff  */               -EPROTO,
+ 	/* Data Togg  */               -EILSEQ,
+ 	/* Stall      */               -EPIPE,
+-	/* DevNotResp */               -ETIMEDOUT,
++	/* DevNotResp */               -ETIME,
+ 	/* PIDCheck   */               -EPROTO,
+ 	/* UnExpPID   */               -EPROTO,
+ 	/* DataOver   */               -EOVERFLOW,
+--- gregkh-2.6.orig/drivers/usb/host/sl811-hcd.c
++++ gregkh-2.6/drivers/usb/host/sl811-hcd.c
+@@ -597,7 +597,7 @@ done(struct sl811 *sl811, struct sl811h_
+ 	/* error? retry, until "3 strikes" */
+ 	} else if (++ep->error_count >= 3) {
+ 		if (status & SL11H_STATMASK_TMOUT)
+-			urbstat = -ETIMEDOUT;
++			urbstat = -ETIME;
+ 		else if (status & SL11H_STATMASK_OVF)
+ 			urbstat = -EOVERFLOW;
+ 		else
+--- gregkh-2.6.orig/drivers/usb/input/hid-core.c
++++ gregkh-2.6/drivers/usb/input/hid-core.c
+@@ -1023,7 +1023,8 @@ static void hid_irq_in(struct urb *urb, 
+ 			return;
+ 		case -EILSEQ:		/* protocol error or unplug */
+ 		case -EPROTO:		/* protocol error or unplug */
+-		case -ETIMEDOUT:	/* NAK */
++		case -ETIME:		/* protocol error or unplug */
++		case -ETIMEDOUT:	/* Should never happen, but... */
+ 			clear_bit(HID_IN_RUNNING, &hid->iofl);
+ 			hid_io_error(hid);
+ 			return;
+--- gregkh-2.6.orig/drivers/usb/input/itmtouch.c
++++ gregkh-2.6/drivers/usb/input/itmtouch.c
+@@ -87,7 +87,7 @@ static void itmtouch_irq(struct urb *urb
+ 	case 0:
+ 		/* success */
+ 		break;
+-	case -ETIMEDOUT:
++	case -ETIME:
+ 		/* this urb is timing out */
+ 		dbg("%s - urb timed out - was the device unplugged?",
+ 		    __FUNCTION__);
+--- gregkh-2.6.orig/drivers/usb/input/mtouchusb.c
++++ gregkh-2.6/drivers/usb/input/mtouchusb.c
+@@ -107,7 +107,7 @@ static void mtouchusb_irq(struct urb *ur
+ 	case 0:
+ 		/* success */
+ 		break;
+-	case -ETIMEDOUT:
++	case -ETIME:
+ 		/* this urb is timing out */
+ 		dbg("%s - urb timed out - was the device unplugged?",
+ 		    __FUNCTION__);
+--- gregkh-2.6.orig/drivers/usb/input/touchkitusb.c
++++ gregkh-2.6/drivers/usb/input/touchkitusb.c
+@@ -201,7 +201,7 @@ static void touchkit_irq(struct urb *urb
+ 	case 0:
+ 		/* success */
+ 		break;
+-	case -ETIMEDOUT:
++	case -ETIME:
+ 		/* this urb is timing out */
+ 		dbg("%s - urb timed out - was the device unplugged?",
+ 		    __FUNCTION__);
+--- gregkh-2.6.orig/drivers/usb/input/usbtouchscreen.c
++++ gregkh-2.6/drivers/usb/input/usbtouchscreen.c
+@@ -508,7 +508,7 @@ static void usbtouch_irq(struct urb *urb
+ 	case 0:
+ 		/* success */
+ 		break;
+-	case -ETIMEDOUT:
++	case -ETIME:
+ 		/* this urb is timing out */
+ 		dbg("%s - urb timed out - was the device unplugged?",
+ 		    __FUNCTION__);
+--- gregkh-2.6.orig/drivers/usb/misc/auerswald.c
++++ gregkh-2.6/drivers/usb/misc/auerswald.c
+@@ -806,7 +806,7 @@ static void auerbuf_releasebuf( pauerbuf
+ 0		Initial, OK
+ -EINPROGRESS	during submission until end
+ -ENOENT		if urb is unlinked
+--ETIMEDOUT	Transfer timed out, NAK
++-ETIME		Device did not respond
+ -ENOMEM		Memory Overflow
+ -ENODEV		Specified USB-device or bus doesn't exist
+ -ENXIO		URB already queued
+@@ -832,7 +832,7 @@ static int auerswald_status_retry (int s
+ {
+ 	switch (status) {
+ 	case 0:
+-	case -ETIMEDOUT:
++	case -ETIME:
+ 	case -EOVERFLOW:
+ 	case -EAGAIN:
+ 	case -EPIPE:
+--- gregkh-2.6.orig/drivers/usb/net/pegasus.c
++++ gregkh-2.6/drivers/usb/net/pegasus.c
+@@ -619,7 +619,7 @@ static void read_bulk_callback(struct ur
+ 	switch (urb->status) {
+ 	case 0:
+ 		break;
+-	case -ETIMEDOUT:
++	case -ETIME:
+ 		if (netif_msg_rx_err(pegasus))
+ 			pr_debug("%s: reset MAC\n", net->name);
+ 		pegasus->flags &= ~PEGASUS_RX_BUSY;
+--- gregkh-2.6.orig/drivers/usb/net/rtl8150.c
++++ gregkh-2.6/drivers/usb/net/rtl8150.c
+@@ -438,7 +438,7 @@ static void read_bulk_callback(struct ur
+ 		break;
+ 	case -ENOENT:
+ 		return;	/* the urb is in unlink state */
+-	case -ETIMEDOUT:
++	case -ETIME:
+ 		warn("may be reset is needed?..");
+ 		goto goon;
+ 	default:
+--- gregkh-2.6.orig/drivers/usb/net/usbnet.c
++++ gregkh-2.6/drivers/usb/net/usbnet.c
+@@ -425,9 +425,9 @@ static void rx_complete (struct urb *urb
+ 	    // we get controller i/o faults during khubd disconnect() delays.
+ 	    // throttle down resubmits, to avoid log floods; just temporarily,
+ 	    // so we still recover when the fault isn't a khubd delay.
+-	    case -EPROTO:		// ehci
+-	    case -ETIMEDOUT:		// ohci
+-	    case -EILSEQ:		// uhci
++	    case -EPROTO:
++	    case -ETIME:
++	    case -EILSEQ:
+ 		dev->stats.rx_errors++;
+ 		if (!timer_pending (&dev->delay)) {
+ 			mod_timer (&dev->delay, jiffies + THROTTLE_JIFFIES);
+@@ -821,9 +821,9 @@ static void tx_complete (struct urb *urb
+ 
+ 		// like rx, tx gets controller i/o faults during khubd delays
+ 		// and so it uses the same throttling mechanism.
+-		case -EPROTO:		// ehci
+-		case -ETIMEDOUT:	// ohci
+-		case -EILSEQ:		// uhci
++		case -EPROTO:
++		case -ETIME:
++		case -EILSEQ:
+ 			if (!timer_pending (&dev->delay)) {
+ 				mod_timer (&dev->delay,
+ 					jiffies + THROTTLE_JIFFIES);
+--- gregkh-2.6.orig/drivers/usb/storage/transport.c
++++ gregkh-2.6/drivers/usb/storage/transport.c
+@@ -294,11 +294,6 @@ static int interpret_urb_result(struct u
+ 			return USB_STOR_XFER_ERROR;
+ 		return USB_STOR_XFER_STALLED;
+ 
+-	/* timeout or excessively long NAK */
+-	case -ETIMEDOUT:
+-		US_DEBUGP("-- timeout or NAK\n");
+-		return USB_STOR_XFER_ERROR;
+-
+ 	/* babble - the device tried to send more than we wanted to read */
+ 	case -EOVERFLOW:
+ 		US_DEBUGP("-- babble\n");
+--- gregkh-2.6.orig/sound/usb/usbmidi.c
++++ gregkh-2.6/sound/usb/usbmidi.c
+@@ -181,9 +181,9 @@ static int snd_usbmidi_urb_error(int sta
+ 	case -ENODEV:
+ 		return -ENODEV;
+ 	/* errors that might occur during unplugging */
+-	case -EPROTO:    /* EHCI */
+-	case -ETIMEDOUT: /* OHCI */
+-	case -EILSEQ:    /* UHCI */
++	case -EPROTO:
++	case -ETIME:
++	case -EILSEQ:
+ 		return -EIO;
+ 	default:
+ 		snd_printk(KERN_ERR "urb status %d\n", status);
