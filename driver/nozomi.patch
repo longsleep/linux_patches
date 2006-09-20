@@ -15,8 +15,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 ---
  drivers/char/Kconfig  |   10 
  drivers/char/Makefile |    1 
- drivers/char/nozomi.c | 2192 ++++++++++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 2203 insertions(+)
+ drivers/char/nozomi.c | 2169 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 2180 insertions(+)
 
 --- gregkh-2.6.orig/drivers/char/Kconfig
 +++ gregkh-2.6/drivers/char/Kconfig
@@ -49,7 +49,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  obj-$(CONFIG_MOXA_INTELLIO)	+= moxa.o
 --- /dev/null
 +++ gregkh-2.6/drivers/char/nozomi.c
-@@ -0,0 +1,2192 @@
+@@ -0,0 +1,2169 @@
 +/* nozomi.c  -- HSDPA driver Broadband Wireless Data Card - Globe Trotter
 +*
 +* Written by: Ulf Jakobsson,
@@ -140,7 +140,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#include <linux/serial.h>
 +#include <linux/interrupt.h>
 +#include <linux/kmod.h>
-+#include <linux/proc_fs.h>
 +#include <linux/init.h>
 +#include <linux/kfifo.h>
 +#include <asm/uaccess.h>
@@ -508,7 +507,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	/* Pointers to registers */
 +	void __iomem *REG_IIR;
 +	void __iomem *REG_FCR;
-+//	volatile u16 * REG_IER;
 +	void __iomem *REG_IER;
 +
 +    u16		 ier_last_written;
@@ -528,15 +526,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +    spinlock_t			 spin_mutex;
 +
 +    u32					open_ttys;
-+    struct proc_dir_entry *proc_entry;
-+
 +} dc_t;
 +
 +/* This is a data packet that is read or written to/from card */
-+typedef struct {
++struct buffer {
 +    u32 size; /* size is the length of the data buffer */
 +    u8 *data;
-+} __attribute__ ((packed)) buf_t;
++} __attribute__ ((packed));
 +
 +/*    Function declarations */
 +static int ntty_tty_init(dc_t *dc);
@@ -544,16 +540,15 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +/*    Global variables */
 +static struct pci_device_id nozomi_pci_tbl[] = {
-+	{VENDOR1, DEVICE1},
++	{PCI_DEVICE(VENDOR1, DEVICE1)},
 +	{0, }
 +};
++MODULE_DEVICE_TABLE(pci, nozomi_pci_tbl);
 +
 +/* Used to store interrupt variables */
 +typedef struct {
 +    u16 read_iir; /* Holds current interrupt tokens */
 +} irq_t;
-+
-+MODULE_DEVICE_TABLE(pci, nozomi_pci_tbl);
 +
 +/* Representing the pci device of interest */
 +static int cards_found;
@@ -1446,29 +1441,27 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +    }
 +}
 +
-+static int read_proc_card_type(char *buf, char **start, off_t offset, int len) {
-+    dc_t *dc = get_dc_by_index(0);
-+    len = 0;
++static int card_type_show(struct device *dev, struct device_attribute *attr,
++			  char *buf)
++{
++	struct pci_dev *pdev = to_pci_dev(dev);
++	dc_t *dc = pci_get_drvdata(pdev);
 +
-+    len += sprintf(buf+len,"%d\n", dc->card_type);
-+    return len;
++	return sprintf(buf, "%d\n", dc->card_type);
 +}
++static DEVICE_ATTR(card_type, 0444, card_type_show, NULL);
 +
-+static int read_proc_open_ttys(char *buf, char **start, off_t offset, int len) {
-+    dc_t *dc = get_dc_by_index(0);
-+    len = 0;
++static int open_ttys_show(struct device *dev, struct device_attribute *attr,
++			  char *buf)
++{
++	struct pci_dev *pdev = to_pci_dev(dev);
++	dc_t *dc = pci_get_drvdata(pdev);
 +
-+    len += sprintf(buf+len,"%d\n", dc->open_ttys);
-+    return len;
++	return sprintf(buf, "%d\n", dc->open_ttys);
 +}
++static DEVICE_ATTR(open_ttys, 0444, open_ttys_show, NULL);
 +
-+static int read_proc_version(char *buf, char **start, off_t offset, int len) {
-+    len = 0;
-+
-+    len += sprintf(buf+len, "%s\n", VERSION_STRING);
-+    return len;
-+}
-+
++#if 0
 +static int read_proc_rtx(char *buf, char **start, off_t offset, int len) {
 +    dc_t *dc = get_dc_by_index(0);
 +    int i;
@@ -1481,35 +1474,20 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +    }
 +    return len;
 +}
++#endif
 +
-+static void make_proc_dirs(void) {
-+    dc_t *dc = get_dc_by_index(0);
++static void make_sysfs_files(dc_t *dc)
++{
++	int retval;
 +
-+    dc->proc_entry = proc_mkdir("nozomi", &proc_root);
-+
-+    /* Register the read_proc */
-+    if ( !create_proc_info_entry("card_type",0,dc->proc_entry,read_proc_card_type) ) {
-+        ERR("ERROR: failed to register read_procmem");
-+    }
-+    if ( !create_proc_info_entry("open_ttys",0,dc->proc_entry,read_proc_open_ttys) ) {
-+        ERR("ERROR: failed to register read_procmem");
-+    }
-+    if ( !create_proc_info_entry("rtx",0,dc->proc_entry,read_proc_rtx) ) {
-+        ERR("ERROR: failed to register read_procmem");
-+    }
-+    if ( !create_proc_info_entry("version",0,dc->proc_entry,read_proc_version) ) {
-+        ERR("ERROR: failed to register read_procmem");
-+    }
++	retval = device_create_file(&dc->pdev->dev, &dev_attr_card_type);
++	retval = device_create_file(&dc->pdev->dev, &dev_attr_open_ttys);
 +}
 +
-+static void remove_proc_dirs(void) {
-+    dc_t *dc = get_dc_by_index(0);
-+
-+    remove_proc_entry("card_type", dc->proc_entry);
-+    remove_proc_entry("open_ttys", dc->proc_entry);
-+    remove_proc_entry("rtx", dc->proc_entry);
-+    remove_proc_entry("version", dc->proc_entry);
-+    remove_proc_entry("nozomi", &proc_root);
++static void remove_sysfs_files(dc_t *dc)
++{
++	device_remove_file(&dc->pdev->dev, &dev_attr_card_type);
++	device_remove_file(&dc->pdev->dev, &dev_attr_open_ttys);
 +}
 +
 +/* Allocate memory for one device */
@@ -1596,14 +1574,16 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +    spin_lock_init(&dc->spin_mutex);
 +
-+    make_proc_dirs();
++    make_sysfs_files(dc);
 +
 +    ntty_tty_init(dc);
 +
 +    /* Enable  RESET interrupt. */
 +    SET_IER( RESET, 0xFFFF );
 +
-+    return 0;
++	pci_set_drvdata(pdev, dc);
++
++	return 0;
 +
 +err_disable_regions:
 +	pci_release_regions(pdev);
@@ -1701,7 +1681,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +    tty_exit();
 +
-+    remove_proc_dirs();
++    remove_sysfs_files(dc);
 +
 +    destroy_workqueue(dc->tty_flip_wq);
 +
@@ -2220,11 +2200,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +static __init int nozomi_init(void)
 +{
-+	int rval = 0;
-+
-+	rval = pci_module_init(&nozomi_driver);
 +	printk(KERN_INFO "Initializing %s\n", VERSION_STRING);
-+	return rval;
++	return pci_register_driver(&nozomi_driver);
 +}
 +
 +static __exit void nozomi_exit(void)
@@ -2237,8 +2214,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +module_exit(nozomi_exit);
 +
 +#ifdef NOZOMI_DEBUG
-+  MODULE_PARM(nzdebug, "i");
++MODULE_PARM(nzdebug, "i");
 +#endif
 +
 +MODULE_LICENSE("Dual BSD/GPL");
-+MODULE_DESCRIPTION( DRIVER_DESC );
++MODULE_DESCRIPTION(DRIVER_DESC);
