@@ -1,0 +1,81 @@
+From stern@rowland.harvard.edu Mon Sep 25 08:56:09 2006
+Date: Mon, 25 Sep 2006 11:55:56 -0400 (EDT)
+From: Alan Stern <stern@rowland.harvard.edu>
+To: Greg KH <greg@kroah.com>
+Subject: USB: dummy-hcd: fix "warn-unused-result" messages
+Message-ID: <Pine.LNX.4.44L0.0609251151370.8816-100000@iolanthe.rowland.org>
+
+This patch (as758) fixes the "warn-unused-result" messages in dummy-hcd.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/gadget/dummy_hcd.c |   33 +++++++++++++++++++++++----------
+ 1 file changed, 23 insertions(+), 10 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/gadget/dummy_hcd.c
++++ gregkh-2.6/drivers/usb/gadget/dummy_hcd.c
+@@ -816,15 +816,14 @@ usb_gadget_register_driver (struct usb_g
+ 	dum->gadget.dev.driver = &driver->driver;
+ 	dev_dbg (udc_dev(dum), "binding gadget driver '%s'\n",
+ 			driver->driver.name);
+-	if ((retval = driver->bind (&dum->gadget)) != 0) {
+-		dum->driver = NULL;
+-		dum->gadget.dev.driver = NULL;
+-		return retval;
+-	}
++	if ((retval = driver->bind (&dum->gadget)) != 0)
++		goto err_bind_gadget;
+ 
+ 	driver->driver.bus = dum->gadget.dev.parent->bus;
+-	driver_register (&driver->driver);
+-	device_bind_driver (&dum->gadget.dev);
++	if ((retval = driver_register (&driver->driver)) != 0)
++		goto err_register;
++	if ((retval = device_bind_driver (&dum->gadget.dev)) != 0)
++		goto err_bind_driver;
+ 
+ 	/* khubd will enumerate this in a while */
+ 	spin_lock_irq (&dum->lock);
+@@ -834,6 +833,19 @@ usb_gadget_register_driver (struct usb_g
+ 
+ 	usb_hcd_poll_rh_status (dummy_to_hcd (dum));
+ 	return 0;
++
++err_bind_driver:
++	driver_unregister (&driver->driver);
++err_register:
++	driver->unbind (&dum->gadget);
++	spin_lock_irq (&dum->lock);
++	dum->pullup = 0;
++	set_link_state (dum);
++	spin_unlock_irq (&dum->lock);
++err_bind_gadget:
++	dum->driver = NULL;
++	dum->gadget.dev.driver = NULL;
++	return retval;
+ }
+ EXPORT_SYMBOL (usb_gadget_register_driver);
+ 
+@@ -916,7 +928,9 @@ static int dummy_udc_probe (struct platf
+ 	usb_get_hcd (dummy_to_hcd (dum));
+ 
+ 	platform_set_drvdata (pdev, dum);
+-	device_create_file (&dum->gadget.dev, &dev_attr_function);
++	rc = device_create_file (&dum->gadget.dev, &dev_attr_function);
++	if (rc < 0)
++		device_unregister (&dum->gadget.dev);
+ 	return rc;
+ }
+ 
+@@ -1864,8 +1878,7 @@ static int dummy_start (struct usb_hcd *
+ #endif
+ 
+ 	/* FIXME 'urbs' should be a per-device thing, maybe in usbcore */
+-	device_create_file (dummy_dev(dum), &dev_attr_urbs);
+-	return 0;
++	return device_create_file (dummy_dev(dum), &dev_attr_urbs);
+ }
+ 
+ static void dummy_stop (struct usb_hcd *hcd)
