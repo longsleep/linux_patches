@@ -1,0 +1,303 @@
+From xiphmont@gmail.com Thu Sep 28 00:01:09 2006
+Message-ID: <806dafc20609280001s6d19db8fkef1a2e8a7c629cc@mail.gmail.com>
+Date: Thu, 28 Sep 2006 03:01:04 -0400
+From: "Christopher \"Monty\" Montgomery" <xiphmont@gmail.com>
+To: linux-usb-devel@lists.sourceforge.net
+Subject: [PATCH 2/15] USB: ehci-hcd: periodic startup/shutdown centralization and hysteresis
+Cc: greg@kroah.com, david-b@pacbell.net, xiphmont@gmail.com
+Content-Disposition: inline
+
+patch 2: Refactors periodic schedule startup and shutdown code such
+that refcounting and code is centralized.  Also adds hysteresis such
+that shutdown does not occur until there's one full pass through the
+periodic schedule with nothing to do.
+
+Signed-off-by: Christopher "Monty" Montgomery <xiphmont@gmail.com>
+Cc: David Brownell <david-b@pacbell.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ drivers/usb/host/ehci-sched.c |  174 ++++++++++++++++++++++++++++++------------
+ drivers/usb/host/ehci.h       |    1 
+ 2 files changed, 127 insertions(+), 48 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/host/ehci-sched.c
++++ gregkh-2.6/drivers/usb/host/ehci-sched.c
+@@ -36,6 +36,14 @@
+ 
+ static int ehci_get_frame (struct usb_hcd *hcd);
+ 
++/* enable/disable shedule-specific debugging output */
++static unsigned sched_verbose = 0;
++module_param (sched_verbose, uint, S_IRUGO);
++MODULE_PARM_DESC (sched_verbose,
++		  "schedule verbose: dump additional scheduling-specific "
++		  "debugging information to syslog.  Incurs large latencies in"
++		  " near-realtime code; default is 0 (off)");
++
+ /*-------------------------------------------------------------------------*/
+ 
+ /*
+@@ -424,51 +432,105 @@ static int tt_no_collision (
+ #endif /* CONFIG_USB_EHCI_TT_NEWSCHED */
+ 
+ /*-------------------------------------------------------------------------*/
++/* enable_periodic - Activate the periodic schedule
++ *
++ * @ehci: pointer to ehci host controller device structure.
++ */
+ 
+ static int enable_periodic (struct ehci_hcd *ehci)
+ {
+ 	u32	cmd;
+ 	int	status;
+ 
+-	/* did clearing PSE did take effect yet?
+-	 * takes effect only at frame boundaries...
+-	 */
+-	status = handshake (&ehci->regs->status, STS_PSS, 0, 9 * 125);
+-	if (status != 0) {
+-		ehci_to_hcd(ehci)->state = HC_STATE_HALT;
+-		return status;
+-	}
++	if(!ehci->periodic_sched){
++
++		if(sched_verbose)
++			printk(KERN_INFO "ehci: enabling periodic schedule\n");
++
++		/* did clearing PSE did take effect yet?
++		 * takes effect only at frame boundaries...
++		 */
++		status = handshake (&ehci->regs->status, STS_PSS, 0, 9 * 125);
++		if (status != 0) {
++			ehci_to_hcd(ehci)->state = HC_STATE_HALT;
++			return status;
++		}
++
++		cmd = readl (&ehci->regs->command) | CMD_PSE;
++		writel (cmd, &ehci->regs->command);
++		/* posted write ... PSS happens later */
++		ehci_to_hcd(ehci)->state = HC_STATE_RUNNING;
++
++		/* make sure ehci_work scans these */
++		ehci->next_uframe = readl (&ehci->regs->frame_index)
++			% (ehci->periodic_size << 3);
++	}
++
++	if(ehci->periodic_sched<2)
++		ehci->periodic_sched=2;
++
++	ehci->periodic_sched++;
+ 
+-	cmd = readl (&ehci->regs->command) | CMD_PSE;
+-	writel (cmd, &ehci->regs->command);
+-	/* posted write ... PSS happens later */
+-	ehci_to_hcd(ehci)->state = HC_STATE_RUNNING;
+-
+-	/* make sure ehci_work scans these */
+-	ehci->next_uframe = readl (&ehci->regs->frame_index)
+-				% (ehci->periodic_size << 3);
+ 	return 0;
+ }
+ 
++/* deref_periodic - decrement refcount of periodic schedule use; will
++ * only take the schedule down to 'idle but running'; it is the
++ * responsibility of scan_periodic to actually halt a running schedule
++ * after it has been idle for one full sweep.
++ *
++ * @ehci: pointer to ehci host controller device structure.
++ */
++static void deref_periodic (struct ehci_hcd *ehci)
++{
++	/* deref as far as 'idle' */
++	if(ehci->periodic_sched>2)
++		ehci->periodic_sched--;
++
++	/* should *never* happen. Watch anyway. */
++	if(ehci->periodic_sched<2){
++		ehci_err(ehci,"periodic schedule refcount incorrect; "
++			 "is %d, should be 2.  Setting to 2.\n",
++			 ehci->periodic_sched);
++		ehci->periodic_sched=2;
++	}
++}
++
++/* disable_periodic - halt execution of the periodic schedule. Note
++ * that the periodic schedule is now disabled after a full pass
++ * through the periodic schedule in which it is unused.  It's not
++ * immediately disabled when the last active transfer completes.
++ *
++ * @ehci: pointer to ehci host controller device structure.
++ */
+ static int disable_periodic (struct ehci_hcd *ehci)
+ {
+ 	u32	cmd;
+ 	int	status;
++
++	if(ehci->periodic_sched == 1){ /* idle, marked to shutdown */
+ 
+-	/* did setting PSE not take effect yet?
+-	 * takes effect only at frame boundaries...
+-	 */
+-	status = handshake (&ehci->regs->status, STS_PSS, STS_PSS, 9 * 125);
+-	if (status != 0) {
+-		ehci_to_hcd(ehci)->state = HC_STATE_HALT;
+-		return status;
+-	}
+-
+-	cmd = readl (&ehci->regs->command) & ~CMD_PSE;
+-	writel (cmd, &ehci->regs->command);
+-	/* posted write ... */
++		if(sched_verbose)
++			printk(KERN_INFO "ehci: disabling periodic schedule\n");
+ 
+-	ehci->next_uframe = -1;
++		/* did setting PSE not take effect yet?
++		 * takes effect only at frame boundaries...
++		 */
++		status = handshake (&ehci->regs->status,
++				    STS_PSS, STS_PSS, 9 * 125);
++		if (status != 0) {
++			ehci_to_hcd(ehci)->state = HC_STATE_HALT;
++			return status;
++		}
++
++		cmd = readl (&ehci->regs->command) & ~CMD_PSE;
++		writel (cmd, &ehci->regs->command);
++		/* posted write ... */
++
++		ehci->next_uframe = -1;
++		ehci->periodic_sched = 0; /* shut down */
++	}
++
+ 	return 0;
+ }
+ 
+@@ -539,10 +601,7 @@ static int qh_link_periodic (struct ehci
+ 		: (qh->usecs * 8);
+ 
+ 	/* maybe enable periodic schedule processing */
+-	if (!ehci->periodic_sched++)
+-		return enable_periodic (ehci);
+-
+-	return 0;
++	return enable_periodic (ehci);
+ }
+ 
+ static void qh_unlink_periodic (struct ehci_hcd *ehci, struct ehci_qh *qh)
+@@ -581,9 +640,7 @@ static void qh_unlink_periodic (struct e
+ 	qh_put (qh);
+ 
+ 	/* maybe turn off periodic schedule */
+-	ehci->periodic_sched--;
+-	if (!ehci->periodic_sched)
+-		(void) disable_periodic (ehci);
++	deref_periodic (ehci);
+ }
+ 
+ static void intr_deschedule (struct ehci_hcd *ehci, struct ehci_qh *qh)
+@@ -1008,6 +1065,10 @@ iso_stream_put(struct ehci_hcd *ehci, st
+ 				);
+ 		}
+ 
++		/* potentially shut off periodic schedule */
++		deref_periodic(ehci);
++
++		/* free the stream */
+ 		kfree(stream);
+ 	}
+ }
+@@ -1340,6 +1401,16 @@ iso_stream_schedule (
+ 		goto fail;
+ 	}
+ 
++	/* first scheduling attempt? */
++	if(!stream->budget_state){
++
++		/* potentially turn on the periodic hardware */
++		status=enable_periodic (ehci);
++		if(status)goto fail;
++
++		stream->budget_state = 1;
++	}
++
+ 	now = readl (&ehci->regs->frame_index) % mod;
+ 
+ 	/* when's the last uframe this urb could start? */
+@@ -1547,8 +1618,6 @@ itd_link_urb (
+ 	urb->hcpriv = NULL;
+ 
+ 	timer_action (ehci, TIMER_IO_WATCHDOG);
+-	if (unlikely (!ehci->periodic_sched++))
+-		return enable_periodic (ehci);
+ 	return 0;
+ }
+ 
+@@ -1620,10 +1689,6 @@ itd_complete (
+ 	ehci_urb_done (ehci, urb, regs);
+ 	urb = NULL;
+ 
+-	/* defer stopping schedule; completion can submit */
+-	ehci->periodic_sched--;
+-	if (unlikely (!ehci->periodic_sched))
+-		(void) disable_periodic (ehci);
+ 	ehci_to_hcd(ehci)->self.bandwidth_isoc_reqs--;
+ 
+ 	if (unlikely (list_empty (&stream->td_list))) {
+@@ -1921,8 +1986,6 @@ sitd_link_urb (
+ 	urb->hcpriv = NULL;
+ 
+ 	timer_action (ehci, TIMER_IO_WATCHDOG);
+-	if (!ehci->periodic_sched++)
+-		return enable_periodic (ehci);
+ 	return 0;
+ }
+ 
+@@ -1985,10 +2048,6 @@ sitd_complete (
+ 	ehci_urb_done (ehci, urb, regs);
+ 	urb = NULL;
+ 
+-	/* defer stopping schedule; completion can submit */
+-	ehci->periodic_sched--;
+-	if (!ehci->periodic_sched)
+-		(void) disable_periodic (ehci);
+ 	ehci_to_hcd(ehci)->self.bandwidth_isoc_reqs--;
+ 
+ 	if (list_empty (&stream->td_list)) {
+@@ -2229,6 +2288,25 @@ restart:
+ 		} else {
+ 			now_uframe++;
+ 			now_uframe %= mod;
++
++			if(now_uframe == 0){
++
++				/* if the periodic schedule is still marked
++				   to be disabled after a complete pass,
++				   disable it now */
++				disable_periodic(ehci);
++
++				/* if the periodic schedule is running
++				   but currently empty, do not disable
++				   it immediately; that may hurt
++				   streaming isoch (as Linux is not
++				   using a true periodic schedule).
++				   Mark the refcount so that it will
++				   be disabled after this pass if no
++				   new transactions are enabled */
++				if(ehci->periodic_sched == 2)
++					ehci->periodic_sched = 1;
++			}
+ 		}
+ 	}
+ }
+--- gregkh-2.6.orig/drivers/usb/host/ehci.h
++++ gregkh-2.6/drivers/usb/host/ehci.h
+@@ -486,6 +486,7 @@ struct ehci_iso_stream {
+ 	unsigned long		rescheduled;
+ 	int			next_uframe;
+ 	__le32			splits;
++        int                     budget_state;
+ 
+ 	/* the rest is derived from the endpoint descriptor,
+ 	 * trusting urb->interval == f(epdesc->bInterval) and

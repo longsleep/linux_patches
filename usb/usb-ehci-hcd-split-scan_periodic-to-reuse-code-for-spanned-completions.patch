@@ -1,0 +1,310 @@
+From xiphmont@gmail.com Thu Sep 28 00:15:53 2006
+Message-ID: <806dafc20609280015m5bbd5e88ibf4c480227be7fcf@mail.gmail.com>
+Date: Thu, 28 Sep 2006 03:15:49 -0400
+From: "Christopher \"Monty\" Montgomery" <xiphmont@gmail.com>
+To: linux-usb-devel@lists.sourceforge.net
+Subject: [PATCH 8/15] USB: ehci-hcd: split scan_periodic to reuse code for spanned completions
+Cc: greg@kroah.com, david-b@pacbell.net, xiphmont@gmail.com
+Content-Disposition: inline
+
+patch 8: split frame scanning code out of the scan_periodic schedule
+walking loop so that the same code can be used to scan preceeding
+frame for completions once FSTN and sITD frame spanning support are
+added.  Add restrictions on the timing of processing QH and sITD
+completions in the current frame to avoid a race where a current
+frame's completion may inadvertantly be processed before a preceeding
+frame's spanning completion (that is, do not process current completions until
+preceeding transactions were checked for completion at a time that
+guarantees they'd have finished).
+
+Signed-off-by: Christopher "Monty" Montgomery <xiphmont@gmail.com>
+Cc: David Brownell <david-b@pacbell.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+
+---
+ drivers/usb/host/ehci-sched.c |  243 ++++++++++++++++++++++++++----------------
+ 1 file changed, 152 insertions(+), 91 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/host/ehci-sched.c
++++ gregkh-2.6/drivers/usb/host/ehci-sched.c
+@@ -2277,6 +2277,152 @@ done:
+ 	return status;
+ }
+ 
++/*-------------------------------------------------------------------------*/
++
++static int scan_frame(struct ehci_hcd *ehci, struct pt_regs *regs,
++		      int frame, int uframes, int rescan){
++
++	unsigned modified = 0;
++	union ehci_shadow	q, *q_p;
++	__le32			type, *hw_p;
++
++	frame = frame & (ehci->periodic_size-1);
++
++	q_p = &ehci->pshadow [frame];
++	hw_p = &ehci->periodic [frame];
++
++	q.ptr = q_p->ptr;
++	type = Q_NEXT_TYPE (*hw_p);
++
++	while (q.ptr != NULL) {
++		unsigned		uf;
++		union ehci_shadow	temp;
++		int			live;
++
++		live = HC_IS_RUNNING (ehci_to_hcd(ehci)->state);
++		switch (type) {
++		case Q_TYPE_QH:
++			/* handle any completions */
++			temp.qh = qh_get (q.qh);
++			q_p = &q.qh->qh_next;
++			hw_p = &q.qh->hw_next;
++			type = Q_NEXT_TYPE (*hw_p);
++
++			q = *q_p;
++
++			modified = qh_completions (ehci, temp.qh, regs);
++			if (unlikely (list_empty (&temp.qh->qtd_list)))
++				periodic_qh_deschedule (ehci, temp.qh);
++
++			qh_put (temp.qh);
++			break;
++		case Q_TYPE_FSTN:
++
++			/* for save-place FSTNs, inspect all QH
++			 * entries in the previous frame for
++			 * completions, but not if we're already in
++			 * recovery mode. */
++
++			if (q.fstn->hw_prev != EHCI_LIST_END &&	!rescan) {
++				modified = scan_frame (ehci,regs,frame-1,8,1);
++				rescan = 1;
++			}
++
++			q_p = &q.fstn->fstn_next;
++			hw_p = &q.fstn->hw_next;
++			type = Q_NEXT_TYPE (*hw_p);
++			q = *q_p;
++
++			break;
++
++		case Q_TYPE_ITD:
++			/* skip itds for later in the frame */
++			rmb ();
++			for (uf = live ? uframes : 8; uf < 8; uf++) {
++				if (0 == (q.itd->hw_transaction [uf]
++					  & ITD_ACTIVE))
++					continue;
++				q_p = &q.itd->itd_next;
++				hw_p = &q.itd->hw_next;
++				type = Q_NEXT_TYPE (*hw_p);
++				q = *q_p;
++				break;
++			}
++			if (uf != 8)
++				break;
++
++			/* this one's ready ... HC won't cache the
++			 * pointer for much longer, if at all.
++			 */
++			*q_p = q.itd->itd_next;
++			*hw_p = q.itd->hw_next;
++			type = Q_NEXT_TYPE (*hw_p);
++			wmb();
++			modified = itd_complete (ehci, q.itd, regs);
++			q = *q_p;
++			break;
++
++		case Q_TYPE_SITD:
++
++			/* is this a spanning dummy? */
++			if (q.sitd->hw_backpointer != EHCI_LIST_END){
++				q_p = &q.sitd->sitd_next;
++				hw_p = &q.sitd->hw_next;
++				type = Q_NEXT_TYPE (*hw_p);
++				q = *q_p;
++
++				if(rescan) break;
++
++				/* note that the original sITD's
++				   completion will unlink the dummy */
++				modified = scan_frame(ehci,regs,
++						      frame-1,8,1);
++				rescan = 1;
++
++			}else{
++				/* process completions for this frame only if
++				 * we're certain all completions for a
++				 * preceeding spanning frame have first been
++				 * processed; that is true iff clock was past
++				 * uframe 1 when we started */
++				if ( ((q.sitd->hw_results & SITD_ACTIVE) ||
++				      uframes < 3)
++				     && live) {
++					q_p = &q.sitd->sitd_next;
++					hw_p = &q.sitd->hw_next;
++					type = Q_NEXT_TYPE (*hw_p);
++					q = *q_p;
++					break;
++				}
++
++				/* unlink the sITD */
++				*q_p = q.sitd->sitd_next;
++				*hw_p = q.sitd->hw_next;
++				type = Q_NEXT_TYPE (*hw_p);
++				wmb();
++
++				/* when spanning sITD support is
++				 * added, the spanning dummy will be
++				 * unlinked here as well. */
++
++				modified = sitd_complete (ehci, q.sitd, regs);
++
++				q = *q_p;
++			}
++			break;
++		default:
++			dbg ("corrupt type %d frame %d shadow %p",
++			     type, frame, q.ptr);
++			// BUG ();
++			q.ptr = NULL;
++		}
++
++		/* assume completion callbacks modify the queue */
++		if (unlikely (modified)) return 1;
++	}
++	return 0;
++}
++
+ /* scan_periodic - completion worker; called out of interrupt (or
+  * poll) handler to finish processing of transactions that have been
+  * completed by the host controller.  Also now has the responsibility
+@@ -2290,7 +2436,6 @@ static void
+ scan_periodic (struct ehci_hcd *ehci, struct pt_regs *regs)
+ {
+ 	unsigned	frame, clock, now_uframe, mod;
+-	unsigned	modified;
+ 
+ 	mod = ehci->periodic_size << 3;
+ 
+@@ -2307,9 +2452,8 @@ scan_periodic (struct ehci_hcd *ehci, st
+ 	clock %= mod;
+ 
+ 	for (;;) {
+-		union ehci_shadow	q, *q_p;
+-		__le32			type, *hw_p;
+ 		unsigned		uframes;
++		int                     repeat = 1;
+ 
+ 		/* don't scan past the live uframe */
+ 		frame = now_uframe >> 3;
+@@ -2321,94 +2465,10 @@ scan_periodic (struct ehci_hcd *ehci, st
+ 			uframes = 8;
+ 		}
+ 
+-restart:
+-		/* scan each element in frame's queue for completions */
+-		q_p = &ehci->pshadow [frame];
+-		hw_p = &ehci->periodic [frame];
+-		q.ptr = q_p->ptr;
+-		type = Q_NEXT_TYPE (*hw_p);
+-		modified = 0;
+-
+-		while (q.ptr != NULL) {
+-			unsigned		uf;
+-			union ehci_shadow	temp;
+-			int			live;
+-
+-			live = HC_IS_RUNNING (ehci_to_hcd(ehci)->state);
+-			switch (type) {
+-			case Q_TYPE_QH:
+-				/* handle any completions */
+-				temp.qh = qh_get (q.qh);
+-				type = Q_NEXT_TYPE (q.qh->hw_next);
+-				q = q.qh->qh_next;
+-				modified = qh_completions (ehci, temp.qh, regs);
+-				if (unlikely (list_empty (&temp.qh->qtd_list)))
+-					periodic_qh_deschedule (ehci, temp.qh);
+-				qh_put (temp.qh);
+-				break;
+-			case Q_TYPE_FSTN:
+-				/* for "save place" FSTNs, look at QH entries
+-				 * in the previous frame for completions.
+-				 */
+-				if (q.fstn->hw_prev != EHCI_LIST_END) {
+-					dbg ("ignoring completions from FSTNs");
+-				}
+-				type = Q_NEXT_TYPE (q.fstn->hw_next);
+-				q = q.fstn->fstn_next;
+-				break;
+-			case Q_TYPE_ITD:
+-				/* skip itds for later in the frame */
+-				rmb ();
+-				for (uf = live ? uframes : 8; uf < 8; uf++) {
+-					if (0 == (q.itd->hw_transaction [uf]
+-							& ITD_ACTIVE))
+-						continue;
+-					q_p = &q.itd->itd_next;
+-					hw_p = &q.itd->hw_next;
+-					type = Q_NEXT_TYPE (q.itd->hw_next);
+-					q = *q_p;
+-					break;
+-				}
+-				if (uf != 8)
+-					break;
+-
+-				/* this one's ready ... HC won't cache the
+-				 * pointer for much longer, if at all.
+-				 */
+-				*q_p = q.itd->itd_next;
+-				*hw_p = q.itd->hw_next;
+-				type = Q_NEXT_TYPE (q.itd->hw_next);
+-				wmb();
+-				modified = itd_complete (ehci, q.itd, regs);
+-				q = *q_p;
+-				break;
+-			case Q_TYPE_SITD:
+-				if ((q.sitd->hw_results & SITD_ACTIVE)
+-						&& live) {
+-					q_p = &q.sitd->sitd_next;
+-					hw_p = &q.sitd->hw_next;
+-					type = Q_NEXT_TYPE (q.sitd->hw_next);
+-					q = *q_p;
+-					break;
+-				}
+-				*q_p = q.sitd->sitd_next;
+-				*hw_p = q.sitd->hw_next;
+-				type = Q_NEXT_TYPE (q.sitd->hw_next);
+-				wmb();
+-				modified = sitd_complete (ehci, q.sitd, regs);
+-				q = *q_p;
+-				break;
+-			default:
+-				dbg ("corrupt type %d frame %d shadow %p",
+-					type, frame, q.ptr);
+-				// BUG ();
+-				q.ptr = NULL;
+-			}
+-
+-			/* assume completion callbacks modify the queue */
+-			if (unlikely (modified))
+-				goto restart;
+-		}
++                /* scan each element in frame's queue for completions */
++		while(repeat)
++			repeat = scan_frame(ehci, regs, frame, uframes, 0);
++
+ 
+ 		/* stop when we catch up to the HC */
+ 
+@@ -2425,6 +2485,7 @@ restart:
+ 
+ 			if (!HC_IS_RUNNING (ehci_to_hcd(ehci)->state))
+ 				break;
++
+ 			ehci->next_uframe = now_uframe;
+ 			now = readl (&ehci->regs->frame_index) % mod;
+ 			if (now_uframe == now)
