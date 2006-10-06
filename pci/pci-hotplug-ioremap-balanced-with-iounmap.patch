@@ -1,0 +1,84 @@
+From amol@verismonetworks.com Wed Oct  4 23:34:24 2006
+Subject: PCI hotplug: ioremap balanced with iounmap
+From: Amol Lad <amol@verismonetworks.com>
+To: Greg KH <gregkh@suse.de>
+Cc: Kristen Carlson Accardi <kristen.c.accardi@intel.com>
+Date: Thu, 05 Oct 2006 12:07:32 +0530
+Message-Id: <1160030252.19143.36.camel@amol.verismonetworks.com>
+
+1. ioremap must be balanced by an iounmap and failing to do so can
+   result in a memory leak.
+2. Handle return value correctly
+
+Tested (compilation only) with:
+- allmodconfig
+
+Signed-off-by: Amol Lad <amol@verismonetworks.com>
+Cc: Kristen Carlson Accardi <kristen.c.accardi@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/pci/hotplug/shpchp_hpc.c |   19 ++++++++++++++-----
+ 1 file changed, 14 insertions(+), 5 deletions(-)
+
+--- gregkh-2.6.orig/drivers/pci/hotplug/shpchp_hpc.c
++++ gregkh-2.6/drivers/pci/hotplug/shpchp_hpc.c
+@@ -1118,7 +1118,7 @@ int shpc_init(struct controller * ctrl, 
+ {
+ 	struct php_ctlr_state_s *php_ctlr, *p;
+ 	void *instance_id = ctrl;
+-	int rc, num_slots = 0;
++	int rc = -1, num_slots = 0;
+ 	u8 hp_slot;
+ 	u32 shpc_base_offset;
+ 	u32 tempdword, slot_reg, slot_config;
+@@ -1184,11 +1184,15 @@ int shpc_init(struct controller * ctrl, 
+ 	info("HPC vendor_id %x device_id %x ss_vid %x ss_did %x\n", pdev->vendor, pdev->device, pdev->subsystem_vendor, 
+ 		pdev->subsystem_device);
+ 	
+-	if (pci_enable_device(pdev))
++	rc = pci_enable_device(pdev);
++	if (rc) {
++		err("%s: pci_enable_device failed\n", __FUNCTION__);
+ 		goto abort_free_ctlr;
++	}
+ 
+ 	if (!request_mem_region(ctrl->mmio_base, ctrl->mmio_size, MY_NAME)) {
+ 		err("%s: cannot reserve MMIO region\n", __FUNCTION__);
++		rc = -1;
+ 		goto abort_free_ctlr;
+ 	}
+ 
+@@ -1197,6 +1201,7 @@ int shpc_init(struct controller * ctrl, 
+ 		err("%s: cannot remap MMIO region %lx @ %lx\n", __FUNCTION__,
+ 		    ctrl->mmio_size, ctrl->mmio_base);
+ 		release_mem_region(ctrl->mmio_base, ctrl->mmio_size);
++		rc = -1;
+ 		goto abort_free_ctlr;
+ 	}
+ 	dbg("%s: php_ctlr->creg %p\n", __FUNCTION__, php_ctlr->creg);
+@@ -1299,8 +1304,10 @@ int shpc_init(struct controller * ctrl, 
+ 	 */
+ 	if (atomic_add_return(1, &shpchp_num_controllers) == 1) {
+ 		shpchp_wq = create_singlethread_workqueue("shpchpd");
+-		if (!shpchp_wq)
+-			return -ENOMEM;
++		if (!shpchp_wq) {
++			rc = -ENOMEM;
++			goto abort_free_ctlr;
++		}
+ 	}
+ 
+ 	/*
+@@ -1330,8 +1337,10 @@ int shpc_init(struct controller * ctrl, 
+ 
+ 	/* We end up here for the many possible ways to fail this API.  */
+ abort_free_ctlr:
++	if (php_ctlr->creg)
++		iounmap(php_ctlr->creg);
+ 	kfree(php_ctlr);
+ abort:
+ 	DBG_LEAVE_ROUTINE
+-	return -1;
++	return rc;
+ }
