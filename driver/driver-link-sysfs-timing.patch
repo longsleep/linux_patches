@@ -1,0 +1,152 @@
+From kay.sievers@novell.com Sat Oct  7 13:11:39 2006
+From: Kay Sievers <kay.sievers@novell.com>
+Date: Sat, 07 Oct 2006 21:55:55 +0200
+Subject: Driver core: fix "driver" symlink timing
+Message-Id: <1160250955.4235.26.camel@localhost>
+
+Create the "driver" link before the child device may be created by
+the probing logic. This makes it possible for userspace (udev), to
+determine the driver property of the parent device, at the time the
+child device is created.
+
+Signed-off-by: Kay Sievers <kay.sievers@novell.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/base/dd.c |   82 ++++++++++++++++++++++++++++++++++--------------------
+ 1 file changed, 52 insertions(+), 30 deletions(-)
+
+--- gregkh-2.6.orig/drivers/base/dd.c
++++ gregkh-2.6/drivers/base/dd.c
+@@ -25,33 +25,23 @@
+ #define to_drv(node) container_of(node, struct device_driver, kobj.entry)
+ 
+ 
+-/**
+- *	device_bind_driver - bind a driver to one device.
+- *	@dev:	device.
+- *
+- *	Allow manual attachment of a driver to a device.
+- *	Caller must have already set @dev->driver.
+- *
+- *	Note that this does not modify the bus reference count
+- *	nor take the bus's rwsem. Please verify those are accounted
+- *	for before calling this. (It is ok to call with no other effort
+- *	from a driver's probe() method.)
+- *
+- *	This function must be called with @dev->sem held.
+- */
+-int device_bind_driver(struct device *dev)
++static void driver_bound(struct device *dev)
+ {
+-	int ret;
+-
+ 	if (klist_node_attached(&dev->knode_driver)) {
+ 		printk(KERN_WARNING "%s: device %s already bound\n",
+ 			__FUNCTION__, kobject_name(&dev->kobj));
+-		return 0;
++		return;
+ 	}
+ 
+ 	pr_debug("bound device '%s' to driver '%s'\n",
+ 		 dev->bus_id, dev->driver->name);
+ 	klist_add_tail(&dev->knode_driver, &dev->driver->klist_devices);
++}
++
++static int driver_sysfs_add(struct device *dev)
++{
++	int ret;
++
+ 	ret = sysfs_create_link(&dev->driver->kobj, &dev->kobj,
+ 			  kobject_name(&dev->kobj));
+ 	if (ret == 0) {
+@@ -64,6 +54,36 @@ int device_bind_driver(struct device *de
+ 	return ret;
+ }
+ 
++static void driver_sysfs_remove(struct device *dev)
++{
++	struct device_driver *drv = dev->driver;
++
++	if (drv) {
++		sysfs_remove_link(&drv->kobj, kobject_name(&dev->kobj));
++		sysfs_remove_link(&dev->kobj, "driver");
++	}
++}
++
++/**
++ *	device_bind_driver - bind a driver to one device.
++ *	@dev:	device.
++ *
++ *	Allow manual attachment of a driver to a device.
++ *	Caller must have already set @dev->driver.
++ *
++ *	Note that this does not modify the bus reference count
++ *	nor take the bus's rwsem. Please verify those are accounted
++ *	for before calling this. (It is ok to call with no other effort
++ *	from a driver's probe() method.)
++ *
++ *	This function must be called with @dev->sem held.
++ */
++int device_bind_driver(struct device *dev)
++{
++	driver_bound(dev);
++	return driver_sysfs_add(dev);
++}
++
+ struct stupid_thread_structure {
+ 	struct device_driver *drv;
+ 	struct device *dev;
+@@ -82,30 +102,32 @@ static int really_probe(void *void_data)
+ 		 drv->bus->name, drv->name, dev->bus_id);
+ 
+ 	dev->driver = drv;
++	if (driver_sysfs_add(dev)) {
++		printk(KERN_ERR "%s: driver_sysfs_add(%s) failed\n",
++			__FUNCTION__, dev->bus_id);
++		goto probe_failed;
++	}
++
+ 	if (dev->bus->probe) {
+ 		ret = dev->bus->probe(dev);
+-		if (ret) {
+-			dev->driver = NULL;
++		if (ret)
+ 			goto probe_failed;
+-		}
+ 	} else if (drv->probe) {
+ 		ret = drv->probe(dev);
+-		if (ret) {
+-			dev->driver = NULL;
++		if (ret)
+ 			goto probe_failed;
+-		}
+-	}
+-	if (device_bind_driver(dev)) {
+-		printk(KERN_ERR "%s: device_bind_driver(%s) failed\n",
+-			__FUNCTION__, dev->bus_id);
+-		/* How does undo a ->probe?  We're screwed. */
+ 	}
++
++	driver_bound(dev);
+ 	ret = 1;
+ 	pr_debug("%s: Bound Device %s to Driver %s\n",
+ 		 drv->bus->name, dev->bus_id, drv->name);
+ 	goto done;
+ 
+ probe_failed:
++	driver_sysfs_remove(dev);
++	dev->driver = NULL;
++
+ 	if (ret == -ENODEV || ret == -ENXIO) {
+ 		/* Driver matched, but didn't support device
+ 		 * or device not found.
+@@ -278,7 +300,7 @@ static void __device_release_driver(stru
+ 	drv = dev->driver;
+ 	if (drv) {
+ 		get_driver(drv);
+-		sysfs_remove_link(&drv->kobj, kobject_name(&dev->kobj));
++		driver_sysfs_remove(dev);
+ 		sysfs_remove_link(&dev->kobj, "driver");
+ 		klist_remove(&dev->knode_driver);
+ 
