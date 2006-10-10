@@ -1,0 +1,92 @@
+From inaky@linux.intel.com Mon Oct  9 18:29:58 2006
+Message-Id: <20061010012950.619323000@sodium.jf.intel.com>
+Date: Mon, 09 Oct 2006 18:26:41 -0700
+From: Inaky Perez-Gonzalez <inaky@linux.intel.com>
+To: greg@kroah.com
+Cc: linux-usb-devel@lists.sourceforge.net, David Brownell <david-b@pacbell.net>, Alan Stern <stern@rowland.harvard.edu>, Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
+Subject: usb hub: fix root hub code so it takes more than 15 devices per root hub
+Content-Disposition: inline; filename=usb-hub-root-hub-code-takes-more-than-15-devices.patch
+
+Wireless USB Host Controllers accept a large number of devices per
+host, which shows up as a large number of ports in its root hub.
+
+When the number of ports in a hub device goes over 16, the activation
+of the hub fails with the cryptic message in klogd.
+
+hub 2-0:1.0: activate --> -22
+
+Following this further, it was seen that:
+
+hub_probe()
+  hub_configure()
+    generates pipe number
+
+    pseudo allocates buffer 'maxp' bytes in size using usb_maxpacket()
+      [?? which gets the max packet size from the interrupt
+      endpoint]. That's maybe not as proper. According to the spec
+      (see below) the amount of data to read for the hub status is
+      (PORTS + 1 + 7) / 8 bytes.
+
+      Haven't been able to track how a fake endpoint descriptor is
+      generated for the root hub's interrupt endpoint, but somehow we
+      ended up with wrong data in there and thus we always had two
+      bytes of buffer space instead of the three that we needed for 16
+      ports (for example) or more...
+
+    hub_activate()
+      usb_hcd_submit_urb()
+        rh_urb_enqueue()
+          urb->pipe is neither int nor ctl, so it errors out
+            rh_queue_status()
+              Returns -EINVAL because the buffer length is smaller
+              than the minimum needed to report all the hub port
+              bits as in accordance with USB2.0[11.12.3]. There has
+              to be trunc((PORTS + 1 + 7) / 8) bytes of space at
+              least.
+
+So this patch simply changes that size calculation to be based on the
+number of ports declared by the hub on its hub descriptor, so it
+always floats based on that.
+
+Signed-off-by: Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ drivers/usb/core/hub.c |   10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/core/hub.c
++++ gregkh-2.6/drivers/usb/core/hub.c
+@@ -554,7 +554,7 @@ static int hub_configure(struct usb_hub 
+ 	u16 hubstatus, hubchange;
+ 	u16 wHubCharacteristics;
+ 	unsigned int pipe;
+-	int maxp, ret;
++	int stat_len, ret;
+ 	char *message;
+ 
+ 	hub->buffer = usb_buffer_alloc(hdev, sizeof(*hub->buffer), GFP_KERNEL,
+@@ -761,10 +761,10 @@ static int hub_configure(struct usb_hub 
+ 
+ 	/* set up the interrupt endpoint */
+ 	pipe = usb_rcvintpipe(hdev, endpoint->bEndpointAddress);
+-	maxp = usb_maxpacket(hdev, pipe, usb_pipeout(pipe));
++	stat_len = (hub->descriptor->bNbrPorts + 1 + 7) / 8;
+ 
+-	if (maxp > sizeof(*hub->buffer))
+-		maxp = sizeof(*hub->buffer);
++	if (stat_len > sizeof(*hub->buffer))
++		stat_len = sizeof(*hub->buffer);
+ 
+ 	hub->urb = usb_alloc_urb(0, GFP_KERNEL);
+ 	if (!hub->urb) {
+@@ -773,7 +773,7 @@ static int hub_configure(struct usb_hub 
+ 		goto fail;
+ 	}
+ 
+-	usb_fill_int_urb(hub->urb, hdev, pipe, *hub->buffer, maxp, hub_irq,
++	usb_fill_int_urb(hub->urb, hdev, pipe, *hub->buffer, stat_len, hub_irq,
+ 		hub, endpoint->bInterval);
+ 	hub->urb->transfer_dma = hub->buffer_dma;
+ 	hub->urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
