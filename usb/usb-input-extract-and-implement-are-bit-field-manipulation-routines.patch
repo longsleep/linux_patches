@@ -1,0 +1,92 @@
+From akpm@osdl.org Tue Oct 10 14:51:29 2006
+Message-Id: <200610102142.k9ALgpO3025530@shell0.pdx.osdl.net>
+From: Grant Grundler <grundler@parisc-linux.org>
+Subject: USB: input: extract() and implement() are bit field manipulation routines
+To: greg@kroah.com
+Cc: akpm@osdl.org, grundler@parisc-linux.org, dtor@mail.ru, matthew@wil.cx,
+   vojtech@suse.cz
+Date: Tue, 10 Oct 2006 14:42:51 -0700
+
+From: Grant Grundler <grundler@parisc-linux.org>
+
+extract() and implement() have brain damaged attempts to handle 32-bit wide
+"fields".
+
+The problem is the index math in the original code didn't clear all the
+relevant bits.  (offset >> 5) only compensated for 32-bit index.  We need
+(offset >> 6) if we want to use 64-bit loads.
+
+But it was also wrong in that it tried to use quasi-aligned loads.  Ie
+"report" was only incremented in multiples of 4 bytes and then the offset
+was masked off for values greater than 4 bytes.  The right way is to
+pretend "report" points at a byte array.  And offset is then only minor
+adjustment for < 8 bits of offset.  "n" (field width) can then be as big as
+24 (assuming 32-bit loads) since "offset" will never be bigger than 7.
+
+If someone needs either function to handle more than 24-bits, please
+document why - point at a specification or specific USB hid device - in
+comments in the code.
+
+extract/implement() are also an eyesore to read.  Please banish whoever
+wrote it to read CodingStyle 3 times in a row to a classroom full of 1st
+graders armed with rubberbands.  Or just flame them.  Whatever.  Globbing
+all the code together on two lines does NOT make it faster and is Just
+Wrong.
+
+I've tested this patch on j6000 (dual 750Mhz PA-RISC, 32-bit 2.6.12-rc5). 
+Kyle McMartin tested on c3000 (up 400Mhz PA-RISC, same kernel).  "p2-mate"
+(Peter De Schrijver?) tested on sb1250 (dual core Mips, broadcom "swarm"
+eval board).
+
+Signed-off-by: Grant Grundler <grundler@parisc-linux.org>
+Signed-off-by: Matthew Wilcox <matthew@wil.cx>
+Cc: Vojtech Pavlik <vojtech@suse.cz>
+Cc: Dmitry Torokhov <dtor@mail.ru>
+Signed-off-by: Andrew Morton <akpm@osdl.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/input/hid-core.c |   24 +++++++++++++++++-------
+ 1 file changed, 17 insertions(+), 7 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/input/hid-core.c
++++ gregkh-2.6/drivers/usb/input/hid-core.c
+@@ -750,21 +750,31 @@ static __inline__ __u32 s32ton(__s32 val
+ }
+ 
+ /*
+- * Extract/implement a data field from/to a report.
++ * Extract/implement a data field from/to a little endian report (bit array).
+  */
+ 
+ static __inline__ __u32 extract(__u8 *report, unsigned offset, unsigned n)
+ {
+-	report += (offset >> 5) << 2; offset &= 31;
+-	return (le64_to_cpu(get_unaligned((__le64*)report)) >> offset) & ((1ULL << n) - 1);
++	u32 x;
++
++	report += offset >> 3;  /* adjust byte index */
++	offset &= 8 - 1;
++	x = get_unaligned((u32 *) report);
++	x = le32_to_cpu(x);
++	x = (x >> offset) & ((1 << n) - 1);
++	return x;
+ }
+ 
+ static __inline__ void implement(__u8 *report, unsigned offset, unsigned n, __u32 value)
+ {
+-	report += (offset >> 5) << 2; offset &= 31;
+-	put_unaligned((get_unaligned((__le64*)report)
+-		& cpu_to_le64(~((((__u64) 1 << n) - 1) << offset)))
+-		| cpu_to_le64((__u64)value << offset), (__le64*)report);
++	u32 x;
++
++	report += offset >> 3;
++	offset &= 8 - 1;
++	x = get_unaligned((u32 *)report);
++	x &= cpu_to_le32(~((((__u32) 1 << n) - 1) << offset));
++	x |= cpu_to_le32(value << offset);
++	put_unaligned(x,(u32 *)report);
+ }
+ 
+ /*
