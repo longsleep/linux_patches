@@ -1,0 +1,751 @@
+From kay.sievers@novell.com Sat Oct  7 13:11:38 2006
+From: Kay Sievers <kay.sievers@novell.com>
+Date: Sat, 07 Oct 2006 21:54:55 +0200
+Subject: Driver core: unify /sys/class and /sys/bus at /sys/subsystem
+Message-Id: <1160250895.4235.24.camel@localhost>
+
+
+This merges the classification information from both device types,
+class devices and bus devices into a single userspace export. It was
+a design mistake in the first place and the kernel should stop
+exporting such private implementation details to userspace.
+
+The /sys/class and /sys/bus directories are still created with their
+individual content but should no longer be used from userspace.
+/sys/subsystems has the same layout structure as /sys/bus and 
+contains all devices of a subsystem in a "devices" directory.
+It properly exports subsystem specific attributes without creating
+possible conflicts with device names, something the flat class
+directory layout can't do.
+
+Subsystems from a bus and a class of the same name merge into
+a single instance.
+
+Signed-off-by: Kay Sievers <kay.sievers@novell.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/base/base.h     |    4 -
+ drivers/base/bus.c      |   39 ++++++++------
+ drivers/base/class.c    |  133 ++++++++++++++++++++++++++++++------------------
+ drivers/base/core.c     |   79 ++++++++++++++++++----------
+ drivers/base/sys.c      |    2 
+ drivers/usb/core/file.c |   62 ++--------------------
+ drivers/usb/core/usb.c  |    6 ++
+ drivers/usb/core/usb.h  |    1 
+ include/linux/device.h  |    8 ++
+ 9 files changed, 179 insertions(+), 155 deletions(-)
+
+--- gregkh-2.6.orig/drivers/base/base.h
++++ gregkh-2.6/drivers/base/base.h
+@@ -1,5 +1,5 @@
+-
+-/* initialisation functions */
++extern struct subsystem devices_subsys;
++extern struct subsystem subs_subsys;
+ 
+ extern int devices_init(void);
+ extern int buses_init(void);
+--- gregkh-2.6.orig/drivers/base/bus.c
++++ gregkh-2.6/drivers/base/bus.c
+@@ -18,14 +18,13 @@
+ 
+ #define to_bus_attr(_attr) container_of(_attr, struct bus_attribute, attr)
+ #define to_bus(obj) container_of(obj, struct bus_type, subsys.kset.kobj)
+-
+-/*
+- * sysfs bindings for drivers
+- */
+-
+ #define to_drv_attr(_attr) container_of(_attr, struct driver_attribute, attr)
+ #define to_driver(obj) container_of(obj, struct device_driver, kobj)
+ 
++/* /sys/bus for compatibility, real location is /sys/subsystems */
++#ifdef CONFIG_SYSFS_DEPRECATED_FUTURE
++static struct kobject bus_depr;
++#endif
+ 
+ static ssize_t
+ drv_attr_show(struct kobject * kobj, struct attribute * attr, char * buf)
+@@ -105,6 +104,10 @@ static struct sysfs_ops bus_sysfs_ops = 
+ 	.store	= bus_attr_store,
+ };
+ 
++static struct kobj_type bus_ktype = {
++	.sysfs_ops	= &bus_sysfs_ops,
++};
++
+ int bus_create_file(struct bus_type * bus, struct bus_attribute * attr)
+ {
+ 	int error;
+@@ -124,14 +127,6 @@ void bus_remove_file(struct bus_type * b
+ 	}
+ }
+ 
+-static struct kobj_type ktype_bus = {
+-	.sysfs_ops	= &bus_sysfs_ops,
+-
+-};
+-
+-static decl_subsys(bus, &ktype_bus, NULL);
+-
+-
+ #ifdef CONFIG_HOTPLUG
+ 
+ /* Manually detach a device from its associated driver. */
+@@ -742,7 +737,8 @@ int bus_register(struct bus_type * bus)
+ 	if (retval)
+ 		goto out;
+ 
+-	subsys_set_kset(bus, bus_subsys);
++	subsys_set_kset(bus, subs_subsys);
++	bus->subsys.kset.ktype = &bus_ktype;
+ 	retval = subsystem_register(&bus->subsys);
+ 	if (retval)
+ 		goto out;
+@@ -766,6 +762,10 @@ int bus_register(struct bus_type * bus)
+ 	if (retval)
+ 		goto bus_attrs_fail;
+ 
++#ifdef CONFIG_SYSFS_DEPRECATED_FUTURE
++	sysfs_create_link(&bus_depr, &bus->subsys.kset.kobj, bus->name);
++#endif
++
+ 	pr_debug("bus type '%s' registered\n", bus->name);
+ 	return 0;
+ 
+@@ -790,6 +790,9 @@ out:
+ void bus_unregister(struct bus_type * bus)
+ {
+ 	pr_debug("bus %s: unregistering\n", bus->name);
++#ifdef CONFIG_SYSFS_DEPRECATED_FUTURE
++	sysfs_remove_link(&bus_depr, bus->name);
++#endif
+ 	bus_remove_attrs(bus);
+ 	kset_unregister(&bus->drivers);
+ 	kset_unregister(&bus->devices);
+@@ -798,10 +801,14 @@ void bus_unregister(struct bus_type * bu
+ 
+ int __init buses_init(void)
+ {
+-	return subsystem_register(&bus_subsys);
++#ifdef CONFIG_SYSFS_DEPRECATED_FUTURE
++	kobject_init(&bus_depr);
++	kobject_set_name(&bus_depr, "bus");
++	return kobject_add(&bus_depr);
++#endif
++	return 0;
+ }
+ 
+-
+ EXPORT_SYMBOL_GPL(bus_for_each_dev);
+ EXPORT_SYMBOL_GPL(bus_find_device);
+ EXPORT_SYMBOL_GPL(bus_for_each_drv);
+--- gregkh-2.6.orig/drivers/base/class.c
++++ gregkh-2.6/drivers/base/class.c
+@@ -19,11 +19,17 @@
+ #include <linux/slab.h>
+ #include "base.h"
+ 
+-extern struct subsystem devices_subsys;
+ 
+ #define to_class_attr(_attr) container_of(_attr, struct class_attribute, attr)
+ #define to_class(obj) container_of(obj, struct class, subsys.kset.kobj)
+ 
++static struct kset_uevent_ops class_dev_uevent_ops;
++
++#ifdef CONFIG_SYSFS_DEPRECATED_FUTURE
++/* /sys/class for compatibility, real location is /sys/subsystems */
++static struct kobject class_depr;
++#endif
++
+ static ssize_t
+ class_attr_show(struct kobject * kobj, struct attribute * attr, char * buf)
+ {
+@@ -67,20 +73,19 @@ static struct sysfs_ops class_sysfs_ops 
+ 	.store	= class_attr_store,
+ };
+ 
+-static struct kobj_type ktype_class = {
++static struct kobj_type class_ktype = {
+ 	.sysfs_ops	= &class_sysfs_ops,
+ 	.release	= class_release,
+ };
+ 
+-/* Hotplug events for classes go to the class_obj subsys */
+-static decl_subsys(class, &ktype_class, NULL);
+-
+-
+ int class_create_file(struct class * cls, const struct class_attribute * attr)
+ {
+ 	int error;
+ 	if (cls) {
+ 		error = sysfs_create_file(&cls->subsys.kset.kobj, &attr->attr);
++#ifdef CONFIG_SYSFS_DEPRECATED_FUTURE
++		error = sysfs_create_file(&cls->class_dir_depr, &attr->attr);
++#endif
+ 	} else
+ 		error = -EINVAL;
+ 	return error;
+@@ -88,8 +93,12 @@ int class_create_file(struct class * cls
+ 
+ void class_remove_file(struct class * cls, const struct class_attribute * attr)
+ {
+-	if (cls)
++	if (cls) {
++#ifdef CONFIG_SYSFS_DEPRECATED_FUTURE
++		sysfs_remove_file(&cls->class_dir_depr, &attr->attr);
++#endif
+ 		sysfs_remove_file(&cls->subsys.kset.kobj, &attr->attr);
++	}
+ }
+ 
+ static struct class *class_get(struct class *cls)
+@@ -146,25 +155,61 @@ int class_register(struct class * cls)
+ 	INIT_LIST_HEAD(&cls->devices);
+ 	INIT_LIST_HEAD(&cls->interfaces);
+ 	init_MUTEX(&cls->sem);
++
+ 	error = kobject_set_name(&cls->subsys.kset.kobj, "%s", cls->name);
+ 	if (error)
+-		return error;
++		goto out;
+ 
+-	subsys_set_kset(cls, class_subsys);
++	subsys_set_kset(cls, subs_subsys);
++	cls->subsys.kset.ktype = &class_ktype;
+ 
+-	error = subsystem_register(&cls->subsys);
+-	if (!error) {
++	/* if we join a bus's directory, don't register */
++	if (cls->bus) {
++		get_bus(cls->bus);
++		subsystem_init(&cls->subsys);
++	} else {
++		error = subsystem_register(&cls->subsys);
++		if (error)
++			goto out;
+ 		error = add_class_attrs(class_get(cls));
+ 		class_put(cls);
++
++		kobject_set_name(&cls->devices_dir.kobj, "devices");
++		cls->devices_dir.subsys = &cls->subsys;
++
++		/* old struct class_device's uevent handler */
++		cls->devices_dir.uevent_ops = &class_dev_uevent_ops,
++
++		error = kset_register(&cls->devices_dir);
++		if (error)
++			goto out;
+ 	}
++
++#ifdef CONFIG_SYSFS_DEPRECATED_FUTURE
++	kobject_init(&cls->class_dir_depr);
++	kobject_set_name(&cls->class_dir_depr, cls->name);
++	cls->class_dir_depr.parent = &class_depr;
++	error = kobject_add(&cls->class_dir_depr);
++#endif
++
++out:
+ 	return error;
+ }
+ 
+ void class_unregister(struct class * cls)
+ {
+ 	pr_debug("device class '%s': unregistering\n", cls->name);
+-	remove_class_attrs(cls);
+-	subsystem_unregister(&cls->subsys);
++#ifdef CONFIG_SYSFS_DEPRECATED_FUTURE
++	kobject_del(&cls->class_dir_depr);
++	kobject_put(&cls->class_dir_depr);
++#endif
++	if (cls->bus)
++		put_bus(cls->bus);
++	else {
++		remove_class_attrs(cls);
++		kset_unregister(&cls->devices_dir);
++		subsystem_unregister(&cls->subsys);
++	}
+ }
+ 
+ static void class_create_release(struct class *cls)
+@@ -179,15 +224,6 @@ static void class_device_create_release(
+ 	kfree(class_dev);
+ }
+ 
+-/* needed to allow these devices to have parent class devices */
+-static int class_device_create_uevent(struct class_device *class_dev,
+-				       char **envp, int num_envp,
+-				       char *buffer, int buffer_size)
+-{
+-	pr_debug("%s called for %s\n", __FUNCTION__, class_dev->class_id);
+-	return 0;
+-}
+-
+ /**
+  * class_create - create a struct class structure
+  * @owner: pointer to the module that is to "own" this struct class
+@@ -328,7 +364,7 @@ static void class_dev_release(struct kob
+ 	}
+ }
+ 
+-static struct kobj_type ktype_class_device = {
++static struct kobj_type class_device_ktype = {
+ 	.sysfs_ops	= &class_dev_sysfs_ops,
+ 	.release	= class_dev_release,
+ };
+@@ -337,7 +373,7 @@ static int class_uevent_filter(struct ks
+ {
+ 	struct kobj_type *ktype = get_ktype(kobj);
+ 
+-	if (ktype == &ktype_class_device) {
++	if (ktype == &class_device_ktype) {
+ 		struct class_device *class_dev = to_class_dev(kobj);
+ 		if (class_dev->class)
+ 			return 1;
+@@ -468,13 +504,7 @@ static int class_uevent(struct kset *kse
+ 	buffer = &buffer[length];
+ 	buffer_size -= length;
+ 
+-	if (class_dev->uevent) {
+-		/* have the class device specific function add its stuff */
+-		retval = class_dev->uevent(class_dev, envp, num_envp,
+-					    buffer, buffer_size);
+-		if (retval)
+-			pr_debug("class_dev->uevent() returned %d\n", retval);
+-	} else if (class_dev->class->uevent) {
++	if (class_dev->class->uevent) {
+ 		/* have the class specific function add its stuff */
+ 		retval = class_dev->class->uevent(class_dev, envp, num_envp,
+ 						   buffer, buffer_size);
+@@ -485,15 +515,12 @@ static int class_uevent(struct kset *kse
+ 	return retval;
+ }
+ 
+-static struct kset_uevent_ops class_uevent_ops = {
++static struct kset_uevent_ops class_dev_uevent_ops = {
+ 	.filter =	class_uevent_filter,
+ 	.name =		class_uevent_name,
+ 	.uevent =	class_uevent,
+ };
+ 
+-static decl_subsys(class_obj, &ktype_class_device, &class_uevent_ops);
+-
+-
+ static int class_device_add_attrs(struct class_device * cd)
+ {
+ 	int i;
+@@ -570,9 +597,9 @@ static ssize_t store_uevent(struct class
+ 
+ void class_device_initialize(struct class_device *class_dev)
+ {
+-	kobj_set_kset_s(class_dev, class_obj_subsys);
+ 	kobject_init(&class_dev->kobj);
+ 	INIT_LIST_HEAD(&class_dev->node);
++	class_dev->kobj.ktype = &class_device_ktype;
+ }
+ 
+ int class_device_add(struct class_device *class_dev)
+@@ -603,10 +630,20 @@ int class_device_add(struct class_device
+ 	if (error)
+ 		goto out2;
+ 
++#ifdef CONFIG_SYSFS_DEPRECATED_FUTURE
++	sysfs_create_link(&parent_class->class_dir_depr,
++			  &class_dev->kobj, class_dev->class_id);
++#endif
++
+ 	if (parent_class_dev)
++		/* stacked class devices are not handled by userspace, avoid it */
+ 		class_dev->kobj.parent = &parent_class_dev->kobj;
+-	else
+-		class_dev->kobj.parent = &parent_class->subsys.kset.kobj;
++	else {
++		/* assign parent kset for uevent hook */
++		class_dev->kobj.kset = &parent_class->devices_dir;
++		/* the device directory in /sys/subsystem/<name>/devices */
++		class_dev->kobj.parent = &parent_class->devices_dir.kobj;
++	}
+ 
+ 	error = kobject_add(&class_dev->kobj);
+ 	if (error)
+@@ -752,7 +789,6 @@ struct class_device *class_device_create
+ 	class_dev->class = cls;
+ 	class_dev->parent = parent;
+ 	class_dev->release = class_device_create_release;
+-	class_dev->uevent = class_device_create_uevent;
+ 
+ 	va_start(args, fmt);
+ 	vsnprintf(class_dev->class_id, BUS_ID_SIZE, fmt, args);
+@@ -783,6 +819,10 @@ void class_device_del(struct class_devic
+ 		up(&parent_class->sem);
+ 	}
+ 
++#ifdef CONFIG_SYSFS_DEPRECATED_FUTURE
++	sysfs_remove_link(&parent_class->class_dir_depr, class_dev->class_id);
++#endif
++
+ 	if (class_dev->dev) {
+ 		remove_deprecated_class_device_links(class_dev);
+ 		sysfs_remove_link(&class_dev->kobj, "device");
+@@ -920,17 +960,12 @@ int virtual_device_parent(struct device 
+ 
+ int __init classes_init(void)
+ {
+-	int retval;
+-
+-	retval = subsystem_register(&class_subsys);
+-	if (retval)
+-		return retval;
++#ifdef CONFIG_SYSFS_DEPRECATED_FUTURE
++	kobject_init(&class_depr);
++	kobject_set_name(&class_depr, "class");
++	return kobject_add(&class_depr);
++#endif
+ 
+-	/* ick, this is ugly, the things we go through to keep from showing up
+-	 * in sysfs... */
+-	subsystem_init(&class_obj_subsys);
+-	if (!class_obj_subsys.kset.subsys)
+-			class_obj_subsys.kset.subsys = &class_obj_subsys;
+ 	return 0;
+ }
+ 
+--- gregkh-2.6.orig/drivers/base/core.c
++++ gregkh-2.6/drivers/base/core.c
+@@ -17,19 +17,13 @@
+ #include <linux/slab.h>
+ #include <linux/string.h>
+ #include <linux/kdev_t.h>
+-
+ #include <asm/semaphore.h>
+-
+ #include "base.h"
+ #include "power/power.h"
+ 
+ int (*platform_notify)(struct device * dev) = NULL;
+ int (*platform_notify_remove)(struct device * dev) = NULL;
+ 
+-/*
+- * sysfs bindings for devices.
+- */
+-
+ /**
+  * dev_driver_string - Return a device's driver name, if at all possible
+  * @dev: struct device to get the name of
+@@ -204,6 +198,14 @@ static int dev_uevent(struct kset *kset,
+ 	buffer = &buffer[length];
+ 	buffer_size -= length;
+ 
++	if (dev->type && dev->type->uevent) {
++		/* have the device type specific fuction add its stuff */
++		retval = dev->type->uevent(dev, envp, num_envp, buffer, buffer_size);
++		if (retval)
++			pr_debug("%s: dev_type uevent() returned %d\n",
++				 __FUNCTION__, retval);
++	}
++
+ 	if (dev->bus && dev->bus->uevent) {
+ 		/* have the bus specific function add its stuff */
+ 		retval = dev->bus->uevent(dev, envp, num_envp, buffer, buffer_size);
+@@ -220,14 +222,6 @@ static int dev_uevent(struct kset *kset,
+ 				 __FUNCTION__, retval);
+ 	}
+ 
+-	if (dev->type && dev->type->uevent) {
+-		/* have the device type specific fuction add its stuff */
+-		retval = dev->type->uevent(dev, envp, num_envp, buffer, buffer_size);
+-		if (retval)
+-			pr_debug("%s: dev_type uevent() returned %d\n",
+-				 __FUNCTION__, retval);
+-	}
+-
+ 	return retval;
+ }
+ 
+@@ -329,13 +323,6 @@ static ssize_t show_dev(struct device *d
+ 	return print_dev_t(buf, dev->devt);
+ }
+ 
+-/*
+- *	devices_subsys - structure to be registered with kobject core.
+- */
+-
+-decl_subsys(devices, &ktype_device, &device_uevent_ops);
+-
+-
+ /**
+  *	device_create_file - create sysfs attribute file for device.
+  *	@dev:	device.
+@@ -444,7 +431,6 @@ void device_initialize(struct device *de
+ int device_add(struct device *dev)
+ {
+ 	struct device *parent = NULL;
+-	char *class_name = NULL;
+ 	struct class_interface *class_intf;
+ 	int error = -EINVAL;
+ 
+@@ -501,20 +487,35 @@ int device_add(struct device *dev)
+ 			kfree(attr);
+ 			goto ueventattrError;
+ 		}
+-
+ 		dev->devt_attr = attr;
+ 	}
+ 
+ 	if (dev->class) {
+-		sysfs_create_link(&dev->kobj, &dev->class->subsys.kset.kobj,
+-				  "subsystem");
+-		sysfs_create_link(&dev->class->subsys.kset.kobj, &dev->kobj,
++		struct kobject *devices_dir;
++		struct kobject *subsys_dir;
++
++		if (dev->class->bus) {
++			devices_dir = &dev->class->bus->devices.kobj;
++			subsys_dir = &dev->class->bus->subsys.kset.kobj;
++		} else {
++			devices_dir = &dev->class->devices_dir.kobj;
++			subsys_dir = &dev->class->subsys.kset.kobj;
++		}
++
++		sysfs_create_link(&dev->kobj, subsys_dir, "subsystem");
++		sysfs_create_link(devices_dir, &dev->kobj, dev->bus_id);
++#ifdef CONFIG_SYSFS_DEPRECATED_FUTURE
++		sysfs_create_link(&dev->class->class_dir_depr, &dev->kobj,
+ 				  dev->bus_id);
++#endif
+ #ifdef CONFIG_SYSFS_DEPRECATED
+ 		if (parent && parent->bus) {
++			const char *class_name;
++
+ 			sysfs_create_link(&dev->kobj, &dev->parent->kobj, "device");
+ 			class_name = make_class_name(dev->class->name, &dev->kobj);
+ 			sysfs_create_link(&dev->parent->kobj, &dev->kobj, class_name);
++ 			kfree(class_name);
+ 		}
+ #endif
+ 	}
+@@ -546,7 +547,6 @@ int device_add(struct device *dev)
+ 		up(&dev->class->sem);
+ 	}
+  Done:
+- 	kfree(class_name);
+ 	put_device(dev);
+ 	return error;
+  AttachError:
+@@ -644,8 +644,18 @@ void device_del(struct device * dev)
+ 	if (dev->devt_attr)
+ 		device_remove_file(dev, dev->devt_attr);
+ 	if (dev->class) {
++		struct kobject *devices_dir;
++
++		if (dev->class->bus)
++			devices_dir = &dev->class->bus->devices.kobj;
++		else
++			devices_dir = &dev->class->devices_dir.kobj;
++
+ 		sysfs_remove_link(&dev->kobj, "subsystem");
+-		sysfs_remove_link(&dev->class->subsys.kset.kobj, dev->bus_id);
++		sysfs_remove_link(devices_dir, dev->bus_id);
++#ifdef CONFIG_SYSFS_DEPRECATED_FUTURE
++		sysfs_remove_link(&dev->class->class_dir_depr, dev->bus_id);
++#endif
+ #ifdef CONFIG_SYSFS_DEPRECATED
+ 		if (parent && parent->bus) {
+ 			char *class_name = NULL;
+@@ -733,9 +743,20 @@ int device_for_each_child(struct device 
+ 	return error;
+ }
+ 
++/* /sys/devices - holds the device tree */
++decl_subsys(devices, &ktype_device, &device_uevent_ops);
++
++/* /sys/subsystem - holds all buses and classes of devices */
++decl_subsys_name(subs, subsystem, NULL, NULL);
++
+ int __init devices_init(void)
+ {
+-	return subsystem_register(&devices_subsys);
++	int retval;
++
++	retval = subsystem_register(&devices_subsys);
++	if (!retval);
++		retval = subsystem_register(&subs_subsys);
++	return retval;
+ }
+ 
+ EXPORT_SYMBOL_GPL(device_for_each_child);
+--- gregkh-2.6.orig/drivers/base/sys.c
++++ gregkh-2.6/drivers/base/sys.c
+@@ -25,8 +25,6 @@
+ 
+ #include "base.h"
+ 
+-extern struct subsystem devices_subsys;
+-
+ #define to_sysdev(k) container_of(k, struct sys_device, kobj)
+ #define to_sysdev_attr(a) container_of(a, struct sysdev_attribute, attr)
+ 
+--- gregkh-2.6.orig/drivers/usb/core/file.c
++++ gregkh-2.6/drivers/usb/core/file.c
+@@ -60,52 +60,10 @@ static const struct file_operations usb_
+ 	.open =		usb_open,
+ };
+ 
+-static struct usb_class {
+-	struct kref kref;
+-	struct class *class;
+-} *usb_class;
+-
+-static int init_usb_class(void)
+-{
+-	int result = 0;
+-
+-	if (usb_class != NULL) {
+-		kref_get(&usb_class->kref);
+-		goto exit;
+-	}
+-
+-	usb_class = kmalloc(sizeof(*usb_class), GFP_KERNEL);
+-	if (!usb_class) {
+-		result = -ENOMEM;
+-		goto exit;
+-	}
+-
+-	kref_init(&usb_class->kref);
+-	usb_class->class = class_create(THIS_MODULE, "usb");
+-	if (IS_ERR(usb_class->class)) {
+-		result = IS_ERR(usb_class->class);
+-		err("class_create failed for usb devices");
+-		kfree(usb_class);
+-		usb_class = NULL;
+-	}
+-
+-exit:
+-	return result;
+-}
+-
+-static void release_usb_class(struct kref *kref)
+-{
+-	/* Ok, we cheat as we know we only have one usb_class */
+-	class_destroy(usb_class->class);
+-	kfree(usb_class);
+-	usb_class = NULL;
+-}
+-
+-static void destroy_usb_class(void)
+-{
+-	if (usb_class)
+-		kref_put(&usb_class->kref, release_usb_class);
+-}
++struct class usb_class = {
++	.name		= "usb",
++	.bus		= &usb_bus_type,
++};
+ 
+ int usb_major_init(void)
+ {
+@@ -181,20 +139,15 @@ int usb_register_dev(struct usb_interfac
+ 	if (retval)
+ 		goto exit;
+ 
+-	retval = init_usb_class();
+-	if (retval)
+-		goto exit;
+-
+-	intf->minor = minor;
+-
+ 	/* create a usb class device for this usb interface */
++	intf->minor = minor;
+ 	snprintf(name, BUS_ID_SIZE, class_driver->name, minor - minor_base);
+ 	temp = strrchr(name, '/');
+ 	if (temp && (temp[1] != 0x00))
+ 		++temp;
+ 	else
+ 		temp = name;
+-	intf->usb_dev = device_create(usb_class->class, &intf->dev,
++	intf->usb_dev = device_create(&usb_class, &intf->dev,
+ 				      MKDEV(USB_MAJOR, minor), "%s", temp);
+ 	if (IS_ERR(intf->usb_dev)) {
+ 		spin_lock (&minor_lock);
+@@ -241,10 +194,9 @@ void usb_deregister_dev(struct usb_inter
+ 	spin_unlock (&minor_lock);
+ 
+ 	snprintf(name, BUS_ID_SIZE, class_driver->name, intf->minor - minor_base);
+-	device_destroy(usb_class->class, MKDEV(USB_MAJOR, intf->minor));
++	device_destroy(&usb_class, MKDEV(USB_MAJOR, intf->minor));
+ 	intf->usb_dev = NULL;
+ 	intf->minor = -1;
+-	destroy_usb_class();
+ }
+ EXPORT_SYMBOL(usb_deregister_dev);
+ 
+--- gregkh-2.6.orig/drivers/usb/core/usb.c
++++ gregkh-2.6/drivers/usb/core/usb.c
+@@ -1012,6 +1012,9 @@ static int __init usb_init(void)
+ 	retval = bus_register(&usb_bus_type);
+ 	if (retval) 
+ 		goto bus_register_failed;
++	retval = class_register(&usb_class);
++	if (retval)
++		goto class_register_failed;
+ 	retval = usb_host_init();
+ 	if (retval)
+ 		goto host_init_failed;
+@@ -1046,6 +1049,8 @@ driver_register_failed:
+ major_init_failed:
+ 	usb_host_cleanup();
+ host_init_failed:
++	class_unregister(&usb_class);
++class_register_failed:
+ 	bus_unregister(&usb_bus_type);
+ bus_register_failed:
+ 	ksuspend_usb_cleanup();
+@@ -1069,6 +1074,7 @@ static void __exit usb_exit(void)
+ 	usbdev_cleanup();
+ 	usb_hub_cleanup();
+ 	usb_host_cleanup();
++	class_unregister(&usb_class);
+ 	bus_unregister(&usb_bus_type);
+ 	ksuspend_usb_cleanup();
+ }
+--- gregkh-2.6.orig/drivers/usb/core/usb.h
++++ gregkh-2.6/drivers/usb/core/usb.h
+@@ -81,6 +81,7 @@ static inline int usb_autoresume_device(
+ extern struct workqueue_struct *ksuspend_usb_wq;
+ extern struct bus_type usb_bus_type;
+ extern struct usb_device_driver usb_generic_driver;
++extern struct class usb_class;
+ 
+ /* Here's how we tell apart devices and interfaces.  Luckily there's
+  * no such thing as a platform USB device, so we can steal the use
+--- gregkh-2.6.orig/include/linux/device.h
++++ gregkh-2.6/include/linux/device.h
+@@ -149,12 +149,18 @@ struct class {
+ 	struct module		* owner;
+ 
+ 	struct subsystem	subsys;
++	struct kset		devices_dir;
+ 	struct list_head	children;
+ 	struct list_head	devices;
+ 	struct list_head	interfaces;
+ 	struct semaphore	sem;	/* locks both the children and interfaces lists */
+ 
++	/* possibly share the subsystem with a bus with the same name */
++	struct bus_type		*bus;
+ 	struct kobject		*virtual_dir;
++#ifdef CONFIG_SYSFS_DEPRECATED_FUTURE
++	struct kobject		class_dir_depr;
++#endif
+ 
+ 	struct class_attribute		* class_attrs;
+ 	struct class_device_attribute	* class_dev_attrs;
+@@ -242,8 +248,6 @@ struct class_device {
+ 	struct attribute_group  ** groups;	/* optional groups */
+ 
+ 	void	(*release)(struct class_device *dev);
+-	int	(*uevent)(struct class_device *dev, char **envp,
+-			   int num_envp, char *buffer, int buffer_size);
+ 	char	class_id[BUS_ID_SIZE];	/* unique to this class */
+ };
+ 
