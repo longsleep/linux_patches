@@ -1,0 +1,84 @@
+From foo@baz Tue Apr  9 12:12:43 2002
+Date: Tue, 24 Oct 2006 00:37:58 +0100
+To: Greg KH <greg@kroah.com>
+From: Greg Kroah-Hartman <gregkh@suse.de>
+Subject: Driver core: make old versions of udev work properly
+
+If CONFIG_SYSFS_DEPRECATED is enabled, old versions of udev will work
+properly with devices that are associated with a class.
+
+Cc: Kay Sievers <kay.sievers@vrfy.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/base/core.c |   36 ++++++++++++++++++++++++++++--------
+ 1 file changed, 28 insertions(+), 8 deletions(-)
+
+--- gregkh-2.6.orig/drivers/base/core.c
++++ gregkh-2.6/drivers/base/core.c
+@@ -383,6 +383,16 @@ void device_initialize(struct device *de
+ 	device_init_wakeup(dev, 0);
+ }
+ 
++#ifdef CONFIG_SYSFS_DEPRECATED
++int setup_parent(struct device *dev, struct device *parent)
++{
++	/* Set the parent to the class, not the parent device */
++	/* this keeps sysfs from having a symlink to make old udevs happy */
++	if ((dev->class) && (dev->kobj.parent == NULL))
++		dev->kobj.parent = &dev->class->subsys.kset.kobj;
++	return 0;
++}
++#else
+ static int virtual_device_parent(struct device *dev)
+ {
+ 	if (!dev->class)
+@@ -400,6 +410,18 @@ static int virtual_device_parent(struct 
+ 	return 0;
+ }
+ 
++int setup_parent(struct device *dev, struct device *parent)
++{
++	int error;
++	/* if this is a class device, and has no parent, create one */
++	if ((dev->class) && (parent == NULL)) {
++		error = virtual_device_parent(dev);
++		if (error)
++			return error;
++	}
++}
++#endif
++
+ /**
+  *	device_add - add device to device hierarchy.
+  *	@dev:	device.
+@@ -422,23 +444,21 @@ int device_add(struct device *dev)
+ 	if (!dev || !strlen(dev->bus_id))
+ 		goto Error;
+ 
+-	/* if this is a class device, and has no parent, create one */
+-	if ((dev->class) && (dev->parent == NULL)) {
+-		error = virtual_device_parent(dev);
+-		if (error)
+-			goto Error;
+-	}
++	pr_debug("DEV: registering device: ID = '%s'\n", dev->bus_id);
+ 
+ 	parent = get_device(dev->parent);
+ 
+-	pr_debug("DEV: registering device: ID = '%s'\n", dev->bus_id);
++	error = setup_parent(dev, parent);
++	if (error)
++		goto Error;
+ 
+ 	/* first, register with generic layer. */
+ 	kobject_set_name(&dev->kobj, "%s", dev->bus_id);
+ 	if (parent)
+ 		dev->kobj.parent = &parent->kobj;
+ 
+-	if ((error = kobject_add(&dev->kobj)))
++	error = kobject_add(&dev->kobj);
++	if (error)
+ 		goto Error;
+ 
+ 	/* notify platform of device entry */
