@@ -1,0 +1,117 @@
+From akpm@osdl.org Thu Oct 19 15:10:11 2006
+Message-Id: <200610192209.k9JM9pgV026887@shell0.pdx.osdl.net>
+From: Grant Grundler <grundler@parisc-linux.org>
+Subject: hid-core: big-endian fix fix
+To: mm-commits@vger.kernel.org
+Cc: grundler@parisc-linux.org, akropel1@rochester.rr.com, dtor@mail.ru, gregkh@suse.de, matthew@wil.cx
+Date: Thu, 19 Oct 2006 15:09:51 -0700
+
+From: Grant Grundler <grundler@parisc-linux.org>
+
+Adam Kropelin had posted 32-bit fix in June 2005 about two weeks after I
+originally had posted my fixes for big endian support.  Adam has a UPS
+device which reports LINEV using 32-bits.
+
+Added comments to describe the limitations of the code.
+
+extract() is the same version I posted earlier and tested in user space. 
+Made similar changes to implement() routine.  I've written (and will
+shortly post) a test for implement().  Code tested on C3600 (parisc) with
+USB keyboard/mouse attached.
+
+
+I've dropped test_implement.c and a few other user space test programs on
+http://iou.parisc-linux.org/~grundler/tests/
+
+-rw-r--r-- 1 grundler grundler 1750 Oct 18 09:13 test_extract.c
+-rw-r--r-- 1 grundler grundler  561 Jan 25  2006 test_ffs.c
+-rw-r--r-- 1 grundler users    7175 Apr  8  2005 test_fls.c
+-rw-r--r-- 1 grundler grundler  206 Sep  1 15:52 test_gettimeofday.c
+-rw-r--r-- 1 grundler grundler 1886 Oct 19 09:20 test_implement.c
+-rw-r--r-- 1 grundler users    2707 Jun  4  2005 test_unaligned.c
+
+I would appreciate if someone else would look at the output of
+test_implement.c to make it does The Right Thing.
+
+Signed-off-by: Grant Grundler <grundler@parisc-linux.org>
+Cc: Matthew Wilcox <matthew@wil.cx>
+Cc: Dmitry Torokhov <dtor@mail.ru>
+Acked-By: Adam Kropelin <akropel1@rochester.rr.com>
+Signed-off-by: Andrew Morton <akpm@osdl.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ drivers/usb/input/hid-core.c |   49 ++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 37 insertions(+), 12 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/input/hid-core.c
++++ gregkh-2.6/drivers/usb/input/hid-core.c
+@@ -751,30 +751,55 @@ static __inline__ __u32 s32ton(__s32 val
+ 
+ /*
+  * Extract/implement a data field from/to a little endian report (bit array).
++ *
++ * Code sort-of follows HID spec:
++ *     http://www.usb.org/developers/devclass_docs/HID1_11.pdf
++ *
++ * While the USB HID spec allows unlimited length bit fields in "report
++ * descriptors", most devices never use more than 16 bits.
++ * One model of UPS is claimed to report "LINEV" as a 32-bit field.
++ * Search linux-kernel and linux-usb-devel archives for "hid-core extract".
+  */
+ 
+ static __inline__ __u32 extract(__u8 *report, unsigned offset, unsigned n)
+ {
+-	u32 x;
++	u64 x;
++
++	WARN_ON(n > 32);
+ 
+ 	report += offset >> 3;  /* adjust byte index */
+-	offset &= 8 - 1;
+-	x = get_unaligned((u32 *) report);
+-	x = le32_to_cpu(x);
+-	x = (x >> offset) & ((1 << n) - 1);
+-	return x;
++	offset &= 7;		/* now only need bit offset into one byte */
++	x = get_unaligned((u64 *) report);
++	x = le64_to_cpu(x);
++	x = (x >> offset) & ((1ULL << n) - 1);	/* extract bit field */
++	return (u32) x;
+ }
+ 
++/*
++ * "implement" : set bits in a little endian bit stream.
++ * Same concepts as "extract" (see comments above).
++ * The data mangled in the bit stream remains in little endian
++ * order the whole time. It make more sense to talk about
++ * endianness of register values by considering a register
++ * a "cached" copy of the little endiad bit stream.
++ */
+ static __inline__ void implement(__u8 *report, unsigned offset, unsigned n, __u32 value)
+ {
+-	u32 x;
++	u64 x;
++	u64 m = (1ULL << n) - 1;
++
++	WARN_ON(n > 32);
++
++	WARN_ON(value > m);
++	value &= m;
+ 
+ 	report += offset >> 3;
+-	offset &= 8 - 1;
+-	x = get_unaligned((u32 *)report);
+-	x &= cpu_to_le32(~((((__u32) 1 << n) - 1) << offset));
+-	x |= cpu_to_le32(value << offset);
+-	put_unaligned(x,(u32 *)report);
++	offset &= 7;
++
++	x = get_unaligned((u64 *)report);
++	x &= cpu_to_le64(~(m << offset));
++	x |= cpu_to_le64(((u64) value) << offset);
++	put_unaligned(x, (u64 *) report);
+ }
+ 
+ /*
