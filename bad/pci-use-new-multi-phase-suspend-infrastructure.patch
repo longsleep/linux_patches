@@ -1,0 +1,211 @@
+From torvalds@osdl.org Thu Oct 12 10:30:00 2006
+From: Linus Torvalds <torvalds@osdl.org>
+Date: Tue Jun 27 19:24:35 2006 -0700
+To: Greg KH <greg@kroah.com>
+cc: Jeff Garzik <jeff@garzik.org>
+Subject: PCI: use new multi-phase suspend infrastructure
+Message-ID: <Pine.LNX.4.64.0610121023320.3952@g5.osdl.org>
+
+Trial use of new multi-phase suspend infrastructure
+
+Big warning. I ran with this patch for a while during early July, and it
+worked for me, but I only ever tested on that one machine. So it may be
+horribly incomplete, and if some PCI device "resume" function does
+things like sleep (and I remember some of them doing that), it will
+complain loudly, because sleeping is _not_ allowed during early resume
+(which happens with interrupts off).
+
+Anyway, this just makes the _default_ PCI resume functions happen
+late-suspend/early-resume - a PCI driver can still decide privately if
+it wants to split them up (and I did sky2.c as an example of that). Of
+course, bridges etc have to wake up early (and they do, because I think
+they all use the default PCI suspend/resume code).
+
+Proof-of-concept, for now.
+
+Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+Cc: Stephen Hemminger <shemminger@osdl.org>
+cc: Jeff Garzik <jeff@garzik.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/net/sky2.c             |   35 ++++++++++++++++++++++++++++++-----
+ drivers/pci/pci-driver.c       |   22 +++++++++++-----------
+ drivers/pci/pcie/portdrv_pci.c |   17 ++++++++++++-----
+ 3 files changed, 53 insertions(+), 21 deletions(-)
+
+--- gregkh-2.6.orig/drivers/net/sky2.c
++++ gregkh-2.6/drivers/net/sky2.c
+@@ -3560,14 +3560,20 @@ static void __devexit sky2_remove(struct
+ }
+ 
+ #ifdef CONFIG_PM
+-static int sky2_suspend(struct pci_dev *pdev, pm_message_t state)
++
++static int sky2_suspend_prepare(struct pci_dev *pdev, pm_message_t state)
+ {
+-	struct sky2_hw *hw = pci_get_drvdata(pdev);
+-	int i;
+ 	pci_power_t pstate = pci_choose_state(pdev, state);
+ 
+ 	if (!(pstate == PCI_D3hot || pstate == PCI_D3cold))
+ 		return -EINVAL;
++	return 0;
++}
++
++static int sky2_suspend(struct pci_dev *pdev, pm_message_t state)
++{
++	struct sky2_hw *hw = pci_get_drvdata(pdev);
++	int i;
+ 
+ 	del_timer_sync(&hw->idle_timer);
+ 	netif_poll_disable(hw->dev[0]);
+@@ -3580,6 +3586,13 @@ static int sky2_suspend(struct pci_dev *
+ 			netif_device_detach(dev);
+ 		}
+ 	}
++	return 0;
++}
++
++static int sky2_suspend_late(struct pci_dev *pdev, pm_message_t state)
++{
++	struct sky2_hw *hw = pci_get_drvdata(pdev);
++	pci_power_t pstate = pci_choose_state(pdev, state);
+ 
+ 	sky2_write32(hw, B0_IMSK, 0);
+ 	pci_save_state(pdev);
+@@ -3587,10 +3600,10 @@ static int sky2_suspend(struct pci_dev *
+ 	return 0;
+ }
+ 
+-static int sky2_resume(struct pci_dev *pdev)
++static int sky2_resume_early(struct pci_dev *pdev)
+ {
+ 	struct sky2_hw *hw = pci_get_drvdata(pdev);
+-	int i, err;
++	int err;
+ 
+ 	pci_restore_state(pdev);
+ 	pci_enable_wake(pdev, PCI_D0, 0);
+@@ -3601,6 +3614,15 @@ static int sky2_resume(struct pci_dev *p
+ 		goto out;
+ 
+ 	sky2_write32(hw, B0_IMSK, Y2_IS_BASE);
++out:
++	return err;
++}
++
++static int sky2_resume(struct pci_dev *pdev)
++{
++	struct sky2_hw *hw = pci_get_drvdata(pdev);
++	int i;
++	int err = 0;
+ 
+ 	for (i = 0; i < hw->ports; i++) {
+ 		struct net_device *dev = hw->dev[i];
+@@ -3630,7 +3652,10 @@ static struct pci_driver sky2_driver = {
+ 	.probe = sky2_probe,
+ 	.remove = __devexit_p(sky2_remove),
+ #ifdef CONFIG_PM
++	.suspend_prepare = sky2_suspend_prepare,
+ 	.suspend = sky2_suspend,
++	.suspend_late = sky2_suspend_late,
++	.resume_early = sky2_resume_early,
+ 	.resume = sky2_resume,
+ #endif
+ };
+--- gregkh-2.6.orig/drivers/pci/pci-driver.c
++++ gregkh-2.6/drivers/pci/pci-driver.c
+@@ -293,14 +293,6 @@ static int pci_device_suspend(struct dev
+ 	if (drv && drv->suspend) {
+ 		i = drv->suspend(pci_dev, state);
+ 		suspend_report_result(drv->suspend, i);
+-	} else {
+-		pci_save_state(pci_dev);
+-		/*
+-		 * mark its power state as "unknown", since we don't know if
+-		 * e.g. the BIOS will change its device state when we suspend.
+-		 */
+-		if (pci_dev->current_state == PCI_D0)
+-			pci_dev->current_state = PCI_UNKNOWN;
+ 	}
+ 	return i;
+ }
+@@ -314,6 +306,14 @@ static int pci_device_suspend_late(struc
+ 	if (drv && drv->suspend_late) {
+ 		i = drv->suspend_late(pci_dev, state);
+ 		suspend_report_result(drv->suspend_late, i);
++	} else if (!drv || !drv->suspend) {
++		pci_save_state(pci_dev);
++		/*
++		 * mark its power state as "unknown", since we don't know if
++		 * e.g. the BIOS will change its device state when we suspend.
++		 */
++		if (pci_dev->current_state == PCI_D0)
++			pci_dev->current_state = PCI_UNKNOWN;
+ 	}
+ 	return i;
+ }
+@@ -340,14 +340,12 @@ static int pci_default_resume(struct pci
+ 
+ static int pci_device_resume(struct device * dev)
+ {
+-	int error;
++	int error = 0;
+ 	struct pci_dev * pci_dev = to_pci_dev(dev);
+ 	struct pci_driver * drv = pci_dev->driver;
+ 
+ 	if (drv && drv->resume)
+ 		error = drv->resume(pci_dev);
+-	else
+-		error = pci_default_resume(pci_dev);
+ 	return error;
+ }
+ 
+@@ -359,6 +357,8 @@ static int pci_device_resume_early(struc
+ 
+ 	if (drv && drv->resume_early)
+ 		error = drv->resume_early(pci_dev);
++	else if (!drv || !drv->resume)
++		error = pci_default_resume(pci_dev);
+ 	return error;
+ }
+ 
+--- gregkh-2.6.orig/drivers/pci/pcie/portdrv_pci.c
++++ gregkh-2.6/drivers/pci/pcie/portdrv_pci.c
+@@ -52,16 +52,21 @@ static int pcie_portdrv_restore_config(s
+ #ifdef CONFIG_PM
+ static int pcie_portdrv_suspend(struct pci_dev *dev, pm_message_t state)
+ {
+-	int ret = pcie_port_device_suspend(dev, state);
++	return pcie_port_device_suspend(dev, state);
++}
+ 
+-	if (!ret)
+-		ret = pcie_portdrv_save_config(dev);
+-	return ret;
++static int pcie_portdrv_suspend_late (struct pci_dev *dev, pm_message_t state)
++{
++	return pcie_portdrv_save_config(dev);
++}
++
++static int pcie_portdrv_resume_early (struct pci_dev *dev)
++{
++	return pcie_portdrv_restore_config(dev);
+ }
+ 
+ static int pcie_portdrv_resume(struct pci_dev *dev)
+ {
+-	pcie_portdrv_restore_config(dev);
+ 	return pcie_port_device_resume(dev);
+ }
+ #else
+@@ -284,6 +289,8 @@ static struct pci_driver pcie_portdrv = 
+ 	.remove		= pcie_portdrv_remove,
+ 
+ 	.suspend	= pcie_portdrv_suspend,
++	.suspend_late	= pcie_portdrv_suspend_late,
++	.resume_early	= pcie_portdrv_resume_early,
+ 	.resume		= pcie_portdrv_resume,
+ 
+ 	.err_handler 	= &pcie_portdrv_err_handler,
