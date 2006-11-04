@@ -1,0 +1,77 @@
+From stern@rowland.harvard.edu Tue Oct 24 09:07:30 2006
+Date: Tue, 24 Oct 2006 12:04:22 -0400 (EDT)
+From: Alan Stern <stern@rowland.harvard.edu>
+To: Greg KH <greg@kroah.com>
+Subject: USB: OHCI: fix root-hub resume bug
+Message-ID: <Pine.LNX.4.44L0.0610241202320.6426-100000@iolanthe.rowland.org>
+
+When a suspended OHCI controller sees a port's status change, it sets
+both the Root-Hub-Status-Change and the Resume-Detect bits in the
+Interrupt Status register.  Processing both these bits, the driver
+tries to resume the root hub twice!
+
+This patch (as807) fixes the bug by ignoring RD if RHSC is set.  It
+also prints a slightly more informative log message when a
+remote-wakeup event occurs.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/ohci-hcd.c |   25 +++++++++++++++----------
+ drivers/usb/host/ohci-hub.c |    3 ++-
+ 2 files changed, 17 insertions(+), 11 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/host/ohci-hcd.c
++++ gregkh-2.6/drivers/usb/host/ohci-hcd.c
+@@ -715,13 +715,6 @@ static irqreturn_t ohci_irq (struct usb_
+ 		return IRQ_NOTMINE;
+ 	}
+ 
+-	if (ints & OHCI_INTR_RHSC) {
+-		ohci_vdbg (ohci, "rhsc\n");
+-		ohci->next_statechange = jiffies + STATECHANGE_DELAY;
+-		ohci_writel (ohci, OHCI_INTR_RHSC, &regs->intrstatus);
+-		usb_hcd_poll_rh_status(hcd);
+-	}
+-
+ 	if (ints & OHCI_INTR_UE) {
+ 		disable (ohci);
+ 		ohci_err (ohci, "OHCI Unrecoverable Error, disabled\n");
+@@ -731,9 +724,21 @@ static irqreturn_t ohci_irq (struct usb_
+ 		ohci_usb_reset (ohci);
+ 	}
+ 
+-	if (ints & OHCI_INTR_RD) {
+-		ohci_vdbg (ohci, "resume detect\n");
+-		ohci_writel (ohci, OHCI_INTR_RD, &regs->intrstatus);
++	if (ints & OHCI_INTR_RHSC) {
++		ohci_vdbg(ohci, "rhsc\n");
++		ohci->next_statechange = jiffies + STATECHANGE_DELAY;
++		ohci_writel(ohci, OHCI_INTR_RD | OHCI_INTR_RHSC,
++				&regs->intrstatus);
++		usb_hcd_poll_rh_status(hcd);
++	}
++
++	/* For connect and disconnect events, we expect the controller
++	 * to turn on RHSC along with RD.  But for remote wakeup events
++	 * this might not happen.
++	 */
++	else if (ints & OHCI_INTR_RD) {
++		ohci_vdbg(ohci, "resume detect\n");
++		ohci_writel(ohci, OHCI_INTR_RD, &regs->intrstatus);
+ 		hcd->poll_rh = 1;
+ 		if (ohci->autostop) {
+ 			spin_lock (&ohci->lock);
+--- gregkh-2.6.orig/drivers/usb/host/ohci-hub.c
++++ gregkh-2.6/drivers/usb/host/ohci-hub.c
+@@ -169,7 +169,8 @@ __acquires(ohci->lock)
+ 		break;
+ 	case OHCI_USB_RESUME:
+ 		/* HCFS changes sometime after INTR_RD */
+-		ohci_info (ohci, "wakeup\n");
++		ohci_info(ohci, "%swakeup\n",
++				autostopped ? "auto-" : "");
+ 		break;
+ 	case OHCI_USB_OPER:
+ 		/* this can happen after resuming a swsusp snapshot */
