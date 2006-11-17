@@ -11,20 +11,21 @@ everything show up properly in /sys/devices/ with symlinks from the
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
- drivers/pcmcia/cs.c              |   26 ++++-----
+ drivers/pcmcia/cs.c              |   34 ++++++------
  drivers/pcmcia/cs_internal.h     |    4 -
- drivers/pcmcia/ds.c              |    2 
+ drivers/pcmcia/ds.c              |   14 ++---
  drivers/pcmcia/i82092.c          |    2 
  drivers/pcmcia/i82365.c          |    2 
  drivers/pcmcia/pcmcia_ioctl.c    |    1 
  drivers/pcmcia/pcmcia_resource.c |    1 
  drivers/pcmcia/pd6729.c          |    2 
- drivers/pcmcia/rsrc_nonstatic.c  |    4 -
+ drivers/pcmcia/rsrc_nonstatic.c  |   56 +++++++++++----------
+ drivers/pcmcia/soc_common.c      |    6 +-
  drivers/pcmcia/socket_sysfs.c    |  104 ++++++++++++++++++++++-----------------
  drivers/pcmcia/tcic.c            |    2 
  drivers/pcmcia/yenta_socket.c    |    2 
  include/pcmcia/ss.h              |    2 
- 13 files changed, 85 insertions(+), 69 deletions(-)
+ 14 files changed, 127 insertions(+), 105 deletions(-)
 
 --- gregkh-2.6.orig/drivers/pcmcia/cs.c
 +++ gregkh-2.6/drivers/pcmcia/cs.c
@@ -33,7 +34,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	down_read(&pcmcia_socket_list_rwsem);
  	list_for_each_entry(socket, &pcmcia_socket_list, socket_list) {
 -		if (socket->dev.dev != dev)
-+		if (&socket->dev != dev)
++		if (socket->dev.parent != dev)
  			continue;
  		mutex_lock(&socket->skt_mutex);
  		socket_suspend(socket);
@@ -42,7 +43,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	down_read(&pcmcia_socket_list_rwsem);
  	list_for_each_entry(socket, &pcmcia_socket_list, socket_list) {
 -		if (socket->dev.dev != dev)
-+		if (&socket->dev != dev)
++		if (socket->dev.parent != dev)
  			continue;
  		mutex_lock(&socket->skt_mutex);
  		socket_resume(socket);
@@ -51,18 +52,19 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  struct pcmcia_socket * pcmcia_get_socket(struct pcmcia_socket *skt)
  {
 -	struct class_device *cl_dev = class_device_get(&skt->dev);
-+	struct device *cl_dev = get_device(&skt->dev);
- 	if (!cl_dev)
+-	if (!cl_dev)
++	struct device *dev = get_device(&skt->dev);
++	if (!dev)
  		return NULL;
 -	skt = class_get_devdata(cl_dev);
-+	skt = dev_get_drvdata(cl_dev);
++	skt = dev_get_drvdata(dev);
  	if (!try_module_get(skt->owner)) {
 -		class_device_put(&skt->dev);
 +		put_device(&skt->dev);
  		return NULL;
  	}
  	return (skt);
-@@ -158,7 +158,7 @@ EXPORT_SYMBOL(pcmcia_get_socket);
+@@ -158,14 +158,14 @@ EXPORT_SYMBOL(pcmcia_get_socket);
  void pcmcia_put_socket(struct pcmcia_socket *skt)
  {
  	module_put(skt->owner);
@@ -71,12 +73,21 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  }
  EXPORT_SYMBOL(pcmcia_put_socket);
  
+ 
+-static void pcmcia_release_socket(struct class_device *class_dev)
++static void pcmcia_release_socket(struct device *dev)
+ {
+-	struct pcmcia_socket *socket = class_get_devdata(class_dev);
++	struct pcmcia_socket *socket = dev_get_drvdata(dev);
+ 
+ 	complete(&socket->socket_released);
+ }
 @@ -180,7 +180,7 @@ int pcmcia_register_socket(struct pcmcia
  	struct task_struct *tsk;
  	int ret;
  
 -	if (!socket || !socket->ops || !socket->dev.dev || !socket->resource_ops)
-+	if (!socket || !socket->ops || !socket->resource_ops)
++	if (!socket || !socket->ops || !socket->dev.parent || !socket->resource_ops)
  		return -EINVAL;
  
  	cs_dbg(socket, 0, "pcmcia_register_socket(0x%p)\n", socket->ops);
@@ -119,15 +130,17 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  			        int num_envp, char *buffer, int buffer_size)
  {
  	struct pcmcia_socket *s = container_of(dev, struct pcmcia_socket, dev);
-@@ -929,7 +929,7 @@ static void pcmcia_release_socket_class(
+@@ -929,8 +929,8 @@ static void pcmcia_release_socket_class(
  
  struct class pcmcia_socket_class = {
  	.name = "pcmcia_socket",
 -	.uevent = pcmcia_socket_uevent,
+-	.release = pcmcia_release_socket,
 +	.dev_uevent = pcmcia_socket_uevent,
- 	.release = pcmcia_release_socket,
++	.dev_release = pcmcia_release_socket,
  	.class_release = pcmcia_release_socket_class,
  };
+ EXPORT_SYMBOL(pcmcia_socket_class);
 --- gregkh-2.6.orig/drivers/pcmcia/cs_internal.h
 +++ gregkh-2.6/drivers/pcmcia/cs_internal.h
 @@ -142,7 +142,7 @@ struct pcmcia_callback{
@@ -154,9 +167,46 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  	p_dev->dev.bus = &pcmcia_bus_type;
 -	p_dev->dev.parent = s->dev.dev;
-+	p_dev->dev.parent = &s->dev;
++	p_dev->dev.parent = s->dev.parent;
  	p_dev->dev.release = pcmcia_release_dev;
  	bus_id_len = sprintf (p_dev->dev.bus_id, "%d.%d", p_dev->socket->sock, p_dev->device_no);
+ 
+@@ -1224,10 +1224,10 @@ static struct pcmcia_callback pcmcia_bus
+ 	.resume = pcmcia_bus_resume,
+ };
+ 
+-static int __devinit pcmcia_bus_add_socket(struct class_device *class_dev,
++static int __devinit pcmcia_bus_add_socket(struct device *dev,
+ 					   struct class_interface *class_intf)
+ {
+-	struct pcmcia_socket *socket = class_get_devdata(class_dev);
++	struct pcmcia_socket *socket = dev_get_drvdata(dev);
+ 	int ret;
+ 
+ 	socket = pcmcia_get_socket(socket);
+@@ -1260,10 +1260,10 @@ static int __devinit pcmcia_bus_add_sock
+ 	return 0;
+ }
+ 
+-static void pcmcia_bus_remove_socket(struct class_device *class_dev,
++static void pcmcia_bus_remove_socket(struct device *dev,
+ 				     struct class_interface *class_intf)
+ {
+-	struct pcmcia_socket *socket = class_get_devdata(class_dev);
++	struct pcmcia_socket *socket = dev_get_drvdata(dev);
+ 
+ 	if (!socket)
+ 		return;
+@@ -1280,8 +1280,8 @@ static void pcmcia_bus_remove_socket(str
+ /* the pcmcia_bus_interface is used to handle pcmcia socket devices */
+ static struct class_interface pcmcia_bus_interface = {
+ 	.class = &pcmcia_socket_class,
+-	.add = &pcmcia_bus_add_socket,
+-	.remove = &pcmcia_bus_remove_socket,
++	.add_dev = &pcmcia_bus_add_socket,
++	.remove_dev = &pcmcia_bus_remove_socket,
+ };
+ 
  
 --- gregkh-2.6.orig/drivers/pcmcia/i82092.c
 +++ gregkh-2.6/drivers/pcmcia/i82092.c
@@ -231,6 +281,151 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	struct socket_data *s_data = s->resource_data;
  	struct pcmcia_align_data data;
  	unsigned long min, max;
+@@ -897,9 +897,10 @@ EXPORT_SYMBOL(pccard_nonstatic_ops);
+ 
+ /* sysfs interface to the resource database */
+ 
+-static ssize_t show_io_db(struct class_device *class_dev, char *buf)
++static ssize_t show_io_db(struct device *dev,
++			  struct device_attribute *attr, char *buf)
+ {
+-	struct pcmcia_socket *s = class_get_devdata(class_dev);
++	struct pcmcia_socket *s = dev_get_drvdata(dev);
+ 	struct socket_data *data;
+ 	struct resource_map *p;
+ 	ssize_t ret = 0;
+@@ -920,9 +921,11 @@ static ssize_t show_io_db(struct class_d
+ 	return (ret);
+ }
+ 
+-static ssize_t store_io_db(struct class_device *class_dev, const char *buf, size_t count)
++static ssize_t store_io_db(struct device *dev,
++			   struct device_attribute *attr,
++			   const char *buf, size_t count)
+ {
+-	struct pcmcia_socket *s = class_get_devdata(class_dev);
++	struct pcmcia_socket *s = dev_get_drvdata(dev);
+ 	unsigned long start_addr, end_addr;
+ 	unsigned int add = ADD_MANAGED_RESOURCE;
+ 	ssize_t ret = 0;
+@@ -947,11 +950,12 @@ static ssize_t store_io_db(struct class_
+ 
+ 	return ret ? ret : count;
+ }
+-static CLASS_DEVICE_ATTR(available_resources_io, 0600, show_io_db, store_io_db);
++static DEVICE_ATTR(available_resources_io, 0600, show_io_db, store_io_db);
+ 
+-static ssize_t show_mem_db(struct class_device *class_dev, char *buf)
++static ssize_t show_mem_db(struct device *dev,
++			   struct device_attribute *attr, char *buf)
+ {
+-	struct pcmcia_socket *s = class_get_devdata(class_dev);
++	struct pcmcia_socket *s = dev_get_drvdata(dev);
+ 	struct socket_data *data;
+ 	struct resource_map *p;
+ 	ssize_t ret = 0;
+@@ -972,9 +976,11 @@ static ssize_t show_mem_db(struct class_
+ 	return (ret);
+ }
+ 
+-static ssize_t store_mem_db(struct class_device *class_dev, const char *buf, size_t count)
++static ssize_t store_mem_db(struct device *dev,
++			    struct device_attribute *attr,
++			    const char *buf, size_t count)
+ {
+-	struct pcmcia_socket *s = class_get_devdata(class_dev);
++	struct pcmcia_socket *s = dev_get_drvdata(dev);
+ 	unsigned long start_addr, end_addr;
+ 	unsigned int add = ADD_MANAGED_RESOURCE;
+ 	ssize_t ret = 0;
+@@ -999,25 +1005,25 @@ static ssize_t store_mem_db(struct class
+ 
+ 	return ret ? ret : count;
+ }
+-static CLASS_DEVICE_ATTR(available_resources_mem, 0600, show_mem_db, store_mem_db);
++static DEVICE_ATTR(available_resources_mem, 0600, show_mem_db, store_mem_db);
+ 
+-static struct class_device_attribute *pccard_rsrc_attributes[] = {
+-	&class_device_attr_available_resources_io,
+-	&class_device_attr_available_resources_mem,
++static struct device_attribute *pccard_rsrc_attributes[] = {
++	&dev_attr_available_resources_io,
++	&dev_attr_available_resources_mem,
+ 	NULL,
+ };
+ 
+-static int __devinit pccard_sysfs_add_rsrc(struct class_device *class_dev,
++static int __devinit pccard_sysfs_add_rsrc(struct device *dev,
+ 					   struct class_interface *class_intf)
+ {
+-	struct pcmcia_socket *s = class_get_devdata(class_dev);
+-	struct class_device_attribute **attr;
++	struct pcmcia_socket *s = dev_get_drvdata(dev);
++	struct device_attribute **attr;
+ 	int ret = 0;
+ 	if (s->resource_ops != &pccard_nonstatic_ops)
+ 		return 0;
+ 
+ 	for (attr = pccard_rsrc_attributes; *attr; attr++) {
+-		ret = class_device_create_file(class_dev, *attr);
++		ret = device_create_file(dev, *attr);
+ 		if (ret)
+ 			break;
+ 	}
+@@ -1025,23 +1031,23 @@ static int __devinit pccard_sysfs_add_rs
+ 	return ret;
+ }
+ 
+-static void __devexit pccard_sysfs_remove_rsrc(struct class_device *class_dev,
++static void __devexit pccard_sysfs_remove_rsrc(struct device *dev,
+ 					       struct class_interface *class_intf)
+ {
+-	struct pcmcia_socket *s = class_get_devdata(class_dev);
+-	struct class_device_attribute **attr;
++	struct pcmcia_socket *s = dev_get_drvdata(dev);
++	struct device_attribute **attr;
+ 
+ 	if (s->resource_ops != &pccard_nonstatic_ops)
+ 		return;
+ 
+ 	for (attr = pccard_rsrc_attributes; *attr; attr++)
+-		class_device_remove_file(class_dev, *attr);
++		device_remove_file(dev, *attr);
+ }
+ 
+ static struct class_interface pccard_rsrc_interface = {
+ 	.class = &pcmcia_socket_class,
+-	.add = &pccard_sysfs_add_rsrc,
+-	.remove = __devexit_p(&pccard_sysfs_remove_rsrc),
++	.add_dev = &pccard_sysfs_add_rsrc,
++	.remove_dev = __devexit_p(&pccard_sysfs_remove_rsrc),
+ };
+ 
+ static int __init nonstatic_sysfs_init(void)
+--- gregkh-2.6.orig/drivers/pcmcia/soc_common.c
++++ gregkh-2.6/drivers/pcmcia/soc_common.c
+@@ -478,10 +478,10 @@ dump_bits(char **p, const char *prefix, 
+  *
+  * Returns: the number of characters added to the buffer
+  */
+-static ssize_t show_status(struct class_device *class_dev, char *buf)
++static ssize_t show_status(struct device *dev, char *buf)
+ {
+ 	struct soc_pcmcia_socket *skt =
+-		container_of(class_dev, struct soc_pcmcia_socket, socket.dev);
++		container_of(dev, struct soc_pcmcia_socket, socket.dev);
+ 	char *p = buf;
+ 
+ 	p+=sprintf(p, "slot     : %d\n", skt->nr);
+@@ -747,7 +747,7 @@ int soc_common_drv_pcmcia_probe(struct d
+ 
+ 		add_timer(&skt->poll_timer);
+ 
+-		class_device_create_file(&skt->socket.dev, &class_device_attr_status);
++		device_create_file(&skt->socket.dev, &device_attr_status);
+ 	}
+ 
+ 	dev_set_drvdata(dev, sinfo);
 --- gregkh-2.6.orig/drivers/pcmcia/socket_sysfs.c
 +++ gregkh-2.6/drivers/pcmcia/socket_sysfs.c
 @@ -40,7 +40,8 @@
