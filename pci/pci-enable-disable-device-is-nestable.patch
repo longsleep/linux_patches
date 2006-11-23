@@ -1,0 +1,256 @@
+From owner-linux-pci@atrey.karlin.mff.cuni.cz  Thu Nov 23 00:24:18 2006
+Message-Id: <20061122230234.424783756@sodium.jf.intel.com>
+Date: Wed, 22 Nov 2006 12:40:31 -0800
+From: Inaky Perez-Gonzalez <inaky@linux.intel.com>
+To: gregkh@suse.de, linux-pci@atrey.karlin.mff.cuni.cz
+Cc: "Grant Grundler" <grundler@parisc-linux.org>, "Matthew Wilcox" <matthew@wil.cx>
+Subject: PCI: switch pci_{enable,disable}_device() to be nestable
+Content-Disposition: inline; filename=pci-enable-disable-device-is-nestable.patch
+
+From: Inaky Perez-Gonzalez <inaky@linux.intel.com>
+
+Changes the pci_{enable,disable}_device() functions to work in a
+nested basis, so that eg, three calls to enable_device() require three
+calls to disable_device().
+
+The reason for this is to simplify PCI drivers for
+multi-interface/capability devices. These are devices that cram more
+than one interface in a single function. A relevant example of that is
+the Wireless [USB] Host Controller Interface (similar to EHCI) [see
+http://www.intel.com/technology/comms/wusb/whci.htm]. 
+
+In these kind of devices, multiple interfaces are accessed through a
+single bar and IRQ line. For that, the drivers map only the smallest
+area of the bar to access their register banks and use shared IRQ
+handlers. 
+
+However, because the order at which those drivers load cannot be known
+ahead of time, the sequence in which the calls to pci_enable_device()
+and pci_disable_device() cannot be predicted. Thus:
+
+1. driverA     starts     pci_enable_device()
+2. driverB     starts     pci_enable_device()
+3. driverA     shutdown   pci_disable_device()
+4. driverB     shutdown   pci_disable_device()
+
+between steps 3 and 4, driver B would loose access to it's device,
+even if it didn't intend to.
+
+By using this modification, the device won't be disabled until all the
+callers to enable() have called disable().
+
+This is implemented by replacing 'struct pci_dev->is_enabled' from a
+bitfield to an atomic use count. Each caller to enable increments it,
+each caller to disable decrements it. When the count increments from 0
+to 1, __pci_enable_device() is called to actually enable the
+device. When it drops to zero, pci_disable_device() actually does the
+disabling.
+
+We keep the backend __pci_enable_device() for pci_default_resume() to
+use and also change the sysfs method implementation, so that userspace
+enabling/disabling the device doesn't disable it one time too much.
+
+Signed-off-by: Inaky Perez-Gonzalez <inaky@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/pci/pci-driver.c |    4 ++--
+ drivers/pci/pci-sysfs.c  |   33 +++++++++++++++++++++------------
+ drivers/pci/pci.c        |   40 +++++++++++++++++++++++++++++++++-------
+ drivers/pci/pci.h        |    1 +
+ include/linux/pci.h      |    3 ++-
+ 5 files changed, 59 insertions(+), 22 deletions(-)
+
+--- gregkh-2.6.orig/drivers/pci/pci-driver.c
++++ gregkh-2.6/drivers/pci/pci-driver.c
+@@ -329,8 +329,8 @@ static int pci_default_resume(struct pci
+ 	/* restore the PCI config space */
+ 	pci_restore_state(pci_dev);
+ 	/* if the device was enabled before suspend, reenable */
+-	if (pci_dev->is_enabled)
+-		retval = pci_enable_device(pci_dev);
++	if (atomic_read(&pci_dev->enable_cnt))
++		retval = __pci_enable_device(pci_dev);
+ 	/* if the device was busmaster before the suspend, make it busmaster again */
+ 	if (pci_dev->is_busmaster)
+ 		pci_set_master(pci_dev);
+--- gregkh-2.6.orig/drivers/pci/pci-sysfs.c
++++ gregkh-2.6/drivers/pci/pci-sysfs.c
+@@ -42,7 +42,6 @@ pci_config_attr(subsystem_vendor, "0x%04
+ pci_config_attr(subsystem_device, "0x%04x\n");
+ pci_config_attr(class, "0x%06x\n");
+ pci_config_attr(irq, "%u\n");
+-pci_config_attr(is_enabled, "%u\n");
+ 
+ static ssize_t broken_parity_status_show(struct device *dev,
+ 					 struct device_attribute *attr,
+@@ -112,26 +111,36 @@ static ssize_t modalias_show(struct devi
+ 		       (u8)(pci_dev->class >> 16), (u8)(pci_dev->class >> 8),
+ 		       (u8)(pci_dev->class));
+ }
+-static ssize_t
+-is_enabled_store(struct device *dev, struct device_attribute *attr,
+-		const char *buf, size_t count)
++
++static ssize_t is_enabled_store(struct device *dev,
++				struct device_attribute *attr, const char *buf,
++				size_t count)
+ {
++	ssize_t result = -EINVAL;
+ 	struct pci_dev *pdev = to_pci_dev(dev);
+-	int retval = 0;
+ 
+ 	/* this can crash the machine when done on the "wrong" device */
+ 	if (!capable(CAP_SYS_ADMIN))
+ 		return count;
+ 
+-	if (*buf == '0')
+-		pci_disable_device(pdev);
++	if (*buf == '0') {
++		if (atomic_read(&pdev->enable_cnt) != 0)
++			pci_disable_device(pdev);
++		else
++			result = -EIO;
++	} else if (*buf == '1')
++		result = pci_enable_device(pdev);
++
++	return result < 0 ? result : count;
++}
+ 
+-	if (*buf == '1')
+-		retval = pci_enable_device(pdev);
++static ssize_t is_enabled_show(struct device *dev,
++			       struct device_attribute *attr, char *buf)
++{
++	struct pci_dev *pdev;
+ 
+-	if (retval)
+-		return retval;
+-	return count;
++	pdev = to_pci_dev (dev);
++	return sprintf (buf, "%u\n", atomic_read(&pdev->enable_cnt));
+ }
+ 
+ static ssize_t
+--- gregkh-2.6.orig/drivers/pci/pci.c
++++ gregkh-2.6/drivers/pci/pci.c
+@@ -612,30 +612,51 @@ pci_enable_device_bars(struct pci_dev *d
+ }
+ 
+ /**
+- * pci_enable_device - Initialize device before it's used by a driver.
++ * __pci_enable_device - Initialize device before it's used by a driver.
+  * @dev: PCI device to be initialized
+  *
+  *  Initialize device before it's used by a driver. Ask low-level code
+  *  to enable I/O and memory. Wake up the device if it was suspended.
+  *  Beware, this function can fail.
++ *
++ * Note this function is a backend and is not supposed to be called by
++ * normal code, use pci_enable_device() instead.
+  */
+ int
+-pci_enable_device(struct pci_dev *dev)
++__pci_enable_device(struct pci_dev *dev)
+ {
+ 	int err;
+ 
+-	if (dev->is_enabled)
+-		return 0;
+-
+ 	err = pci_enable_device_bars(dev, (1 << PCI_NUM_RESOURCES) - 1);
+ 	if (err)
+ 		return err;
+ 	pci_fixup_device(pci_fixup_enable, dev);
+-	dev->is_enabled = 1;
+ 	return 0;
+ }
+ 
+ /**
++ * pci_enable_device - Initialize device before it's used by a driver.
++ * @dev: PCI device to be initialized
++ *
++ *  Initialize device before it's used by a driver. Ask low-level code
++ *  to enable I/O and memory. Wake up the device if it was suspended.
++ *  Beware, this function can fail.
++ *
++ *  Note we don't actually enable the device many times if we call
++ *  this function repeatedly (we just increment the count).
++ */
++int pci_enable_device(struct pci_dev *dev)
++{
++	int result;
++	if (atomic_add_return(1, &dev->enable_cnt) > 1)
++		return 0;		/* already enabled */
++	result = __pci_enable_device(dev);
++	if (result < 0)
++		atomic_dec(&dev->enable_cnt);
++	return result;
++}
++
++/**
+  * pcibios_disable_device - disable arch specific PCI resources for device dev
+  * @dev: the PCI device to disable
+  *
+@@ -651,12 +672,18 @@ void __attribute__ ((weak)) pcibios_disa
+  *
+  * Signal to the system that the PCI device is not in use by the system
+  * anymore.  This only involves disabling PCI bus-mastering, if active.
++ *
++ * Note we don't actually disable the device until all callers of
++ * pci_device_enable() have called pci_device_disable().
+  */
+ void
+ pci_disable_device(struct pci_dev *dev)
+ {
+ 	u16 pci_command;
+ 
++	if (atomic_sub_return(1, &dev->enable_cnt) != 0)
++		return;
++
+ 	if (dev->msi_enabled)
+ 		disable_msi_mode(dev, pci_find_capability(dev, PCI_CAP_ID_MSI),
+ 			PCI_CAP_ID_MSI);
+@@ -672,7 +699,6 @@ pci_disable_device(struct pci_dev *dev)
+ 	dev->is_busmaster = 0;
+ 
+ 	pcibios_disable_device(dev);
+-	dev->is_enabled = 0;
+ }
+ 
+ /**
+--- gregkh-2.6.orig/drivers/pci/pci.h
++++ gregkh-2.6/drivers/pci/pci.h
+@@ -1,5 +1,6 @@
+ /* Functions internal to the PCI core code */
+ 
++extern int __must_check __pci_enable_device(struct pci_dev *);
+ extern int pci_uevent(struct device *dev, char **envp, int num_envp,
+ 		      char *buffer, int buffer_size);
+ extern int pci_create_sysfs_dev_files(struct pci_dev *pdev);
+--- gregkh-2.6.orig/include/linux/pci.h
++++ gregkh-2.6/include/linux/pci.h
+@@ -51,6 +51,7 @@
+ #include <linux/list.h>
+ #include <linux/compiler.h>
+ #include <linux/errno.h>
++#include <asm/atomic.h>
+ #include <linux/device.h>
+ 
+ /* File state for mmap()s on /proc/bus/pci/X/Y */
+@@ -159,7 +160,6 @@ struct pci_dev {
+ 	unsigned int	transparent:1;	/* Transparent PCI bridge */
+ 	unsigned int	multifunction:1;/* Part of multi-function device */
+ 	/* keep track of device state */
+-	unsigned int	is_enabled:1;	/* pci_enable_device has been called */
+ 	unsigned int	is_busmaster:1; /* device is busmaster */
+ 	unsigned int	no_msi:1;	/* device may not use msi */
+ 	unsigned int	no_d1d2:1;   /* only allow d0 or d3 */
+@@ -167,6 +167,7 @@ struct pci_dev {
+ 	unsigned int	broken_parity_status:1;	/* Device generates false positive parity */
+ 	unsigned int 	msi_enabled:1;
+ 	unsigned int	msix_enabled:1;
++	atomic_t	enable_cnt;	/* pci_enable_device has been called */
+ 
+ 	u32		saved_config_space[16]; /* config space saved at suspend time */
+ 	struct hlist_head saved_cap_space;
