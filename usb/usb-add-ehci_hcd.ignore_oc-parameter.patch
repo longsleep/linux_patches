@@ -1,0 +1,107 @@
+From david-b@pacbell.net Fri Nov 17 01:36:26 2006
+From: David Brownell <david-b@pacbell.net>
+To: Greg KH <greg@kroah.com>
+Subject: USB: add ehci_hcd.ignore_oc parameter
+Date: Thu, 16 Nov 2006 23:34:58 -0800
+Cc: linux-usb-devel@lists.sourceforge.net
+Message-Id: <200611162334.58363.david-b@pacbell.net>
+
+Certain boards seem to like to issue false overcurrent notifications, for
+example on ports that don't have anything connected to them.  This looks
+like a hardware error, at the level of noise to those ports' overcurrent
+input signals (or non-debounced VBUS comparators).  This surfaces to users
+as truly massive amounts of syslog spam from khubd (which is appropriate
+for real hardware problems, except for the volume from multiple ports).
+
+Using this new "ignore_oc" flag helps such systems work more sanely, by
+preventing such indications from getting to khubd (and spam syslog).  The
+downside is of course that true overcurrent errors will be masked; they'll
+appear as spontaneous disconnects, without the diagnostics that will let
+users troubleshoot issues like short circuited cables.
+
+Note that the bulk of these reports seem to be with VIA southbridges, but
+I think some were with Intel ones.
+
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/ehci-hcd.c |   10 ++++++++--
+ drivers/usb/host/ehci-hub.c |   18 +++++++++++++++---
+ 2 files changed, 23 insertions(+), 5 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/host/ehci-hcd.c
++++ gregkh-2.6/drivers/usb/host/ehci-hcd.c
+@@ -126,6 +126,11 @@ static unsigned park = 0;
+ module_param (park, uint, S_IRUGO);
+ MODULE_PARM_DESC (park, "park setting; 1-3 back-to-back async packets");
+ 
++/* for flakey hardware, ignore overcurrent indicators */
++static int ignore_oc = 0;
++module_param (ignore_oc, bool, S_IRUGO);
++MODULE_PARM_DESC (ignore_oc, "ignore bogus hardware overcurrent indications");
++
+ #define	INTR_MASK (STS_IAA | STS_FATAL | STS_PCD | STS_ERR | STS_INT)
+ 
+ /*-------------------------------------------------------------------------*/
+@@ -541,9 +546,10 @@ static int ehci_run (struct usb_hcd *hcd
+ 
+ 	temp = HC_VERSION(readl (&ehci->caps->hc_capbase));
+ 	ehci_info (ehci,
+-		"USB %x.%x started, EHCI %x.%02x, driver %s\n",
++		"USB %x.%x started, EHCI %x.%02x, driver %s%s\n",
+ 		((ehci->sbrn & 0xf0)>>4), (ehci->sbrn & 0x0f),
+-		temp >> 8, temp & 0xff, DRIVER_VERSION);
++		temp >> 8, temp & 0xff, DRIVER_VERSION,
++		ignore_oc ? ", overcurrent ignored" : "");
+ 
+ 	writel (INTR_MASK, &ehci->regs->intr_enable); /* Turn On Interrupts */
+ 
+--- gregkh-2.6.orig/drivers/usb/host/ehci-hub.c
++++ gregkh-2.6/drivers/usb/host/ehci-hub.c
+@@ -218,6 +218,7 @@ ehci_hub_status_data (struct usb_hcd *hc
+ {
+ 	struct ehci_hcd	*ehci = hcd_to_ehci (hcd);
+ 	u32		temp, status = 0;
++	u32		mask;
+ 	int		ports, i, retval = 1;
+ 	unsigned long	flags;
+ 
+@@ -233,6 +234,18 @@ ehci_hub_status_data (struct usb_hcd *hc
+ 		retval++;
+ 	}
+ 
++	/* Some boards (mostly VIA?) report bogus overcurrent indications,
++	 * causing massive log spam unless we completely ignore them.  It
++	 * may be relevant that VIA VT8235 controlers, where PORT_POWER is
++	 * always set, seem to clear PORT_OCC and PORT_CSC when writing to
++	 * PORT_POWER; that's surprising, but maybe within-spec.
++	 */
++	if (!ignore_oc)
++		mask = PORT_CSC | PORT_PEC | PORT_OCC;
++	else
++		mask = PORT_CSC | PORT_PEC;
++	// PORT_RESUME from hardware ~= PORT_STAT_C_SUSPEND
++
+ 	/* no hub change reports (bit 0) for now (power, ...) */
+ 
+ 	/* port N changes (bit N)? */
+@@ -250,8 +263,7 @@ ehci_hub_status_data (struct usb_hcd *hc
+ 		}
+ 		if (!(temp & PORT_CONNECT))
+ 			ehci->reset_done [i] = 0;
+-		if ((temp & (PORT_CSC | PORT_PEC | PORT_OCC)) != 0
+-				// PORT_STAT_C_SUSPEND?
++		if ((temp & mask) != 0
+ 				|| ((temp & PORT_RESUME) != 0
+ 					&& time_after (jiffies,
+ 						ehci->reset_done [i]))) {
+@@ -418,7 +430,7 @@ static int ehci_hub_control (
+ 			status |= 1 << USB_PORT_FEAT_C_CONNECTION;
+ 		if (temp & PORT_PEC)
+ 			status |= 1 << USB_PORT_FEAT_C_ENABLE;
+-		if (temp & PORT_OCC)
++		if ((temp & PORT_OCC) && !ignore_oc)
+ 			status |= 1 << USB_PORT_FEAT_C_OVER_CURRENT;
+ 
+ 		/* whoever resumes must GetPortStatus to complete it!! */
