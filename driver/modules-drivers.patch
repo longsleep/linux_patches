@@ -1,0 +1,102 @@
+From kay.sievers@vrfy.org Sun Nov 26 01:41:34 2006
+From: Kay Sievers <kay.sievers@vrfy.org>
+Subject: Driver core: show drivers in /sys/module/
+Date: Fri, 24 Nov 2006 12:15:25 +0100
+Message-Id: <1164366925.3468.34.camel@pim.off.vrfy.org>
+Mime-Version: 1.0
+Content-Transfer-Encoding: 7bit
+Status: RO
+Content-Length: 2574
+
+Show the drivers, which belong to the module:
+  $ ls -l /sys/module/usbcore/drivers/
+  hub -> ../../../bus/usb/drivers/hub
+  usb -> ../../../bus/usb/drivers/usb
+  usbfs -> ../../../bus/usb/drivers/usbfs
+
+Signed-off-by: Kay Sievers <kay.sievers@vrfy.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+---
+ include/linux/module.h |    1 +
+ kernel/module.c        |   26 +++++++++++++++++++++-----
+ 2 files changed, 22 insertions(+), 5 deletions(-)
+
+--- gregkh-2.6.orig/include/linux/module.h
++++ gregkh-2.6/include/linux/module.h
+@@ -264,6 +264,7 @@ struct module
+ 	struct module_attribute *modinfo_attrs;
+ 	const char *version;
+ 	const char *srcversion;
++	struct kobject *drivers_dir;
+ 
+ 	/* Exported symbols */
+ 	const struct kernel_symbol *syms;
+--- gregkh-2.6.orig/kernel/module.c
++++ gregkh-2.6/kernel/module.c
+@@ -1111,22 +1111,35 @@ static int mod_sysfs_setup(struct module
+ 		goto out;
+ 	kobj_set_kset_s(&mod->mkobj, module_subsys);
+ 	mod->mkobj.mod = mod;
+-	err = kobject_register(&mod->mkobj.kobj);
++
++	/* delay uevent until full sysfs population */
++	kobject_init(&mod->mkobj.kobj);
++	err = kobject_add(&mod->mkobj.kobj);
+ 	if (err)
+ 		goto out;
+ 
++	mod->drivers_dir = kobject_add_dir(&mod->mkobj.kobj, "drivers");
++	if (!mod->drivers_dir)
++		goto out_unreg;
++
+ 	err = module_param_sysfs_setup(mod, kparam, num_params);
+ 	if (err)
+-		goto out_unreg;
++		goto out_unreg_drivers;
+ 
+ 	err = module_add_modinfo_attrs(mod);
+ 	if (err)
+-		goto out_unreg;
++		goto out_unreg_param;
+ 
++	kobject_uevent(&mod->mkobj.kobj, KOBJ_ADD);
+ 	return 0;
+ 
++out_unreg_drivers:
++	kobject_unregister(mod->drivers_dir);
++out_unreg_param:
++	module_param_sysfs_remove(mod);
+ out_unreg:
+-	kobject_unregister(&mod->mkobj.kobj);
++	kobject_del(&mod->mkobj.kobj);
++	kobject_put(&mod->mkobj.kobj);
+ out:
+ 	return err;
+ }
+@@ -1135,6 +1148,7 @@ static void mod_kobject_remove(struct mo
+ {
+ 	module_remove_modinfo_attrs(mod);
+ 	module_param_sysfs_remove(mod);
++	kobject_unregister(mod->drivers_dir);
+ 
+ 	kobject_unregister(&mod->mkobj.kobj);
+ }
+@@ -2303,8 +2317,9 @@ void module_add_driver(struct module *mo
+ 	if (!mod || !drv)
+ 		return;
+ 
+-	/* Don't check return code; this call is idempotent */
++	/* Don't check return codes; these calls are idempotent */
+ 	sysfs_create_link(&drv->kobj, &mod->mkobj.kobj, "module");
++	sysfs_create_link(mod->drivers_dir, &drv->kobj, drv->name);
+ }
+ EXPORT_SYMBOL(module_add_driver);
+ 
+@@ -2313,6 +2328,7 @@ void module_remove_driver(struct device_
+ 	if (!drv)
+ 		return;
+ 	sysfs_remove_link(&drv->kobj, "module");
++	sysfs_remove_link(drv->owner->drivers_dir, drv->name);
+ }
+ EXPORT_SYMBOL(module_remove_driver);
+ 
