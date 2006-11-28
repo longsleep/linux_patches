@@ -1,0 +1,235 @@
+From cornelia.huck@de.ibm.com Mon Nov 27 01:34:35 2006
+Date: Mon, 27 Nov 2006 10:35:07 +0100
+From: Cornelia Huck <cornelia.huck@de.ibm.com>
+To: Greg K-H <greg@kroah.com>
+Cc: Andrew Morton <akpm@osdl.org>
+Subject: driver core fixes: sysfs_create_link() retval checks in core.c
+Message-ID: <20061127103507.0b6628ab@gondolin.boeblingen.de.ibm.com>
+
+From: Cornelia Huck <cornelia.huck@de.ibm.com>
+
+Check for return value of sysfs_create_link() in device_add()
+and device_rename().  Add helper functions device_add_class_symlinks() and
+device_remove_class_symlinks() to make the code easier to read.
+
+Signed-off-by: Cornelia Huck <cornelia.huck@de.ibm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/base/core.c |  142 +++++++++++++++++++++++++++++++++++++---------------
+ 1 file changed, 103 insertions(+), 39 deletions(-)
+
+--- gregkh-2.6.orig/drivers/base/core.c
++++ gregkh-2.6/drivers/base/core.c
+@@ -365,6 +365,81 @@ static void klist_children_put(struct kl
+ }
+ 
+ 
++static int device_add_class_symlinks(struct device *dev)
++{
++	int error;
++
++	if (!dev->class)
++		return 0;
++	error = sysfs_create_link(&dev->kobj, &dev->class->subsys.kset.kobj,
++				  "subsystem");
++	if (error)
++		goto out;
++	/* If this is not a "fake" compatible device, then create the
++	 * symlink from the class to the device. */
++	if (dev->kobj.parent != &dev->class->subsys.kset.kobj) {
++		error = sysfs_create_link(&dev->class->subsys.kset.kobj,
++					  &dev->kobj, dev->bus_id);
++		if (error)
++			goto out_subsys;
++	}
++#ifdef CONFIG_SYSFS_DEPRECATED
++	if (dev->parent) {
++		char *class_name;
++
++		error = sysfs_create_link(&dev->kobj, &dev->parent->kobj,
++					  "device");
++		if (error)
++			goto out_busid;
++		class_name = make_class_name(dev->class->name, &dev->kobj);
++		if (!class_name) {
++			error = -ENOMEM;
++			goto out_busid;
++		}
++		error = sysfs_create_link(&dev->parent->kobj, &dev->kobj,
++					  class_name);
++		kfree(class_name);
++		if (error)
++			goto out_device;
++	}
++#endif
++	return 0;
++
++#ifdef CONFIG_SYSFS_DEPRECATED
++out_device:
++	if (dev->parent)
++		sysfs_remove_link(&dev->kobj, "device");
++out_busid:
++#endif
++	if (dev->kobj.parent != &dev->class->subsys.kset.kobj)
++		sysfs_remove_link(&dev->class->subsys.kset.kobj, dev->bus_id);
++out_subsys:
++	sysfs_remove_link(&dev->kobj, "subsystem");
++out:
++	return error;
++}
++
++static void device_remove_class_symlinks(struct device *dev)
++{
++	if (!dev->class)
++		return;
++#ifdef CONFIG_SYSFS_DEPRECATED
++	if (dev->parent) {
++		char *class_name;
++
++		class_name = make_class_name(dev->class->name, &dev->kobj);
++		if (class_name) {
++			sysfs_remove_link(&dev->parent->kobj, class_name);
++			kfree(class_name);
++		}
++		sysfs_remove_link(&dev->kobj, "device");
++	}
++#endif
++	if (dev->kobj.parent != &dev->class->subsys.kset.kobj)
++		sysfs_remove_link(&dev->class->subsys.kset.kobj, dev->bus_id);
++	sysfs_remove_link(&dev->kobj, "subsystem");
++}
++
+ /**
+  *	device_initialize - init device structure.
+  *	@dev:	device.
+@@ -448,7 +523,6 @@ static int setup_parent(struct device *d
+ int device_add(struct device *dev)
+ {
+ 	struct device *parent = NULL;
+-	char *class_name = NULL;
+ 	struct class_interface *class_intf;
+ 	int error = -EINVAL;
+ 
+@@ -509,27 +583,8 @@ int device_add(struct device *dev)
+ 		dev->devt_attr = attr;
+ 	}
+ 
+-	if (dev->class) {
+-		sysfs_create_link(&dev->kobj, &dev->class->subsys.kset.kobj,
+-				  "subsystem");
+-		/* If this is not a "fake" compatible device, then create the
+-		 * symlink from the class to the device. */
+-		if (dev->kobj.parent != &dev->class->subsys.kset.kobj)
+-			sysfs_create_link(&dev->class->subsys.kset.kobj,
+-					  &dev->kobj, dev->bus_id);
+-#ifdef CONFIG_SYSFS_DEPRECATED
+-		if (parent) {
+-			sysfs_create_link(&dev->kobj, &dev->parent->kobj,
+-							"device");
+-			class_name = make_class_name(dev->class->name,
+-							&dev->kobj);
+-			if (class_name)
+-				sysfs_create_link(&dev->parent->kobj,
+-						  &dev->kobj, class_name);
+-		}
+-#endif
+-	}
+-
++	if ((error = device_add_class_symlinks(dev)))
++		goto SymlinkError;
+ 	if ((error = device_add_attrs(dev)))
+ 		goto AttrsError;
+ 	if ((error = device_add_groups(dev)))
+@@ -556,7 +611,6 @@ int device_add(struct device *dev)
+ 		up(&dev->class->sem);
+ 	}
+  Done:
+- 	kfree(class_name);
+ 	put_device(dev);
+ 	return error;
+  AttachError:
+@@ -571,6 +625,8 @@ int device_add(struct device *dev)
+  GroupError:
+  	device_remove_attrs(dev);
+  AttrsError:
++	device_remove_class_symlinks(dev);
++ SymlinkError:
+ 	if (dev->devt_attr) {
+ 		device_remove_file(dev, dev->devt_attr);
+ 		kfree(dev->devt_attr);
+@@ -908,7 +964,7 @@ int device_rename(struct device *dev, ch
+ {
+ 	char *old_class_name = NULL;
+ 	char *new_class_name = NULL;
+-	char *old_symlink_name = NULL;
++	char *old_device_name = NULL;
+ 	int error;
+ 
+ 	dev = get_device(dev);
+@@ -922,25 +978,28 @@ int device_rename(struct device *dev, ch
+ 		old_class_name = make_class_name(dev->class->name, &dev->kobj);
+ #endif
+ 
+-	if (dev->class) {
+-		old_symlink_name = kmalloc(BUS_ID_SIZE, GFP_KERNEL);
+-		if (!old_symlink_name) {
+-			error = -ENOMEM;
+-			goto out_free_old_class;
+-		}
+-		strlcpy(old_symlink_name, dev->bus_id, BUS_ID_SIZE);
++	old_device_name = kmalloc(BUS_ID_SIZE, GFP_KERNEL);
++	if (!old_device_name) {
++		error = -ENOMEM;
++		goto out;
+ 	}
+-
++	strlcpy(old_device_name, dev->bus_id, BUS_ID_SIZE);
+ 	strlcpy(dev->bus_id, new_name, BUS_ID_SIZE);
+ 
+ 	error = kobject_rename(&dev->kobj, new_name);
++	if (error) {
++		strlcpy(dev->bus_id, old_device_name, BUS_ID_SIZE);
++		goto out;
++	}
+ 
+ #ifdef CONFIG_SYSFS_DEPRECATED
+ 	if (old_class_name) {
+ 		new_class_name = make_class_name(dev->class->name, &dev->kobj);
+ 		if (new_class_name) {
+-			sysfs_create_link(&dev->parent->kobj, &dev->kobj,
+-					  new_class_name);
++			error = sysfs_create_link(&dev->parent->kobj,
++						  &dev->kobj, new_class_name);
++			if (error)
++				goto out;
+ 			sysfs_remove_link(&dev->parent->kobj, old_class_name);
+ 		}
+ 	}
+@@ -948,16 +1007,21 @@ int device_rename(struct device *dev, ch
+ 
+ 	if (dev->class) {
+ 		sysfs_remove_link(&dev->class->subsys.kset.kobj,
+-				  old_symlink_name);
+-		sysfs_create_link(&dev->class->subsys.kset.kobj, &dev->kobj,
+-				  dev->bus_id);
++				  old_device_name);
++		error = sysfs_create_link(&dev->class->subsys.kset.kobj,
++					  &dev->kobj, dev->bus_id);
++		if (error) {
++			/* Uh... how to unravel this if restoring can fail? */
++			dev_err(dev, "%s: sysfs_create_link failed (%d)\n",
++				__FUNCTION__, error);
++		}
+ 	}
++ out:
+ 	put_device(dev);
+ 
+ 	kfree(new_class_name);
+-	kfree(old_symlink_name);
+- out_free_old_class:
+ 	kfree(old_class_name);
++	kfree(old_device_name);
+ 
+ 	return error;
+ }
