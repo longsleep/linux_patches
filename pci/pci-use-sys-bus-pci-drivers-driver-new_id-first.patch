@@ -1,0 +1,80 @@
+From owner-linux-pci@atrey.karlin.mff.cuni.cz  Mon Dec  4 14:39:55 2006
+Date: Wed, 29 Nov 2006 21:18:04 +0000
+From: Russell King <rmk+lkml@arm.linux.org.uk>
+To: Greg KH <greg@kroah.com>
+Subject: PCI: use /sys/bus/pci/drivers/<driver>/new_id first
+Message-ID: <20061129211803.GB15186@flint.arm.linux.org.uk>
+Mime-Version: 1.0
+Content-Type: text/plain; charset=us-ascii
+Content-Disposition: inline
+
+Unfortunately, the .../new_id feature does not work with the 8250_pci
+driver.
+
+The reason for this comes down to the way .../new_id is implemented.
+When PCI tries to match a driver to a device, it checks the modules
+static device ID tables _before_ checking the dynamic new_id tables.
+
+When a driver is capable of matching by ID, and falls back to matching
+by class (as 8250_pci does), this makes it absolutely impossible to
+specify a board by ID, and as such the correct driver_data value to
+use with it.
+
+Let's say you have a serial board with vendor 0x1234 and device 0x5678.
+It's class is set to PCI_CLASS_COMMUNICATION_SERIAL.
+
+On boot, this card is matched to the 8250_pci driver, which tries to
+probe it because it matched using the class entry.  The driver finds
+that it is unable to automatically detect the correct settings to use,
+so it returns -ENODEV.
+
+You know that the information the driver needs is to match this card
+using a device_data value of '7'.  So you echo 1234 5678 0 0 0 0 7
+into new_id.
+
+The kernel attempts to re-bind 8250_pci to this device.  However,
+because it scans the PCI driver tables, it _again_ matches the class
+entry which has the wrong device_data.  It fails.
+
+End of story.  You can't support the card without rebuilding the
+kernel (or writing a specific PCI probe module to support it.)
+
+So, can we make new_id override the driver-internal PCI ID tables?
+IOW, like this:
+
+
+From: Russell King <rmk@arm.linux.org.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/pci/pci-driver.c |   10 +++-------
+ 1 file changed, 3 insertions(+), 7 deletions(-)
+
+--- gregkh-2.6.orig/drivers/pci/pci-driver.c
++++ gregkh-2.6/drivers/pci/pci-driver.c
+@@ -162,14 +162,9 @@ const struct pci_device_id *pci_match_id
+ const struct pci_device_id *pci_match_device(struct pci_driver *drv,
+ 					     struct pci_dev *dev)
+ {
+-	const struct pci_device_id *id;
+ 	struct pci_dynid *dynid;
+ 
+-	id = pci_match_id(drv->id_table, dev);
+-	if (id)
+-		return id;
+-
+-	/* static ids didn't match, lets look at the dynamic ones */
++	/* Look at the dynamic ids first, before the static ones */
+ 	spin_lock(&drv->dynids.lock);
+ 	list_for_each_entry(dynid, &drv->dynids.list, node) {
+ 		if (pci_match_one_device(&dynid->id, dev)) {
+@@ -178,7 +173,8 @@ const struct pci_device_id *pci_match_de
+ 		}
+ 	}
+ 	spin_unlock(&drv->dynids.lock);
+-	return NULL;
++
++	return pci_match_id(drv->id_table, dev);
+ }
+ 
+ static int pci_call_probe(struct pci_driver *drv, struct pci_dev *dev,
