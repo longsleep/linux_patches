@@ -1,0 +1,155 @@
+From alan@lxorguk.ukuu.org.uk Mon Dec  4 08:35:47 2006
+Date: Mon, 4 Dec 2006 16:43:01 +0000
+From: Alan <alan@lxorguk.ukuu.org.uk>
+To: akpm@osdl.org, linux-kernel@vger.kernel.org, greg@kroah.com
+Subject: usb serial: Eliminate bogus ioctl code
+Message-ID: <20061204164301.02f870a9@localhost.localdomain>
+Mime-Version: 1.0
+Content-Type: text/plain; charset=US-ASCII
+
+Several drivers have bogus ioctl code that tries unneccessarily to
+override the standard processing. In the three cases here the actual code
+is not only wrong but also not required as they implement the proper
+set_termios method as well.
+
+Remove the junk.
+
+Signed-off-by: Alan Cox <alan@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/serial/cypress_m8.c |   15 --------
+ drivers/usb/serial/kl5kusb105.c |   68 ----------------------------------------
+ drivers/usb/serial/mos7840.c    |    6 ---
+ 3 files changed, 89 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/serial/cypress_m8.c
++++ gregkh-2.6/drivers/usb/serial/cypress_m8.c
+@@ -962,21 +962,6 @@ static int cypress_ioctl (struct usb_ser
+ 			cypress_set_termios(port, &priv->tmp_termios);
+ 			return (0);
+ 			break;
+-		/* these are called when setting baud rate from gpsd */
+-		case TCGETS:
+-			if (copy_to_user((void __user *)arg, port->tty->termios, sizeof(struct termios))) {
+-				return -EFAULT;
+-			}
+-			return (0);
+-			break;
+-		case TCSETS:
+-			if (copy_from_user(port->tty->termios, (void __user *)arg, sizeof(struct termios))) {
+-				return -EFAULT;
+-			}
+-			/* here we need to call cypress_set_termios to invoke the new settings */
+-			cypress_set_termios(port, &priv->tmp_termios);
+-			return (0);
+-			break;
+ 		/* This code comes from drivers/char/serial.c and ftdi_sio.c */
+ 		case TIOCMIWAIT:
+ 			while (priv != NULL) {
+--- gregkh-2.6.orig/drivers/usb/serial/kl5kusb105.c
++++ gregkh-2.6/drivers/usb/serial/kl5kusb105.c
+@@ -87,10 +87,6 @@ static int  klsi_105_write_room         
+ static void klsi_105_read_bulk_callback  (struct urb *urb);
+ static void klsi_105_set_termios         (struct usb_serial_port *port,
+ 					  struct termios * old);
+-static int  klsi_105_ioctl	         (struct usb_serial_port *port,
+-					  struct file * file,
+-					  unsigned int cmd,
+-					  unsigned long arg);
+ static void klsi_105_throttle		 (struct usb_serial_port *port);
+ static void klsi_105_unthrottle		 (struct usb_serial_port *port);
+ /*
+@@ -140,7 +136,6 @@ static struct usb_serial_driver kl5kusb1
+ 	.chars_in_buffer =   klsi_105_chars_in_buffer,
+ 	.write_room =        klsi_105_write_room,
+ 	.read_bulk_callback =klsi_105_read_bulk_callback,
+-	.ioctl =	     klsi_105_ioctl,
+ 	.set_termios =	     klsi_105_set_termios,
+ 	/*.break_ctl =	     klsi_105_break_ctl,*/
+ 	.tiocmget =          klsi_105_tiocmget,
+@@ -899,69 +894,6 @@ static int klsi_105_tiocmset (struct usb
+ */
+ 	return retval;
+ }
+-					
+-static int klsi_105_ioctl (struct usb_serial_port *port, struct file * file,
+-			   unsigned int cmd, unsigned long arg)
+-{
+-	struct klsi_105_private *priv = usb_get_serial_port_data(port);
+-	void __user *user_arg = (void __user *)arg;
+-	
+-	dbg("%scmd=0x%x", __FUNCTION__, cmd);
+-
+-	/* Based on code from acm.c and others */
+-	switch (cmd) {
+-	case TIOCMIWAIT:
+-		/* wait for any of the 4 modem inputs (DCD,RI,DSR,CTS)*/
+-		/* TODO */
+-		dbg("%s - TIOCMIWAIT not handled", __FUNCTION__);
+-		return -ENOIOCTLCMD;
+-	case TIOCGICOUNT:
+-		/* return count of modemline transitions */
+-		/* TODO */
+-		dbg("%s - TIOCGICOUNT not handled", __FUNCTION__);
+-		return -ENOIOCTLCMD;
+-	case TCGETS:
+-		/* return current info to caller */
+-		dbg("%s - TCGETS data faked/incomplete", __FUNCTION__);
+-
+-		if (!access_ok(VERIFY_WRITE, user_arg, sizeof(struct termios)))
+-			return -EFAULT;
+-
+-		if (kernel_termios_to_user_termios((struct termios __user *)arg,
+-						   &priv->termios))
+-			return -EFAULT;
+-		return 0;
+-	case TCSETS:
+-		/* set port termios to the one given by the user */
+-		dbg("%s - TCSETS not handled", __FUNCTION__);
+-
+-		if (!access_ok(VERIFY_READ, user_arg, sizeof(struct termios)))
+-			return -EFAULT;
+-
+-		if (user_termios_to_kernel_termios(&priv->termios,
+-						   (struct termios __user *)arg))
+-			return -EFAULT;
+-		klsi_105_set_termios(port, &priv->termios);
+-		return 0;
+-	case TCSETSW: {
+-		/* set port termios and try to wait for completion of last
+-		 * write operation */
+-		/* We guess here. If there are not too many write urbs
+-		 * outstanding, we lie. */
+-		/* what is the right way to wait here? schedule() ? */
+-	        /*
+-		while (klsi_105_chars_in_buffer(port) > (NUM_URBS / 4 ) * URB_TRANSFER_BUFFER_SIZE)
+-			    schedule();
+-		 */
+-		return -ENOIOCTLCMD;
+-		      }
+-	default:
+-		dbg("%s: arg not supported - 0x%04x", __FUNCTION__,cmd);
+-		return(-ENOIOCTLCMD);
+-		break;
+-	}
+-	return 0;
+-} /* klsi_105_ioctl */
+ 
+ static void klsi_105_throttle (struct usb_serial_port *port)
+ {
+--- gregkh-2.6.orig/drivers/usb/serial/mos7840.c
++++ gregkh-2.6/drivers/usb/serial/mos7840.c
+@@ -2460,12 +2460,6 @@ static int mos7840_ioctl(struct usb_seri
+ 		tty_ldisc_deref(ld);
+ 		return 0;
+ 
+-	case TCGETS:
+-		if (kernel_termios_to_user_termios
+-		    ((struct termios __user *)argp, tty->termios))
+-			return -EFAULT;
+-		return 0;
+-
+ 	case TIOCSERGETLSR:
+ 		dbg("%s (%d) TIOCSERGETLSR", __FUNCTION__, port->number);
+ 		return mos7840_get_lsr_info(mos7840_port, argp);
