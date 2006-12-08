@@ -1,0 +1,222 @@
+From hjk@linutronix.de Thu Dec  7 01:58:37 2006
+From: Hans J. Koch <hjk@linutronix.de>
+To: Greg KH <greg@kroah.com>
+Cc: tglx@linutronix.de, Benedikt Spranger <b.spranger@linutronix.de>
+Subject: UIO: dummy test module for the uio core
+Date: Thu, 7 Dec 2006 10:58:29 +0100
+
+From: Hans J. Koch <hjk@linutronix.de>
+
+This is a dummy module that tests out the uio core.
+
+From: Hans J. Koch <hjk@linutronix.de>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Benedikt Spranger <b.spranger@linutronix.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/uio/Kconfig     |    5 +
+ drivers/uio/Makefile    |    1 
+ drivers/uio/uio_dummy.c |  180 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 186 insertions(+)
+
+--- gregkh-2.6.orig/drivers/uio/Kconfig
++++ gregkh-2.6/drivers/uio/Kconfig
+@@ -8,4 +8,9 @@ config UIO
+ 	  to be written in userspace.  Note that a small kernel driver
+ 	  is also required for interrupt handling to work properly.
+ 
++config UIO_DUMMY
++	tristate "Userspace I/O dummy driver"
++	depends on UIO
++	help
++	  example/dummy driver for userspace I/O
+ endmenu
+--- gregkh-2.6.orig/drivers/uio/Makefile
++++ gregkh-2.6/drivers/uio/Makefile
+@@ -1 +1,2 @@
+ obj-$(CONFIG_UIO) += uio.o
++obj-$(CONFIG_UIO_DUMMY) += uio_dummy.o
+--- /dev/null
++++ gregkh-2.6/drivers/uio/uio_dummy.c
+@@ -0,0 +1,180 @@
++/*
++ * driver/uio/uio_dummy.c
++ *
++ * Copyright(C) 2005, Benedikt Spranger <b.spranger@linutronix.de>
++ * Copyright(C) 2005, Thomas Gleixner <tglx@linutronix.de>
++ * Copyright(C) 2006, Hans J. Koch <hjk@linutronix.de>
++ *
++ * Userspace IO dummy/demo driver
++ *
++ * This driver allows testing of the Userspace IO framework.
++ * It creates a UIO device that triggers events using the
++ * cyclic timer feature (irq = UIO_IRQ_CYCLIC).
++ * This file is also meant to serve as a template for writing
++ * other UIO drivers.
++ *
++ * Licensed under the GPLv2 only.
++ */
++
++#define DEBUG 1
++
++#include <linux/uio_driver.h>
++#include <linux/platform_device.h>
++#include <linux/module.h>
++
++#define UIO_DUMMY_MEMSIZE 8192
++
++static long freq;
++
++static struct timer_list poll_timer;
++
++static struct uio_info uio_dummy_info = {
++	.name = "uio_dummy",
++	.version = "0.0.0",
++	.irq = UIO_IRQ_CUSTOM,
++	.size = UIO_DUMMY_MEMSIZE,
++	.memtype = UIO_MEM_LOGICAL,
++};
++
++static struct uio_device *uio_dummy_idev;
++
++static long uio_dummy_count;
++
++static ssize_t show_count(struct device *dev, struct device_attribute *attr,
++			  char *buf)
++{
++	return sprintf(buf, "%ld\n", uio_dummy_count);
++}
++
++static ssize_t store_count(struct device *dev, struct device_attribute *attr,
++			   const char *buf, size_t count)
++{
++	uio_dummy_count = simple_strtol(buf, NULL, 10);
++	return count;
++}
++static DEVICE_ATTR(count, S_IRUGO|S_IWUSR|S_IWGRP, show_count, store_count);
++
++static ssize_t show_freq(struct device *dev, struct device_attribute *attr,
++			 char *buf)
++{
++	return sprintf(buf, "%ld\n", freq);
++}
++
++static ssize_t store_freq(struct device *dev, struct device_attribute *attr,
++			   const char *buf, size_t count)
++{
++	long tmp = simple_strtol(buf, NULL, 10);
++	if (tmp < 1)
++		tmp = 1;
++	freq = tmp;
++	return count;
++}
++
++static DEVICE_ATTR(freq, S_IRUGO|S_IWUSR|S_IWGRP, show_freq, store_freq);
++
++static void uio_dummy_timer(unsigned long data)
++{
++	struct uio_info *info = (struct uio_info *)data;
++	unsigned long *addr = (unsigned long *)info->addr;
++
++	uio_dummy_count++;
++	*addr = uio_dummy_count;
++	uio_event_notify(uio_dummy_idev);
++	mod_timer(&poll_timer, jiffies + freq);
++}
++
++static int uio_dummy_probe(struct device *dev)
++{
++	uio_dummy_info.addr = (unsigned long)kmalloc(UIO_DUMMY_MEMSIZE,
++							   GFP_KERNEL);
++	if (!uio_dummy_info.addr)
++		return -ENOMEM;
++
++	uio_dummy_info.memtype = UIO_MEM_LOGICAL;
++
++	freq = HZ;
++
++	uio_dummy_idev = uio_register_device(dev, &uio_dummy_info);
++	if (IS_ERR(uio_dummy_idev)) {
++		kfree((void *)uio_dummy_info.addr);
++		return -ENODEV;
++	}
++	init_timer(&poll_timer);
++	poll_timer.data = (unsigned long)&uio_dummy_info;
++	poll_timer.function = uio_dummy_timer;
++	mod_timer(&poll_timer, jiffies + freq);
++	return 0;
++}
++
++static int uio_dummy_remove(struct device *dev)
++{
++	del_timer_sync(&poll_timer);
++	return 0;
++}
++
++static void uio_dummy_shutdown(struct device *dev)
++{
++
++}
++
++struct platform_device *uio_dummy_device;
++
++static struct device_driver uio_dummy_driver = {
++	.name		= "uio_dummy",
++	.bus		= &platform_bus_type,
++	.probe		= uio_dummy_probe,
++	.remove		= uio_dummy_remove,
++	.shutdown	= uio_dummy_shutdown,
++};
++
++/*
++ * Main initialization/remove routines
++ */
++static int __init uio_dummy_init(void)
++{
++	int ret;
++
++	uio_dummy_device = platform_device_register_simple("uio_dummy", -1,
++							   NULL, 0);
++	if (IS_ERR(uio_dummy_device))
++		return PTR_ERR(uio_dummy_device);
++
++	ret = device_create_file(&uio_dummy_device->dev, &dev_attr_count);
++	if (ret)
++		goto error_register;
++	ret = device_create_file(&uio_dummy_device->dev, &dev_attr_freq);
++	if (ret)
++		goto error_file_count;
++	ret = driver_register(&uio_dummy_driver);
++	if (ret)
++		goto error_file_freq;
++
++	return ret;
++
++error_file_freq:
++	device_remove_file(&uio_dummy_device->dev, &dev_attr_freq);
++error_file_count:
++	device_remove_file(&uio_dummy_device->dev, &dev_attr_count);
++error_register:
++	platform_device_unregister(uio_dummy_device);
++	return ret;
++}
++
++void __exit uio_dummy_exit(void)
++{
++	device_remove_file(&uio_dummy_device->dev, &dev_attr_freq);
++	device_remove_file(&uio_dummy_device->dev, &dev_attr_count);
++
++	uio_unregister_device(uio_dummy_idev);
++	kfree((void *)uio_dummy_info.addr);
++
++	platform_device_unregister(uio_dummy_device);
++	driver_unregister(&uio_dummy_driver);
++}
++
++module_init(uio_dummy_init);
++module_exit(uio_dummy_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Benedikt Spranger");
++MODULE_DESCRIPTION("UIO dummy driver");
