@@ -1,0 +1,141 @@
+From david-b@pacbell.net Thu Dec  7 23:58:24 2006
+From: Andrew Victor <andrew@sanpeople.com>
+Subject: USB: at91_udc, misc fixes
+To: Greg KH <greg@kroah.com>
+Date: Thu, 7 Dec 2006 22:44:38 -0800
+Cc: Andrew Victor <andrew@sanpeople.com>
+MIME-Version: 1.0
+Message-Id: <200612072244.39076.david-b@pacbell.net>
+
+From: Andrew Victor <andrew@sanpeople.com>
+
+This is an update to the AT91 USB Device (Gadget) driver.
+
+Adds support for the Atmel AT91SAM9260 and AT91SAM9261 processors.  The
+only difference is how they handle the pullup pin.
+[Patch from Patrice Vilchez]
+
+Need to clear any pending USB Device interrupts before registering the
+interrupt handler.  The bootloader might have been using the USB Device
+port.   [Patch from Peer Georgi]
+
+VBUS detection is handled by a GPIO interrupt which only triggers on a
+change. Is is therefore necessary to read the current VBUS state
+explicitly at startup.  [Patch from Peer Georgi]
+
+
+Signed-off-by: Andrew Victor <andrew@sanpeople.com>
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/gadget/at91_udc.c |   42 +++++++++++++++++++++++++++++++++++++++---
+ drivers/usb/gadget/at91_udc.h |    6 +++---
+ 2 files changed, 42 insertions(+), 6 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/gadget/at91_udc.c
++++ gregkh-2.6/drivers/usb/gadget/at91_udc.c
+@@ -51,6 +51,8 @@
+ 
+ #include <asm/arch/gpio.h>
+ #include <asm/arch/board.h>
++#include <asm/arch/cpu.h>
++#include <asm/arch/at91sam9261_matrix.h>
+ 
+ #include "at91_udc.h"
+ 
+@@ -909,11 +911,37 @@ static void pullup(struct at91_udc *udc,
+ 	if (is_on) {
+ 		clk_on(udc);
+ 		at91_udp_write(udc, AT91_UDP_TXVC, 0);
+-		at91_set_gpio_value(udc->board.pullup_pin, 1);
++		if (cpu_is_at91rm9200())
++			at91_set_gpio_value(udc->board.pullup_pin, 1);
++		else if (cpu_is_at91sam9260()) {
++			u32	txvc = at91_udp_read(udc, AT91_UDP_TXVC);
++
++			txvc |= AT91_UDP_TXVC_PUON;
++			at91_udp_write(udc, AT91_UDP_TXVC, txvc);
++		} else if (cpu_is_at91sam9261()) {
++			u32	usbpucr;
++
++			usbpucr = at91_sys_read(AT91_MATRIX_USBPUCR);
++			usbpucr |= AT91_MATRIX_USBPUCR_PUON;
++			at91_sys_write(AT91_MATRIX_USBPUCR, usbpucr);
++		}
+ 	} else {
+ 		stop_activity(udc);
+ 		at91_udp_write(udc, AT91_UDP_TXVC, AT91_UDP_TXVC_TXVDIS);
+-		at91_set_gpio_value(udc->board.pullup_pin, 0);
++		if (cpu_is_at91rm9200())
++			at91_set_gpio_value(udc->board.pullup_pin, 0);
++		else if (cpu_is_at91sam9260()) {
++			u32	txvc = at91_udp_read(udc, AT91_UDP_TXVC);
++
++			txvc &= ~AT91_UDP_TXVC_PUON;
++			at91_udp_write(udc, AT91_UDP_TXVC, txvc);
++		} else if (cpu_is_at91sam9261()) {
++			u32	usbpucr;
++
++			usbpucr = at91_sys_read(AT91_MATRIX_USBPUCR);
++			usbpucr &= ~AT91_MATRIX_USBPUCR_PUON;
++			at91_sys_write(AT91_MATRIX_USBPUCR, usbpucr);
++		}
+ 		clk_off(udc);
+ 	}
+ }
+@@ -1668,7 +1696,8 @@ static int __devinit at91udc_probe(struc
+ 	udc->fclk = clk_get(dev, "udpck");
+ 	if (IS_ERR(udc->iclk) || IS_ERR(udc->fclk)) {
+ 		DBG("clocks missing\n");
+-		return -ENODEV;
++		retval = -ENODEV;
++		goto fail0;
+ 	}
+ 
+ 	retval = device_register(&udc->gadget.dev);
+@@ -1679,6 +1708,8 @@ static int __devinit at91udc_probe(struc
+ 	clk_enable(udc->iclk);
+ 	at91_udp_write(udc, AT91_UDP_TXVC, AT91_UDP_TXVC_TXVDIS);
+ 	at91_udp_write(udc, AT91_UDP_IDR, 0xffffffff);
++	/* Clear all pending interrupts - UDP may be used by bootloader. */
++	at91_udp_write(udc, AT91_UDP_ICR, 0xffffffff);
+ 	clk_disable(udc->iclk);
+ 
+ 	/* request UDC and maybe VBUS irqs */
+@@ -1690,6 +1721,11 @@ static int __devinit at91udc_probe(struc
+ 		goto fail1;
+ 	}
+ 	if (udc->board.vbus_pin > 0) {
++		/*
++		 * Get the initial state of VBUS - we cannot expect
++		 * a pending interrupt.
++		 */
++		udc->vbus = at91_get_gpio_value(udc->board.vbus_pin);
+ 		if (request_irq(udc->board.vbus_pin, at91_vbus_irq,
+ 				IRQF_DISABLED, driver_name, udc)) {
+ 			DBG("request vbus irq %d failed\n",
+--- gregkh-2.6.orig/drivers/usb/gadget/at91_udc.h
++++ gregkh-2.6/drivers/usb/gadget/at91_udc.h
+@@ -51,10 +51,10 @@
+ #define     AT91_UDP_EP(n)	(1 << (n))	/* Endpoint Interrupt Status */
+ #define     AT91_UDP_RXSUSP	(1 <<  8) 	/* USB Suspend Interrupt Status */
+ #define     AT91_UDP_RXRSM	(1 <<  9)	/* USB Resume Interrupt Status */
+-#define     AT91_UDP_EXTRSM	(1 << 10)	/* External Resume Interrupt Status */
++#define     AT91_UDP_EXTRSM	(1 << 10)	/* External Resume Interrupt Status [AT91RM9200 only] */
+ #define     AT91_UDP_SOFINT	(1 << 11)	/* Start of Frame Interrupt Status */
+ #define     AT91_UDP_ENDBUSRES	(1 << 12)	/* End of Bus Reset Interrpt Status */
+-#define     AT91_UDP_WAKEUP	(1 << 13)	/* USB Wakeup Interrupt Status */
++#define     AT91_UDP_WAKEUP	(1 << 13)	/* USB Wakeup Interrupt Status [AT91RM9200 only] */
+ 
+ #define AT91_UDP_ICR		0x20		/* Interrupt Clear Register */
+ #define AT91_UDP_RST_EP		0x28		/* Reset Endpoint Register */
+@@ -84,7 +84,7 @@
+ 
+ #define AT91_UDP_TXVC		0x74		/* Transceiver Control Register */
+ #define     AT91_UDP_TXVC_TXVDIS (1 << 8)	/* Transceiver Disable */
+-
++#define     AT91_UDP_TXVC_PUON   (1 << 9)	/* PullUp On [AT91SAM9260 only] */
+ 
+ /*-------------------------------------------------------------------------*/
+ 

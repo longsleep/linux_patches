@@ -1,0 +1,72 @@
+From david-b@pacbell.net Wed Dec  6 17:48:01 2006
+From: Takamasa Ohtake <ohtake-txa@necst.nec.co.jp>
+To: Greg KH <greg@kroah.com>
+Subject: USB: ohci handles hardware faults during root port resets
+Date: Wed, 6 Dec 2006 17:04:15 -0800
+Cc: Takamasa Ohtake <ohtake-txa@necst.nec.co.jp>
+MIME-Version: 1.0
+Content-Disposition: inline
+Message-Id: <200612061704.16406.david-b@pacbell.net>
+
+From: Takamasa Ohtake <ohtake-txa@necst.nec.co.jp>
+
+I have found a problem where the root_port_reset() goes into an infinite
+loop and stalls the kernel.
+
+This happens when a hardware fault inside the machine occurs during a small
+timing window.  In case of USB device connection, if a USB device responds to
+hcd_submit_urb(), and later the controller fails before root_port_reset(),
+root_port_reset() will loop infinitely because ohci_readl() will always
+return "-1".  Such a failure can include ejecting a CardBus OHCI controller.
+
+The probability of this problem is low, but it will increase if PnP type
+usage is frequent.  The attached patch can solve this problem and I believe
+that it is better to fix this problem.
+
+Signed-off-by: Takamasa Ohtake <ohtake-txa@necst.nec.co.jp>
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/ohci-hub.c |    9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/host/ohci-hub.c
++++ gregkh-2.6/drivers/usb/host/ohci-hub.c
+@@ -555,7 +555,7 @@ static void start_hnp(struct ohci_hcd *o
+ #define tick_before(t1,t2) ((s16)(((s16)(t1))-((s16)(t2))) < 0)
+ 
+ /* called from some task, normally khubd */
+-static inline void root_port_reset (struct ohci_hcd *ohci, unsigned port)
++static inline int root_port_reset (struct ohci_hcd *ohci, unsigned port)
+ {
+ 	__hc32 __iomem *portstat = &ohci->regs->roothub.portstatus [port];
+ 	u32	temp;
+@@ -570,6 +570,9 @@ static inline void root_port_reset (stru
+ 		/* spin until any current reset finishes */
+ 		for (;;) {
+ 			temp = ohci_readl (ohci, portstat);
++			/* handle e.g. CardBus eject */
++			if (temp == ~(u32)0)
++				return -ESHUTDOWN;
+ 			if (!(temp & RH_PS_PRS))
+ 				break;
+ 			udelay (500);
+@@ -586,6 +589,8 @@ static inline void root_port_reset (stru
+ 		now = ohci_readl(ohci, &ohci->regs->fmnumber);
+ 	} while (tick_before(now, reset_done));
+ 	/* caller synchronizes using PRSC */
++
++	return 0;
+ }
+ 
+ static int ohci_hub_control (
+@@ -702,7 +707,7 @@ static int ohci_hub_control (
+ 				&ohci->regs->roothub.portstatus [wIndex]);
+ 			break;
+ 		case USB_PORT_FEAT_RESET:
+-			root_port_reset (ohci, wIndex);
++			retval = root_port_reset (ohci, wIndex);
+ 			break;
+ 		default:
+ 			goto error;

@@ -1,0 +1,126 @@
+From stern@rowland.harvard.edu Tue Dec  5 13:30:11 2006
+Date: Tue, 5 Dec 2006 16:29:55 -0500 (EST)
+From: Alan Stern <stern@rowland.harvard.edu>
+To: Greg KH <greg@kroah.com>
+cc: =?ISO-8859-1?Q?Jos=E9_A=2E_Ca=F1izo?= <ozarfreo@yahoo.com>
+Subject: UHCI: module parameter to ignore overcurrent changes
+Message-ID: <Pine.LNX.4.44L0.0612051627420.8218-100000@iolanthe.rowland.org>
+MIME-Version: 1.0
+Content-Type: TEXT/PLAIN; charset=US-ASCII
+
+Certain boards seem to like to issue false overcurrent notifications,
+for example on ports that don't have anything connected to them.  This
+looks like a hardware error, at the level of noise to those ports'
+overcurrent input signals (or non-debounced VBUS comparators).  This
+surfaces to users as truly massive amounts of syslog spam from khubd
+(which is appropriate for real hardware problems, except for the
+volume from multiple ports).
+
+Using this new "ignore_oc" flag helps such systems work more sanely,
+by preventing such indications from getting to khubd (and spamming
+syslog).  The downside is of course that true overcurrent errors will
+be masked; they'll appear as spontaneous disconnects, without the
+diagnostics that will let users troubleshoot issues like
+short-circuited cables.  In addition, controllers with no devices
+attached will be forced to poll for new devices rather than relying on
+interrupts, since each overcurrent event would generate a new
+interrupt.
+
+This patch (as826) is essentially a copy of David Brownell's ignore_oc
+patch for ehci-hcd, ported to uhci-hcd.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ Documentation/kernel-parameters.txt |    8 ++++++++
+ drivers/usb/host/uhci-hcd.c         |   13 ++++++++++++-
+ drivers/usb/host/uhci-hub.c         |   14 ++++++++++++--
+ 3 files changed, 32 insertions(+), 3 deletions(-)
+
+--- gregkh-2.6.orig/Documentation/kernel-parameters.txt
++++ gregkh-2.6/Documentation/kernel-parameters.txt
+@@ -1708,6 +1708,14 @@ and is between 256 and 4096 characters. 
+ 	uart6850=	[HW,OSS]
+ 			Format: <io>,<irq>
+ 
++	uhci-hcd.ignore_oc=
++			[USB] Ignore overcurrent events (default N).
++			Some badly-designed motherboards generate lots of
++			bogus events, for ports that aren't wired to
++			anything.  Set this parameter to avoid log spamming.
++			Note that genuine overcurrent events won't be
++			reported either.
++
+ 	usbhid.mousepoll=
+ 			[USBHID] The interval which mice are to be polled at.
+ 
+--- gregkh-2.6.orig/drivers/usb/host/uhci-hcd.c
++++ gregkh-2.6/drivers/usb/host/uhci-hcd.c
+@@ -60,6 +60,11 @@ Randy Dunlap, Georg Acher, Deti Fliegl, 
+ Alan Stern"
+ #define DRIVER_DESC "USB Universal Host Controller Interface driver"
+ 
++/* for flakey hardware, ignore overcurrent indicators */
++static int ignore_oc;
++module_param(ignore_oc, bool, S_IRUGO);
++MODULE_PARM_DESC(ignore_oc, "ignore hardware overcurrent indications");
++
+ /*
+  * debug = 0, no debugging messages
+  * debug = 1, dump failed URBs except for stalls
+@@ -169,6 +174,11 @@ static int resume_detect_interrupts_are_
+ {
+ 	int port;
+ 
++	/* If we have to ignore overcurrent events then almost by definition
++	 * we can't depend on resume-detect interrupts. */
++	if (ignore_oc)
++		return 1;
++
+ 	switch (to_pci_dev(uhci_dev(uhci))->vendor) {
+ 	    default:
+ 		break;
+@@ -921,7 +931,8 @@ static int __init uhci_hcd_init(void)
+ {
+ 	int retval = -ENOMEM;
+ 
+-	printk(KERN_INFO DRIVER_DESC " " DRIVER_VERSION "\n");
++	printk(KERN_INFO DRIVER_DESC " " DRIVER_VERSION "%s\n",
++			ignore_oc ? ", overcurrent ignored" : "");
+ 
+ 	if (usb_disabled())
+ 		return -ENODEV;
+--- gregkh-2.6.orig/drivers/usb/host/uhci-hub.c
++++ gregkh-2.6/drivers/usb/host/uhci-hub.c
+@@ -52,10 +52,20 @@ static int any_ports_active(struct uhci_
+ static inline int get_hub_status_data(struct uhci_hcd *uhci, char *buf)
+ {
+ 	int port;
++	int mask = RWC_BITS;
++
++	/* Some boards (both VIA and Intel apparently) report bogus
++	 * overcurrent indications, causing massive log spam unless
++	 * we completely ignore them.  This doesn't seem to be a problem
++	 * with the chipset so much as with the way it is connected on
++	 * the motherboard; if the overcurrent input is left to float
++	 * then it may constantly register false positives. */
++	if (ignore_oc)
++		mask &= ~USBPORTSC_OCC;
+ 
+ 	*buf = 0;
+ 	for (port = 0; port < uhci->rh_numports; ++port) {
+-		if ((inw(uhci->io_addr + USBPORTSC1 + port * 2) & RWC_BITS) ||
++		if ((inw(uhci->io_addr + USBPORTSC1 + port * 2) & mask) ||
+ 				test_bit(port, &uhci->port_c_suspend))
+ 			*buf |= (1 << (port + 1));
+ 	}
+@@ -263,7 +273,7 @@ static int uhci_hub_control(struct usb_h
+ 			wPortChange |= USB_PORT_STAT_C_CONNECTION;
+ 		if (status & USBPORTSC_PEC)
+ 			wPortChange |= USB_PORT_STAT_C_ENABLE;
+-		if (status & USBPORTSC_OCC)
++		if ((status & USBPORTSC_OCC) && !ignore_oc)
+ 			wPortChange |= USB_PORT_STAT_C_OVERCURRENT;
+ 
+ 		if (test_bit(port, &uhci->port_c_suspend)) {

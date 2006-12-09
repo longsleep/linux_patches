@@ -1,0 +1,359 @@
+From david-b@pacbell.net Tue Dec  5 10:09:43 2006
+From: David Brownell <david-b@pacbell.net>
+To: linux-usb-devel@lists.sourceforge.net
+Subject: USB: gadget driver unbind() is optional; section fixes; misc
+Date: Tue, 5 Dec 2006 03:15:33 -0800
+Cc: Greg KH <greg@kroah.com>
+Message-Id: <200612050315.34200.david-b@pacbell.net>
+
+Allow gadget drivers to omit the unbind() method.  When they're
+statically linked, that's an appropriate memory saving tweak.
+
+Similarly, provide consistent/simpler handling for a should-not-happen
+error case:  removing a peripheral controller driver when a gadget
+driver is still loaded.  Such code dates back to early versions of the
+first implementation of the gadget API, and has never been triggered.
+
+Includes relevant section annotation fixs for gmidi.c, file_storage.c,
+and serial.c; we don't yet have an "init or exit" annotation.  Also
+some whitespace fixes in gmidi.c (space at EOL, before tabs, etc).
+
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/gadget/at91_udc.c     |    9 ++++-----
+ drivers/usb/gadget/dummy_hcd.c    |    7 ++++---
+ drivers/usb/gadget/file_storage.c |    2 +-
+ drivers/usb/gadget/gmidi.c        |   12 ++++++------
+ drivers/usb/gadget/goku_udc.c     |   12 +++---------
+ drivers/usb/gadget/lh7a40x_udc.c  |   13 ++++++++-----
+ drivers/usb/gadget/net2280.c      |   11 ++---------
+ drivers/usb/gadget/omap_udc.c     |   13 ++++++++-----
+ drivers/usb/gadget/pxa2xx_udc.c   |    7 ++++---
+ drivers/usb/gadget/serial.c       |    2 +-
+ 10 files changed, 41 insertions(+), 47 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/gadget/at91_udc.c
++++ gregkh-2.6/drivers/usb/gadget/at91_udc.c
+@@ -1574,7 +1574,6 @@ int usb_gadget_register_driver (struct u
+ 	if (!driver
+ 			|| driver->speed != USB_SPEED_FULL
+ 			|| !driver->bind
+-			|| !driver->unbind
+ 			|| !driver->setup) {
+ 		DBG("bad parameter.\n");
+ 		return -EINVAL;
+@@ -1611,7 +1610,7 @@ int usb_gadget_unregister_driver (struct
+ {
+ 	struct at91_udc *udc = &controller;
+ 
+-	if (!driver || driver != udc->driver)
++	if (!driver || driver != udc->driver || !driver->unbind)
+ 		return -EINVAL;
+ 
+ 	local_irq_disable();
+@@ -1731,10 +1730,10 @@ static int __devexit at91udc_remove(stru
+ 
+ 	DBG("remove\n");
+ 
+-	pullup(udc, 0);
++	if (udc->driver)
++		return -EBUSY;
+ 
+-	if (udc->driver != 0)
+-		usb_gadget_unregister_driver(udc->driver);
++	pullup(udc, 0);
+ 
+ 	device_init_wakeup(&pdev->dev, 0);
+ 	remove_debug_file(udc);
+--- gregkh-2.6.orig/drivers/usb/gadget/dummy_hcd.c
++++ gregkh-2.6/drivers/usb/gadget/dummy_hcd.c
+@@ -779,7 +779,7 @@ usb_gadget_register_driver (struct usb_g
+ 		return -EINVAL;
+ 	if (dum->driver)
+ 		return -EBUSY;
+-	if (!driver->bind || !driver->unbind || !driver->setup
++	if (!driver->bind || !driver->setup
+ 			|| driver->speed == USB_SPEED_UNKNOWN)
+ 		return -EINVAL;
+ 
+@@ -837,7 +837,8 @@ usb_gadget_register_driver (struct usb_g
+ err_bind_driver:
+ 	driver_unregister (&driver->driver);
+ err_register:
+-	driver->unbind (&dum->gadget);
++	if (driver->unbind)
++		driver->unbind (&dum->gadget);
+ 	spin_lock_irq (&dum->lock);
+ 	dum->pullup = 0;
+ 	set_link_state (dum);
+@@ -857,7 +858,7 @@ usb_gadget_unregister_driver (struct usb
+ 
+ 	if (!dum)
+ 		return -ENODEV;
+-	if (!driver || driver != dum->driver)
++	if (!driver || driver != dum->driver || !driver->unbind)
+ 		return -EINVAL;
+ 
+ 	dev_dbg (udc_dev(dum), "unregister gadget driver '%s'\n",
+--- gregkh-2.6.orig/drivers/usb/gadget/file_storage.c
++++ gregkh-2.6/drivers/usb/gadget/file_storage.c
+@@ -4100,7 +4100,7 @@ static struct usb_gadget_driver		fsg_dri
+ #endif
+ 	.function	= (char *) longname,
+ 	.bind		= fsg_bind,
+-	.unbind		= __exit_p(fsg_unbind),
++	.unbind		= fsg_unbind,
+ 	.disconnect	= fsg_disconnect,
+ 	.setup		= fsg_setup,
+ 	.suspend	= fsg_suspend,
+--- gregkh-2.6.orig/drivers/usb/gadget/gmidi.c
++++ gregkh-2.6/drivers/usb/gadget/gmidi.c
+@@ -123,7 +123,7 @@ struct gmidi_device {
+ 	struct usb_request	*req;		/* for control responses */
+ 	u8			config;
+ 	struct usb_ep		*in_ep, *out_ep;
+-	struct snd_card 	*card;
++	struct snd_card		*card;
+ 	struct snd_rawmidi	*rmidi;
+ 	struct snd_rawmidi_substream *in_substream;
+ 	struct snd_rawmidi_substream *out_substream;
+@@ -490,7 +490,7 @@ static void gmidi_complete(struct usb_ep
+ 	int status = req->status;
+ 
+ 	switch (status) {
+-	case 0: 			/* normal completion */
++	case 0:				/* normal completion */
+ 		if (ep == dev->out_ep) {
+ 			/* we received stuff.
+ 			   req is queued again, below */
+@@ -505,7 +505,7 @@ static void gmidi_complete(struct usb_ep
+ 		break;
+ 
+ 	/* this endpoint is normally active while we're configured */
+-	case -ECONNABORTED: 		/* hardware forced ep reset */
++	case -ECONNABORTED:		/* hardware forced ep reset */
+ 	case -ECONNRESET:		/* request dequeued */
+ 	case -ESHUTDOWN:		/* disconnect from host */
+ 		VDBG(dev, "%s gone (%d), %d/%d\n", ep->name, status,
+@@ -656,7 +656,7 @@ gmidi_set_config(struct gmidi_device *de
+ 		case USB_SPEED_LOW:	speed = "low"; break;
+ 		case USB_SPEED_FULL:	speed = "full"; break;
+ 		case USB_SPEED_HIGH:	speed = "high"; break;
+-		default: 		speed = "?"; break;
++		default:		speed = "?"; break;
+ 		}
+ 
+ 		dev->config = number;
+@@ -1308,7 +1308,7 @@ static struct usb_gadget_driver gmidi_dr
+ 	.speed		= USB_SPEED_FULL,
+ 	.function	= (char *)longname,
+ 	.bind		= gmidi_bind,
+-	.unbind		= __exit_p(gmidi_unbind),
++	.unbind		= gmidi_unbind,
+ 
+ 	.setup		= gmidi_setup,
+ 	.disconnect	= gmidi_disconnect,
+@@ -1316,7 +1316,7 @@ static struct usb_gadget_driver gmidi_dr
+ 	.suspend	= gmidi_suspend,
+ 	.resume		= gmidi_resume,
+ 
+-	.driver 	= {
++	.driver		= {
+ 		.name		= (char *)shortname,
+ 		.owner		= THIS_MODULE,
+ 	},
+--- gregkh-2.6.orig/drivers/usb/gadget/goku_udc.c
++++ gregkh-2.6/drivers/usb/gadget/goku_udc.c
+@@ -1432,7 +1432,6 @@ int usb_gadget_register_driver(struct us
+ 	if (!driver
+ 			|| driver->speed != USB_SPEED_FULL
+ 			|| !driver->bind
+-			|| !driver->unbind
+ 			|| !driver->disconnect
+ 			|| !driver->setup)
+ 		return -EINVAL;
+@@ -1495,7 +1494,7 @@ int usb_gadget_unregister_driver(struct 
+ 
+ 	if (!dev)
+ 		return -ENODEV;
+-	if (!driver || driver != dev->driver)
++	if (!driver || driver != dev->driver || !driver->unbind)
+ 		return -EINVAL;
+ 
+ 	spin_lock_irqsave(&dev->lock, flags);
+@@ -1808,13 +1807,8 @@ static void goku_remove(struct pci_dev *
+ 	struct goku_udc		*dev = pci_get_drvdata(pdev);
+ 
+ 	DBG(dev, "%s\n", __FUNCTION__);
+-	/* start with the driver above us */
+-	if (dev->driver) {
+-		/* should have been done already by driver model core */
+-		WARN(dev, "pci remove, driver '%s' is still registered\n",
+-				dev->driver->driver.name);
+-		usb_gadget_unregister_driver(dev->driver);
+-	}
++
++	BUG_ON(dev->driver);
+ 
+ #ifdef CONFIG_USB_GADGET_DEBUG_FILES
+ 	remove_proc_entry(proc_node_name, NULL);
+--- gregkh-2.6.orig/drivers/usb/gadget/lh7a40x_udc.c
++++ gregkh-2.6/drivers/usb/gadget/lh7a40x_udc.c
+@@ -422,9 +422,10 @@ int usb_gadget_register_driver(struct us
+ 	DEBUG("%s: %s\n", __FUNCTION__, driver->driver.name);
+ 
+ 	if (!driver
+-	    || driver->speed != USB_SPEED_FULL
+-	    || !driver->bind
+-	    || !driver->unbind || !driver->disconnect || !driver->setup)
++			|| driver->speed != USB_SPEED_FULL
++			|| !driver->bind
++			|| !driver->disconnect
++			|| !driver->setup)
+ 		return -EINVAL;
+ 	if (!dev)
+ 		return -ENODEV;
+@@ -471,7 +472,7 @@ int usb_gadget_unregister_driver(struct 
+ 
+ 	if (!dev)
+ 		return -ENODEV;
+-	if (!driver || driver != dev->driver)
++	if (!driver || driver != dev->driver || !driver->unbind)
+ 		return -EINVAL;
+ 
+ 	spin_lock_irqsave(&dev->lock, flags);
+@@ -2125,9 +2126,11 @@ static int lh7a40x_udc_remove(struct pla
+ 
+ 	DEBUG("%s: %p\n", __FUNCTION__, pdev);
+ 
++	if (dev->driver)
++		return -EBUSY;
++
+ 	udc_disable(dev);
+ 	remove_proc_files();
+-	usb_gadget_unregister_driver(dev->driver);
+ 
+ 	free_irq(IRQ_USBINTR, dev);
+ 
+--- gregkh-2.6.orig/drivers/usb/gadget/net2280.c
++++ gregkh-2.6/drivers/usb/gadget/net2280.c
+@@ -2020,7 +2020,6 @@ int usb_gadget_register_driver (struct u
+ 	if (!driver
+ 			|| driver->speed != USB_SPEED_HIGH
+ 			|| !driver->bind
+-			|| !driver->unbind
+ 			|| !driver->setup)
+ 		return -EINVAL;
+ 	if (!dev)
+@@ -2107,7 +2106,7 @@ int usb_gadget_unregister_driver (struct
+ 
+ 	if (!dev)
+ 		return -ENODEV;
+-	if (!driver || driver != dev->driver)
++	if (!driver || driver != dev->driver || !driver->unbind)
+ 		return -EINVAL;
+ 
+ 	spin_lock_irqsave (&dev->lock, flags);
+@@ -2803,13 +2802,7 @@ static void net2280_remove (struct pci_d
+ {
+ 	struct net2280		*dev = pci_get_drvdata (pdev);
+ 
+-	/* start with the driver above us */
+-	if (dev->driver) {
+-		/* should have been done already by driver model core */
+-		WARN (dev, "pci remove, driver '%s' is still registered\n",
+-				dev->driver->driver.name);
+-		usb_gadget_unregister_driver (dev->driver);
+-	}
++	BUG_ON(dev->driver);
+ 
+ 	/* then clean up the resources we allocated during probe() */
+ 	net2280_led_shutdown (dev);
+--- gregkh-2.6.orig/drivers/usb/gadget/omap_udc.c
++++ gregkh-2.6/drivers/usb/gadget/omap_udc.c
+@@ -2043,7 +2043,6 @@ int usb_gadget_register_driver (struct u
+ 			// FIXME if otg, check:  driver->is_otg
+ 			|| driver->speed < USB_SPEED_FULL
+ 			|| !driver->bind
+-			|| !driver->unbind
+ 			|| !driver->setup)
+ 		return -EINVAL;
+ 
+@@ -2087,9 +2086,11 @@ int usb_gadget_register_driver (struct u
+ 		status = otg_set_peripheral(udc->transceiver, &udc->gadget);
+ 		if (status < 0) {
+ 			ERR("can't bind to transceiver\n");
+-			driver->unbind (&udc->gadget);
+-			udc->gadget.dev.driver = NULL;
+-			udc->driver = NULL;
++			if (driver->unbind) {
++				driver->unbind (&udc->gadget);
++				udc->gadget.dev.driver = NULL;
++				udc->driver = NULL;
++			}
+ 			goto done;
+ 		}
+ 	} else {
+@@ -2117,7 +2118,7 @@ int usb_gadget_unregister_driver (struct
+ 
+ 	if (!udc)
+ 		return -ENODEV;
+-	if (!driver || driver != udc->driver)
++	if (!driver || driver != udc->driver || !driver->unbind)
+ 		return -EINVAL;
+ 
+ 	if (machine_is_omap_innovator() || machine_is_omap_osk())
+@@ -2870,6 +2871,8 @@ static int __exit omap_udc_remove(struct
+ 
+ 	if (!udc)
+ 		return -ENODEV;
++	if (udc->driver)
++		return -EBUSY;
+ 
+ 	udc->done = &done;
+ 
+--- gregkh-2.6.orig/drivers/usb/gadget/pxa2xx_udc.c
++++ gregkh-2.6/drivers/usb/gadget/pxa2xx_udc.c
+@@ -1623,7 +1623,6 @@ int usb_gadget_register_driver(struct us
+ 	if (!driver
+ 			|| driver->speed < USB_SPEED_FULL
+ 			|| !driver->bind
+-			|| !driver->unbind
+ 			|| !driver->disconnect
+ 			|| !driver->setup)
+ 		return -EINVAL;
+@@ -1694,7 +1693,7 @@ int usb_gadget_unregister_driver(struct 
+ 
+ 	if (!dev)
+ 		return -ENODEV;
+-	if (!driver || driver != dev->driver)
++	if (!driver || driver != dev->driver || !driver->unbind)
+ 		return -EINVAL;
+ 
+ 	local_irq_disable();
+@@ -2638,9 +2637,11 @@ static int __exit pxa2xx_udc_remove(stru
+ {
+ 	struct pxa2xx_udc *dev = platform_get_drvdata(pdev);
+ 
++	if (dev->driver)
++		return -EBUSY;
++
+ 	udc_disable(dev);
+ 	remove_proc_files();
+-	usb_gadget_unregister_driver(dev->driver);
+ 
+ 	if (dev->got_irq) {
+ 		free_irq(IRQ_USB, dev);
+--- gregkh-2.6.orig/drivers/usb/gadget/serial.c
++++ gregkh-2.6/drivers/usb/gadget/serial.c
+@@ -296,7 +296,7 @@ static struct usb_gadget_driver gs_gadge
+ #endif /* CONFIG_USB_GADGET_DUALSPEED */
+ 	.function =		GS_LONG_NAME,
+ 	.bind =			gs_bind,
+-	.unbind =		__exit_p(gs_unbind),
++	.unbind =		gs_unbind,
+ 	.setup =		gs_setup,
+ 	.disconnect =		gs_disconnect,
+ 	.driver = {
