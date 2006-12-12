@@ -1,0 +1,219 @@
+From hjk@linutronix.de Thu Dec  7 01:58:37 2006
+From: Hans J. Koch <hjk@linutronix.de>
+To: Greg KH <greg@kroah.com>
+Cc: tglx@linutronix.de, Benedikt Spranger <b.spranger@linutronix.de>
+Subject: UIO: irq test module for the uio core
+Date: Thu, 7 Dec 2006 10:58:29 +0100
+
+From: Hans J. Koch <hjk@linutronix.de>
+
+This is a module and userspace code that tests out the uio core for interrupt usage
+
+From: Hans J. Koch <hjk@linutronix.de>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Benedikt Spranger <b.spranger@linutronix.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/uio/Kconfig       |    6 +++
+ drivers/uio/Makefile      |    2 +
+ drivers/uio/uio_irq.c     |   86 ++++++++++++++++++++++++++++++++++++++++++++++
+ drivers/uio/uio_parport.c |   84 ++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 178 insertions(+)
+
+--- gregkh-2.6.orig/drivers/uio/Kconfig
++++ gregkh-2.6/drivers/uio/Kconfig
+@@ -13,4 +13,10 @@ config UIO_DUMMY
+ 	depends on UIO
+ 	help
+ 	  example/dummy driver for userspace I/O
++
++config UIO_IRQ
++	tristate "Userspace I/O irq demo driver"
++	depends on UIO
++	help
++	  minimal irq demo driver for userspace I/O
+ endmenu
+--- gregkh-2.6.orig/drivers/uio/Makefile
++++ gregkh-2.6/drivers/uio/Makefile
+@@ -1,2 +1,4 @@
+ obj-$(CONFIG_UIO) += uio.o
+ obj-$(CONFIG_UIO_DUMMY) += uio_dummy.o
++obj-$(CONFIG_UIO_IRQ) += uio_irq.o
++
+--- /dev/null
++++ gregkh-2.6/drivers/uio/uio_irq.c
+@@ -0,0 +1,86 @@
++/*
++ * driver/uio/uio_irq.c
++ *
++ * Copyright(C) 2006, Hans J. Koch <hjk@linutronix.de>
++ *
++ * Userspace IO minimal demo driver
++ *
++ * This UIO driver just registers an interrupt.
++ *
++ * Licensed under the GPLv2 only.
++ */
++
++#define DEBUG 1
++
++#include <linux/uio_driver.h>
++#include <linux/platform_device.h>
++#include <linux/module.h>
++
++static int irq = 7;
++
++module_param(irq, int, S_IRUGO);
++
++static struct uio_device *uio_irq_idev;
++
++irqreturn_t uio_irq_handler(int irq, void *dev_id)
++{
++	return IRQ_HANDLED;
++}
++
++static struct uio_info uio_irq_info = {
++	.name = "uio_irq",
++	.version = "0.0.0",
++	.handler = uio_irq_handler,
++	.irq_flags = SA_INTERRUPT,
++};
++
++static int uio_irq_probe(struct device *dev)
++{
++	uio_irq_info.irq = irq;
++	uio_irq_idev = uio_register_device(dev, &uio_irq_info);
++	if (IS_ERR(uio_irq_idev))
++		return -ENODEV;
++
++	return 0;
++}
++
++static int uio_irq_remove(struct device *dev)
++{
++	uio_unregister_device(uio_irq_idev);
++	return 0;
++}
++
++struct platform_device *uio_irq_device;
++
++static struct device_driver uio_irq_driver = {
++	.name		= "uio_irq",
++	.bus		= &platform_bus_type,
++	.probe		= uio_irq_probe,
++	.remove		= uio_irq_remove,
++};
++
++/*
++ * Main initialization/remove routines
++ */
++static int __init uio_irq_init(void)
++{
++	uio_irq_device = platform_device_register_simple("uio_irq", -1,
++							   NULL, 0);
++	if (IS_ERR(uio_irq_device))
++		return PTR_ERR(uio_irq_device);
++
++	return driver_register(&uio_irq_driver);
++}
++
++void __exit uio_irq_exit(void)
++{
++	platform_device_unregister(uio_irq_device);
++	driver_unregister(&uio_irq_driver);
++}
++
++module_init(uio_irq_init);
++module_exit(uio_irq_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Hans J. Koch");
++MODULE_DESCRIPTION("UIO irq demo driver");
+--- /dev/null
++++ gregkh-2.6/drivers/uio/uio_parport.c
+@@ -0,0 +1,84 @@
++/*
++ * Simple test program for UIO event devices
++ * Copyright (c) 2006 Hans J. Koch <hjk@linutronix.de>
++ *
++ * License: GPL v2
++ *
++ * Usage: uio_events <event device>
++ *
++ */
++
++#include <sys/types.h>
++#include <sys/time.h>
++#include <sys/stat.h>
++#include <sys/io.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++#define UIO_DEV   "/dev/uio0"
++#define PARPORT_BASE 0x378
++
++void err_exit(char *msg)
++{
++	perror(msg);
++	exit(2);
++}
++
++int init_parport_irq()
++{
++	int ret = ioperm(PARPORT_BASE,3,1);
++	if (ret)
++		return ret;
++	outb(0x10,PARPORT_BASE+2);
++	return 0;
++}
++
++int main(int argc, char *argv[])
++{
++	int uiofd = open(UIO_DEV,O_RDONLY);
++	if (uiofd < 0) err_exit("open (uio dev)");
++
++	printf("Opened %s\n",UIO_DEV);
++
++	if (init_parport_irq())
++		err_exit("init_parport_irq");
++
++	fd_set rd_fds, tmp_fds;
++	FD_ZERO(&rd_fds);
++	FD_SET(uiofd,&rd_fds);
++
++	struct timeval timeout;
++	unsigned long irq_count = 0;
++	unsigned long tim_count = 0;
++
++	double dt=0.0, cur_tim, last_tim=-1.0;
++	struct timeval cur_tv;
++
++	while (1){
++		printf("\033[1G");
++		printf("Total: %d Timeouts: %d dt: %.5f sec.",
++		irq_count, tim_count, dt);
++		fflush(stdout);
++		tmp_fds = rd_fds;
++		timeout.tv_sec = 1;
++		timeout.tv_usec = 0;
++		int ret = select(uiofd+1, &tmp_fds, NULL, NULL, &timeout);
++		if (ret > 0){
++			irq_count++;
++			gettimeofday(&cur_tv,NULL);
++			cur_tim = cur_tv.tv_sec
++				+ (double)cur_tv.tv_usec/1000000.0;
++			if (last_tim > 0.0)
++				dt = (cur_tim - last_tim);
++			last_tim = cur_tim;
++			unsigned long dummy;
++			if (read(uiofd,&dummy,sizeof(dummy)) != sizeof(dummy))
++				err_exit("read");
++		}
++		else if (ret == 0)
++			tim_count++;
++		else if (ret < 0)
++			err_exit("select");
++	}
++}

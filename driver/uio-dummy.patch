@@ -7,7 +7,7 @@ Date: Thu, 7 Dec 2006 10:58:29 +0100
 
 From: Hans J. Koch <hjk@linutronix.de>
 
-This is a dummy module that tests out the uio core.
+This is a dummy module and userspace code that tests out the uio core.
 
 From: Hans J. Koch <hjk@linutronix.de>
 Cc: Thomas Gleixner <tglx@linutronix.de>
@@ -15,10 +15,11 @@ Cc: Benedikt Spranger <b.spranger@linutronix.de>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
- drivers/uio/Kconfig     |    5 +
- drivers/uio/Makefile    |    1 
- drivers/uio/uio_dummy.c |  174 ++++++++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 180 insertions(+)
+ drivers/uio/Kconfig      |    5 +
+ drivers/uio/Makefile     |    1 
+ drivers/uio/uio_dummy.c  |  174 +++++++++++++++++++++++++++++++++++++++++++++++
+ drivers/uio/uio_events.c |  119 ++++++++++++++++++++++++++++++++
+ 4 files changed, 299 insertions(+)
 
 --- gregkh-2.6.orig/drivers/uio/Kconfig
 +++ gregkh-2.6/drivers/uio/Kconfig
@@ -214,3 +215,125 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +MODULE_LICENSE("GPL");
 +MODULE_AUTHOR("Benedikt Spranger");
 +MODULE_DESCRIPTION("UIO dummy driver");
+--- /dev/null
++++ gregkh-2.6/drivers/uio/uio_events.c
+@@ -0,0 +1,119 @@
++/*
++ * Simple test program for UIO event devices
++ * Copyright (c) 2006 Hans J. Koch <hjk@linutronix.de>
++ *
++ * License: GPL v2
++ *
++ * Usage: uio_events <event device>
++ *
++ */
++
++#include <sys/types.h>
++#include <sys/time.h>
++#include <sys/stat.h>
++#include <sys/mman.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++#define UIO_DEV   "/dev/uio0"
++#define UIO_SIZE  "/sys/class/uio/uio0/size"
++#define UIO_ADDR  "/sys/class/uio/uio0/addr"
++
++void err_exit(char *msg)
++{
++	perror(msg);
++	exit(2);
++}
++
++int get_mem_size(void)
++{
++	int result,ret;
++	FILE* file = fopen(UIO_SIZE,"r");
++	if (!file)
++		err_exit("get_mem_size");
++	ret = fscanf(file,"0x%lx",&result);
++	if (ret<0)
++		err_exit("get_mem_size/fscanf");
++	fclose(file);
++	return result;
++}
++
++unsigned long get_mem_addr(void)
++{
++	unsigned long result;
++	int ret;
++	FILE* file = fopen(UIO_ADDR,"r");
++	if (!file)
++		err_exit("get_mem_addr");
++	ret = fscanf(file,"0x%lx",&result);
++	if (ret<0)
++		err_exit("get_mem_addr/fscanf");
++	fclose(file);
++	return result;
++}
++
++int main(int argc, char *argv[])
++{
++	int uiofd = open(UIO_DEV,O_RDONLY);
++	if (uiofd < 0)
++		err_exit("open (uio dev)");
++
++	printf("Opened %s\n",UIO_DEV);
++
++	int mem_size = get_mem_size();
++	printf ("Memory size: %d bytes.\n", mem_size);
++
++	unsigned long mem_addr = get_mem_addr();
++	printf ("Memory addr: 0x%lx\n", mem_addr);
++
++	unsigned long* map_addr = mmap(NULL,
++				       mem_size,
++				       PROT_READ,
++				       MAP_SHARED,
++				       uiofd,
++				       0);
++	if (map_addr == ((unsigned long*) -1))
++		err_exit("mmap");
++	printf("Memory mapped to 0x%lx\n", (unsigned long)map_addr);
++
++	fd_set rd_fds, tmp_fds;
++	FD_ZERO(&rd_fds);
++	FD_SET(uiofd,&rd_fds);
++
++	struct timeval timeout;
++	unsigned long irq_count = 0;
++	unsigned long tim_count = 0;
++
++	double dt=0.0, cur_tim, last_tim=-1.0;
++	struct timeval cur_tv;
++
++	while (1) {
++		printf("\033[1G");
++		printf("Total: %d Timeouts: %d dt: %.5f sec. Mem: %d",
++		irq_count, tim_count, dt, *map_addr);
++		fflush(stdout);
++		tmp_fds = rd_fds;
++		timeout.tv_sec = 2;
++		timeout.tv_usec = 0;
++		int ret = select(uiofd+1, &tmp_fds, NULL, NULL, &timeout);
++		if (ret > 0){
++			irq_count++;
++			gettimeofday(&cur_tv,NULL);
++			cur_tim = cur_tv.tv_sec
++				+ (double)cur_tv.tv_usec/1000000.0;
++			if (last_tim > 0.0) dt = (cur_tim - last_tim);
++			last_tim = cur_tim;
++			unsigned long dummy;
++			if (read(uiofd,&dummy,sizeof(dummy)) != sizeof(dummy))
++				err_exit("read");
++
++		}
++		else if (ret == 0)
++			tim_count++;
++		else if (ret < 0)
++			err_exit("select");
++	}
++
++}
