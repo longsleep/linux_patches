@@ -13,18 +13,18 @@ everything show up properly in /sys/devices/ with symlinks from the
 Signed-off-by: Kay Sievers <kay.sievers@vrfy.org>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 ---
- drivers/ieee1394/dv1394.c    |    8 +--
+ drivers/ieee1394/dv1394.c    |    8 +-
  drivers/ieee1394/hosts.c     |   10 +--
  drivers/ieee1394/hosts.h     |    2 
- drivers/ieee1394/nodemgr.c   |  113 +++++++++++++++++++++----------------------
+ drivers/ieee1394/nodemgr.c   |  117 ++++++++++++++++++++++---------------------
  drivers/ieee1394/nodemgr.h   |    4 -
  drivers/ieee1394/raw1394.c   |   18 +++---
  drivers/ieee1394/video1394.c |   10 +--
- 7 files changed, 83 insertions(+), 82 deletions(-)
+ 7 files changed, 86 insertions(+), 83 deletions(-)
 
 --- gregkh-2.6.orig/drivers/ieee1394/dv1394.c
 +++ gregkh-2.6/drivers/ieee1394/dv1394.c
-@@ -2305,7 +2305,7 @@ static void dv1394_remove_host (struct h
+@@ -2293,7 +2293,7 @@ static void dv1394_remove_host (struct h
  			dv1394_un_init(video);
  	} while (video != NULL);
  
@@ -33,7 +33,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		MKDEV(IEEE1394_MAJOR, IEEE1394_MINOR_BLOCK_DV1394 * 16 + (id<<2)));
  }
  
-@@ -2320,9 +2320,9 @@ static void dv1394_add_host (struct hpsb
+@@ -2308,9 +2308,9 @@ static void dv1394_add_host (struct hpsb
  
  	ohci = (struct ti_ohci *)host->hostdata;
  
@@ -48,7 +48,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	dv1394_init(ohci, DV1394_NTSC, MODE_TRANSMIT);
 --- gregkh-2.6.orig/drivers/ieee1394/hosts.c
 +++ gregkh-2.6/drivers/ieee1394/hosts.c
-@@ -166,12 +166,12 @@ struct hpsb_host *hpsb_alloc_host(struct
+@@ -167,13 +167,13 @@ struct hpsb_host *hpsb_alloc_host(struct
  	h->device.parent = dev;
  	snprintf(h->device.bus_id, BUS_ID_SIZE, "fw-host%d", h->id);
  
@@ -59,13 +59,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	h->host_dev.class = &hpsb_host_class;
 +	snprintf(h->host_dev.bus_id, BUS_ID_SIZE, "fw-host%d", h->id);
  
- 	device_register(&h->device);
--	class_device_register(&h->class_dev);
-+	device_register(&h->host_dev);
- 	get_device(&h->device);
- 
- 	mutex_unlock(&host_num_alloc);
-@@ -204,7 +204,7 @@ void hpsb_remove_host(struct hpsb_host *
+ 	if (device_register(&h->device))
+ 		goto fail;
+-	if (class_device_register(&h->class_dev)) {
++	if (device_register(&h->host_dev)) {
+ 		device_unregister(&h->device);
+ 		goto fail;
+ 	}
+@@ -211,7 +211,7 @@ void hpsb_remove_host(struct hpsb_host *
  
  	hpsb_remove_extra_config_roms(host);
  
@@ -84,10 +85,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	struct device host_dev;
  
  	int update_config_rom;
- 	struct work_struct delayed_reset;
+ 	struct delayed_work delayed_reset;
 --- gregkh-2.6.orig/drivers/ieee1394/nodemgr.c
 +++ gregkh-2.6/drivers/ieee1394/nodemgr.c
-@@ -167,7 +167,7 @@ struct host_info {
+@@ -169,7 +169,7 @@ struct host_info {
  };
  
  static int nodemgr_bus_match(struct device * dev, struct device_driver * drv);
@@ -96,7 +97,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  			  char *buffer, int buffer_size);
  static void nodemgr_resume_ne(struct node_entry *ne);
  static void nodemgr_remove_ne(struct node_entry *ne);
-@@ -178,37 +178,39 @@ struct bus_type ieee1394_bus_type = {
+@@ -180,37 +180,39 @@ struct bus_type ieee1394_bus_type = {
  	.match		= nodemgr_bus_match,
  };
  
@@ -147,28 +148,43 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  };
  
  static struct hpsb_highlevel nodemgr_highlevel;
-@@ -705,16 +707,16 @@ static int nodemgr_bus_match(struct devi
+@@ -753,11 +755,11 @@ static DEFINE_MUTEX(nodemgr_serialize_re
  
  static void nodemgr_remove_uds(struct node_entry *ne)
  {
--	struct class_device *cdev, *next;
-+	struct device *dev, *next;
- 	struct unit_directory *ud;
+-	struct class_device *cdev;
++	struct device *dev;
+ 	struct unit_directory *tmp, *ud;
  
--	list_for_each_entry_safe(cdev, next, &nodemgr_ud_class.children, node) {
--		ud = container_of(cdev, struct unit_directory, class_dev);
-+	list_for_each_entry_safe(dev, next, &nodemgr_ud_class.devices, node) {
-+		ud = container_of(dev, struct unit_directory, unit_dev);
- 
- 		if (ud->ne != ne)
- 			continue;
- 
+ 	/* Iteration over nodemgr_ud_class.children has to be protected by
+-	 * nodemgr_ud_class.sem, but class_device_unregister() will eventually
++	 * nodemgr_ud_class.sem, but device_unregister() will eventually
+ 	 * take nodemgr_ud_class.sem too. Therefore pick out one ud at a time,
+ 	 * release the semaphore, and then unregister the ud. Since this code
+ 	 * may be called from other contexts besides the knodemgrds, protect the
+@@ -767,9 +769,9 @@ static void nodemgr_remove_uds(struct no
+ 	for (;;) {
+ 		ud = NULL;
+ 		down(&nodemgr_ud_class.sem);
+-		list_for_each_entry(cdev, &nodemgr_ud_class.children, node) {
+-			tmp = container_of(cdev, struct unit_directory,
+-					   class_dev);
++		list_for_each_entry(dev, &nodemgr_ud_class.devices, node) {
++			tmp = container_of(dev, struct unit_directory,
++					   unit_dev);
+ 			if (tmp->ne == ne) {
+ 				ud = tmp;
+ 				break;
+@@ -778,7 +780,7 @@ static void nodemgr_remove_uds(struct no
+ 		up(&nodemgr_ud_class.sem);
+ 		if (ud == NULL)
+ 			break;
 -		class_device_unregister(&ud->class_dev);
 +		device_unregister(&ud->unit_dev);
  		device_unregister(&ud->device);
  	}
- }
-@@ -730,10 +732,9 @@ static void nodemgr_remove_ne(struct nod
+ 	mutex_unlock(&nodemgr_serialize_remove_uds);
+@@ -795,10 +797,9 @@ static void nodemgr_remove_ne(struct nod
  
  	HPSB_DEBUG("Node removed: ID:BUS[" NODE_BUS_FMT "]  GUID[%016Lx]",
  		   NODE_BUS_ARGS(ne->host, ne->nodeid), (unsigned long long)ne->guid);
@@ -180,7 +196,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	device_unregister(dev);
  
  	put_device(dev);
-@@ -741,7 +742,9 @@ static void nodemgr_remove_ne(struct nod
+@@ -806,7 +807,9 @@ static void nodemgr_remove_ne(struct nod
  
  static int __nodemgr_remove_host_dev(struct device *dev, void *data)
  {
@@ -191,63 +207,59 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	return 0;
  }
  
-@@ -809,13 +812,13 @@ static struct node_entry *nodemgr_create
+@@ -874,14 +877,14 @@ static struct node_entry *nodemgr_create
  	snprintf(ne->device.bus_id, BUS_ID_SIZE, "%016Lx",
  		 (unsigned long long)(ne->guid));
  
 -	ne->class_dev.dev = &ne->device;
 -	ne->class_dev.class = &nodemgr_ne_class;
 -	snprintf(ne->class_dev.class_id, BUS_ID_SIZE, "%016Lx",
+-		 (unsigned long long)(ne->guid));
 +	ne->node_dev.parent = &ne->device;
 +	ne->node_dev.class = &nodemgr_ne_class;
 +	snprintf(ne->node_dev.bus_id, BUS_ID_SIZE, "%016Lx",
- 		 (unsigned long long)(ne->guid));
++		(unsigned long long)(ne->guid));
  
- 	device_register(&ne->device);
--	class_device_register(&ne->class_dev);
-+	device_register(&ne->node_dev);
+ 	if (device_register(&ne->device))
+ 		goto fail_devreg;
+-	if (class_device_register(&ne->class_dev))
++	if (device_register(&ne->node_dev))
+ 		goto fail_classdevreg;
  	get_device(&ne->device);
  
- 	if (ne->guid_vendor_oui)
-@@ -835,12 +838,12 @@ static struct node_entry *nodemgr_create
+@@ -914,12 +917,12 @@ fail_alloc:
+ 
  static struct node_entry *find_entry_by_guid(u64 guid)
  {
- 	struct class *class = &nodemgr_ne_class;
 -	struct class_device *cdev;
 +	struct device *dev;
  	struct node_entry *ne, *ret_ne = NULL;
  
- 	down_read(&class->subsys.rwsem);
--	list_for_each_entry(cdev, &class->children, node) {
+ 	down(&nodemgr_ne_class.sem);
+-	list_for_each_entry(cdev, &nodemgr_ne_class.children, node) {
 -		ne = container_of(cdev, struct node_entry, class_dev);
-+	list_for_each_entry(dev, &class->devices, node) {
++	list_for_each_entry(dev, &nodemgr_ne_class.children, node) {
 +		ne = container_of(dev, struct node_entry, node_dev);
  
  		if (ne->guid == guid) {
  			ret_ne = ne;
-@@ -856,12 +859,12 @@ static struct node_entry *find_entry_by_
- static struct node_entry *find_entry_by_nodeid(struct hpsb_host *host, nodeid_t nodeid)
+@@ -935,12 +938,12 @@ static struct node_entry *find_entry_by_
+ static struct node_entry *find_entry_by_nodeid(struct hpsb_host *host,
+ 					       nodeid_t nodeid)
  {
- 	struct class *class = &nodemgr_ne_class;
 -	struct class_device *cdev;
 +	struct device *dev;
  	struct node_entry *ne, *ret_ne = NULL;
  
- 	down_read(&class->subsys.rwsem);
--	list_for_each_entry(cdev, &class->children, node) {
+ 	down(&nodemgr_ne_class.sem);
+-	list_for_each_entry(cdev, &nodemgr_ne_class.children, node) {
 -		ne = container_of(cdev, struct node_entry, class_dev);
-+	list_for_each_entry(dev, &class->devices, node) {
++	list_for_each_entry(dev, &nodemgr_ne_class.children, node) {
 +		ne = container_of(dev, struct node_entry, node_dev);
  
  		if (ne->host == host && ne->nodeid == nodeid) {
  			ret_ne = ne;
-@@ -879,19 +882,17 @@ static void nodemgr_register_device(stru
- {
- 	memcpy(&ud->device, &nodemgr_dev_template_ud,
- 	       sizeof(ud->device));
--
- 	ud->device.parent = parent;
--
+@@ -964,14 +967,14 @@ static void nodemgr_register_device(stru
  	snprintf(ud->device.bus_id, BUS_ID_SIZE, "%s-%u",
  		 ne->device.bus_id, ud->id);
  
@@ -259,13 +271,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	snprintf(ud->unit_dev.bus_id, BUS_ID_SIZE, "%s-%u",
  		 ne->device.bus_id, ud->id);
  
- 	device_register(&ud->device);
--	class_device_register(&ud->class_dev);
-+	device_register(&ud->unit_dev);
+ 	if (device_register(&ud->device))
+ 		goto fail_devreg;
+-	if (class_device_register(&ud->class_dev))
++	if (device_register(&ud->unit_dev))
+ 		goto fail_classdevreg;
  	get_device(&ud->device);
  
- 	if (ud->vendor_oui)
-@@ -1101,7 +1102,7 @@ static void nodemgr_process_root_directo
+@@ -1197,7 +1200,7 @@ fail:
  
  #ifdef CONFIG_HOTPLUG
  
@@ -274,7 +287,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  			  char *buffer, int buffer_size)
  {
  	struct unit_directory *ud;
-@@ -1110,10 +1111,10 @@ static int nodemgr_uevent(struct class_d
+@@ -1206,10 +1209,10 @@ static int nodemgr_uevent(struct class_d
  	/* ieee1394:venNmoNspNverN */
  	char buf[8 + 1 + 3 + 8 + 2 + 8 + 2 + 8 + 3 + 8 + 1];
  
@@ -287,7 +300,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  	if (ud->ne->in_limbo || ud->ignore_driver)
  		return -ENODEV;
-@@ -1151,7 +1152,7 @@ do {								\
+@@ -1247,7 +1250,7 @@ do {								\
  
  #else
  
@@ -296,8 +309,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  			  char *buffer, int buffer_size)
  {
  	return -ENODEV;
-@@ -1319,7 +1320,7 @@ static void nodemgr_node_scan(struct hos
- /* Caller needs to hold nodemgr_ud_class.subsys.rwsem as reader. */
+@@ -1418,7 +1421,7 @@ static void nodemgr_node_scan(struct hos
+ 
  static void nodemgr_suspend_ne(struct node_entry *ne)
  {
 -	struct class_device *cdev;
@@ -305,18 +318,18 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	struct unit_directory *ud;
  
  	HPSB_DEBUG("Node suspended: ID:BUS[" NODE_BUS_FMT "]  GUID[%016Lx]",
-@@ -1329,8 +1330,8 @@ static void nodemgr_suspend_ne(struct no
- 	device_create_file(&ne->device, &dev_attr_ne_in_limbo);
+@@ -1428,8 +1431,8 @@ static void nodemgr_suspend_ne(struct no
+ 	WARN_ON(device_create_file(&ne->device, &dev_attr_ne_in_limbo));
  
- 	down_write(&ne->device.bus->subsys.rwsem);
+ 	down(&nodemgr_ud_class.sem);
 -	list_for_each_entry(cdev, &nodemgr_ud_class.children, node) {
 -		ud = container_of(cdev, struct unit_directory, class_dev);
-+	list_for_each_entry(dev, &nodemgr_ud_class.devices, node) {
++	list_for_each_entry(dev, &nodemgr_ud_class.children, node) {
 +		ud = container_of(dev, struct unit_directory, unit_dev);
- 
  		if (ud->ne != ne)
  			continue;
-@@ -1346,7 +1347,7 @@ static void nodemgr_suspend_ne(struct no
+ 
+@@ -1446,15 +1449,15 @@ static void nodemgr_suspend_ne(struct no
  
  static void nodemgr_resume_ne(struct node_entry *ne)
  {
@@ -325,71 +338,71 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	struct unit_directory *ud;
  
  	ne->in_limbo = 0;
-@@ -1354,8 +1355,8 @@ static void nodemgr_resume_ne(struct nod
+ 	device_remove_file(&ne->device, &dev_attr_ne_in_limbo);
  
- 	down_read(&nodemgr_ud_class.subsys.rwsem);
- 	down_read(&ne->device.bus->subsys.rwsem);
+ 	down(&nodemgr_ud_class.sem);
 -	list_for_each_entry(cdev, &nodemgr_ud_class.children, node) {
 -		ud = container_of(cdev, struct unit_directory, class_dev);
-+	list_for_each_entry(dev, &nodemgr_ud_class.devices, node) {
++	list_for_each_entry(dev, &nodemgr_ud_class.children, node) {
 +		ud = container_of(dev, struct unit_directory, unit_dev);
- 
  		if (ud->ne != ne)
  			continue;
-@@ -1376,10 +1377,10 @@ static void nodemgr_update_pdrv(struct n
+ 
+@@ -1474,11 +1477,11 @@ static void nodemgr_update_pdrv(struct n
  {
  	struct unit_directory *ud;
  	struct hpsb_protocol_driver *pdrv;
 -	struct class_device *cdev;
 +	struct device *dev;
  
+ 	down(&nodemgr_ud_class.sem);
 -	list_for_each_entry(cdev, &nodemgr_ud_class.children, node) {
 -		ud = container_of(cdev, struct unit_directory, class_dev);
-+	list_for_each_entry(dev, &nodemgr_ud_class.devices, node) {
++	list_for_each_entry(dev, &nodemgr_ud_class.children, node) {
 +		ud = container_of(dev, struct unit_directory, unit_dev);
- 		if (ud->ne != ne || !ud->device.driver)
+ 		if (ud->ne != ne)
  			continue;
  
-@@ -1456,7 +1457,7 @@ static void nodemgr_node_probe(struct ho
+@@ -1555,7 +1558,7 @@ static void nodemgr_probe_ne(struct host
+ static void nodemgr_node_probe(struct host_info *hi, int generation)
  {
  	struct hpsb_host *host = hi->host;
- 	struct class *class = &nodemgr_ne_class;
 -	struct class_device *cdev;
 +	struct device *dev;
  	struct node_entry *ne;
  
  	/* Do some processing of the nodes we've probed. This pulls them
-@@ -1469,13 +1470,13 @@ static void nodemgr_node_probe(struct ho
+@@ -1568,13 +1571,13 @@ static void nodemgr_node_probe(struct ho
  	 * improvement...) */
  
- 	down_read(&class->subsys.rwsem);
--	list_for_each_entry(cdev, &class->children, node) {
+ 	down(&nodemgr_ne_class.sem);
+-	list_for_each_entry(cdev, &nodemgr_ne_class.children, node) {
 -		ne = container_of(cdev, struct node_entry, class_dev);
-+	list_for_each_entry(dev, &class->devices, node) {
++	list_for_each_entry(dev, &nodemgr_ne_class.children, node) {
 +		ne = container_of(dev, struct node_entry, node_dev);
  		if (!ne->needs_probe)
  			nodemgr_probe_ne(hi, ne, generation);
  	}
--	list_for_each_entry(cdev, &class->children, node) {
+-	list_for_each_entry(cdev, &nodemgr_ne_class.children, node) {
 -		ne = container_of(cdev, struct node_entry, class_dev);
-+	list_for_each_entry(dev, &class->devices, node) {
++	list_for_each_entry(dev, &nodemgr_ne_class.children, node) {
 +		ne = container_of(dev, struct node_entry, node_dev);
  		if (ne->needs_probe)
  			nodemgr_probe_ne(hi, ne, generation);
  	}
-@@ -1692,13 +1693,13 @@ exit:
+@@ -1789,13 +1792,13 @@ exit:
+ 
  int nodemgr_for_each_host(void *__data, int (*cb)(struct hpsb_host *, void *))
  {
- 	struct class *class = &hpsb_host_class;
 -	struct class_device *cdev;
 +	struct device *dev;
  	struct hpsb_host *host;
  	int error = 0;
  
- 	down_read(&class->subsys.rwsem);
--	list_for_each_entry(cdev, &class->children, node) {
+ 	down(&hpsb_host_class.sem);
+-	list_for_each_entry(cdev, &hpsb_host_class.children, node) {
 -		host = container_of(cdev, struct hpsb_host, class_dev);
-+	list_for_each_entry(dev, &class->devices, node) {
++	list_for_each_entry(dev, &hpsb_host_class.children, node) {
 +		host = container_of(dev, struct hpsb_host, host_dev);
  
  		if ((error = cb(host, __data)))
@@ -416,7 +429,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	int in_limbo;
 --- gregkh-2.6.orig/drivers/ieee1394/raw1394.c
 +++ gregkh-2.6/drivers/ieee1394/raw1394.c
-@@ -3009,9 +3009,9 @@ static int __init init_raw1394(void)
+@@ -3022,9 +3022,9 @@ static int __init init_raw1394(void)
  	hpsb_register_highlevel(&raw1394_highlevel);
  
  	if (IS_ERR
@@ -429,7 +442,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	      RAW1394_DEVICE_NAME))) {
  		ret = -EFAULT;
  		goto out_unreg;
-@@ -3038,9 +3038,9 @@ static int __init init_raw1394(void)
+@@ -3051,9 +3051,9 @@ static int __init init_raw1394(void)
  	goto out;
  
        out_dev:
@@ -442,7 +455,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
        out_unreg:
  	hpsb_unregister_highlevel(&raw1394_highlevel);
        out:
-@@ -3049,9 +3049,9 @@ static int __init init_raw1394(void)
+@@ -3062,9 +3062,9 @@ static int __init init_raw1394(void)
  
  static void __exit cleanup_raw1394(void)
  {
@@ -457,7 +470,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	hpsb_unregister_protocol(&raw1394_driver);
 --- gregkh-2.6.orig/drivers/ieee1394/video1394.c
 +++ gregkh-2.6/drivers/ieee1394/video1394.c
-@@ -1353,9 +1353,9 @@ static void video1394_add_host (struct h
+@@ -1333,9 +1333,9 @@ static void video1394_add_host (struct h
  	hpsb_set_hostinfo_key(&video1394_highlevel, host, ohci->host->id);
  
  	minor = IEEE1394_MINOR_BLOCK_VIDEO1394 * 16 + ohci->host->id;
@@ -470,7 +483,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  }
  
  
-@@ -1364,8 +1364,8 @@ static void video1394_remove_host (struc
+@@ -1344,8 +1344,8 @@ static void video1394_remove_host (struc
  	struct ti_ohci *ohci = hpsb_get_hostinfo(&video1394_highlevel, host);
  
  	if (ohci)
