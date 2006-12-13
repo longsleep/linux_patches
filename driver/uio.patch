@@ -25,9 +25,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  drivers/Makefile           |    1 
  drivers/uio/Kconfig        |   11 
  drivers/uio/Makefile       |    1 
- drivers/uio/uio.c          |  611 +++++++++++++++++++++++++++++++++++++++++++++
+ drivers/uio/uio.c          |  618 +++++++++++++++++++++++++++++++++++++++++++++
  include/linux/uio_driver.h |   71 +++++
- 6 files changed, 696 insertions(+)
+ 6 files changed, 703 insertions(+)
 
 --- gregkh-2.6.orig/drivers/Kconfig
 +++ gregkh-2.6/drivers/Kconfig
@@ -67,7 +67,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +obj-$(CONFIG_UIO) += uio.o
 --- /dev/null
 +++ gregkh-2.6/drivers/uio/uio.c
-@@ -0,0 +1,611 @@
+@@ -0,0 +1,618 @@
 +/*
 + * driver/uio/uio.c
 + *
@@ -97,7 +97,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	struct module		*owner;
 +	struct device		*dev;
 +	int			minor;
-+	long			event_listener;
 +	atomic_t		event;
 +	struct fasync_struct	*async_queue;
 +	wait_queue_head_t	wait;
@@ -162,23 +161,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +}
 +static DEVICE_ATTR(version, S_IRUGO, show_version, NULL);
 +
-+static ssize_t show_listener(struct device *dev,
-+			     struct device_attribute *attr, char *buf)
-+{
-+	struct uio_device *idev = dev_get_drvdata(dev);
-+	if (idev)
-+		return sprintf(buf, "%ld\n", idev->event_listener);
-+	else
-+		return -ENODEV;
-+}
-+static DEVICE_ATTR(listener, S_IRUGO, show_listener, NULL);
-+
 +static ssize_t show_event(struct device *dev,
 +			  struct device_attribute *attr, char *buf)
 +{
 +	struct uio_device *idev = dev_get_drvdata(dev);
 +	if (idev)
-+		return sprintf(buf, "%d\n", atomic_read(&idev->event));
++		return sprintf(buf, "%u\n",
++				(unsigned int)atomic_read(&idev->event));
 +	else
 +		return -ENODEV;
 +}
@@ -187,7 +176,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static struct attribute *uio_attrs[] = {
 +	&dev_attr_name.attr,
 +	&dev_attr_version.attr,
-+	&dev_attr_listener.attr,
 +	&dev_attr_event.attr,
 +	NULL,
 +};
@@ -269,11 +257,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + */
 +void uio_event_notify(struct uio_device *idev)
 +{
-+	if (idev->event_listener) {
-+		atomic_inc(&idev->event);
-+		wake_up_interruptible(&idev->wait);
-+		kill_fasync(&idev->async_queue, SIGIO, POLL_IN);
-+	}
++	atomic_inc(&idev->event);
++	wake_up_interruptible(&idev->wait);
++	kill_fasync(&idev->async_queue, SIGIO, POLL_IN);
 +}
 +EXPORT_SYMBOL_GPL(uio_event_notify);
 +
@@ -293,29 +279,46 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return ret;
 +}
 +
++struct uio_listener {
++	struct uio_device *dev;
++	int event_count;
++};
++
 +static int uio_open(struct inode *inode, struct file *filep)
 +{
 +	struct uio_device *idev;
++	struct uio_listener *listener;
 +	int ret = 0;
 +
 +	idev = idr_find(&uio_idr, iminor(inode));
 +	if (!idev)
 +		return -ENODEV;
 +
-+	filep->private_data = idev;
-+	idev->event_listener++;
++	listener = kmalloc(sizeof(*listener), GFP_KERNEL);
++	if (!listener)
++		return -ENOMEM;
++
++	listener->dev = idev;
++	listener->event_count = atomic_read(&idev->event);
++	filep->private_data = listener;
++
 +	if (idev->info->open) {
 +		if (!try_module_get(idev->owner))
 +			return -ENODEV;
 +		ret = idev->info->open(idev->info, inode);
 +		module_put(idev->owner);
 +	}
++
++	if (ret)
++		kfree(listener);
++
 +	return ret;
 +}
 +
 +static int uio_fasync(int fd, struct file *filep, int on)
 +{
-+	struct uio_device *idev = filep->private_data;
++	struct uio_listener *listener = filep->private_data;
++	struct uio_device *idev = listener->dev;
 +
 +	return fasync_helper(fd, filep, on, &idev->async_queue);
 +}
@@ -323,7 +326,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static int uio_release(struct inode *inode, struct file *filep)
 +{
 +	int ret = 0;
-+	struct uio_device *idev = filep->private_data;
++	struct uio_listener *listener = filep->private_data;
++	struct uio_device *idev = listener->dev;
 +
 +	if (idev->info->release) {
 +		if (!try_module_get(idev->owner))
@@ -331,28 +335,31 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		ret = idev->info->release(idev->info, inode);
 +		module_put(idev->owner);
 +	}
-+	idev->event_listener--;
 +	if (filep->f_flags & FASYNC)
 +		ret = uio_fasync(-1, filep, 0);
++	kfree(listener);
 +	return ret;
 +}
 +
 +static unsigned int uio_poll(struct file *filep, poll_table *wait)
 +{
-+	struct uio_device *idev = filep->private_data;
++	struct uio_listener *listener = filep->private_data;
++	struct uio_device *idev = listener->dev;
 +
-+	if (idev->info->irq < 0)
++	if (idev->info->irq == UIO_IRQ_NONE)
 +		return -EIO;
 +
 +	poll_wait(filep, &idev->wait, wait);
-+
-+	return POLLIN | POLLRDNORM;
++	if (listener->event_count != atomic_read(&idev->event))
++		return POLLIN | POLLRDNORM;
++	return 0;
 +}
 +
 +static ssize_t uio_read(struct file *filep, char __user *buf,
 +			size_t count, loff_t *ppos)
 +{
-+	struct uio_device *idev = filep->private_data;
++	struct uio_listener *listener = filep->private_data;
++	struct uio_device *idev = listener->dev;
 +	DECLARE_WAITQUEUE(wait, current);
 +	ssize_t retval;
 +	int event_count;
@@ -360,39 +367,38 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	if (idev->info->irq == UIO_IRQ_NONE)
 +		return -EIO;
 +
-+	if (count > sizeof(int))
-+		count = sizeof(int);
++	if (count != sizeof(int))
++		return -EINVAL;
 +
 +	add_wait_queue(&idev->wait, &wait);
 +
 +	do {
-+		__set_current_state(TASK_INTERRUPTIBLE);
++		set_current_state(TASK_INTERRUPTIBLE);
 +
 +		event_count = atomic_read(&idev->event);
-+		if (event_count)
++		if (event_count != listener->event_count) {
++			if (copy_to_user(buf, &event_count, count))
++				retval = -EFAULT;
++			else {
++				listener->event_count = event_count;
++				retval = count;
++			}
 +			break;
++		}
 +
 +		if (filep->f_flags & O_NONBLOCK) {
 +			retval = -EAGAIN;
-+			goto out;
++			break;
 +		}
 +
 +		if (signal_pending(current)) {
 +			retval = -ERESTARTSYS;
-+			goto out;
++			break;
 +		}
 +		schedule();
 +	} while (1);
 +
-+	atomic_dec(&idev->event);
-+
-+	if (copy_to_user(buf, &event_count, count))
-+		retval = -EFAULT;
-+	else
-+		retval = count;
-+
-+out:
-+	current->state = TASK_RUNNING;
++	__set_current_state(TASK_RUNNING);
 +	remove_wait_queue(&idev->wait, &wait);
 +
 +	return retval;
@@ -460,7 +466,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +static int uio_mmap(struct file *filep, struct vm_area_struct *vma)
 +{
-+	struct uio_device *idev = filep->private_data;
++	struct uio_listener *listener = filep->private_data;
++	struct uio_device *idev = listener->dev;
 +	int ret = 0;
 +
 +	if (vma->vm_end < vma->vm_start)
@@ -469,7 +476,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	if ((unsigned long)(vma->vm_end - vma->vm_start) > idev->info->size)
 +		return -EINVAL;
 +
-+	vma->vm_private_data  = filep->private_data;
++	vma->vm_private_data  = idev;
 +
 +	if (idev->info->mmap) {
 +		if (!try_module_get(idev->owner))
