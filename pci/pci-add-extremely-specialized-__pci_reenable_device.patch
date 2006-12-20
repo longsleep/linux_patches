@@ -1,0 +1,108 @@
+From seto.hidetoshi@jp.fujitsu.com  Wed Dec 20 11:11:55 2006
+Message-ID: <4585EF18.8040101@jp.fujitsu.com>
+Date: Mon, 18 Dec 2006 10:30:00 +0900
+From: Hidetoshi Seto <seto.hidetoshi@jp.fujitsu.com>
+MIME-Version: 1.0
+To: Greg KH <greg@kroah.com>
+Cc: Kenji Kaneshige <kaneshige.kenji@jp.fujitsu.com>, Grant Grundler <grundler@parisc-linux.org>
+Subject: PCI : add extremely specialized __pci_reenable_device
+ for default resume
+Content-Type: text/plain; charset=ISO-8859-1; format=flowed
+
+Original patch was posted as "PCI : Move pci_fixup_device and is_enabled".
+This 3 of 3 patches does:
+
+  - add __pci_reenable_device
+    (recover former change of 1st patch)
+
+Signed-off-by: Kenji Kaneshige <kaneshige.kenji@jp.fujitsu.com>
+Signed-off-by: Hidetoshi Seto <seto.hidetoshi@jp.fujitsu.com>
+Cc: Inaky Perez-Gonzalez <inaky@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ drivers/pci/pci-driver.c |    3 +--
+ drivers/pci/pci.c        |   41 ++++++++++++++++++++++++++++++++---------
+ drivers/pci/pci.h        |    1 +
+ 3 files changed, 34 insertions(+), 11 deletions(-)
+
+--- gregkh-2.6.orig/drivers/pci/pci-driver.c
++++ gregkh-2.6/drivers/pci/pci-driver.c
+@@ -325,8 +325,7 @@ static int pci_default_resume(struct pci
+ 	/* restore the PCI config space */
+ 	pci_restore_state(pci_dev);
+ 	/* if the device was enabled before suspend, reenable */
+-	if (atomic_read(&pci_dev->enable_cnt))
+-		retval = pci_enable_device(pci_dev);
++	retval = __pci_reenable_device(pci_dev);
+ 	/* if the device was busmaster before the suspend, make it busmaster again */
+ 	if (pci_dev->is_busmaster)
+ 		pci_set_master(pci_dev);
+--- gregkh-2.6.orig/drivers/pci/pci.c
++++ gregkh-2.6/drivers/pci/pci.c
+@@ -675,6 +675,36 @@ pci_restore_state(struct pci_dev *dev)
+ 	return 0;
+ }
+ 
++static int do_pci_enable_device(struct pci_dev *dev, int bars)
++{
++	int err;
++
++	err = pci_set_power_state(dev, PCI_D0);
++	if (err < 0 && err != -EIO)
++		return err;
++	err = pcibios_enable_device(dev, bars);
++	if (err < 0)
++		return err;
++	pci_fixup_device(pci_fixup_enable, dev);
++
++	return 0;
++}
++
++/**
++ * __pci_reenable_device - Resume abandoned device
++ * @dev: PCI device to be resumed
++ *
++ *  Note this function is a backend of pci_default_resume and is not supposed
++ *  to be called by normal code, write proper resume handler and use it instead.
++ */
++int
++__pci_reenable_device(struct pci_dev *dev)
++{
++	if (atomic_read(&dev->enable_cnt))
++		return do_pci_enable_device(dev, (1 << PCI_NUM_RESOURCES) - 1);
++	return 0;
++}
++
+ /**
+  * pci_enable_device_bars - Initialize some of a device for use
+  * @dev: PCI device to be initialized
+@@ -692,16 +722,9 @@ pci_enable_device_bars(struct pci_dev *d
+ 	if (atomic_add_return(1, &dev->enable_cnt) > 1)
+ 		return 0;		/* already enabled */
+ 
+-	err = pci_set_power_state(dev, PCI_D0);
+-	if (err < 0 && err != -EIO)
+-		goto err_out;
+-	err = pcibios_enable_device(dev, bars);
++	err = do_pci_enable_device(dev, bars);
+ 	if (err < 0)
+-		goto err_out;
+-	pci_fixup_device(pci_fixup_enable, dev);
+-
+-err_out:
+-	atomic_dec(&dev->enable_cnt);
++		atomic_dec(&dev->enable_cnt);
+ 	return err;
+ }
+ 
+--- gregkh-2.6.orig/drivers/pci/pci.h
++++ gregkh-2.6/drivers/pci/pci.h
+@@ -1,5 +1,6 @@
+ /* Functions internal to the PCI core code */
+ 
++extern int __must_check __pci_reenable_device(struct pci_dev *);
+ extern int pci_uevent(struct device *dev, char **envp, int num_envp,
+ 		      char *buffer, int buffer_size);
+ extern int pci_create_sysfs_dev_files(struct pci_dev *pdev);
