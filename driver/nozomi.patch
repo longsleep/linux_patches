@@ -15,8 +15,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 ---
  drivers/char/Kconfig  |   10 
  drivers/char/Makefile |    1 
- drivers/char/nozomi.c | 2257 ++++++++++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 2268 insertions(+)
+ drivers/char/nozomi.c | 2233 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 2244 insertions(+)
 
 --- gregkh-2.6.orig/drivers/char/Kconfig
 +++ gregkh-2.6/drivers/char/Kconfig
@@ -49,7 +49,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  obj-$(CONFIG_MOXA_INTELLIO)	+= moxa.o
 --- /dev/null
 +++ gregkh-2.6/drivers/char/nozomi.c
-@@ -0,0 +1,2257 @@
+@@ -0,0 +1,2233 @@
 +/* nozomi.c  -- HSDPA driver Broadband Wireless Data Card - Globe Trotter
 +*
 +* Written by: Ulf Jakobsson,
@@ -534,27 +534,17 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static struct nozomi *my_dev = NULL;
 +static struct irq my_irq;
 +
-+static inline struct nozomi *get_dc_by_pdev(struct pci_dev *pdev)
++static struct nozomi *get_dc_by_index(s32 index)
 +{
 +	return my_dev;
 +}
 +
-+static inline struct nozomi *get_dc_by_index(s32 index)
++static struct port *get_port_by_tty(struct tty_struct *tty)
 +{
-+	return my_dev;
++	return &my_dev->port[tty->index];
 +}
 +
-+static inline s32 get_index(struct tty_struct *tty)
-+{
-+	return tty->index;
-+}
-+
-+static inline struct port *get_port_by_tty(struct tty_struct *tty)
-+{
-+	return &my_dev->port[get_index(tty)];
-+}
-+
-+static inline struct nozomi *get_dc_by_tty(struct tty_struct *tty)
++static struct nozomi *get_dc_by_tty(struct tty_struct *tty)
 +{
 +	return my_dev;
 +}
@@ -1331,16 +1321,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +static irqreturn_t interrupt_handler(int irq, void *dev_id)
 +{
-+	struct nozomi *dc = NULL;
++	struct nozomi *dc = dev_id;
 +	struct irq *m = &my_irq;
 +
-+	if (my_dev && my_dev->pdev != dev_id)
-+		return IRQ_NONE;
-+
-+	dc = get_dc_by_pdev(dev_id);
 +	if (!dc) {
-+		dev_err(&dc->pdev->dev, "Could not find device context from "
-+			"pci_dev: %p\n", dev_id);
++		dev_err(&dc->pdev->dev, "Wrong interrupt context?\n");
 +		return IRQ_NONE;
 +	}
 +
@@ -1441,18 +1426,15 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +}
 +
 +/* Request a shared IRQ from system */
-+static int nozomi_setup_interrupt(struct pci_dev *pdev)
++static int nozomi_setup_interrupt(struct nozomi *dc)
 +{
++	int rval;
 +
-+	int rval = 0;
-+
-+	if ((rval =
-+	     request_irq(pdev->irq, &interrupt_handler, SA_SHIRQ, NOZOMI_NAME,
-+			 pdev))) {
-+		dev_err(&pdev->dev, "Cannot open because IRQ %d "
-+			"is already in use.\n", pdev->irq);
-+		return rval;
-+	}
++	rval = request_irq(dc->pdev->irq, &interrupt_handler, SA_SHIRQ,
++			   NOZOMI_NAME, dc);
++	if (rval)
++		dev_err(&dc->pdev->dev, "Cannot open because IRQ %d "
++			"is already in use.\n", dc->pdev->irq);
 +
 +	return rval;
 +}
@@ -1519,7 +1501,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	return sprintf(buf, "%d\n", dc->card_type);
 +}
-+
 +static DEVICE_ATTR(card_type, 0444, card_type_show, NULL);
 +
 +static ssize_t open_ttys_show(struct device *dev, struct device_attribute *attr,
@@ -1530,7 +1511,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	return sprintf(buf, "%d\n", dc->open_ttys);
 +}
-+
 +static DEVICE_ATTR(open_ttys, 0444, open_ttys_show, NULL);
 +
 +#if 0
@@ -1573,21 +1553,22 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	struct nozomi *dc = NULL;
 +
 +	cards_found++;
-+	dev_dbg(&pdev->dev, "Init, cards_found: %d\n", cards_found);
-+
-+	my_dev = kzalloc(sizeof(struct nozomi), GFP_KERNEL);
-+	if (!my_dev) {
-+		dev_err(&pdev->dev, "Could not allocate memory\n");
-+		return -ENOMEM;
-+	}
-+
 +	if (cards_found > 1) {
 +		dev_err(&pdev->dev, "This driver only supports 1 device\n");
 +		return -ENODEV;
 +	}
++	dev_dbg(&pdev->dev, "Init, cards_found: %d\n", cards_found);
 +
-+	my_dev->pdev = pdev;
-+	dc = my_dev;
++	dc = kzalloc(sizeof(struct nozomi), GFP_KERNEL);
++	if (!dc) {
++		dev_err(&pdev->dev, "Could not allocate memory\n");
++		return -ENOMEM;
++	}
++	dc->pdev = pdev;
++	pci_set_drvdata(pdev, dc);
++
++	/* FIXME */
++	my_dev = dc;
 +
 +	/* Find out what card type it is */
 +	nozomi_get_card_type(dc);
@@ -1632,7 +1613,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	SET_IER(0, 0xFFFF);
 +
 +	/* Setup interrupt handler */
-+	if (nozomi_setup_interrupt(dc->pdev)) {
++	if (nozomi_setup_interrupt(dc)) {
 +		ret = -EIO;
 +		goto err_disable_regions;
 +	}
@@ -1674,13 +1655,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +{
 +	unsigned long flags;
 +
-+	if (down_interruptible(&port->tty_sem)) {
++	if (down_interruptible(&port->tty_sem))
 +		return;
-+	}
 +
-+	if (!port->tty_open_count) {
++	if (!port->tty_open_count)
 +		goto exit;
-+	}
 +
 +	dc->open_ttys--;
 +	port->tty_open_count--;
@@ -1692,7 +1671,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		spin_unlock_irqrestore(&dc->spin_mutex, flags);
 +	}
 +
-+      exit:
++exit:
 +	up(&port->tty_sem);
 +}
 +
@@ -1717,11 +1696,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +}
 +
 +/* Deallocate memory for one device */
-+static void __devexit nozomi_card_exit(struct pci_dev *pdev)
++static void nozomi_card_exit(struct pci_dev *pdev)
 +{
 +	int i;
 +	struct ctrl_ul ctrl;
-+	struct nozomi *dc = get_dc_by_pdev(pdev);
++	struct nozomi *dc = pci_get_drvdata(pdev);
 +
 +	/* Disable all interrupts */
 +	SET_IER(0, 0xFFFF);
@@ -1793,8 +1772,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +/* Called when the userspace process opens the tty, /dev/noz*. */
 +static int ntty_open(struct tty_struct *tty, struct file *file)
 +{
-+
-+	s32 index = get_index(tty);
 +	struct port *port = get_port_by_tty(tty);
 +	struct nozomi *dc = get_dc_by_tty(tty);
 +	unsigned long flags;
@@ -1806,7 +1783,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	tty->low_latency = 1;
 +	tty->driver_data = port;
 +	port->tty = tty;
-+	port->tty_index = index;
++	port->tty_index = tty->index;
 +
 +	port->tty_open_count++;
 +	dc->open_ttys++;
@@ -1844,9 +1821,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	/* D1( "WRITEx: %d, index = %d", count, index); */
 +
-+	if (!port) {
++	if (!port)
 +		return -ENODEV;
-+	}
 +
 +	if (down_trylock(&port->tty_sem)) {
 +		/* must test lock as tty layer wraps calls to this function with BKL */
@@ -2285,7 +2261,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	.name = NOZOMI_NAME,
 +	.id_table = nozomi_pci_tbl,
 +	.probe = nozomi_card_init,
-+	.remove = __devexit_p(nozomi_card_exit),
++	.remove = nozomi_card_exit,
 +};
 +
 +static __init int nozomi_init(void)
