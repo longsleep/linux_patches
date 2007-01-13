@@ -1,10 +1,67 @@
----
- drivers/usb/misc/berry_charge.c |   99 ++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 99 insertions(+)
+From: Greg Kroah-Hartman <gregkh@suse.de>
+Date: Sat, 13 Jan 2007 10:57:42 -0800
+Subject: USB: Driver to charge USB blackberry devices
 
+A simple driver to turn on the charging capability of a USB BlackBerry
+device when it is plugged into the machine.  It does not bind to the
+device, so all userspace programs can still sync properly with it.
+
+I might want to not even register the driver, but have it always unload
+itself so that it doesn't even live in memory, but will require some
+testing with a real device before I can do that.
+
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/Makefile            |    1 
+ drivers/usb/misc/Kconfig        |   11 +++
+ drivers/usb/misc/Makefile       |    1 
+ drivers/usb/misc/berry_charge.c |  113 ++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 126 insertions(+)
+
+--- gregkh-2.6.orig/drivers/usb/Makefile
++++ gregkh-2.6/drivers/usb/Makefile
+@@ -51,6 +51,7 @@ obj-$(CONFIG_USB_SERIAL)	+= serial/
+ obj-$(CONFIG_USB_ADUTUX)	+= misc/
+ obj-$(CONFIG_USB_APPLEDISPLAY)	+= misc/
+ obj-$(CONFIG_USB_AUERSWALD)	+= misc/
++obj-$(CONFIG_USB_BERRY_CHARGE)	+= misc/
+ obj-$(CONFIG_USB_CYPRESS_CY7C63)+= misc/
+ obj-$(CONFIG_USB_CYTHERM)	+= misc/
+ obj-$(CONFIG_USB_EMI26)		+= misc/
+--- gregkh-2.6.orig/drivers/usb/misc/Kconfig
++++ gregkh-2.6/drivers/usb/misc/Kconfig
+@@ -88,6 +88,17 @@ config USB_LCD
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called usblcd.
+ 
++config USB_BERRY_CHARGE
++	tristate "USB BlackBerry recharge support"
++	depends on USB
++	help
++	  Say Y here if you want to connect a BlackBerry device to your
++	  computer's USB port and have it automatically switch to "recharge"
++	  mode.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called berry_charge.
++
+ config USB_LED
+ 	tristate "USB LED driver support"
+ 	depends on USB
+--- gregkh-2.6.orig/drivers/usb/misc/Makefile
++++ gregkh-2.6/drivers/usb/misc/Makefile
+@@ -6,6 +6,7 @@
+ obj-$(CONFIG_USB_ADUTUX)	+= adutux.o
+ obj-$(CONFIG_USB_APPLEDISPLAY)	+= appledisplay.o
+ obj-$(CONFIG_USB_AUERSWALD)	+= auerswald.o
++obj-$(CONFIG_USB_BERRY_CHARGE)	+= berry_charge.o
+ obj-$(CONFIG_USB_CYPRESS_CY7C63)+= cypress_cy7c63.o
+ obj-$(CONFIG_USB_CYTHERM)	+= cytherm.o
+ obj-$(CONFIG_USB_EMI26)		+= emi26.o
 --- /dev/null
 +++ gregkh-2.6/drivers/usb/misc/berry_charge.c
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,113 @@
 +/*
 + * USB BlackBerry charging module
 + *
@@ -29,9 +86,7 @@
 +#include <linux/init.h>
 +#include <linux/slab.h>
 +#include <linux/module.h>
-+#include <linux/kref.h>
 +#include <linux/usb.h>
-+#include <linux/mutex.h>
 +
 +#define RIM_VENDOR		0x0fca
 +#define BLACKBERRY		0x0001
@@ -42,11 +97,10 @@
 +};
 +MODULE_DEVICE_TABLE(usb, id_table);
 +
-+
-+int magic_charge(struct usb_interface *intf)
++static int magic_charge(struct usb_device *udev)
 +{
-+	struct usb_device *udev = usb_get_dev(interface_to_usbdev(intf));
-+	char *dummy_buffer = kmalloc(3, GFP_KERNEL);
++	char *dummy_buffer = kzalloc(2, GFP_KERNEL);
++	int retval;
 +
 +	if (!dummy_buffer)
 +		return -ENOMEM;
@@ -54,29 +108,45 @@
 +	/* send two magic commands and then set the configuration.  The device
 +	 * will then reset itself with the new power usage and should start
 +	 * charging. */
-+	usb_control_msg(udev, usbrcvctrlpipe(udev, 0),
-+			0xa5, 0xc0, 0, 1, dummy_buffer, 100);
-+	usb_control_msg(udev, usbrcvctrlpipe(udev, 0),
-+			0xa2, 0x40, 0, 1, dummy_buffer, 100);
-+	usb_driver_set_configuration(udev, 1);
-+	return 0;
++	retval = usb_control_msg(udev, usb_rcvctrlpipe(udev, 0),
++				 0xa5, 0xc0, 0, 1, dummy_buffer, 2, 100);
++	if (retval != 2) {
++		dev_err(&udev->dev, "First magic command failed: %d.\n",
++			retval);
++		return retval;
++	}
++	retval = usb_control_msg(udev, usb_rcvctrlpipe(udev, 0),
++				 0xa2, 0x40, 0, 1, dummy_buffer, 2, 100);
++	if (retval != 2) {
++		dev_err(&udev->dev, "Second magic command failed: %d.\n",
++			retval);
++		return retval;
++	}
++	retval = usb_driver_set_configuration(udev, 1);
++	if (retval)
++		dev_err(&udev->dev, "Set Configuration failed :%d.\n", retval);
++
++	return retval;
 +}
 +
 +static int berry_probe(struct usb_interface *intf,
 +		       const struct usb_device_id *id)
 +{
++	struct usb_device *udev = interface_to_usbdev(intf);
++
 +	/* check the power usage so we don't try to enable something that is
 +	 * already enabled */
-+
++	if (udev->actconfig->desc.bMaxPower != 100) {
++		dev_dbg(&udev->dev, "device is already charging.\n");
++		return -ENODEV;
++	}
 +
 +	/* turn the power on */
-+	magic_charge(interface);
++	magic_charge(udev);
 +
 +	/* we don't really want to bind to the device, userspace programs can
 +	 * handle the syncing just fine, so get outta here. */
 +	return -ENODEV;
-+}
-+
 +}
 +
 +static void berry_disconnect(struct usb_interface *intf)
@@ -104,3 +174,4 @@
 +module_exit(berry_exit);
 +
 +MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Greg Kroah-Hartman <gregkh@suse.de>");
