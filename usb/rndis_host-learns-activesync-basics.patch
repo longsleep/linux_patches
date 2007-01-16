@@ -41,11 +41,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 
 ---
- drivers/usb/core/generic.c   |   28 +++++++++----
- drivers/usb/net/Kconfig      |    6 +-
- drivers/usb/net/cdc_ether.c  |   60 +++++++++++++++++++++++++++-
- drivers/usb/net/rndis_host.c |   90 ++++++++++++++++++++++++++++++++-----------
- 4 files changed, 151 insertions(+), 33 deletions(-)
+ drivers/usb/core/generic.c   |   28 ++++++++++----
+ drivers/usb/net/Kconfig      |    6 ++-
+ drivers/usb/net/cdc_ether.c  |   60 ++++++++++++++++++++++++++++++-
+ drivers/usb/net/rndis_host.c |   81 ++++++++++++++++++++++++++++++++-----------
+ 4 files changed, 144 insertions(+), 31 deletions(-)
 
 --- gregkh-2.6.orig/drivers/usb/core/generic.c
 +++ gregkh-2.6/drivers/usb/core/generic.c
@@ -303,7 +303,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  					msg, sizeof *msg,
  					RNDIS_CONTROL_TIMEOUT_MS);
  				if (unlikely(retval < 0))
-@@ -392,41 +405,72 @@ static int rndis_bind(struct usbnet *dev
+@@ -393,38 +406,64 @@ static int rndis_bind(struct usbnet *dev
  	u32			tmp;
  
  	/* we can't rely on i/o from stack working, or stack allocation */
@@ -313,7 +313,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		return -ENOMEM;
  	retval = usbnet_generic_cdc_bind(dev, intf);
  	if (retval < 0)
- 		goto done;
+ 		goto fail;
  
 -	net->hard_header_len += sizeof (struct rndis_data_hdr);
 -
@@ -323,7 +323,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	u.init->major_version = ccpu2(1);
  	u.init->minor_version = ccpu2(0);
 -	u.init->max_transfer_size = ccpu2(net->mtu + net->hard_header_len);
-+
+ 
 +	/* max transfer (in spec) is 0x4000 at full speed, but for
 +	 * TX we'll stick to one Ethernet packet plus RNDIS framing.
 +	 * For RX we handle drivers that zero-pad to end-of-packet.
@@ -337,30 +337,20 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	u.init->max_transfer_size = cpu_to_le32(dev->rx_urb_size);
 +
 +	net->change_mtu = NULL;
- 
  	retval = rndis_command(dev, u.header);
  	if (unlikely(retval < 0)) {
-+		struct cdc_state		*info;
-+
  		/* it might not even be an RNDIS device!! */
  		dev_err(&intf->dev, "RNDIS init failed, %d\n", retval);
- fail:
--		usb_driver_release_interface(driver_of(intf),
--			((struct cdc_state *)&(dev->data))->data);
-+		info = (void *) &dev->data;
-+		usb_set_intfdata(info->data, NULL);
-+		usb_driver_release_interface(driver_of(intf), info->data);
-+		info->data = NULL;
- 		goto done;
- 	}
--	dev->hard_mtu = le32_to_cpu(u.init_c->max_transfer_size);
++ 		goto fail_and_release;
++	}
 +	tmp = le32_to_cpu(u.init_c->max_transfer_size);
 +	if (tmp < dev->hard_mtu) {
 +		dev_err(&intf->dev,
 +			"dev can't take %u byte packets (max %u)\n",
 +			dev->hard_mtu, tmp);
-+		goto fail;
-+	}
+ 		goto fail_and_release;
+ 	}
+-	dev->hard_mtu = le32_to_cpu(u.init_c->max_transfer_size);
 +
  	/* REVISIT:  peripheral "alignment" request is ignored ... */
 -	dev_dbg(&intf->dev, "hard mtu %u, align %d\n", dev->hard_mtu,
@@ -388,8 +378,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  	retval = rndis_command(dev, u.header);
  	if (unlikely(retval < 0)) {
-@@ -434,7 +478,7 @@ fail:
- 		goto fail;
+@@ -432,7 +471,7 @@ static int rndis_bind(struct usbnet *dev
+ 		goto fail_and_release;
  	}
  	tmp = le32_to_cpu(u.get_c->offset);
 -	if (unlikely((tmp + 8) > (1024 - ETH_ALEN)
@@ -397,7 +387,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  			|| u.get_c->len != ccpu2(ETH_ALEN))) {
  		dev_err(&intf->dev, "rndis ethaddr off %d len %d ?\n",
  			tmp, le32_to_cpu(u.get_c->len));
-@@ -593,6 +637,10 @@ static const struct usb_device_id	produc
+@@ -598,6 +637,10 @@ static const struct usb_device_id	produc
  	/* RNDIS is MSFT's un-official variant of CDC ACM */
  	USB_INTERFACE_INFO(USB_CLASS_COMM, 2 /* ACM */, 0x0ff),
  	.driver_info = (unsigned long) &rndis_info,

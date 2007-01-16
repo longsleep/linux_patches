@@ -1,0 +1,151 @@
+From david-b@pacbell.net Mon Jan 15 11:35:11 2007
+From: "Phil Endecott" <spam_from_usb_devel@chezphil.org>
+Date: Mon, 15 Jan 2007 11:35:01 -0800
+Subject: usb: gadgetfs remove delayed init mode
+To: linux-usb-devel@lists.sourceforge.net, greg@kroah.com
+Cc: Phil Endecott <spam_from_usb_devel@chezphil.org>
+Message-ID: <20070115193502.28285144459@adsl-69-226-248-13.dsl.pltn13.pacbell.net>
+
+
+From: "Phil Endecott" <spam_from_usb_devel@chezphil.org>
+
+Gadgetfs had a mode in which endpoint descriptors were written by the user
+program before connection.  This mode had some bugs, and hasn't seen much
+(if any) use.  This patch removes that mode, leaving the mode of operation
+where the user program waits for endpoint 0 to report a SET_CONFIGURATION,
+and only then configures the endpoints.
+
+From: "Phil Endecott" <spam_from_usb_devel@chezphil.org>
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ drivers/usb/gadget/inode.c |   60 +++++++++------------------------------------
+ 1 file changed, 12 insertions(+), 48 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/gadget/inode.c
++++ gregkh-2.6/drivers/usb/gadget/inode.c
+@@ -59,11 +59,11 @@
+  *   may serve as a source of device events, used to handle all control
+  *   requests other than basic enumeration.
+  *
+- * - Then either immediately, or after a SET_CONFIGURATION control request,
+- *   ep_config() is called when each /dev/gadget/ep* file is configured
+- *   (by writing endpoint descriptors).  Afterwards these files are used
+- *   to write() IN data or to read() OUT data.  To halt the endpoint, a
+- *   "wrong direction" request is issued (like reading an IN endpoint).
++ * - Then, after a SET_CONFIGURATION control request, ep_config() is
++ *   called when each /dev/gadget/ep* file is configured (by writing
++ *   endpoint descriptors).  Afterwards these files are used to write()
++ *   IN data or to read() OUT data.  To halt the endpoint, a "wrong
++ *   direction" request is issued (like reading an IN endpoint).
+  *
+  * Unlike "usbfs" the only ioctl()s are for things that are rare, and maybe
+  * not possible on all hardware.  For example, precise fault handling with
+@@ -188,7 +188,6 @@ static struct dev_data *dev_new (void)
+ enum ep_state {
+ 	STATE_EP_DISABLED = 0,
+ 	STATE_EP_READY,
+-	STATE_EP_DEFER_ENABLE,
+ 	STATE_EP_ENABLED,
+ 	STATE_EP_UNBOUND,
+ };
+@@ -313,18 +312,10 @@ nonblock:
+ 
+ 	if ((val = down_interruptible (&epdata->lock)) < 0)
+ 		return val;
+-newstate:
++
+ 	switch (epdata->state) {
+ 	case STATE_EP_ENABLED:
+ 		break;
+-	case STATE_EP_DEFER_ENABLE:
+-		DBG (epdata->dev, "%s wait for host\n", epdata->name);
+-		if ((val = wait_event_interruptible (epdata->wait, 
+-				epdata->state != STATE_EP_DEFER_ENABLE
+-				|| epdata->dev->state == STATE_DEV_UNBOUND
+-				)) < 0)
+-			goto fail;
+-		goto newstate;
+ 	// case STATE_EP_DISABLED:		/* "can't happen" */
+ 	// case STATE_EP_READY:			/* "can't happen" */
+ 	default:				/* error! */
+@@ -333,7 +324,6 @@ newstate:
+ 		// FALLTHROUGH
+ 	case STATE_EP_UNBOUND:			/* clean disconnect */
+ 		val = -ENODEV;
+-fail:
+ 		up (&epdata->lock);
+ 	}
+ 	return val;
+@@ -852,9 +842,9 @@ ep_config (struct file *fd, const char _
+ 		break;
+ #endif
+ 	default:
+-		DBG (data->dev, "unconnected, %s init deferred\n",
++		DBG(data->dev, "unconnected, %s init abandoned\n",
+ 				data->name);
+-		data->state = STATE_EP_DEFER_ENABLE;
++		value = -EINVAL;
+ 	}
+ 	if (value == 0) {
+ 		fd->f_op = &ep_io_operations;
+@@ -1393,8 +1383,6 @@ gadgetfs_setup (struct usb_gadget *gadge
+ 	spin_lock (&dev->lock);
+ 	dev->setup_abort = 0;
+ 	if (dev->state == STATE_UNCONNECTED) {
+-		struct usb_ep	*ep;
+-		struct ep_data	*data;
+ 
+ 		dev->state = STATE_CONNECTED;
+ 		dev->dev->bMaxPacketSize0 = gadget->ep0->maxpacket;
+@@ -1411,27 +1399,6 @@ gadgetfs_setup (struct usb_gadget *gadge
+ 		event->u.speed = gadget->speed;
+ 		ep0_readable (dev);
+ 
+-		list_for_each_entry (ep, &gadget->ep_list, ep_list) {
+-			data = ep->driver_data;
+-			/* ... down_trylock (&data->lock) ... */
+-			if (data->state != STATE_EP_DEFER_ENABLE)
+-				continue;
+-#ifdef	CONFIG_USB_GADGET_DUALSPEED
+-			if (gadget->speed == USB_SPEED_HIGH)
+-				value = usb_ep_enable (ep, &data->hs_desc);
+-			else
+-#endif	/* CONFIG_USB_GADGET_DUALSPEED */
+-				value = usb_ep_enable (ep, &data->desc);
+-			if (value) {
+-				ERROR (dev, "deferred %s enable --> %d\n",
+-					data->name, value);
+-				continue;
+-			}
+-			data->state = STATE_EP_ENABLED;
+-			wake_up (&data->wait);
+-			DBG (dev, "woke up %s waiters\n", data->name);
+-		}
+-
+ 	/* host may have given up waiting for response.  we can miss control
+ 	 * requests handled lower down (device/endpoint status and features);
+ 	 * then ep0_{read,write} will report the wrong status. controller
+@@ -1852,16 +1819,13 @@ static struct usb_gadget_driver probe_dr
+  *	this one's optional except for high-speed hardware
+  * . device descriptor
+  *
+- * Endpoints are not yet enabled. Drivers may want to immediately
+- * initialize them, using the /dev/gadget/ep* files that are available
+- * as soon as the kernel sees the configuration, or they can wait
+- * until device configuration and interface altsetting changes create
++ * Endpoints are not yet enabled. Drivers must wait until device
++ * configuration and interface altsetting changes create
+  * the need to configure (or unconfigure) them.
+  *
+  * After initialization, the device stays active for as long as that
+- * $CHIP file is open.  Events may then be read from that descriptor,
+- * such as configuration notifications.  More complex drivers will handle
+- * some control requests in user space.
++ * $CHIP file is open.  Events must then be read from that descriptor,
++ * such as configuration notifications.
+  */
+ 
+ static int is_valid_config (struct usb_config_descriptor *config)

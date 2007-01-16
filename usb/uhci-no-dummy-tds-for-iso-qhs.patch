@@ -1,0 +1,79 @@
+From stern@rowland.harvard.edu Mon Jan  8 09:01:52 2007
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Mon, 8 Jan 2007 12:01:43 -0500 (EST)
+Subject: UHCI: no dummy TDs for Iso QHs
+To: Greg KH <greg@kroah.com>
+Message-ID: <Pine.LNX.4.44L0.0701081200290.4249-100000@iolanthe.rowland.org>
+
+
+Isochronous queues don't need a dummy TD because the Queue Header
+isn't managed by the hardware.  This patch (as836) removes the
+unnecessary dummy TDs.
+
+The patch also fixes a long-standing typo in a comment (a "don't" was
+missing -- potentially very confusing!).
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/uhci-debug.c |    2 +-
+ drivers/usb/host/uhci-q.c     |   17 ++++++++++-------
+ 2 files changed, 11 insertions(+), 8 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/host/uhci-debug.c
++++ gregkh-2.6/drivers/usb/host/uhci-debug.c
+@@ -208,7 +208,7 @@ static int uhci_show_qh(struct uhci_qh *
+ 					space, "", nurbs);
+ 	}
+ 
+-	if (qh->udev) {
++	if (qh->dummy_td) {
+ 		out += sprintf(out, "%*s  Dummy TD\n", space, "");
+ 		out += uhci_show_td(qh->dummy_td, out, len - (out - buf), 0);
+ 	}
+--- gregkh-2.6.orig/drivers/usb/host/uhci-q.c
++++ gregkh-2.6/drivers/usb/host/uhci-q.c
+@@ -248,16 +248,18 @@ static struct uhci_qh *uhci_alloc_qh(str
+ 	INIT_LIST_HEAD(&qh->node);
+ 
+ 	if (udev) {		/* Normal QH */
+-		qh->dummy_td = uhci_alloc_td(uhci);
+-		if (!qh->dummy_td) {
+-			dma_pool_free(uhci->qh_pool, qh, dma_handle);
+-			return NULL;
++		qh->type = hep->desc.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK;
++		if (qh->type != USB_ENDPOINT_XFER_ISOC) {
++			qh->dummy_td = uhci_alloc_td(uhci);
++			if (!qh->dummy_td) {
++				dma_pool_free(uhci->qh_pool, qh, dma_handle);
++				return NULL;
++			}
+ 		}
+ 		qh->state = QH_STATE_IDLE;
+ 		qh->hep = hep;
+ 		qh->udev = udev;
+ 		hep->hcpriv = qh;
+-		qh->type = hep->desc.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK;
+ 
+ 	} else {		/* Skeleton QH */
+ 		qh->state = QH_STATE_ACTIVE;
+@@ -275,7 +277,8 @@ static void uhci_free_qh(struct uhci_hcd
+ 	list_del(&qh->node);
+ 	if (qh->udev) {
+ 		qh->hep->hcpriv = NULL;
+-		uhci_free_td(uhci, qh->dummy_td);
++		if (qh->dummy_td)
++			uhci_free_td(uhci, qh->dummy_td);
+ 	}
+ 	dma_pool_free(uhci->qh_pool, qh, qh->dma_handle);
+ }
+@@ -327,7 +330,7 @@ static int uhci_cleanup_queue(struct uhc
+ 		goto done;
+ 	qh->element = UHCI_PTR_TERM;
+ 
+-	/* Control pipes have to worry about toggles */
++	/* Control pipes don't have to worry about toggles */
+ 	if (qh->type == USB_ENDPOINT_XFER_CONTROL)
+ 		goto done;
+ 
