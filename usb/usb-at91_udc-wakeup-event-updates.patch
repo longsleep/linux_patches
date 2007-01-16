@@ -1,0 +1,77 @@
+From david-b@pacbell.net Tue Jan 16 12:46:48 2007
+From: David Brownell <david-b@pacbell.net>
+Date: Tue, 16 Jan 2007 12:46:39 -0800
+Subject: USB: at91_udc wakeup event updates
+To: Greg KH <greg@kroah.com>, linux-usb-devel@lists.sourceforge.net
+Cc: Andrew Victor <andrew@sanpeople.com>
+Message-ID: <200701161246.40299.david-b@pacbell.net>
+Content-Disposition: inline
+
+
+This updates the AT91 UDC driver's handling of wakeup events:
+
+ - Fix a bug in the original scheme, which was never updated after
+   the {enable,disable}_irq_wake() semantics were updated to address
+   refcounting issues (i.e. behave for shared irqs).
+
+ - Couple handling of both type of wakeup events, to be more direct.  The
+   controller can be source of wakeup events for cases like bus reset
+   and USB resume.  On some boards, VBUS sensing is also IRQ driven.
+
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/gadget/at91_udc.c |   19 +++++++++++--------
+ drivers/usb/gadget/at91_udc.h |    1 +
+ 2 files changed, 12 insertions(+), 8 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/gadget/at91_udc.c
++++ gregkh-2.6/drivers/usb/gadget/at91_udc.c
+@@ -1807,16 +1807,13 @@ static int at91udc_suspend(struct platfo
+ 			|| !wake
+ 			|| at91_suspend_entering_slow_clock()) {
+ 		pullup(udc, 0);
+-		disable_irq_wake(udc->udp_irq);
++		wake = 0;
+ 	} else
+ 		enable_irq_wake(udc->udp_irq);
+ 
+-	if (udc->board.vbus_pin > 0) {
+-		if (wake)
+-			enable_irq_wake(udc->board.vbus_pin);
+-		else
+-			disable_irq_wake(udc->board.vbus_pin);
+-	}
++	udc->active_suspend = wake;
++	if (udc->board.vbus_pin > 0 && wake)
++		enable_irq_wake(udc->board.vbus_pin);
+ 	return 0;
+ }
+ 
+@@ -1824,8 +1821,14 @@ static int at91udc_resume(struct platfor
+ {
+ 	struct at91_udc *udc = platform_get_drvdata(pdev);
+ 
++	if (udc->board.vbus_pin > 0 && udc->active_suspend)
++		disable_irq_wake(udc->board.vbus_pin);
++
+ 	/* maybe reconnect to host; if so, clocks on */
+-	pullup(udc, 1);
++	if (udc->active_suspend)
++		disable_irq_wake(udc->udp_irq);
++	else
++		pullup(udc, 1);
+ 	return 0;
+ }
+ #else
+--- gregkh-2.6.orig/drivers/usb/gadget/at91_udc.h
++++ gregkh-2.6/drivers/usb/gadget/at91_udc.h
+@@ -136,6 +136,7 @@ struct at91_udc {
+ 	unsigned			wait_for_addr_ack:1;
+ 	unsigned			wait_for_config_ack:1;
+ 	unsigned			selfpowered:1;
++	unsigned			active_suspend:1;
+ 	u8				addr;
+ 	struct at91_udc_data		board;
+ 	struct clk			*iclk, *fclk;
