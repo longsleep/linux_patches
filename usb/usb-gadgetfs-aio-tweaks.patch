@@ -1,0 +1,70 @@
+From david-b@pacbell.net Tue Jan 16 23:28:58 2007
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Tue, 16 Jan 2007 23:28:48 -0800
+Subject: USB: gadgetfs AIO tweaks
+To: Greg KH <greg@kroah.com>
+Cc: Alan Stern <stern@rowland.harvard.edu>
+Message-ID: <200701162328.49291.david-b@pacbell.net>
+Content-Disposition: inline
+
+From: Alan Stern <stern@rowland.harvard.edu>
+
+This patch (as837) fixes several mistakes in the AIO interface of the
+gadgetfs driver:
+
+	The ki_retry method is not supposed to do a put on the kiocb.
+	The extra call to aio_put_req() causes memory corruption.
+	(Note: This call was removed before, by patch as691, and then
+	mysteriously re-introduced later.)
+
+	Even if a read transfer is cancelled, we can and should send
+	to the user all the data that did manage to get transferred.
+
+	Testing for AIO cancellation in the I/O completion handler
+	is both racy and (now) unnecessary.  aio_complete() does its
+	own checking, in a safe manner.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/gadget/inode.c |   16 +++++++---------
+ 1 file changed, 7 insertions(+), 9 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/gadget/inode.c
++++ gregkh-2.6/drivers/usb/gadget/inode.c
+@@ -576,7 +576,6 @@ static ssize_t ep_aio_read_retry(struct 
+ 	}
+ 	kfree(priv->buf);
+ 	kfree(priv);
+-	aio_put_req(iocb);
+ 	return len;
+ }
+ 
+@@ -590,18 +589,17 @@ static void ep_aio_complete(struct usb_e
+ 	spin_lock(&epdata->dev->lock);
+ 	priv->req = NULL;
+ 	priv->epdata = NULL;
+-	if (priv->iv == NULL
+-			|| unlikely(req->actual == 0)
+-			|| unlikely(kiocbIsCancelled(iocb))) {
++
++	/* if this was a write or a read returning no data then we
++	 * don't need to copy anything to userspace, so we can
++	 * complete the aio request immediately.
++	 */
++	if (priv->iv == NULL || unlikely(req->actual == 0)) {
+ 		kfree(req->buf);
+ 		kfree(priv);
+ 		iocb->private = NULL;
+ 		/* aio_complete() reports bytes-transferred _and_ faults */
+-		if (unlikely(kiocbIsCancelled(iocb)))
+-			aio_put_req(iocb);
+-		else
+-			aio_complete(iocb,
+-				req->actual ? req->actual : req->status,
++		aio_complete(iocb, req->actual ? req->actual : req->status,
+ 				req->status);
+ 	} else {
+ 		/* retry() won't report both; so we hide some faults */
