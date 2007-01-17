@@ -1,0 +1,110 @@
+From oneukum@suse.de Thu Jan 11 05:35:53 2007
+From: Oliver Neukum <oneukum@suse.de>
+Date: Thu, 11 Jan 2007 14:35:50 +0100
+Subject: USB: total removal of multithreaded probing in usb
+To: Greg KH <greg@kroah.com>, Pavel Machek <pavel@ucw.cz>, Alan Stern <stern@rowland.harvard.edu>
+Message-ID: <200701111435.50572.oneukum@suse.de>
+Content-Disposition: inline
+
+
+The whole approach is simply wrong.  Forking a thread means that
+  - errors are ignored
+  - locking is ignored
+
+Doing this correctly would require major surgery for questionable benefit.
+
+Signed-off-by: Oliver Neukum <oneukum@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/hub.c |   64 ++++++++++++++++---------------------------------
+ 1 file changed, 21 insertions(+), 43 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/core/hub.c
++++ gregkh-2.6/drivers/usb/core/hub.c
+@@ -87,9 +87,6 @@ static DECLARE_WAIT_QUEUE_HEAD(khubd_wai
+ 
+ static struct task_struct *khubd_task;
+ 
+-/* multithreaded probe logic */
+-static int multithread_probe = 0;
+-
+ /* cycle leds on hubs that aren't blinking for attention */
+ static int blinkenlights = 0;
+ module_param (blinkenlights, bool, S_IRUGO);
+@@ -1256,9 +1253,28 @@ static inline void show_string(struct us
+ static int __usb_port_suspend(struct usb_device *, int port1);
+ #endif
+ 
+-static int __usb_new_device(void *void_data)
++/**
++ * usb_new_device - perform initial device setup (usbcore-internal)
++ * @udev: newly addressed device (in ADDRESS state)
++ *
++ * This is called with devices which have been enumerated, but not yet
++ * configured.  The device descriptor is available, but not descriptors
++ * for any device configuration.  The caller must have locked either
++ * the parent hub (if udev is a normal device) or else the
++ * usb_bus_list_lock (if udev is a root hub).  The parent's pointer to
++ * udev has already been installed, but udev is not yet visible through
++ * sysfs or other filesystem code.
++ *
++ * It will return if the device is configured properly or not.  Zero if
++ * the interface was registered with the driver core; else a negative
++ * errno value.
++ *
++ * This call is synchronous, and may not be used in an interrupt context.
++ *
++ * Only the hub driver or root-hub registrar should ever call this.
++ */
++int usb_new_device(struct usb_device *udev)
+ {
+-	struct usb_device *udev = void_data;
+ 	int err;
+ 
+ 	/* Lock ourself into memory in order to keep a probe sequence
+@@ -1375,44 +1391,6 @@ fail:
+ 	goto exit;
+ }
+ 
+-/**
+- * usb_new_device - perform initial device setup (usbcore-internal)
+- * @udev: newly addressed device (in ADDRESS state)
+- *
+- * This is called with devices which have been enumerated, but not yet
+- * configured.  The device descriptor is available, but not descriptors
+- * for any device configuration.  The caller must have locked either
+- * the parent hub (if udev is a normal device) or else the
+- * usb_bus_list_lock (if udev is a root hub).  The parent's pointer to
+- * udev has already been installed, but udev is not yet visible through
+- * sysfs or other filesystem code.
+- *
+- * The return value for this function depends on if the
+- * multithread_probe variable is set or not.  If it's set, it will
+- * return a if the probe thread was successfully created or not.  If the
+- * variable is not set, it will return if the device is configured
+- * properly or not.  interfaces, in sysfs); else a negative errno value.
+- *
+- * This call is synchronous, and may not be used in an interrupt context.
+- *
+- * Only the hub driver or root-hub registrar should ever call this.
+- */
+-int usb_new_device(struct usb_device *udev)
+-{
+-	struct task_struct *probe_task;
+-	int ret = 0;
+-
+-	if (multithread_probe) {
+-		probe_task = kthread_run(__usb_new_device, udev,
+-					 "usb-probe-%s", udev->devnum);
+-		if (IS_ERR(probe_task))
+-			ret = PTR_ERR(probe_task);
+-	} else
+-		ret = __usb_new_device(udev);
+-
+-	return ret;
+-}
+-
+ static int hub_port_status(struct usb_hub *hub, int port1,
+ 			       u16 *status, u16 *change)
+ {
