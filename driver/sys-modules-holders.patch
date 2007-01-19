@@ -1,0 +1,180 @@
+From kay.sievers@vrfy.org  Fri Jan 19 09:46:03 2007
+From: Kay Sievers <kay.sievers@vrfy.org>
+Date: Thu, 18 Jan 2007 13:26:15 +0100
+Subject: /sys/modules/*/holders
+To: Greg KH <greg@kroah.com>
+Message-ID: <1169123175.3940.4.camel@pim.off.vrfy.org>
+
+  /sys/module/usbcore/
+  |-- drivers
+  |   |-- usb:hub -> ../../../subsystem/usb/drivers/hub
+  |   |-- usb:usb -> ../../../subsystem/usb/drivers/usb
+  |   `-- usb:usbfs -> ../../../subsystem/usb/drivers/usbfs
+  |-- holders
+  |   |-- ehci_hcd -> ../../../module/ehci_hcd
+  |   |-- uhci_hcd -> ../../../module/uhci_hcd
+  |   |-- usb_storage -> ../../../module/usb_storage
+  |   `-- usbhid -> ../../../module/usbhid
+  |-- initstate
+
+Signed-off-by: Kay Sievers <kay.sievers@vrfy.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ include/linux/module.h |    1 +
+ kernel/module.c        |   37 +++++++++++++++++++++++++++++++------
+ kernel/params.c        |   17 ++++++++++++++++-
+ 3 files changed, 48 insertions(+), 7 deletions(-)
+
+--- gregkh-2.6.orig/include/linux/module.h
++++ gregkh-2.6/include/linux/module.h
+@@ -264,6 +264,7 @@ struct module
+ 	struct module_attribute *modinfo_attrs;
+ 	const char *version;
+ 	const char *srcversion;
++	struct kobject *holders_dir;
+ 
+ 	/* Exported symbols */
+ 	const struct kernel_symbol *syms;
+--- gregkh-2.6.orig/kernel/module.c
++++ gregkh-2.6/kernel/module.c
+@@ -537,6 +537,8 @@ static int already_uses(struct module *a
+ static int use_module(struct module *a, struct module *b)
+ {
+ 	struct module_use *use;
++	int no_warn;
++
+ 	if (b == NULL || already_uses(a, b)) return 1;
+ 
+ 	if (!strong_try_module_get(b))
+@@ -552,6 +554,7 @@ static int use_module(struct module *a, 
+ 
+ 	use->module_which_uses = a;
+ 	list_add(&use->list, &b->modules_which_use_me);
++	no_warn = sysfs_create_link(b->holders_dir, &a->mkobj.kobj, a->name);
+ 	return 1;
+ }
+ 
+@@ -569,6 +572,7 @@ static void module_unload_free(struct mo
+ 				module_put(i);
+ 				list_del(&use->list);
+ 				kfree(use);
++				sysfs_remove_link(i->holders_dir, mod->name);
+ 				/* There can be at most one match. */
+ 				break;
+ 			}
+@@ -1106,9 +1110,7 @@ static void module_remove_modinfo_attrs(
+ 	kfree(mod->modinfo_attrs);
+ }
+ 
+-static int mod_sysfs_setup(struct module *mod,
+-			   struct kernel_param *kparam,
+-			   unsigned int num_params)
++static int mod_sysfs_init(struct module *mod)
+ {
+ 	int err;
+ 
+@@ -1125,15 +1127,30 @@ static int mod_sysfs_setup(struct module
+ 	kobj_set_kset_s(&mod->mkobj, module_subsys);
+ 	mod->mkobj.mod = mod;
+ 
+-	/* delay uevent until full sysfs population */
+ 	kobject_init(&mod->mkobj.kobj);
++
++out:
++	return err;
++}
++
++static int mod_sysfs_setup(struct module *mod,
++			   struct kernel_param *kparam,
++			   unsigned int num_params)
++{
++	int err;
++
++	/* delay uevent until full sysfs population */
+ 	err = kobject_add(&mod->mkobj.kobj);
+ 	if (err)
+ 		goto out;
+ 
++	mod->holders_dir = kobject_add_dir(&mod->mkobj.kobj, "holders");
++	if (!mod->holders_dir)
++		goto out_unreg;
++
+ 	err = module_param_sysfs_setup(mod, kparam, num_params);
+ 	if (err)
+-		goto out_unreg_drivers;
++		goto out_unreg_holders;
+ 
+ 	err = module_add_modinfo_attrs(mod);
+ 	if (err)
+@@ -1144,7 +1161,9 @@ static int mod_sysfs_setup(struct module
+ 
+ out_unreg_param:
+ 	module_param_sysfs_remove(mod);
+-out_unreg_drivers:
++out_unreg_holders:
++	kobject_unregister(mod->holders_dir);
++out_unreg:
+ 	kobject_del(&mod->mkobj.kobj);
+ 	kobject_put(&mod->mkobj.kobj);
+ out:
+@@ -1157,6 +1176,8 @@ static void mod_kobject_remove(struct mo
+ 	module_param_sysfs_remove(mod);
+ 	if (mod->mkobj.drivers_dir)
+ 		kobject_unregister(mod->mkobj.drivers_dir);
++	if (mod->holders_dir)
++		kobject_unregister(mod->holders_dir);
+ 
+ 	kobject_unregister(&mod->mkobj.kobj);
+ }
+@@ -1761,6 +1782,10 @@ static struct module *load_module(void _
+ 	/* Now we've moved module, initialize linked lists, etc. */
+ 	module_unload_init(mod);
+ 
++	/* Initialize kobject, so we can reference it. */
++	if (mod_sysfs_init(mod) != 0)
++		goto cleanup;
++
+ 	/* Set up license info based on the info section */
+ 	set_license(mod, get_modinfo(sechdrs, infoindex, "license"));
+ 
+--- gregkh-2.6.orig/kernel/params.c
++++ gregkh-2.6/kernel/params.c
+@@ -30,6 +30,8 @@
+ #define DEBUGP(fmt, a...)
+ #endif
+ 
++static struct kobj_type module_ktype;
++
+ static inline char dash2underscore(char c)
+ {
+ 	if (c == '-')
+@@ -671,6 +673,19 @@ static struct sysfs_ops module_sysfs_ops
+ 	.store = module_attr_store,
+ };
+ 
++static int uevent_filter(struct kset *kset, struct kobject *kobj)
++{
++	struct kobj_type *ktype = get_ktype(kobj);
++
++	if (ktype == &module_ktype)
++		return 1;
++	return 0;
++}
++
++static struct kset_uevent_ops module_uevent_ops = {
++	.filter = uevent_filter,
++};
++
+ #else
+ static struct sysfs_ops module_sysfs_ops = {
+ 	.show = NULL,
+@@ -682,7 +697,7 @@ static struct kobj_type module_ktype = {
+ 	.sysfs_ops =	&module_sysfs_ops,
+ };
+ 
+-decl_subsys(module, &module_ktype, NULL);
++decl_subsys(module, &module_ktype, &module_uevent_ops);
+ 
+ /*
+  * param_sysfs_init - wrapper for built-in params support
