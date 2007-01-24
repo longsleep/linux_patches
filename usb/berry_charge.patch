@@ -6,9 +6,9 @@ A simple driver to turn on the charging capability of a USB BlackBerry
 device when it is plugged into the machine.  It does not bind to the
 device, so all userspace programs can still sync properly with it.
 
-I might want to not even register the driver, but have it always unload
-itself so that it doesn't even live in memory, but will require some
-testing with a real device before I can do that.
+Note, if CONFIG_USB_SUSPEND is enabled, it can play havoc with this
+device as the power to the port will be shut down.  This device id will
+have to be added to the global blacklist table when it is created.
 
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
@@ -16,8 +16,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  drivers/usb/Makefile            |    1 
  drivers/usb/misc/Kconfig        |   11 +++
  drivers/usb/misc/Makefile       |    1 
- drivers/usb/misc/berry_charge.c |  118 ++++++++++++++++++++++++++++++++++++++++
- 4 files changed, 131 insertions(+)
+ drivers/usb/misc/berry_charge.c |  135 ++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 148 insertions(+)
 
 --- gregkh-2.6.orig/drivers/usb/Makefile
 +++ gregkh-2.6/drivers/usb/Makefile
@@ -61,11 +61,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  obj-$(CONFIG_USB_EMI26)		+= emi26.o
 --- /dev/null
 +++ gregkh-2.6/drivers/usb/misc/berry_charge.c
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,135 @@
 +/*
 + * USB BlackBerry charging module
 + *
-+ * Copyright (C) 2006 Greg Kroah-Hartman <gregkh@suse.de>
++ * Copyright (C) 2007 Greg Kroah-Hartman <gregkh@suse.de>
 + *
 + *	This program is free software; you can redistribute it and/or
 + *	modify it under the terms of the GNU General Public License as
@@ -91,6 +91,15 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#define RIM_VENDOR		0x0fca
 +#define BLACKBERRY		0x0001
 +
++static int debug;
++
++#ifdef dbg
++#undef dbg
++#endif
++#define dbg(dev, format, arg...)				\
++	if (debug)						\
++		dev_printk(KERN_DEBUG , dev , format , ## arg)
++
 +static struct usb_device_id id_table [] = {
 +	{ USB_DEVICE(RIM_VENDOR, BLACKBERRY) },
 +	{ },					/* Terminating entry */
@@ -108,6 +117,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	/* send two magic commands and then set the configuration.  The device
 +	 * will then reset itself with the new power usage and should start
 +	 * charging. */
++
++	/* Note, with testing, it only seems that the first message is really
++	 * needed (at least for the 8700c), but to be safe, we emulate what
++	 * other operating systems seem to be sending to their device.  We
++	 * really need to get some specs for this device to be sure about what
++	 * is going on here.
++	 */
 +	retval = usb_control_msg(udev, usb_rcvctrlpipe(udev, 0),
 +				 0xa5, 0xc0, 0, 1, dummy_buffer, 2, 100);
 +	if (retval != 2) {
@@ -116,8 +132,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		return retval;
 +	}
 +	retval = usb_control_msg(udev, usb_rcvctrlpipe(udev, 0),
-+				 0xa2, 0x40, 0, 1, dummy_buffer, 2, 100);
-+	if (retval != 2) {
++				 0xa2, 0x40, 0, 1, dummy_buffer, 0, 100);
++	if (retval != 0) {
 +		dev_err(&udev->dev, "Second magic command failed: %d.\n",
 +			retval);
 +		return retval;
@@ -134,17 +150,16 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +{
 +	struct usb_device *udev = interface_to_usbdev(intf);
 +
-+	dev_dbg(&udev->dev, "Power is set to %dmA\n",
-+		udev->actconfig->desc.bMaxPower * 2);
-+#if 0
++	dbg(&udev->dev, "Power is set to %dmA\n",
++	    udev->actconfig->desc.bMaxPower * 2);
++
 +	/* check the power usage so we don't try to enable something that is
 +	 * already enabled */
 +	if ((udev->actconfig->desc.bMaxPower * 2) == 500) {
-+		dev_dbg(&udev->dev, "device is already charging, power is "
-+			"set to %dmA\n", udev->actconfig->desc.bMaxPower);
++		dbg(&udev->dev, "device is already charging, power is "
++		    "set to %dmA\n", udev->actconfig->desc.bMaxPower * 2);
 +		return -ENODEV;
 +	}
-+#endif
 +
 +	/* turn the power on */
 +	magic_charge(udev);
@@ -180,3 +195,5 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +MODULE_LICENSE("GPL");
 +MODULE_AUTHOR("Greg Kroah-Hartman <gregkh@suse.de>");
++module_param(debug, bool, S_IRUGO | S_IWUSR);
++MODULE_PARM_DESC(debug, "Debug enabled or not");
