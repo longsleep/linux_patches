@@ -1,0 +1,104 @@
+From stern@rowland.harvard.edu  Thu Jan 25 13:15:01 2007
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Mon, 22 Jan 2007 16:08:53 -0500 (EST)
+Subject: EHCI: fix interrupt-driven remote wakeup
+To: Greg KH <greg@kroah.com>
+Cc: David Brownell <david-b@pacbell.net>, Marcelo Tosatti <marcelo@kvack.org>
+Message-ID: <Pine.LNX.4.44L0.0701221607560.2472-100000@iolanthe.rowland.org>
+
+
+Now that port status change notifications are interrupt-driven,
+ehci-hcd needs to tell usbcore when a remote-wakeup resume operation
+is finished -- we can no longer rely on the core to poll and find
+out.  This patch (as843) uses the root-hub status timer to force a
+poll after the resume is complete.
+
+The patch also changes the test for detecting when the TDRSMDN resume
+period has expired.  It's necessary to use time_after_eq() instead of
+time_after(), since the polling is triggered precisely by a timer.
+The same change is made for TDRSTR reset expiration, for consistency.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Cc: David Brownell <david-b@pacbell.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ drivers/usb/host/ehci-hub.c |   50 ++++++++++++++++++++++++++++----------------
+ 1 file changed, 32 insertions(+), 18 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/host/ehci-hub.c
++++ gregkh-2.6/drivers/usb/host/ehci-hub.c
+@@ -379,8 +379,8 @@ ehci_hub_status_data (struct usb_hcd *hc
+ 			ehci->reset_done [i] = 0;
+ 		if ((temp & mask) != 0
+ 				|| ((temp & PORT_RESUME) != 0
+-					&& time_after (jiffies,
+-						ehci->reset_done [i]))) {
++					&& time_after_eq(jiffies,
++						ehci->reset_done[i]))) {
+ 			if (i < 7)
+ 			    buf [0] |= 1 << (i + 1);
+ 			else
+@@ -554,31 +554,45 @@ static int ehci_hub_control (
+ 			status |= 1 << USB_PORT_FEAT_C_OVER_CURRENT;
+ 
+ 		/* whoever resumes must GetPortStatus to complete it!! */
+-		if ((temp & PORT_RESUME)
+-				&& time_after (jiffies,
+-					ehci->reset_done [wIndex])) {
+-			status |= 1 << USB_PORT_FEAT_C_SUSPEND;
+-			ehci->reset_done [wIndex] = 0;
++		if (temp & PORT_RESUME) {
+ 
+-			/* stop resume signaling */
+-			temp = ehci_readl(ehci, status_reg);
+-			ehci_writel(ehci,
++			/* Remote Wakeup received? */
++			if (!ehci->reset_done[wIndex]) {
++				/* resume signaling for 20 msec */
++				ehci->reset_done[wIndex] = jiffies
++						+ msecs_to_jiffies(20);
++				/* check the port again */
++				mod_timer(&ehci_to_hcd(ehci)->rh_timer,
++						ehci->reset_done[wIndex]);
++			}
++
++			/* resume completed? */
++			else if (time_after_eq(jiffies,
++					ehci->reset_done[wIndex])) {
++				status |= 1 << USB_PORT_FEAT_C_SUSPEND;
++				ehci->reset_done[wIndex] = 0;
++
++				/* stop resume signaling */
++				temp = ehci_readl(ehci, status_reg);
++				ehci_writel(ehci,
+ 					temp & ~(PORT_RWC_BITS | PORT_RESUME),
+ 					status_reg);
+-			retval = handshake(ehci, status_reg,
++				retval = handshake(ehci, status_reg,
+ 					   PORT_RESUME, 0, 2000 /* 2msec */);
+-			if (retval != 0) {
+-				ehci_err (ehci, "port %d resume error %d\n",
+-					wIndex + 1, retval);
+-				goto error;
++				if (retval != 0) {
++					ehci_err(ehci,
++						"port %d resume error %d\n",
++						wIndex + 1, retval);
++					goto error;
++				}
++				temp &= ~(PORT_SUSPEND|PORT_RESUME|(3<<10));
+ 			}
+-			temp &= ~(PORT_SUSPEND|PORT_RESUME|(3<<10));
+ 		}
+ 
+ 		/* whoever resets must GetPortStatus to complete it!! */
+ 		if ((temp & PORT_RESET)
+-				&& time_after (jiffies,
+-					ehci->reset_done [wIndex])) {
++				&& time_after_eq(jiffies,
++					ehci->reset_done[wIndex])) {
+ 			status |= 1 << USB_PORT_FEAT_C_RESET;
+ 			ehci->reset_done [wIndex] = 0;
+ 
