@@ -1,0 +1,216 @@
+From oliver@neukum.name Fri Jan 26 05:26:29 2007
+From: Oliver Neukum <oliver@neukum.name>
+Date: Fri, 26 Jan 2007 14:26:21 +0100
+Subject: USB: add a blacklist for devices that can't handle some things we throw at them.
+To: linux-usb-devel@lists.sourceforge.net, Alan Stern <stern@rowland.harvard.edu>, gregkh@suse.de, Prakash Punnoor <prakash@punnoor.de>
+Message-ID: <200701261426.21765.oliver@neukum.name>
+Content-Disposition: inline
+
+From: Oliver Neukum <oneukum@suse.de>
+
+This adds a blacklist to the USB core to handle some autosuspend and
+string issues that devices have.
+
+Originally written by Oliver, but hacked up a lot by Greg.
+
+Signed-off-by: Oliver Neukum <oneukum@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/Makefile  |    2 -
+ drivers/usb/core/hub.c     |    3 +
+ drivers/usb/core/message.c |    4 ++
+ drivers/usb/core/quirks.c  |   80 +++++++++++++++++++++++++++++++++++++++++++++
+ drivers/usb/core/sysfs.c   |   11 ++++++
+ drivers/usb/core/usb.h     |    1 
+ include/linux/usb.h        |    1 
+ include/linux/usb/quirks.h |   11 ++++++
+ 8 files changed, 112 insertions(+), 1 deletion(-)
+
+--- gregkh-2.6.orig/drivers/usb/core/Makefile
++++ gregkh-2.6/drivers/usb/core/Makefile
+@@ -4,7 +4,7 @@
+ 
+ usbcore-objs	:= usb.o hub.o hcd.o urb.o message.o driver.o \
+ 			config.o file.o buffer.o sysfs.o endpoint.o \
+-			devio.o notify.o generic.o
++			devio.o notify.o generic.o quirks.o
+ 
+ ifeq ($(CONFIG_PCI),y)
+ 	usbcore-objs	+= hcd-pci.o
+--- gregkh-2.6.orig/drivers/usb/core/hub.c
++++ gregkh-2.6/drivers/usb/core/hub.c
+@@ -1283,6 +1283,9 @@ int usb_new_device(struct usb_device *ud
+ 	if (!try_module_get(THIS_MODULE))
+ 		return -EINVAL;
+ 
++	/* Determine quirks */
++	usb_detect_quirks(udev);
++
+ 	err = usb_get_configuration(udev);
+ 	if (err < 0) {
+ 		dev_err(&udev->dev, "can't read configurations, error %d\n",
+--- gregkh-2.6.orig/drivers/usb/core/message.c
++++ gregkh-2.6/drivers/usb/core/message.c
+@@ -11,6 +11,7 @@
+ #include <linux/timer.h>
+ #include <linux/ctype.h>
+ #include <linux/device.h>
++#include <linux/usb/quirks.h>
+ #include <asm/byteorder.h>
+ #include <asm/scatterlist.h>
+ 
+@@ -810,6 +811,9 @@ char *usb_cache_string(struct usb_device
+ 	char *smallbuf = NULL;
+ 	int len;
+ 
++	if (udev->quirks & USB_QUIRK_STRING_FETCH)
++		return NULL;
++
+ 	if (index > 0 && (buf = kmalloc(256, GFP_KERNEL)) != NULL) {
+ 		if ((len = usb_string(udev, index, buf, 256)) > 0) {
+ 			if ((smallbuf = kmalloc(++len, GFP_KERNEL)) == NULL)
+--- /dev/null
++++ gregkh-2.6/drivers/usb/core/quirks.c
+@@ -0,0 +1,80 @@
++/*
++ * USB device quirk handling logic and table
++ *
++ * Copyright (c) 2007 Oliver Neukum
++ * Copyright (c) 2007 Greg Kroah-Hartman <gregkh@suse.de>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the Free
++ * Software Foundation, version 2.
++ *
++ *
++ */
++
++#include <linux/usb.h>
++#include <linux/usb/quirks.h>
++#include "usb.h"
++
++/* List of quirky USB devices.  Please keep this list ordered by:
++ * 	1) Vendor ID
++ * 	2) Product ID
++ * 	3) Class ID
++ *
++ * as we want specific devices to be overridden first, and only after that, any
++ * class specific quirks.
++ *
++ * Right now the logic aborts if it finds a valid device in the table, we might
++ * want to change that in the future if it turns out that a whole class of
++ * devices is broken...
++ */
++static const struct usb_device_id usb_quirk_list[] = {
++	/* HP 5300/5370C scanner */
++	{ USB_DEVICE(0x03f0, 0x0701), .driver_info = USB_QUIRK_STRING_FETCH },
++
++	/* Seiko Epson Corp. Perfection 1250 */
++	{ USB_DEVICE(0x04b8, 0x010f), .driver_info = USB_QUIRK_NO_AUTOSUSPEND },
++
++	/* Elsa MicroLink 56k (V.250) */
++	{ USB_DEVICE(0x05cc, 0x2267), .driver_info = USB_QUIRK_NO_AUTOSUSPEND },
++
++	/* USB Blackberry devices */
++	{ USB_DEVICE(0x0fca, 0x0001), .driver_info = USB_QUIRK_NO_AUTOSUSPEND },
++
++	{ }  /* terminating entry must be last */
++};
++
++static void usb_autosuspend_quirk(struct usb_device *udev)
++{
++	/* unbalanced resume that will prevent autosuspension */
++	usb_autoresume_device(udev);
++}
++
++static const struct usb_device_id *find_id(struct usb_device *udev)
++{
++	const struct usb_device_id *id = usb_quirk_list;
++
++	for (; id->idVendor || id->bDeviceClass || id->bInterfaceClass ||
++	       id->driver_info; id++) {
++		if (usb_match_device(udev, id))
++			return id;
++	}
++	return NULL;
++}
++
++/*
++ * Detect any quirks the device has, and do any housekeeping for it if needed.
++ */
++void usb_detect_quirks(struct usb_device *udev)
++{
++	const struct usb_device_id *id = usb_quirk_list;
++
++	id = find_id(udev);
++	if (id)
++		udev->quirks = (u32)(id->driver_info);
++
++	dev_dbg(&udev->dev, "USB quirks for this device: %x\n", udev->quirks);
++
++	/* do any special quirk handling here if needed */
++	if (udev->quirks & USB_QUIRK_NO_AUTOSUSPEND)
++		usb_autosuspend_quirk(udev);
++}
+--- gregkh-2.6.orig/drivers/usb/core/sysfs.c
++++ gregkh-2.6/drivers/usb/core/sysfs.c
+@@ -148,6 +148,16 @@ show_maxchild(struct device *dev, struct
+ }
+ static DEVICE_ATTR(maxchild, S_IRUGO, show_maxchild, NULL);
+ 
++static ssize_t
++show_quirks(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct usb_device *udev;
++
++	udev = to_usb_device(dev);
++	return sprintf(buf, "%d\n", udev->quirks);
++}
++static DEVICE_ATTR(quirks, S_IRUGO, show_quirks, NULL);
++
+ /* Descriptor fields */
+ #define usb_descriptor_attr_le16(field, format_string)			\
+ static ssize_t								\
+@@ -204,6 +214,7 @@ static struct attribute *dev_attrs[] = {
+ 	&dev_attr_devnum.attr,
+ 	&dev_attr_version.attr,
+ 	&dev_attr_maxchild.attr,
++	&dev_attr_quirks.attr,
+ 	NULL,
+ };
+ static struct attribute_group dev_attr_grp = {
+--- gregkh-2.6.orig/drivers/usb/core/usb.h
++++ gregkh-2.6/drivers/usb/core/usb.h
+@@ -13,6 +13,7 @@ extern void usb_disable_interface (struc
+ 		struct usb_interface *intf);
+ extern void usb_release_interface_cache(struct kref *ref);
+ extern void usb_disable_device (struct usb_device *dev, int skip_ep0);
++extern void usb_detect_quirks(struct usb_device *udev);
+ 
+ extern int usb_get_device_descriptor(struct usb_device *dev,
+ 		unsigned int size);
+--- gregkh-2.6.orig/include/linux/usb.h
++++ gregkh-2.6/include/linux/usb.h
+@@ -388,6 +388,7 @@ struct usb_device {
+ 	struct usb_device *children[USB_MAXCHILDREN];
+ 
+ 	int pm_usage_cnt;		/* usage counter for autosuspend */
++	u32 quirks;			/* quirks of the whole device */
+ #ifdef CONFIG_PM
+ 	struct delayed_work autosuspend; /* for delayed autosuspends */
+ 	struct mutex pm_mutex;		/* protects PM operations */
+--- /dev/null
++++ gregkh-2.6/include/linux/usb/quirks.h
+@@ -0,0 +1,11 @@
++/*
++ * This file holds the definitions of quirks found in USB devices
++ * Only quirks that affect the whole device, not an interface,
++ * belong here
++ */
++
++/* devices which must not be autosuspended */
++#define USB_QUIRK_NO_AUTOSUSPEND	0x00000001
++
++/* devices which crash when string descriptors are fetched */
++#define USB_QUIRK_STRING_FETCH		0x00000002
