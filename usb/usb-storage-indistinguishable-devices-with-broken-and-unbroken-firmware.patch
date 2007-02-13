@@ -1,0 +1,99 @@
+From oneukum@suse.de Thu Feb  8 00:04:39 2007
+From: Oliver Neukum <oneukum@suse.de>
+Date: Thu, 8 Feb 2007 09:04:48 +0100
+Subject: USB Storage: indistinguishable devices with broken and unbroken firmware
+To: usb-storage@lists.one-eyed-alien.net, linux-scsi@vger.kernel.org, gregkh@suse.de, Alan Stern <stern@rowland.harvard.edu>
+Message-ID: <200702080904.48806.oneukum@suse.de>
+Content-Disposition: inline
+
+there's a USB mass storage device which exists in two version. One
+reports the correct size and the other does not. Apart from that they
+are identical and cannot be told apart. Here's a heuristic based on the
+empirical finding that drives have even sizes.
+
+
+Signed-off-by: Oliver Neukum <oneukum@suse.de>
+Acked-by: Alan Stern <stern@rowland.harvard.edu>
+Acked-by: Matthew Dharm <mdharm-usb@one-eyed-alien.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ drivers/scsi/sd.c                  |   11 ++++++++++-
+ drivers/usb/storage/scsiglue.c     |    6 ++++++
+ drivers/usb/storage/unusual_devs.h |    2 +-
+ include/linux/usb_usual.h          |    4 +++-
+ include/scsi/scsi_device.h         |    1 +
+ 5 files changed, 21 insertions(+), 3 deletions(-)
+
+--- gregkh-2.6.orig/drivers/scsi/sd.c
++++ gregkh-2.6/drivers/scsi/sd.c
+@@ -1270,9 +1270,18 @@ repeat:
+ 
+ 	/* Some devices return the total number of sectors, not the
+ 	 * highest sector number.  Make the necessary adjustment. */
+-	if (sdp->fix_capacity)
++	if (sdp->fix_capacity) {
+ 		--sdkp->capacity;
+ 
++	/* Some devices have version which report the correct sizes
++	 * and others which do not. We guess size according to a heuristic
++	 * and err on the side of lowering the capacity. */
++	} else {
++		if (sdp->guess_capacity)
++			if (sdkp->capacity & 0x01) /* odd sizes are odd */
++				--sdkp->capacity;
++	}
++
+ got_data:
+ 	if (sector_size == 0) {
+ 		sector_size = 512;
+--- gregkh-2.6.orig/drivers/usb/storage/scsiglue.c
++++ gregkh-2.6/drivers/usb/storage/scsiglue.c
+@@ -153,6 +153,12 @@ static int slave_configure(struct scsi_d
+ 		if (us->flags & US_FL_FIX_CAPACITY)
+ 			sdev->fix_capacity = 1;
+ 
++		/* A few disks have two indistinguishable version, one of
++		 * which reports the correct capacity and the other does not.
++		 * The sd driver has to guess which is the case. */
++		if (us->flags & US_FL_CAPACITY_HEURISTICS)
++			sdev->guess_capacity = 1;
++
+ 		/* Some devices report a SCSI revision level above 2 but are
+ 		 * unable to handle the REPORT LUNS command (for which
+ 		 * support is mandatory at level 3).  Since we already have
+--- gregkh-2.6.orig/drivers/usb/storage/unusual_devs.h
++++ gregkh-2.6/drivers/usb/storage/unusual_devs.h
+@@ -1434,7 +1434,7 @@ UNUSUAL_DEV(  0xed06, 0x4500, 0x0001, 0x
+ 		"DataStor",
+ 		"USB4500 FW1.04",
+ 		US_SC_DEVICE, US_PR_DEVICE, NULL,
+-		US_FL_FIX_CAPACITY),
++		US_FL_CAPACITY_HEURISTICS),
+ 
+ /* Control/Bulk transport for all SubClass values */
+ USUAL_DEV(US_SC_RBC, US_PR_CB, USB_US_TYPE_STOR),
+--- gregkh-2.6.orig/include/linux/usb_usual.h
++++ gregkh-2.6/include/linux/usb_usual.h
+@@ -46,7 +46,9 @@
+ 	US_FLAG(MAX_SECTORS_64,	0x00000400)			\
+ 		/* Sets max_sectors to 64    */			\
+ 	US_FLAG(IGNORE_DEVICE,	0x00000800)			\
+-		/* Don't claim device */
++		/* Don't claim device */			\
++	US_FLAG(CAPACITY_HEURISTICS,	0x00001000)		\
++		/* sometimes sizes is too big */
+ 
+ #define US_FLAG(name, value)	US_FL_##name = value ,
+ enum { US_DO_ALL_FLAGS };
+--- gregkh-2.6.orig/include/scsi/scsi_device.h
++++ gregkh-2.6/include/scsi/scsi_device.h
+@@ -122,6 +122,7 @@ struct scsi_device {
+ 	unsigned no_uld_attach:1; /* disable connecting to upper level drivers */
+ 	unsigned select_no_atn:1;
+ 	unsigned fix_capacity:1;	/* READ_CAPACITY is too high by 1 */
++	unsigned guess_capacity:1;	/* READ_CAPACITY might be too high by 1 */
+ 	unsigned retry_hwerror:1;	/* Retry HARDWARE_ERROR */
+ 
+ 	unsigned int device_blocked;	/* Device returned QUEUE_FULL. */
