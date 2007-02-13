@@ -1,0 +1,389 @@
+From hjk@linutronix.de  Mon Feb 12 22:58:23 2007
+From: Hans-Jürgen Koch <hjk@linutronix.de>
+Date: Wed, 7 Feb 2007 18:17:36 +0100
+Subject: UIO: support for multiple mappings
+To: Greg KH <greg@kroah.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>, Benedikt Spranger <b.spranger@linutronix.de>
+Message-ID: <200702071817.37519.hjk@linutronix.de>
+
+
+You can now have more than one mappable memory area for UIO devices.
+These areas appear in sysfs like:
+
+/sys/class/uio/uio0/maps/map0/{addr|size} and so on.
+
+To choose mapping N, you have to give N*getpagesize() as the "offset"
+parameter in the user space mmap() call. The mapping always starts at
+the beginning of an area. The maximum size is the size as found in
+sysfs, rounded up to full page sizes (this was not handled correctly in
+the previous version, btw).
+
+I tested this with the Hilscher CIF driver (DeviceNet card), with two
+PCI regions mapped. It seems to work fine.
+
+---
+ drivers/uio/uio.c          |  183 +++++++++++++++++++++++++++++++--------------
+ include/linux/uio_driver.h |   28 ++++--
+ 2 files changed, 148 insertions(+), 63 deletions(-)
+
+--- gregkh-2.6.orig/drivers/uio/uio.c
++++ gregkh-2.6/drivers/uio/uio.c
+@@ -1,5 +1,5 @@
+ /*
+- * driver/uio/uio.c
++ * drivers/uio/uio.c
+  *
+  * Copyright(C) 2005, Benedikt Spranger <b.spranger@linutronix.de>
+  * Copyright(C) 2005, Thomas Gleixner <tglx@linutronix.de>
+@@ -19,6 +19,8 @@
+ #include <linux/device.h>
+ #include <linux/mm.h>
+ #include <linux/idr.h>
++#include <linux/string.h>
++#include <linux/kobject.h>
+ #include <linux/uio_driver.h>
+ 
+ #define UIO_MAX_DEVICES 255
+@@ -32,6 +34,7 @@ struct uio_device {
+ 	wait_queue_head_t	wait;
+ 	int			vma_count;
+ 	struct uio_info		*info;
++	struct kset 		map_attr_kset;
+ };
+ 
+ static int uio_major;
+@@ -47,38 +50,62 @@ static struct uio_class {
+ /*
+  * attributes
+  */
+-static ssize_t show_addr(struct device *dev,
+-			 struct device_attribute *attr, char *buf)
++
++static struct attribute attr_addr = {
++	.owner = THIS_MODULE,
++	.name  = "addr",
++	.mode  = S_IRUGO,
++};
++
++static struct attribute attr_size = {
++	.owner = THIS_MODULE,
++	.name  = "size",
++	.mode  = S_IRUGO,
++};
++
++static struct attribute* map_attrs[] = {
++	&attr_addr, &attr_size, NULL
++};
++
++static ssize_t map_attr_show(struct kobject *kobj, struct attribute *attr,
++			     char *buf)
+ {
+-	struct uio_device *idev = dev_get_drvdata(dev);
+-	if (idev)
+-		return sprintf(buf, "0x%lx\n", idev->info->addr);
+-	else
+-		return -ENODEV;
++	struct uio_mem *mem = container_of(kobj, struct uio_mem, kobj);
++
++	if (strncmp(attr->name,"addr",4) == 0)
++		return sprintf(buf, "0x%lx\n", mem->addr);
++
++	if (strncmp(attr->name,"size",4) == 0)
++		return sprintf(buf, "0x%lx\n", mem->size);
++
++	return -ENODEV;
+ }
+-static DEVICE_ATTR(addr, S_IRUGO, show_addr, NULL);
+ 
+-static ssize_t show_name(struct device *dev,
+-			 struct device_attribute *attr, char *buf)
++static void map_attr_release(struct kobject *kobj)
+ {
+-	struct uio_device *idev = dev_get_drvdata(dev);
+-	if (idev)
+-		return sprintf(buf, "%s\n", idev->info->name);
+-	else
+-		return -ENODEV;
++	/* TODO ??? */
+ }
+-static DEVICE_ATTR(name, S_IRUGO, show_name, NULL);
+ 
+-static ssize_t show_size(struct device *dev,
++static struct sysfs_ops map_attr_ops = {
++	.show  = map_attr_show,
++};
++
++static struct kobj_type map_attr_type = {
++	.release	= map_attr_release,
++	.sysfs_ops	= &map_attr_ops,
++	.default_attrs	= map_attrs,
++};
++
++static ssize_t show_name(struct device *dev,
+ 			 struct device_attribute *attr, char *buf)
+ {
+ 	struct uio_device *idev = dev_get_drvdata(dev);
+ 	if (idev)
+-		return sprintf(buf, "0x%lx\n", idev->info->size);
++		return sprintf(buf, "%s\n", idev->info->name);
+ 	else
+ 		return -ENODEV;
+ }
+-static DEVICE_ATTR(size, S_IRUGO, show_size, NULL);
++static DEVICE_ATTR(name, S_IRUGO, show_name, NULL);
+ 
+ static ssize_t show_version(struct device *dev,
+ 			    struct device_attribute *attr, char *buf)
+@@ -109,6 +136,7 @@ static struct attribute *uio_attrs[] = {
+ 	&dev_attr_event.attr,
+ 	NULL,
+ };
++
+ static struct attribute_group uio_attr_grp = {
+ 	.attrs = uio_attrs,
+ };
+@@ -119,26 +147,46 @@ static struct attribute_group uio_attr_g
+ static int uio_dev_add_attributes(struct uio_device *idev)
+ {
+ 	int ret;
++	int mi;
++	int map_found = 0;
++	struct uio_mem *mem;
+ 
+ 	ret = sysfs_create_group(&idev->dev->kobj, &uio_attr_grp);
+ 	if (ret)
+ 		goto err_group;
+-	if (idev->info->addr) {
+-		ret = device_create_file(idev->dev, &dev_attr_addr);
+-		if (ret)
+-			goto err_addr;
+-	}
+-	if (idev->info->size) {
+-		ret = device_create_file(idev->dev, &dev_attr_size);
++
++	for (mi = 0; mi < MAX_UIO_MAPS; mi++) {
++		mem = &idev->info->mem[mi];
++		if (mem->size == 0)
++			break;
++		if (!map_found) {
++			map_found = 1;
++			kobject_set_name(&idev->map_attr_kset.kobj,"maps");
++			idev->map_attr_kset.ktype = &map_attr_type;
++			idev->map_attr_kset.kobj.parent = &idev->dev->kobj;
++			idev->map_attr_kset.subsys = &uio_class->class->subsys;
++			ret = kset_register(&idev->map_attr_kset);
++			if (ret)
++				goto err_remove_group;
++		}
++		kobject_init(&mem->kobj);
++		kobject_set_name(&mem->kobj,"map%d",mi);
++		mem->kobj.parent = &idev->map_attr_kset.kobj;
++		mem->kobj.kset = &idev->map_attr_kset;
++		ret = kobject_add(&mem->kobj);
+ 		if (ret)
+-			goto err_size;
++			goto err_remove_maps;
+ 	}
++
+ 	return 0;
+ 
+-err_size:
+-	if (idev->info->addr)
+-		device_remove_file(idev->dev, &dev_attr_addr);
+-err_addr:
++err_remove_maps:
++	for (mi--; mi>=0; mi--) {
++		mem = &idev->info->mem[mi];
++		kobject_unregister(&mem->kobj);
++	}
++	kset_unregister(&idev->map_attr_kset); /* Needed ? */
++err_remove_group:
+ 	sysfs_remove_group(&idev->dev->kobj, &uio_attr_grp);
+ err_group:
+ 	dev_err(idev->dev, "error creating sysfs files (%d)\n", ret);
+@@ -147,11 +195,16 @@ err_group:
+ 
+ static void uio_dev_del_attributes(struct uio_device *idev)
+ {
++	int mi;
++	struct uio_mem *mem;
++	for (mi = 0; mi < MAX_UIO_MAPS; mi++) {
++		mem = &idev->info->mem[mi];
++		if (mem->size == 0)
++			break;
++		kobject_unregister(&mem->kobj);
++	}
++	kset_unregister(&idev->map_attr_kset);
+ 	sysfs_remove_group(&idev->dev->kobj, &uio_attr_grp);
+-	if (idev->info->addr)
+-		device_remove_file(idev->dev, &dev_attr_addr);
+-	if (idev->info->size)
+-		device_remove_file(idev->dev, &dev_attr_size);
+ }
+ 
+ static int uio_get_minor(struct uio_device *idev)
+@@ -334,6 +387,20 @@ static ssize_t uio_read(struct file *fil
+ 	return retval;
+ }
+ 
++static int uio_find_mem_index(struct vm_area_struct *vma)
++{
++	int mi;
++	struct uio_device *idev = vma->vm_private_data;
++
++	for (mi = 0; mi < MAX_UIO_MAPS; mi++) {
++		if (idev->info->mem[mi].size == 0)
++			return -1;
++		if (vma->vm_pgoff == mi)
++			return mi;
++	}
++	return -1;
++}
++
+ static void uio_vma_open(struct vm_area_struct *vma)
+ {
+ 	struct uio_device *idev = vma->vm_private_data;
+@@ -351,14 +418,15 @@ static struct page *uio_vma_nopage(struc
+ {
+ 	struct uio_device *idev = vma->vm_private_data;
+ 	struct page* page = NOPAGE_SIGBUS;
+-	unsigned long offset;
+-	offset = (address - vma->vm_start) + (vma->vm_pgoff << PAGE_SHIFT);
+-	if (offset >= idev->info->size)
++
++	int mi = uio_find_mem_index(vma);
++	if (mi < 0)
+ 		return page;
+-	if (idev->info->memtype == UIO_MEM_LOGICAL)
+-		page = virt_to_page(idev->info->addr);
++
++	if (idev->info->mem[mi].memtype == UIO_MEM_LOGICAL)
++		page = virt_to_page(idev->info->mem[mi].addr);
+ 	else
+-		page = vmalloc_to_page((void *)idev->info->addr);
++		page = vmalloc_to_page((void*)idev->info->mem[mi].addr);
+ 	get_page(page);
+ 	if (type)
+ 		*type = VM_FAULT_MINOR;
+@@ -374,17 +442,17 @@ static struct vm_operations_struct uio_v
+ static int uio_mmap_physical(struct vm_area_struct *vma)
+ {
+ 	struct uio_device *idev = vma->vm_private_data;
+-	unsigned long vsize = vma->vm_end - vma->vm_start;
++	int mi = uio_find_mem_index(vma);
+ 
+-	if (vsize > idev->info->size)
++	if (mi < 0)
+ 		return -EINVAL;
+ 
+ 	vma->vm_flags |= VM_IO | VM_RESERVED;
+ 
+ 	return remap_pfn_range(vma,
+ 			       vma->vm_start,
+-			       idev->info->addr >> PAGE_SHIFT,
+-			       vsize,
++			       idev->info->mem[mi].addr >> PAGE_SHIFT,
++			       vma->vm_end - vma->vm_start,
+ 			       vma->vm_page_prot);
+ }
+ 
+@@ -400,15 +468,23 @@ static int uio_mmap(struct file *filep, 
+ {
+ 	struct uio_listener *listener = filep->private_data;
+ 	struct uio_device *idev = listener->dev;
++	int mi;
++	unsigned long requested_pages, actual_pages;
+ 	int ret = 0;
+ 
+ 	if (vma->vm_end < vma->vm_start)
+ 		return -EINVAL;
+ 
+-	if ((unsigned long)(vma->vm_end - vma->vm_start) > idev->info->size)
++	vma->vm_private_data = idev;
++
++	mi = uio_find_mem_index(vma);
++	if (mi < 0)
+ 		return -EINVAL;
+ 
+-	vma->vm_private_data  = idev;
++	requested_pages = (vma->vm_end - vma->vm_start) >> PAGE_SHIFT;
++	actual_pages = (idev->info->mem[mi].size + PAGE_SIZE -1) >> PAGE_SHIFT;
++	if (requested_pages > actual_pages)
++		return -EINVAL;
+ 
+ 	if (idev->info->mmap) {
+ 		if (!try_module_get(idev->owner))
+@@ -418,7 +494,7 @@ static int uio_mmap(struct file *filep, 
+ 		return ret;
+ 	}
+ 
+-	switch (idev->info->memtype) {
++	switch (idev->info->mem[mi].memtype) {
+ 		case UIO_MEM_PHYS:
+ 			return uio_mmap_physical(vma);
+ 		case UIO_MEM_LOGICAL:
+@@ -508,14 +584,11 @@ static void uio_class_destroy(void)
+ /**
+  * uio_register_device - register a new userspace IO device
+  *
+- * @owner:	module owner of this device.
+  * @parent:	parent device
+- * @info:	struct uio_info to describe the device.
++ * @idev:	device capabilities
+  *
+- * Returns a pointer to a struct uio_device if the device can be created
+- * successfully, otherwise a negative error code is returned.  On
+- * success the device is registered with the driver core and is ready to
+- * be used by userspace.  error code.
++ * returns a positive UIO device driver identifier or a negative
++ * error code.
+  */
+ struct uio_device *__uio_register_device(struct module *owner,
+ 					 struct device *parent,
+--- gregkh-2.6.orig/include/linux/uio_driver.h
++++ gregkh-2.6/include/linux/uio_driver.h
+@@ -19,14 +19,28 @@
+ #include <linux/interrupt.h>
+ 
+ /**
+- * struct uio_info - UIO device description.
+- *
+- * @owner:		module owner of this device.
+- * @name:		device name
+- * @version:		device driver version
++ * uio_mem - description of a UIO memory region
++ * @kobj:		kobject for this mapping
+  * @addr:		address of the device's memory
+  * @size:		size of IO
+  * @memtype:		type of memory addr points to
++ * @internal_addr:	ioremap-ped version of addr, for driver internal use
++ */
++struct uio_mem {
++	struct kobject		kobj;
++	unsigned long		addr;
++	unsigned long		size;
++	int			memtype;
++	void			*internal_addr;
++};
++
++#define MAX_UIO_MAPS 	5
++
++/**
++ * uio_info - UIO device capabilities
++ * @name:		device name
++ * @version:		device driver version
++ * @mem:		list of mappable memory regions, size==0 for end of list
+  * @irq:		interrupt number or UIO_IRQ_CUSTOM
+  * @irq_flags		flags for request_irq()
+  * @handler:		the device's irq handler
+@@ -38,9 +52,7 @@ struct uio_info {
+ 	struct module 		*owner;
+ 	char			*name;
+ 	char			*version;
+-	unsigned long		addr;
+-	unsigned long		size;
+-	int			memtype;
++	struct uio_mem		mem[ MAX_UIO_MAPS ];
+ 	long			irq;
+ 	unsigned long		irq_flags;
+ 	irqreturn_t (*handler)(int irq, struct uio_info *dev_info);

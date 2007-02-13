@@ -1,0 +1,115 @@
+From stern@rowland.harvard.edu  Mon Feb 12 22:57:56 2007
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Thu, 8 Feb 2007 16:40:43 -0500 (EST)
+Subject: USB: unconfigure devices which have config 0
+To: Greg KH <greg@kroah.com>
+Message-ID: <Pine.LNX.4.44L0.0702081639100.2518-100000@iolanthe.rowland.org>
+
+
+Some USB devices do have a configuration 0, in contravention of the
+USB spec.  Normally 0 is supposed to indicate that a device is
+unconfigured.
+
+While we can't change what the device is doing, we can change usbcore.
+This patch (as852) allows usb_set_configuration() to accept a config
+value of -1 as indicating that the device should be unconfigured.  The
+request actually sent to the device will still contain 0 as the value.
+But even if the device does have a configuration 0, dev->actconfig
+will be set to NULL and dev->state will be set to USB_STATE_ADDRESS.
+
+Without some sort of special-case handling like this, there is no way
+to unconfigure these non-compliant devices.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/devio.c   |    4 ++--
+ drivers/usb/core/generic.c |    2 +-
+ drivers/usb/core/message.c |   22 ++++++++++++++++++----
+ drivers/usb/core/sysfs.c   |    2 +-
+ 4 files changed, 22 insertions(+), 8 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/core/devio.c
++++ gregkh-2.6/drivers/usb/core/devio.c
+@@ -857,11 +857,11 @@ static int proc_setintf(struct dev_state
+ 
+ static int proc_setconfig(struct dev_state *ps, void __user *arg)
+ {
+-	unsigned int u;
++	int u;
+ 	int status = 0;
+  	struct usb_host_config *actconfig;
+ 
+-	if (get_user(u, (unsigned int __user *)arg))
++	if (get_user(u, (int __user *)arg))
+ 		return -EFAULT;
+ 
+  	actconfig = ps->dev->actconfig;
+--- gregkh-2.6.orig/drivers/usb/core/generic.c
++++ gregkh-2.6/drivers/usb/core/generic.c
+@@ -184,7 +184,7 @@ static void generic_disconnect(struct us
+ 	/* if this is only an unbind, not a physical disconnect, then
+ 	 * unconfigure the device */
+ 	if (udev->actconfig)
+-		usb_set_configuration(udev, 0);
++		usb_set_configuration(udev, -1);
+ 
+ 	usb_remove_sysfs_dev_files(udev);
+ }
+--- gregkh-2.6.orig/drivers/usb/core/message.c
++++ gregkh-2.6/drivers/usb/core/message.c
+@@ -1316,6 +1316,14 @@ static void release_interface(struct dev
+  * use this kind of configurability; many devices only have one
+  * configuration.
+  *
++ * @configuration is the value of the configuration to be installed.
++ * According to the USB spec (e.g. section 9.1.1.5), configuration values
++ * must be non-zero; a value of zero indicates that the device in
++ * unconfigured.  However some devices erroneously use 0 as one of their
++ * configuration values.  To help manage such devices, this routine will
++ * accept @configuration = -1 as indicating the device should be put in
++ * an unconfigured state.
++ *
+  * USB device configurations may affect Linux interoperability,
+  * power consumption and the functionality available.  For example,
+  * the default configuration is limited to using 100mA of bus power,
+@@ -1347,10 +1355,15 @@ int usb_set_configuration(struct usb_dev
+ 	struct usb_interface **new_interfaces = NULL;
+ 	int n, nintf;
+ 
+-	for (i = 0; i < dev->descriptor.bNumConfigurations; i++) {
+-		if (dev->config[i].desc.bConfigurationValue == configuration) {
+-			cp = &dev->config[i];
+-			break;
++	if (configuration == -1)
++		configuration = 0;
++	else {
++		for (i = 0; i < dev->descriptor.bNumConfigurations; i++) {
++			if (dev->config[i].desc.bConfigurationValue ==
++					configuration) {
++				cp = &dev->config[i];
++				break;
++			}
+ 		}
+ 	}
+ 	if ((!cp && configuration != 0))
+@@ -1359,6 +1372,7 @@ int usb_set_configuration(struct usb_dev
+ 	/* The USB spec says configuration 0 means unconfigured.
+ 	 * But if a device includes a configuration numbered 0,
+ 	 * we will accept it as a correctly configured state.
++	 * Use -1 if you really want to unconfigure the device.
+ 	 */
+ 	if (cp && configuration == 0)
+ 		dev_warn(&dev->dev, "config 0 descriptor??\n");
+--- gregkh-2.6.orig/drivers/usb/core/sysfs.c
++++ gregkh-2.6/drivers/usb/core/sysfs.c
+@@ -63,7 +63,7 @@ set_bConfigurationValue(struct device *d
+ 	struct usb_device	*udev = to_usb_device(dev);
+ 	int			config, value;
+ 
+-	if (sscanf(buf, "%u", &config) != 1 || config > 255)
++	if (sscanf(buf, "%d", &config) != 1 || config < -1 || config > 255)
+ 		return -EINVAL;
+ 	usb_lock_device(udev);
+ 	value = usb_set_configuration(udev, config);
