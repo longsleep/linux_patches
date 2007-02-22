@@ -13,11 +13,11 @@ Cc: Robert Marquardt <marquardt@codemercs.com>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
- drivers/usb/misc/Kconfig     |   14 
- drivers/usb/misc/Makefile    |    1 
- drivers/usb/misc/iowarrior.c |  914 +++++++++++++++++++++++++++++++++++++++++++
- drivers/usb/misc/iowarrior.h |   31 +
- 4 files changed, 960 insertions(+)
+ drivers/usb/misc/Kconfig      |   14 
+ drivers/usb/misc/Makefile     |    1 
+ drivers/usb/misc/iowarrior.c  |  925 ++++++++++++++++++++++++++++++++++++++++++
+ include/linux/usb/iowarrior.h |   33 +
+ 4 files changed, 973 insertions(+)
 
 --- gregkh-2.6.orig/drivers/usb/misc/Kconfig
 +++ gregkh-2.6/drivers/usb/misc/Kconfig
@@ -54,7 +54,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  obj-$(CONFIG_USB_LED)		+= usbled.o
 --- /dev/null
 +++ gregkh-2.6/drivers/usb/misc/iowarrior.c
-@@ -0,0 +1,914 @@
+@@ -0,0 +1,925 @@
 +/*
 + *  Native support for the I/O-Warrior USB devices
 + *
@@ -77,7 +77,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#include <linux/sched.h>
 +#include <linux/poll.h>
 +#include <linux/version.h>
-+#include "iowarrior.h"
++#include <linux/usb/iowarrior.h>
 +
 +/* Version Information */
 +#define DRIVER_VERSION "v0.4.0"
@@ -105,7 +105,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +/*
 +   maximum number of urbs that are submitted for writes at the same time,
 +   this applies to the IOWarrior56 only!
-+   IOWarrior24 and IOWarrior40 use synchronus usb_control_msg calls.
++   IOWarrior24 and IOWarrior40 use synchronous usb_control_msg calls.
 +*/
 +#define MAX_WRITES_IN_FLIGHT 4
 +
@@ -150,7 +150,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	int present;			/* this is 1 as long as the device is connected */
 +	int opened;			/* this is 1 if the device is currently open */
 +	char chip_serial[9];		/* the serial number string of the chip connected */
-+	int packet_size;		/* number of bytes in a report */
++	int report_size;		/* number of bytes in a report */
 +	u16 product_id;
 +};
 +
@@ -165,7 +165,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + */
 +#define GET_TIMEOUT 5
 +#define USB_REQ_GET_REPORT  0x01
-+#if 0
++//#if 0
 +static int usb_get_report(struct usb_device *dev,
 +			  struct usb_host_interface *inter, unsigned char type,
 +			  unsigned char id, void *buf, int size)
@@ -177,7 +177,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			       inter->desc.bInterfaceNumber, buf, size,
 +			       GET_TIMEOUT);
 +}
-+#endif
++//#endif
 +
 +#define USB_REQ_SET_REPORT 0x09
 +
@@ -197,7 +197,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +/* driver registration */
 +/*---------------------*/
 +/* table of devices that work with this driver */
-+struct usb_device_id iowarrior_ids[] = {
++static struct usb_device_id iowarrior_ids[] = {
 +	{USB_DEVICE(USB_VENDOR_ID_CODEMERCS, USB_DEVICE_ID_CODEMERCS_IOW40)},
 +	{USB_DEVICE(USB_VENDOR_ID_CODEMERCS, USB_DEVICE_ID_CODEMERCS_IOW24)},
 +	{USB_DEVICE(USB_VENDOR_ID_CODEMERCS, USB_DEVICE_ID_CODEMERCS_IOWPV1)},
@@ -205,7 +205,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	{USB_DEVICE(USB_VENDOR_ID_CODEMERCS, USB_DEVICE_ID_CODEMERCS_IOW56)},
 +	{}			/* Terminating entry */
 +};
-+
 +MODULE_DEVICE_TABLE(usb, iowarrior_ids);
 +
 +/*
@@ -242,10 +241,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	if ((intr_idx != read_idx)
 +	    && (dev->interface->cur_altsetting->desc.bInterfaceNumber == 0)) {
 +		/* + 1 for serial number */
-+		offset = aux_idx * (dev->packet_size + 1);
++		offset = aux_idx * (dev->report_size + 1);
 +		if (!memcmp
 +		    (dev->read_queue + offset, urb->transfer_buffer,
-+		     dev->packet_size)) {
++		     dev->report_size)) {
 +			/* equal values on interface 0 will be ignored */
 +			spin_unlock(&dev->intr_idx_lock);
 +			goto exit;
@@ -262,10 +261,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	}
 +
 +	/* +1 for serial number */
-+	offset = intr_idx * (dev->packet_size + 1);
++	offset = intr_idx * (dev->report_size + 1);
 +	memcpy(dev->read_queue + offset, urb->transfer_buffer,
-+	       dev->packet_size);
-+	*(dev->read_queue + offset + (dev->packet_size)) = dev->serial_number++;
++	       dev->report_size);
++	*(dev->read_queue + offset + (dev->report_size)) = dev->serial_number++;
 +
 +	atomic_set(&dev->intr_idx, aux_idx);
 +	spin_unlock(&dev->intr_idx_lock);
@@ -275,8 +274,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +exit:
 +	status = usb_submit_urb(urb, GFP_ATOMIC);
 +	if (status)
-+		err("%s - usb_submit_urb failed with result %d", __FUNCTION__,
-+		    status);
++		dev_err(&dev->interface->dev, "%s - usb_submit_urb failed with result %d",
++			__FUNCTION__, status);
 +
 +}
 +
@@ -347,8 +346,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	dbg("%s - minor %d, count = %zd", __func__, dev->minor, count);
 +
 +	/* read count must be packet size (+ time stamp) */
-+	if ((count != dev->packet_size)
-+	    && (count != (dev->packet_size + 1)))
++	if ((count != dev->report_size)
++	    && (count != (dev->report_size + 1)))
 +		return -EINVAL;
 +
 +	/* repeat until no buffer overrun in callback handler occur */
@@ -381,7 +380,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			}
 +		}
 +
-+		offset = read_idx * (dev->packet_size + 1);
++		offset = read_idx * (dev->report_size + 1);
 +		if (copy_to_user(buffer, dev->read_queue + offset, count)) {
 +			return -EFAULT;
 +		}
@@ -406,6 +405,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	dev = (struct iowarrior *)file->private_data;
 +
++	mutex_lock(&dev->mutex);
 +	/* verify that the device wasn't unplugged */
 +	if (dev == NULL || !dev->present) {
 +		retval = -ENODEV;
@@ -418,15 +418,16 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		goto exit;
 +	}
 +	/* We only accept full reports */
-+	if (count != dev->packet_size) {
++	if (count != dev->report_size) {
 +		retval = -EINVAL;
 +		goto exit;
 +	}
-+	if (dev->product_id == USB_DEVICE_ID_CODEMERCS_IOW24 ||
-+	    dev->product_id == USB_DEVICE_ID_CODEMERCS_IOWPV1 ||
-+	    dev->product_id == USB_DEVICE_ID_CODEMERCS_IOWPV2 ||
-+	    dev->product_id == USB_DEVICE_ID_CODEMERCS_IOW40) {
-+		/* IOW24 and IOW40 use a synchronus call */
++	switch (dev->product_id) {
++	case USB_DEVICE_ID_CODEMERCS_IOW24:
++	case USB_DEVICE_ID_CODEMERCS_IOWPV1:
++	case USB_DEVICE_ID_CODEMERCS_IOWPV2:
++	case USB_DEVICE_ID_CODEMERCS_IOW40:
++		/* IOW24 and IOW40 use a synchronous call */
 +		buf = kmalloc(8, GFP_KERNEL);	/* 8 bytes are enough for both products */
 +		if (!buf) {
 +			retval = -ENOMEM;
@@ -437,26 +438,20 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			kfree(buf);
 +			goto exit;
 +		}
-+		retval =
-+		    usb_set_report(dev->interface, 2, 0, (void *)buf, count);
++		retval = usb_set_report(dev->interface, 2, 0, buf, count);
 +		kfree(buf);
 +		goto exit;
-+	} else if (dev->product_id == USB_DEVICE_ID_CODEMERCS_IOW56) {
-+		/* The IOW56 uses asynchronus IO and more urbs */
++		break;
++	case USB_DEVICE_ID_CODEMERCS_IOW56:
++		/* The IOW56 uses asynchronous IO and more urbs */
 +		if (atomic_read(&dev->write_busy) == MAX_WRITES_IN_FLIGHT) {
 +			/* Wait until we are below the limit for submitted urbs */
 +			if (file->f_flags & O_NONBLOCK) {
 +				retval = -EAGAIN;
 +				goto exit;
 +			} else {
-+				retval =
-+				    wait_event_interruptible(dev->write_wait,
-+							     (!dev->present
-+							      ||
-+							      (atomic_read
-+							       (&dev->
-+								write_busy) <
-+							       MAX_WRITES_IN_FLIGHT)));
++				retval = wait_event_interruptible(dev->write_wait,
++								  (!dev->present || (atomic_read (&dev-> write_busy) < MAX_WRITES_IN_FLIGHT)));
 +				if (retval) {
 +					/* we were interrupted by a signal */
 +					retval = -ERESTART;
@@ -481,7 +476,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			dbg("%s Unable to allocate urb ", __func__);
 +			goto error;
 +		}
-+		buf = usb_buffer_alloc(dev->udev, dev->packet_size,
++		buf = usb_buffer_alloc(dev->udev, dev->report_size,
 +				       GFP_KERNEL, &int_out_urb->transfer_dma);
 +		if (!buf) {
 +			retval = -ENOMEM;
@@ -490,10 +485,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		}
 +		usb_fill_int_urb(int_out_urb, dev->udev,
 +				 usb_sndintpipe(dev->udev,
-+						dev->int_out_endpoint->
-+						bEndpointAddress), buf,
-+				 dev->packet_size, iowarrior_write_callback,
-+				 dev, dev->int_out_endpoint->bInterval);
++						dev->int_out_endpoint->bEndpointAddress),
++				 buf, dev->report_size,
++				 iowarrior_write_callback, dev,
++				 dev->int_out_endpoint->bInterval);
 +		int_out_urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
 +		if (copy_from_user(buf, user_buffer, count)) {
 +			retval = -EFAULT;
@@ -509,20 +504,23 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		retval = count;
 +		usb_free_urb(int_out_urb);
 +		goto exit;
-+	} else {
++		break;
++	default:
 +		/* what do we have here ? An unsupported Product-ID ? */
-+		err("%s - not supported for product=0x%x", __func__,
-+		    dev->product_id);
++		dev_err(&dev->interface->dev, "%s - not supported for product=0x%x",
++			__FUNCTION__, dev->product_id);
 +		retval = -EFAULT;
 +		goto exit;
++		break;
 +	}
 +error:
-+	usb_buffer_free(dev->udev, dev->packet_size, buf,
++	usb_buffer_free(dev->udev, dev->report_size, buf,
 +			int_out_urb->transfer_dma);
 +	usb_free_urb(int_out_urb);
 +	atomic_dec(&dev->write_busy);
 +	wake_up_interruptible(&dev->write_wait);
 +exit:
++	mutex_unlock(&dev->mutex);
 +	return retval;
 +}
 +
@@ -532,12 +530,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static int iowarrior_ioctl(struct inode *inode, struct file *file,
 +			   unsigned int cmd, unsigned long arg)
 +{
-+	return -ENOTTY;
-+	/* disabled for now until we can figure out how the userspace tools interact properly. */
-+#if 0
 +	struct iowarrior *dev = NULL;
-+	__u8 buffer[64];
-+	__u8 __user *user_buffer = (__u8 __user *)arg;
++	__u8 *buffer;
++	__u8 __user *user_buffer;
 +	int retval;
 +	int io_res;		/* checks for bytes read/written and copy_to/from_user results */
 +
@@ -545,6 +540,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	if (dev == NULL) {
 +		return -ENODEV;
 +	}
++
++	buffer = kzalloc(dev->report_size, GFP_KERNEL);
++	if (!buffer)
++		return -ENOMEM;
 +
 +	/* lock this object */
 +	mutex_lock(&dev->mutex);
@@ -566,30 +565,34 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		    dev->product_id == USB_DEVICE_ID_CODEMERCS_IOWPV1 ||
 +		    dev->product_id == USB_DEVICE_ID_CODEMERCS_IOWPV2 ||
 +		    dev->product_id == USB_DEVICE_ID_CODEMERCS_IOW40) {
++			user_buffer = (__u8 __user *)arg;
 +			io_res = copy_from_user(buffer, user_buffer,
-+						dev->packet_size);
++						dev->report_size);
 +			if (io_res) {
 +				retval = -EFAULT;
 +			} else {
 +				io_res = usb_set_report(dev->interface, 2, 0,
 +							buffer,
-+							dev->packet_size);
++							dev->report_size);
 +				if (io_res < 0)
 +					retval = io_res;
 +			}
 +		} else {
 +			retval = -EINVAL;
-+			err("ioctl 'IOW_WRITE' is not supported for product=0x%x.", dev->product_id);
++			dev_err(&dev->interface->dev,
++				"ioctl 'IOW_WRITE' is not supported for product=0x%x.",
++				dev->product_id);
 +		}
 +		break;
 +	case IOW_READ:
++		user_buffer = (__u8 __user *)arg;
 +		io_res = usb_get_report(dev->udev,
 +					dev->interface->cur_altsetting, 1, 0,
-+					buffer, dev->packet_size);
++					buffer, dev->report_size);
 +		if (io_res < 0)
 +			retval = io_res;
 +		else {
-+			io_res = copy_to_user(user_buffer, buffer, dev->packet_size);
++			io_res = copy_to_user(user_buffer, buffer, dev->report_size);
 +			if (io_res < 0)
 +				retval = -EFAULT;
 +		}
@@ -598,15 +601,19 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		{
 +			/* Report available information for the device */
 +			struct iowarrior_info info;
-+			struct usb_config_descriptor *cfg_descriptor = &dev->udev->actconfig->desc;	/* needed for power consumption */
++			/* needed for power consumption */
++			struct usb_config_descriptor *cfg_descriptor = &dev->udev->actconfig->desc;
 +
 +			/* directly from the descriptor */
 +			info.vendor = le16_to_cpu(dev->udev->descriptor.idVendor);
 +			info.product = dev->product_id;
 +			info.revision = le16_to_cpu(dev->udev->descriptor.bcdDevice);
-+			info.speed = le16_to_cpu(dev->udev->speed);	/* 0==UNKNOWN, 1==LOW(usb1.1) ,2=FULL(usb1.1), 3=HIGH(usb2.0) */
++
++			/* 0==UNKNOWN, 1==LOW(usb1.1) ,2=FULL(usb1.1), 3=HIGH(usb2.0) */
++			info.speed = le16_to_cpu(dev->udev->speed);
 +			info.if_num = dev->interface->cur_altsetting->desc.bInterfaceNumber;
-+			info.packet_size = dev->packet_size;
++			info.report_size = dev->report_size;
++
 +			/* serial number string has been read earlier 8 chars or empty string */
 +			memcpy(info.serial, dev->chip_serial,
 +			       sizeof(dev->chip_serial));
@@ -631,7 +638,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	/* unlock the device */
 +	mutex_unlock(&dev->mutex);
 +	return retval;
-+#endif
 +}
 +
 +/**
@@ -653,7 +659,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	interface = usb_find_interface(&iowarrior_driver, subminor);
 +	if (!interface) {
-+		err("%s - error, can't find device for minor %d", __func__,
++		err("%s - error, can't find device for minor %d", __FUNCTION__,
 +		    subminor);
 +		retval = -ENODEV;
 +		goto out;
@@ -834,15 +840,20 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			/* this one will match for the IOWarrior56 only */
 +			dev->int_out_endpoint = endpoint;
 +	}
-+	/* we have to check the packet_size often, so remember it in the endianess suitable for our machine */
-+	dev->packet_size = le16_to_cpu(dev->int_in_endpoint->wMaxPacketSize);
++	/* we have to check the report_size often, so remember it in the endianess suitable for our machine */
++	dev->report_size = le16_to_cpu(dev->int_in_endpoint->wMaxPacketSize);
++	if ((dev->interface->cur_altsetting->desc.bInterfaceNumber == 0) &&
++	    (dev->product_id == USB_DEVICE_ID_CODEMERCS_IOW56))
++		/* IOWarrior56 has wMaxPacketSize different from report size */
++		dev->report_size = 7;
++
 +	/* create the urb and buffer for reading */
 +	dev->int_in_urb = usb_alloc_urb(0, GFP_KERNEL);
 +	if (!dev->int_in_urb) {
 +		dev_err(&interface->dev, "Couldn't allocate interrupt_in_urb\n");
 +		goto error;
 +	}
-+	dev->int_in_buffer = kmalloc(dev->packet_size, GFP_KERNEL);
++	dev->int_in_buffer = kmalloc(dev->report_size, GFP_KERNEL);
 +	if (!dev->int_in_buffer) {
 +		dev_err(&interface->dev, "Couldn't allocate int_in_buffer\n");
 +		goto error;
@@ -850,12 +861,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	usb_fill_int_urb(dev->int_in_urb, dev->udev,
 +			 usb_rcvintpipe(dev->udev,
 +					dev->int_in_endpoint->bEndpointAddress),
-+			 dev->int_in_buffer, dev->packet_size,
++			 dev->int_in_buffer, dev->report_size,
 +			 iowarrior_callback, dev,
 +			 dev->int_in_endpoint->bInterval);
 +	/* create an internal buffer for interrupt data from the device */
 +	dev->read_queue =
-+	    kmalloc(((dev->packet_size + 1) * MAX_INTERRUPT_BUFFER),
++	    kmalloc(((dev->report_size + 1) * MAX_INTERRUPT_BUFFER),
 +		    GFP_KERNEL);
 +	if (!dev->read_queue) {
 +		dev_err(&interface->dev, "Couldn't allocate read_queue\n");
@@ -970,20 +981,22 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +module_init(iowarrior_init);
 +module_exit(iowarrior_exit);
 --- /dev/null
-+++ gregkh-2.6/drivers/usb/misc/iowarrior.h
-@@ -0,0 +1,31 @@
++++ gregkh-2.6/include/linux/usb/iowarrior.h
+@@ -0,0 +1,33 @@
 +#ifndef _IOWARRIOR_H_
 +#define _IOWARRIOR_H_
 +
 +#define CODEMERCS_MAGIC_NUMBER	0xC0	/* like COde Mercenaries */
 +
 +/* Define the ioctl commands for reading and writing data */
-+#define IOW_WRITE	_IOW(CODEMERCS_MAGIC_NUMBER, 1, long)
-+#define IOW_READ	_IOW(CODEMERCS_MAGIC_NUMBER, 2, long)
++#define IOW_WRITE	_IOW(CODEMERCS_MAGIC_NUMBER, 1, __u8 *)
++#define IOW_READ	_IOW(CODEMERCS_MAGIC_NUMBER, 2, __u8 *)
 +
 +/*
 +   A struct for available device info which is read
-+   with the ioctl IOW_GETINFO
++   with the ioctl IOW_GETINFO.
++   To be compatible with 2.4 userspace which didn't have an easy way to get
++   this information.
 +*/
 +struct iowarrior_info {
 +	__u32 vendor;		/* vendor id : supposed to be USB_VENDOR_ID_CODEMERCS in all cases */
@@ -993,7 +1006,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	__u32 speed;		/* USB-speed of the device (0=UNKNOWN, 1=LOW, 2=FULL 3=HIGH) */
 +	__u32 power;		/* power consumption of the device in mA */
 +	__u32 if_num;		/* the number of the endpoint */
-+	__u32 packet_size;	/* size of the data-packets on this interface */
++	__u32 report_size;	/* size of the data-packets on this interface */
 +};
 +
 +/*
