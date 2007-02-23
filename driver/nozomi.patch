@@ -15,8 +15,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 ---
  drivers/char/Kconfig  |   10 
  drivers/char/Makefile |    1 
- drivers/char/nozomi.c | 2233 ++++++++++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 2244 insertions(+)
+ drivers/char/nozomi.c | 2251 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 2262 insertions(+)
 
 --- gregkh-2.6.orig/drivers/char/Kconfig
 +++ gregkh-2.6/drivers/char/Kconfig
@@ -49,7 +49,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  obj-$(CONFIG_MOXA_INTELLIO)	+= moxa.o
 --- /dev/null
 +++ gregkh-2.6/drivers/char/nozomi.c
-@@ -0,0 +1,2233 @@
+@@ -0,0 +1,2251 @@
 +/* nozomi.c  -- HSDPA driver Broadband Wireless Data Card - Globe Trotter
 +*
 +* Written by: Ulf Jakobsson,
@@ -143,12 +143,15 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#include <linux/kfifo.h>
 +#include <asm/uaccess.h>
 +
++#include <linux/delay.h>
++
++
 +#define VERSION_STRING DRIVER_DESC " 2.1 (build date: " __DATE__ " " __TIME__ ")"
 +
 +/*    Macros definitions */
 +
 +/* Default debug printout level */
-+#define NOZOMI_DEBUG_LEVEL 0x0f
++#define NOZOMI_DEBUG_LEVEL 0x00
 +
 +#define P_BUF_SIZE 128
 +#define NFO( _err_flag_, args...)					\
@@ -179,7 +182,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +/* These printouts are always printed */
 +
 +#else
-+static const int debug = 0;
++static int debug = 0;
 +#define D_(lvl, args...)
 +#endif
 +
@@ -1324,20 +1327,22 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	struct nozomi *dc = dev_id;
 +	struct irq *m = &my_irq;
 +
-+	if (!dc) {
-+		dev_err(&dc->pdev->dev, "Wrong interrupt context?\n");
++	if (!dc)
 +		return IRQ_NONE;
-+	}
 +
++	spin_lock(&dc->spin_mutex);
 +	GET_IIR(m->read_iir);
++
++	/* Card removed */
++	if (m->read_iir == (u16)-1)
++		goto none;
 +
 +	/* Just handle interrupt enabled in IER (by masking with dc->ier_last_written) */
 +	m->read_iir &= dc->ier_last_written;
 +
 +	if (m->read_iir == 0)
-+		return IRQ_NONE;
++		goto none;
 +
-+	spin_lock(&dc->spin_mutex);
 +
 +	D4("%s irq:0x%04X, prev:0x%04X", interrupt2str(m->read_iir),
 +	   m->read_iir, dc->ier_last_written);
@@ -1423,6 +1428,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +exit_handler:
 +	spin_unlock(&dc->spin_mutex);
 +	return IRQ_HANDLED;
++none:
++	spin_unlock(&dc->spin_mutex);
++	return IRQ_NONE;
 +}
 +
 +/* Request a shared IRQ from system */
@@ -1655,6 +1663,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +{
 +	unsigned long flags;
 +
++	if (!dc || !port)
++		return;
++
 +	if (down_interruptible(&port->tty_sem))
 +		return;
 +
@@ -1669,6 +1680,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		spin_lock_irqsave(&dc->spin_mutex, flags);
 +		SET_IER(0, port->token_dl);
 +		spin_unlock_irqrestore(&dc->spin_mutex, flags);
++		port->tty = NULL;
 +	}
 +
 +exit:
@@ -1678,20 +1690,26 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static void __devexit tty_exit(void)
 +{
 +	struct nozomi *dc = my_dev;
-+	int i;
++	int i, ret;
 +
 +	D1(" ");
 +
 +	for (i = 0; i < NTTY_TTY_MINORS; i++) {
-+		while (dc->port[i].tty_open_count)
-+			tty_do_close(dc, &dc->port[i]);
-+		dc->port[i].tty = NULL;
++		if (dc->port[i].tty)
++			tty_hangup(dc->port[i].tty);
++	}
++
++	while (dc->open_ttys) {
++		msleep_interruptible(1);
 +	}
 +
 +	for (i = 0; i < NTTY_TTY_MINORS; ++i)
 +		tty_unregister_device(dc->tty_driver, i);
 +
-+	tty_unregister_driver(dc->tty_driver);
++	ret = tty_unregister_driver(dc->tty_driver);
++	if (ret) {
++		printk(KERN_ERR "Unable to unregister the tty driver ! (%d)\n", ret);
++	}
 +	put_tty_driver(dc->tty_driver);
 +}
 +
@@ -1701,6 +1719,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	int i;
 +	struct ctrl_ul ctrl;
 +	struct nozomi *dc = pci_get_drvdata(pdev);
++
++	tty_exit();
 +
 +	/* Disable all interrupts */
 +	SET_IER(0, 0xFFFF);
@@ -1727,20 +1747,19 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	D1("pci_disable_device");
 +	pci_disable_device(pdev);
 +
-+	free_irq(pdev->irq, pdev);
++	free_irq(pdev->irq, dc);
 +
 +	for (i = PORT_MDM; i < MAX_PORT; i++)
 +		kfree(dc->port[i].fifo_ul);
 +
 +	kfree(dc->send_buf);
 +
-+	tty_exit();
-+
 +	remove_sysfs_files(dc);
 +
 +	destroy_workqueue(dc->tty_flip_wq);
 +
 +	kfree(my_dev);
++	my_dev = NULL;
 +
 +	cards_found--;
 +}
@@ -1780,16 +1799,15 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		return -ERESTARTSYS;
 +	}
 +
-+	tty->low_latency = 1;
-+	tty->driver_data = port;
-+	port->tty = tty;
-+	port->tty_index = tty->index;
-+
 +	port->tty_open_count++;
 +	dc->open_ttys++;
 +
 +	/* Enable interrupt downlink for channel */
 +	if (port->tty_open_count == 1) {
++		tty->low_latency = 1;
++		tty->driver_data = port;
++		port->tty = tty;
++		port->tty_index = tty->index;
 +		port->rx_data = port->tx_data = 0;
 +		D1("open: %d", port->token_dl);
 +		spin_lock_irqsave(&dc->spin_mutex, flags);
@@ -1821,7 +1839,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	/* D1( "WRITEx: %d, index = %d", count, index); */
 +
-+	if (!port)
++	if (!dc || !port)
 +		return -ENODEV;
 +
 +	if (down_trylock(&port->tty_sem)) {
@@ -1871,9 +1889,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	struct port *port = (struct port *)tty->driver_data;
 +	int room = 0;
 +//      u32      flags = 0;
-+//      struct nozomi *dc = get_dc_by_tty(tty);
++	struct nozomi *dc = get_dc_by_tty(tty);
 +
-+	if (!port) {
++	if (!dc || !port) {
 +		return 0;
 +	}
 +	if (down_trylock(&port->tty_sem)) {
@@ -2184,7 +2202,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	struct nozomi *dc = get_dc_by_tty(tty);
 +	s32 rval;
 +
-+	if (!port) {
++	if (!dc || !port) {
 +		rval = -ENODEV;
 +		goto exit_in_buffer;
 +	}
