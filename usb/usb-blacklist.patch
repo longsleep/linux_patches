@@ -19,13 +19,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 ---
  drivers/usb/core/Makefile  |    2 -
  drivers/usb/core/hub.c     |    3 +
- drivers/usb/core/message.c |    4 ++
- drivers/usb/core/quirks.c  |   80 +++++++++++++++++++++++++++++++++++++++++++++
+ drivers/usb/core/message.c |    6 ++-
+ drivers/usb/core/quirks.c  |   78 +++++++++++++++++++++++++++++++++++++++++++++
  drivers/usb/core/sysfs.c   |   11 ++++++
  drivers/usb/core/usb.h     |    1 
  include/linux/usb.h        |    1 
  include/linux/usb/quirks.h |   11 ++++++
- 8 files changed, 112 insertions(+), 1 deletion(-)
+ 8 files changed, 111 insertions(+), 2 deletions(-)
 
 --- gregkh-2.6.orig/drivers/usb/core/Makefile
 +++ gregkh-2.6/drivers/usb/core/Makefile
@@ -60,19 +60,21 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  #include <asm/byteorder.h>
  #include <asm/scatterlist.h>
  
-@@ -810,6 +811,9 @@ char *usb_cache_string(struct usb_device
- 	char *smallbuf = NULL;
- 	int len;
+@@ -685,7 +686,10 @@ static int usb_string_sub(struct usb_dev
  
-+	if (udev->quirks & USB_QUIRK_STRING_FETCH)
-+		return NULL;
-+
- 	if (index > 0 && (buf = kmalloc(256, GFP_KERNEL)) != NULL) {
- 		if ((len = usb_string(udev, index, buf, 256)) > 0) {
- 			if ((smallbuf = kmalloc(++len, GFP_KERNEL)) == NULL)
+ 	/* Try to read the string descriptor by asking for the maximum
+ 	 * possible number of bytes */
+-	rc = usb_get_string(dev, langid, index, buf, 255);
++	if (dev->quirks & USB_QUIRK_STRING_FETCH_255)
++		rc = -EIO;
++	else
++		rc = usb_get_string(dev, langid, index, buf, 255);
+ 
+ 	/* If that failed try to read the descriptor length, then
+ 	 * ask for just that many bytes */
 --- /dev/null
 +++ gregkh-2.6/drivers/usb/core/quirks.c
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,78 @@
 +/*
 + * USB device quirk handling logic and table
 + *
@@ -104,10 +106,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + */
 +static const struct usb_device_id usb_quirk_list[] = {
 +	/* HP 5300/5370C scanner */
-+	{ USB_DEVICE(0x03f0, 0x0701), .driver_info = USB_QUIRK_STRING_FETCH },
-+
-+	/* Seiko Epson Corp. Perfection 1250 */
-+	{ USB_DEVICE(0x04b8, 0x010f), .driver_info = USB_QUIRK_NO_AUTOSUSPEND },
++	{ USB_DEVICE(0x03f0, 0x0701), .driver_info = USB_QUIRK_STRING_FETCH_255 },
 +
 +	/* Elsa MicroLink 56k (V.250) */
 +	{ USB_DEVICE(0x05cc, 0x2267), .driver_info = USB_QUIRK_NO_AUTOSUSPEND },
@@ -120,7 +119,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +static void usb_autosuspend_quirk(struct usb_device *udev)
 +{
-+	/* unbalanced resume that will prevent autosuspension */
++	/* unbalanced resume to prevent autosuspends */
 +	usb_autoresume_device(udev);
 +}
 +
@@ -129,7 +128,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	const struct usb_device_id *id = usb_quirk_list;
 +
 +	for (; id->idVendor || id->bDeviceClass || id->bInterfaceClass ||
-+	       id->driver_info; id++) {
++			id->driver_info; id++) {
 +		if (usb_match_device(udev, id))
 +			return id;
 +	}
@@ -146,8 +145,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	id = find_id(udev);
 +	if (id)
 +		udev->quirks = (u32)(id->driver_info);
-+
-+	dev_dbg(&udev->dev, "USB quirks for this device: %x\n", udev->quirks);
++	if (udev->quirks)
++		dev_dbg(&udev->dev, "USB quirks for this device: %x\n",
++				udev->quirks);
 +
 +	/* do any special quirk handling here if needed */
 +	if (udev->quirks & USB_QUIRK_NO_AUTOSUSPEND)
@@ -165,7 +165,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	struct usb_device *udev;
 +
 +	udev = to_usb_device(dev);
-+	return sprintf(buf, "%d\n", udev->quirks);
++	return sprintf(buf, "0x%x\n", udev->quirks);
 +}
 +static DEVICE_ATTR(quirks, S_IRUGO, show_quirks, NULL);
 +
@@ -204,13 +204,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +++ gregkh-2.6/include/linux/usb/quirks.h
 @@ -0,0 +1,11 @@
 +/*
-+ * This file holds the definitions of quirks found in USB devices
++ * This file holds the definitions of quirks found in USB devices.
 + * Only quirks that affect the whole device, not an interface,
-+ * belong here
++ * belong here.
 + */
 +
-+/* devices which must not be autosuspended */
++/* device must not be autosuspended */
 +#define USB_QUIRK_NO_AUTOSUSPEND	0x00000001
 +
-+/* devices which crash when string descriptors are fetched */
-+#define USB_QUIRK_STRING_FETCH		0x00000002
++/* string descriptors must not be fetched using a 255-byte read */
++#define USB_QUIRK_STRING_FETCH_255	0x00000002

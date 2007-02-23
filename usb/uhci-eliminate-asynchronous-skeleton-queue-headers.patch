@@ -1,0 +1,638 @@
+From stern@rowland.harvard.edu Mon Feb 19 12:52:56 2007
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Mon, 19 Feb 2007 15:52:45 -0500 (EST)
+Subject: UHCI: Eliminate asynchronous skeleton Queue Headers
+To: Greg KH <greg@kroah.com>
+Cc: USB development list <linux-usb-devel@lists.sourceforge.net>
+Message-ID: <Pine.LNX.4.44L0.0702191551520.2865-100000@iolanthe.rowland.org>
+
+
+This patch (as856) attempts to improve the performance of uhci-hcd by
+removing the asynchronous skeleton Queue Headers.  They don't contain
+any useful information but the controller has to read through them at
+least once every millisecond, incurring a non-zero DMA overhead.
+
+Now all the asynchronous queues are combined, along with the period-1
+interrupt queue, into a single list with a single skeleton QH.  The
+start of the low-speed control, full-speed control, and bulk sublists
+is determined by linear search.  Since there should rarely be more
+than a couple of QHs in the list, the searches should incur a much
+smaller total load than keeping the skeleton QHs.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/uhci-debug.c |   50 ++++++----
+ drivers/usb/host/uhci-hcd.c   |   52 ++++-------
+ drivers/usb/host/uhci-hcd.h   |   78 ++++++++--------
+ drivers/usb/host/uhci-q.c     |  193 +++++++++++++++++++++++++++++++++++++-----
+ 4 files changed, 258 insertions(+), 115 deletions(-)
+
+--- gregkh-2.6.orig/drivers/usb/host/uhci-debug.c
++++ gregkh-2.6/drivers/usb/host/uhci-debug.c
+@@ -220,16 +220,6 @@ static int uhci_show_qh(struct uhci_qh *
+ 	return out - buf;
+ }
+ 
+-static const char * const qh_names[] = {
+-  "skel_unlink_qh", "skel_iso_qh",
+-  "skel_int128_qh", "skel_int64_qh",
+-  "skel_int32_qh", "skel_int16_qh",
+-  "skel_int8_qh", "skel_int4_qh",
+-  "skel_int2_qh", "skel_int1_qh",
+-  "skel_ls_control_qh", "skel_fs_control_qh",
+-  "skel_bulk_qh", "skel_term_qh"
+-};
+-
+ static int uhci_show_sc(int port, unsigned short status, char *buf, int len)
+ {
+ 	char *out = buf;
+@@ -352,6 +342,12 @@ static int uhci_sprint_schedule(struct u
+ 	struct uhci_td *td;
+ 	struct list_head *tmp, *head;
+ 	int nframes, nerrs;
++	__le32 link;
++
++	static const char * const qh_names[] = {
++		"unlink", "iso", "int128", "int64", "int32", "int16",
++		"int8", "int4", "int2", "async", "term"
++	};
+ 
+ 	out += uhci_show_root_hub_state(uhci, out, len - (out - buf));
+ 	out += sprintf(out, "HC status\n");
+@@ -374,7 +370,7 @@ static int uhci_sprint_schedule(struct u
+ 	nframes = 10;
+ 	nerrs = 0;
+ 	for (i = 0; i < UHCI_NUMFRAMES; ++i) {
+-		__le32 link, qh_dma;
++		__le32 qh_dma;
+ 
+ 		j = 0;
+ 		td = uhci->frame_cpu[i];
+@@ -430,23 +426,21 @@ check_link:
+ 
+ 	for (i = 0; i < UHCI_NUM_SKELQH; ++i) {
+ 		int cnt = 0;
++		__le32 fsbr_link = 0;
+ 
+ 		qh = uhci->skelqh[i];
+-		out += sprintf(out, "- %s\n", qh_names[i]); \
++		out += sprintf(out, "- skel_%s_qh\n", qh_names[i]); \
+ 		out += uhci_show_qh(qh, out, len - (out - buf), 4);
+ 
+ 		/* Last QH is the Terminating QH, it's different */
+-		if (i == UHCI_NUM_SKELQH - 1) {
+-			if (qh->link != UHCI_PTR_TERM)
+-				out += sprintf(out, "    bandwidth reclamation on!\n");
+-
++		if (i == SKEL_TERM) {
+ 			if (qh_element(qh) != LINK_TO_TD(uhci->term_td))
+ 				out += sprintf(out, "    skel_term_qh element is not set to term_td!\n");
+-
++			if (link == LINK_TO_QH(uhci->skel_term_qh))
++				goto check_qh_link;
+ 			continue;
+ 		}
+ 
+-		j = (i < 9) ? 9 : i+1;		/* Next skeleton */
+ 		head = &qh->node;
+ 		tmp = head->next;
+ 
+@@ -456,14 +450,26 @@ check_link:
+ 			if (++cnt <= 10)
+ 				out += uhci_show_qh(qh, out,
+ 						len - (out - buf), 4);
++			if (!fsbr_link && qh->skel >= SKEL_FSBR)
++				fsbr_link = LINK_TO_QH(qh);
+ 		}
+ 		if ((cnt -= 10) > 0)
+ 			out += sprintf(out, "    Skipped %d QHs\n", cnt);
+ 
+-		if (i > 1 && i < UHCI_NUM_SKELQH - 1) {
+-			if (qh->link != LINK_TO_QH(uhci->skelqh[j]))
+-				out += sprintf(out, "    last QH not linked to next skeleton!\n");
+-		}
++		link = UHCI_PTR_TERM;
++		if (i <= SKEL_ISO)
++			;
++		else if (i < SKEL_ASYNC)
++			link = LINK_TO_QH(uhci->skel_async_qh);
++		else if (!uhci->fsbr_is_on)
++			;
++		else if (fsbr_link)
++			link = fsbr_link;
++		else
++			link = LINK_TO_QH(uhci->skel_term_qh);
++check_qh_link:
++		if (qh->link != link)
++			out += sprintf(out, "    last QH not linked to next skeleton!\n");
+ 	}
+ 
+ 	return out - buf;
+--- gregkh-2.6.orig/drivers/usb/host/uhci-hcd.c
++++ gregkh-2.6/drivers/usb/host/uhci-hcd.c
+@@ -13,7 +13,7 @@
+  * (C) Copyright 2000 Yggdrasil Computing, Inc. (port of new PCI interface
+  *               support from usb-ohci.c by Adam Richter, adam@yggdrasil.com).
+  * (C) Copyright 1999 Gregory P. Smith (from usb-ohci.c)
+- * (C) Copyright 2004-2006 Alan Stern, stern@rowland.harvard.edu
++ * (C) Copyright 2004-2007 Alan Stern, stern@rowland.harvard.edu
+  *
+  * Intel documents this fairly well, and as far as I know there
+  * are no royalties or anything like that, but even so there are
+@@ -107,10 +107,10 @@ static __le32 uhci_frame_skel_link(struc
+ 	 * interrupt QHs, which will help spread out bandwidth utilization.
+ 	 *
+ 	 * ffs (Find First bit Set) does exactly what we need:
+-	 * 1,3,5,...  => ffs = 0 => use skel_int2_qh = skelqh[8],
+-	 * 2,6,10,... => ffs = 1 => use skel_int4_qh = skelqh[7], etc.
++	 * 1,3,5,...  => ffs = 0 => use period-2 QH = skelqh[8],
++	 * 2,6,10,... => ffs = 1 => use period-4 QH = skelqh[7], etc.
+ 	 * ffs >= 7 => not on any high-period queue, so use
+-	 *	skel_int1_qh = skelqh[9].
++	 *	period-1 QH = skelqh[9].
+ 	 * Add in UHCI_NUMFRAMES to insure at least one bit is set.
+ 	 */
+ 	skelnum = 8 - (int) __ffs(frame | UHCI_NUMFRAMES);
+@@ -540,16 +540,18 @@ static void uhci_shutdown(struct pci_dev
+  *
+  * The hardware doesn't really know any difference
+  * in the queues, but the order does matter for the
+- * protocols higher up. The order is:
++ * protocols higher up.  The order in which the queues
++ * are encountered by the hardware is:
+  *
+- *  - any isochronous events handled before any
++ *  - All isochronous events are handled before any
+  *    of the queues. We don't do that here, because
+  *    we'll create the actual TD entries on demand.
+- *  - The first queue is the interrupt queue.
+- *  - The second queue is the control queue, split into low- and full-speed
+- *  - The third queue is bulk queue.
+- *  - The fourth queue is the bandwidth reclamation queue, which loops back
+- *    to the full-speed control queue.
++ *  - The first queue is the high-period interrupt queue.
++ *  - The second queue is the period-1 interrupt and async
++ *    (low-speed control, full-speed control, then bulk) queue.
++ *  - The third queue is the terminating bandwidth reclamation queue,
++ *    which contains no members, loops back to itself, and is present
++ *    only when FSBR is on and there are no full-speed control or bulk QHs.
+  */
+ static int uhci_start(struct usb_hcd *hcd)
+ {
+@@ -626,30 +628,18 @@ static int uhci_start(struct usb_hcd *hc
+ 	}
+ 
+ 	/*
+-	 * 8 Interrupt queues; link all higher int queues to int1,
+-	 * then link int1 to control and control to bulk
++	 * 8 Interrupt queues; link all higher int queues to int1 = async
+ 	 */
+-	uhci->skel_int128_qh->link =
+-			uhci->skel_int64_qh->link =
+-			uhci->skel_int32_qh->link =
+-			uhci->skel_int16_qh->link =
+-			uhci->skel_int8_qh->link =
+-			uhci->skel_int4_qh->link =
+-			uhci->skel_int2_qh->link = LINK_TO_QH(
+-				uhci->skel_int1_qh);
+-
+-	uhci->skel_int1_qh->link = LINK_TO_QH(uhci->skel_ls_control_qh);
+-	uhci->skel_ls_control_qh->link = LINK_TO_QH(uhci->skel_fs_control_qh);
+-	uhci->skel_fs_control_qh->link = LINK_TO_QH(uhci->skel_bulk_qh);
+-	uhci->skel_bulk_qh->link = LINK_TO_QH(uhci->skel_term_qh);
++	for (i = SKEL_ISO + 1; i < SKEL_ASYNC; ++i)
++		uhci->skelqh[i]->link = LINK_TO_QH(uhci->skel_async_qh);
++	uhci->skel_async_qh->link = uhci->skel_term_qh->link = UHCI_PTR_TERM;
+ 
+ 	/* This dummy TD is to work around a bug in Intel PIIX controllers */
+ 	uhci_fill_td(uhci->term_td, 0, uhci_explen(0) |
+-		(0x7f << TD_TOKEN_DEVADDR_SHIFT) | USB_PID_IN, 0);
+-	uhci->term_td->link = LINK_TO_TD(uhci->term_td);
+-
+-	uhci->skel_term_qh->link = UHCI_PTR_TERM;
+-	uhci->skel_term_qh->element = LINK_TO_TD(uhci->term_td);
++			(0x7f << TD_TOKEN_DEVADDR_SHIFT) | USB_PID_IN, 0);
++	uhci->term_td->link = UHCI_PTR_TERM;
++	uhci->skel_async_qh->element = uhci->skel_term_qh->element =
++			LINK_TO_TD(uhci->term_td);
+ 
+ 	/*
+ 	 * Fill the frame list: make all entries point to the proper
+--- gregkh-2.6.orig/drivers/usb/host/uhci-hcd.h
++++ gregkh-2.6/drivers/usb/host/uhci-hcd.h
+@@ -135,7 +135,6 @@ struct uhci_qh {
+ 	struct usb_host_endpoint *hep;	/* Endpoint information */
+ 	struct usb_device *udev;
+ 	struct list_head queue;		/* Queue of urbps for this QH */
+-	struct uhci_qh *skel;		/* Skeleton for this QH */
+ 	struct uhci_td *dummy_td;	/* Dummy TD to end the queue */
+ 	struct uhci_td *post_td;	/* Last TD completed */
+ 
+@@ -151,6 +150,7 @@ struct uhci_qh {
+ 
+ 	int state;			/* QH_STATE_xxx; see above */
+ 	int type;			/* Queue type (control, bulk, etc) */
++	int skel;			/* Skeleton queue number */
+ 
+ 	unsigned int initial_toggle:1;	/* Endpoint's current toggle value */
+ 	unsigned int needs_fixup:1;	/* Must fix the TD toggle values */
+@@ -276,12 +276,13 @@ static inline u32 td_status(struct uhci_
+ /*
+  * The UHCI driver uses QHs with Interrupt, Control and Bulk URBs for
+  * automatic queuing. To make it easy to insert entries into the schedule,
+- * we have a skeleton of QHs for each predefined Interrupt latency,
+- * low-speed control, full-speed control, bulk, and terminating QH
+- * (see explanation for the terminating QH below).
++ * we have a skeleton of QHs for each predefined Interrupt latency.
++ * Asynchronous QHs (low-speed control, full-speed control, and bulk)
++ * go onto the period-1 interrupt list, since they all get accessed on
++ * every frame.
+  *
+- * When we want to add a new QH, we add it to the end of the list for the
+- * skeleton QH.  For instance, the schedule list can look like this:
++ * When we want to add a new QH, we add it to the list starting from the
++ * appropriate skeleton QH.  For instance, the schedule can look like this:
+  *
+  * skel int128 QH
+  * dev 1 interrupt QH
+@@ -289,50 +290,47 @@ static inline u32 td_status(struct uhci_
+  * skel int64 QH
+  * skel int32 QH
+  * ...
+- * skel int1 QH
+- * skel low-speed control QH
+- * dev 5 control QH
+- * skel full-speed control QH
+- * skel bulk QH
++ * skel int1 + async QH
++ * dev 5 low-speed control QH
+  * dev 1 bulk QH
+  * dev 2 bulk QH
+- * skel terminating QH
+  *
+- * The terminating QH is used for 2 reasons:
+- * - To place a terminating TD which is used to workaround a PIIX bug
+- *   (see Intel errata for explanation), and
+- * - To loop back to the full-speed control queue for full-speed bandwidth
+- *   reclamation.
++ * There is a special terminating QH used to keep full-speed bandwidth
++ * reclamation active when no full-speed control or bulk QHs are linked
++ * into the schedule.  It has an inactive TD (to work around a PIIX bug,
++ * see the Intel errata) and it points back to itself.
+  *
+- * There's a special skeleton QH for Isochronous QHs.  It never appears
+- * on the schedule, and Isochronous TDs go on the schedule before the
++ * There's a special skeleton QH for Isochronous QHs which never appears
++ * on the schedule.  Isochronous TDs go on the schedule before the
+  * the skeleton QHs.  The hardware accesses them directly rather than
+  * through their QH, which is used only for bookkeeping purposes.
+  * While the UHCI spec doesn't forbid the use of QHs for Isochronous,
+  * it doesn't use them either.  And the spec says that queues never
+  * advance on an error completion status, which makes them totally
+  * unsuitable for Isochronous transfers.
+- */
+-
+-#define UHCI_NUM_SKELQH		14
+-#define skel_unlink_qh		skelqh[0]
+-#define skel_iso_qh		skelqh[1]
+-#define skel_int128_qh		skelqh[2]
+-#define skel_int64_qh		skelqh[3]
+-#define skel_int32_qh		skelqh[4]
+-#define skel_int16_qh		skelqh[5]
+-#define skel_int8_qh		skelqh[6]
+-#define skel_int4_qh		skelqh[7]
+-#define skel_int2_qh		skelqh[8]
+-#define skel_int1_qh		skelqh[9]
+-#define skel_ls_control_qh	skelqh[10]
+-#define skel_fs_control_qh	skelqh[11]
+-#define skel_bulk_qh		skelqh[12]
+-#define skel_term_qh		skelqh[13]
+-
+-/* Find the skelqh entry corresponding to an interval exponent */
+-#define UHCI_SKEL_INDEX(exponent)	(9 - exponent)
+-
++ *
++ * There's also a special skeleton QH used for QHs which are in the process
++ * of unlinking and so may still be in use by the hardware.  It too never
++ * appears on the schedule.
++ */
++
++#define UHCI_NUM_SKELQH		11
++#define SKEL_UNLINK		0
++#define skel_unlink_qh		skelqh[SKEL_UNLINK]
++#define SKEL_ISO		1
++#define skel_iso_qh		skelqh[SKEL_ISO]
++	/* int128, int64, ..., int1 = 2, 3, ..., 9 */
++#define SKEL_INDEX(exponent)	(9 - exponent)
++#define SKEL_ASYNC		9
++#define skel_async_qh		skelqh[SKEL_ASYNC]
++#define SKEL_TERM		10
++#define skel_term_qh		skelqh[SKEL_TERM]
++
++/* The following entries refer to sublists of skel_async_qh */
++#define SKEL_LS_CONTROL		20
++#define SKEL_FS_CONTROL		21
++#define SKEL_FSBR		SKEL_FS_CONTROL
++#define SKEL_BULK		22
+ 
+ /*
+  *	The UHCI controller and root hub
+--- gregkh-2.6.orig/drivers/usb/host/uhci-q.c
++++ gregkh-2.6/drivers/usb/host/uhci-q.c
+@@ -13,7 +13,7 @@
+  * (C) Copyright 2000 Yggdrasil Computing, Inc. (port of new PCI interface
+  *               support from usb-ohci.c by Adam Richter, adam@yggdrasil.com).
+  * (C) Copyright 1999 Gregory P. Smith (from usb-ohci.c)
+- * (C) Copyright 2004-2006 Alan Stern, stern@rowland.harvard.edu
++ * (C) Copyright 2004-2007 Alan Stern, stern@rowland.harvard.edu
+  */
+ 
+ 
+@@ -45,14 +45,43 @@ static inline void uhci_clear_next_inter
+  */
+ static void uhci_fsbr_on(struct uhci_hcd *uhci)
+ {
++	struct uhci_qh *fsbr_qh, *lqh, *tqh;
++
+ 	uhci->fsbr_is_on = 1;
+-	uhci->skel_term_qh->link = LINK_TO_QH(uhci->skel_fs_control_qh);
++	lqh = list_entry(uhci->skel_async_qh->node.prev,
++			struct uhci_qh, node);
++
++	/* Find the first FSBR QH.  Linear search through the list is
++	 * acceptable because normally FSBR gets turned on as soon as
++	 * one QH needs it. */
++	fsbr_qh = NULL;
++	list_for_each_entry_reverse(tqh, &uhci->skel_async_qh->node, node) {
++		if (tqh->skel < SKEL_FSBR)
++			break;
++		fsbr_qh = tqh;
++	}
++
++	/* No FSBR QH means we must insert the terminating skeleton QH */
++	if (!fsbr_qh) {
++		uhci->skel_term_qh->link = LINK_TO_QH(uhci->skel_term_qh);
++		wmb();
++		lqh->link = uhci->skel_term_qh->link;
++
++	/* Otherwise loop the last QH to the first FSBR QH */
++	} else
++		lqh->link = LINK_TO_QH(fsbr_qh);
+ }
+ 
+ static void uhci_fsbr_off(struct uhci_hcd *uhci)
+ {
++	struct uhci_qh *lqh;
++
+ 	uhci->fsbr_is_on = 0;
+-	uhci->skel_term_qh->link = UHCI_PTR_TERM;
++	lqh = list_entry(uhci->skel_async_qh->node.prev,
++			struct uhci_qh, node);
++
++	/* End the async list normally and unlink the terminating QH */
++	lqh->link = uhci->skel_term_qh->link = UHCI_PTR_TERM;
+ }
+ 
+ static void uhci_add_fsbr(struct uhci_hcd *uhci, struct urb *urb)
+@@ -404,12 +433,81 @@ static void uhci_fixup_toggles(struct uh
+ }
+ 
+ /*
+- * Put a QH on the schedule in both hardware and software
++ * Link an Isochronous QH into its skeleton's list
+  */
+-static void uhci_activate_qh(struct uhci_hcd *uhci, struct uhci_qh *qh)
++static inline void link_iso(struct uhci_hcd *uhci, struct uhci_qh *qh)
++{
++	list_add_tail(&qh->node, &uhci->skel_iso_qh->node);
++
++	/* Isochronous QHs aren't linked by the hardware */
++}
++
++/*
++ * Link a high-period interrupt QH into the schedule at the end of its
++ * skeleton's list
++ */
++static void link_interrupt(struct uhci_hcd *uhci, struct uhci_qh *qh)
+ {
+ 	struct uhci_qh *pqh;
+ 
++	list_add_tail(&qh->node, &uhci->skelqh[qh->skel]->node);
++
++	pqh = list_entry(qh->node.prev, struct uhci_qh, node);
++	qh->link = pqh->link;
++	wmb();
++	pqh->link = LINK_TO_QH(qh);
++}
++
++/*
++ * Link a period-1 interrupt or async QH into the schedule at the
++ * correct spot in the async skeleton's list, and update the FSBR link
++ */
++static void link_async(struct uhci_hcd *uhci, struct uhci_qh *qh)
++{
++	struct uhci_qh *pqh, *lqh;
++	__le32 link_to_new_qh;
++	__le32 *extra_link = &link_to_new_qh;
++
++	/* Find the predecessor QH for our new one and insert it in the list.
++	 * The list of QHs is expected to be short, so linear search won't
++	 * take too long. */
++	list_for_each_entry_reverse(pqh, &uhci->skel_async_qh->node, node) {
++		if (pqh->skel <= qh->skel)
++			break;
++	}
++	list_add(&qh->node, &pqh->node);
++	qh->link = pqh->link;
++
++	link_to_new_qh = LINK_TO_QH(qh);
++
++	/* If this is now the first FSBR QH, take special action */
++	if (uhci->fsbr_is_on && pqh->skel < SKEL_FSBR &&
++			qh->skel >= SKEL_FSBR) {
++		lqh = list_entry(uhci->skel_async_qh->node.prev,
++				struct uhci_qh, node);
++
++		/* If the new QH is also the last one, we must unlink
++		 * the terminating skeleton QH and make the new QH point
++		 * back to itself. */
++		if (qh == lqh) {
++			qh->link = link_to_new_qh;
++			extra_link = &uhci->skel_term_qh->link;
++
++		/* Otherwise the last QH must point to the new QH */
++		} else
++			extra_link = &lqh->link;
++	}
++
++	/* Link it into the schedule */
++	wmb();
++	*extra_link = pqh->link = link_to_new_qh;
++}
++
++/*
++ * Put a QH on the schedule in both hardware and software
++ */
++static void uhci_activate_qh(struct uhci_hcd *uhci, struct uhci_qh *qh)
++{
+ 	WARN_ON(list_empty(&qh->queue));
+ 
+ 	/* Set the element pointer if it isn't set already.
+@@ -431,18 +529,64 @@ static void uhci_activate_qh(struct uhci
+ 		return;
+ 	qh->state = QH_STATE_ACTIVE;
+ 
+-	/* Move the QH from its old list to the end of the appropriate
++	/* Move the QH from its old list to the correct spot in the appropriate
+ 	 * skeleton's list */
+ 	if (qh == uhci->next_qh)
+ 		uhci->next_qh = list_entry(qh->node.next, struct uhci_qh,
+ 				node);
+-	list_move_tail(&qh->node, &qh->skel->node);
++	list_del(&qh->node);
++
++	if (qh->skel == SKEL_ISO)
++		link_iso(uhci, qh);
++	else if (qh->skel < SKEL_ASYNC)
++		link_interrupt(uhci, qh);
++	else
++		link_async(uhci, qh);
++}
++
++/*
++ * Unlink a high-period interrupt QH from the schedule
++ */
++static void unlink_interrupt(struct uhci_hcd *uhci, struct uhci_qh *qh)
++{
++	struct uhci_qh *pqh;
+ 
+-	/* Link it into the schedule */
+ 	pqh = list_entry(qh->node.prev, struct uhci_qh, node);
+-	qh->link = pqh->link;
+-	wmb();
+-	pqh->link = LINK_TO_QH(qh);
++	pqh->link = qh->link;
++	mb();
++}
++
++/*
++ * Unlink a period-1 interrupt or async QH from the schedule
++ */
++static void unlink_async(struct uhci_hcd *uhci, struct uhci_qh *qh)
++{
++	struct uhci_qh *pqh, *lqh;
++	__le32 link_to_next_qh = qh->link;
++
++	pqh = list_entry(qh->node.prev, struct uhci_qh, node);
++
++	/* If this is the first FSBQ QH, take special action */
++	if (uhci->fsbr_is_on && pqh->skel < SKEL_FSBR &&
++			qh->skel >= SKEL_FSBR) {
++		lqh = list_entry(uhci->skel_async_qh->node.prev,
++				struct uhci_qh, node);
++
++		/* If this QH is also the last one, we must link in
++		 * the terminating skeleton QH. */
++		if (qh == lqh) {
++			link_to_next_qh = LINK_TO_QH(uhci->skel_term_qh);
++			uhci->skel_term_qh->link = link_to_next_qh;
++			wmb();
++			qh->link = link_to_next_qh;
++
++		/* Otherwise the last QH must point to the new first FSBR QH */
++		} else
++			lqh->link = link_to_next_qh;
++	}
++
++	pqh->link = link_to_next_qh;
++	mb();
+ }
+ 
+ /*
+@@ -450,17 +594,18 @@ static void uhci_activate_qh(struct uhci
+  */
+ static void uhci_unlink_qh(struct uhci_hcd *uhci, struct uhci_qh *qh)
+ {
+-	struct uhci_qh *pqh;
+-
+ 	if (qh->state == QH_STATE_UNLINKING)
+ 		return;
+ 	WARN_ON(qh->state != QH_STATE_ACTIVE || !qh->udev);
+ 	qh->state = QH_STATE_UNLINKING;
+ 
+ 	/* Unlink the QH from the schedule and record when we did it */
+-	pqh = list_entry(qh->node.prev, struct uhci_qh, node);
+-	pqh->link = qh->link;
+-	mb();
++	if (qh->skel == SKEL_ISO)
++		;
++	else if (qh->skel < SKEL_ASYNC)
++		unlink_interrupt(uhci, qh);
++	else
++		unlink_async(uhci, qh);
+ 
+ 	uhci_get_current_frame_number(uhci);
+ 	qh->unlink_frame = uhci->frame_number;
+@@ -696,6 +841,7 @@ static int uhci_submit_control(struct uh
+ 	dma_addr_t data = urb->transfer_dma;
+ 	__le32 *plink;
+ 	struct urb_priv *urbp = urb->hcpriv;
++	int skel;
+ 
+ 	/* The "pipe" thing contains the destination in bits 8--18 */
+ 	destination = (urb->pipe & PIPE_DEVEP_MASK) | USB_PID_SETUP;
+@@ -796,11 +942,13 @@ static int uhci_submit_control(struct uh
+ 	 * isn't in the CONFIGURED state. */
+ 	if (urb->dev->speed == USB_SPEED_LOW ||
+ 			urb->dev->state != USB_STATE_CONFIGURED)
+-		qh->skel = uhci->skel_ls_control_qh;
++		skel = SKEL_LS_CONTROL;
+ 	else {
+-		qh->skel = uhci->skel_fs_control_qh;
++		skel = SKEL_FS_CONTROL;
+ 		uhci_add_fsbr(uhci, urb);
+ 	}
++	if (qh->state != QH_STATE_ACTIVE)
++		qh->skel = skel;
+ 
+ 	urb->actual_length = -8;	/* Account for the SETUP packet */
+ 	return 0;
+@@ -930,7 +1078,7 @@ nomem:
+ 	return -ENOMEM;
+ }
+ 
+-static inline int uhci_submit_bulk(struct uhci_hcd *uhci, struct urb *urb,
++static int uhci_submit_bulk(struct uhci_hcd *uhci, struct urb *urb,
+ 		struct uhci_qh *qh)
+ {
+ 	int ret;
+@@ -939,7 +1087,8 @@ static inline int uhci_submit_bulk(struc
+ 	if (urb->dev->speed == USB_SPEED_LOW)
+ 		return -EINVAL;
+ 
+-	qh->skel = uhci->skel_bulk_qh;
++	if (qh->state != QH_STATE_ACTIVE)
++		qh->skel = SKEL_BULK;
+ 	ret = uhci_submit_common(uhci, urb, qh);
+ 	if (ret == 0)
+ 		uhci_add_fsbr(uhci, urb);
+@@ -967,7 +1116,7 @@ static int uhci_submit_interrupt(struct 
+ 		if (exponent < 0)
+ 			return -EINVAL;
+ 		qh->period = 1 << exponent;
+-		qh->skel = uhci->skelqh[UHCI_SKEL_INDEX(exponent)];
++		qh->skel = SKEL_INDEX(exponent);
+ 
+ 		/* For now, interrupt phase is fixed by the layout
+ 		 * of the QH lists. */
+@@ -1215,7 +1364,7 @@ static int uhci_submit_isochronous(struc
+ 		qh->iso_status = 0;
+ 	}
+ 
+-	qh->skel = uhci->skel_iso_qh;
++	qh->skel = SKEL_ISO;
+ 	if (!qh->bandwidth_reserved)
+ 		uhci_reserve_bandwidth(uhci, qh);
+ 	return 0;
