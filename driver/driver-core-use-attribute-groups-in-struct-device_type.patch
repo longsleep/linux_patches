@@ -1,0 +1,226 @@
+From dtor@insightbb.com  Fri Mar  9 23:23:02 2007
+From: Dmitry Torokhov <dtor@insightbb.com>
+Date: Sat, 10 Mar 2007 01:37:34 -0500
+Subject: driver core: Use attribute groups in struct device_type
+To: Greg KH <gregkh@suse.de>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Message-ID: <200703100137.35203.dtor@insightbb.com>
+Content-Disposition: inline
+
+Driver core: use attribute groups in struct device_type
+
+Attribute groups are more flexible than attribute lists
+(an attribute list can be represented by anonymous group)
+so switch struct device_type to use them.
+
+Also rework attribute creation for devices so that they all
+cleaned up properly in case of errors.
+
+Signed-off-by: Dmitry Torokhov <dtor@mail.ru>
+Cc: Kay Sievers <kay.sievers@novell.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/base/core.c    |  115 +++++++++++++++++++++++++++++--------------------
+ include/linux/device.h |    2 
+ 2 files changed, 70 insertions(+), 47 deletions(-)
+
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@ -259,64 +259,95 @@ static ssize_t store_uevent(struct devic
+ 	return count;
+ }
+ 
+-static int device_add_groups(struct device *dev)
++static int device_add_attributes(struct device *dev,
++				 struct device_attribute *attrs)
++{
++	int error = 0;
++	int i;
++
++	if (attrs) {
++		for (i = 0; attr_name(attrs[i]); i++) {
++			error = device_create_file(dev, &attrs[i]);
++			if (error)
++				break;
++		}
++		if (error)
++			while (--i >= 0)
++				device_remove_file(dev, &attrs[i]);
++	}
++	return error;
++}
++
++static void device_remove_attributes(struct device *dev,
++				     struct device_attribute *attrs)
+ {
+ 	int i;
++
++	if (attrs)
++		for (i = 0; attr_name(attrs[i]); i++)
++			device_remove_file(dev, &attrs[i]);
++}
++
++static int device_add_groups(struct device *dev,
++			     struct attribute_group **groups)
++{
+ 	int error = 0;
++	int i;
+ 
+-	if (dev->groups) {
+-		for (i = 0; dev->groups[i]; i++) {
+-			error = sysfs_create_group(&dev->kobj, dev->groups[i]);
++	if (groups) {
++		for (i = 0; groups[i]; i++) {
++			error = sysfs_create_group(&dev->kobj, groups[i]);
+ 			if (error) {
+ 				while (--i >= 0)
+-					sysfs_remove_group(&dev->kobj, dev->groups[i]);
+-				goto out;
++					sysfs_remove_group(&dev->kobj, groups[i]);
++				break;
+ 			}
+ 		}
+ 	}
+-out:
+ 	return error;
+ }
+ 
+-static void device_remove_groups(struct device *dev)
++static void device_remove_groups(struct device *dev,
++				 struct attribute_group **groups)
+ {
+ 	int i;
+-	if (dev->groups) {
+-		for (i = 0; dev->groups[i]; i++) {
+-			sysfs_remove_group(&dev->kobj, dev->groups[i]);
+-		}
+-	}
++
++	if (groups)
++		for (i = 0; groups[i]; i++)
++			sysfs_remove_group(&dev->kobj, groups[i]);
+ }
+ 
+ static int device_add_attrs(struct device *dev)
+ {
+ 	struct class *class = dev->class;
+ 	struct device_type *type = dev->type;
+-	int error = 0;
+-	int i;
++	int error;
+ 
+-	if (class && class->dev_attrs) {
+-		for (i = 0; attr_name(class->dev_attrs[i]); i++) {
+-			error = device_create_file(dev, &class->dev_attrs[i]);
+-			if (error)
+-				break;
+-		}
++	if (class) {
++		error = device_add_attributes(dev, class->dev_attrs);
+ 		if (error)
+-			while (--i >= 0)
+-				device_remove_file(dev, &class->dev_attrs[i]);
++			return error;
+ 	}
+ 
+-	if (type && type->attrs) {
+-		for (i = 0; attr_name(type->attrs[i]); i++) {
+-			error = device_create_file(dev, &type->attrs[i]);
+-			if (error)
+-				break;
+-		}
++	if (type) {
++		error = device_add_groups(dev, type->groups);
+ 		if (error)
+-			while (--i >= 0)
+-				device_remove_file(dev, &type->attrs[i]);
++			goto err_remove_class_attrs;
+ 	}
+ 
++	error = device_add_groups(dev, dev->groups);
++	if (error)
++		goto err_remove_type_groups;
++
++	return 0;
++
++ err_remove_type_groups:
++	if (type)
++		device_remove_groups(dev, type->groups);
++ err_remove_class_attrs:
++	if (class)
++		device_remove_attributes(dev, class->dev_attrs);
++
+ 	return error;
+ }
+ 
+@@ -324,17 +355,14 @@ static void device_remove_attrs(struct d
+ {
+ 	struct class *class = dev->class;
+ 	struct device_type *type = dev->type;
+-	int i;
+ 
+-	if (class && class->dev_attrs) {
+-		for (i = 0; attr_name(class->dev_attrs[i]); i++)
+-			device_remove_file(dev, &class->dev_attrs[i]);
+-	}
++	device_remove_groups(dev, dev->groups);
+ 
+-	if (type && type->attrs) {
+-		for (i = 0; attr_name(type->attrs[i]); i++)
+-			device_remove_file(dev, &type->attrs[i]);
+-	}
++	if (type)
++		device_remove_groups(dev, type->groups);
++
++	if (class)
++		device_remove_attributes(dev, class->dev_attrs);
+ }
+ 
+ 
+@@ -599,8 +627,6 @@ int device_add(struct device *dev)
+ 
+ 	if ((error = device_add_attrs(dev)))
+ 		goto AttrsError;
+-	if ((error = device_add_groups(dev)))
+-		goto GroupError;
+ 	if ((error = device_pm_add(dev)))
+ 		goto PMError;
+ 	if ((error = bus_add_device(dev)))
+@@ -624,7 +650,7 @@ int device_add(struct device *dev)
+ 		up(&dev->class->sem);
+ 	}
+  Done:
+- 	kfree(class_name);
++	kfree(class_name);
+ 	put_device(dev);
+ 	return error;
+  AttachError:
+@@ -635,8 +661,6 @@ int device_add(struct device *dev)
+ 	if (dev->bus)
+ 		blocking_notifier_call_chain(&dev->bus->bus_notifier,
+ 					     BUS_NOTIFY_DEL_DEVICE, dev);
+-	device_remove_groups(dev);
+- GroupError:
+ 	device_remove_attrs(dev);
+  AttrsError:
+ 	if (dev->devt_attr) {
+@@ -783,7 +807,6 @@ void device_del(struct device * dev)
+ 		up(&dev->class->sem);
+ 	}
+ 	device_remove_file(dev, &dev->uevent_attr);
+-	device_remove_groups(dev);
+ 	device_remove_attrs(dev);
+ 	bus_remove_device(dev);
+ 
+--- a/include/linux/device.h
++++ b/include/linux/device.h
+@@ -332,7 +332,7 @@ extern struct class_device *class_device
+ extern void class_device_destroy(struct class *cls, dev_t devt);
+ 
+ struct device_type {
+-	struct device_attribute *attrs;
++	struct attribute_group **groups;
+ 	int (*uevent)(struct device *dev, char **envp, int num_envp,
+ 		      char *buffer, int buffer_size);
+ 	void (*release)(struct device *dev);
