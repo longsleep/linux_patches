@@ -1,4 +1,4 @@
-From kay.sievers@vrfy.org Mon Dec 11 21:49:50 2006
+>From kay.sievers@vrfy.org Mon Dec 11 21:49:50 2006
 From: Kay Sievers <kay.sievers@vrfy.org>
 Subject: Driver core: convert block from raw kobjects to devices
 Date: Mon, 11 Dec 2006 16:01:49 +0100
@@ -33,7 +33,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 
 ---
- block/genhd.c              |  391 +++++++++++++++++----------------------------
+ block/genhd.c              |  399 ++++++++++++++++++---------------------------
  block/ll_rw_blk.c          |    4 
  drivers/base/core.c        |    2 
  drivers/block/aoe/aoeblk.c |   51 ++---
@@ -42,11 +42,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  drivers/md/dm.c            |    2 
  drivers/md/md.c            |    8 
  fs/block_dev.c             |    8 
- fs/partitions/check.c      |  305 ++++++++++++-----------------------
+ fs/partitions/check.c      |  310 ++++++++++++----------------------
  fs/super.c                 |    6 
  include/linux/genhd.h      |   23 +-
  init/do_mounts.c           |  109 +-----------
- 13 files changed, 333 insertions(+), 593 deletions(-)
+ 13 files changed, 349 insertions(+), 590 deletions(-)
 
 --- a/block/genhd.c
 +++ b/block/genhd.c
@@ -342,13 +342,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -	return print_dev_t(page, base);
 -}
 -static ssize_t disk_range_read(struct gendisk * disk, char *page)
-+static ssize_t disk_size_show(struct device *dev,
-+			      struct device_attribute *attr, char *buf)
- {
+-{
 -	return sprintf(page, "%d\n", disk->minors);
 -}
 -static ssize_t disk_removable_read(struct gendisk * disk, char *page)
--{
++static ssize_t disk_size_show(struct device *dev,
++			      struct device_attribute *attr, char *buf)
+ {
 -	return sprintf(page, "%d\n",
 -		       (disk->flags & GENHD_FL_REMOVABLE ? 1 : 0));
 +	struct gendisk *disk = dev_to_disk(dev);
@@ -408,11 +408,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			      struct device_attribute *attr, char *buf)
 +{
 +	struct gendisk *disk = dev_to_disk(dev);
-+
-+	return sprintf(buf, "%d\n", disk->flags & GENHD_FL_FAIL ? 1 : 0);
-+}
  
 -static ssize_t disk_fail_store(struct gendisk * disk,
++	return sprintf(buf, "%d\n", disk->flags & GENHD_FL_FAIL ? 1 : 0);
++}
++
 +static ssize_t disk_fail_store(struct device *dev,
 +			       struct device_attribute *attr,
  			       const char *buf, size_t count)
@@ -421,7 +421,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	int i;
  
  	if (count > 0 && sscanf(buf, "%d", &i) > 0) {
-@@ -436,154 +405,85 @@ static ssize_t disk_fail_store(struct ge
+@@ -436,154 +405,95 @@ static ssize_t disk_fail_store(struct ge
  
  	return count;
  }
@@ -434,7 +434,15 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -	.store	= disk_fail_store,
 -	.show	= disk_fail_read
 -};
--
++#endif
+ 
++static DEVICE_ATTR(range, S_IRUGO, disk_range_show, NULL);
++static DEVICE_ATTR(removable, S_IRUGO, disk_removable_show, NULL);
++static DEVICE_ATTR(size, S_IRUGO, disk_size_show, NULL);
++static DEVICE_ATTR(stat, S_IRUGO, disk_stat_show, NULL);
++#ifdef CONFIG_FAIL_MAKE_REQUEST
++static device_attribute dev_attr_fail =
++	__ATTR(make-it-fail, S_IRUGO|S_IWUSR, disk_fail_show, disk_fail_store);
  #endif
  
 -static struct attribute * default_attrs[] = {
@@ -444,28 +452,29 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -	&disk_attr_removable.attr,
 -	&disk_attr_size.attr,
 -	&disk_attr_stat.attr,
-+static struct device_attribute disk_attrs[] = {
-+	__ATTR(range, S_IRUGO, disk_range_show, NULL),
-+	__ATTR(removable, S_IRUGO, disk_removable_show, NULL),
-+	__ATTR(size, S_IRUGO, disk_size_show, NULL),
-+	__ATTR(stat, S_IRUGO, disk_stat_show, NULL),
++static struct attribute *disk_attrs[] = {
++	&dev_attr_range.attr,
++	&dev_attr_removable.attr,
++	&dev_attr_size.attr,
++	&dev_attr_stat.attr,
  #ifdef CONFIG_FAIL_MAKE_REQUEST
 -	&disk_attr_fail.attr,
-+	{
-+		.attr = {
-+			.name = "make-it-fail",
-+			.mode = S_IRUGO | S_IWUSR,
-+			.owner = THIS_MODULE,
-+		},
-+		.show	= disk_fail_show,
-+		.store	= disk_fail_store,
-+	},
++	&dev_attr_fail.attr,
  #endif
 -	NULL,
-+	__ATTR_NULL,
++	NULL
++};
++
++static struct attribute_group disk_attr_group = {
++	.attrs = disk_attrs,
  };
  
 -static void disk_release(struct kobject * kobj)
++static struct attribute_group *disk_attr_groups[] = {
++	&disk_attr_group,
++	NULL
++};
++
 +static void disk_release(struct device *dev)
  {
 -	struct gendisk *disk = to_disk(kobj);
@@ -555,7 +564,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -	.filter		= block_uevent_filter,
 -	.uevent		= block_uevent,
 +struct device_type disk_type = {
-+	.attrs		= disk_attrs,
++	.groups		= disk_attr_groups,
 +	.release	= disk_release,
  };
  
@@ -616,7 +625,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  }
  
  static int diskstats_show(struct seq_file *s, void *v)
-@@ -593,7 +493,7 @@ static int diskstats_show(struct seq_fil
+@@ -593,7 +503,7 @@ static int diskstats_show(struct seq_fil
  	int n = 0;
  
  	/*
@@ -625,7 +634,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		seq_puts(s,	"major minor name"
  				"     rio rmerge rsect ruse wio wmerge "
  				"wsect wuse running use aveq"
-@@ -637,6 +537,25 @@ struct seq_operations diskstats_op = {
+@@ -637,6 +547,25 @@ struct seq_operations diskstats_op = {
  	.show	= diskstats_show
  };
  
@@ -651,7 +660,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  struct gendisk *alloc_disk(int minors)
  {
  	return alloc_disk_node(minors, -1);
-@@ -663,9 +582,11 @@ struct gendisk *alloc_disk_node(int mino
+@@ -663,9 +592,11 @@ struct gendisk *alloc_disk_node(int mino
  			memset(disk->part, 0, size);
  		}
  		disk->minors = minors;
@@ -665,7 +674,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	}
  	return disk;
  }
-@@ -683,7 +604,7 @@ struct kobject *get_disk(struct gendisk 
+@@ -683,7 +614,7 @@ struct kobject *get_disk(struct gendisk 
  	owner = disk->fops->owner;
  	if (owner && !try_module_get(owner))
  		return NULL;
@@ -674,7 +683,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	if (kobj == NULL) {
  		module_put(owner);
  		return NULL;
-@@ -697,7 +618,7 @@ EXPORT_SYMBOL(get_disk);
+@@ -697,7 +628,7 @@ EXPORT_SYMBOL(get_disk);
  void put_disk(struct gendisk *disk)
  {
  	if (disk)
@@ -704,7 +713,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  }
 --- a/drivers/base/core.c
 +++ b/drivers/base/core.c
-@@ -821,7 +821,7 @@ void device_del(struct device * dev)
+@@ -818,7 +818,7 @@ void device_del(struct device * dev)
  		if (dev->kobj.parent != &dev->class->subsys.kset.kobj)
  			sysfs_remove_link(&dev->class->subsys.kset.kobj,
  					  dev->bus_id);
@@ -1061,11 +1070,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			      struct device_attribute *attr, char *buf)
 +{
 +	struct hd_struct *p = dev_to_part(dev);
-+
-+	return sprintf(buf, "%d\n", p->make_it_fail);
-+}
  
 -static ssize_t part_fail_store(struct hd_struct * p,
++	return sprintf(buf, "%d\n", p->make_it_fail);
++}
++
 +static ssize_t part_fail_store(struct device *dev,
 +			       struct device_attribute *attr,
  			       const char *buf, size_t count)
@@ -1074,7 +1083,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	int i;
  
  	if (count > 0 && sscanf(buf, "%d", &i) > 0)
-@@ -288,49 +242,42 @@ static ssize_t part_fail_store(struct hd
+@@ -288,49 +242,51 @@ static ssize_t part_fail_store(struct hd
  
  	return count;
  }
@@ -1087,7 +1096,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -	.store	= part_fail_store,
 -	.show	= part_fail_read
 -};
--
++#endif
+ 
++static DEVICE_ATTR(start, S_IRUGO, part_start_show, NULL);
++static DEVICE_ATTR(size, S_IRUGO, part_size_show, NULL);
++static DEVICE_ATTR(stat, S_IRUGO, part_stat_show, NULL);
++#ifdef CONFIG_FAIL_MAKE_REQUEST
++static struct part_attribute dev_attr_fail =
++	__ATTR(make-it-fail, S_IRUGO|S_IWUSR, part_fail_store, part_fail_read);
  #endif
  
 -static struct attribute * default_attrs[] = {
@@ -1096,28 +1112,28 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -	&part_attr_start.attr,
 -	&part_attr_size.attr,
 -	&part_attr_stat.attr,
-+static struct device_attribute part_attrs[] = {
-+	__ATTR(start, S_IRUGO, part_start_show, NULL),
-+	__ATTR(size, S_IRUGO, part_size_show, NULL),
-+	__ATTR(stat, S_IRUGO, part_stat_show, NULL),
++static struct attribute *part_attrs[] = {
++	&dev_attr_start.attr,
++	&dev_attr_size.attr,
++	&dev_attr_stat.attr,
  #ifdef CONFIG_FAIL_MAKE_REQUEST
 -	&part_attr_fail.attr,
-+	{
-+		.attr = {
-+			.name = "make-it-fail",
-+			.mode = S_IRUGO | S_IWUSR,
-+			.owner = THIS_MODULE,
-+		},
-+		.show	= part_fail_show,
-+		.store	= part_fail_store,
-+	},
++	&dev_attr_fail,
  #endif
 -	NULL,
-+	__ATTR_NULL
++	NULL
  };
  
 -extern struct subsystem block_subsys;
--
++static struct attribute_group part_attr_group = {
++	.attrs = part_attrs,
++};
++
++static struct attribute_group *part_attr_groups[] = {
++	&part_attr_group,
++	NULL
++};
+ 
 -static void part_release(struct kobject *kobj)
 +static void part_release(struct device *dev)
  {
@@ -1128,7 +1144,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
 -struct kobj_type ktype_part = {
 +struct device_type part_type = {
-+	.attrs		= part_attrs,
++	.groups		= part_attr_groups,
  	.release	= part_release,
 -	.default_attrs	= default_attrs,
 -	.sysfs_ops	= &part_sysfs_ops,
@@ -1143,7 +1159,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	p->holder_dir = kobject_add_dir(k, "holders");
  	kobject_put(k);
  }
-@@ -339,7 +286,7 @@ static inline void disk_sysfs_add_subdir
+@@ -339,7 +295,7 @@ static inline void disk_sysfs_add_subdir
  {
  	struct kobject *k;
  
@@ -1152,7 +1168,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	disk->holder_dir = kobject_add_dir(k, "holders");
  	disk->slave_dir = kobject_add_dir(k, "slaves");
  	kobject_put(k);
-@@ -348,6 +295,7 @@ static inline void disk_sysfs_add_subdir
+@@ -348,6 +304,7 @@ static inline void disk_sysfs_add_subdir
  void delete_partition(struct gendisk *disk, int part)
  {
  	struct hd_struct *p = disk->part[part-1];
@@ -1160,7 +1176,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	if (!p)
  		return;
  	if (!p->nr_sects)
-@@ -357,16 +305,15 @@ void delete_partition(struct gendisk *di
+@@ -357,16 +314,15 @@ void delete_partition(struct gendisk *di
  	p->nr_sects = 0;
  	p->ios[0] = p->ios[1] = 0;
  	p->sectors[0] = p->sectors[1] = 0;
@@ -1180,7 +1196,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  	p = kmalloc(sizeof(*p), GFP_KERNEL);
  	if (!p)
-@@ -378,17 +325,26 @@ void add_partition(struct gendisk *disk,
+@@ -378,17 +334,26 @@ void add_partition(struct gendisk *disk,
  	p->partno = part;
  	p->policy = disk->policy;
  
@@ -1217,7 +1233,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	if (flags & ADDPART_FLAG_WHOLEDISK) {
  		static struct attribute addpartattr = {
  			.name = "whole_disk",
-@@ -396,73 +352,25 @@ void add_partition(struct gendisk *disk,
+@@ -396,73 +361,25 @@ void add_partition(struct gendisk *disk,
  			.owner = THIS_MODULE,
  		};
  
@@ -1227,14 +1243,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -	partition_sysfs_add_subdir(p);
 -	disk->part[part-1] = p;
 -}
- 
+-
 -static char *make_block_name(struct gendisk *disk)
 -{
 -	char *name;
 -	static char *block_str = "block:";
 -	int size;
 -	char *s;
--
+ 
 -	size = strlen(block_str) + strlen(disk->disk_name) + 1;
 -	name = kmalloc(size, GFP_KERNEL);
 -	if (!name)
@@ -1303,7 +1319,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	return err;
  }
  
-@@ -475,16 +383,23 @@ void register_disk(struct gendisk *disk)
+@@ -475,16 +392,23 @@ void register_disk(struct gendisk *disk)
  	struct hd_struct *p;
  	int err;
  
@@ -1332,7 +1348,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		return;
  	}
   	disk_sysfs_add_subdirs(disk);
-@@ -501,25 +416,23 @@ void register_disk(struct gendisk *disk)
+@@ -501,25 +425,23 @@ void register_disk(struct gendisk *disk)
  	if (!bdev)
  		goto exit;
  
@@ -1362,7 +1378,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	}
  }
  
-@@ -601,19 +514,15 @@ void del_gendisk(struct gendisk *disk)
+@@ -601,19 +523,15 @@ void del_gendisk(struct gendisk *disk)
  	disk_stat_set_all(disk, 0);
  	disk->stamp = 0;
  
