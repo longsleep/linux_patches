@@ -1,0 +1,57 @@
+From oneukum@suse.de  Thu Mar 15 15:39:02 2007
+From: Oliver Neukum <oneukum@suse.de>
+To: Greg KH <gregkh@suse.de>, linux-usb-devel@lists.sourceforge.net
+Subject: USB: usb_serial_driver insufficient for clean disconnect handling
+Date: Thu, 15 Mar 2007 13:59:30 +0100
+Message-Id: <200703151359.31071.oneukum@suse.de>
+
+it seems to me that for several usb serial drivers it is currently
+impossible to cleanly handle disconnect, because usb_serial_driver
+lacks a needed method.
+
+As we often discussed, before a disconnect handler may return, it has
+to finish all IO to the device. That means that usb_kill_urb() has to be
+called on all URBs that might be active.
+The serial driver does kill all standard URBs (bulk/interrupt in/out)
+but it does not and indeed cannot deal with any private URBs (eg.
+control URBs as in mos7720/mos7840).
+The shutdown() method is unable to do the job because it can be
+delayed if additional references to the port exist.
+
+To allow killing them in time I propose this additional method for
+usb_serial_driver.
+
+Signed-off-by: Oliver Neukum <oneukum@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/serial/usb-serial.c |    7 ++++++-
+ include/linux/usb/serial.h      |    1 +
+ 2 files changed, 7 insertions(+), 1 deletion(-)
+
+--- a/drivers/usb/serial/usb-serial.c
++++ b/drivers/usb/serial/usb-serial.c
+@@ -1063,7 +1063,12 @@ void usb_serial_disconnect(struct usb_in
+ 				kill_traffic(port);
+ 			}
+ 		}
+-		/* let the last holder of this object 
++		/* allow the subdriver to cleanly kill
++		 * private URBs */
++		if (serial->type->detach)
++			(serial->type->detach)(serial);
++
++		/* let the last holder of this object
+ 		 * cause it to be cleaned up */
+ 		usb_serial_put(serial);
+ 	}
+--- a/include/linux/usb/serial.h
++++ b/include/linux/usb/serial.h
+@@ -214,6 +214,7 @@ struct usb_serial_driver {
+ 
+ 	int (*probe) (struct usb_serial *serial, const struct usb_device_id *id);
+ 	int (*attach) (struct usb_serial *serial);
++	void (*detach) (struct usb_serial *serial);
+ 	int (*calc_num_ports) (struct usb_serial *serial);
+ 
+ 	void (*shutdown) (struct usb_serial *serial);
