@@ -48,40 +48,33 @@ write ATTR{}="$kernel" to sysfs files.
 
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 ---
- drivers/base/bus.c     |   63 +++++++++++++++++++++++++++++++++++++++++++++----
- include/linux/device.h |   34 ++++++++++++++------------
- 2 files changed, 78 insertions(+), 19 deletions(-)
+ drivers/base/bus.c     |   84 +++++++++++++++++++++++++++++++++++++++++++++----
+ include/linux/device.h |   34 +++++++++++--------
+ 2 files changed, 97 insertions(+), 21 deletions(-)
 
 --- a/drivers/base/bus.c
 +++ b/drivers/base/bus.c
-@@ -425,7 +425,8 @@ int bus_attach_device(struct device * de
+@@ -27,6 +27,9 @@
+ #define to_driver(obj) container_of(obj, struct device_driver, kobj)
  
- 	if (bus) {
- 		dev->is_registered = 1;
--		ret = device_attach(dev);
-+		if (bus->drivers_autoprobe)
-+			ret = device_attach(dev);
- 		if (ret >= 0) {
- 			klist_add_tail(&dev->knode_bus, &bus->klist_devices);
- 			ret = 0;
-@@ -541,9 +542,11 @@ int bus_add_driver(struct device_driver 
- 	if ((error = kobject_register(&drv->kobj)))
- 		goto out_put_bus;
  
--	error = driver_attach(drv);
--	if (error)
--		goto out_unregister;
-+	if (drv->bus->drivers_autoprobe) {
-+		error = driver_attach(drv);
-+		if (error)
-+			goto out_unregister;
-+	}
- 	klist_add_tail(&drv->knode_bus, &bus->klist_drivers);
- 	module_add_driver(drv->owner, drv);
++static int __must_check bus_rescan_devices_helper(struct device *dev,
++						void *data);
++
+ static ssize_t
+ drv_attr_show(struct kobject * kobj, struct attribute * attr, char * buf)
+ {
+@@ -133,7 +136,6 @@ static decl_subsys(bus, &ktype_bus, NULL
  
-@@ -724,6 +727,34 @@ static void klist_devices_put(struct kli
- 	put_device(dev);
+ 
+ #ifdef CONFIG_HOTPLUG
+-
+ /* Manually detach a device from its associated driver. */
+ static int driver_helper(struct device *dev, void *data)
+ {
+@@ -199,6 +201,33 @@ static ssize_t driver_bind(struct device
  }
+ static DRIVER_ATTR(bind, S_IWUSR, NULL, driver_bind);
  
 +static ssize_t show_drivers_autoprobe(struct bus_type *bus, char *buf)
 +{
@@ -110,14 +103,27 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		return -EINVAL;
 +	return count;
 +}
-+
- /**
-  *	bus_register - register a bus with the system.
-  *	@bus:	bus.
-@@ -762,6 +793,25 @@ int bus_register(struct bus_type * bus)
+ #endif
  
- 	klist_init(&bus->klist_devices, klist_devices_get, klist_devices_put);
- 	klist_init(&bus->klist_drivers, NULL, NULL);
+ static struct device * next_device(struct klist_iter * i)
+@@ -425,7 +454,8 @@ int bus_attach_device(struct device * de
+ 
+ 	if (bus) {
+ 		dev->is_registered = 1;
+-		ret = device_attach(dev);
++		if (bus->drivers_autoprobe)
++			ret = device_attach(dev);
+ 		if (ret >= 0) {
+ 			klist_add_tail(&dev->knode_bus, &bus->klist_devices);
+ 			ret = 0;
+@@ -515,9 +545,41 @@ static void remove_bind_files(struct dev
+ 	driver_remove_file(drv, &driver_attr_bind);
+ 	driver_remove_file(drv, &driver_attr_unbind);
+ }
++
++static int add_probe_files(struct bus_type *bus)
++{
++	int retval;
 +
 +	bus->drivers_probe_attr.attr.name = "drivers_probe";
 +	bus->drivers_probe_attr.attr.mode = S_IWUSR;
@@ -125,9 +131,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	bus->drivers_probe_attr.store = store_drivers_probe;
 +	retval = bus_create_file(bus, &bus->drivers_probe_attr);
 +	if (retval)
-+		goto bus_probe_fail;
++		goto out;
 +
-+	bus->drivers_autoprobe = 1;
 +	bus->drivers_autoprobe_attr.attr.name = "drivers_autoprobe";
 +	bus->drivers_autoprobe_attr.attr.mode = S_IWUSR | S_IRUGO;
 +	bus->drivers_autoprobe_attr.attr.owner = bus->owner;
@@ -135,27 +140,74 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	bus->drivers_autoprobe_attr.store = store_drivers_autoprobe;
 +	retval = bus_create_file(bus, &bus->drivers_autoprobe_attr);
 +	if (retval)
-+		goto bus_autoprobe_fail;
++		bus_remove_file(bus, &bus->drivers_probe_attr);
++out:
++	return retval;
++}
++
++static void remove_probe_files(struct bus_type *bus)
++{
++	bus_remove_file(bus, &bus->drivers_autoprobe_attr);
++	bus_remove_file(bus, &bus->drivers_probe_attr);
++}
+ #else
+ static inline int add_bind_files(struct device_driver *drv) { return 0; }
+ static inline void remove_bind_files(struct device_driver *drv) {}
++static inline int add_probe_files(struct bus_type *bus) { return 0; }
++static inline void remove_probe_files(struct bus_type *bus) {}
+ #endif
+ 
+ /**
+@@ -541,9 +603,11 @@ int bus_add_driver(struct device_driver 
+ 	if ((error = kobject_register(&drv->kobj)))
+ 		goto out_put_bus;
+ 
+-	error = driver_attach(drv);
+-	if (error)
+-		goto out_unregister;
++	if (drv->bus->drivers_autoprobe) {
++		error = driver_attach(drv);
++		if (error)
++			goto out_unregister;
++	}
+ 	klist_add_tail(&drv->knode_bus, &bus->klist_drivers);
+ 	module_add_driver(drv->owner, drv);
+ 
+@@ -762,6 +826,12 @@ int bus_register(struct bus_type * bus)
+ 
+ 	klist_init(&bus->klist_devices, klist_devices_get, klist_devices_put);
+ 	klist_init(&bus->klist_drivers, NULL, NULL);
++
++	bus->drivers_autoprobe = 1;
++	retval = add_probe_files(bus);
++	if (retval)
++		goto bus_probe_files_fail;
 +
  	retval = bus_add_attrs(bus);
  	if (retval)
  		goto bus_attrs_fail;
-@@ -770,6 +820,10 @@ int bus_register(struct bus_type * bus)
+@@ -770,6 +840,8 @@ int bus_register(struct bus_type * bus)
  	return 0;
  
  bus_attrs_fail:
-+	bus_remove_file(bus, &bus->drivers_autoprobe_attr);
-+bus_autoprobe_fail:
-+	bus_remove_file(bus, &bus->drivers_probe_attr);
-+bus_probe_fail:
++	remove_probe_files(bus);
++bus_probe_files_fail:
  	kset_unregister(&bus->drivers);
  bus_drivers_fail:
  	kset_unregister(&bus->devices);
-@@ -791,6 +845,7 @@ void bus_unregister(struct bus_type * bu
+@@ -779,7 +851,6 @@ out:
+ 	return retval;
+ }
+ 
+-
+ /**
+  *	bus_unregister - remove a bus from the system
+  *	@bus:	bus.
+@@ -791,6 +862,7 @@ void bus_unregister(struct bus_type * bu
  {
  	pr_debug("bus %s: unregistering\n", bus->name);
  	bus_remove_attrs(bus);
-+	bus_remove_file(bus, &bus->drivers_autoprobe_attr);
++	remove_probe_files(bus);
  	kset_unregister(&bus->drivers);
  	kset_unregister(&bus->devices);
  	subsystem_unregister(&bus->subsys);
