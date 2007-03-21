@@ -1,0 +1,602 @@
+From owner-linux-pci@atrey.karlin.mff.cuni.cz Fri Mar  9 12:08:23 2007
+Date: Fri, 9 Mar 2007 15:03:34 -0500
+From: Aristeu Rozanski <arozansk@redhat.com>
+To: Grant Grundler <grundler@parisc-linux.org>
+Cc: Greg KH <greg@kroah.com>, Tim Small <tim@buttersideup.com>,
+	Dave Jones <davej@redhat.com>, linux-pci@atrey.karlin.mff.cuni.cz,
+	bluesmoke-devel <bluesmoke-devel@lists.sourceforge.net>
+Subject: PCI: Two drivers on one PCI device (EDAC and AGPGART)
+Message-ID: <20070309200334.GK2899@redhat.com>
+Mime-Version: 1.0
+Content-Type: text/plain; charset=us-ascii
+Content-Disposition: inline
+
+> Are you sure the last two lines shouldn't be:
+> 
+> 	((id1->class & id1->class_mask) == (id2->class & id2->class_mask))
+> 
+> I'm just not used to seeing anyone comparing class_mask field directly.
+oops, you're right. here's the updated patch:
+
+---
+ drivers/char/agp/intel-agp.c |    5 
+ drivers/edac/e7xxx_edac.c    |    5 
+ drivers/pci/Kconfig          |   11 +
+ drivers/pci/Makefile         |    3 
+ drivers/pci/sharing.c        |  462 +++++++++++++++++++++++++++++++++++++++++++
+ include/linux/pcids.h        |   26 ++
+ 6 files changed, 508 insertions(+), 4 deletions(-)
+
+--- a/drivers/char/agp/intel-agp.c
++++ b/drivers/char/agp/intel-agp.c
+@@ -4,6 +4,7 @@
+ 
+ #include <linux/module.h>
+ #include <linux/pci.h>
++#include <linux/pcids.h>
+ #include <linux/init.h>
+ #include <linux/kernel.h>
+ #include <linux/pagemap.h>
+@@ -2099,12 +2100,12 @@ static int __init agp_intel_init(void)
+ {
+ 	if (agp_off)
+ 		return -EINVAL;
+-	return pci_register_driver(&agp_intel_pci_driver);
++	return pcids_register_driver(&agp_intel_pci_driver);
+ }
+ 
+ static void __exit agp_intel_cleanup(void)
+ {
+-	pci_unregister_driver(&agp_intel_pci_driver);
++	pcids_unregister_driver(&agp_intel_pci_driver);
+ }
+ 
+ module_init(agp_intel_init);
+--- a/drivers/edac/e7xxx_edac.c
++++ b/drivers/edac/e7xxx_edac.c
+@@ -26,6 +26,7 @@
+ #include <linux/init.h>
+ #include <linux/pci.h>
+ #include <linux/pci_ids.h>
++#include <linux/pcids.h>
+ #include <linux/slab.h>
+ #include "edac_mc.h"
+ 
+@@ -550,12 +551,12 @@ static struct pci_driver e7xxx_driver = 
+ 
+ static int __init e7xxx_init(void)
+ {
+-	return pci_register_driver(&e7xxx_driver);
++	return pcids_register_driver(&e7xxx_driver);
+ }
+ 
+ static void __exit e7xxx_exit(void)
+ {
+-	pci_unregister_driver(&e7xxx_driver);
++	pcids_unregister_driver(&e7xxx_driver);
+ }
+ 
+ module_init(e7xxx_init);
+--- a/drivers/pci/Kconfig
++++ b/drivers/pci/Kconfig
+@@ -60,3 +60,14 @@ config HT_IRQ
+ 	   This allows native hypertransport devices to use interrupts.
+ 
+ 	   If unsure say Y.
++
++config PCI_DEVICE_SHARING
++	bool "PCI device sharing"
++	default n
++	depends on PCI && HOTPLUG && EXPERIMENTAL
++	help
++	   Say Y here if you want to drivers to be able to share the PCI
++	   devices.
++
++	   If unsure, say N.
++
+--- a/drivers/pci/Makefile
++++ b/drivers/pci/Makefile
+@@ -20,6 +20,9 @@ obj-$(CONFIG_PCI_MSI) += msi.o
+ # Build the Hypertransport interrupt support
+ obj-$(CONFIG_HT_IRQ) += htirq.o
+ 
++# Build the device sharing support
++obj-$(CONFIG_PCI_DEVICE_SHARING) += sharing.o
++
+ #
+ # Some architectures use the generic PCI setup functions
+ #
+--- /dev/null
++++ b/drivers/pci/sharing.c
+@@ -0,0 +1,462 @@
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include "pci.h"
++
++struct pcids_device_id;
++struct pcids_driver;
++struct pcids_driver_device {
++	struct list_head list;
++	struct pcids_driver *sdrv;
++	void *private;
++};
++struct pcids_device {
++	struct list_head list;
++	struct pci_dev *dev;
++	struct list_head drivers;
++};
++static LIST_HEAD(pcids_devices);
++
++struct pcids_device_id {
++	struct list_head list;
++	struct pci_device_id id;
++	int usecount;
++};
++static LIST_HEAD(pcids_device_ids);
++
++struct pcids_driver {
++	struct list_head list;
++	struct pci_driver *driver;
++};
++static LIST_HEAD(pcids_drivers);
++
++DEFINE_SPINLOCK(pcids_lock);
++
++#define to_pcids_device(x) (pci_get_drvdata(x))
++
++static void pcids_call_remove(struct pcids_device *sdev,
++			      struct pcids_driver *sdrv, void *data);
++static int pcids_bind_driver(struct pcids_device *sdev,
++			     struct pcids_driver *sdrv,
++			     struct pcids_driver_device **p);
++static void pcids_update_driver_data(struct pcids_driver_device *pdd,
++				     void *data);
++static int pcids_probe(struct pci_dev *dev, const struct pci_device_id *id);
++static void pcids_remove(struct pci_dev *dev);
++#if 0
++static int pcids_suspend(struct pci_dev *dev, pm_message_t state);
++static int pcids_suspend_late(struct pci_dev *dev, pm_message_t state);
++static int pcids_resume_early(struct pci_dev *dev);
++static int pcids_resume(struct pci_dev *dev);
++static int pcids_enable_wake(struct pci_dev *dev, pci_power_t state,
++			     int enable);
++static void pcids_shutdown(struct pci_dev *dev);
++#endif
++
++static struct pci_driver pcids_pci_driver = {
++	.name = "pcids",
++	.probe = pcids_probe,
++	.remove = pcids_remove,
++#if 0
++	.suspend = pcids_suspend,
++	.suspend_late = pcids_suspend_late,
++	.resume_early = pcids_resume_early,
++	.resume = pcids_resume,
++	.enable_wake = pcids_enable_wake,
++	.shutdown = pcids_shutdown,
++#endif
++};
++
++static struct pcids_driver *to_pcids_driver(struct pci_driver *pdrv)
++{
++	struct pcids_driver *sdrv = NULL;
++
++	spin_lock(&pcids_lock);
++	list_for_each_entry(sdrv, &pcids_drivers, list) {
++		if (sdrv->driver == pdrv)
++			break;
++	}
++	spin_unlock(&pcids_lock);
++
++	BUG_ON(sdrv->driver != pdrv);
++	return sdrv;
++}
++
++static struct pcids_device *pcids_new_device(struct pci_dev *dev,
++					     struct pcids_device_id *sdev_id)
++{
++	struct pcids_device *sdev;
++
++	sdev = kzalloc(sizeof(struct pcids_device), GFP_KERNEL);
++	if (sdev) {
++		sdev->dev = dev;
++		INIT_LIST_HEAD(&sdev->list);
++		INIT_LIST_HEAD(&sdev->drivers);
++	}
++	return sdev;
++}
++
++static int pcids_call_probe(struct pcids_device *sdev,
++			    struct pcids_driver *sdrv,
++			    const struct pci_device_id *id)
++{
++	struct pci_dev *dev = sdev->dev;
++	int retval = -ENODEV;
++
++	pci_set_drvdata(dev, NULL);
++	if (sdrv->driver->probe(dev, id) == 0) {
++		struct pcids_driver_device *pdd;
++		void *data;
++
++		retval = pcids_bind_driver(sdev, sdrv, &pdd);
++		if (retval) {
++			pcids_call_remove(sdev, sdrv,
++					  pci_get_drvdata(dev));
++			goto out;
++		}
++
++		/*
++		 * check if the driver changed the device's
++		 * driver private data. if it did, save the
++		 * value to be retrieved later
++		 */
++		data = pci_get_drvdata(dev);
++		if (data != NULL)
++			/* save private driver data */
++			pcids_update_driver_data(pdd, data);
++		retval = 0;
++	}
++out:
++	pci_set_drvdata(dev, sdev);
++	return retval;
++}
++
++static void pcids_call_remove(struct pcids_device *sdev,
++			      struct pcids_driver *sdrv, void *data)
++{
++	pci_set_drvdata(sdev->dev, data);
++	sdrv->driver->remove(sdev->dev);
++	pci_set_drvdata(sdev->dev, sdev);
++}
++
++static void pcids_remove_device(struct pcids_device *sdev)
++{
++	struct pcids_driver_device *pdd, *n;
++	struct pcids_driver *sdrv;
++
++	list_del(&sdev->list);
++	list_for_each_entry_safe(pdd, n, &sdev->drivers, list) {
++		sdrv = pdd->sdrv;
++
++		pcids_call_remove(sdev, sdrv, pdd->private);
++
++		list_del(&pdd->list);
++		kfree(pdd);
++	}
++	kfree(sdev);
++}
++
++static int pcids_bind_driver(struct pcids_device *sdev,
++			     struct pcids_driver *sdrv,
++			     struct pcids_driver_device **p)
++{
++	struct pcids_driver_device *pdd;
++
++	pdd = kzalloc(sizeof(struct pcids_driver_device), GFP_KERNEL);
++	if (pdd == NULL)
++		return -ENOMEM;
++	INIT_LIST_HEAD(&pdd->list);
++	pdd->sdrv = sdrv;
++	list_add_tail(&pdd->list, &sdev->drivers);
++	*p = pdd;
++
++	return 0;
++}
++
++static void pcids_update_driver_data(struct pcids_driver_device *pdd,
++				     void *data)
++{
++	pdd->private = data;
++}
++
++static struct pcids_device_id *pcids_find_id(const struct pci_device_id *id)
++{
++	struct pcids_device_id *sdev_id;
++
++	list_for_each_entry(sdev_id, &pcids_device_ids, list)
++		if (pci_match_single_id(&sdev_id->id, id))
++			return sdev_id;
++
++	return NULL;
++}
++
++static struct pcids_device_id *pcids_add_id(const struct pci_device_id *id)
++{
++	struct pcids_device_id *sdev_id;
++
++	sdev_id = kzalloc(sizeof(struct pcids_device_id), GFP_KERNEL);
++	if (sdev_id != NULL) {
++		INIT_LIST_HEAD(&sdev_id->list);
++		memcpy(&sdev_id->id, id, sizeof(struct pci_device_id));
++		sdev_id->usecount = 1;
++
++		list_add_tail(&sdev_id->list, &pcids_device_ids);
++	}
++
++	return sdev_id;
++}
++
++static void pcids_get_id(struct pcids_device_id *sdev_id)
++{
++	sdev_id->usecount++;
++}
++
++static void pcids_put_id(struct pcids_device_id *sdev_id)
++{
++	if (--sdev_id->usecount == 0) {
++		list_del(&sdev_id->list);
++		pci_free_dynid(&pcids_pci_driver, &sdev_id->id);
++		kfree(sdev_id);
++	}
++}
++
++static void pcids_unbind_all_devices(struct pcids_driver *sdrv)
++{
++	struct pcids_device *sdev;
++	struct pcids_driver_device *pdd, *n;
++
++	list_for_each_entry(sdev, &pcids_devices, list) {
++		list_for_each_entry_safe(pdd, n, &sdev->drivers, list) {
++			if (pdd->sdrv == sdrv) {
++				pcids_call_remove(sdev, sdrv, pdd->private);
++				list_del(&pdd->list);
++				kfree(pdd);
++			}
++		}
++	}
++}
++
++static int pcids_probe_existing_devices(struct pcids_device_id *sdev_id,
++					struct pcids_driver *sdrv)
++{
++	struct pcids_device *sdev;
++	struct pci_device_id *id;
++	int retval = 0;
++
++	list_for_each_entry(sdev, &pcids_devices, list) {
++		if (pci_match_one_device(&sdev_id->id, sdev->dev)) {
++			id = pci_match_device(sdrv->driver, sdev->dev);
++			if (id) {
++				/* we must pass the driver's id structure
++				 * because it may contain private data */
++				retval = pcids_call_probe(sdev, sdrv, id);
++				if (retval)
++					goto out;
++			}
++		}
++	}
++
++out:
++	return retval;
++}
++
++static int pcids_probe(struct pci_dev *dev, const struct pci_device_id *id)
++{
++	struct pcids_device_id *sdev_id;
++	struct pcids_device *sdev;
++	struct pcids_driver *sdrv;
++	struct pci_device_id *drv_id;
++	int retval;
++
++	retval = -ENODEV;
++	spin_lock(&pcids_lock);
++	sdev_id = pcids_find_id(id);
++	if (sdev_id == NULL)
++		goto out;
++
++	retval = -ENOMEM;
++	sdev = pcids_new_device(dev, sdev_id);
++	if (sdev == NULL)
++		goto out;
++	list_add_tail(&sdev->list, &pcids_devices);
++
++	list_for_each_entry(sdrv, &pcids_drivers, list) {
++		drv_id = pci_match_device(sdrv->driver, dev);
++		if (drv_id) {
++			/* we must pass the driver's id structure because it
++			 * may contain private data */
++			retval = pcids_call_probe(sdev, sdrv, drv_id);
++			if (retval && retval != -ENODEV)
++				goto free_sdev;
++		}
++	}
++	/*
++	 * we always accept the device; if a new driver kicks in, we must be
++	 * able to try giving it this device
++	 */
++	retval = 0;
++
++out:
++	spin_unlock(&pcids_lock);
++	return retval;
++free_sdev:
++	pcids_remove_device(sdev);
++	goto out;
++}
++
++static void pcids_remove(struct pci_dev *dev)
++{
++	struct pcids_device *sdev = to_pcids_device(dev);
++
++	spin_lock(&pcids_lock);
++	pcids_remove_device(sdev);
++	spin_unlock(&pcids_lock);
++}
++
++#if 0
++static int pcids_suspend(struct pci_dev *dev, pm_message_t state)
++{
++	return 0;
++}
++
++static int pcids_suspend_late(struct pci_dev *dev, pm_message_t state)
++{
++	return 0;
++}
++
++static int pcids_resume_early(struct pci_dev *dev)
++{
++	return 0;
++}
++
++static int pcids_resume(struct pci_dev *dev)
++{
++	return 0;
++}
++
++static int pcids_enable_wake(struct pci_dev *dev, pci_power_t state,
++			     int enable)
++{
++	return 0;
++}
++
++static void pcids_shutdown(struct pci_dev *dev)
++{
++
++}
++#endif
++
++int pcids_register_driver(struct pci_driver *pdrv)
++{
++	const struct pci_device_id *id;
++	struct pcids_driver *sdrv;
++	struct pcids_device_id *sdev_id;
++	int i, retval;
++
++	retval = -ENOMEM;
++	sdrv = kzalloc(sizeof(struct pcids_driver), GFP_KERNEL);
++	if (sdrv == NULL)
++		goto out;
++	sdrv->driver = pdrv;
++	INIT_LIST_HEAD(&sdrv->list);
++
++	spin_lock(&pcids_lock);
++	list_add_tail(&sdrv->list, &pcids_drivers);
++	for (i = 0; pdrv->id_table[i].vendor ||
++		    pdrv->id_table[i].subvendor ||
++		    pdrv->id_table[i].class_mask; i++) {
++		id = &pdrv->id_table[i];
++		sdev_id = pcids_find_id(id);
++		if (sdev_id != NULL) {
++			pcids_get_id(sdev_id);
++			retval = pcids_probe_existing_devices(sdev_id, sdrv);
++			if (retval && retval != -ENODEV)
++				goto free_ids;
++		} else {
++			sdev_id = pcids_add_id(id);
++			if (sdev_id == NULL) {
++				retval = -ENOMEM;
++				goto free_ids;
++			}
++
++			/*
++			 * probing existing devices. this is needed because
++			 * some drivers may be more or less restrictive with
++			 * PCI ids and they'll look differently than the
++			 * already added ones and will be added twice on the
++			 * list.
++			 */
++			retval = pcids_probe_existing_devices(sdev_id, sdrv);
++			if (retval && retval != -ENODEV) {
++				pcids_put_id(sdev_id);
++				goto free_ids;
++			}
++
++			/* Call pci_add_dynid() only after having everything
++			 * set: it'll call pcids_probe() if any new device is
++			 * found */
++			spin_unlock(&pcids_lock);
++			retval = pci_add_dynid(&pcids_pci_driver, id);
++			spin_lock(&pcids_lock);
++			if (retval) {
++				pcids_put_id(sdev_id);
++				goto free_ids;
++			}
++		}
++	}
++	spin_unlock(&pcids_lock);
++
++out:
++	return retval;
++free_ids:
++	for (i--; i >= 0; i--) {
++		sdev_id = pcids_find_id(&pdrv->id_table[i]);
++		if (sdev_id)
++			pcids_put_id(sdev_id);
++	}
++	pcids_unbind_all_devices(sdrv);
++	list_del(&sdrv->list);
++	spin_unlock(&pcids_lock);
++	kfree(sdrv);
++	goto out;
++}
++EXPORT_SYMBOL_GPL(pcids_register_driver);
++
++void pcids_unregister_driver(struct pci_driver *pdrv)
++{
++	struct pcids_driver *sdrv = to_pcids_driver(pdrv);
++	struct pcids_device_id *sdev_id;
++	int i;
++
++	spin_lock(&pcids_lock);
++	/* releasing driver from all the devices */
++	pcids_unbind_all_devices(sdrv);
++
++	/* decrementing usage of device id entries */
++	for (i = 0; pdrv->id_table[i].vendor ||
++		    pdrv->id_table[i].subvendor ||
++		    pdrv->id_table[i].class_mask; i++) {
++		sdev_id = pcids_find_id(&pdrv->id_table[i]);
++		if (sdev_id)
++			pcids_put_id(sdev_id);
++	}
++	list_del(&sdrv->list);
++	kfree(sdrv);
++	spin_unlock(&pcids_lock);
++}
++EXPORT_SYMBOL_GPL(pcids_unregister_driver);
++
++static int pcids_init(void)
++{
++	return pci_register_driver(&pcids_pci_driver);
++}
++
++static void pcids_exit(void)
++{
++	pci_unregister_driver(&pcids_pci_driver);
++}
++
++module_init(pcids_init);
++module_exit(pcids_exit);
++MODULE_LICENSE("GPL");
++
+--- /dev/null
++++ b/include/linux/pcids.h
+@@ -0,0 +1,26 @@
++/*
++ *	pcids.h
++ *
++ *	PCI device sharing support
++ *	Copyright 2007, Aristeu Rozanski
++ *
++ */
++#ifndef PCIDS_H
++#define PCIDS_H
++#include <linux/pci.h>
++
++#ifdef CONFIG_PCI_DEVICE_SHARING
++extern int pcids_register_driver(struct pci_driver *pdrv);
++extern void pcids_unregister_driver(struct pci_driver *pdrv);
++#else	/* ! CONFIG_PCI_DEVICE_SHARING */
++static inline int pcids_register_driver(struct pci_driver *pdrv)
++{
++	return pci_register_driver(pdrv);
++}
++static inline void pcids_unregister_driver(struct pci_driver *pdrv)
++{
++	pci_unregister_driver(pdrv);
++}
++#endif	/* CONFIG_PCI_DEVICE_SHARING */
++#endif	/* PCIDS_H */
++

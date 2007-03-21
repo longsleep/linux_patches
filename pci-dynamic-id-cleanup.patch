@@ -1,0 +1,175 @@
+From owner-linux-pci@atrey.karlin.mff.cuni.cz Fri Mar  9 12:08:23 2007
+Date: Fri, 9 Mar 2007 15:03:34 -0500
+From: Aristeu Rozanski <arozansk@redhat.com>
+To: Grant Grundler <grundler@parisc-linux.org>
+Cc: Greg KH <greg@kroah.com>, Tim Small <tim@buttersideup.com>,
+	Dave Jones <davej@redhat.com>, linux-pci@atrey.karlin.mff.cuni.cz,
+	bluesmoke-devel <bluesmoke-devel@lists.sourceforge.net>
+Subject: PCI: add pci id helper functions
+Message-ID: <20070309200334.GK2899@redhat.com>
+Mime-Version: 1.0
+Content-Type: text/plain; charset=us-ascii
+Content-Disposition: inline
+
+From: Aristeu Rozanski <arozansk@redhat.com>
+
+This will be needed later on when we add multiple pci drivers per
+device.
+
+Split out from an original patch by Aristeu by Greg.
+
+From: Aristeu Rozanski <arozansk@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/pci/pci-driver.c |   84 ++++++++++++++++++++++++++++++++++-------------
+ drivers/pci/pci.h        |   13 +++++++
+ 2 files changed, 74 insertions(+), 23 deletions(-)
+
+--- a/drivers/pci/pci-driver.c
++++ b/drivers/pci/pci-driver.c
+@@ -39,6 +39,34 @@ struct pci_dynid {
+ #ifdef CONFIG_HOTPLUG
+ 
+ /**
++ * pci_add_dynid - attach a new dynamic id to a PCI driver and re-probe devices
++ * @driver: target device driver
++ * @id: new id
++ */
++int pci_add_dynid(struct pci_driver *pdrv, const struct pci_device_id *id)
++{
++	struct pci_dynid *dynid;
++	int retval = 0;
++
++	dynid = kzalloc(sizeof(*dynid), GFP_KERNEL);
++	if (!dynid)
++		return -ENOMEM;
++	INIT_LIST_HEAD(&dynid->node);
++	memcpy(&dynid->id, id, sizeof(struct pci_device_id));
++
++	spin_lock(&pdrv->dynids.lock);
++	list_add_tail(&pdrv->dynids.list, &dynid->node);
++	spin_unlock(&pdrv->dynids.lock);
++
++	if (get_driver(&pdrv->driver)) {
++		retval = driver_attach(&pdrv->driver);
++		put_driver(&pdrv->driver);
++	}
++
++	return retval;
++}
++
++/**
+  * store_new_id - add a new PCI device ID to this driver and re-probe devices
+  * @driver: target device driver
+  * @buf: buffer for scanning device ID data
+@@ -50,7 +78,7 @@ struct pci_dynid {
+ static ssize_t
+ store_new_id(struct device_driver *driver, const char *buf, size_t count)
+ {
+-	struct pci_dynid *dynid;
++	struct pci_device_id id;
+ 	struct pci_driver *pdrv = to_pci_driver(driver);
+ 	__u32 vendor=PCI_ANY_ID, device=PCI_ANY_ID, subvendor=PCI_ANY_ID,
+ 		subdevice=PCI_ANY_ID, class=0, class_mask=0;
+@@ -64,35 +92,38 @@ store_new_id(struct device_driver *drive
+ 	if (fields < 0)
+ 		return -EINVAL;
+ 
+-	dynid = kzalloc(sizeof(*dynid), GFP_KERNEL);
+-	if (!dynid)
+-		return -ENOMEM;
+-
+-	INIT_LIST_HEAD(&dynid->node);
+-	dynid->id.vendor = vendor;
+-	dynid->id.device = device;
+-	dynid->id.subvendor = subvendor;
+-	dynid->id.subdevice = subdevice;
+-	dynid->id.class = class;
+-	dynid->id.class_mask = class_mask;
+-	dynid->id.driver_data = pdrv->dynids.use_driver_data ?
+-		driver_data : 0UL;
+-
+-	spin_lock(&pdrv->dynids.lock);
+-	list_add_tail(&pdrv->dynids.list, &dynid->node);
+-	spin_unlock(&pdrv->dynids.lock);
+-
+-	if (get_driver(&pdrv->driver)) {
+-		retval = driver_attach(&pdrv->driver);
+-		put_driver(&pdrv->driver);
+-	}
++	id.vendor = vendor;
++	id.device = device;
++	id.subvendor = subvendor;
++	id.subdevice = subdevice;
++	id.class = class;
++	id.class_mask = class_mask;
++	id.driver_data = pdrv->dynids.use_driver_data ? driver_data : 0UL;
+ 
++	retval = pci_add_dynid(pdrv, &id);
+ 	if (retval)
+ 		return retval;
++
+ 	return count;
+ }
+ static DRIVER_ATTR(new_id, S_IWUSR, NULL, store_new_id);
+ 
++void pci_free_dynid(struct pci_driver *pdrv, const struct pci_device_id *id)
++{
++	struct pci_dynid *dynid;
++
++	spin_lock(&pdrv->dynids.lock);
++	list_for_each_entry(dynid, &pdrv->dynids.list, node) {
++		if (pci_match_single_id(&dynid->id, id)) {
++			list_del(&dynid->node);
++			kfree(dynid);
++			spin_unlock(&pdrv->dynids.lock);
++			return;
++		}
++	}
++	spin_unlock(&pdrv->dynids.lock);
++}
++
+ static void
+ pci_free_dynids(struct pci_driver *drv)
+ {
+@@ -117,6 +148,13 @@ pci_create_newid_file(struct pci_driver 
+ }
+ 
+ #else /* !CONFIG_HOTPLUG */
++static inline int pci_add_dynid(struct device_driver *pdrv,
++				const struct pci_device_id *id)
++{
++	return 0;
++}
++static inline void pci_free_dynid(struct pci_driver *drv,
++				  const struct pci_device_id *id) {}
+ static inline void pci_free_dynids(struct pci_driver *drv) {}
+ static inline int pci_create_newid_file(struct pci_driver *drv)
+ {
+--- a/drivers/pci/pci.h
++++ b/drivers/pci/pci.h
+@@ -34,6 +34,9 @@ static inline int pci_proc_detach_device
+ static inline int pci_proc_detach_bus(struct pci_bus *bus) { return 0; }
+ #endif
+ 
++extern int pci_add_dynid(struct pci_driver *pdrv, const struct pci_device_id *id);
++extern void pci_free_dynid(struct pci_driver *pdrv, const struct pci_device_id *id);
++
+ /* Functions for PCI Hotplug drivers to use */
+ extern unsigned int pci_do_scan_bus(struct pci_bus *bus);
+ extern int pci_bus_find_capability (struct pci_bus *bus, unsigned int devfn, int cap);
+@@ -90,3 +93,13 @@ pci_match_one_device(const struct pci_de
+ 	return NULL;
+ }
+ 
++static inline int pci_match_single_id(const struct pci_device_id *id1,
++				      const struct pci_device_id *id2)
++{
++	return (id1->vendor == id2->vendor) &&
++		(id1->device == id2->device) &&
++		(id1->subvendor == id2->subvendor) &&
++		(id1->subdevice == id2->subdevice) &&
++		((id1->class & id1->class_mask) ==
++		 (id2->class & id2->class_mask));
++}
