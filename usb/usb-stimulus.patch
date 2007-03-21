@@ -1,11 +1,34 @@
 ---
+ drivers/usb/misc/Kconfig                |    2 
+ drivers/usb/misc/Makefile               |    1 
  drivers/usb/misc/stimulus/Kconfig       |    6 
  drivers/usb/misc/stimulus/Makefile      |    2 
  drivers/usb/misc/stimulus/STG200x_def.h |  129 +
  drivers/usb/misc/stimulus/commands.h    |  571 ++++++++
- drivers/usb/misc/stimulus/stimulus.c    | 2125 ++++++++++++++++++++++++++++++++
- 5 files changed, 2833 insertions(+)
+ drivers/usb/misc/stimulus/stimulus.c    | 2070 ++++++++++++++++++++++++++++++++
+ 7 files changed, 2781 insertions(+)
 
+--- a/drivers/usb/misc/Kconfig
++++ b/drivers/usb/misc/Kconfig
+@@ -224,6 +224,8 @@ config USB_APPLEDISPLAY
+ 
+ source "drivers/usb/misc/sisusbvga/Kconfig"
+ 
++#source "drivers/usb/misc/stimulus/Kconfig"
++
+ config USB_LD
+ 	tristate "USB LD driver"
+ 	depends on USB
+--- a/drivers/usb/misc/Makefile
++++ b/drivers/usb/misc/Makefile
+@@ -29,6 +29,7 @@ obj-$(CONFIG_USB_TRANCEVIBRATOR)	+= tran
+ obj-$(CONFIG_USB_USS720)	+= uss720.o
+ 
+ obj-$(CONFIG_USB_SISUSBVGA)	+= sisusbvga/
++obj-$(CONFIG_USB_STIMULUS)	+= stimulus/
+ 
+ ifeq ($(CONFIG_USB_DEBUG),y)
+ EXTRA_CFLAGS += -DDEBUG
 --- /dev/null
 +++ b/drivers/usb/misc/stimulus/Kconfig
 @@ -0,0 +1,6 @@
@@ -728,7 +751,7 @@
 +#endif
 --- /dev/null
 +++ b/drivers/usb/misc/stimulus/stimulus.c
-@@ -0,0 +1,2125 @@
+@@ -0,0 +1,2070 @@
 +/*
 + * Driver for MCS Stimulus
 + *
@@ -750,7 +773,6 @@
 + * this driver.
 + * */
 +
-+#include <linux/config.h>
 +#include <linux/kernel.h>
 +#include <linux/sched.h>
 +#include <linux/signal.h>
@@ -758,15 +780,14 @@
 +#include <linux/poll.h>
 +#include <linux/init.h>
 +#include <linux/slab.h>
++#include <linux/mm.h>
 +#include <linux/fcntl.h>
 +#include <linux/module.h>
 +#include <linux/spinlock.h>
 +#include <linux/list.h>
 +#include <linux/smp_lock.h>
-+#include <linux/devfs_fs_kernel.h>
 +#include <linux/usb.h>
 +#include <linux/vmalloc.h>
-+#include <linux/wrapper.h>
 +
 +#include "STG200x_def.h"
 +#include "commands.h"
@@ -781,12 +802,9 @@
 +
 +#define SYNC_PACKET_SIZE (3*STG200x_NUM_TRIGGER+16)
 +
-+
-+
 +#define MAX_READ_SIZE 8000
 +
 +#define dprintk(x)
-+
 +
 +/*
 + * This macro checks if the coldfire is still operational. The 'coldfire'
@@ -799,10 +817,8 @@
 +	((coldfire)->last_error == 0) && \
 +	(!(coldfire)->remove_pending))
 +
-+
 +/* Most helpful debugging aid */
 +#define assert(expr) ((void) ((expr) ? 0 : (err("assert failed at line %d",__LINE__))))
-+
 +
 +#ifdef CONFIG_USB_DEBUG
 +static int debug = 1;
@@ -814,33 +830,27 @@
 +#undef dbg
 +#define dbg(format, arg...) do { if (debug) printk(KERN_DEBUG __FILE__ ": " format "\n" , ## arg); } while (0)
 +
-+
 +/* Version Information */
 +#define DRIVER_VERSION "v0.45"
 +#define DRIVER_AUTHOR "MCS"
 +#define DRIVER_DESC "MCS Stimulus"
 +
 +/* Module paramaters */
-+MODULE_PARM(debug, "i");
++module_param(debug, bool, S_IRUGO | S_IWUSR);
 +MODULE_PARM_DESC(debug, "Debug enabled or not");
-+
 +
 +/* Define these values to match your device */
 +#define USB_STIMULUS_VENDOR_ID	0xabcd
 +#define USB_STIMULUS_PRODUCT_ID	0xc104
-+//#define USB_STIMULUS_PRODUCT_ID	0x1235
++//#define USB_STIMULUS_PRODUCT_ID       0x1235
 +
 +/* table of devices that work with this driver */
-+static struct usb_device_id stimulus_table [] = {
-+	{ USB_DEVICE(USB_STIMULUS_VENDOR_ID, USB_STIMULUS_PRODUCT_ID) },
-+	{ }					/* Terminating entry */
++static struct usb_device_id stimulus_table[] = {
++	{USB_DEVICE(USB_STIMULUS_VENDOR_ID, USB_STIMULUS_PRODUCT_ID)},
++	{}			/* Terminating entry */
 +};
 +
-+MODULE_DEVICE_TABLE (usb, stimulus_table);
-+
-+
-+
-+
++MODULE_DEVICE_TABLE(usb, stimulus_table);
 +
 +/* Get a minor range for your devices from the usb maintainer */
 +#define USB_STIMULUS_MINOR_BASE	200
@@ -849,147 +859,132 @@
 +#define MAX_DEVICES		16
 +
 +/* This structure represents one Isoc request - URB and buffer */
-+typedef struct {
++struct coldfire_sbuf {
 +	char *data;
 +	struct urb *urb;
-+} coldfire_sbuf_t;
-+
++};
 +
 +/* Statistics that can be overlaid on screen */
-+typedef struct {
-+    unsigned long frame_num;	/* Sequential number of the frame */
-+    unsigned long urb_count;        /* How many URBs we received so far */
-+    unsigned long urb_length;       /* Length of last URB */
-+    unsigned long data_count;       /* How many bytes we received */
-+    unsigned long header_count;     /* How many frame headers we found */
++typedef struct coldfile_statistics {
++	unsigned long frame_num;	/* Sequential number of the frame */
++	unsigned long urb_count;	/* How many URBs we received so far */
++	unsigned long urb_length;	/* Length of last URB */
++	unsigned long data_count;	/* How many bytes we received */
++	unsigned long header_count;	/* How many frame headers we found */
 +	unsigned long iso_skip_count;	/* How many empty ISO packets received */
 +	unsigned long iso_err_count;	/* How many bad ISO packets received */
-+} coldfire_statistics_t;
-+
++} coldfire_statistics;
 +
 +#define	RING_QUEUE_ADVANCE_INDEX(rq,ind,n) (rq)->ind = ((rq)->ind + (n)) % (rq)->length
 +#define	RING_QUEUE_DEQUEUE_BYTES(rq,n) RING_QUEUE_ADVANCE_INDEX(rq,ri,n)
 +#define	RING_QUEUE_PEEK(rq,ofs) ((rq)->queue[((ofs) + (rq)->ri) % (rq)->length])
 +
-+typedef struct {
++typedef struct ring_queue {
 +	unsigned char *queue;	/* Data from the Isoc data pump */
 +	int length;		/* How many bytes allocated for the queue */
 +	int wi;			/* That's where we write */
 +	int ri;			/* Read from here until you hit write index */
 +	wait_queue_head_t wqh;	/* Processes waiting */
-+} RingQueue_t;
-+
-+
-+
++};
 +
 +/* Structure to hold all of our device specific stuff */
 +struct coldfire_t {
-+	struct usb_device *	dev;			/* save off the usb device pointer */
-+	struct usb_interface *	interface;		/* the interface for this device */
++	struct usb_device *dev;			/* save off the usb device pointer */
++	struct usb_interface *interface;	/* the interface for this device */
 +
 +	unsigned char int_in_endp;
 +	unsigned char iso_in_endp;
-+    unsigned char iso_out_endp;
-+    unsigned char bulk_out_endp;
++	unsigned char iso_out_endp;
++	unsigned char bulk_out_endp;
 +
-+	spinlock_t lock;         /* DMA buffer access spinlock */
++	spinlock_t lock;	/* DMA buffer access spinlock */
 +
++	unsigned char minor;		/* the starting minor number for this device */
++	unsigned char num_ports;	/* the number of ports this device has */
 +
-+	devfs_handle_t		devfs;			/* devfs device node */
-+	unsigned char		minor;			/* the starting minor number for this device */
-+	unsigned char		num_ports;		/* the number of ports this device has */
++	char *data_ioctl;
++	char *data_coldfire;
 +
-+    char *              data_ioctl;
-+    char *              data_coldfire;
++	unsigned char *write_buffer;
 +
-+    unsigned char * write_buffer;
-+
-+	struct tq_struct	tqueue;			/* task queue for line discipline waking up */
-+	int			        open_count[4];		/* number of times this port has been opened */
-+	int                 open_count_total;
-+	struct semaphore	sem;			/* locks this structure */
-+
-+
++	struct tq_struct tqueue;	/* task queue for line discipline waking up */
++	int open_count[4];		/* number of times this port has been opened */
++	int open_count_total;
++	struct semaphore sem;		/* locks this structure */
 +
 +	int int_in_data;
 +
 +	int int_in_rate;
 +	int int_in_packet_len;
-+    int iso_in_packet_len;
-+    int iso_out_packet_len;
-+    int bulk_out_packet_len;
++	int iso_in_packet_len;
++	int iso_out_packet_len;
++	int bulk_out_packet_len;
 +
-+    //    unsigned int samplerate = STG200x_MAX_SAMPLERATE;
++	//    unsigned int samplerate = STG200x_MAX_SAMPLERATE;
 +
-+    unsigned int freqn;                   /* nominal sampling rate in USB format, i.e. fs/1000 in Q10.14 */
-+    unsigned int freqm[STG200x_NUM_TRIGGER];      /* momentary sampling rate in USB format, i.e. fs/1000 in Q10.14 */
-+    unsigned int freqmax;                 /* maximum sampling rate, used for buffer management */
-+    unsigned int phase[STG200x_NUM_TRIGGER];      /* phase accumulator */
-+    //    unsigned int flags;      /* see FLG_ defines */
++	unsigned int freqn;	/* nominal sampling rate in USB format, i.e. fs/1000 in Q10.14 */
++	unsigned int freqm[STG200x_NUM_TRIGGER];	/* momentary sampling rate in USB format, i.e. fs/1000 in Q10.14 */
++	unsigned int freqmax;	/* maximum sampling rate, used for buffer management */
++	unsigned int phase[STG200x_NUM_TRIGGER];	/* phase accumulator */
++	//    unsigned int flags;      /* see FLG_ defines */
 +
++	struct urb *int_urb;
 +
-+	struct urb int_urb;
++	struct coldfire_sbuf sync_urb[COLDFIRE_NUMSBUF];
++	struct coldfire_sbuf data_urb[COLDFIRE_NUMSBUF];
 +
-+    coldfire_sbuf_t sync_urb[COLDFIRE_NUMSBUF];
-+    coldfire_sbuf_t data_urb[COLDFIRE_NUMSBUF];
++	struct coldfire_statistics stats;
 +
++	int last_error;
++	int remove_pending;
 +
++	int sample_count;
 +
-+    coldfire_statistics_t stats;
++	struct ring_queue dp[STG200x_NUM_TRIGGER];
++	uint16 *trigger_buffer[STG200x_NUM_TRIGGER];
 +
-+    int last_error;
-+    int remove_pending;
-+
-+    int sample_count;
-+
-+    RingQueue_t dp[STG200x_NUM_TRIGGER];
-+	uint16      *trigger_buffer[STG200x_NUM_TRIGGER];
-+
-+    int streaming;
++	int streaming;
 +	int int_active;
 +
 +	setuptrigger triggermap;
 +
-+    int debug;
++	int debug;
 +};
 +
-+
-+/* the global usb devfs handle */
-+extern devfs_handle_t usb_devfs_handle;
-+
-+
 +/* local function prototypes */
-+static unsigned int stimulus_poll   (struct file *file, poll_table *wait);
-+static ssize_t stimulus_write	(struct file *file, const char *buffer, size_t count, loff_t *ppos);
-+static int stimulus_ioctl		(struct inode *inode, struct file *file, unsigned int cmd, unsigned long arg);
-+static int stimulus_open		(struct inode *inode, struct file *file);
-+static int stimulus_release		(struct inode *inode, struct file *file);
++static unsigned int stimulus_poll(struct file *file, poll_table * wait);
++static ssize_t stimulus_write(struct file *file, const char *buffer,
++			      size_t count, loff_t * ppos);
++static int stimulus_ioctl(struct inode *inode, struct file *file,
++			  unsigned int cmd, unsigned long arg);
++static int stimulus_open(struct inode *inode, struct file *file);
++static int stimulus_release(struct inode *inode, struct file *file);
 +
-+static void * stimulus_probe	(struct usb_device *dev, unsigned int ifnum, const struct usb_device_id *id);
-+static void stimulus_disconnect	(struct usb_device *dev, void *ptr);
-+
++static int stimulus_probe(struct usb_interface *intf,
++			    const struct usb_device_id *id);
++static void stimulus_disconnect(struct usb_interface *interface);
 +
 +int usb_start_iso(struct coldfire_t *coldfire);
 +int usb_stop_iso(struct coldfire_t *coldfire);
 +
-+
-+
-+static int usbout_sync_prepare_desc(struct coldfire_t *coldfire, struct urb *urb);
-+static int usbout_sync_retire_desc(struct coldfire_t *coldfire, struct urb *urb);
++static int usbout_sync_prepare_desc(struct coldfire_t *coldfire,
++				    struct urb *urb);
++static int usbout_sync_retire_desc(struct coldfire_t *coldfire,
++				   struct urb *urb);
 +static void usbout_sync_completed(struct urb *urb);
 +
 +static int usbout_prepare_desc(struct coldfire_t *coldfire, struct urb *urb);
 +static int usbout_retire_desc(struct coldfire_t *coldfire, struct urb *urb);
 +static void usbout_completed(struct urb *urb);
 +
-+static int copy_samples(struct coldfire_t *coldfire, unsigned char *dest, int *num);
-+
++static int copy_samples(struct coldfire_t *coldfire, unsigned char *dest,
++			int *num);
 +
 +/* array of pointers to our devices that are currently connected */
-+static struct coldfire_t		*minor_table[MAX_DEVICES];
++static struct coldfire_t *minor_table[MAX_DEVICES];
 +
 +/* lock to protect the minor_table structure */
-+static DECLARE_MUTEX (minor_table_mutex);
++static DECLARE_MUTEX(minor_table_mutex);
 +
 +/*
 + * File operations needed when we register this driver.
@@ -1001,47 +996,28 @@
 + * device would use "struct tty_driver".
 + */
 +static struct file_operations stimulus_fops = {
-+	/*
-+	 * The owner field is part of the module-locking
-+	 * mechanism. The idea is that the kernel knows
-+	 * which module to increment the use-counter of
-+	 * BEFORE it calls the device's open() function.
-+	 * This also means that the kernel can decrement
-+	 * the use-counter again before calling release()
-+	 * or should the open() function fail.
-+	 *
-+	 * Not all device structures have an "owner" field
-+	 * yet. "struct file_operations" and "struct net_device"
-+	 * do, while "struct tty_driver" does not. If the struct
-+	 * has an "owner" field, then initialize it to the value
-+	 * THIS_MODULE and the kernel will handle all module
-+	 * locking for you automatically. Otherwise, you must
-+	 * increment the use-counter in the open() function
-+	 * and decrement it again in the release() function
-+	 * yourself.
-+	 */
-+	owner:		THIS_MODULE,
-+
-+    //	read:		stimulus_read,
-+	write:		stimulus_write,
-+	poll:       stimulus_poll,
-+	ioctl:		stimulus_ioctl,
-+	open:		stimulus_open,
-+	release:	stimulus_release,
++	.owner =	THIS_MODULE,
++	/* .read =		stimulus_read, */
++	.write = 	stimulus_write,
++	.poll = 	stimulus_poll,
++	.ioctl =	stimulus_ioctl,
++	.open = 	stimulus_open,
++	.release =	stimulus_release,
 +};
-+
 +
 +/* usb specific object needed to register this driver with the usb subsystem */
 +static struct usb_driver stimulus_driver = {
-+	name:		"stimulus",
-+	probe:		stimulus_probe,
-+	disconnect:	stimulus_disconnect,
-+	fops:		&stimulus_fops,
-+	minor:		USB_STIMULUS_MINOR_BASE,
-+	id_table:	stimulus_table,
++	.name =		"stimulus",
++	.probe =	stimulus_probe,
++	.disconnect =	stimulus_disconnect,
++	.id_table = 	stimulus_table,
 +};
 +
-+
++static struct usb_class_driver stimulus_class = {
++	.name =		"stimulus%d",
++	.fops =		&stimulus_fops,
++	.minor_base =	USB_STIMULUS_MINOR_BASE,
++};
 +
 +
 +void *usbvideo_rvmalloc(unsigned long size)
@@ -1054,8 +1030,8 @@
 +	if (!mem)
 +		return NULL;
 +
-+	memset(mem, 0, size); /* Clear the ram out, no junk to the user */
-+	adr = (unsigned long) mem;
++	memset(mem, 0, size);	/* Clear the ram out, no junk to the user */
++	adr = (unsigned long)mem;
 +	while (size > 0) {
 +		mem_map_reserve(vmalloc_to_page((void *)adr));
 +		adr += PAGE_SIZE;
@@ -1072,8 +1048,8 @@
 +	if (!mem)
 +		return;
 +
-+	adr = (unsigned long) mem;
-+	while ((long) size > 0) {
++	adr = (unsigned long)mem;
++	while ((long)size > 0) {
 +		mem_map_unreserve(vmalloc_to_page((void *)adr));
 +		adr += PAGE_SIZE;
 +		size -= PAGE_SIZE;
@@ -1081,16 +1057,13 @@
 +	vfree(mem);
 +}
 +
-+
-+
-+
-+void RingQueue_Initialize(RingQueue_t *rq)
++void RingQueue_Initialize(struct ring_queue *rq)
 +{
 +	assert(rq != NULL);
 +	init_waitqueue_head(&rq->wqh);
 +}
 +
-+void RingQueue_Allocate(RingQueue_t *rq, int rqLen)
++void RingQueue_Allocate(struct ring_queue *rq, int rqLen)
 +{
 +	assert(rq != NULL);
 +	assert(rqLen > 0);
@@ -1099,14 +1072,14 @@
 +	assert(rq->queue != NULL);
 +}
 +
-+int RingQueue_IsAllocated(const RingQueue_t *rq)
++int RingQueue_IsAllocated(const struct ring_queue *rq)
 +{
 +	if (rq == NULL)
 +		return 0;
 +	return (rq->queue != NULL) && (rq->length > 0);
 +}
 +
-+void RingQueue_Free(RingQueue_t *rq)
++void RingQueue_Free(struct ring_queue *rq)
 +{
 +	assert(rq != NULL);
 +	if (RingQueue_IsAllocated(rq)) {
@@ -1116,39 +1089,39 @@
 +	}
 +}
 +
-+int RingQueue_Dequeue(RingQueue_t *rq, unsigned char *dst, int len)
++int RingQueue_Dequeue(struct ring_queue *rq, unsigned char *dst, int len)
 +{
 +	int dequeued = 0;
 +
 +	assert(rq != NULL);
 +	assert(dst != NULL);
 +
-+	while ( len > 0 ) {
++	while (len > 0) {
 +		int m, q_rest;
 +
 +		q_rest = rq->length - rq->ri;
-+		if ( q_rest <= 0 ) {
++		if (q_rest <= 0) {
 +			rq->ri = 0;
 +			q_rest = rq->length;
 +		}
 +		m = len;
 +		assert(q_rest > 0);
-+		if ( m > q_rest ) {
++		if (m > q_rest) {
 +			m = q_rest;
 +		}
 +
 +		memmove(dst, rq->queue + rq->ri, m);
 +		RING_QUEUE_ADVANCE_INDEX(rq, ri, m);
 +
-+		dst      += m;
++		dst += m;
 +		dequeued += m;
-+		len      -= m;
++		len -= m;
 +	}
 +
 +	return dequeued;
 +}
 +
-+int RingQueue_Enqueue(RingQueue_t *rq, const unsigned char *cdata, int n)
++int RingQueue_Enqueue(struct ring_queue *rq, const unsigned char *cdata, int n)
 +{
 +	int enqueued = 0;
 +
@@ -1178,7 +1151,7 @@
 +	return enqueued;
 +}
 +
-+int RingQueue_GetLength(const RingQueue_t *rq)
++int RingQueue_GetLength(const struct ring_queue *rq)
 +{
 +	int ri, wi;
 +
@@ -1194,123 +1167,101 @@
 +		return wi + (rq->length - ri);
 +}
 +
-+void RingQueue_InterruptibleSleepOn(RingQueue_t *rq)
++void RingQueue_InterruptibleSleepOn(struct ring_queue *rq)
 +{
 +	assert(rq != NULL);
 +	interruptible_sleep_on(&rq->wqh);
 +}
 +
-+void RingQueue_WakeUpInterruptible(RingQueue_t *rq)
++void RingQueue_WakeUpInterruptible(struct ring_queue *rq)
 +{
 +	assert(rq != NULL);
 +	if (waitqueue_active(&rq->wqh))
 +		wake_up_interruptible(&rq->wqh);
 +}
 +
-+
-+
-+
 +static void coldfire_int_irq(struct urb *urb)
 +{
 +	struct coldfire_t *coldfire = (struct coldfire_t *)urb->context;
 +
-+
 +	static int count = 0;
 +	static int old_jiffies = 0;
 +
-+	if ( urb->actual_length > 0 || 1 ) {
-+		printk ("irq %d data: %x status: %d interval: %d length: %d jiffies: %ld %ld ms\n",
-+				count++,
-+				coldfire->int_in_data,
-+				urb->status,
-+				urb->interval,
-+				urb->actual_length,
-+				jiffies,
-+				(jiffies-old_jiffies)*10);
++	if (urb->actual_length > 0 || 1) {
++		printk
++		    ("irq %d data: %x status: %d interval: %d length: %d jiffies: %ld %ld ms\n",
++		     count++, coldfire->int_in_data, urb->status, urb->interval,
++		     urb->actual_length, jiffies, (jiffies - old_jiffies) * 10);
 +	}
 +	old_jiffies = jiffies;
 +}
 +
-+
-+
 +/**
 + *	usb_stimulus_debug_data
 + */
-+static inline void usb_stimulus_debug_data (const char *function, int size, const unsigned char *data)
++static inline void usb_stimulus_debug_data(const char *function, int size,
++					   const unsigned char *data)
 +{
 +	int i;
 +
 +	if (!debug)
 +		return;
 +
-+	printk (KERN_DEBUG __FILE__": %s - length = %d, data = ",
-+            function, size);
++	printk(KERN_DEBUG __FILE__ ": %s - length = %d, data = ",
++	       function, size);
 +	for (i = 0; i < size; ++i) {
-+		printk ("%.2x ", data[i]);
++		printk("%.2x ", data[i]);
 +	}
-+	printk ("\n");
++	printk("\n");
 +}
-+
 +
 +/**
 + *	stimulus_delete
 + */
-+static inline void stimulus_delete (struct coldfire_t *coldfire)
++static inline void stimulus_delete(struct coldfire_t *coldfire)
 +{
-+    int i;
++	int i;
 +
-+    printk("stimulus_delete\n");
++	printk("stimulus_delete\n");
 +
-+    usb_stop_iso(coldfire);
++	usb_stop_iso(coldfire);
 +
-+	if ( coldfire->int_active ) {
++	if (coldfire->int_active) {
 +		printk("stimulus_delete: unlink int urb\n");
-+		usb_unlink_urb (&coldfire->int_urb);
++		usb_unlink_urb(coldfire->int_urb);
 +		coldfire->int_active = 0;
 +	}
 +
-+	minor_table[coldfire->minor+0] = NULL;
-+	minor_table[coldfire->minor+1] = NULL;
-+	minor_table[coldfire->minor+2] = NULL;
-+	minor_table[coldfire->minor+3] = NULL;
++	minor_table[coldfire->minor + 0] = NULL;
++	minor_table[coldfire->minor + 1] = NULL;
++	minor_table[coldfire->minor + 2] = NULL;
++	minor_table[coldfire->minor + 3] = NULL;
 +
-+    if (coldfire->write_buffer != NULL)
-+        kfree(coldfire->write_buffer);
++	kfree(coldfire->write_buffer);
 +
-+    kfree(coldfire->data_ioctl);
-+    kfree(coldfire->data_coldfire);
++	kfree(coldfire->data_ioctl);
++	kfree(coldfire->data_coldfire);
 +
-+
-+
-+
-+
-+	for (i=0; i < COLDFIRE_NUMSBUF; i++) {
-+        if ( coldfire->sync_urb[i].urb != NULL )
-+            usb_free_urb( coldfire->sync_urb[i].urb );
-+        if ( coldfire->sync_urb[i].data != NULL )
-+            kfree ( coldfire->sync_urb[i].data );
-+
-+
-+        if ( coldfire->data_urb[i].urb != NULL )
-+            usb_free_urb( coldfire->data_urb[i].urb );
-+        if ( coldfire->data_urb[i].data != NULL )
-+            kfree ( coldfire->data_urb[i].data );
++	usb_free_urb(coldfire->int_urb);
++	for (i = 0; i < COLDFIRE_NUMSBUF; i++) {
++		usb_free_urb(coldfire->sync_urb[i].urb);
++		kfree(coldfire->sync_urb[i].data);
++		usb_free_urb(coldfire->data_urb[i].urb);
++		kfree(coldfire->data_urb[i].data);
 +	}
 +
-+	for ( i = 0; i < STG200x_NUM_TRIGGER; i++ ) {
++	for (i = 0; i < STG200x_NUM_TRIGGER; i++) {
 +		RingQueue_Free(&coldfire->dp[i]);
-+		kfree ( coldfire->trigger_buffer[i] );
++		kfree(coldfire->trigger_buffer[i]);
 +	}
 +
-+
-+	kfree (coldfire);
++	kfree(coldfire);
 +}
-+
 +
 +/**
 + *	stimulus_open
 + */
-+static int stimulus_open (struct inode *inode, struct file *file)
++static int stimulus_open(struct inode *inode, struct file *file)
 +{
 +	struct coldfire_t *coldfire = NULL;
 +	unsigned int subminor;
@@ -1319,53 +1270,42 @@
 +
 +	dbg("%s", __FUNCTION__);
 +
-+	subminor = MINOR (inode->i_rdev) - USB_STIMULUS_MINOR_BASE;
-+	channel  = subminor & 3;
-+	if ((subminor < 0) ||
-+	    (subminor >= MAX_DEVICES)) {
++	subminor = MINOR(inode->i_rdev) - USB_STIMULUS_MINOR_BASE;
++	channel = subminor & 3;
++	if ((subminor < 0) || (subminor >= MAX_DEVICES)) {
 +		printk("subminor: %d\n", subminor);
 +		return -ENODEV;
 +	}
 +
-+	/* Increment our usage count for the module.
-+	 * This is redundant here, because "struct file_operations"
-+	 * has an "owner" field. This line is included here soley as
-+	 * a reference for drivers using lesser structures... ;-)
-+	 */
-+	MOD_INC_USE_COUNT;
-+
 +	/* lock our minor table and get our local data for this minor */
-+	down (&minor_table_mutex);
++	down(&minor_table_mutex);
 +	coldfire = minor_table[subminor];
 +	if (coldfire == NULL) {
-+		up (&minor_table_mutex);
-+		MOD_DEC_USE_COUNT;
++		up(&minor_table_mutex);
 +		printk("coldfire == NULL\n");
 +		return -ENODEV;
 +	}
 +
 +	/* lock this device */
-+	down (&coldfire->sem);
++	down(&coldfire->sem);
 +
 +	/* unlock the minor table */
-+	up (&minor_table_mutex);
++	up(&minor_table_mutex);
 +
-+	printk ("open coldfire: %p subminor: %d channel: %d\n",
-+			coldfire, subminor, channel);
++	printk("open coldfire: %p subminor: %d channel: %d\n",
++	       coldfire, subminor, channel);
 +
-+	if ( coldfire->open_count[channel] ) {
-+		up (&coldfire->sem);
-+		MOD_DEC_USE_COUNT;
++	if (coldfire->open_count[channel]) {
++		up(&coldfire->sem);
 +		return -EBUSY;
 +	}
 +
-+	if ( channel == 0 ) {
-+		coldfire->int_urb.dev = coldfire->dev;
++	if (channel == 0) {
++		coldfire->int_urb->dev = coldfire->dev;
 +		printk("submit int urb\n");
-+		if (usb_submit_urb(&coldfire->int_urb)) {
-+			up (&coldfire->sem);
++		if (usb_submit_urb(coldfire->int_urb, GFP_KERNEL)) {
++			up(&coldfire->sem);
 +			printk("unable to sumbmit interrupt urb\n");
-+			MOD_DEC_USE_COUNT;
 +			return -EIO;
 +		}
 +		coldfire->int_active = 1;
@@ -1379,18 +1319,15 @@
 +	file->private_data = coldfire;
 +
 +	/* unlock this device */
-+	up (&coldfire->sem);
-+
-+
++	up(&coldfire->sem);
 +
 +	return retval;
 +}
 +
-+
 +/**
 + *	stimulus_release
 + */
-+static int stimulus_release (struct inode *inode, struct file *file)
++static int stimulus_release(struct inode *inode, struct file *file)
 +{
 +	struct coldfire_t *coldfire;
 +	unsigned int subminor;
@@ -1399,26 +1336,25 @@
 +
 +	coldfire = (struct coldfire_t *)file->private_data;
 +	if (coldfire == NULL) {
-+		dbg ("%s - object is NULL", __FUNCTION__);
++		dbg("%s - object is NULL", __FUNCTION__);
 +		return -ENODEV;
 +	}
-+
 +#if 0
 +	dbg("%s - minor %d", __FUNCTION__, coldfire->minor);
 +#endif
 +
 +	/* lock our minor table */
-+	down (&minor_table_mutex);
++	down(&minor_table_mutex);
 +
 +	/* lock our device */
-+	down (&coldfire->sem);
++	down(&coldfire->sem);
 +
-+	subminor = MINOR (inode->i_rdev) - USB_STIMULUS_MINOR_BASE;
-+	channel  = subminor & 3;
++	subminor = MINOR(inode->i_rdev) - USB_STIMULUS_MINOR_BASE;
++	channel = subminor & 3;
 +	printk("stimulus_release channel: %d\n", channel);
 +
 +	if (coldfire->open_count[channel] <= 0) {
-+		dbg ("%s - device not opened", __FUNCTION__);
++		dbg("%s - device not opened", __FUNCTION__);
 +		retval = -ENODEV;
 +		goto exit_not_opened;
 +	}
@@ -1427,16 +1363,14 @@
 +		/* the device was unplugged before the file was released */
 +		--coldfire->open_count[channel];
 +		--coldfire->open_count_total;
-+		if ( coldfire->open_count_total ) {
-+			up (&coldfire->sem);
-+			up (&minor_table_mutex);
-+			MOD_DEC_USE_COUNT;
++		if (coldfire->open_count_total) {
++			up(&coldfire->sem);
++			up(&minor_table_mutex);
 +			return 0;
 +		} else {
-+			up (&coldfire->sem);
-+			stimulus_delete (coldfire);
-+			up (&minor_table_mutex);
-+			MOD_DEC_USE_COUNT;
++			up(&coldfire->sem);
++			stimulus_delete(coldfire);
++			up(&minor_table_mutex);
 +			return 0;
 +		}
 +	}
@@ -1446,32 +1380,27 @@
 +	--coldfire->open_count_total;
 +	if ((coldfire->open_count[channel] <= 0) && (channel == 0)) {
 +		/* shutdown any bulk writes that might be going on */
-+#if 1 /* was 1 */
-+		if ( coldfire->int_active ) {
++#if 1				/* was 1 */
++		if (coldfire->int_active) {
 +			printk("unlink int urb\n");
-+			usb_unlink_urb (&coldfire->int_urb);
++			usb_unlink_urb(coldfire->int_urb);
 +			coldfire->int_active = 0;
 +		}
 +#endif
 +		coldfire->open_count[channel] = 0;
 +	}
 +
-+	/* decrement our usage count for the module */
-+	MOD_DEC_USE_COUNT;
-+
-+ exit_not_opened:
-+	up (&coldfire->sem);
-+	up (&minor_table_mutex);
++      exit_not_opened:
++	up(&coldfire->sem);
++	up(&minor_table_mutex);
 +
 +	return retval;
 +}
 +
-+
-+
 +/**
 + *	stimulus_poll
 + */
-+static unsigned int stimulus_poll (struct file *file, poll_table *wait)
++static unsigned int stimulus_poll(struct file *file, poll_table * wait)
 +{
 +	struct coldfire_t *coldfire;
 +	unsigned int mask = 0;
@@ -1481,50 +1410,47 @@
 +	coldfire = (struct coldfire_t *)file->private_data;
 +
 +	if (!COLDFIRE_IS_OPERATIONAL(coldfire))
-+	  return -EFAULT;
-+
++		return -EFAULT;
 +
 +#if 0
 +	dbg("%s - minor %d", __FUNCTION__, coldfire->minor);
 +#endif
 +
 +	/* lock this object */
-+	down (&coldfire->sem);
++	down(&coldfire->sem);
 +
-+	subminor = MINOR(file->f_dentry->d_inode->i_rdev) - USB_STIMULUS_MINOR_BASE;
-+	channel  = subminor & 3;
++	subminor =
++	    MINOR(file->f_dentry->d_inode->i_rdev) - USB_STIMULUS_MINOR_BASE;
++	channel = subminor & 3;
 +
 +	/* verify that the device wasn't unplugged */
 +	if (coldfire->dev == NULL) {
-+		up (&coldfire->sem);
++		up(&coldfire->sem);
 +		return -ENODEV;
 +	}
 +
-+
-+	poll_wait( file, &coldfire->dp[channel].wqh, wait);
-+	if ( RINGBUFFERSIZE - RingQueue_GetLength(&coldfire->dp[channel]) > 2 ) {
++	poll_wait(file, &coldfire->dp[channel].wqh, wait);
++	if (RINGBUFFERSIZE - RingQueue_GetLength(&coldfire->dp[channel]) > 2) {
 +		mask |= POLLOUT | POLLWRNORM;
 +	}
 +
 +	/* unlock the device */
-+	up (&coldfire->sem);
++	up(&coldfire->sem);
 +
 +	return mask;
 +}
 +
-+
-+
-+
 +/**
 + *	stimulus_write
 + */
-+static ssize_t stimulus_write (struct file *file, const char *buffer, size_t count, loff_t *ppos)
++static ssize_t stimulus_write(struct file *file, const char *buffer,
++			      size_t count, loff_t * ppos)
 +{
 +	struct coldfire_t *coldfire;
 +	ssize_t bytes_written = 0;
 +	int retval = 0;
-+    int space_in_ringbuffer;
-+    int ret;
++	int space_in_ringbuffer;
++	int ret;
 +
 +	unsigned int subminor;
 +	unsigned int channel;
@@ -1532,14 +1458,16 @@
 +	coldfire = (struct coldfire_t *)file->private_data;
 +
 +#if 0
-+	dbg("%s - minor %d, count = %d  rbum = %d", __FUNCTION__, coldfire->minor, count, channel);
++	dbg("%s - minor %d, count = %d  rbum = %d", __FUNCTION__,
++	    coldfire->minor, count, channel);
 +#endif
 +
 +	/* lock this object */
-+	down (&coldfire->sem);
++	down(&coldfire->sem);
 +
-+	subminor = MINOR(file->f_dentry->d_inode->i_rdev) - USB_STIMULUS_MINOR_BASE;
-+	channel  = subminor & 3;
++	subminor =
++	    MINOR(file->f_dentry->d_inode->i_rdev) - USB_STIMULUS_MINOR_BASE;
++	channel = subminor & 3;
 +
 +	/* verify that the device wasn't unplugged */
 +	if (coldfire->dev == NULL) {
@@ -1554,589 +1482,626 @@
 +	}
 +
 +	/* we can only write as much as ringbuffer will hold */
-+    space_in_ringbuffer = RINGBUFFERSIZE - RingQueue_GetLength(&coldfire->dp[channel]) - 2;
++	space_in_ringbuffer =
++	    RINGBUFFERSIZE - RingQueue_GetLength(&coldfire->dp[channel]) - 2;
 +
-+    if ( space_in_ringbuffer < count ) {
-+        bytes_written = space_in_ringbuffer;
-+    } else {
-+        bytes_written = count;
-+    }
++	if (space_in_ringbuffer < count) {
++		bytes_written = space_in_ringbuffer;
++	} else {
++		bytes_written = count;
++	}
 +
-+	if ( bytes_written < 0 ) {
++	if (bytes_written < 0) {
 +		printk("bytes written: %d x\n", bytes_written);
 +	}
 +
-+    if ( bytes_written > WRITEBUFFERSIZE ) bytes_written = WRITEBUFFERSIZE;
++	if (bytes_written > WRITEBUFFERSIZE)
++		bytes_written = WRITEBUFFERSIZE;
 +
 +	/* copy the data from userspace into our urb */
-+	if (copy_from_user(coldfire->write_buffer, buffer,
-+                       bytes_written)) {
++	if (copy_from_user(coldfire->write_buffer, buffer, bytes_written)) {
 +		retval = -EFAULT;
 +		goto exit;
 +	}
 +
-+    ret = RingQueue_Enqueue(&coldfire->dp[channel], coldfire->write_buffer, bytes_written);
-+    if ( ret != bytes_written ) {
-+        printk("failed to enqueue all bytes: %d %d\n", ret, bytes_written);
-+    } else {
++	ret =
++	    RingQueue_Enqueue(&coldfire->dp[channel], coldfire->write_buffer,
++			      bytes_written);
++	if (ret != bytes_written) {
++		printk("failed to enqueue all bytes: %d %d\n", ret,
++		       bytes_written);
++	} else {
 +#if 0
-+        printk("enqueud %d bytes (%d %d)\n",
-+               bytes_written,
-+               space_in_ringbuffer,
-+               RINGBUFFERSIZE - RingQueue_GetLength(&coldfire->dp[channel]) );
++		printk("enqueud %d bytes (%d %d)\n",
++		       bytes_written,
++		       space_in_ringbuffer,
++		       RINGBUFFERSIZE -
++		       RingQueue_GetLength(&coldfire->dp[channel]));
 +#endif
-+    }
++	}
 +
-+    retval = bytes_written;
++	retval = bytes_written;
 +
-+ exit:
++      exit:
 +	/* unlock the device */
-+	up (&coldfire->sem);
++	up(&coldfire->sem);
 +
 +	return retval;
 +}
 +
-+
-+void change_byteorder(char *data, char *data_coldfire, int elements, int *list, int size, int cmd)
++void change_byteorder(char *data, char *data_coldfire, int elements, int *list,
++		      int size, int cmd)
 +{
-+    int i, j;
-+    int count;
-+    int inc;
++	int i, j;
++	int count;
++	int inc;
 +
-+    count = 0;
-+    for ( i = 0; i < elements; i++, list++ ) {
-+        inc = *list;
-+        switch ( *list ) {
-+        case 1:
-+            *data_coldfire = *data;
-+            break;
-+        case 2:
-+            *(data_coldfire+0) = *(data+1);
-+            *(data_coldfire+1) = *(data+0);
-+            break;
-+        case 4:
-+            *(data_coldfire+0) = *(data+3);
-+            *(data_coldfire+1) = *(data+2);
-+            *(data_coldfire+2) = *(data+1);
-+            *(data_coldfire+3) = *(data+0);
-+            break;
-+        default:
-+            if ( *list < 0 ) {
-+                inc = -(*list);
-+                for ( j = 0; j < inc; j++ ) {
-+                    *(data_coldfire+j) = *(data+j);
-+                }
-+            } else {
-+                printk("unknown data size: %d\n", *list);
-+            }
-+            break;
-+        }
-+        data          += inc;
-+        data_coldfire += inc;
-+        count         += inc;
-+    }
++	count = 0;
++	for (i = 0; i < elements; i++, list++) {
++		inc = *list;
++		switch (*list) {
++		case 1:
++			*data_coldfire = *data;
++			break;
++		case 2:
++			*(data_coldfire + 0) = *(data + 1);
++			*(data_coldfire + 1) = *(data + 0);
++			break;
++		case 4:
++			*(data_coldfire + 0) = *(data + 3);
++			*(data_coldfire + 1) = *(data + 2);
++			*(data_coldfire + 2) = *(data + 1);
++			*(data_coldfire + 3) = *(data + 0);
++			break;
++		default:
++			if (*list < 0) {
++				inc = -(*list);
++				for (j = 0; j < inc; j++) {
++					*(data_coldfire + j) = *(data + j);
++				}
++			} else {
++				printk("unknown data size: %d\n", *list);
++			}
++			break;
++		}
++		data += inc;
++		data_coldfire += inc;
++		count += inc;
++	}
 +
-+    if ( count != size ) {
-+        printk ("error in acu.h: count != size (%d != %d) for command cmd: %x\n",
-+                count, size, cmd);
-+    }
++	if (count != size) {
++		printk
++		    ("error in acu.h: count != size (%d != %d) for command cmd: %x\n",
++		     count, size, cmd);
++	}
 +
 +}
 +
-+int send_control_message(struct coldfire_t *coldfire, int cmd, char *data, int len)
++int send_control_message(struct coldfire_t *coldfire, int cmd, char *data,
++			 int len)
 +{
-+    int ok;
-+    int retval;
++	int ok;
++	int retval;
 +
-+    ok = 1;
++	ok = 1;
 +
-+    if ( !(len % 8) ) {
-+        printk ("mult 8\n");
-+        len++;
-+    }
++	if (!(len % 8)) {
++		printk("mult 8\n");
++		len++;
++	}
 +
-+    retval = usb_control_msg(coldfire->dev, usb_sndctrlpipe(coldfire->dev, 0),
-+                             cmd, USB_TYPE_VENDOR | USB_DIR_OUT, 0, 0,
-+                             data, len, HZ);
++	retval =
++	    usb_control_msg(coldfire->dev, usb_sndctrlpipe(coldfire->dev, 0),
++			    cmd, USB_TYPE_VENDOR | USB_DIR_OUT, 0, 0, data, len,
++			    HZ);
 +
 +#if 0
-+    printk ("usb_control_msg: len: %d '%d,%d,%d,%d' retval: %d\n",
-+            len,
-+            *(data+0), *(data+1),
-+            *(data+2), *(data+3),
-+            retval);
++	printk("usb_control_msg: len: %d '%d,%d,%d,%d' retval: %d\n",
++	       len, *(data + 0), *(data + 1), *(data + 2), *(data + 3), retval);
 +#endif
 +
-+    if ( retval != len ) {
-+		printk ("usb_control_msg: error: %d\n", retval);
++	if (retval != len) {
++		printk("usb_control_msg: error: %d\n", retval);
 +		ok = 0;
 +	}
 +
-+    return ok;
++	return ok;
 +}
 +
 +int send_bulk_message(struct coldfire_t *coldfire, int cmd, char *data, int len)
 +{
-+    int ok;
-+    int retval;
++	int ok;
++	int retval;
 +
-+    int16 cmd16;
++	int16 cmd16;
 +
++	ok = 1;
 +
-+    ok = 1;
++	if (!(len % 8)) {
++		printk("mult 8\n");
++		len++;
++	}
 +
-+    if ( !(len % 8) ) {
-+        printk ("mult 8\n");
-+        len++;
-+    }
++	cmd16 = cmd;
++	change_byteorder((char *)&cmd16, data, bulkcommand_elements,
++			 bulkcommand_list, 2, 0);
 +
-+    cmd16 = cmd;
-+    change_byteorder((char *)&cmd16, data, bulkcommand_elements, bulkcommand_list, 2, 0);
-+
-+    usb_bulk_msg(coldfire->dev, usb_sndbulkpipe(coldfire->dev, 2),
-+                 data, len, &retval, HZ);
++	usb_bulk_msg(coldfire->dev, usb_sndbulkpipe(coldfire->dev, 2),
++		     data, len, &retval, HZ);
 +
 +#if 0
-+    printk ("usb_bulk_msg: len: %d '%d,%d,%d,%d' retval: %d\n",
-+            len,
-+            *(data+0), *(data+1),
-+            *(data+2), *(data+3),
-+            retval);
++	printk("usb_bulk_msg: len: %d '%d,%d,%d,%d' retval: %d\n",
++	       len, *(data + 0), *(data + 1), *(data + 2), *(data + 3), retval);
 +#endif
 +
-+    if ( retval != len ) ok = 0;
++	if (retval != len)
++		ok = 0;
 +
-+    return ok;
++	return ok;
 +}
 +
-+
-+int recv_control_message(struct coldfire_t *coldfire, int cmd, char *data, int len)
++int recv_control_message(struct coldfire_t *coldfire, int cmd, char *data,
++			 int len)
 +{
-+    int ok;
-+    int retval;
++	int ok;
++	int retval;
 +	int len_orig;
 +
-+    ok = 1;
++	ok = 1;
 +
 +	len_orig = len;
 +
-+    if ( !(len % 8) ) {
-+        printk ("cmd:%d len %d mult 8\n", cmd, len);
-+        len++;
-+    }
++	if (!(len % 8)) {
++		printk("cmd:%d len %d mult 8\n", cmd, len);
++		len++;
++	}
 +
-+    retval = usb_control_msg(coldfire->dev, usb_rcvctrlpipe(coldfire->dev, 0),
-+                             cmd, USB_TYPE_VENDOR | USB_DIR_IN, 0, 0,
-+                             data, len, HZ);
++	retval =
++	    usb_control_msg(coldfire->dev, usb_rcvctrlpipe(coldfire->dev, 0),
++			    cmd, USB_TYPE_VENDOR | USB_DIR_IN, 0, 0, data, len,
++			    HZ);
 +
++	if (retval != len_orig)
++		ok = 0;
 +
-+    if ( retval != len_orig ) ok = 0;
++	printk("retval: %d len: %d\n", retval, len);
 +
-+	printk ("retval: %d len: %d\n", retval, len);
-+
-+    return ok;
++	return ok;
 +}
-+
-+
-+
 +
 +/**
 + *	stimulus_ioctl
 + */
-+static int stimulus_ioctl (struct inode *inode, struct file *file, unsigned int cmd, unsigned long arg)
++static int stimulus_ioctl(struct inode *inode, struct file *file,
++			  unsigned int cmd, unsigned long arg)
 +{
 +	int ok;
-+    int len, retval;
++	int len, retval;
 +
 +	struct coldfire_t *coldfire;
 +
-+    char *data;
-+    char *data_coldfire;
-+
++	char *data;
++	char *data_coldfire;
 +
 +	coldfire = (struct coldfire_t *)file->private_data;
 +
 +	if (!COLDFIRE_IS_OPERATIONAL(coldfire))
-+        return -EFAULT;
++		return -EFAULT;
 +
 +	/* lock this object */
-+	down (&coldfire->sem);
++	down(&coldfire->sem);
 +
 +	/* verify that the device wasn't unplugged */
 +	if (coldfire->dev == NULL) {
-+		up (&coldfire->sem);
++		up(&coldfire->sem);
 +		return -ENODEV;
 +	}
-+
 +#if 0
 +	dbg("%s - minor %d, cmd 0x%.4x, arg %ld",
 +	    __FUNCTION__, coldfire->minor, cmd, arg);
 +#endif
 +
-+
 +	/* fill in your device specific stuff here */
 +
++	data = coldfire->data_ioctl;
++	data_coldfire = coldfire->data_coldfire;
++	len = -1;
 +
-+    data          = coldfire->data_ioctl;
-+    data_coldfire = coldfire->data_coldfire;
-+    len           = -1;
++	ok = 0;
++	retval = 0;
 +
-+	ok     = 0;
-+    retval = 0;
-+
-+	switch ( cmd ) {
++	switch (cmd) {
 +	case ISO_STOP:
-+        printk ("ioctl: stop iso samples: %d\n", coldfire->sample_count);
-+        usb_stop_iso(coldfire);
++		printk("ioctl: stop iso samples: %d\n", coldfire->sample_count);
++		usb_stop_iso(coldfire);
 +		usb_set_interface(coldfire->dev, 0, 0);
-+        ok = 1;
-+        break;
++		ok = 1;
++		break;
 +
 +	case ISO_START:
-+        printk ("ioctl: start iso\n");
-+        coldfire->sample_count = 0;
++		printk("ioctl: start iso\n");
++		coldfire->sample_count = 0;
 +		usb_set_interface(coldfire->dev, 0, 1);
-+        usb_start_iso(coldfire);
-+        ok = 1;
-+        break;
++		usb_start_iso(coldfire);
++		ok = 1;
++		break;
 +
-+    case SET_SAMPLERATE:
-+        printk ("ioctl: set samplerate: %ld\n", arg);
-+        len = sizeof(samplerate);
-+        copy_from_user(data, (char *)arg, len);
-+        change_byteorder(data, data_coldfire, samplerate_elements, samplerate_list, len, cmd);
-+        ok = send_control_message(coldfire, cmd, data_coldfire, len);
-+        break;
++	case SET_SAMPLERATE:
++		printk("ioctl: set samplerate: %ld\n", arg);
++		len = sizeof(samplerate);
++		if (copy_from_user(data, (char *)arg, len))
++			goto error;
++		change_byteorder(data, data_coldfire, samplerate_elements,
++				 samplerate_list, len, cmd);
++		ok = send_control_message(coldfire, cmd, data_coldfire, len);
++		break;
 +
++	case SET_PROGRAM_INFO:
++		len = sizeof(programinfo);
++		if (copy_from_user(data, (char *)arg, len))
++			goto error;
++		change_byteorder(data, data_coldfire, programinfo_elements,
++				 programinfo_list, len, cmd);
++		ok = send_control_message(coldfire, cmd, data_coldfire, len);
++		break;
 +
-+    case SET_PROGRAM_INFO:
-+        len = sizeof(programinfo);
-+        copy_from_user(data, (char *)arg, len);
-+        change_byteorder(data, data_coldfire, programinfo_elements, programinfo_list, len, cmd);
-+        ok = send_control_message(coldfire, cmd, data_coldfire, len);
-+        break;
++	case SET_CAPACITY:
++		len = sizeof(capacity);
++		if (copy_from_user(data, (char *)arg, len))
++			goto error;
++		change_byteorder(data, data_coldfire, capacity_elements,
++				 capacity_list, len, cmd);
++		ok = send_control_message(coldfire, cmd, data_coldfire, len);
++		break;
 +
-+
-+    case SET_CAPACITY:
-+        len = sizeof(capacity);
-+        copy_from_user(data, (char *)arg, len);
-+        change_byteorder(data, data_coldfire, capacity_elements, capacity_list, len, cmd);
-+        ok = send_control_message(coldfire, cmd, data_coldfire, len);
-+        break;
-+
-+
-+    case SETUP_TRIGGER:
-+        len = sizeof(setuptrigger);
-+        copy_from_user(data, (char *)arg, len);
-+        change_byteorder(data, data_coldfire, setuptrigger_elements, setuptrigger_list, len, cmd);
-+        ok = send_control_message(coldfire, cmd, data_coldfire, len);
-+		if ( ok ) {
++	case SETUP_TRIGGER:
++		len = sizeof(setuptrigger);
++		if (copy_from_user(data, (char *)arg, len))
++			goto error;
++		change_byteorder(data, data_coldfire, setuptrigger_elements,
++				 setuptrigger_list, len, cmd);
++		ok = send_control_message(coldfire, cmd, data_coldfire, len);
++		if (ok) {
 +			memcpy((char *)&coldfire->triggermap, data, len);
 +		}
-+        break;
++		break;
 +
++	case SETUP_RETRIGGER_MODE:
++		len = sizeof(retrigger_mode);
++		if (copy_from_user(data, (char *)arg, len))
++			goto error;
++		change_byteorder(data, data_coldfire, retrigger_mode_elements,
++				 retrigger_mode_list, len, cmd);
++		ok = send_control_message(coldfire, cmd, data_coldfire, len);
++		break;
 +
-+    case SETUP_RETRIGGER_MODE:
-+        len = sizeof(retrigger_mode);
-+        copy_from_user(data, (char *)arg, len);
-+        change_byteorder(data, data_coldfire, retrigger_mode_elements, retrigger_mode_list, len, cmd);
-+        ok = send_control_message(coldfire, cmd, data_coldfire, len);
-+        break;
++	case CHANNEL_RESET:
++		len = sizeof(channelreset);
++		if (copy_from_user(data, (char *)arg, len))
++			goto error;
++		change_byteorder(data, data_coldfire, channelreset_elements,
++				 channelreset_list, len, cmd);
++		ok = send_control_message(coldfire, cmd, data_coldfire, len);
++		break;
 +
++	case CHANNEL_DATA:
++		len = sizeof(channeldata);
++		if (copy_from_user(data, (char *)arg, len))
++			goto error;
++		change_byteorder(data, data_coldfire, channeldata_elements,
++				 channeldata_list, len, cmd);
++		ok = send_bulk_message(coldfire, cmd, data_coldfire, len);
++		break;
 +
-+    case CHANNEL_RESET:
-+        len = sizeof(channelreset);
-+        copy_from_user(data, (char *)arg, len);
-+        change_byteorder(data, data_coldfire, channelreset_elements, channelreset_list, len, cmd);
-+        ok = send_control_message(coldfire, cmd, data_coldfire, len);
-+        break;
++	case SYNC_RESET:
++		len = sizeof(syncoutreset);
++		if (copy_from_user(data, (char *)arg, len))
++			goto error;
++		change_byteorder(data, data_coldfire, syncoutreset_elements,
++				 syncoutreset_list, len, cmd);
++		ok = send_control_message(coldfire, cmd, data_coldfire, len);
++		break;
 +
++	case SYNC_DATA:
++		len = sizeof(syncoutdata);
++		if (copy_from_user(data, (char *)arg, len))
++			goto error;
++		change_byteorder(data, data_coldfire, syncoutdata_elements,
++				 syncoutdata_list, len, cmd);
++		ok = send_bulk_message(coldfire, cmd, data_coldfire, len);
++		break;
 +
-+    case CHANNEL_DATA:
-+        len = sizeof(channeldata);
-+        copy_from_user(data, (char *)arg, len);
-+        change_byteorder(data, data_coldfire, channeldata_elements, channeldata_list, len, cmd);
-+        ok = send_bulk_message(coldfire, cmd, data_coldfire, len);
-+        break;
++	case COMMAND_UPLOAD:
++		len = sizeof(upload_block);
++		if (copy_from_user(data, (char *)arg, len))
++			goto error;
++		change_byteorder(data, data_coldfire, upload_elements,
++				 upload_list, len, cmd);
++		ok = send_control_message(coldfire, cmd, data_coldfire, len);
++		break;
 +
-+
-+
-+    case SYNC_RESET:
-+        len = sizeof(syncoutreset);
-+        copy_from_user(data, (char *)arg, len);
-+        change_byteorder(data, data_coldfire, syncoutreset_elements, syncoutreset_list, len, cmd);
-+        ok = send_control_message(coldfire, cmd, data_coldfire, len);
-+        break;
-+
-+
-+    case SYNC_DATA:
-+        len = sizeof(syncoutdata);
-+        copy_from_user(data, (char *)arg, len);
-+        change_byteorder(data, data_coldfire, syncoutdata_elements, syncoutdata_list, len, cmd);
-+        ok = send_bulk_message(coldfire, cmd, data_coldfire, len);
-+        break;
-+
-+
-+
-+    case COMMAND_UPLOAD:
-+        len = sizeof(upload_block);
-+        copy_from_user(data, (char *)arg, len);
-+        change_byteorder(data, data_coldfire, upload_elements, upload_list, len, cmd);
-+        ok = send_control_message(coldfire, cmd, data_coldfire, len);
-+        break;
-+
-+
-+    case COMMAND_FLASH:
-+    case COMMAND_EEPROM:
-+        printk ("command: %x\n", cmd);
-+        len = sizeof(flash_command);
-+        copy_from_user(data, (char *)arg, len);
-+        change_byteorder(data, data_coldfire, flash_elements, flash_list, len, cmd);
-+        ok = send_control_message(coldfire, cmd, data_coldfire, len);
-+        break;
++	case COMMAND_FLASH:
++	case COMMAND_EEPROM:
++		printk("command: %x\n", cmd);
++		len = sizeof(flash_command);
++		if (copy_from_user(data, (char *)arg, len))
++			goto error;
++		change_byteorder(data, data_coldfire, flash_elements,
++				 flash_list, len, cmd);
++		ok = send_control_message(coldfire, cmd, data_coldfire, len);
++		break;
 +
 +	case STG_START:
 +	case STG_STOP:
-+        printk ("command start/stop: %x\n", cmd);
-+        len = sizeof(startstop);
-+        copy_from_user(data, (char *)arg, len);
-+        change_byteorder(data, data_coldfire, startstop_elements, startstop_list, len, cmd);
-+        ok = send_control_message(coldfire, cmd, data_coldfire, len);
-+        break;
++		printk("command start/stop: %x\n", cmd);
++		len = sizeof(startstop);
++		if (copy_from_user(data, (char *)arg, len))
++			goto error;
++		change_byteorder(data, data_coldfire, startstop_elements,
++				 startstop_list, len, cmd);
++		ok = send_control_message(coldfire, cmd, data_coldfire, len);
++		break;
 +
-+    case DISABLE_TRIGGER:
-+    case ENABLE_TRIGGER:
-+        printk ("enable/disable trigger: %x\n", cmd);
-+        len = sizeof(endistrigger);
-+        copy_from_user(data, (char *)arg, len);
-+        change_byteorder(data, data_coldfire, endistrigger_elements, endistrigger_list, len, cmd);
-+        ok = send_control_message(coldfire, cmd, data_coldfire, len);
-+        break;
++	case DISABLE_TRIGGER:
++	case ENABLE_TRIGGER:
++		printk("enable/disable trigger: %x\n", cmd);
++		len = sizeof(endistrigger);
++		if (copy_from_user(data, (char *)arg, len))
++			goto error;
++		change_byteorder(data, data_coldfire, endistrigger_elements,
++				 endistrigger_list, len, cmd);
++		ok = send_control_message(coldfire, cmd, data_coldfire, len);
++		break;
 +
 +	case STG_RESET_STATUS:
-+        printk ("command reset_status: %x\n", cmd);
-+        len = sizeof(reset_status);
-+        copy_from_user(data, (char *)arg, len);
-+        change_byteorder(data, data_coldfire, reset_status_elements, reset_status_list, len, cmd);
-+        ok = send_control_message(coldfire, cmd, data_coldfire, len);
-+        break;
++		printk("command reset_status: %x\n", cmd);
++		len = sizeof(reset_status);
++		if (copy_from_user(data, (char *)arg, len))
++			goto error;
++		change_byteorder(data, data_coldfire, reset_status_elements,
++				 reset_status_list, len, cmd);
++		ok = send_control_message(coldfire, cmd, data_coldfire, len);
++		break;
 +
 +	case SEGMENT_DEFINE:
-+        printk ("command segment_define: %x\n", cmd);
-+        len = sizeof(segmentdef);
-+        copy_from_user(data, (char *)arg, len);
-+        change_byteorder(data, data_coldfire, segmentdef_elements, segmentdef_list, len, cmd);
-+        ok = send_control_message(coldfire, cmd, data_coldfire, len);
-+        break;
++		printk("command segment_define: %x\n", cmd);
++		len = sizeof(segmentdef);
++		if (copy_from_user(data, (char *)arg, len))
++			goto error;
++		change_byteorder(data, data_coldfire, segmentdef_elements,
++				 segmentdef_list, len, cmd);
++		ok = send_control_message(coldfire, cmd, data_coldfire, len);
++		break;
 +
 +	case SEGMENT_SELECT:
-+        printk ("command segment_select: %x\n", cmd);
-+        len = sizeof(segmentselect);
-+        copy_from_user(data, (char *)arg, len);
-+        change_byteorder(data, data_coldfire, segmentselect_elements, segmentselect_list, len, cmd);
-+        ok = send_control_message(coldfire, cmd, data_coldfire, len);
-+        break;
++		printk("command segment_select: %x\n", cmd);
++		len = sizeof(segmentselect);
++		if (copy_from_user(data, (char *)arg, len))
++			goto error;
++		change_byteorder(data, data_coldfire, segmentselect_elements,
++				 segmentselect_list, len, cmd);
++		ok = send_control_message(coldfire, cmd, data_coldfire, len);
++		break;
 +
 +	case SEGMENT_START:
-+        printk ("command segment_start: %x\n", cmd);
-+        len = sizeof(segmentstart);
-+        copy_from_user(data, (char *)arg, len);
-+        change_byteorder(data, data_coldfire, segmentstart_elements, segmentstart_list, len, cmd);
-+        ok = send_control_message(coldfire, cmd, data_coldfire, len);
-+        break;
++		printk("command segment_start: %x\n", cmd);
++		len = sizeof(segmentstart);
++		if (copy_from_user(data, (char *)arg, len))
++			goto error;
++		change_byteorder(data, data_coldfire, segmentstart_elements,
++				 segmentstart_list, len, cmd);
++		ok = send_control_message(coldfire, cmd, data_coldfire, len);
++		break;
 +
-+    case COMMAND_COLDSTART:
++	case COMMAND_COLDSTART:
 +	case COMMAND_DOWNLOADMODE:
 +	case COMMAND_STREAMINGMODE:
 +	case COMMAND_CONT_MODE_ON:
 +	case COMMAND_CONT_MODE_OFF:
-+        len = 0;
-+        ok = send_control_message(coldfire, cmd, data_coldfire, len);
-+        break;
++		len = 0;
++		ok = send_control_message(coldfire, cmd, data_coldfire, len);
++		break;
 +
++	case COMMAND_RESET:
++		usb_reset_device(coldfire->dev);
++		ok = 1;
++		retval = 0;
++		break;
 +
-+    case COMMAND_RESET:
-+        usb_reset_device(coldfire->dev);
-+        ok = 1;
-+        retval = 0;
-+        break;
-+
-+    case GET_UVAL:
-+    case GET_IVAL:
-+        len = sizeof(getval);
++	case GET_UVAL:
++	case GET_IVAL:
++		len = sizeof(getval);
 +		ok = recv_control_message(coldfire, cmd, data_coldfire, len);
-+        change_byteorder(data_coldfire, data, getval_elements, getval_list, len, cmd);
++		change_byteorder(data_coldfire, data, getval_elements,
++				 getval_list, len, cmd);
 +
-+        if ( ok ) {
++		if (ok) {
 +#if 1
-+            printk ("usb_control_msg (getval): len: %d '%lx' retval: %d\n", len, *(uint32 *)data, retval);
++			printk
++			    ("usb_control_msg (getval): len: %d '%lx' retval: %d\n",
++			     len, *(uint32 *) data, retval);
 +#endif
-+            copy_to_user((char *)arg, data, len);
-+        }
++			if (copy_to_user((char *)arg, data, len))
++				goto error;
++		}
 +
-+        break;
++		break;
 +
-+    case GET_IDENT:
-+        len = sizeof(getident);
++	case GET_IDENT:
++		len = sizeof(getident);
 +		ok = recv_control_message(coldfire, cmd, data_coldfire, len);
-+        change_byteorder(data_coldfire, data, getident_elements, getident_list, len, cmd);
++		change_byteorder(data_coldfire, data, getident_elements,
++				 getident_list, len, cmd);
 +
-+        if ( ok ) {
-+            printk ("usb_control_msg: len: %d '%lx' retval: %d\n", len, *(uint32 *)data, retval);
-+            copy_to_user((char *)arg, data, len);
-+        }
++		if (ok) {
++			printk("usb_control_msg: len: %d '%lx' retval: %d\n",
++			       len, *(uint32 *) data, retval);
++			if (copy_to_user((char *)arg, data, len))
++				goto error;
++		}
 +
-+        break;
-+
++		break;
 +
 +	case GET_TOTALMEM:
-+    case GET_MEM:
-+        len = sizeof(mem);
++	case GET_MEM:
++		len = sizeof(mem);
 +		ok = recv_control_message(coldfire, cmd, data_coldfire, len);
-+        change_byteorder(data_coldfire, data, mem_elements, mem_list, len, cmd);
++		change_byteorder(data_coldfire, data, mem_elements, mem_list,
++				 len, cmd);
 +
-+        if ( ok ) {
-+            printk ("usb_control_msg: len: %d '%lx' retval: %d\n", len, *(uint32 *)data, retval);
-+            copy_to_user((char *)arg, data, len);
-+        }
++		if (ok) {
++			printk("usb_control_msg: len: %d '%lx' retval: %d\n",
++			       len, *(uint32 *) data, retval);
++			if (copy_to_user((char *)arg, data, len))
++				goto error;
++		}
 +
-+        break;
++		break;
 +
-+    case GET_TRIGGERMAP:
-+        len = sizeof(setuptrigger);
-+        ok = recv_control_message(coldfire, cmd, data_coldfire, len);
-+        if ( ok ) {
-+            change_byteorder(data_coldfire, data,
-+                             setuptrigger_elements, setuptrigger_list, len, cmd);
-+            copy_to_user((char *)arg, data, len);
-+        }
-+        break;
++	case GET_TRIGGERMAP:
++		len = sizeof(setuptrigger);
++		ok = recv_control_message(coldfire, cmd, data_coldfire, len);
++		if (ok) {
++			change_byteorder(data_coldfire, data,
++					 setuptrigger_elements,
++					 setuptrigger_list, len, cmd);
++			if (copy_to_user((char *)arg, data, len))
++				goto error;
++		}
++		break;
 +
++	case GET_SAMPLERATE:
++		len = sizeof(samplerate);
++		ok = recv_control_message(coldfire, cmd, data_coldfire, len);
++		if (ok) {
++			change_byteorder(data_coldfire, data,
++					 samplerate_elements, samplerate_list,
++					 len, cmd);
++			if (copy_to_user((char *)arg, data, len))
++				goto error;
++		}
++		break;
 +
-+    case GET_SAMPLERATE:
-+        len = sizeof(samplerate);
-+        ok = recv_control_message(coldfire, cmd, data_coldfire, len);
-+        if ( ok ) {
-+            change_byteorder(data_coldfire, data,
-+                             samplerate_elements, samplerate_list, len, cmd);
-+            copy_to_user((char *)arg, data, len);
-+        }
-+        break;
-+
-+    case GET_CAPACITY:
-+        len = sizeof(capacity);
-+        ok = recv_control_message(coldfire, cmd, data_coldfire, len);
-+        if ( ok ) {
-+            change_byteorder(data_coldfire, data,
-+                             capacity_elements, capacity_list, len, cmd);
-+            copy_to_user((char *)arg, data, len);
-+        }
-+        break;
-+
-+
-+
-+
++	case GET_CAPACITY:
++		len = sizeof(capacity);
++		ok = recv_control_message(coldfire, cmd, data_coldfire, len);
++		if (ok) {
++			change_byteorder(data_coldfire, data,
++					 capacity_elements, capacity_list, len,
++					 cmd);
++			if (copy_to_user((char *)arg, data, len))
++				goto error;
++		}
++		break;
 +
 +	case GET_ASCII_VERSION:
 +	case GET_BUILT_DATE:
 +	case GET_BUILT_TIME:
-+        ok = 1;
++		ok = 1;
 +
-+        len = 32;
-+        retval = usb_control_msg(coldfire->dev, usb_rcvctrlpipe(coldfire->dev, 0),
-+                                 cmd, USB_TYPE_VENDOR | USB_DIR_IN, 0, 0,
-+                                 data, len, HZ);
-+        if ( retval > len || retval < 0 ) ok = 0;
++		len = 32;
++		retval =
++		    usb_control_msg(coldfire->dev,
++				    usb_rcvctrlpipe(coldfire->dev, 0), cmd,
++				    USB_TYPE_VENDOR | USB_DIR_IN, 0, 0, data,
++				    len, HZ);
++		if (retval > len || retval < 0)
++			ok = 0;
 +
-+        if ( ok ) {
-+            data[retval] = 0;
-+            copy_to_user((char *)arg, data, retval);
-+        }
++		if (ok) {
++			data[retval] = 0;
++			if (copy_to_user((char *)arg, data, retval))
++				goto error;
++		}
 +
++		break;
 +
-+        break;
-+
-+    case GET_VERSION:
-+        len = sizeof(version);
-+		printk ("get version: len: %d\n", len);
++	case GET_VERSION:
++		len = sizeof(version);
++		printk("get version: len: %d\n", len);
 +		ok = recv_control_message(coldfire, cmd, data_coldfire, len);
-+        change_byteorder(data_coldfire, data, version_elements, version_list, len, cmd);
++		change_byteorder(data_coldfire, data, version_elements,
++				 version_list, len, cmd);
 +
++		if (ok) {
++			printk("usb_control_msg: len: %d '%lx' retval: %d\n",
++			       len, *(uint32 *) data, retval);
++			if (copy_to_user((char *)arg, data, len))
++				goto error;
++		}
 +
-+        if ( ok ) {
-+            printk ("usb_control_msg: len: %d '%lx' retval: %d\n", len, *(uint32 *)data, retval);
-+            copy_to_user((char *)arg, data, len);
-+        }
++		break;
 +
-+        break;
++	case GET_PRODUCT:
++		if (coldfire->dev->descriptor.iProduct &&
++		    usb_string(coldfire->dev,
++			       coldfire->dev->descriptor.iProduct,
++			       data_coldfire, 63) > 0) {
++			if (copy_to_user((char *)arg, data_coldfire, 63))
++				goto error;
++			ok = 1;
++		}
 +
++		break;
++	case GET_MANUFACTURER:
++		if (coldfire->dev->descriptor.iManufacturer &&
++		    usb_string(coldfire->dev,
++			       coldfire->dev->descriptor.iManufacturer,
++			       data_coldfire, 63) > 0) {
++			if (copy_to_user((char *)arg, data_coldfire, 63))
++				goto error;
++			ok = 1;
++		}
 +
-+    case GET_PRODUCT:
-+        if ( coldfire->dev->descriptor.iProduct &&
-+             usb_string(coldfire->dev,
-+                        coldfire->dev->descriptor.iProduct,
-+                        data_coldfire, 63) > 0) {
-+            copy_to_user((char *)arg, data_coldfire, 63);
-+            ok = 1;
-+        }
++		break;
++	case GET_SERIALNUMBER:
++		if (coldfire->dev->descriptor.iSerialNumber &&
++		    usb_string(coldfire->dev,
++			       coldfire->dev->descriptor.iSerialNumber,
++			       data_coldfire, 63) > 0) {
++			if (copy_to_user((char *)arg, data_coldfire, 63))
++				goto error;
++			ok = 1;
++		}
 +
-+        break;
-+    case GET_MANUFACTURER:
-+        if ( coldfire->dev->descriptor.iManufacturer &&
-+             usb_string(coldfire->dev,
-+                        coldfire->dev->descriptor.iManufacturer,
-+                        data_coldfire, 63) > 0) {
-+            copy_to_user((char *)arg, data_coldfire, 63);
-+            ok = 1;
-+        }
++		break;
 +
-+        break;
-+    case GET_SERIALNUMBER:
-+        if ( coldfire->dev->descriptor.iSerialNumber &&
-+             usb_string(coldfire->dev,
-+                        coldfire->dev->descriptor.iSerialNumber,
-+                        data_coldfire, 63) > 0) {
-+            copy_to_user((char *)arg, data_coldfire, 63);
-+            ok = 1;
-+        }
++	case GET_BCDDEVICE:
++		data_coldfire[0] = ((coldfire->dev->descriptor.bcdDevice >> 12) & 0x0f) + '0';
++		data_coldfire[1] = ((coldfire->dev->descriptor.bcdDevice >> 8) & 0x0f) + '0';
++		data_coldfire[2] = '.';
++		data_coldfire[3] = ((coldfire->dev->descriptor.bcdDevice >> 4) & 0x0f) + '0';
++		data_coldfire[4] = ((coldfire->dev->descriptor.bcdDevice >> 0) & 0x0f) + '0';
++		data_coldfire[5] = 0;
++		if (copy_to_user((char *)arg, data_coldfire, 6))
++			goto error;
++		ok = 1;
++		break;
 +
-+        break;
-+
-+    case GET_BCDDEVICE:
-+        data_coldfire[0] = (( coldfire->dev->descriptor.bcdDevice >> 12 ) & 0x0f) + '0';
-+        data_coldfire[1] = (( coldfire->dev->descriptor.bcdDevice >>  8 ) & 0x0f) + '0';
-+        data_coldfire[2] = '.';
-+        data_coldfire[3] = (( coldfire->dev->descriptor.bcdDevice >>  4 ) & 0x0f) + '0';
-+        data_coldfire[4] = (( coldfire->dev->descriptor.bcdDevice >>  0 ) & 0x0f) + '0';
-+        data_coldfire[5] = 0;
-+        copy_to_user((char *)arg, data_coldfire, 6);
-+        ok = 1;
-+        break;
-+
-+    case DEBUG_CHANNELDATA:
-+        len = 4;
-+        copy_from_user(data, (char *)arg, len);
-+        ok = send_control_message(coldfire, cmd, data, len);
-+        break;
++	case DEBUG_CHANNELDATA:
++		len = 4;
++		if (copy_from_user(data, (char *)arg, len))
++			goto error;
++		ok = send_control_message(coldfire, cmd, data, len);
++		break;
 +
 +	default:
-+        printk ("ioctl: unknown command: %x\n", cmd);
-+        break;
++		printk("ioctl: unknown command: %x\n", cmd);
++		break;
 +	}
 +
-+
 +	/* unlock the device */
-+	up (&coldfire->sem);
++	up(&coldfire->sem);
 +
-+
-+	if ( ok )
-+        return retval;
++	if (ok)
++		return retval;
 +
 +	/* return that we did not understand this ioctl call */
 +	return -ENOTTY;
++error:
++	up(&coldfire->sem);
++	return -EFAULT;
 +}
-+
-+
 +
 +/**
 + *	stimulus_probe
@@ -2144,10 +2109,10 @@
 + *	Called by the usb core when a new device is connected that it thinks
 + *	this driver might be interested in.
 + */
-+static void * stimulus_probe(struct usb_device *dev, unsigned int ifnum, const struct usb_device_id *id)
++static int stimulus_probe(struct usb_interface *interface, const struct usb_device_id *id)
 +{
++	struct usb_device *dev = interface_to_usbdev(interface);
 +	struct coldfire_t *coldfire = NULL;
-+	struct usb_interface *interface;
 +	struct usb_interface_descriptor *iface_desc;
 +	struct usb_endpoint_descriptor *endpoint;
 +	int minor;
@@ -2155,55 +2120,40 @@
 +	int pipe, maxp;
 +	char name[10];
 +
-+
-+    printk ("stimulus probe called %04x %04x ifnum: %d\n",
-+            dev->descriptor.idVendor,
-+            dev->descriptor.idProduct,
-+            ifnum);
-+
-+	/* See if the device offered us matches what we can accept */
-+	if ((dev->descriptor.idVendor != USB_STIMULUS_VENDOR_ID) ||
-+	    (dev->descriptor.idProduct != USB_STIMULUS_PRODUCT_ID)) {
-+		return NULL;
-+	}
-+
-+    printk ("product and vendor id found\n");
-+
++	printk("stimulus probe called %04x %04x\n",
++	       dev->descriptor.idVendor, dev->descriptor.idProduct);
 +
 +	/* select a "subminor" number (part of a minor number) */
-+	down (&minor_table_mutex);
++	down(&minor_table_mutex);
 +	for (minor = 0; minor < MAX_DEVICES; ++minor) {
 +		if (minor_table[minor] == NULL)
 +			break;
 +	}
-+	if (minor >= MAX_DEVICES-3) {
-+		info ("Too many devices plugged in, can not handle this device.");
++	if (minor >= MAX_DEVICES - 3) {
++		info("Too many devices plugged in, can not handle this device.");
 +		goto exit;
 +	}
 +
 +	/* allocate memory for our device state and intialize it */
-+	coldfire = kmalloc (sizeof(struct coldfire_t), GFP_KERNEL);
++	coldfire = kmalloc(sizeof(struct coldfire_t), GFP_KERNEL);
 +	if (coldfire == NULL) {
-+		err ("Out of memory");
++		err("Out of memory");
 +		goto exit;
 +	}
-+	memset (coldfire, 0x00, sizeof (*coldfire));
-+	minor_table[minor+0] = coldfire;
-+	minor_table[minor+1] = coldfire;
-+	minor_table[minor+2] = coldfire;
-+	minor_table[minor+3] = coldfire;
++	memset(coldfire, 0x00, sizeof(*coldfire));
++	minor_table[minor + 0] = coldfire;
++	minor_table[minor + 1] = coldfire;
++	minor_table[minor + 2] = coldfire;
++	minor_table[minor + 3] = coldfire;
 +
-+	interface = &dev->actconfig->interface[ifnum];
-+
-+	init_MUTEX (&coldfire->sem);
++	init_MUTEX(&coldfire->sem);
 +	coldfire->dev = dev;
 +	coldfire->interface = interface;
 +	coldfire->minor = minor;
 +
-+	memset((char *)&coldfire->triggermap,   0, sizeof(setuptrigger));
++	memset((char *)&coldfire->triggermap, 0, sizeof(setuptrigger));
 +
-+    printk ("search for endpoints\n");
-+
++	printk("search for endpoints\n");
 +
 +	/* set up the endpoint information */
 +	/* check out the endpoints */
@@ -2214,193 +2164,185 @@
 +		if ((endpoint->bEndpointAddress & 0x80) &&
 +		    ((endpoint->bmAttributes & 3) == 0x03)) {
 +			/* we found an interrupt in endpoint */
-+            coldfire->int_in_endp       = endpoint->bEndpointAddress;
++			coldfire->int_in_endp = endpoint->bEndpointAddress;
 +			coldfire->int_in_packet_len = endpoint->wMaxPacketSize;
-+			coldfire->int_in_rate       = endpoint->bInterval;
-+            printk("found int in endpoint (ep: %d len: %d rate: %d)\n",
-+			       coldfire->int_in_endp,
-+			       coldfire->int_in_packet_len,
-+				   coldfire->int_in_rate);
++			coldfire->int_in_rate = endpoint->bInterval;
++			printk
++			    ("found int in endpoint (ep: %d len: %d rate: %d)\n",
++			     coldfire->int_in_endp, coldfire->int_in_packet_len,
++			     coldfire->int_in_rate);
 +
 +		}
 +
 +		if ((endpoint->bEndpointAddress & 0x80) &&
 +		    ((endpoint->bmAttributes & 3) == 0x01)) {
 +			/* we found an iso in endpoint */
-+            coldfire->iso_in_endp       = endpoint->bEndpointAddress;
++			coldfire->iso_in_endp = endpoint->bEndpointAddress;
 +			coldfire->iso_in_packet_len = endpoint->wMaxPacketSize;
-+            printk("found iso in endpoint (ep: %d len: %d)\n",
++			printk("found iso in endpoint (ep: %d len: %d)\n",
 +			       coldfire->iso_in_endp,
 +			       coldfire->iso_in_packet_len);
 +
-+            if ( coldfire->iso_in_packet_len != 3*4 + 16 ) {
-+                printk ("Warning: iso_in_packet_len != 3*4: %d, not a sync iso endpoint\n",
-+                        coldfire->iso_in_packet_len);
-+            }
++			if (coldfire->iso_in_packet_len != 3 * 4 + 16) {
++				printk
++				    ("Warning: iso_in_packet_len != 3*4: %d, not a sync iso endpoint\n",
++				     coldfire->iso_in_packet_len);
++			}
 +		}
 +
-+		if (((endpoint->bEndpointAddress & 0x80) == 0x00 ) &&
++		if (((endpoint->bEndpointAddress & 0x80) == 0x00) &&
 +		    ((endpoint->bmAttributes & 3) == 0x01)) {
 +			/* we found an iso out endpoint */
-+            coldfire->iso_out_endp       = endpoint->bEndpointAddress;
++			coldfire->iso_out_endp = endpoint->bEndpointAddress;
 +			coldfire->iso_out_packet_len = endpoint->wMaxPacketSize;
-+            printk("found iso out endpoint (ep: %d len: %d)\n",
++			printk("found iso out endpoint (ep: %d len: %d)\n",
 +			       coldfire->iso_out_endp,
 +			       coldfire->iso_out_packet_len);
 +		}
 +
-+
-+		if (((endpoint->bEndpointAddress & 0x80) == 0x00 ) &&
++		if (((endpoint->bEndpointAddress & 0x80) == 0x00) &&
 +		    ((endpoint->bmAttributes & 3) == 0x02)) {
 +			/* we found an bulk out endpoint */
-+            coldfire->bulk_out_endp       = endpoint->bEndpointAddress;
-+			coldfire->bulk_out_packet_len = endpoint->wMaxPacketSize;
-+            printk("found bulk out endpoint (ep: %d len: %d)\n",
++			coldfire->bulk_out_endp = endpoint->bEndpointAddress;
++			coldfire->bulk_out_packet_len =
++			    endpoint->wMaxPacketSize;
++			printk("found bulk out endpoint (ep: %d len: %d)\n",
 +			       coldfire->bulk_out_endp,
 +			       coldfire->bulk_out_packet_len);
 +		}
 +
 +	}
 +
-+
 +	/* initialize the devfs node for this device and register it */
 +	sprintf(name, "stimulus%d", coldfire->minor);
 +
-+	coldfire->devfs = devfs_register (usb_devfs_handle, name,
-+                                      DEVFS_FL_DEFAULT, USB_MAJOR,
-+                                      USB_STIMULUS_MINOR_BASE + coldfire->minor,
-+                                      S_IFCHR | S_IRUSR | S_IWUSR |
-+                                      S_IRGRP | S_IWGRP | S_IROTH,
-+                                      &stimulus_fops, NULL);
-+
 +	coldfire->remove_pending = 0;
-+	coldfire->last_error     = 0;
++	coldfire->last_error = 0;
 +
-+    coldfire->data_ioctl    = kmalloc(4*1024, GFP_KERNEL);
-+    coldfire->data_coldfire = kmalloc(4*1024, GFP_KERNEL);
++	coldfire->data_ioctl = kmalloc(4 * 1024, GFP_KERNEL);
++	coldfire->data_coldfire = kmalloc(4 * 1024, GFP_KERNEL);
 +
-+
-+    coldfire->write_buffer = kmalloc(WRITEBUFFERSIZE, GFP_KERNEL);
-+
++	coldfire->write_buffer = kmalloc(WRITEBUFFERSIZE, GFP_KERNEL);
 +
 +	/* init int transfer */
 +
 +	pipe = usb_rcvintpipe(coldfire->dev, coldfire->int_in_endp);
 +	maxp = usb_maxpacket(coldfire->dev, pipe, usb_pipeout(pipe));
-+	printk ("pipe: %x %x\n", pipe, maxp);
++	printk("pipe: %x %x\n", pipe, maxp);
 +
-+	printk ("fill int urb: rate: %d\n", coldfire->int_in_rate);
++	printk("fill int urb: rate: %d\n", coldfire->int_in_rate);
 +
-+	FILL_INT_URB(&coldfire->int_urb,
-+				 coldfire->dev, pipe,
-+				 &coldfire->int_in_data,
-+				 coldfire->int_in_packet_len,
-+				 coldfire_int_irq, coldfire,
-+				 coldfire->int_in_rate);
++	coldfire->int_urb = usb_alloc_urb(0, GFP_KERNEL);
++	if (!coldfire->int_urb)
++		return -ENOMEM;
++	usb_fill_int_urb(coldfire->int_urb,
++			 coldfire->dev, pipe,
++			 &coldfire->int_in_data,
++			 coldfire->int_in_packet_len,
++			 coldfire_int_irq, coldfire, coldfire->int_in_rate);
 +
 +#if 0
 +	printk("submit in urb\n");
-+	if (usb_submit_urb(&coldfire->int_urb)) {
-+		printk ("unable to submit URB\n");
++	if (usb_submit_urb(coldfire->int_urb, GFP_KERNEL)) {
++		printk("unable to submit URB\n");
 +	}
 +#endif
 +
-+
-+	for ( i = 0; i < STG200x_NUM_TRIGGER; i++ ) {
++	for (i = 0; i < STG200x_NUM_TRIGGER; i++) {
 +		RingQueue_Allocate(&coldfire->dp[i], RINGBUFFERSIZE);
 +		RingQueue_Initialize(&coldfire->dp[i]);
-+		coldfire->trigger_buffer[i] = kmalloc( 1023 * 2 * ( STG200x_NUM_CHANNELS+1), GFP_KERNEL );
++		coldfire->trigger_buffer[i] =
++		    kmalloc(1023 * 2 * (STG200x_NUM_CHANNELS + 1), GFP_KERNEL);
 +	}
 +
-+	for (i=0; i < COLDFIRE_NUMSBUF; i++) {
-+        coldfire->sync_urb[i].urb  = usb_alloc_urb(SYNCFRAMES);
-+        coldfire->sync_urb[i].data = kmalloc(SYNCFRAMES * SYNC_PACKET_SIZE, GFP_KERNEL);
-+        if (coldfire->sync_urb[i].urb == NULL) {
-+            err("usb_alloc_urb(%d.) failed.", SYNCFRAMES);
-+            //		      coldfire->uvd_used = 0;
-+            goto error;
-+        }
++	for (i = 0; i < COLDFIRE_NUMSBUF; i++) {
++		coldfire->sync_urb[i].urb =
++		    usb_alloc_urb(SYNCFRAMES, GFP_KERNEL);
++		coldfire->sync_urb[i].data =
++		    kmalloc(SYNCFRAMES * SYNC_PACKET_SIZE, GFP_KERNEL);
++		if (coldfire->sync_urb[i].urb == NULL) {
++			err("usb_alloc_urb(%d.) failed.", SYNCFRAMES);
++			//                coldfire->uvd_used = 0;
++			goto error;
++		}
 +
-+        coldfire->data_urb[i].urb  = usb_alloc_urb(DESCFRAMES);
-+        coldfire->data_urb[i].data = kmalloc(DESCFRAMES * coldfire->iso_out_packet_len, GFP_KERNEL);
-+        printk("data urb buffer: %p len: %d\n",
-+               coldfire->data_urb[i].data,
-+               DESCFRAMES * coldfire->iso_out_packet_len);
-+        if (coldfire->data_urb[i].urb == NULL) {
-+            err("usb_alloc_urb(%d.) failed.", DESCFRAMES);
-+            //		      coldfire->uvd_used = 0;
-+            goto error;
-+        }
++		coldfire->data_urb[i].urb =
++		    usb_alloc_urb(DESCFRAMES, GFP_KERNEL);
++		coldfire->data_urb[i].data =
++		    kmalloc(DESCFRAMES * coldfire->iso_out_packet_len,
++			    GFP_KERNEL);
++		printk("data urb buffer: %p len: %d\n",
++		       coldfire->data_urb[i].data,
++		       DESCFRAMES * coldfire->iso_out_packet_len);
++		if (coldfire->data_urb[i].urb == NULL) {
++			err("usb_alloc_urb(%d.) failed.", DESCFRAMES);
++			//                coldfire->uvd_used = 0;
++			goto error;
++		}
 +
 +	}
 +
-+
-+
++	/* save our data pointer in this interface device */
++	usb_set_intfdata(interface, coldfire);
 +
 +	/* let the user know what node this device is now attached to */
-+	info ("USB Skeleton device now attached to USBStimulus%d", coldfire->minor);
++	info("USB Skeleton device now attached to USBStimulus%d",
++	     coldfire->minor);
 +	goto exit;
 +
-+ error:
-+	stimulus_delete (coldfire);
++      error:
++	stimulus_delete(coldfire);
 +	coldfire = NULL;
 +
-+ exit:
-+	up (&minor_table_mutex);
-+	return coldfire;
++      exit:
++	up(&minor_table_mutex);
++	return 0;
 +}
-+
 +
 +/**
 + *	stimulus_disconnect
 + *
 + *	Called by the usb core when the device is removed from the system.
 + */
-+static void stimulus_disconnect(struct usb_device *dev, void *ptr)
++static void stimulus_disconnect(struct usb_interface *interface)
 +{
 +	struct coldfire_t *coldfire;
 +	int minor;
 +
-+	coldfire = (struct coldfire_t *)ptr;
++	coldfire = usb_get_intfdata(interface);
 +
 +	printk("stimulus_disconnect\n");
 +
-+	down (&minor_table_mutex);
-+	down (&coldfire->sem);
++	down(&minor_table_mutex);
++	down(&coldfire->sem);
 +
 +	coldfire->remove_pending = 1;
 +
 +	minor = coldfire->minor;
 +
-+	/* remove our devfs node */
-+	devfs_unregister(coldfire->devfs);
-+
-+
 +#if 0
 +	printk("unlink int urb\n");
-+	usb_unlink_urb (&coldfire->int_urb);
++	usb_unlink_urb(coldfire->int_urb);
 +#endif
 +
 +	/* if the device is not opened, then we clean up right now */
 +	if (!coldfire->open_count_total) {
-+		up (&coldfire->sem);
-+		stimulus_delete (coldfire);
++		up(&coldfire->sem);
++		stimulus_delete(coldfire);
 +	} else {
-+        usb_stop_iso(coldfire);
-+		if ( coldfire->int_active ) {
-+			printk ("stimulus disconnect: usb_unlink_urb\n");
-+			usb_unlink_urb (&coldfire->int_urb);
++		usb_stop_iso(coldfire);
++		if (coldfire->int_active) {
++			printk("stimulus disconnect: usb_unlink_urb\n");
++			usb_unlink_urb(coldfire->int_urb);
 +			coldfire->int_active = 0;
 +		}
 +		coldfire->dev = NULL;
-+		up (&coldfire->sem);
++		up(&coldfire->sem);
 +	}
 +
 +	info("USB Stimulus #%d now disconnected", minor);
-+	up (&minor_table_mutex);
++	up(&minor_table_mutex);
 +}
-+
-+
 +
 +/**
 + *	usb_stimulus_init
@@ -2409,20 +2351,19 @@
 +{
 +	int result;
 +
-+    printk ("sizeof int: %d sizeof long: %d\n", sizeof(int), sizeof(long));
++	printk("sizeof int: %d sizeof long: %d\n", sizeof(int), sizeof(long));
 +
 +	/* register this driver with the USB subsystem */
 +	result = usb_register(&stimulus_driver);
 +	if (result < 0) {
-+		err("usb_register failed for the "__FILE__" driver. Error number %d",
-+		    result);
++		err("usb_register failed for the " __FILE__
++		    " driver. Error number %d", result);
 +		return -1;
 +	}
 +
 +	info(DRIVER_DESC " " DRIVER_VERSION);
 +	return 0;
 +}
-+
 +
 +/**
 + *	usb_stimulus_exit
@@ -2433,118 +2374,114 @@
 +	usb_deregister(&stimulus_driver);
 +}
 +
-+
-+module_init (usb_stimulus_init);
-+module_exit (usb_stimulus_exit);
++module_init(usb_stimulus_init);
++module_exit(usb_stimulus_exit);
 +
 +MODULE_AUTHOR(DRIVER_AUTHOR);
 +MODULE_DESCRIPTION(DRIVER_DESC);
 +MODULE_LICENSE("GPL");
 +
-+
-+
 +int usb_stop_iso(struct coldfire_t *coldfire)
 +{
-+    static const char proc[] = "usb_stop_iso";
-+    int i, j, n;
++	static const char proc[] = "usb_stop_iso";
++	int i, j, n;
 +
-+    printk("usb_stop_iso called\n");
++	printk("usb_stop_iso called\n");
 +
++	if ((coldfire == NULL) || (!coldfire->streaming)
++	    || (coldfire->dev == NULL))
++		return 0;
 +
-+    if ( (coldfire == NULL) || (!coldfire->streaming) || (coldfire->dev == NULL) )
-+        return 0;
++	printk("usb_stop_iso\n");
 +
-+    printk("usb_stop_iso\n");
++	for (i = 0; i < COLDFIRE_NUMSBUF; i++) {
++		j = usb_unlink_urb(coldfire->sync_urb[i].urb);
++		if (j < 0)
++			err("%s: usb_unlink_urb() error %d.", proc, j);
 +
-+    for (i=0; i < COLDFIRE_NUMSBUF; i++) {
-+        j = usb_unlink_urb(coldfire->sync_urb[i].urb);
-+        if ( j < 0 )
-+            err("%s: usb_unlink_urb() error %d.", proc, j);
++		j = usb_unlink_urb(coldfire->data_urb[i].urb);
++		if (j < 0)
++			err("%s: usb_unlink_urb() error %d.", proc, j);
++	}
 +
-+        j = usb_unlink_urb(coldfire->data_urb[i].urb);
-+        if ( j < 0 )
-+            err("%s: usb_unlink_urb() error %d.", proc, j);
-+    }
-+
-+	for ( i = 0; i < STG200x_NUM_TRIGGER; i++ ) {
++	for (i = 0; i < STG200x_NUM_TRIGGER; i++) {
 +		n = RingQueue_GetLength(&coldfire->dp[i]);
 +		RING_QUEUE_DEQUEUE_BYTES(&coldfire->dp[i], n);
 +	}
 +
++	coldfire->streaming = 0;
 +
-+    coldfire->streaming = 0;
-+
-+    return 0;
++	return 0;
 +}
 +
 +int usb_start_iso(struct coldfire_t *coldfire)
 +{
-+    static const char proc[] = "coldfire_StartDataPump";
-+    struct usb_device *dev = coldfire->dev;
-+    int i, errFlag;
++	static const char proc[] = "coldfire_StartDataPump";
++	struct usb_device *dev = coldfire->dev;
++	int i, errFlag;
 +
-+    if (!COLDFIRE_IS_OPERATIONAL(coldfire)) {
-+        err("%s: Coldfire is not operational",proc);
-+        return -EFAULT;
-+    }
++	if (!COLDFIRE_IS_OPERATIONAL(coldfire)) {
++		err("%s: Coldfire is not operational", proc);
++		return -EFAULT;
++	}
 +
-+
-+    coldfire->freqn = (( STG200x_MAX_SAMPLERATE << 11  ) + 62) / 125;  /* shift the samplerate per ms to bits 14..23 */
-+    coldfire->freqmax = coldfire->freqn + (coldfire->freqn >> 2);
-+	for ( i = 0; i < STG200x_NUM_TRIGGER; i++ ) {
++	coldfire->freqn = ((STG200x_MAX_SAMPLERATE << 11) + 62) / 125;	/* shift the samplerate per ms to bits 14..23 */
++	coldfire->freqmax = coldfire->freqn + (coldfire->freqn >> 2);
++	for (i = 0; i < STG200x_NUM_TRIGGER; i++) {
 +		coldfire->freqm[i] = coldfire->freqn;
 +		coldfire->phase[i] = 0;
 +	}
 +
++	for (i = 0; i < COLDFIRE_NUMSBUF; i++) {
++		struct urb *urb = coldfire->sync_urb[i].urb;
++		urb->dev = dev;
++		urb->context = coldfire;
++		urb->pipe = usb_rcvisocpipe(dev, coldfire->iso_in_endp);
++		urb->transfer_flags = USB_ISO_ASAP;
++		urb->transfer_buffer = coldfire->sync_urb[i].data;
++		urb->complete = usbout_sync_completed;
++		urb->number_of_packets = SYNCFRAMES;
++		urb->transfer_buffer_length = SYNCFRAMES * SYNC_PACKET_SIZE;
++		urb->next = 0;
 +
-+    for (i=0; i < COLDFIRE_NUMSBUF; i++ ) {
-+        struct urb *urb = coldfire->sync_urb[i].urb;
-+        urb->dev                    = dev;
-+        urb->context                = coldfire;
-+        urb->pipe                   = usb_rcvisocpipe(dev, coldfire->iso_in_endp);
-+        urb->transfer_flags         = USB_ISO_ASAP;
-+        urb->transfer_buffer        = coldfire->sync_urb[i].data;
-+        urb->complete               = usbout_sync_completed;
-+        urb->number_of_packets      = SYNCFRAMES;
-+        urb->transfer_buffer_length = SYNCFRAMES * SYNC_PACKET_SIZE;
-+        urb->next                   = 0;
++		usbout_sync_prepare_desc(coldfire, urb);
 +
-+        usbout_sync_prepare_desc(coldfire, urb);
++		urb = coldfire->data_urb[i].urb;
++		urb->dev = dev;
++		urb->context = coldfire;
++		urb->pipe = usb_sndisocpipe(dev, coldfire->iso_out_endp);
++		urb->transfer_flags = USB_ISO_ASAP;
++		urb->transfer_buffer = coldfire->data_urb[i].data;
++		urb->complete = usbout_completed;
++		urb->number_of_packets = DESCFRAMES;
++		urb->transfer_buffer_length =
++		    DESCFRAMES * coldfire->iso_out_packet_len;
++		urb->next = NULL;
 +
-+        urb = coldfire->data_urb[i].urb;
-+        urb->dev                    = dev;
-+        urb->context                = coldfire;
-+        urb->pipe                   = usb_sndisocpipe(dev, coldfire->iso_out_endp);
-+        urb->transfer_flags         = USB_ISO_ASAP;
-+        urb->transfer_buffer        = coldfire->data_urb[i].data;
-+        urb->complete               = usbout_completed;
-+        urb->number_of_packets      = DESCFRAMES;
-+        urb->transfer_buffer_length = DESCFRAMES * coldfire->iso_out_packet_len;
-+        urb->next                   = NULL;
++		usbout_prepare_desc(coldfire, urb);
++	}
 +
-+        usbout_prepare_desc(coldfire, urb);
-+    }
++	/* Submit all URBs */
++	for (i = 0; i < COLDFIRE_NUMSBUF; i++) {
++		errFlag = usb_submit_urb(coldfire->sync_urb[i].urb, GFP_KERNEL);
++		if (errFlag)
++			err("%s: usb_submit_isoc(%d) ret %d", proc, i, errFlag);
 +
-+    /* Submit all URBs */
-+    for (i=0; i < COLDFIRE_NUMSBUF; i++) {
-+        errFlag = usb_submit_urb(coldfire->sync_urb[i].urb);
-+        if (errFlag)
-+            err("%s: usb_submit_isoc(%d) ret %d", proc, i, errFlag);
++		errFlag = usb_submit_urb(coldfire->data_urb[i].urb, GFP_KERNEL);
++		if (errFlag)
++			err("%s: usb_submit_isoc(%d) ret %d", proc, i, errFlag);
++	}
 +
-+        errFlag = usb_submit_urb(coldfire->data_urb[i].urb);
-+        if (errFlag)
-+            err("%s: usb_submit_isoc(%d) ret %d", proc, i, errFlag);
-+    }
++	coldfire->streaming = 1;
 +
-+    coldfire->streaming = 1;
-+
-+    return 0;
++	return 0;
 +
 +}
 +
-+static int usbout_sync_prepare_desc(struct coldfire_t *coldfire, struct urb *urb)
++static int usbout_sync_prepare_desc(struct coldfire_t *coldfire,
++				    struct urb *urb)
 +{
-+    unsigned int i, offs;
++	unsigned int i, offs;
 +
 +	for (i = offs = 0; i < SYNCFRAMES; i++, offs += SYNC_PACKET_SIZE) {
 +		urb->iso_frame_desc[i].length = SYNC_PACKET_SIZE;
@@ -2566,34 +2503,50 @@
 +
 +	for (i = 0; i < SYNCFRAMES; i++, cp += SYNC_PACKET_SIZE) {
 +		if (urb->iso_frame_desc[i].status) {
-+			dprintk((KERN_DEBUG "usbout_sync_retire_desc: frame %u status %d\n", i, urb->iso_frame_desc[i].status));
++			dprintk((KERN_DEBUG
++				 "usbout_sync_retire_desc: frame %u status %d\n",
++				 i, urb->iso_frame_desc[i].status));
 +			continue;
 +		}
 +		if (urb->iso_frame_desc[i].actual_length < SYNC_PACKET_SIZE) {
-+			dprintk((KERN_DEBUG "usbout_sync_retire_desc: frame %u length %d\n", i, urb->iso_frame_desc[i].actual_length));
++			dprintk((KERN_DEBUG
++				 "usbout_sync_retire_desc: frame %u length %d\n",
++				 i, urb->iso_frame_desc[i].actual_length));
 +			continue;
 +		}
-+		for ( j = 0; j < STG200x_NUM_TRIGGER; j++ ) {
-+			f[j] = cp[j*3+0] | (cp[j*3+1] << 8) | (cp[j*3+2] << 16);
++		for (j = 0; j < STG200x_NUM_TRIGGER; j++) {
++			f[j] =
++			    cp[j * 3 +
++			       0] | (cp[j * 3 + 1] << 8) | (cp[j * 3 +
++							       2] << 16);
 +		}
-+		for ( j = 0; j < STG200x_NUM_TRIGGER; j++ ) {
-+			rb_size[j] = cp[j*4+12] | (cp[j*4+13] << 8) | (cp[j*4+14] << 16) | (cp[j*4+15] << 24);
++		for (j = 0; j < STG200x_NUM_TRIGGER; j++) {
++			rb_size[j] =
++			    cp[j * 4 +
++			       12] | (cp[j * 4 + 13] << 8) | (cp[j * 4 +
++								 14] << 16) |
++			    (cp[j * 4 + 15] << 24);
 +		}
 +#if 0
-+		if (abs(f - coldfire->freqn) > (coldfire->freqn >> 3) || f > coldfire->freqmax) {
-+			printk(KERN_WARNING "usbout_sync_retire_desc: requested frequency %u (nominal %u) out of range!\n", f, coldfire->freqn);
++		if (abs(f - coldfire->freqn) > (coldfire->freqn >> 3)
++		    || f > coldfire->freqmax) {
++			printk(KERN_WARNING
++			       "usbout_sync_retire_desc: requested frequency %u (nominal %u) out of range!\n",
++			       f, coldfire->freqn);
 +			continue;
 +		}
 +#endif
-+		for ( j = 0; j < STG200x_NUM_TRIGGER; j++ ) {
++		for (j = 0; j < STG200x_NUM_TRIGGER; j++) {
 +#if 1
 +			max_wait[j]++;
-+			if ( f_old[j] != f[j] || max_wait[j] == 100 ) {
++			if (f_old[j] != f[j] || max_wait[j] == 100) {
 +				max_wait[j] = 0;
-+				printk ("new value for freq[%d]: old: %d new: %d diff: %d freq: %d frac: %x full: %x phase: %x\n",
-+						j, coldfire->freqm[j], f[j], coldfire->freqm[j] - f[j],
-+						f[j]>>14, (f[j] & 0x3fff) , rb_size[j],
-+						coldfire->phase[j]);
++				printk
++				    ("new value for freq[%d]: old: %d new: %d diff: %d freq: %d frac: %x full: %x phase: %x\n",
++				     j, coldfire->freqm[j], f[j],
++				     coldfire->freqm[j] - f[j], f[j] >> 14,
++				     (f[j] & 0x3fff), rb_size[j],
++				     coldfire->phase[j]);
 +				f_old[j] = f[j];
 +			}
 +#endif
@@ -2604,61 +2557,61 @@
 +	return 0;
 +}
 +
-+
 +static void usbout_sync_completed(struct urb *urb)
 +{
 +	//    unsigned long flags;
 +	struct coldfire_t *coldfire = (struct coldfire_t *)urb->context;
-+	int suret = USB_ST_NOERROR;
++	int suret = 0;
 +
-+    if ( !COLDFIRE_IS_OPERATIONAL(coldfire)) return;
-+    if ( !coldfire->streaming ) {
-+        //        info ("not streaming, but interrupt!\n");
-+        return;
-+    }
-+
++	if (!COLDFIRE_IS_OPERATIONAL(coldfire))
++		return;
++	if (!coldfire->streaming) {
++		//        info ("not streaming, but interrupt!\n");
++		return;
++	}
 +#if 0
-+	printk(KERN_DEBUG "usbout_sync_completed: status %d errcnt %d flags 0x%x\n", urb->status, urb->error_count, u->flags);
++	printk(KERN_DEBUG
++	       "usbout_sync_completed: status %d errcnt %d flags 0x%x\n",
++	       urb->status, urb->error_count, u->flags);
 +#endif
 +
-+
 +	urb->dev = coldfire->dev;
-+	//	spin_lock_irqsave(&coldfire->lock, flags);
++	//      spin_lock_irqsave(&coldfire->lock, flags);
 +	usbout_sync_retire_desc(coldfire, urb);
-+    usbout_sync_prepare_desc(coldfire, urb);
-+    if ((suret = usb_submit_urb(urb)) != USB_ST_NOERROR) {
-+		dprintk((KERN_DEBUG "usbout_sync_completed: descriptor not restarted (usb_submit_urb: %d)\n", suret));
++	usbout_sync_prepare_desc(coldfire, urb);
++	if ((suret = usb_submit_urb(urb, GFP_KERNEL)) != 0) {
++		dprintk((KERN_DEBUG
++			 "usbout_sync_completed: descriptor not restarted (usb_submit_urb: %d)\n",
++			 suret));
 +	}
-+	//	spin_unlock_irqrestore(&coldfire->lock, flags);
++	//      spin_unlock_irqrestore(&coldfire->lock, flags);
 +}
-+
 +
 +static int usbout_prepare_desc(struct coldfire_t *coldfire, struct urb *urb)
 +{
-+    unsigned int i, j;
++	unsigned int i, j;
 +	unsigned int cnt, acnt, offs;
-+    unsigned char *cp = urb->transfer_buffer;
++	unsigned char *cp = urb->transfer_buffer;
 +	unsigned int scnt[STG200x_NUM_TRIGGER];
 +
-+    for (i = offs = 0; i < urb->number_of_packets; i++) {
-+		for ( j = 0; j < STG200x_NUM_TRIGGER; j++ ) {
-+			coldfire->phase[j] = (coldfire->phase[j] & 0x3fff) + coldfire->freqm[j];
-+			scnt[j]  = coldfire->phase[j] >> 14;
++	for (i = offs = 0; i < urb->number_of_packets; i++) {
++		for (j = 0; j < STG200x_NUM_TRIGGER; j++) {
++			coldfire->phase[j] =
++			    (coldfire->phase[j] & 0x3fff) + coldfire->freqm[j];
++			scnt[j] = coldfire->phase[j] >> 14;
 +		}
 +
-+        acnt  = copy_samples(coldfire, cp, scnt);
-+        cnt   = acnt * STG200x_BYTES_PER_SAMPLE;
++		acnt = copy_samples(coldfire, cp, scnt);
++		cnt = acnt * STG200x_BYTES_PER_SAMPLE;
 +
++		urb->iso_frame_desc[i].offset = offs;
++		urb->iso_frame_desc[i].length = cnt;
 +
-+        urb->iso_frame_desc[i].offset = offs;
-+        urb->iso_frame_desc[i].length = cnt;
++		offs += cnt;
++		cp += cnt;
++	}
 +
-+
-+        offs += cnt;
-+        cp   += cnt;
-+    }
-+
-+    return 0;
++	return 0;
 +}
 +
 +static int usbout_retire_desc(struct coldfire_t *coldfire, struct urb *urb)
@@ -2668,16 +2621,18 @@
 +
 +	for (i = 0; i < DESCFRAMES; i++) {
 +		if (urb->iso_frame_desc[i].status) {
-+			dprintk((KERN_DEBUG "usbout_retire_desc: frame %u status %d\n", i, urb->iso_frame_desc[i].status));
++			dprintk((KERN_DEBUG
++				 "usbout_retire_desc: frame %u status %d\n", i,
++				 urb->iso_frame_desc[i].status));
 +			continue;
 +		}
 +	}
 +
-+	if ( last_frame != urb->start_frame ) {
-+		printk ("start frame: ist: %d soll: %d\n", urb->start_frame, last_frame);
++	if (last_frame != urb->start_frame) {
++		printk("start frame: ist: %d soll: %d\n", urb->start_frame,
++		       last_frame);
 +	}
 +	last_frame = (urb->start_frame + DESCFRAMES) & 0x3ff;
-+
 +
 +	return 0;
 +}
@@ -2686,27 +2641,30 @@
 +{
 +	//    unsigned long flags;
 +	struct coldfire_t *coldfire = (struct coldfire_t *)urb->context;
-+	int suret = USB_ST_NOERROR;
++	int suret = 0;
 +
-+    if ( !COLDFIRE_IS_OPERATIONAL(coldfire)) return;
-+    if ( !coldfire->streaming ) {
-+        //        info ("not streaming, but interrupt!\n");
-+        return;
-+    }
-+
++	if (!COLDFIRE_IS_OPERATIONAL(coldfire))
++		return;
++	if (!coldfire->streaming) {
++		//        info ("not streaming, but interrupt!\n");
++		return;
++	}
 +#if 0
-+	printk(KERN_DEBUG "usbout_completed: status %d errcnt %d flags 0x%x\n", urb->status, urb->error_count, u->flags);
++	printk(KERN_DEBUG "usbout_completed: status %d errcnt %d flags 0x%x\n",
++	       urb->status, urb->error_count, u->flags);
 +#endif
 +	urb->dev = coldfire->dev;
-+	//	spin_lock_irqsave(&coldfire->lock, flags);
++	//      spin_lock_irqsave(&coldfire->lock, flags);
 +
 +	usbout_retire_desc(coldfire, urb);
-+    usbout_prepare_desc(coldfire, urb);
++	usbout_prepare_desc(coldfire, urb);
 +
-+	if ((suret = usb_submit_urb(urb)) != USB_ST_NOERROR) {
-+		dprintk((KERN_DEBUG "usbout_completed: descriptor not restarted (usb_submit_urb: %d)\n", suret));
++	if ((suret = usb_submit_urb(urb, GFP_KERNEL)) != 0) {
++		dprintk((KERN_DEBUG
++			 "usbout_completed: descriptor not restarted (usb_submit_urb: %d)\n",
++			 suret));
 +	}
-+	//	spin_unlock_irqrestore(&coldfire->lock, flags);
++	//      spin_unlock_irqrestore(&coldfire->lock, flags);
 +}
 +
 +/*
@@ -2717,27 +2675,26 @@
 +   demuxing is done in the coldfire
 +*/
 +
-+static int copy_samples(struct coldfire_t *coldfire, unsigned char *dest, int *num)
++static int copy_samples(struct coldfire_t *coldfire, unsigned char *dest,
++			int *num)
 +{
-+    static int packet = 0;
++	static int packet = 0;
 +
 +	static int bytepos[STG200x_NUM_TRIGGER] = { 0, 0, 2, 2 };
-+	static int bitpos[STG200x_NUM_TRIGGER]  = { 6, 7, 6, 7 };
++	static int bitpos[STG200x_NUM_TRIGGER] = { 6, 7, 6, 7 };
 +
 +	static int syncout_bytepos[4] = { 4, 4, 6, 6 };
-+	static int syncout_bitpos[4]  = { 6, 7, 6, 7 };
++	static int syncout_bitpos[4] = { 6, 7, 6, 7 };
 +
 +	static int digout_bytepos[8] = { 8, 8, 10, 10, 12, 12, 14, 14 };
-+	static int digout_bitpos[8]  = { 6, 7,  6,  7,  6,  7,  6,  7 };
++	static int digout_bitpos[8] = { 6, 7, 6, 7, 6, 7, 6, 7 };
 +
-+
-+
-+    unsigned int i, j;
++	unsigned int i, j;
 +	unsigned int trigger;
 +
 +	unsigned int samples[STG200x_NUM_TRIGGER];
 +	unsigned int n[STG200x_NUM_TRIGGER];
-+	uint16   *tp[STG200x_NUM_TRIGGER];
++	uint16 *tp[STG200x_NUM_TRIGGER];
 +
 +	unsigned char hb, lb;
 +
@@ -2745,95 +2702,111 @@
 +
 +	max_samples = 0;
 +
-+	for ( trigger = 0; trigger < STG200x_NUM_TRIGGER; trigger++ ) {
-+		n[trigger] = RingQueue_GetLength(&coldfire->dp[trigger])/(2*(STG200x_NUM_CHANNELS+1));
++	for (trigger = 0; trigger < STG200x_NUM_TRIGGER; trigger++) {
++		n[trigger] =
++		    RingQueue_GetLength(&coldfire->dp[trigger]) / (2 *
++								   (STG200x_NUM_CHANNELS
++								    + 1));
 +
-+
-+		if ( num[trigger] * STG200x_BYTES_PER_SAMPLE > coldfire->iso_out_packet_len ) {
-+			printk ("trigger: %d num too big: %d %d\n",
-+					trigger,
-+					num[trigger], coldfire->iso_out_packet_len/STG200x_BYTES_PER_SAMPLE);
-+			num[trigger] = coldfire->iso_out_packet_len / STG200x_BYTES_PER_SAMPLE;
++		if (num[trigger] * STG200x_BYTES_PER_SAMPLE >
++		    coldfire->iso_out_packet_len) {
++			printk("trigger: %d num too big: %d %d\n", trigger,
++			       num[trigger],
++			       coldfire->iso_out_packet_len /
++			       STG200x_BYTES_PER_SAMPLE);
++			num[trigger] =
++			    coldfire->iso_out_packet_len /
++			    STG200x_BYTES_PER_SAMPLE;
 +		}
 +
-+
 +#if 0
-+		printk ("%d: %d %d  ", trigger, num[trigger], n[trigger]);
++		printk("%d: %d %d  ", trigger, num[trigger], n[trigger]);
 +#endif
 +
 +		samples[trigger] = num[trigger];
-+		if ( num[trigger] > n[trigger] ) {
++		if (num[trigger] > n[trigger]) {
 +#if 0
-+			if ( trigger == 0 || trigger == 1) {
-+				printk("warning: ringbuffer trigger %d empty: num %d n: %d\n",
-+					   trigger, num[trigger], n[trigger]);
++			if (trigger == 0 || trigger == 1) {
++				printk
++				    ("warning: ringbuffer trigger %d empty: num %d n: %d\n",
++				     trigger, num[trigger], n[trigger]);
 +			}
 +#endif
 +			samples[trigger] = n[trigger];
 +		}
 +
-+		if ( samples[trigger] > max_samples ) {
++		if (samples[trigger] > max_samples) {
 +			max_samples = samples[trigger];
 +		}
 +	}
 +
 +#if 0
-+	printk ("\n");
++	printk("\n");
 +#endif
-+    if ( !max_samples ) {
-+        memset(dest, 0, STG200x_BYTES_PER_SAMPLE);
-+        return 1;
-+    }
++	if (!max_samples) {
++		memset(dest, 0, STG200x_BYTES_PER_SAMPLE);
++		return 1;
++	}
 +
++	memset(dest, 0, STG200x_BYTES_PER_SAMPLE * max_samples);
 +
-+    memset(dest, 0, STG200x_BYTES_PER_SAMPLE*max_samples);
++	/* Es werden 16 Bytes (8 Kanaele je 16 bit) je sample geschickt */
 +
-+    /* Es werden 16 Bytes (8 Kanaele je 16 bit) je sample geschickt */
-+
-+	for ( trigger = 0; trigger < STG200x_NUM_TRIGGER; trigger++ ) {
++	for (trigger = 0; trigger < STG200x_NUM_TRIGGER; trigger++) {
 +		RingQueue_Dequeue(&coldfire->dp[trigger],
-+						  (unsigned char *)coldfire->trigger_buffer[trigger],
-+						  2*samples[trigger]*(STG200x_NUM_CHANNELS+1));
++				  (unsigned char *)coldfire->
++				  trigger_buffer[trigger],
++				  2 * samples[trigger] * (STG200x_NUM_CHANNELS +
++							  1));
 +		tp[trigger] = coldfire->trigger_buffer[trigger];
-+		if ( samples[trigger] ) {
++		if (samples[trigger]) {
 +			RingQueue_WakeUpInterruptible(&coldfire->dp[trigger]);
 +		}
 +	}
 +
-+    for ( i = 0; i < max_samples; i++, dest+=STG200x_BYTES_PER_SAMPLE ) {
-+		for ( trigger = 0; trigger < STG200x_NUM_TRIGGER; trigger++ ) {
++	for (i = 0; i < max_samples; i++, dest += STG200x_BYTES_PER_SAMPLE) {
++		for (trigger = 0; trigger < STG200x_NUM_TRIGGER; trigger++) {
 +
-+			if ( samples[trigger] == 0 ) continue;
++			if (samples[trigger] == 0)
++				continue;
 +			samples[trigger]--;
 +
-+
 +			/* include this trigger in the usb packet */
-+			*(unsigned short *)(dest+bytepos[trigger]) |= ( 1 << bitpos[trigger] );
++			*(unsigned short *)(dest + bytepos[trigger]) |=
++			    (1 << bitpos[trigger]);
 +
-+			for ( j = 0; j < STG200x_NUM_CHANNELS; j++ ) {                                          // all channels
++			for (j = 0; j < STG200x_NUM_CHANNELS; j++) {	// all channels
 +				*tp[trigger] &= 0x1fff;
 +
-+				if ( coldfire->triggermap.channelmap[trigger] & ( 1 << j ) ) {
++				if (coldfire->triggermap.
++				    channelmap[trigger] & (1 << j)) {
 +					hb = (*tp[trigger]) >> 8;
 +					lb = (*tp[trigger]) & 0xff;
-+					*(unsigned short *)(dest+(j<<1)) |= ((lb << 8) + hb);
++					*(unsigned short *)(dest + (j << 1)) |=
++					    ((lb << 8) + hb);
 +				}
 +				tp[trigger]++;
 +			}
 +
 +#if 1
-+			if ( coldfire->triggermap.digoutmap[trigger] ) {
-+				for ( j = 0; j < 8; j++ ) {
-+					if ( *tp[trigger] & ( 1 << (8+j) ) ) {
-+						*(unsigned short *)(dest+digout_bytepos[j]) |= ( 1 << digout_bitpos[j] );
++			if (coldfire->triggermap.digoutmap[trigger]) {
++				for (j = 0; j < 8; j++) {
++					if (*tp[trigger] & (1 << (8 + j))) {
++						*(unsigned short *)(dest +
++								    digout_bytepos
++								    [j]) |=
++						    (1 << digout_bitpos[j]);
 +					}
 +				}
 +			}
 +
-+			if ( coldfire->triggermap.syncmap[trigger] ) {
-+				for ( j = 0; j < 4; j++ ) {
-+					if ( *tp[trigger] & ( 1 << j ) ) {
-+						*(unsigned short *)(dest+syncout_bytepos[j]) |= ( 1 << syncout_bitpos[j] );
++			if (coldfire->triggermap.syncmap[trigger]) {
++				for (j = 0; j < 4; j++) {
++					if (*tp[trigger] & (1 << j)) {
++						*(unsigned short *)(dest +
++								    syncout_bytepos
++								    [j]) |=
++						    (1 << syncout_bitpos[j]);
 +					}
 +				}
 +			}
@@ -2841,16 +2814,11 @@
 +
 +			tp[trigger]++;
 +
-+
-+
-+		} /* trigger */
++		}		/* trigger */
 +		packet++;
-+	} /* samples (i) */
++	}			/* samples (i) */
 +
-+    coldfire->sample_count += max_samples;
++	coldfire->sample_count += max_samples;
 +
-+
-+    return max_samples;
++	return max_samples;
 +}
-+
-+
