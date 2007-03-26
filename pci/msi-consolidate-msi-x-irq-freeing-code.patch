@@ -1,0 +1,103 @@
+From owner-linux-pci@atrey.karlin.mff.cuni.cz Thu Mar 22 03:53:46 2007
+From: Michael Ellerman <michael@ellerman.id.au>
+To: linux-pci@atrey.karlin.mff.cuni.cz
+Cc: Greg Kroah-Hartman <greg@kroah.com>,
+	Eric W.Biederman <ebiederm@xmission.com>,
+	David S.Miller <davem@davemloft.net>,
+	Benjamin Herrenschmidt <benh@kernel.crashing.org>,
+	Andrew Morton <akpm@osdl.org>,
+	<daniel.e.wolstenholme@intel.com>
+Date: Thu, 22 Mar 2007 21:51:33 +1100
+Subject: MSI: Consolidate MSI-X irq freeing code
+Message-Id: <20070322105335.33AD5DDF5D@ozlabs.org>
+
+For the MSI-X case we do exactly the same logic in pci_disable_msix() and
+msi_remove_pci_irq_vectors(), so consolidate them.
+
+msi_remove_pci_irq_vectors() wasn't setting dev->first_msi_irq to 0, but
+I think it should have been, so the consolidated version does.
+
+Signed-off-by: Michael Ellerman <michael@ellerman.id.au>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/pci/msi.c |   51 +++++++++++++++++++++------------------------------
+ 1 file changed, 21 insertions(+), 30 deletions(-)
+
+--- a/drivers/pci/msi.c
++++ b/drivers/pci/msi.c
+@@ -648,10 +648,26 @@ int pci_enable_msix(struct pci_dev* dev,
+ 	return status;
+ }
+ 
+-void pci_disable_msix(struct pci_dev* dev)
++static void msix_free_all_irqs(struct pci_dev *dev)
+ {
+ 	int irq, head, tail = 0;
+ 
++	irq = head = dev->first_msi_irq;
++	while (head != tail) {
++		tail = get_irq_msi(irq)->link.tail;
++
++		BUG_ON(irq_has_action(irq));
++
++		if (irq != head)
++			msi_free_irq(dev, irq);
++		irq = tail;
++	}
++	msi_free_irq(dev, irq);
++	dev->first_msi_irq = 0;
++}
++
++void pci_disable_msix(struct pci_dev* dev)
++{
+ 	if (!pci_msi_enable)
+ 		return;
+ 	if (!dev)
+@@ -664,18 +680,7 @@ void pci_disable_msix(struct pci_dev* de
+ 	pci_intx(dev, 1);		/* enable intx */
+ 	dev->msix_enabled = 0;
+ 
+-	irq = head = dev->first_msi_irq;
+-	while (head != tail) {
+-		tail = get_irq_msi(irq)->link.tail;
+-
+-		BUG_ON(irq_has_action(irq));
+-
+-		if (irq != head)	/* Release MSI-X irq */
+-			msi_free_irq(dev, irq);
+-		irq = tail;
+-	}
+-	msi_free_irq(dev, irq);
+-	dev->first_msi_irq = 0;
++	msix_free_all_irqs(dev);
+ }
+ 
+ /**
+@@ -696,23 +701,9 @@ void msi_remove_pci_irq_vectors(struct p
+ 		BUG_ON(irq_has_action(dev->first_msi_irq));
+ 		msi_free_irq(dev, dev->first_msi_irq);
+ 	}
+-	if (dev->msix_enabled) {
+-		int irq, head, tail = 0;
+-		void __iomem *base = NULL;
+-
+-		irq = head = dev->first_msi_irq;
+-		while (head != tail) {
+-			tail = get_irq_msi(irq)->link.tail;
+-			base = get_irq_msi(irq)->mask_base;
+-
+-			BUG_ON(irq_has_action(irq));
+-
+-			if (irq != head) /* Release MSI-X irq */
+-				msi_free_irq(dev, irq);
+-			irq = tail;
+-		}
+-		msi_free_irq(dev, irq);
+-	}
++
++	if (dev->msix_enabled)
++		msix_free_all_irqs(dev);
+ }
+ 
+ void pci_no_msi(void)
