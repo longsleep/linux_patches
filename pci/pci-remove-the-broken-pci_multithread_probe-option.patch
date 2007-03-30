@@ -1,0 +1,186 @@
+From bunk@stusta.de Mon Mar 26 18:02:48 2007
+From: Adrian Bunk <bunk@stusta.de>
+Date: Tue, 27 Mar 2007 03:02:51 +0200
+Subject: PCI: remove the broken PCI_MULTITHREAD_PROBE option
+To: gregkh@suse.de
+Cc: linux-pci@atrey.karlin.mff.cuni.cz, linux-kernel@vger.kernel.org
+Message-ID: <20070327010251.GX16477@stusta.de>
+Content-Disposition: inline
+
+
+This patch removes the PCI_MULTITHREAD_PROBE option that had already 
+been marked as broken.
+
+Signed-off-by: Adrian Bunk <bunk@stusta.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ Documentation/pci.txt    |    4 ----
+ drivers/base/dd.c        |   41 +++--------------------------------------
+ drivers/pci/Kconfig      |   25 -------------------------
+ drivers/pci/pci-driver.c |   15 ---------------
+ include/linux/device.h   |    1 -
+ 5 files changed, 3 insertions(+), 83 deletions(-)
+
+--- a/Documentation/pci.txt
++++ b/Documentation/pci.txt
+@@ -124,10 +124,6 @@ initialization with a pointer to a struc
+ 
+ 	err_handler	See Documentation/pci-error-recovery.txt
+ 
+-	multithread_probe	Enable multi-threaded probe/scan. Driver must
+-			provide its own locking/syncronization for init
+-			operations if this is enabled.
+-
+ 
+ The ID table is an array of struct pci_device_id entries ending with an
+ all-zero entry.  Each entry consists of:
+--- a/drivers/base/dd.c
++++ b/drivers/base/dd.c
+@@ -226,12 +226,10 @@ static int device_probe_drivers(void *da
+  *
+  *	Walk the list of drivers that the bus has and call
+  *	driver_probe_device() for each pair. If a compatible
+- *	pair is found, break out and return. If the bus specifies
+- *	multithreaded probing, walking the list of drivers is done
+- *	on a probing thread.
++ *	pair is found, break out and return.
+  *
+  *	Returns 1 if the device was bound to a driver;
+- *	0 if no matching device was found or multithreaded probing is done;
++ *	0 if no matching device was found;
+  *	-ENODEV if the device is not registered.
+  *
+  *	When called for a USB interface, @dev->parent->sem must be held.
+@@ -239,7 +237,6 @@ static int device_probe_drivers(void *da
+ int device_attach(struct device * dev)
+ {
+ 	int ret = 0;
+-	struct task_struct *probe_task = ERR_PTR(-ENOMEM);
+ 
+ 	down(&dev->sem);
+ 	if (dev->driver) {
+@@ -251,12 +248,7 @@ int device_attach(struct device * dev)
+ 			ret = 0;
+ 		}
+ 	} else {
+-		if (dev->bus->multithread_probe)
+-			probe_task = kthread_run(device_probe_drivers, dev,
+-						 "probe-%s", dev->bus_id);
+-		if(IS_ERR(probe_task))
+-			ret = bus_for_each_drv(dev->bus, NULL, dev,
+-					       __device_attach);
++		ret = bus_for_each_drv(dev->bus, NULL, dev, __device_attach);
+ 	}
+ 	up(&dev->sem);
+ 	return ret;
+@@ -383,33 +375,6 @@ void driver_detach(struct device_driver 
+ 	}
+ }
+ 
+-#ifdef CONFIG_PCI_MULTITHREAD_PROBE
+-static int __init wait_for_probes(void)
+-{
+-	DEFINE_WAIT(wait);
+-
+-	printk(KERN_INFO "%s: waiting for %d threads\n", __FUNCTION__,
+-			atomic_read(&probe_count));
+-	if (!atomic_read(&probe_count))
+-		return 0;
+-	while (atomic_read(&probe_count)) {
+-		prepare_to_wait(&probe_waitqueue, &wait, TASK_UNINTERRUPTIBLE);
+-		if (atomic_read(&probe_count))
+-			schedule();
+-	}
+-	finish_wait(&probe_waitqueue, &wait);
+-	return 0;
+-}
+-
+-core_initcall_sync(wait_for_probes);
+-postcore_initcall_sync(wait_for_probes);
+-arch_initcall_sync(wait_for_probes);
+-subsys_initcall_sync(wait_for_probes);
+-fs_initcall_sync(wait_for_probes);
+-device_initcall_sync(wait_for_probes);
+-late_initcall_sync(wait_for_probes);
+-#endif
+-
+ EXPORT_SYMBOL_GPL(device_bind_driver);
+ EXPORT_SYMBOL_GPL(device_release_driver);
+ EXPORT_SYMBOL_GPL(device_attach);
+--- a/drivers/pci/Kconfig
++++ b/drivers/pci/Kconfig
+@@ -17,31 +17,6 @@ config PCI_MSI
+ 
+ 	   If you don't know what to do here, say N.
+ 
+-config PCI_MULTITHREAD_PROBE
+-	bool "PCI Multi-threaded probe (EXPERIMENTAL)"
+-	depends on PCI && EXPERIMENTAL && BROKEN
+-	help
+-	  Say Y here if you want the PCI core to spawn a new thread for
+-	  every PCI device that is probed.  This can cause a huge
+-	  speedup in boot times on multiprocessor machines, and even a
+-	  smaller speedup on single processor machines.
+-
+-	  But it can also cause lots of bad things to happen.  A number
+-	  of PCI drivers cannot properly handle running in this way,
+-	  some will just not work properly at all, while others might
+-	  decide to blow up power supplies with a huge load all at once,
+-	  so use this option at your own risk.
+-
+-	  It is very unwise to use this option if you are not using a
+-	  boot process that can handle devices being created in any
+-	  order.  A program that can create persistent block and network
+-	  device names (like udev) is a good idea if you wish to use
+-	  this option.
+-
+-	  Again, use this option at your own risk, you have been warned!
+-
+-	  When in doubt, say N.
+-
+ config PCI_DEBUG
+ 	bool "PCI Debugging"
+ 	depends on PCI && DEBUG_KERNEL
+--- a/drivers/pci/pci-driver.c
++++ b/drivers/pci/pci-driver.c
+@@ -14,20 +14,6 @@
+ #include "pci.h"
+ 
+ /*
+- *  Registration of PCI drivers and handling of hot-pluggable devices.
+- */
+-
+-/* multithreaded probe logic */
+-static int pci_multithread_probe =
+-#ifdef CONFIG_PCI_MULTITHREAD_PROBE
+-	1;
+-#else
+-	0;
+-#endif
+-__module_param_call("", pci_multithread_probe, param_set_bool, param_get_bool, &pci_multithread_probe, 0644);
+-
+-
+-/*
+  * Dynamic device IDs are disabled for !CONFIG_HOTPLUG
+  */
+ 
+@@ -569,7 +555,6 @@ struct bus_type pci_bus_type = {
+ 
+ static int __init pci_driver_init(void)
+ {
+-	pci_bus_type.multithread_probe = pci_multithread_probe;
+ 	return bus_register(&pci_bus_type);
+ }
+ 
+--- a/include/linux/device.h
++++ b/include/linux/device.h
+@@ -80,7 +80,6 @@ struct bus_type {
+ 	int (*resume)(struct device * dev);
+ 
+ 	unsigned int drivers_autoprobe:1;
+-	unsigned int multithread_probe:1;
+ };
+ 
+ extern int __must_check bus_register(struct bus_type * bus);

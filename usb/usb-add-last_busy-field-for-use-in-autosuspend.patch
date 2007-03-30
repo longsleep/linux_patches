@@ -1,0 +1,305 @@
+From stern@rowland.harvard.edu Tue Mar 27 10:34:09 2007
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Tue, 27 Mar 2007 13:33:59 -0400 (EDT)
+Subject: [PATCH] USB: add "last_busy" field for use in autosuspend
+To: Greg KH <greg@kroah.com>
+Cc: USB development list <linux-usb-devel@lists.sourceforge.net>
+
+
+This patch (as877) adds a "last_busy" field to struct usb_device, for
+use by the autosuspend framework.  Now if an autosuspend call comes at
+a time when the device isn't busy but hasn't yet been idle for long
+enough, the timer can be set to exactly the desired value.  And we
+will be ready to handle things like HID drivers, which can't maintain
+a useful usage count and must rely on the time-of-last-use to decide
+when to autosuspend.
+
+The patch also makes some related minor improvements:
+
+	Move the calls to the autosuspend condition-checking routine
+	into usb_suspend_both(), which is the only place where it
+	really matters.
+
+	If the autosuspend timer is already running, don't stop
+	and restart it.
+
+	Replace immediate returns with gotos so that the optional
+	debugging ouput won't be bypassed.
+
+	If autoresume is disabled but the device is already awake,
+	don't return an error for an autoresume call.
+
+	Don't try to autoresume a device if it isn't suspended.
+	(Yes, this undercuts the previous change -- so sue me.)
+
+	Don't duplicate existing code in the autosuspend work routine.
+
+	Fix the kerneldoc in usb_autopm_put_interface(): If an
+	autoresume call fails, the usage counter is left unchanged.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ drivers/usb/core/driver.c |  102 +++++++++++++++++++++++++++++-----------------
+ drivers/usb/core/hcd.c    |    1 
+ drivers/usb/core/hub.c    |    1 
+ include/linux/usb.h       |    8 +++
+ 4 files changed, 75 insertions(+), 37 deletions(-)
+
+--- a/drivers/usb/core/driver.c
++++ b/drivers/usb/core/driver.c
+@@ -932,6 +932,7 @@ static int autosuspend_check(struct usb_
+ {
+ 	int			i;
+ 	struct usb_interface	*intf;
++	long			suspend_time;
+ 
+ 	/* For autosuspend, fail fast if anything is in use or autosuspend
+ 	 * is disabled.  Also fail if any interfaces require remote wakeup
+@@ -943,6 +944,7 @@ static int autosuspend_check(struct usb_
+ 	if (udev->autosuspend_delay < 0 || udev->autosuspend_disabled)
+ 		return -EPERM;
+ 
++	suspend_time = udev->last_busy + udev->autosuspend_delay;
+ 	if (udev->actconfig) {
+ 		for (i = 0; i < udev->actconfig->desc.bNumInterfaces; i++) {
+ 			intf = udev->actconfig->interface[i];
+@@ -958,6 +960,17 @@ static int autosuspend_check(struct usb_
+ 			}
+ 		}
+ 	}
++
++	/* If everything is okay but the device hasn't been idle for long
++	 * enough, queue a delayed autosuspend request.
++	 */
++	suspend_time -= jiffies;
++	if (suspend_time > 0) {
++		if (!timer_pending(&udev->autosuspend.timer))
++			queue_delayed_work(ksuspend_usb_wq, &udev->autosuspend,
++					suspend_time);
++		return -EAGAIN;
++	}
+ 	return 0;
+ }
+ 
+@@ -1010,19 +1023,18 @@ static int usb_suspend_both(struct usb_d
+ 	struct usb_interface	*intf;
+ 	struct usb_device	*parent = udev->parent;
+ 
+-	cancel_delayed_work(&udev->autosuspend);
+-	if (udev->state == USB_STATE_NOTATTACHED)
+-		return 0;
+-	if (udev->state == USB_STATE_SUSPENDED)
+-		return 0;
++	if (udev->state == USB_STATE_NOTATTACHED ||
++			udev->state == USB_STATE_SUSPENDED)
++		goto done;
+ 
+ 	udev->do_remote_wakeup = device_may_wakeup(&udev->dev);
+ 
+ 	if (udev->auto_pm) {
+ 		status = autosuspend_check(udev);
+ 		if (status < 0)
+-			return status;
++			goto done;
+ 	}
++	cancel_delayed_work(&udev->autosuspend);
+ 
+ 	/* Suspend all the interfaces and then udev itself */
+ 	if (udev->actconfig) {
+@@ -1047,6 +1059,7 @@ static int usb_suspend_both(struct usb_d
+ 	} else if (parent)
+ 		usb_autosuspend_device(parent);
+ 
++ done:
+ 	// dev_dbg(&udev->dev, "%s: status %d\n", __FUNCTION__, status);
+ 	return status;
+ }
+@@ -1086,14 +1099,18 @@ static int usb_resume_both(struct usb_de
+ 	struct usb_interface	*intf;
+ 	struct usb_device	*parent = udev->parent;
+ 
+-	if (udev->auto_pm && udev->autoresume_disabled)
+-		return -EPERM;
+ 	cancel_delayed_work(&udev->autosuspend);
+-	if (udev->state == USB_STATE_NOTATTACHED)
+-		return -ENODEV;
++	if (udev->state == USB_STATE_NOTATTACHED) {
++		status = -ENODEV;
++		goto done;
++	}
+ 
+ 	/* Propagate the resume up the tree, if necessary */
+ 	if (udev->state == USB_STATE_SUSPENDED) {
++		if (udev->auto_pm && udev->autoresume_disabled) {
++			status = -EPERM;
++			goto done;
++		}
+ 		if (parent) {
+ 			status = usb_autoresume_device(parent);
+ 			if (status == 0) {
+@@ -1139,24 +1156,13 @@ static int usb_resume_both(struct usb_de
+ 		}
+ 	}
+ 
++ done:
+ 	// dev_dbg(&udev->dev, "%s: status %d\n", __FUNCTION__, status);
+ 	return status;
+ }
+ 
+ #ifdef CONFIG_USB_SUSPEND
+ 
+-/* usb_autosuspend_work - callback routine to autosuspend a USB device */
+-void usb_autosuspend_work(struct work_struct *work)
+-{
+-	struct usb_device *udev =
+-		container_of(work, struct usb_device, autosuspend.work);
+-
+-	usb_pm_lock(udev);
+-	udev->auto_pm = 1;
+-	usb_suspend_both(udev, PMSG_SUSPEND);
+-	usb_pm_unlock(udev);
+-}
+-
+ /* Internal routine to adjust a device's usage counter and change
+  * its autosuspend state.
+  */
+@@ -1165,20 +1171,34 @@ static int usb_autopm_do_device(struct u
+ 	int	status = 0;
+ 
+ 	usb_pm_lock(udev);
++	udev->auto_pm = 1;
+ 	udev->pm_usage_cnt += inc_usage_cnt;
+ 	WARN_ON(udev->pm_usage_cnt < 0);
+ 	if (inc_usage_cnt >= 0 && udev->pm_usage_cnt > 0) {
+-		udev->auto_pm = 1;
+-		status = usb_resume_both(udev);
++		if (udev->state == USB_STATE_SUSPENDED)
++			status = usb_resume_both(udev);
+ 		if (status != 0)
+ 			udev->pm_usage_cnt -= inc_usage_cnt;
+-	} else if (inc_usage_cnt <= 0 && autosuspend_check(udev) == 0)
+-		queue_delayed_work(ksuspend_usb_wq, &udev->autosuspend,
+-				udev->autosuspend_delay);
++		else if (inc_usage_cnt)
++			udev->last_busy = jiffies;
++	} else if (inc_usage_cnt <= 0 && udev->pm_usage_cnt <= 0) {
++		if (inc_usage_cnt)
++			udev->last_busy = jiffies;
++		status = usb_suspend_both(udev, PMSG_SUSPEND);
++	}
+ 	usb_pm_unlock(udev);
+ 	return status;
+ }
+ 
++/* usb_autosuspend_work - callback routine to autosuspend a USB device */
++void usb_autosuspend_work(struct work_struct *work)
++{
++	struct usb_device *udev =
++		container_of(work, struct usb_device, autosuspend.work);
++
++	usb_autopm_do_device(udev, 0);
++}
++
+ /**
+  * usb_autosuspend_device - delayed autosuspend of a USB device and its interfaces
+  * @udev: the usb_device to autosuspend
+@@ -1270,15 +1290,20 @@ static int usb_autopm_do_interface(struc
+ 	if (intf->condition == USB_INTERFACE_UNBOUND)
+ 		status = -ENODEV;
+ 	else {
++		udev->auto_pm = 1;
+ 		intf->pm_usage_cnt += inc_usage_cnt;
+ 		if (inc_usage_cnt >= 0 && intf->pm_usage_cnt > 0) {
+-			udev->auto_pm = 1;
+-			status = usb_resume_both(udev);
++			if (udev->state == USB_STATE_SUSPENDED)
++				status = usb_resume_both(udev);
+ 			if (status != 0)
+ 				intf->pm_usage_cnt -= inc_usage_cnt;
+-		} else if (inc_usage_cnt <= 0 && autosuspend_check(udev) == 0)
+-			queue_delayed_work(ksuspend_usb_wq, &udev->autosuspend,
+-					udev->autosuspend_delay);
++			else if (inc_usage_cnt)
++				udev->last_busy = jiffies;
++		} else if (inc_usage_cnt <= 0 && intf->pm_usage_cnt <= 0) {
++			if (inc_usage_cnt)
++				udev->last_busy = jiffies;
++			status = usb_suspend_both(udev, PMSG_SUSPEND);
++		}
+ 	}
+ 	usb_pm_unlock(udev);
+ 	return status;
+@@ -1337,11 +1362,14 @@ EXPORT_SYMBOL_GPL(usb_autopm_put_interfa
+  * or @intf is unbound.  A typical example would be a character-device
+  * driver when its device file is opened.
+  *
+- * The routine increments @intf's usage counter.  So long as the counter
+- * is greater than 0, autosuspend will not be allowed for @intf or its
+- * usb_device.  When the driver is finished using @intf it should call
+- * usb_autopm_put_interface() to decrement the usage counter and queue
+- * a delayed autosuspend request (if the counter is <= 0).
++ *
++ * The routine increments @intf's usage counter.  (However if the
++ * autoresume fails then the counter is re-decremented.)  So long as the
++ * counter is greater than 0, autosuspend will not be allowed for @intf
++ * or its usb_device.  When the driver is finished using @intf it should
++ * call usb_autopm_put_interface() to decrement the usage counter and
++ * queue a delayed autosuspend request (if the counter is <= 0).
++ *
+  *
+  * Note that @intf->pm_usage_cnt is owned by the interface driver.  The
+  * core will not change its value other than the increment and decrement
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -1306,6 +1306,7 @@ static void hcd_resume_work(struct work_
+ 	struct usb_device *udev = hcd->self.root_hub;
+ 
+ 	usb_lock_device(udev);
++	usb_mark_last_busy(udev);
+ 	usb_external_resume_device(udev);
+ 	usb_unlock_device(udev);
+ }
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -1861,6 +1861,7 @@ static int remote_wakeup(struct usb_devi
+ 	usb_lock_device(udev);
+ 	if (udev->state == USB_STATE_SUSPENDED) {
+ 		dev_dbg(&udev->dev, "usb %sresume\n", "wakeup-");
++		usb_mark_last_busy(udev);
+ 		status = usb_external_resume_device(udev);
+ 	}
+ 	usb_unlock_device(udev);
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -398,6 +398,7 @@ struct usb_device {
+ 	struct delayed_work autosuspend; /* for delayed autosuspends */
+ 	struct mutex pm_mutex;		/* protects PM operations */
+ 
++	unsigned long last_busy;	/* time of last use */
+ 	int autosuspend_delay;		/* in jiffies */
+ 
+ 	unsigned auto_pm:1;		/* autosuspend/resume in progress */
+@@ -443,6 +444,11 @@ static inline void usb_autopm_disable(st
+ 	usb_autopm_set_interface(intf);
+ }
+ 
++static inline void usb_mark_last_busy(struct usb_device *udev)
++{
++	udev->last_busy = jiffies;
++}
++
+ #else
+ 
+ static inline int usb_autopm_set_interface(struct usb_interface *intf)
+@@ -457,6 +463,8 @@ static inline void usb_autopm_enable(str
+ { }
+ static inline void usb_autopm_disable(struct usb_interface *intf)
+ { }
++static inline void usb_mark_last_busy(struct usb_device *udev)
++{ }
+ #endif
+ 
+ /*-------------------------------------------------------------------------*/
