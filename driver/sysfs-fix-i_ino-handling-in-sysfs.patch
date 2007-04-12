@@ -1,0 +1,82 @@
+From htejun@gmail.com Sun Apr  8 21:18:58 2007
+From: Tejun Heo <htejun@gmail.com>
+Date: Mon, 9 Apr 2007 13:18:47 +0900
+Subject: sysfs: fix i_ino handling in sysfs
+To: gregkh@suse.de, maneesh@in.ibm.com, dmitry.torokhov@gmail.com, cornelia.huck@de.ibm.com, oneukum@suse.de, rpurdie@rpsys.net, James.Bottomley@SteelEye.com, stern@rowland.harvard.edu, linux-kernel@vger.kernel.org, htejun@gmail.com
+Cc: Tejun Heo <htejun@gmail.com>
+Message-ID: <11760923274128-git-send-email-htejun@gmail.com>
+
+
+Inode number handling was incorrect in two ways.
+
+1. sysfs uses the inode number allocated by new_inode() and never
+   hashes it.  When reporting the inode number, it uses iunique() if
+   inode is inaccessible.  This is incorrect because iunique() assumes
+   the inodes are hashed.  This can cause duplicate inode numbers and
+   the condition is likely to happen because new_inode() and iunique()
+   use separate increasing static counters to scan for empty slot.
+
+2. sysfs_dirent->s_dentry can go away anytime and can't be referenced
+   unless the caller knows the dentry is not and not going to be
+   deleted.
+
+This patch makes sysfs report the pointer to sysfs_dirent as ino.
+ino_t is always as big as or larger than unsigned long && sysfs_dirent
+hierarchy is the internal representation of the sysfs tree, so it
+makes sense and simple to implement.
+
+Signed-off-by: Tejun Heo <htejun@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ fs/sysfs/dir.c   |   11 ++++-------
+ fs/sysfs/inode.c |    1 +
+ 2 files changed, 5 insertions(+), 7 deletions(-)
+
+--- a/fs/sysfs/dir.c
++++ b/fs/sysfs/dir.c
+@@ -504,19 +504,19 @@ static int sysfs_readdir(struct file * f
+ 	struct sysfs_dirent * parent_sd = dentry->d_fsdata;
+ 	struct sysfs_dirent *cursor = filp->private_data;
+ 	struct list_head *p, *q = &cursor->s_sibling;
+-	ino_t ino;
++	unsigned long ino;
+ 	int i = filp->f_pos;
+ 
+ 	switch (i) {
+ 		case 0:
+-			ino = dentry->d_inode->i_ino;
++			ino = (unsigned long)parent_sd;
+ 			if (filldir(dirent, ".", 1, i, ino, DT_DIR) < 0)
+ 				break;
+ 			filp->f_pos++;
+ 			i++;
+ 			/* fallthrough */
+ 		case 1:
+-			ino = parent_ino(dentry);
++			ino = (unsigned long)dentry->d_parent->d_fsdata;
+ 			if (filldir(dirent, "..", 2, i, ino, DT_DIR) < 0)
+ 				break;
+ 			filp->f_pos++;
+@@ -538,10 +538,7 @@ static int sysfs_readdir(struct file * f
+ 
+ 				name = sysfs_get_name(next);
+ 				len = strlen(name);
+-				if (next->s_dentry)
+-					ino = next->s_dentry->d_inode->i_ino;
+-				else
+-					ino = iunique(sysfs_sb, 2);
++				ino = (unsigned long)next;
+ 
+ 				if (filldir(dirent, name, len, filp->f_pos, ino,
+ 						 dt_type(next)) < 0)
+--- a/fs/sysfs/inode.c
++++ b/fs/sysfs/inode.c
+@@ -140,6 +140,7 @@ struct inode * sysfs_new_inode(mode_t mo
+ 		inode->i_mapping->a_ops = &sysfs_aops;
+ 		inode->i_mapping->backing_dev_info = &sysfs_backing_dev_info;
+ 		inode->i_op = &sysfs_inode_operations;
++		inode->i_ino = (unsigned long)sd;
+ 		lockdep_set_class(&inode->i_mutex, &sysfs_inode_imutex_key);
+ 
+ 		if (sd->s_iattr) {

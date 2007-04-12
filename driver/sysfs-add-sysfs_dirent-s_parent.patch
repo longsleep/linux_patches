@@ -1,0 +1,126 @@
+From htejun@gmail.com Sun Apr  8 21:18:59 2007
+From: Tejun Heo <htejun@gmail.com>
+Date: Mon, 9 Apr 2007 13:18:48 +0900
+Subject: sysfs: add sysfs_dirent->s_parent
+To: gregkh@suse.de, maneesh@in.ibm.com, dmitry.torokhov@gmail.com, cornelia.huck@de.ibm.com, oneukum@suse.de, rpurdie@rpsys.net, James.Bottomley@SteelEye.com, stern@rowland.harvard.edu, linux-kernel@vger.kernel.org, htejun@gmail.com
+Cc: Tejun Heo <htejun@gmail.com>
+Message-ID: <11760923281438-git-send-email-htejun@gmail.com>
+
+
+Add sysfs_dirent->s_parent.  With this patch, each sd points to and
+holds a reference to its parent.  This allows walking sysfs tree
+without referencing sd->s_dentry which can go away anytime if the user
+doesn't control when it's deleted.
+
+sd->s_parent is initialized and parent is referenced in
+sysfs_attach_dirent().  Reference to parent is released when the sd is
+released, so as long as reference to a sd is held, s_parent can be
+followed.
+
+dentry walk in sysfs_readdir() is convereted to s_parent walk.
+
+This will be used to reimplement symlink such that it uses only
+sysfs_dirent tree.
+
+Signed-off-by: Tejun Heo <htejun@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ fs/sysfs/dir.c   |   27 ++++++++++++++++++++-------
+ fs/sysfs/mount.c |    1 +
+ fs/sysfs/sysfs.h |    1 +
+ 3 files changed, 22 insertions(+), 7 deletions(-)
+
+--- a/fs/sysfs/dir.c
++++ b/fs/sysfs/dir.c
+@@ -16,6 +16,11 @@ DECLARE_RWSEM(sysfs_rename_sem);
+ 
+ void release_sysfs_dirent(struct sysfs_dirent * sd)
+ {
++	struct sysfs_dirent *parent_sd;
++
++ repeat:
++	parent_sd = sd->s_parent;
++
+ 	if (sd->s_type & SYSFS_KOBJ_LINK) {
+ 		struct sysfs_symlink * sl = sd->s_element;
+ 		kfree(sl->link_name);
+@@ -24,6 +29,10 @@ void release_sysfs_dirent(struct sysfs_d
+ 	}
+ 	kfree(sd->s_iattr);
+ 	kmem_cache_free(sysfs_dir_cachep, sd);
++
++	sd = parent_sd;
++	if (sd && atomic_dec_and_test(&sd->s_count))
++		goto repeat;
+ }
+ 
+ static void sysfs_d_iput(struct dentry * dentry, struct inode * inode)
+@@ -71,8 +80,10 @@ void sysfs_attach_dirent(struct sysfs_di
+ 		dentry->d_op = &sysfs_dentry_ops;
+ 	}
+ 
+-	if (parent_sd)
++	if (parent_sd) {
++		sd->s_parent = sysfs_get(parent_sd);
+ 		list_add(&sd->s_sibling, &parent_sd->s_children);
++	}
+ }
+ 
+ /*
+@@ -508,7 +519,7 @@ static int sysfs_readdir(struct file * f
+ 			i++;
+ 			/* fallthrough */
+ 		case 1:
+-			ino = (unsigned long)dentry->d_parent->d_fsdata;
++			ino = (unsigned long)parent_sd->s_parent;
+ 			if (filldir(dirent, "..", 2, i, ino, DT_DIR) < 0)
+ 				break;
+ 			filp->f_pos++;
+@@ -625,13 +636,13 @@ int sysfs_make_shadowed_dir(struct kobje
+ 
+ struct dentry *sysfs_create_shadow_dir(struct kobject *kobj)
+ {
++	struct dentry *dir = kobj->dentry;
++	struct inode *inode = dir->d_inode;
++	struct dentry *parent = dir->d_parent;
++	struct sysfs_dirent *parent_sd = parent->d_fsdata;
++	struct dentry *shadow;
+ 	struct sysfs_dirent *sd;
+-	struct dentry *parent, *dir, *shadow;
+-	struct inode *inode;
+ 
+-	dir = kobj->dentry;
+-	inode = dir->d_inode;
+-	parent = dir->d_parent;
+ 	shadow = ERR_PTR(-EINVAL);
+ 	if (!sysfs_is_shadowed_inode(inode))
+ 		goto out;
+@@ -643,6 +654,8 @@ struct dentry *sysfs_create_shadow_dir(s
+ 	sd = sysfs_new_dirent(kobj, inode->i_mode, SYSFS_DIR);
+ 	if (!sd)
+ 		goto nomem;
++	/* point to parent_sd but don't attach to it */
++	sd->s_parent = sysfs_get(parent_sd);
+ 	sysfs_attach_dirent(sd, NULL, shadow);
+ 
+ 	d_instantiate(shadow, igrab(inode));
+--- a/fs/sysfs/mount.c
++++ b/fs/sysfs/mount.c
+@@ -28,6 +28,7 @@ static const struct super_operations sys
+ };
+ 
+ static struct sysfs_dirent sysfs_root = {
++	.s_count	= ATOMIC_INIT(1),
+ 	.s_sibling	= LIST_HEAD_INIT(sysfs_root.s_sibling),
+ 	.s_children	= LIST_HEAD_INIT(sysfs_root.s_children),
+ 	.s_element	= NULL,
+--- a/fs/sysfs/sysfs.h
++++ b/fs/sysfs/sysfs.h
+@@ -1,5 +1,6 @@
+ struct sysfs_dirent {
+ 	atomic_t		s_count;
++	struct sysfs_dirent	* s_parent;
+ 	struct list_head	s_sibling;
+ 	struct list_head	s_children;
+ 	void 			* s_element;
