@@ -5,10 +5,8 @@ From: Greg Kroah-Hartman <gregkh@suse.de>
 Subject: USB: remove use of the bus rwsem, as it doesn't really protect anything.
 
 The driver core stopped using the rwsem a long time ago, yet the USB
-core still grabbed the lock, thinking it protected something.  As a lock
-is really needed for these instances, I've replaced it with a local
-mutex to protect the bus, but odds are there is still a code path that
-needs to have this lock added to it to properly protect things.
+core still grabbed the lock, thinking it protected something.  This
+patch removes that useless use.
 
 Cc: Alan Stern <stern@rowland.harvard.edu>
 Cc: Oliver Neukum <oneukum@suse.de>
@@ -17,93 +15,86 @@ Cc: linux-usb-devel <linux-usb-devel@lists.sourceforge.net>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
- drivers/usb/core/devices.c |    4 ++--
- drivers/usb/core/devio.c   |   20 ++++++++++----------
+ drivers/usb/core/devices.c |    2 --
+ drivers/usb/core/devio.c   |   13 -------------
+ drivers/usb/core/driver.c  |   12 ++++++------
  drivers/usb/core/message.c |    2 +-
- drivers/usb/core/usb.c     |    2 ++
- drivers/usb/core/usb.h     |    1 +
- 5 files changed, 16 insertions(+), 13 deletions(-)
+ 4 files changed, 7 insertions(+), 22 deletions(-)
 
 --- a/drivers/usb/core/devices.c
 +++ b/drivers/usb/core/devices.c
-@@ -246,7 +246,7 @@ static char *usb_dump_interface_descript
+@@ -246,7 +246,6 @@ static char *usb_dump_interface_descript
  
  	if (start > end)
  		return start;
 -	down_read(&usb_bus_type.subsys.rwsem);
-+	mutex_lock(&usb_bus_lock);
  	if (iface) {
  		driver_name = (iface->dev.driver
  				? iface->dev.driver->name
-@@ -263,7 +263,7 @@ static char *usb_dump_interface_descript
+@@ -263,7 +262,6 @@ static char *usb_dump_interface_descript
  			 desc->bInterfaceSubClass,
  			 desc->bInterfaceProtocol,
  			 driver_name);
 -	up_read(&usb_bus_type.subsys.rwsem);
-+	mutex_unlock(&usb_bus_lock);
  	return start;
  }
  
 --- a/drivers/usb/core/devio.c
 +++ b/drivers/usb/core/devio.c
-@@ -422,13 +422,13 @@ static int claimintf(struct dev_state *p
+@@ -421,14 +421,11 @@ static int claimintf(struct dev_state *p
+ 	if (test_bit(ifnum, &ps->ifclaimed))
  		return 0;
  
- 	/* lock against other changes to driver bindings */
+-	/* lock against other changes to driver bindings */
 -	down_write(&usb_bus_type.subsys.rwsem);
-+	mutex_lock(&usb_bus_lock);
  	intf = usb_ifnum_to_if(dev, ifnum);
  	if (!intf)
  		err = -ENOENT;
  	else
  		err = usb_driver_claim_interface(&usbfs_driver, intf, ps);
 -	up_write(&usb_bus_type.subsys.rwsem);
-+	mutex_unlock(&usb_bus_lock);
  	if (err == 0)
  		set_bit(ifnum, &ps->ifclaimed);
  	return err;
-@@ -445,7 +445,7 @@ static int releaseintf(struct dev_state 
+@@ -444,8 +441,6 @@ static int releaseintf(struct dev_state 
+ 	if (ifnum >= 8*sizeof(ps->ifclaimed))
  		return err;
  	dev = ps->dev;
- 	/* lock against other changes to driver bindings */
+-	/* lock against other changes to driver bindings */
 -	down_write(&usb_bus_type.subsys.rwsem);
-+	mutex_lock(&usb_bus_lock);
  	intf = usb_ifnum_to_if(dev, ifnum);
  	if (!intf)
  		err = -ENOENT;
-@@ -453,7 +453,7 @@ static int releaseintf(struct dev_state 
+@@ -453,7 +448,6 @@ static int releaseintf(struct dev_state 
  		usb_driver_release_interface(&usbfs_driver, intf);
  		err = 0;
  	}
 -	up_write(&usb_bus_type.subsys.rwsem);
-+	mutex_unlock(&usb_bus_lock);
  	return err;
  }
  
-@@ -813,7 +813,7 @@ static int proc_getdriver(struct dev_sta
+@@ -813,7 +807,6 @@ static int proc_getdriver(struct dev_sta
  
  	if (copy_from_user(&gd, arg, sizeof(gd)))
  		return -EFAULT;
 -	down_read(&usb_bus_type.subsys.rwsem);
-+	mutex_lock(&usb_bus_lock);
  	intf = usb_ifnum_to_if(ps->dev, gd.interface);
  	if (!intf || !intf->dev.driver)
  		ret = -ENODATA;
-@@ -822,7 +822,7 @@ static int proc_getdriver(struct dev_sta
+@@ -822,7 +815,6 @@ static int proc_getdriver(struct dev_sta
  				sizeof(gd.driver));
  		ret = (copy_to_user(arg, &gd, sizeof(gd)) ? -EFAULT : 0);
  	}
 -	up_read(&usb_bus_type.subsys.rwsem);
-+	mutex_unlock(&usb_bus_lock);
  	return ret;
  }
  
-@@ -1352,14 +1352,14 @@ static int proc_ioctl(struct dev_state *
+@@ -1351,15 +1343,12 @@ static int proc_ioctl(struct dev_state *
+ 
  	/* disconnect kernel driver from interface */
  	case USBDEVFS_DISCONNECT:
- 
+-
 -		down_write(&usb_bus_type.subsys.rwsem);
-+		mutex_lock(&usb_bus_lock);
  		if (intf->dev.driver) {
  			driver = to_usb_driver(intf->dev.driver);
  			dev_dbg (&intf->dev, "disconnect by usbfs\n");
@@ -111,28 +102,53 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		} else
  			retval = -ENODATA;
 -		up_write(&usb_bus_type.subsys.rwsem);
-+		mutex_unlock(&usb_bus_lock);
  		break;
  
  	/* let kernel drivers try to (re)bind to the interface */
-@@ -1371,7 +1371,7 @@ static int proc_ioctl(struct dev_state *
+@@ -1371,7 +1360,6 @@ static int proc_ioctl(struct dev_state *
  
  	/* talk directly to the interface's driver */
  	default:
 -		down_read(&usb_bus_type.subsys.rwsem);
-+		mutex_lock(&usb_bus_lock);
  		if (intf->dev.driver)
  			driver = to_usb_driver(intf->dev.driver);
  		if (driver == NULL || driver->ioctl == NULL) {
-@@ -1381,7 +1381,7 @@ static int proc_ioctl(struct dev_state *
+@@ -1381,7 +1369,6 @@ static int proc_ioctl(struct dev_state *
  			if (retval == -ENOIOCTLCMD)
  				retval = -ENOTTY;
  		}
 -		up_read(&usb_bus_type.subsys.rwsem);
-+		mutex_unlock(&usb_bus_lock);
  	}
  
  	/* cleanup and return */
+--- a/drivers/usb/core/driver.c
++++ b/drivers/usb/core/driver.c
+@@ -287,9 +287,9 @@ static int usb_unbind_interface(struct d
+  * way to bind to an interface is to return the private data from
+  * the driver's probe() method.
+  *
+- * Callers must own the device lock and the driver model's usb_bus_type.subsys
+- * writelock.  So driver probe() entries don't need extra locking,
+- * but other call contexts may need to explicitly claim those locks.
++ * Callers must own the device lock, so driver probe() entries don't need
++ * extra locking, but other call contexts may need to explicitly claim that
++ * lock.
+  */
+ int usb_driver_claim_interface(struct usb_driver *driver,
+ 				struct usb_interface *iface, void* priv)
+@@ -330,9 +330,9 @@ EXPORT_SYMBOL(usb_driver_claim_interface
+  * also causes the driver disconnect() method to be called.
+  *
+  * This call is synchronous, and may not be used in an interrupt context.
+- * Callers must own the device lock and the driver model's usb_bus_type.subsys
+- * writelock.  So driver disconnect() entries don't need extra locking,
+- * but other call contexts may need to explicitly claim those locks.
++ * Callers must own the device lock, so driver disconnect() entries don't
++ * need extra locking, but other call contexts may need to explicitly claim
++ * that lock.
+  */
+ void usb_driver_release_interface(struct usb_driver *driver,
+ 					struct usb_interface *iface)
 --- a/drivers/usb/core/message.c
 +++ b/drivers/usb/core/message.c
 @@ -1349,7 +1349,7 @@ static void release_interface(struct dev
@@ -144,31 +160,3 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
   *
   * Returns zero on success, or else the status code returned by the
   * underlying call that failed.  On successful completion, each interface
---- a/drivers/usb/core/usb.c
-+++ b/drivers/usb/core/usb.c
-@@ -48,6 +48,7 @@
- const char *usbcore_name = "usbcore";
- 
- static int nousb;	/* Disable USB when built into kernel image */
-+struct mutex usb_bus_lock;
- 
- struct workqueue_struct *ksuspend_usb_wq;	/* For autosuspend */
- 
-@@ -887,6 +888,7 @@ static int __init usb_init(void)
- 		return 0;
- 	}
- 
-+	mutex_init(&usb_bus_lock);
- 	retval = ksuspend_usb_init();
- 	if (retval)
- 		goto out;
---- a/drivers/usb/core/usb.h
-+++ b/drivers/usb/core/usb.h
-@@ -83,6 +83,7 @@ static inline int usb_autoresume_device(
- extern struct workqueue_struct *ksuspend_usb_wq;
- extern struct bus_type usb_bus_type;
- extern struct usb_device_driver usb_generic_driver;
-+extern struct mutex usb_bus_lock;
- 
- /* Here's how we tell apart devices and interfaces.  Luckily there's
-  * no such thing as a platform USB device, so we can steal the use
