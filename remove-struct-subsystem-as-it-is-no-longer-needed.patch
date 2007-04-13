@@ -1,0 +1,1013 @@
+From foo@baz Tue Apr  9 12:12:43 2002
+Date: Fri, 13 Apr 2007 13:15:19 -0700
+To: Greg KH <greg@kroah.com>
+From: Greg Kroah-Hartman <gregkh@suse.de>
+Subject: remove "struct subsystem" as it is no longer needed
+
+First cut, doesn't even boot :(
+
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ block/genhd.c                          |   12 +++---
+ drivers/base/base.h                    |    2 +
+ drivers/base/bus.c                     |   14 +++----
+ drivers/base/class.c                   |   18 ++++------
+ drivers/base/core.c                    |   20 +++++------
+ drivers/base/firmware.c                |    4 +-
+ drivers/base/power/shutdown.c          |    4 --
+ drivers/base/sys.c                     |   17 +++++----
+ drivers/gregkh/gregkh.c                |    4 +-
+ drivers/input/evdev.c                  |    4 +-
+ drivers/input/mousedev.c               |    4 +-
+ drivers/pci/hotplug/pci_hotplug_core.c |    2 -
+ drivers/uio/uio.c                      |    2 -
+ fs/partitions/check.c                  |    6 +--
+ fs/sysfs/file.c                        |   11 ++----
+ include/acpi/acpi_bus.h                |    2 -
+ include/linux/device.h                 |    8 ++--
+ include/linux/fs.h                     |    2 -
+ include/linux/kobject.h                |   58 ++++++++++++++-------------------
+ include/linux/module.h                 |    2 -
+ include/linux/pci_hotplug.h            |    2 -
+ kernel/ksysfs.c                        |   12 +++---
+ kernel/module.c                        |   14 +++----
+ kernel/power/disk.c                    |   14 +++----
+ kernel/power/main.c                    |   10 ++---
+ kernel/power/power.h                   |    2 -
+ lib/kobject.c                          |   28 +++++++--------
+ 27 files changed, 134 insertions(+), 144 deletions(-)
+
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -17,7 +17,7 @@
+ #include <linux/buffer_head.h>
+ #include <linux/mutex.h>
+ 
+-struct subsystem block_subsys;
++struct kset block_subsys;
+ static DEFINE_MUTEX(block_subsys_lock);
+ 
+ /*
+@@ -221,7 +221,7 @@ static void *part_start(struct seq_file 
+ 	loff_t l = *pos;
+ 
+ 	mutex_lock(&block_subsys_lock);
+-	list_for_each(p, &block_subsys.kset.list)
++	list_for_each(p, &block_subsys.list)
+ 		if (!l--)
+ 			return list_entry(p, struct gendisk, kobj.entry);
+ 	return NULL;
+@@ -231,7 +231,7 @@ static void *part_next(struct seq_file *
+ {
+ 	struct list_head *p = ((struct gendisk *)v)->kobj.entry.next;
+ 	++*pos;
+-	return p==&block_subsys.kset.list ? NULL : 
++	return p==&block_subsys.list ? NULL :
+ 		list_entry(p, struct gendisk, kobj.entry);
+ }
+ 
+@@ -246,7 +246,7 @@ static int show_partition(struct seq_fil
+ 	int n;
+ 	char buf[BDEVNAME_SIZE];
+ 
+-	if (&sgp->kobj.entry == block_subsys.kset.list.next)
++	if (&sgp->kobj.entry == block_subsys.list.next)
+ 		seq_puts(part, "major minor  #blocks  name\n\n");
+ 
+ 	/* Don't show non-partitionable removeable devices or empty devices */
+@@ -565,7 +565,7 @@ static void *diskstats_start(struct seq_
+ 	struct list_head *p;
+ 
+ 	mutex_lock(&block_subsys_lock);
+-	list_for_each(p, &block_subsys.kset.list)
++	list_for_each(p, &block_subsys.list)
+ 		if (!k--)
+ 			return list_entry(p, struct gendisk, kobj.entry);
+ 	return NULL;
+@@ -575,7 +575,7 @@ static void *diskstats_next(struct seq_f
+ {
+ 	struct list_head *p = ((struct gendisk *)v)->kobj.entry.next;
+ 	++*pos;
+-	return p==&block_subsys.kset.list ? NULL :
++	return p==&block_subsys.list ? NULL :
+ 		list_entry(p, struct gendisk, kobj.entry);
+ }
+ 
+--- a/drivers/base/base.h
++++ b/drivers/base/base.h
+@@ -45,3 +45,5 @@ struct class_device_attribute *to_class_
+ extern char *make_class_name(const char *name, struct kobject *kobj);
+ 
+ extern void devres_release_all(struct device *dev);
++
++extern struct kset devices_subsys;
+--- a/drivers/base/bus.c
++++ b/drivers/base/bus.c
+@@ -17,7 +17,7 @@
+ #include "power/power.h"
+ 
+ #define to_bus_attr(_attr) container_of(_attr, struct bus_attribute, attr)
+-#define to_bus(obj) container_of(obj, struct bus_type, subsys.kset.kobj)
++#define to_bus(obj) container_of(obj, struct bus_type, subsys.kobj)
+ 
+ /*
+  * sysfs bindings for drivers
+@@ -123,7 +123,7 @@ int bus_create_file(struct bus_type * bu
+ {
+ 	int error;
+ 	if (get_bus(bus)) {
+-		error = sysfs_create_file(&bus->subsys.kset.kobj, &attr->attr);
++		error = sysfs_create_file(&bus->subsys.kobj, &attr->attr);
+ 		put_bus(bus);
+ 	} else
+ 		error = -EINVAL;
+@@ -133,7 +133,7 @@ int bus_create_file(struct bus_type * bu
+ void bus_remove_file(struct bus_type * bus, struct bus_attribute * attr)
+ {
+ 	if (get_bus(bus)) {
+-		sysfs_remove_file(&bus->subsys.kset.kobj, &attr->attr);
++		sysfs_remove_file(&bus->subsys.kobj, &attr->attr);
+ 		put_bus(bus);
+ 	}
+ }
+@@ -431,7 +431,7 @@ int bus_add_device(struct device * dev)
+ 		if (error)
+ 			goto out_id;
+ 		error = sysfs_create_link(&dev->kobj,
+-				&dev->bus->subsys.kset.kobj, "subsystem");
++				&dev->bus->subsys.kobj, "subsystem");
+ 		if (error)
+ 			goto out_subsys;
+ 		error = make_deprecated_bus_links(dev);
+@@ -808,7 +808,7 @@ int bus_register(struct bus_type * bus)
+ 
+ 	BLOCKING_INIT_NOTIFIER_HEAD(&bus->bus_notifier);
+ 
+-	retval = kobject_set_name(&bus->subsys.kset.kobj, "%s", bus->name);
++	retval = kobject_set_name(&bus->subsys.kobj, "%s", bus->name);
+ 	if (retval)
+ 		goto out;
+ 
+@@ -818,13 +818,13 @@ int bus_register(struct bus_type * bus)
+ 		goto out;
+ 
+ 	kobject_set_name(&bus->devices.kobj, "devices");
+-	bus->devices.subsys = &bus->subsys;
++//	bus->devices.subsys = &bus->subsys;
+ 	retval = kset_register(&bus->devices);
+ 	if (retval)
+ 		goto bus_devices_fail;
+ 
+ 	kobject_set_name(&bus->drivers.kobj, "drivers");
+-	bus->drivers.subsys = &bus->subsys;
++//	bus->drivers.subsys = &bus->subsys;
+ 	bus->drivers.ktype = &ktype_driver;
+ 	retval = kset_register(&bus->drivers);
+ 	if (retval)
+--- a/drivers/base/class.c
++++ b/drivers/base/class.c
+@@ -19,10 +19,8 @@
+ #include <linux/slab.h>
+ #include "base.h"
+ 
+-extern struct subsystem devices_subsys;
+-
+ #define to_class_attr(_attr) container_of(_attr, struct class_attribute, attr)
+-#define to_class(obj) container_of(obj, struct class, subsys.kset.kobj)
++#define to_class(obj) container_of(obj, struct class, subsys.kobj)
+ 
+ static ssize_t
+ class_attr_show(struct kobject * kobj, struct attribute * attr, char * buf)
+@@ -80,7 +78,7 @@ int class_create_file(struct class * cls
+ {
+ 	int error;
+ 	if (cls) {
+-		error = sysfs_create_file(&cls->subsys.kset.kobj, &attr->attr);
++		error = sysfs_create_file(&cls->subsys.kobj, &attr->attr);
+ 	} else
+ 		error = -EINVAL;
+ 	return error;
+@@ -89,7 +87,7 @@ int class_create_file(struct class * cls
+ void class_remove_file(struct class * cls, const struct class_attribute * attr)
+ {
+ 	if (cls)
+-		sysfs_remove_file(&cls->subsys.kset.kobj, &attr->attr);
++		sysfs_remove_file(&cls->subsys.kobj, &attr->attr);
+ }
+ 
+ static struct class *class_get(struct class *cls)
+@@ -147,7 +145,7 @@ int class_register(struct class * cls)
+ 	INIT_LIST_HEAD(&cls->interfaces);
+ 	kset_init(&cls->class_dirs);
+ 	init_MUTEX(&cls->sem);
+-	error = kobject_set_name(&cls->subsys.kset.kobj, "%s", cls->name);
++	error = kobject_set_name(&cls->subsys.kobj, "%s", cls->name);
+ 	if (error)
+ 		return error;
+ 
+@@ -611,7 +609,7 @@ int class_device_add(struct class_device
+ 	if (parent_class_dev)
+ 		class_dev->kobj.parent = &parent_class_dev->kobj;
+ 	else
+-		class_dev->kobj.parent = &parent_class->subsys.kset.kobj;
++		class_dev->kobj.parent = &parent_class->subsys.kobj;
+ 
+ 	error = kobject_add(&class_dev->kobj);
+ 	if (error)
+@@ -619,7 +617,7 @@ int class_device_add(struct class_device
+ 
+ 	/* add the needed attributes to this device */
+ 	error = sysfs_create_link(&class_dev->kobj,
+-				  &parent_class->subsys.kset.kobj, "subsystem");
++				  &parent_class->subsys.kobj, "subsystem");
+ 	if (error)
+ 		goto out3;
+ 	class_dev->uevent_attr.attr.name = "uevent";
+@@ -915,8 +913,8 @@ int __init classes_init(void)
+ 	/* ick, this is ugly, the things we go through to keep from showing up
+ 	 * in sysfs... */
+ 	subsystem_init(&class_obj_subsys);
+-	if (!class_obj_subsys.kset.subsys)
+-			class_obj_subsys.kset.subsys = &class_obj_subsys;
++//	if (!class_obj_subsys.kset.subsys)
++//			class_obj_subsys.kset.subsys = &class_obj_subsys;
+ 	return 0;
+ }
+ 
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@ -568,7 +568,7 @@ static struct kobject *virtual_device_pa
+ 	static struct kobject *virtual_dir = NULL;
+ 
+ 	if (!virtual_dir)
+-		virtual_dir = kobject_add_dir(&devices_subsys.kset.kobj, "virtual");
++		virtual_dir = kobject_add_dir(&devices_subsys.kobj, "virtual");
+ 
+ 	return virtual_dir;
+ }
+@@ -698,12 +698,12 @@ int device_add(struct device *dev)
+ 	}
+ 
+ 	if (dev->class) {
+-		sysfs_create_link(&dev->kobj, &dev->class->subsys.kset.kobj,
++		sysfs_create_link(&dev->kobj, &dev->class->subsys.kobj,
+ 				  "subsystem");
+ 		/* If this is not a "fake" compatible device, then create the
+ 		 * symlink from the class to the device. */
+-		if (dev->kobj.parent != &dev->class->subsys.kset.kobj)
+-			sysfs_create_link(&dev->class->subsys.kset.kobj,
++		if (dev->kobj.parent != &dev->class->subsys.kobj)
++			sysfs_create_link(&dev->class->subsys.kobj,
+ 					  &dev->kobj, dev->bus_id);
+ 		if (parent) {
+ 			sysfs_create_link(&dev->kobj, &dev->parent->kobj,
+@@ -761,8 +761,8 @@ int device_add(struct device *dev)
+ 		sysfs_remove_link(&dev->kobj, "subsystem");
+ 		/* If this is not a "fake" compatible device, remove the
+ 		 * symlink from the class to the device. */
+-		if (dev->kobj.parent != &dev->class->subsys.kset.kobj)
+-			sysfs_remove_link(&dev->class->subsys.kset.kobj,
++		if (dev->kobj.parent != &dev->class->subsys.kobj)
++			sysfs_remove_link(&dev->class->subsys.kobj,
+ 					  dev->bus_id);
+ 		if (parent) {
+ #ifdef CONFIG_SYSFS_DEPRECATED
+@@ -863,8 +863,8 @@ void device_del(struct device * dev)
+ 		sysfs_remove_link(&dev->kobj, "subsystem");
+ 		/* If this is not a "fake" compatible device, remove the
+ 		 * symlink from the class to the device. */
+-		if (dev->kobj.parent != &dev->class->subsys.kset.kobj)
+-			sysfs_remove_link(&dev->class->subsys.kset.kobj,
++		if (dev->kobj.parent != &dev->class->subsys.kobj)
++			sysfs_remove_link(&dev->class->subsys.kobj,
+ 					  dev->bus_id);
+ 		if (parent) {
+ #ifdef CONFIG_SYSFS_DEPRECATED
+@@ -1180,9 +1180,9 @@ int device_rename(struct device *dev, ch
+ #endif
+ 
+ 	if (dev->class) {
+-		sysfs_remove_link(&dev->class->subsys.kset.kobj,
++		sysfs_remove_link(&dev->class->subsys.kobj,
+ 				  old_symlink_name);
+-		sysfs_create_link(&dev->class->subsys.kset.kobj, &dev->kobj,
++		sysfs_create_link(&dev->class->subsys.kobj, &dev->kobj,
+ 				  dev->bus_id);
+ 	}
+ 	put_device(dev);
+--- a/drivers/base/firmware.c
++++ b/drivers/base/firmware.c
+@@ -17,13 +17,13 @@
+ 
+ static decl_subsys(firmware, NULL, NULL);
+ 
+-int firmware_register(struct subsystem * s)
++int firmware_register(struct kset *s)
+ {
+ 	kset_set_kset_s(s, firmware_subsys);
+ 	return subsystem_register(s);
+ }
+ 
+-void firmware_unregister(struct subsystem * s)
++void firmware_unregister(struct kset *s)
+ {
+ 	subsystem_unregister(s);
+ }
+--- a/drivers/base/power/shutdown.c
++++ b/drivers/base/power/shutdown.c
+@@ -16,8 +16,6 @@
+ 
+ #define to_dev(node) container_of(node, struct device, kobj.entry)
+ 
+-extern struct subsystem devices_subsys;
+-
+ 
+ /**
+  * We handle system devices differently - we suspend and shut them
+@@ -36,7 +34,7 @@ void device_shutdown(void)
+ {
+ 	struct device * dev, *devn;
+ 
+-	list_for_each_entry_safe_reverse(dev, devn, &devices_subsys.kset.list,
++	list_for_each_entry_safe_reverse(dev, devn, &devices_subsys.list,
+ 				kobj.entry) {
+ 		if (dev->bus && dev->bus->shutdown) {
+ 			dev_dbg(dev, "shutdown\n");
+--- a/drivers/base/sys.c
++++ b/drivers/base/sys.c
+@@ -25,7 +25,7 @@
+ 
+ #include "base.h"
+ 
+-extern struct subsystem devices_subsys;
++extern struct kset devices_subsys;
+ 
+ #define to_sysdev(k) container_of(k, struct sys_device, kobj)
+ #define to_sysdev_attr(a) container_of(a, struct sysdev_attribute, attr)
+@@ -138,8 +138,9 @@ int sysdev_class_register(struct sysdev_
+ 	pr_debug("Registering sysdev class '%s'\n",
+ 		 kobject_name(&cls->kset.kobj));
+ 	INIT_LIST_HEAD(&cls->drivers);
+-	cls->kset.subsys = &system_subsys;
+-	kset_set_kset_s(cls, system_subsys);
++//	cls->kset.subsys = &system_subsys;
++//	kset_set_kset_s(&cls.kset, system_subsys);
++	cls->kset.kobj.kset = &system_subsys;
+ 	return kset_register(&cls->kset);
+ }
+ 
+@@ -309,7 +310,7 @@ void sysdev_shutdown(void)
+ 	pr_debug("Shutting Down System Devices\n");
+ 
+ 	down(&sysdev_drivers_lock);
+-	list_for_each_entry_reverse(cls, &system_subsys.kset.list,
++	list_for_each_entry_reverse(cls, &system_subsys.list,
+ 				    kset.kobj.entry) {
+ 		struct sys_device * sysdev;
+ 
+@@ -384,7 +385,7 @@ int sysdev_suspend(pm_message_t state)
+ 
+ 	pr_debug("Suspending System Devices\n");
+ 
+-	list_for_each_entry_reverse(cls, &system_subsys.kset.list,
++	list_for_each_entry_reverse(cls, &system_subsys.list,
+ 				    kset.kobj.entry) {
+ 
+ 		pr_debug("Suspending type '%s':\n",
+@@ -457,7 +458,7 @@ gbl_driver:
+ 	}
+ 
+ 	/* resume other classes */
+-	list_for_each_entry_continue(cls, &system_subsys.kset.list,
++	list_for_each_entry_continue(cls, &system_subsys.list,
+ 					kset.kobj.entry) {
+ 		list_for_each_entry(err_dev, &cls->kset.list, kobj.entry) {
+ 			pr_debug(" %s\n", kobject_name(&err_dev->kobj));
+@@ -483,7 +484,7 @@ int sysdev_resume(void)
+ 
+ 	pr_debug("Resuming System Devices\n");
+ 
+-	list_for_each_entry(cls, &system_subsys.kset.list, kset.kobj.entry) {
++	list_for_each_entry(cls, &system_subsys.list, kset.kobj.entry) {
+ 		struct sys_device * sysdev;
+ 
+ 		pr_debug("Resuming type '%s':\n",
+@@ -501,7 +502,7 @@ int sysdev_resume(void)
+ 
+ int __init system_bus_init(void)
+ {
+-	system_subsys.kset.kobj.parent = &devices_subsys.kset.kobj;
++	system_subsys.kobj.parent = &devices_subsys.kobj;
+ 	return subsystem_register(&system_subsys);
+ }
+ 
+--- a/drivers/gregkh/gregkh.c
++++ b/drivers/gregkh/gregkh.c
+@@ -272,8 +272,8 @@ static int greg_init(void)
+ 
+ 	kobj_set_kset_s(g1, gregkh_subsys);
+ 	kobj_set_kset_s(g2, gregkh_subsys);
+-	g1->kobj.parent = &gregkh_subsys.kset.kobj;
+-	g2->kobj.parent = &gregkh_subsys.kset.kobj;
++	g1->kobj.parent = &gregkh_subsys.kobj;
++	g2->kobj.parent = &gregkh_subsys.kobj;
+ 
+ 	kobject_register(&g1->kobj);
+ 	kobject_register(&g2->kobj);
+--- a/drivers/input/evdev.c
++++ b/drivers/input/evdev.c
+@@ -650,7 +650,7 @@ static struct input_handle *evdev_connec
+ 			dev->cdev.dev, evdev->name);
+ 
+ 	/* temporary symlink to keep userspace happy */
+-	sysfs_create_link(&input_class.subsys.kset.kobj, &cdev->kobj,
++	sysfs_create_link(&input_class.subsys.kobj, &cdev->kobj,
+ 			  evdev->name);
+ 
+ 	return &evdev->handle;
+@@ -661,7 +661,7 @@ static void evdev_disconnect(struct inpu
+ 	struct evdev *evdev = handle->private;
+ 	struct evdev_list *list;
+ 
+-	sysfs_remove_link(&input_class.subsys.kset.kobj, evdev->name);
++	sysfs_remove_link(&input_class.subsys.kobj, evdev->name);
+ 	class_device_destroy(&input_class,
+ 			MKDEV(INPUT_MAJOR, EVDEV_MINOR_BASE + evdev->minor));
+ 	evdev->exist = 0;
+--- a/drivers/input/mousedev.c
++++ b/drivers/input/mousedev.c
+@@ -661,7 +661,7 @@ static struct input_handle *mousedev_con
+ 			dev->cdev.dev, mousedev->name);
+ 
+ 	/* temporary symlink to keep userspace happy */
+-	sysfs_create_link(&input_class.subsys.kset.kobj, &cdev->kobj,
++	sysfs_create_link(&input_class.subsys.kobj, &cdev->kobj,
+ 			  mousedev->name);
+ 
+ 	return &mousedev->handle;
+@@ -672,7 +672,7 @@ static void mousedev_disconnect(struct i
+ 	struct mousedev *mousedev = handle->private;
+ 	struct mousedev_list *list;
+ 
+-	sysfs_remove_link(&input_class.subsys.kset.kobj, mousedev->name);
++	sysfs_remove_link(&input_class.subsys.kobj, mousedev->name);
+ 	class_device_destroy(&input_class,
+ 			MKDEV(INPUT_MAJOR, MOUSEDEV_MINOR_BASE + mousedev->minor));
+ 	mousedev->exist = 0;
+--- a/drivers/pci/hotplug/pci_hotplug_core.c
++++ b/drivers/pci/hotplug/pci_hotplug_core.c
+@@ -62,7 +62,7 @@ static int debug;
+ 
+ static LIST_HEAD(pci_hotplug_slot_list);
+ 
+-struct subsystem pci_hotplug_slots_subsys;
++struct kset pci_hotplug_slots_subsys;
+ 
+ static ssize_t hotplug_slot_attr_show(struct kobject *kobj,
+ 		struct attribute *attr, char *buf)
+--- a/drivers/uio/uio.c
++++ b/drivers/uio/uio.c
+@@ -162,7 +162,7 @@ static int uio_dev_add_attributes(struct
+ 			kobject_set_name(&idev->map_attr_kset.kobj,"maps");
+ 			idev->map_attr_kset.ktype = &map_attr_type;
+ 			idev->map_attr_kset.kobj.parent = &idev->dev->kobj;
+-			idev->map_attr_kset.subsys = &uio_class->class->subsys;
++//			idev->map_attr_kset.subsys = &uio_class->class->subsys;
+ 			ret = kset_register(&idev->map_attr_kset);
+ 			if (ret)
+ 				goto err_remove_group;
+--- a/fs/partitions/check.c
++++ b/fs/partitions/check.c
+@@ -312,7 +312,7 @@ static struct attribute * default_attrs[
+ 	NULL,
+ };
+ 
+-extern struct subsystem block_subsys;
++extern struct kset block_subsys;
+ 
+ static void part_release(struct kobject *kobj)
+ {
+@@ -388,7 +388,7 @@ void add_partition(struct gendisk *disk,
+ 	kobject_add(&p->kobj);
+ 	if (!disk->part_uevent_suppress)
+ 		kobject_uevent(&p->kobj, KOBJ_ADD);
+-	sysfs_create_link(&p->kobj, &block_subsys.kset.kobj, "subsystem");
++	sysfs_create_link(&p->kobj, &block_subsys.kobj, "subsystem");
+ 	if (flags & ADDPART_FLAG_WHOLEDISK) {
+ 		static struct attribute addpartattr = {
+ 			.name = "whole_disk",
+@@ -443,7 +443,7 @@ static int disk_sysfs_symlinks(struct ge
+ 			goto err_out_dev_link;
+ 	}
+ 
+-	err = sysfs_create_link(&disk->kobj, &block_subsys.kset.kobj,
++	err = sysfs_create_link(&disk->kobj, &block_subsys.kobj,
+ 				"subsystem");
+ 	if (err)
+ 		goto err_out_disk_name_lnk;
+--- a/fs/sysfs/file.c
++++ b/fs/sysfs/file.c
+@@ -13,8 +13,7 @@
+ 
+ #include "sysfs.h"
+ 
+-#define to_subsys(k) container_of(k,struct subsystem,kset.kobj)
+-#define to_sattr(a) container_of(a,struct subsys_attribute,attr)
++#define to_sattr(a) container_of(a,struct subsys_attribute, attr)
+ 
+ /*
+  * Subsystem file operations.
+@@ -24,12 +23,12 @@
+ static ssize_t 
+ subsys_attr_show(struct kobject * kobj, struct attribute * attr, char * page)
+ {
+-	struct subsystem * s = to_subsys(kobj);
++	struct kset *kset = to_kset(kobj);
+ 	struct subsys_attribute * sattr = to_sattr(attr);
+ 	ssize_t ret = -EIO;
+ 
+ 	if (sattr->show)
+-		ret = sattr->show(s,page);
++		ret = sattr->show(kset, page);
+ 	return ret;
+ }
+ 
+@@ -37,12 +36,12 @@ static ssize_t 
+ subsys_attr_store(struct kobject * kobj, struct attribute * attr, 
+ 		  const char * page, size_t count)
+ {
+-	struct subsystem * s = to_subsys(kobj);
++	struct kset *kset = to_kset(kobj);
+ 	struct subsys_attribute * sattr = to_sattr(attr);
+ 	ssize_t ret = -EIO;
+ 
+ 	if (sattr->store)
+-		ret = sattr->store(s,page,count);
++		ret = sattr->store(kset, page, count);
+ 	return ret;
+ }
+ 
+--- a/include/acpi/acpi_bus.h
++++ b/include/acpi/acpi_bus.h
+@@ -316,7 +316,7 @@ struct acpi_bus_event {
+ 	u32 data;
+ };
+ 
+-extern struct subsystem acpi_subsys;
++extern struct kset acpi_subsys;
+ 
+ /*
+  * External Functions
+--- a/include/linux/device.h
++++ b/include/linux/device.h
+@@ -53,7 +53,7 @@ struct bus_type {
+ 	const char		* name;
+ 	struct module		* owner;
+ 
+-	struct subsystem	subsys;
++	struct kset		subsys;
+ 	struct kset		drivers;
+ 	struct kset		devices;
+ 	struct klist		klist_devices;
+@@ -178,7 +178,7 @@ struct class {
+ 	const char		* name;
+ 	struct module		* owner;
+ 
+-	struct subsystem	subsys;
++	struct kset		subsys;
+ 	struct list_head	children;
+ 	struct list_head	devices;
+ 	struct list_head	interfaces;
+@@ -554,8 +554,8 @@ extern void device_shutdown(void);
+ 
+ 
+ /* drivers/base/firmware.c */
+-extern int __must_check firmware_register(struct subsystem *);
+-extern void firmware_unregister(struct subsystem *);
++extern int __must_check firmware_register(struct kset *);
++extern void firmware_unregister(struct kset *);
+ 
+ /* debugging and troubleshooting/diagnostic helpers. */
+ extern const char *dev_driver_string(struct device *dev);
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -1411,7 +1411,7 @@ extern void mnt_set_mountpoint(struct vf
+ extern int vfs_statfs(struct dentry *, struct kstatfs *);
+ 
+ /* /sys/fs */
+-extern struct subsystem fs_subsys;
++extern struct kset fs_subsys;
+ 
+ #define FLOCK_VERIFY_READ  1
+ #define FLOCK_VERIFY_WRITE 2
+--- a/include/linux/kobject.h
++++ b/include/linux/kobject.h
+@@ -126,7 +126,6 @@ struct kset_uevent_ops {
+ };
+ 
+ struct kset {
+-	struct subsystem	* subsys;
+ 	struct kobj_type	* ktype;
+ 	struct list_head	list;
+ 	spinlock_t		list_lock;
+@@ -173,32 +172,23 @@ extern struct kobject * kset_find_obj(st
+ #define set_kset_name(str)	.kset = { .kobj = { .name = str } }
+ 
+ 
+-
+-struct subsystem {
+-	struct kset		kset;
+-};
+-
+ #define decl_subsys(_name,_type,_uevent_ops) \
+-struct subsystem _name##_subsys = { \
+-	.kset = { \
+-		.kobj = { .name = __stringify(_name) }, \
+-		.ktype = _type, \
+-		.uevent_ops =_uevent_ops, \
+-	} \
++struct kset _name##_subsys = { \
++	.kobj = { .name = __stringify(_name) }, \
++	.ktype = _type, \
++	.uevent_ops =_uevent_ops, \
+ }
+ #define decl_subsys_name(_varname,_name,_type,_uevent_ops) \
+-struct subsystem _varname##_subsys = { \
+-	.kset = { \
+-		.kobj = { .name = __stringify(_name) }, \
+-		.ktype = _type, \
+-		.uevent_ops =_uevent_ops, \
+-	} \
++struct kset _varname##_subsys = { \
++	.kobj = { .name = __stringify(_name) }, \
++	.ktype = _type, \
++	.uevent_ops =_uevent_ops, \
+ }
+ 
+ /* The global /sys/kernel/ subsystem for people to chain off of */
+-extern struct subsystem kernel_subsys;
++extern struct kset kernel_subsys;
+ /* The global /sys/hypervisor/ subsystem  */
+-extern struct subsystem hypervisor_subsys;
++extern struct kset hypervisor_subsys;
+ 
+ /**
+  * Helpers for setting the kset of registered objects.
+@@ -216,7 +206,7 @@ extern struct subsystem hypervisor_subsy
+  */
+ 
+ #define kobj_set_kset_s(obj,subsys) \
+-	(obj)->kobj.kset = &(subsys).kset
++	(obj)->kobj.kset = &(subsys)
+ 
+ /**
+  *	kset_set_kset_s(obj,subsys) - set kset for embedded kset.
+@@ -230,7 +220,7 @@ extern struct subsystem hypervisor_subsy
+  */
+ 
+ #define kset_set_kset_s(obj,subsys) \
+-	(obj)->kset.kobj.kset = &(subsys).kset
++	(obj)->kobj.kset = &(subsys)
+ 
+ /**
+  *	subsys_set_kset(obj,subsys) - set kset for subsystem
+@@ -243,29 +233,31 @@ extern struct subsystem hypervisor_subsy
+  */
+ 
+ #define subsys_set_kset(obj,_subsys) \
+-	(obj)->subsys.kset.kobj.kset = &(_subsys).kset
++	(obj)->subsys.kobj.kset = &(_subsys)
+ 
+-extern void subsystem_init(struct subsystem *);
+-extern int __must_check subsystem_register(struct subsystem *);
+-extern void subsystem_unregister(struct subsystem *);
++extern void subsystem_init(struct kset *);
++extern int __must_check subsystem_register(struct kset *);
++extern void subsystem_unregister(struct kset *);
+ 
+-static inline struct subsystem * subsys_get(struct subsystem * s)
++static inline struct kset *subsys_get(struct kset *s)
+ {
+-	return s ? container_of(kset_get(&s->kset),struct subsystem,kset) : NULL;
++	if (s)
++		return kset_get(s);
++	return NULL;
+ }
+ 
+-static inline void subsys_put(struct subsystem * s)
++static inline void subsys_put(struct kset *s)
+ {
+-	kset_put(&s->kset);
++	kset_put(s);
+ }
+ 
+ struct subsys_attribute {
+ 	struct attribute attr;
+-	ssize_t (*show)(struct subsystem *, char *);
+-	ssize_t (*store)(struct subsystem *, const char *, size_t); 
++	ssize_t (*show)(struct kset *, char *);
++	ssize_t (*store)(struct kset *, const char *, size_t);
+ };
+ 
+-extern int __must_check subsys_create_file(struct subsystem * ,
++extern int __must_check subsys_create_file(struct kset *,
+ 					struct subsys_attribute *);
+ 
+ #if defined(CONFIG_HOTPLUG)
+--- a/include/linux/module.h
++++ b/include/linux/module.h
+@@ -568,7 +568,7 @@ struct device_driver;
+ #ifdef CONFIG_SYSFS
+ struct module;
+ 
+-extern struct subsystem module_subsys;
++extern struct kset module_subsys;
+ 
+ int mod_sysfs_init(struct module *mod);
+ int mod_sysfs_setup(struct module *mod,
+--- a/include/linux/pci_hotplug.h
++++ b/include/linux/pci_hotplug.h
+@@ -174,7 +174,7 @@ extern int pci_hp_register		(struct hotp
+ extern int pci_hp_deregister		(struct hotplug_slot *slot);
+ extern int __must_check pci_hp_change_slot_info	(struct hotplug_slot *slot,
+ 						 struct hotplug_slot_info *info);
+-extern struct subsystem pci_hotplug_slots_subsys;
++extern struct kset pci_hotplug_slots_subsys;
+ 
+ /* PCI Setting Record (Type 0) */
+ struct hpp_type0 {
+--- a/kernel/ksysfs.c
++++ b/kernel/ksysfs.c
+@@ -24,18 +24,18 @@ static struct subsys_attribute _name##_a
+ 
+ #if defined(CONFIG_HOTPLUG) && defined(CONFIG_NET)
+ /* current uevent sequence number */
+-static ssize_t uevent_seqnum_show(struct subsystem *subsys, char *page)
++static ssize_t uevent_seqnum_show(struct kset *kset, char *page)
+ {
+ 	return sprintf(page, "%llu\n", (unsigned long long)uevent_seqnum);
+ }
+ KERNEL_ATTR_RO(uevent_seqnum);
+ 
+ /* uevent helper program, used during early boo */
+-static ssize_t uevent_helper_show(struct subsystem *subsys, char *page)
++static ssize_t uevent_helper_show(struct kset *kset, char *page)
+ {
+ 	return sprintf(page, "%s\n", uevent_helper);
+ }
+-static ssize_t uevent_helper_store(struct subsystem *subsys, const char *page, size_t count)
++static ssize_t uevent_helper_store(struct kset *kset, const char *page, size_t count)
+ {
+ 	if (count+1 > UEVENT_HELPER_PATH_LEN)
+ 		return -ENOENT;
+@@ -49,13 +49,13 @@ KERNEL_ATTR_RW(uevent_helper);
+ #endif
+ 
+ #ifdef CONFIG_KEXEC
+-static ssize_t kexec_loaded_show(struct subsystem *subsys, char *page)
++static ssize_t kexec_loaded_show(struct kset *kset, char *page)
+ {
+ 	return sprintf(page, "%d\n", !!kexec_image);
+ }
+ KERNEL_ATTR_RO(kexec_loaded);
+ 
+-static ssize_t kexec_crash_loaded_show(struct subsystem *subsys, char *page)
++static ssize_t kexec_crash_loaded_show(struct kset *kset, char *page)
+ {
+ 	return sprintf(page, "%d\n", !!kexec_crash_image);
+ }
+@@ -85,7 +85,7 @@ static int __init ksysfs_init(void)
+ {
+ 	int error = subsystem_register(&kernel_subsys);
+ 	if (!error)
+-		error = sysfs_create_group(&kernel_subsys.kset.kobj,
++		error = sysfs_create_group(&kernel_subsys.kobj,
+ 					   &kernel_attr_group);
+ 
+ 	return error;
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@ -1114,12 +1114,12 @@ int mod_sysfs_init(struct module *mod)
+ {
+ 	int err;
+ 
+-	if (!module_subsys.kset.subsys) {
+-		printk(KERN_ERR "%s: module_subsys not initialized\n",
+-		       mod->name);
+-		err = -EINVAL;
+-		goto out;
+-	}
++//	if (!module_subsys.kset.subsys) {
++//		printk(KERN_ERR "%s: module_subsys not initialized\n",
++//		       mod->name);
++//		err = -EINVAL;
++//		goto out;
++//	}
+ 	memset(&mod->mkobj.kobj, 0, sizeof(mod->mkobj.kobj));
+ 	err = kobject_set_name(&mod->mkobj.kobj, "%s", mod->name);
+ 	if (err)
+@@ -2380,7 +2380,7 @@ void module_add_driver(struct module *mo
+ 		struct kobject *mkobj;
+ 
+ 		/* Lookup built-in module entry in /sys/modules */
+-		mkobj = kset_find_obj(&module_subsys.kset, drv->mod_name);
++		mkobj = kset_find_obj(&module_subsys, drv->mod_name);
+ 		if (mkobj) {
+ 			mk = container_of(mkobj, struct module_kobject, kobj);
+ 			/* remember our module structure */
+--- a/kernel/power/disk.c
++++ b/kernel/power/disk.c
+@@ -313,13 +313,13 @@ static const char * const pm_disk_modes[
+  *	supports it (as determined from pm_ops->pm_disk_mode).
+  */
+ 
+-static ssize_t disk_show(struct subsystem * subsys, char * buf)
++static ssize_t disk_show(struct kset *kset, char *buf)
+ {
+ 	return sprintf(buf, "%s\n", pm_disk_modes[pm_disk_mode]);
+ }
+ 
+ 
+-static ssize_t disk_store(struct subsystem * s, const char * buf, size_t n)
++static ssize_t disk_store(struct kset *kset, const char *buf, size_t n)
+ {
+ 	int error = 0;
+ 	int i;
+@@ -360,13 +360,13 @@ static ssize_t disk_store(struct subsyst
+ 
+ power_attr(disk);
+ 
+-static ssize_t resume_show(struct subsystem * subsys, char *buf)
++static ssize_t resume_show(struct kset *kset, char *buf)
+ {
+ 	return sprintf(buf,"%d:%d\n", MAJOR(swsusp_resume_device),
+ 		       MINOR(swsusp_resume_device));
+ }
+ 
+-static ssize_t resume_store(struct subsystem *subsys, const char *buf, size_t n)
++static ssize_t resume_store(struct kset *kset, const char *buf, size_t n)
+ {
+ 	unsigned int maj, min;
+ 	dev_t res;
+@@ -392,12 +392,12 @@ static ssize_t resume_store(struct subsy
+ 
+ power_attr(resume);
+ 
+-static ssize_t image_size_show(struct subsystem * subsys, char *buf)
++static ssize_t image_size_show(struct kset *kset, char *buf)
+ {
+ 	return sprintf(buf, "%lu\n", image_size);
+ }
+ 
+-static ssize_t image_size_store(struct subsystem * subsys, const char * buf, size_t n)
++static ssize_t image_size_store(struct kset *kset, const char *buf, size_t n)
+ {
+ 	unsigned long size;
+ 
+@@ -426,7 +426,7 @@ static struct attribute_group attr_group
+ 
+ static int __init pm_disk_init(void)
+ {
+-	return sysfs_create_group(&power_subsys.kset.kobj,&attr_group);
++	return sysfs_create_group(&power_subsys.kobj, &attr_group);
+ }
+ 
+ core_initcall(pm_disk_init);
+--- a/kernel/power/main.c
++++ b/kernel/power/main.c
+@@ -256,7 +256,7 @@ decl_subsys(power,NULL,NULL);
+  *	proper enumerated value, and initiates a suspend transition.
+  */
+ 
+-static ssize_t state_show(struct subsystem * subsys, char * buf)
++static ssize_t state_show(struct kset *kset, char *buf)
+ {
+ 	int i;
+ 	char * s = buf;
+@@ -269,7 +269,7 @@ static ssize_t state_show(struct subsyst
+ 	return (s - buf);
+ }
+ 
+-static ssize_t state_store(struct subsystem * subsys, const char * buf, size_t n)
++static ssize_t state_store(struct kset *kset, const char *buf, size_t n)
+ {
+ 	suspend_state_t state = PM_SUSPEND_STANDBY;
+ 	const char * const *s;
+@@ -296,13 +296,13 @@ power_attr(state);
+ #ifdef CONFIG_PM_TRACE
+ int pm_trace_enabled;
+ 
+-static ssize_t pm_trace_show(struct subsystem * subsys, char * buf)
++static ssize_t pm_trace_show(struct kset *kset, char *buf)
+ {
+ 	return sprintf(buf, "%d\n", pm_trace_enabled);
+ }
+ 
+ static ssize_t
+-pm_trace_store(struct subsystem * subsys, const char * buf, size_t n)
++pm_trace_store(struct kset *kset, const char *buf, size_t n)
+ {
+ 	int val;
+ 
+@@ -336,7 +336,7 @@ static int __init pm_init(void)
+ {
+ 	int error = subsystem_register(&power_subsys);
+ 	if (!error)
+-		error = sysfs_create_group(&power_subsys.kset.kobj,&attr_group);
++		error = sysfs_create_group(&power_subsys.kobj,&attr_group);
+ 	return error;
+ }
+ 
+--- a/kernel/power/power.h
++++ b/kernel/power/power.h
+@@ -35,7 +35,7 @@ static struct subsys_attribute _name##_a
+ 	.store	= _name##_store,		\
+ }
+ 
+-extern struct subsystem power_subsys;
++extern struct kset power_subsys;
+ 
+ /* References to section boundaries */
+ extern const void __nosave_begin, __nosave_end;
+--- a/lib/kobject.c
++++ b/lib/kobject.c
+@@ -645,8 +645,8 @@ void kset_init(struct kset * k)
+ 
+ int kset_add(struct kset * k)
+ {
+-	if (!k->kobj.parent && !k->kobj.kset && k->subsys)
+-		k->kobj.parent = &k->subsys->kset.kobj;
++//	if (!k->kobj.parent && !k->kobj.kset && k->subsys)
++//		k->kobj.parent = &k->subsys->kset.kobj;
+ 
+ 	return kobject_add(&k->kobj);
+ }
+@@ -707,9 +707,9 @@ struct kobject * kset_find_obj(struct ks
+ }
+ 
+ 
+-void subsystem_init(struct subsystem * s)
++void subsystem_init(struct kset *s)
+ {
+-	kset_init(&s->kset);
++	kset_init(s);
+ }
+ 
+ /**
+@@ -720,7 +720,7 @@ void subsystem_init(struct subsystem * s
+  *	the kset points back to this subsystem.
+  */
+ 
+-int subsystem_register(struct subsystem * s)
++int subsystem_register(struct kset *s)
+ {
+ 	int error;
+ 
+@@ -728,21 +728,21 @@ int subsystem_register(struct subsystem 
+ 		return -EINVAL;
+ 
+ 	subsystem_init(s);
+-	pr_debug("subsystem %s: registering\n",s->kset.kobj.name);
++	pr_debug("subsystem %s: registering\n", kobject_name(&s->kobj));
+ 
+-	if (!(error = kset_add(&s->kset))) {
+-		if (!s->kset.subsys)
+-			s->kset.subsys = s;
++	if (!(error = kset_add(s))) {
++//		if (!s->kset.subsys)
++//			s->kset.subsys = s;
+ 	}
+ 	return error;
+ }
+ 
+-void subsystem_unregister(struct subsystem * s)
++void subsystem_unregister(struct kset *s)
+ {
+ 	if (!s)
+ 		return;
+-	pr_debug("subsystem %s: unregistering\n",s->kset.kobj.name);
+-	kset_unregister(&s->kset);
++	pr_debug("subsystem %s: unregistering\n", kobject_name(&s->kobj));
++	kset_unregister(s);
+ }
+ 
+ 
+@@ -752,7 +752,7 @@ void subsystem_unregister(struct subsyst
+  *	@a:	subsystem attribute descriptor.
+  */
+ 
+-int subsys_create_file(struct subsystem * s, struct subsys_attribute * a)
++int subsys_create_file(struct kset *s, struct subsys_attribute *a)
+ {
+ 	int error = 0;
+ 
+@@ -760,7 +760,7 @@ int subsys_create_file(struct subsystem 
+ 		return -EINVAL;
+ 
+ 	if (subsys_get(s)) {
+-		error = sysfs_create_file(&s->kset.kobj,&a->attr);
++		error = sysfs_create_file(&s->kobj, &a->attr);
+ 		subsys_put(s);
+ 	}
+ 	return error;
