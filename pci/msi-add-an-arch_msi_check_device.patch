@@ -1,0 +1,105 @@
+From michael@ozlabs.org Thu Apr  5 00:19:13 2007
+From: Michael Ellerman <michael@ellerman.id.au>
+Date: Thu, 05 Apr 2007 17:19:08 +1000
+Subject: [PATCH 2/9] MSI: Add an arch_msi_check_device()
+To: linux-pci@atrey.karlin.mff.cuni.cz
+Cc: Greg Kroah-Hartman <greg@kroah.com>, Eric W. Biederman <ebiederm@xmission.com>, Benjamin Herrenschmidt <benh@kernel.crashing.org>, David S. Miller <davem@davemloft.net>
+Message-ID: <20070405071909.4CCF5DDE44@ozlabs.org>
+
+
+Add an arch_check_device(), which gives archs a chance to check the input
+to pci_enable_msi/x. The arch might be interested in the value of nvec so
+pass it in. Propagate the error value returned from the arch routine out
+to the caller.
+
+Signed-off-by: Michael Ellerman <michael@ellerman.id.au>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/pci/msi.c   |   29 +++++++++++++++++++++++++----
+ include/linux/msi.h |    1 +
+ 2 files changed, 26 insertions(+), 4 deletions(-)
+
+--- a/drivers/pci/msi.c
++++ b/drivers/pci/msi.c
+@@ -459,15 +459,17 @@ static int msix_capability_init(struct p
+ /**
+  * pci_msi_check_device - check whether MSI may be enabled on a device
+  * @dev: pointer to the pci_dev data structure of MSI device function
++ * @nvec: how many MSIs have been requested ?
+  * @type: are we checking for MSI or MSI-X ?
+  *
+  * Look at global flags, the device itself, and its parent busses
+  * to determine if MSI/-X are supported for the device. If MSI/-X is
+  * supported return 0, else return an error code.
+  **/
+-static int pci_msi_check_device(struct pci_dev * dev, int type)
++static int pci_msi_check_device(struct pci_dev* dev, int nvec, int type)
+ {
+ 	struct pci_bus *bus;
++	int ret;
+ 
+ 	/* MSI must be globally enabled and supported by the device */
+ 	if (!pci_msi_enable || !dev || dev->no_msi)
+@@ -483,6 +485,10 @@ static int pci_msi_check_device(struct p
+ 		if (bus->bus_flags & PCI_BUS_FLAGS_NO_MSI)
+ 			return -EINVAL;
+ 
++	ret = arch_msi_check_device(dev, nvec, type);
++	if (ret)
++		return ret;
++
+ 	if (!pci_find_capability(dev, type))
+ 		return -EINVAL;
+ 
+@@ -503,8 +509,9 @@ int pci_enable_msi(struct pci_dev* dev)
+ {
+ 	int status;
+ 
+-	if (pci_msi_check_device(dev, PCI_CAP_ID_MSI))
+-		return -EINVAL;
++	status = pci_msi_check_device(dev, 1, PCI_CAP_ID_MSI);
++	if (status)
++		return status;
+ 
+ 	WARN_ON(!!dev->msi_enabled);
+ 
+@@ -601,9 +608,13 @@ int pci_enable_msix(struct pci_dev* dev,
+ 	int i, j;
+ 	u16 control;
+ 
+-	if (!entries || pci_msi_check_device(dev, PCI_CAP_ID_MSIX))
++	if (!entries)
+  		return -EINVAL;
+ 
++	status = pci_msi_check_device(dev, nvec, PCI_CAP_ID_MSIX);
++	if (status)
++		return status;
++
+ 	pos = pci_find_capability(dev, PCI_CAP_ID_MSIX);
+ 	pci_read_config_word(dev, msi_control_reg(pos), &control);
+ 	nr_entries = multi_msix_capable(control);
+@@ -687,3 +698,13 @@ void pci_no_msi(void)
+ {
+ 	pci_msi_enable = 0;
+ }
++
++
++/* Arch hooks */
++
++int __attribute__ ((weak))
++arch_msi_check_device(struct pci_dev* dev, int nvec, int type)
++{
++	return 0;
++}
++
+--- a/include/linux/msi.h
++++ b/include/linux/msi.h
+@@ -41,6 +41,7 @@ struct msi_desc {
+  */
+ int arch_setup_msi_irq(struct pci_dev *dev, struct msi_desc *desc);
+ void arch_teardown_msi_irq(unsigned int irq);
++extern int arch_msi_check_device(struct pci_dev* dev, int nvec, int type);
+ 
+ 
+ #endif /* LINUX_MSI_H */

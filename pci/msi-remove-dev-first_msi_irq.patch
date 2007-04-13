@@ -1,0 +1,123 @@
+From michael@ozlabs.org Thu Apr  5 00:19:21 2007
+From: Michael Ellerman <michael@ellerman.id.au>
+Date: Thu, 05 Apr 2007 17:19:12 +1000
+Subject: [PATCH 6/9] MSI: Remove dev->first_msi_irq
+To: linux-pci@atrey.karlin.mff.cuni.cz
+Cc: Greg Kroah-Hartman <greg@kroah.com>, Eric W. Biederman <ebiederm@xmission.com>, Benjamin Herrenschmidt <benh@kernel.crashing.org>, David S. Miller <davem@davemloft.net>
+Message-ID: <20070405071913.9C5B2DDE49@ozlabs.org>
+
+
+Now that we keep a list of msi descriptors, we don't need first_msi_irq
+in the pci dev.
+
+If we somehow have zero MSIs configured list_entry() will give us weird
+oopes or nice memory corruption bugs. So be paranoid. Add BUG_ONs and also
+a check in pci_msi_check_device() to make sure nvec > 0.
+
+Signed-off-by: Michael Ellerman <michael@ellerman.id.au>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/pci/msi.c   |   31 ++++++++++++++++++++-----------
+ include/linux/pci.h |    1 -
+ 2 files changed, 20 insertions(+), 12 deletions(-)
+
+--- a/drivers/pci/msi.c
++++ b/drivers/pci/msi.c
+@@ -269,7 +269,8 @@ static void __pci_restore_msix_state(str
+ 		msi_set_mask_bit(entry->irq, entry->msi_attrib.masked);
+ 	}
+ 
+-	entry = get_irq_msi(dev->first_msi_irq);
++	BUG_ON(list_empty(&dev->msi_list));
++	entry = list_entry(dev->msi_list.next, struct msi_desc, list);
+ 	pos = entry->msi_attrib.pos;
+ 	pci_read_config_word(dev, pos + PCI_MSIX_FLAGS, &control);
+ 	control &= ~PCI_MSIX_FLAGS_MASKALL;
+@@ -341,7 +342,6 @@ static int msi_capability_init(struct pc
+ 	}
+ 	entry->irq = irq;
+ 	list_add(&entry->list, &dev->msi_list);
+-	dev->first_msi_irq = irq;
+ 	set_irq_msi(irq, entry);
+ 
+ 	/* Set MSI enabled bits	 */
+@@ -433,7 +433,6 @@ static int msix_capability_init(struct p
+ 			avail = -EBUSY;
+ 		return avail;
+ 	}
+-	dev->first_msi_irq = entries[0].vector;
+ 	/* Set MSI-X enabled bits */
+ 	pci_intx(dev, 0);		/* disable intx */
+ 	msix_set_enable(dev, 1);
+@@ -461,6 +460,14 @@ static int pci_msi_check_device(struct p
+ 	if (!pci_msi_enable || !dev || dev->no_msi)
+ 		return -EINVAL;
+ 
++	/*
++	 * You can't ask to have 0 or less MSIs configured.
++	 *  a) it's stupid ..
++	 *  b) the list manipulation code assumes nvec >= 1.
++	 */
++	if (nvec < 1)
++		return -ERANGE;
++
+ 	/* Any bridge which does NOT route MSI transactions from it's
+ 	 * secondary bus to it's primary bus must set NO_MSI flag on
+ 	 * the secondary pci_bus.
+@@ -525,18 +532,17 @@ void pci_disable_msi(struct pci_dev* dev
+ 	pci_intx(dev, 1);		/* enable intx */
+ 	dev->msi_enabled = 0;
+ 
+-	entry = get_irq_msi(dev->first_msi_irq);
+-	if (!entry || !entry->dev || entry->msi_attrib.type != PCI_CAP_ID_MSI) {
++	BUG_ON(list_empty(&dev->msi_list));
++	entry = list_entry(dev->msi_list.next, struct msi_desc, list);
++	if (!entry->dev || entry->msi_attrib.type != PCI_CAP_ID_MSI) {
+ 		return;
+ 	}
+ 
+ 	default_irq = entry->msi_attrib.default_irq;
+-	msi_free_irq(dev, dev->first_msi_irq);
++	msi_free_irq(dev, entry->irq);
+ 
+ 	/* Restore dev->irq to its default pin-assertion irq */
+ 	dev->irq = default_irq;
+-
+-	dev->first_msi_irq = 0;
+ }
+ EXPORT_SYMBOL(pci_disable_msi);
+ 
+@@ -634,7 +640,6 @@ static void msix_free_all_irqs(struct pc
+ 
+ 	list_for_each_entry(entry, &dev->msi_list, list)
+ 		msi_free_irq(dev, entry->irq);
+-	dev->first_msi_irq = 0;
+ }
+ 
+ void pci_disable_msix(struct pci_dev* dev)
+@@ -664,8 +669,12 @@ void msi_remove_pci_irq_vectors(struct p
+ 	if (!pci_msi_enable || !dev)
+  		return;
+ 
+-	if (dev->msi_enabled)
+-		msi_free_irq(dev, dev->first_msi_irq);
++	if (dev->msi_enabled) {
++		struct msi_desc *entry;
++		BUG_ON(list_empty(&dev->msi_list));
++		entry = list_entry(dev->msi_list.next, struct msi_desc, list);
++		msi_free_irq(dev, entry->irq);
++	}
+ 
+ 	if (dev->msix_enabled)
+ 		msix_free_all_irqs(dev);
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@ -189,7 +189,6 @@ struct pci_dev {
+ 	int rom_attr_enabled;		/* has display of the rom attribute been enabled? */
+ 	struct bin_attribute *res_attr[DEVICE_COUNT_RESOURCE]; /* sysfs file for resources */
+ #ifdef CONFIG_PCI_MSI
+-	unsigned int first_msi_irq;
+ 	struct list_head msi_list;
+ #endif
+ };
