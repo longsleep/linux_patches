@@ -1,0 +1,228 @@
+From owner-linux-pci@atrey.karlin.mff.cuni.cz  Wed Apr 18 12:30:04 2007
+From: Michael Ellerman <michael@ellerman.id.au>
+Date: Wed, 18 Apr 2007 19:39:21 +1000
+Subject: MSI: arch must connect the irq and the msi_desc
+To: Greg Kroah-Hartman <greg@kroah.com>
+Cc: linux-pci@atrey.karlin.mff.cuni.cz
+Message-ID: <1176889161.50097.939227152395.qpush@cradle>
+
+
+From: Michael Ellerman <michael@ellerman.id.au>
+
+set_irq_msi() currently connects an irq_desc to an msi_desc. The archs call
+it at some point in their setup routine, and then the generic code sets up the
+reverse mapping from the msi_desc back to the irq.
+
+set_irq_msi() should do both connections, making it the one and only call
+required to connect an irq with it's MSI desc and vice versa.
+
+The arch code MUST call set_irq_msi(), and it must do so only once it's sure
+it's not going to fail the irq allocation.
+
+Given that there's no need for the arch to return the irq anymore, the return
+value from the arch setup routine just becomes 0 for success and anything else
+for failure.
+
+Signed-off-by: Michael Ellerman <michael@ellerman.id.au>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ arch/i386/kernel/io_apic.c      |    4 ++--
+ arch/ia64/sn/kernel/msi_sn.c    |    4 ++--
+ arch/sparc64/kernel/pci.c       |    4 ++--
+ arch/sparc64/kernel/pci_sun4v.c |    4 ++--
+ arch/x86_64/kernel/io_apic.c    |    4 ++--
+ drivers/pci/msi.c               |   23 +++++++++--------------
+ kernel/irq/chip.c               |    3 +++
+ 7 files changed, 22 insertions(+), 24 deletions(-)
+
+--- a/arch/i386/kernel/io_apic.c
++++ b/arch/i386/kernel/io_apic.c
+@@ -2611,19 +2611,19 @@ int arch_setup_msi_irq(struct pci_dev *d
+ 	if (irq < 0)
+ 		return irq;
+ 
+-	set_irq_msi(irq, desc);
+ 	ret = msi_compose_msg(dev, irq, &msg);
+ 	if (ret < 0) {
+ 		destroy_irq(irq);
+ 		return ret;
+ 	}
+ 
++	set_irq_msi(irq, desc);
+ 	write_msi_msg(irq, &msg);
+ 
+ 	set_irq_chip_and_handler_name(irq, &msi_chip, handle_edge_irq,
+ 				      "edge");
+ 
+-	return irq;
++	return 0;
+ }
+ 
+ void arch_teardown_msi_irq(unsigned int irq)
+--- a/arch/ia64/sn/kernel/msi_sn.c
++++ b/arch/ia64/sn/kernel/msi_sn.c
+@@ -87,7 +87,6 @@ int sn_setup_msi_irq(struct pci_dev *pde
+ 	if (irq < 0)
+ 		return irq;
+ 
+-	set_irq_msi(irq, entry);
+ 	/*
+ 	 * Set up the vector plumbing.  Let the prom (via sn_intr_alloc)
+ 	 * decide which cpu to direct this msi at by default.
+@@ -144,10 +143,11 @@ int sn_setup_msi_irq(struct pci_dev *pde
+ 	 */
+ 	msg.data = 0x100 + irq;
+ 
++	set_irq_msi(irq, entry);
+ 	write_msi_msg(irq, &msg);
+ 	set_irq_chip_and_handler(irq, &sn_msi_chip, handle_edge_irq);
+ 
+-	return irq;
++	return 0;
+ }
+ 
+ #ifdef CONFIG_SMP
+--- a/arch/sparc64/kernel/pci.c
++++ b/arch/sparc64/kernel/pci.c
+@@ -660,10 +660,10 @@ int arch_setup_msi_irq(struct pci_dev *p
+ 		return -EINVAL;
+ 
+ 	err = p->setup_msi_irq(&virt_irq, pdev, desc);
+-	if (err < 0)
++	if (err)
+ 		return err;
+ 
+-	return virt_irq;
++	return 0;
+ }
+ 
+ void arch_teardown_msi_irq(unsigned int virt_irq)
+--- a/arch/sparc64/kernel/pci_sun4v.c
++++ b/arch/sparc64/kernel/pci_sun4v.c
+@@ -1430,8 +1430,6 @@ static int pci_sun4v_setup_msi_irq(unsig
+ 	if (!devino)
+ 		goto out_err;
+ 
+-	set_irq_msi(*virt_irq_p, entry);
+-
+ 	msiqid = ((devino - pbm->msiq_first_devino) +
+ 		  pbm->msiq_first);
+ 
+@@ -1465,6 +1463,8 @@ static int pci_sun4v_setup_msi_irq(unsig
+ 		msg.address_lo = pbm->msi32_start;
+ 	}
+ 	msg.data = msi_num;
++
++	set_irq_msi(*virt_irq_p, entry);
+ 	write_msi_msg(*virt_irq_p, &msg);
+ 
+ 	irq_install_pre_handler(*virt_irq_p,
+--- a/arch/x86_64/kernel/io_apic.c
++++ b/arch/x86_64/kernel/io_apic.c
+@@ -1983,18 +1983,18 @@ int arch_setup_msi_irq(struct pci_dev *d
+ 	if (irq < 0)
+ 		return irq;
+ 
+-	set_irq_msi(irq, desc);
+ 	ret = msi_compose_msg(dev, irq, &msg);
+ 	if (ret < 0) {
+ 		destroy_irq(irq);
+ 		return ret;
+ 	}
+ 
++	set_irq_msi(irq, desc);
+ 	write_msi_msg(irq, &msg);
+ 
+ 	set_irq_chip_and_handler_name(irq, &msi_chip, handle_edge_irq, "edge");
+ 
+-	return irq;
++	return 0;
+ }
+ 
+ void arch_teardown_msi_irq(unsigned int irq)
+--- a/drivers/pci/msi.c
++++ b/drivers/pci/msi.c
+@@ -297,7 +297,7 @@ void pci_restore_msi_state(struct pci_de
+ static int msi_capability_init(struct pci_dev *dev)
+ {
+ 	struct msi_desc *entry;
+-	int pos, irq;
++	int pos, ret;
+ 	u16 control;
+ 
+ 	msi_set_enable(dev, 0);	/* Ensure msi is disabled as I set it up */
+@@ -335,21 +335,19 @@ static int msi_capability_init(struct pc
+ 			maskbits);
+ 	}
+ 	/* Configure MSI capability structure */
+-	irq = arch_setup_msi_irq(dev, entry);
+-	if (irq < 0) {
++	ret = arch_setup_msi_irq(dev, entry);
++	if (ret) {
+ 		kfree(entry);
+-		return irq;
++		return ret;
+ 	}
+-	entry->irq = irq;
+ 	list_add(&entry->list, &dev->msi_list);
+-	set_irq_msi(irq, entry);
+ 
+ 	/* Set MSI enabled bits	 */
+ 	pci_intx(dev, 0);		/* disable intx */
+ 	msi_set_enable(dev, 1);
+ 	dev->msi_enabled = 1;
+ 
+-	dev->irq = irq;
++	dev->irq = entry->irq;
+ 	return 0;
+ }
+ 
+@@ -367,7 +365,7 @@ static int msix_capability_init(struct p
+ 				struct msix_entry *entries, int nvec)
+ {
+ 	struct msi_desc *entry;
+-	int irq, pos, i, j, nr_entries;
++	int irq, pos, i, j, nr_entries, ret;
+ 	unsigned long phys_addr;
+ 	u32 table_offset;
+  	u16 control;
+@@ -407,16 +405,13 @@ static int msix_capability_init(struct p
+ 		entry->mask_base = base;
+ 
+ 		/* Configure MSI-X capability structure */
+-		irq = arch_setup_msi_irq(dev, entry);
+-		if (irq < 0) {
++		ret = arch_setup_msi_irq(dev, entry);
++		if (ret) {
+ 			kfree(entry);
+ 			break;
+ 		}
+-		entry->irq = irq;
+- 		entries[i].vector = irq;
++ 		entries[i].vector = entry->irq;
+ 		list_add(&entry->list, &dev->msi_list);
+-
+-		set_irq_msi(irq, entry);
+ 	}
+ 	if (i != nvec) {
+ 		int avail = i - 1;
+--- a/kernel/irq/chip.c
++++ b/kernel/irq/chip.c
+@@ -11,6 +11,7 @@
+  */
+ 
+ #include <linux/irq.h>
++#include <linux/msi.h>
+ #include <linux/module.h>
+ #include <linux/interrupt.h>
+ #include <linux/kernel_stat.h>
+@@ -185,6 +186,8 @@ int set_irq_msi(unsigned int irq, struct
+ 	desc = irq_desc + irq;
+ 	spin_lock_irqsave(&desc->lock, flags);
+ 	desc->msi_desc = entry;
++	if (entry)
++		entry->irq = irq;
+ 	spin_unlock_irqrestore(&desc->lock, flags);
+ 	return 0;
+ }

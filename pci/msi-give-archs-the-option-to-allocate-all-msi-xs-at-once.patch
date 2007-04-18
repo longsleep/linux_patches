@@ -1,0 +1,154 @@
+From michael@ozlabs.org  Wed Apr 18 12:30:39 2007
+From: Michael Ellerman <michael@ellerman.id.au>
+Date: Wed, 18 Apr 2007 19:39:21 +1000
+Subject: MSI: Give archs the option to allocate all MSI/Xs at once.
+To: Greg Kroah-Hartman <greg@kroah.com>
+Cc: linux-pci@atrey.karlin.mff.cuni.cz
+Message-ID: <20070418093945.58DB7DDE37@ozlabs.org>
+
+From: Michael Ellerman <michael@ellerman.id.au>
+
+This patch introduces an optional function, arch_setup_msi_irqs(),
+(note the plural) which gives an arch the opportunity to do per-device
+setup for MSI/X and then allocate all the requested MSI/Xs at once.
+
+If that's not required by the arch, the default version simply calls
+arch_setup_msi_irq() for each MSI irq required.
+
+arch_setup_msi_irqs() is passed a pdev, attached to the pdev is a list
+of msi_descs with irq == 0, it is up to the arch to connect these up to
+an irq (via set_irq_msi()) or return an error. For convenience the number
+of vectors and the type are passed also.
+
+All msi_descs with irq != 0 are considered allocated, and the arch
+teardown routine will be called on them when necessary.
+
+The existing semantics of pci_enable_msix() are that if the requested
+number of irqs can not be allocated, the maximum number that _could_ be
+allocated is returned. To support that, we define that in case of an
+error from arch_setup_msi_irqs(), the number of msi_descs with irq != 0
+are considered allocated, and are counted toward the "max that could be
+allocated".
+
+
+Signed-off-by: Michael Ellerman <michael@ellerman.id.au>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/pci/msi.c   |   63 ++++++++++++++++++++++++++++++++++++----------------
+ include/linux/msi.h |    1 
+ 2 files changed, 45 insertions(+), 19 deletions(-)
+
+--- a/drivers/pci/msi.c
++++ b/drivers/pci/msi.c
+@@ -334,13 +334,15 @@ static int msi_capability_init(struct pc
+ 			msi_mask_bits_reg(pos, is_64bit_address(control)),
+ 			maskbits);
+ 	}
++	list_add(&entry->list, &dev->msi_list);
++
+ 	/* Configure MSI capability structure */
+-	ret = arch_setup_msi_irq(dev, entry);
++	ret = arch_setup_msi_irqs(dev, 1, PCI_CAP_ID_MSI);
+ 	if (ret) {
++		list_del(&entry->list);
+ 		kfree(entry);
+ 		return ret;
+ 	}
+-	list_add(&entry->list, &dev->msi_list);
+ 
+ 	/* Set MSI enabled bits	 */
+ 	pci_intx(dev, 0);		/* disable intx */
+@@ -365,7 +367,7 @@ static int msix_capability_init(struct p
+ 				struct msix_entry *entries, int nvec)
+ {
+ 	struct msi_desc *entry;
+-	int irq, pos, i, j, nr_entries, ret;
++	int pos, i, j, nr_entries, ret;
+ 	unsigned long phys_addr;
+ 	u32 table_offset;
+  	u16 control;
+@@ -404,30 +406,33 @@ static int msix_capability_init(struct p
+ 		entry->dev = dev;
+ 		entry->mask_base = base;
+ 
+-		/* Configure MSI-X capability structure */
+-		ret = arch_setup_msi_irq(dev, entry);
+-		if (ret) {
+-			kfree(entry);
+-			break;
+-		}
+- 		entries[i].vector = entry->irq;
+ 		list_add(&entry->list, &dev->msi_list);
+ 	}
+-	if (i != nvec) {
+-		int avail = i - 1;
+-		i--;
+-		for (; i >= 0; i--) {
+-			irq = (entries + i)->vector;
+-			msi_free_irq(dev, irq);
+-			(entries + i)->vector = 0;
++
++	ret = arch_setup_msi_irqs(dev, nvec, PCI_CAP_ID_MSIX);
++	if (ret) {
++		int avail = 0;
++		list_for_each_entry(entry, &dev->msi_list, list) {
++			if (entry->irq != 0) {
++				avail++;
++				msi_free_irq(dev, entry->irq);
++			}
+ 		}
++
+ 		/* If we had some success report the number of irqs
+ 		 * we succeeded in setting up.
+ 		 */
+-		if (avail <= 0)
+-			avail = -EBUSY;
++		if (avail == 0)
++			avail = ret;
+ 		return avail;
+ 	}
++
++	i = 0;
++	list_for_each_entry(entry, &dev->msi_list, list) {
++		entries[i].vector = entry->irq;
++		set_irq_msi(entry->irq, entry);
++		i++;
++	}
+ 	/* Set MSI-X enabled bits */
+ 	pci_intx(dev, 0);		/* disable intx */
+ 	msix_set_enable(dev, 1);
+@@ -694,3 +699,23 @@ arch_msi_check_device(struct pci_dev* de
+ 	return 0;
+ }
+ 
++int __attribute__ ((weak))
++arch_setup_msi_irq(struct pci_dev *dev, struct msi_desc *entry)
++{
++	return 0;
++}
++
++int __attribute__ ((weak))
++arch_setup_msi_irqs(struct pci_dev *dev, int nvec, int type)
++{
++	struct msi_desc *entry;
++	int ret;
++
++	list_for_each_entry(entry, &dev->msi_list, list) {
++		ret = arch_setup_msi_irq(dev, entry);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
+--- a/include/linux/msi.h
++++ b/include/linux/msi.h
+@@ -41,6 +41,7 @@ struct msi_desc {
+  */
+ int arch_setup_msi_irq(struct pci_dev *dev, struct msi_desc *desc);
+ void arch_teardown_msi_irq(unsigned int irq);
++extern int arch_setup_msi_irqs(struct pci_dev *dev, int nvec, int type);
+ extern int arch_msi_check_device(struct pci_dev* dev, int nvec, int type);
+ 
+ 
