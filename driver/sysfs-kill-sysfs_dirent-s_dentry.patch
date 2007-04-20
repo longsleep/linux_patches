@@ -1,0 +1,87 @@
+From htejun@gmail.com  Fri Apr 20 11:02:05 2007
+From: Tejun Heo <htejun@gmail.com>
+Date: Sat, 21 Apr 2007 02:08:23 +0900
+Subject: [PATCH 4/4] sysfs: kill sysfs_dirent->s_dentry
+To: <gregkh@suse.de>, <maneesh@in.ibm.com>, <dmitry.torokhov@gmail.com>, <cornelia.huck@de.ibm.com>, <oneukum@suse.de>, <stern@rowland.harvard.edu>, htejun@gmail.com
+Cc: Tejun Heo <htejun@gmail.com>
+Message-ID: <11770889033975-git-send-email-htejun@gmail.com>
+
+
+sd->s_dentry is now unused, kill it.  This fixes the following race.
+
+   thread shrinking dcache		thread looking up sysfs entry
+  --------------------------------------------------------------------
+1. sysfs dentry for A is chosen as
+   victim.
+2. prune_one_dentry() drops the dentry
+   and calls dentry_iput().
+3. dentry_iput() unlinks d_alias and
+   releases spin locks.
+					4. looks up dentry for A which
+					   is not in dcache.
+					5. new dentry is created and
+					   sysfs_lookup() is invoked,
+					   which instantiates the dentry
+					   and set sd->s_dentry to it.
+6. sysfs_d_iput() is called.
+   BUG_ON(sd->s_dentry != dentry)
+   triggers and sd->s_dentry is
+   cleared.  You're screwed.
+
+Signed-off-by: Tejun Heo <htejun@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ fs/sysfs/dir.c   |    9 +--------
+ fs/sysfs/sysfs.h |    1 -
+ 2 files changed, 1 insertion(+), 9 deletions(-)
+
+--- a/fs/sysfs/dir.c
++++ b/fs/sysfs/dir.c
+@@ -50,11 +50,7 @@ static void sysfs_d_iput(struct dentry *
+ {
+ 	struct sysfs_dirent * sd = dentry->d_fsdata;
+ 
+-	if (sd) {
+-		BUG_ON(sd->s_dentry != dentry);
+-		sd->s_dentry = NULL;
+-		sysfs_put(sd);
+-	}
++	sysfs_put(sd);
+ 	iput(inode);
+ }
+ 
+@@ -96,7 +92,6 @@ void sysfs_attach_dirent(struct sysfs_di
+ 			 struct sysfs_dirent *parent_sd, struct dentry *dentry)
+ {
+ 	if (dentry) {
+-		sd->s_dentry = dentry;
+ 		dentry->d_fsdata = sysfs_get(sd);
+ 		dentry->d_op = &sysfs_dentry_ops;
+ 	}
+@@ -259,7 +254,6 @@ static int sysfs_attach_attr(struct sysf
+         }
+ 
+ 	dentry->d_fsdata = sysfs_get(sd);
+-	sd->s_dentry = dentry;
+ 	error = sysfs_create(dentry, (attr->mode & S_IALLUGO) | S_IFREG, init);
+ 	if (error) {
+ 		sysfs_put(sd);
+@@ -281,7 +275,6 @@ static int sysfs_attach_link(struct sysf
+ 	int err = 0;
+ 
+ 	dentry->d_fsdata = sysfs_get(sd);
+-	sd->s_dentry = dentry;
+ 	err = sysfs_create(dentry, S_IFLNK|S_IRWXUGO, init_symlink);
+ 	if (!err) {
+ 		dentry->d_op = &sysfs_dentry_ops;
+--- a/fs/sysfs/sysfs.h
++++ b/fs/sysfs/sysfs.h
+@@ -36,7 +36,6 @@ struct sysfs_dirent {
+ 
+ 	int			s_type;
+ 	umode_t			s_mode;
+-	struct dentry		* s_dentry;
+ 	struct iattr		* s_iattr;
+ 	atomic_t		s_event;
+ };
