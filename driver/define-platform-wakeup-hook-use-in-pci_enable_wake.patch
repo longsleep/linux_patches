@@ -1,0 +1,181 @@
+From akpm@linux-foundation.org Thu Apr 26 00:14:08 2007
+From: David Brownell <david-b@pacbell.net>
+Date: Thu, 26 Apr 2007 00:12:06 -0700
+Subject: define platform wakeup hook, use in pci_enable_wake()
+To: greg@kroah.com
+Cc: akpm@linux-foundation.org, david-b@pacbell.net, dbrownell@users.sourceforge.net, lenb@kernel.org, rui.zhang@intel.com
+Message-ID: <200704260712.l3Q7C6Ak023443@shell0.pdx.osdl.net>
+
+
+From: David Brownell <david-b@pacbell.net>
+
+This defines a platform hook to enable/disable a device as a wakeup event
+source.  It's initially for use with ACPI, but more generally it could be used
+whenever enable_irq_wake()/disable_irq_wake() don't suffice.
+
+The hook is called -- if available -- inside pci_enable_wake(); and the
+semantics of that call are enhanced so that support for PCI PME# is no longer
+needed.  It can now work for devices with "legacy PCI PM", when platform
+support allows it.  (That support would use some board-specific signal for for
+the same purpose as PME#.)
+
+[akpm@linux-foundation.org: Make it compile with CONFIG_PM=n]
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Zhang Rui <rui.zhang@intel.com>
+Cc: Len Brown <lenb@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/base/power/main.c |    3 ++
+ drivers/pci/pci.c         |   60 ++++++++++++++++++++++++++++++++--------------
+ include/linux/pm.h        |   19 ++++++++++++++
+ 3 files changed, 64 insertions(+), 18 deletions(-)
+
+--- a/drivers/base/power/main.c
++++ b/drivers/base/power/main.c
+@@ -29,6 +29,9 @@ LIST_HEAD(dpm_off_irq);
+ DECLARE_MUTEX(dpm_sem);
+ DECLARE_MUTEX(dpm_list_sem);
+ 
++int (*platform_enable_wakeup)(struct device *dev, int is_on);
++
++
+ /**
+  *	device_pm_set_parent - Specify power dependency.
+  *	@dev:		Device who needs power.
+--- a/drivers/pci/pci.c
++++ b/drivers/pci/pci.c
+@@ -13,6 +13,7 @@
+ #include <linux/delay.h>
+ #include <linux/init.h>
+ #include <linux/pci.h>
++#include <linux/pm.h>
+ #include <linux/module.h>
+ #include <linux/spinlock.h>
+ #include <linux/string.h>
+@@ -891,31 +892,48 @@ pci_disable_device(struct pci_dev *dev)
+ }
+ 
+ /**
+- * pci_enable_wake - enable device to generate PME# when suspended
+- * @dev: - PCI device to operate on
+- * @state: - Current state of device.
+- * @enable: - Flag to enable or disable generation
+- * 
+- * Set the bits in the device's PM Capabilities to generate PME# when
+- * the system is suspended. 
+- *
+- * -EIO is returned if device doesn't have PM Capabilities. 
+- * -EINVAL is returned if device supports it, but can't generate wake events.
+- * 0 if operation is successful.
+- * 
++ * pci_enable_wake - enable PCI device as wakeup event source
++ * @dev: PCI device affected
++ * @state: PCI state from which device will issue wakeup events
++ * @enable: True to enable event generation; false to disable
++ *
++ * This enables the device as a wakeup event source, or disables it.
++ * When such events involves platform-specific hooks, those hooks are
++ * called automatically by this routine.
++ *
++ * Devices with legacy power management (no standard PCI PM capabilities)
++ * always require such platform hooks.  Depending on the platform, devices
++ * supporting the standard PCI PME# signal may require such platform hooks;
++ * they always update bits in config space to allow PME# generation.
++ *
++ * -EIO is returned if the device can't ever be a wakeup event source.
++ * -EINVAL is returned if the device can't generate wakeup events from
++ * the specified PCI state.  Returns zero if the operation is successful.
+  */
+ int pci_enable_wake(struct pci_dev *dev, pci_power_t state, int enable)
+ {
+ 	int pm;
++	int status;
+ 	u16 value;
+ 
++	/* Note that drivers should verify device_may_wakeup(&dev->dev)
++	 * before calling this function.  Platform code should report
++	 * errors when drivers try to enable wakeup on devices that
++	 * can't issue wakeups, or on which wakeups were disabled by
++	 * userspace updating the /sys/devices.../power/wakeup file.
++	 */
++
++	status = call_platform_enable_wakeup(&dev->dev, enable);
++
+ 	/* find PCI PM capability in list */
+ 	pm = pci_find_capability(dev, PCI_CAP_ID_PM);
+ 
+-	/* If device doesn't support PM Capabilities, but request is to disable
+-	 * wake events, it's a nop; otherwise fail */
+-	if (!pm) 
+-		return enable ? -EIO : 0; 
++	/* If device doesn't support PM Capabilities, but caller wants to
++	 * disable wake events, it's a NOP.  Otherwise fail unless the
++	 * platform hooks handled this legacy device already.
++	 */
++	if (!pm)
++		return enable ? status : 0;
+ 
+ 	/* Check device's ability to generate PME# */
+ 	pci_read_config_word(dev,pm+PCI_PM_PMC,&value);
+@@ -924,8 +942,14 @@ int pci_enable_wake(struct pci_dev *dev,
+ 	value >>= ffs(PCI_PM_CAP_PME_MASK) - 1;   /* First bit of mask */
+ 
+ 	/* Check if it can generate PME# from requested state. */
+-	if (!value || !(value & (1 << state))) 
++	if (!value || !(value & (1 << state))) {
++		/* if it can't, revert what the platform hook changed,
++		 * always reporting the base "EINVAL, can't PME#" error
++		 */
++		if (enable)
++			call_platform_enable_wakeup(&dev->dev, 0);
+ 		return enable ? -EINVAL : 0;
++	}
+ 
+ 	pci_read_config_word(dev, pm + PCI_PM_CTRL, &value);
+ 
+@@ -936,7 +960,7 @@ int pci_enable_wake(struct pci_dev *dev,
+ 		value &= ~PCI_PM_CTRL_PME_ENABLE;
+ 
+ 	pci_write_config_word(dev, pm + PCI_PM_CTRL, value);
+-	
++
+ 	return 0;
+ }
+ 
+--- a/include/linux/pm.h
++++ b/include/linux/pm.h
+@@ -273,6 +273,20 @@ extern void __suspend_report_result(cons
+ 		__suspend_report_result(__FUNCTION__, fn, ret);		\
+ 	} while (0)
+ 
++/*
++ * Platform hook to activate device wakeup capability, if that's not already
++ * handled by enable_irq_wake() etc.
++ * Returns zero on success, else negative errno
++ */
++extern int (*platform_enable_wakeup)(struct device *dev, int is_on);
++
++static inline int call_platform_enable_wakeup(struct device *dev, int is_on)
++{
++	if (platform_enable_wakeup)
++		return (*platform_enable_wakeup)(dev, is_on);
++	return 0;
++}
++
+ #else /* !CONFIG_PM */
+ 
+ static inline int device_suspend(pm_message_t state)
+@@ -294,6 +308,11 @@ static inline void dpm_runtime_resume(st
+ 
+ #define suspend_report_result(fn, ret) do { } while (0)
+ 
++static inline int call_platform_enable_wakeup(struct device *dev, int is_on)
++{
++	return -EIO;
++}
++
+ #endif
+ 
+ /* changes to device_may_wakeup take effect on the next pm state change.

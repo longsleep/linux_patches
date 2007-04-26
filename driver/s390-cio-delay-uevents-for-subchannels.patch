@@ -1,0 +1,63 @@
+From akpm@linux-foundation.org Thu Apr 26 00:12:58 2007
+From: akpm@linux-foundation.org
+Date: Thu, 26 Apr 2007 00:12:03 -0700
+Subject: s390: cio: Delay uevents for subchannels
+To: greg@kroah.com
+Cc: akpm@linux-foundation.org, cornelia.huck@de.ibm.com, eric.rannaud@gmail.com, heiko.carstens@de.ibm.com, kay.sievers@vrfy.org
+Message-ID: <200704260712.l3Q7C3aZ023434@shell0.pdx.osdl.net>
+
+
+From: Cornelia Huck <cornelia.huck@de.ibm.com>
+
+We often have the situation that we register a subchannel and start device
+recognition, only to find out that the device is not usable after all, which
+triggers an unregister of the subchannel.  This often happens on hundreds of
+subchannels on a LPAR, leading to a storm of events which aren't of any use. 
+Therefore, use uevent_suppress to delay the KOBJ_ADD uevent for a subchannel
+until we know that its ccw_device is to be registered.
+
+Signed-off-by: Cornelia Huck <cornelia.huck@de.ibm.com>
+Cc: Kay Sievers <kay.sievers@vrfy.org>
+Cc: Eric Rannaud <eric.rannaud@gmail.com>
+Cc: Heiko Carstens <heiko.carstens@de.ibm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/s390/cio/css.c    |    9 +++++++++
+ drivers/s390/cio/device.c |    6 ++++++
+ 2 files changed, 15 insertions(+)
+
+--- a/drivers/s390/cio/css.c
++++ b/drivers/s390/cio/css.c
+@@ -135,6 +135,15 @@ css_register_subchannel(struct subchanne
+ 	sch->dev.bus = &css_bus_type;
+ 	sch->dev.release = &css_subchannel_release;
+ 	sch->dev.groups = subch_attr_groups;
++	/*
++	 * We don't want to generate uevents for I/O subchannels that don't
++	 * have a working ccw device behind them since they will be
++	 * unregistered before they can be used anyway, so we delay the add
++	 * uevent until after device recognition was successful.
++	 */
++	if (!cio_is_console(sch->schid))
++		/* Console is special, no need to suppress. */
++		sch->dev.uevent_suppress = 1;
+ 
+ 	css_get_ssd_info(sch);
+ 
+--- a/drivers/s390/cio/device.c
++++ b/drivers/s390/cio/device.c
+@@ -888,6 +888,12 @@ io_subchannel_register(struct work_struc
+ 		}
+ 		goto out;
+ 	}
++	/*
++	 * Now we know this subchannel will stay, we can throw
++	 * our delayed uevent.
++	 */
++	sch->dev.uevent_suppress = 0;
++	kobject_uevent(&sch->dev.kobj, KOBJ_ADD);
+ 	/* make it known to the system */
+ 	ret = ccw_device_register(cdev);
+ 	if (ret) {
