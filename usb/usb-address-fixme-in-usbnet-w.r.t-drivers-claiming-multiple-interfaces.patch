@@ -1,0 +1,81 @@
+From david-b@pacbell.net Mon Apr 30 01:37:56 2007
+From: Oliver Neukum <oneukum@suse.de>
+Date: Mon, 30 Apr 2007 01:37:44 -0700
+Subject: USB: address FIXME in usbnet w.r.t drivers claiming multiple interfaces
+To: Greg KH <greg@kroah.com>
+Cc: Oliver Neukum <oliver@suse.de>
+Message-ID: <200704300137.44952.david-b@pacbell.net>
+Content-Disposition: inline
+
+From: Oliver Neukum <oneukum@suse.de>
+
+This fixes the issue of drivers claiming multiple interfaces. Operations
+are stopped as soon as an interface is suspend and resumed only as
+all interfaces have been resumed.
+
+Signed-off-by: Oliver Neukum <oneukum@suse.de>
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/net/usbnet.c |   25 +++++++++++++++----------
+ drivers/usb/net/usbnet.h |    1 +
+ 2 files changed, 16 insertions(+), 10 deletions(-)
+
+--- a/drivers/usb/net/usbnet.c
++++ b/drivers/usb/net/usbnet.c
+@@ -1252,20 +1252,23 @@ EXPORT_SYMBOL_GPL(usbnet_probe);
+ 
+ /*-------------------------------------------------------------------------*/
+ 
+-/* FIXME these suspend/resume methods assume non-CDC style
+- * devices, with only one interface.
++/*
++ * suspend the whole driver as soon as the first interface is suspended
++ * resume only when the last interface is resumed
+  */
+ 
+ int usbnet_suspend (struct usb_interface *intf, pm_message_t message)
+ {
+ 	struct usbnet		*dev = usb_get_intfdata(intf);
+ 
+-	/* accelerate emptying of the rx and queues, to avoid
+-	 * having everything error out.
+-	 */
+-	netif_device_detach (dev->net);
+-	(void) unlink_urbs (dev, &dev->rxq);
+-	(void) unlink_urbs (dev, &dev->txq);
++	if (!dev->suspend_count++) {
++		/* accelerate emptying of the rx and queues, to avoid
++		 * having everything error out.
++		 */
++		netif_device_detach (dev->net);
++		(void) unlink_urbs (dev, &dev->rxq);
++		(void) unlink_urbs (dev, &dev->txq);
++	}
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(usbnet_suspend);
+@@ -1274,8 +1277,10 @@ int usbnet_resume (struct usb_interface 
+ {
+ 	struct usbnet		*dev = usb_get_intfdata(intf);
+ 
+-	netif_device_attach (dev->net);
+-	tasklet_schedule (&dev->bh);
++	if (!--dev->suspend_count) {
++		netif_device_attach (dev->net);
++		tasklet_schedule (&dev->bh);
++	}
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(usbnet_resume);
+--- a/drivers/usb/net/usbnet.h
++++ b/drivers/usb/net/usbnet.h
+@@ -32,6 +32,7 @@ struct usbnet {
+ 	const char		*driver_name;
+ 	wait_queue_head_t	*wait;
+ 	struct mutex		phy_mutex;
++	unsigned char		suspend_count;
+ 
+ 	/* i/o info: pipes etc */
+ 	unsigned		in, out;

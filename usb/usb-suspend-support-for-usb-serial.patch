@@ -1,0 +1,130 @@
+From oneukum@suse.de Fri Apr 27 12:09:40 2007
+From: Oliver Neukum <oneukum@suse.de>
+Date: Fri, 27 Apr 2007 20:54:57 +0200
+Subject: USB: suspend support for usb serial
+To: Greg KH <greg@kroah.com>, linux-usb-devel@lists.sourceforge.net
+Message-ID: <200704272054.57369.oneukum@suse.de>
+Content-Disposition: inline
+
+this implements generic support for suspend/resume for usb serial.
+
+Signed-off-by: Oliver Neukum <oneukum@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/serial/generic.c    |   18 ++++++++++++++++++
+ drivers/usb/serial/usb-serial.c |   31 +++++++++++++++++++++++++++++++
+ include/linux/usb/serial.h      |    7 +++++++
+ 3 files changed, 56 insertions(+)
+
+--- a/drivers/usb/serial/generic.c
++++ b/drivers/usb/serial/generic.c
+@@ -69,6 +69,7 @@ struct usb_serial_driver usb_serial_gene
+ 	.shutdown =		usb_serial_generic_shutdown,
+ 	.throttle =		usb_serial_generic_throttle,
+ 	.unthrottle =		usb_serial_generic_unthrottle,
++	.resume =		usb_serial_generic_resume,
+ };
+ 
+ static int generic_probe(struct usb_interface *interface,
+@@ -169,6 +170,23 @@ static void generic_cleanup (struct usb_
+ 	}
+ }
+ 
++int usb_serial_generic_resume(struct usb_serial *serial)
++{
++	struct usb_serial_port *port;
++	int i, c = 0, r;
++
++	for (i = 0; i < serial->num_ports; i++) {
++		port = serial->port[i];
++		if (port->open_count && port->read_urb) {
++			r = usb_submit_urb(port->read_urb, GFP_NOIO);
++			if (r < 0)
++				c++;
++		}
++	}
++
++	return c ? -EIO : 0;
++}
++
+ void usb_serial_generic_close (struct usb_serial_port *port, struct file * filp)
+ {
+ 	dbg("%s - port %d", __FUNCTION__, port->number);
+--- a/drivers/usb/serial/usb-serial.c
++++ b/drivers/usb/serial/usb-serial.c
+@@ -47,6 +47,8 @@ static struct usb_driver usb_serial_driv
+ 	.name =		"usbserial",
+ 	.probe =	usb_serial_probe,
+ 	.disconnect =	usb_serial_disconnect,
++	.suspend =	usb_serial_suspend,
++	.resume =	usb_serial_resume,
+ 	.no_dynamic_id = 	1,
+ };
+ 
+@@ -1070,6 +1072,35 @@ void usb_serial_disconnect(struct usb_in
+ 	dev_info(dev, "device disconnected\n");
+ }
+ 
++int usb_serial_suspend(struct usb_interface *intf, pm_message_t message)
++{
++	struct usb_serial *serial = usb_get_intfdata(intf);
++	struct usb_serial_port *port;
++	int i, r = 0;
++
++	if (serial) {
++		for (i = 0; i < serial->num_ports; ++i) {
++			port = serial->port[i];
++			if (port)
++				kill_traffic(port);
++		}
++	}
++
++	if (serial->type->suspend)
++		serial->type->suspend(serial, message);
++
++	return r;
++}
++EXPORT_SYMBOL(usb_serial_suspend);
++
++int usb_serial_resume(struct usb_interface *intf)
++{
++	struct usb_serial *serial = usb_get_intfdata(intf);
++
++	return serial->type->resume(serial);
++}
++EXPORT_SYMBOL(usb_serial_resume);
++
+ static const struct tty_operations serial_ops = {
+ 	.open =			serial_open,
+ 	.close =		serial_close,
+--- a/include/linux/usb/serial.h
++++ b/include/linux/usb/serial.h
+@@ -221,6 +221,9 @@ struct usb_serial_driver {
+ 	int (*port_probe) (struct usb_serial_port *port);
+ 	int (*port_remove) (struct usb_serial_port *port);
+ 
++	int (*suspend) (struct usb_serial *serial, pm_message_t message);
++	int (*resume) (struct usb_serial *serial);
++
+ 	/* serial function calls */
+ 	int  (*open)		(struct usb_serial_port *port, struct file * filp);
+ 	void (*close)		(struct usb_serial_port *port, struct file * filp);
+@@ -249,6 +252,9 @@ extern void usb_serial_port_softint(stru
+ extern int usb_serial_probe(struct usb_interface *iface, const struct usb_device_id *id);
+ extern void usb_serial_disconnect(struct usb_interface *iface);
+ 
++extern int usb_serial_suspend(struct usb_interface *intf, pm_message_t message);
++extern int usb_serial_resume(struct usb_interface *intf);
++
+ extern int ezusb_writememory (struct usb_serial *serial, int address, unsigned char *data, int length, __u8 bRequest);
+ extern int ezusb_set_reset (struct usb_serial *serial, unsigned char reset_bit);
+ 
+@@ -269,6 +275,7 @@ extern void usb_serial_put(struct usb_se
+ extern int usb_serial_generic_open (struct usb_serial_port *port, struct file *filp);
+ extern int usb_serial_generic_write (struct usb_serial_port *port, const unsigned char *buf, int count);
+ extern void usb_serial_generic_close (struct usb_serial_port *port, struct file *filp);
++extern int usb_serial_generic_resume (struct usb_serial *serial);
+ extern int usb_serial_generic_write_room (struct usb_serial_port *port);
+ extern int usb_serial_generic_chars_in_buffer (struct usb_serial_port *port);
+ extern void usb_serial_generic_read_bulk_callback (struct urb *urb);
