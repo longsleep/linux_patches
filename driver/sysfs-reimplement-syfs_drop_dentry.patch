@@ -1,0 +1,318 @@
+From htejun@gmail.com Sat Apr 28 06:40:08 2007
+From: Tejun Heo <htejun@gmail.com>
+Date: Sat, 28 Apr 2007 22:39:43 +0900
+Subject: [PATCH 21/21] sysfs: reimplement syfs_drop_dentry()
+To: gregkh@suse.de, dmitry.torokhov@gmail.com, cornelia.huck@de.ibm.com, oneukum@suse.de, rpurdie@rpsys.net, stern@rowland.harvard.edu, maneesh@in.ibm.com, akpm@linux-foundation.org, linux-kernel@vger.kernel.org, htejun@gmail.com
+Cc: Tejun Heo <htejun@gmail.com>
+Message-ID: <1177767582707-git-send-email-htejun@gmail.com>
+
+
+There are two races around sysfs_drop_dentry().
+
+### race 1
+
+   http://article.gmane.org/gmane.linux.kernel/516210
+
+   Unable to handle kernel NULL pointer dereference at 000000000000004c RIP:
+    [<ffffffff802935b4>] simple_unlink+0x14/0x5c
+   ...
+   Call Trace:
+    [<ffffffff802b31ee>] sysfs_hash_and_remove+0x7c/0xef
+    [<ffffffff803a0c1a>] device_del+0x66/0x20a
+    [<ffffffff804d2d7e>] netdev_run_todo+0xc6/0x225
+    [<ffffffff8800d025>] :dummy:dummy_free_one+0x1c/0x2d
+    [<ffffffff8800d0a2>] :dummy:dummy_cleanup_module+0xe/0x23
+    [<ffffffff8024ceed>] sys_delete_module+0x1b1/0x1e0
+    [<ffffffff803437e7>] __up_write+0x21/0x10e
+    [<ffffffff80209bbe>] system_call+0x7e/0x83
+
+   This is race between dcache shrinking triggered by umount and sysfs
+   deletion.  It seems to be introduced when dentries for attr and
+   symlink nodes are made unpinned.  sd->s_dentry clearing is done
+   without synchronization and sysfs_drop_entry() ends up deleting
+   already deleted dentry (dentry->inode is NULL).
+
+### race 2
+
+    thread shrinking dcache		thread looking up sysfs entry
+   --------------------------------------------------------------------
+ 1. sysfs dentry for A is chosen as
+    victim.
+ 2. prune_one_dentry() drops the dentry
+    and calls dentry_iput().
+ 3. dentry_iput() unlinks d_alias and
+    releases spin locks.
+					4. looks up dentry for A which
+					   is not in dcache.
+					5. new dentry is created and
+					   sysfs_lookup() is invoked,
+					   which instantiates the dentry
+					   and set sd->s_dentry to it.
+ 6. sysfs_d_iput() is called.
+    BUG_ON(sd->s_dentry != dentry)
+    triggers and sd->s_dentry is
+    cleared.  You're screwed.
+
+Both races are caused by sd->s_dentry going out of sync.  This patch
+introduces sysfs_lock and protect sd->s_dentry with it so that...
+
+* sd->s_dentry always points to the dentry which is looked up most
+  recently.  This is guaranteed even when dentry_iput() on the
+  previous dentry overlaps with the lookup of the latest dentry.
+
+* While sysfs_lock is held, the value contained in sd->s_dentry is
+  valid.  If null, no dentry is associated with the sd.  If not null,
+  the dentry is accessible and is or used to be associated with the
+  sd.  Whether the dentry is alive or not can be checked by locking
+  dcache_lock and checking whether the dentry is positive.
+
+This change allows syfs_drop_dentry() to reliably determine the
+associated dentry and drop it.  This patch also converts remove_dir()
+which used to use a separate drop mechanism to use the same drop path.
+With this change, making directories reclaimable is much easier.
+
+Signed-off-by: Tejun Heo <htejun@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ fs/sysfs/dir.c   |   39 +++++++++++++++---------
+ fs/sysfs/inode.c |   88 +++++++++++++++++++++++++++++++++++++++++++++----------
+ fs/sysfs/sysfs.h |    3 +
+ 3 files changed, 98 insertions(+), 32 deletions(-)
+
+--- a/fs/sysfs/dir.c
++++ b/fs/sysfs/dir.c
+@@ -14,6 +14,7 @@
+ #include "sysfs.h"
+ 
+ DECLARE_RWSEM(sysfs_rename_sem);
++spinlock_t sysfs_lock = SPIN_LOCK_UNLOCKED;
+ spinlock_t kobj_sysfs_assoc_lock = SPIN_LOCK_UNLOCKED;
+ 
+ static spinlock_t sysfs_ino_lock = SPIN_LOCK_UNLOCKED;
+@@ -83,8 +84,19 @@ static void sysfs_d_iput(struct dentry *
+ 	struct sysfs_dirent * sd = dentry->d_fsdata;
+ 
+ 	if (sd) {
+-		BUG_ON(sd->s_dentry != dentry);
+-		sd->s_dentry = NULL;
++		/* sd->s_dentry is protected with sysfs_lock.  This
++		 * allows sysfs_drop_dentry() to dereference it.
++		 */
++		spin_lock(&sysfs_lock);
++
++		/* The dentry might have been deleted or another
++		 * lookup could have happened updating sd->s_dentry to
++		 * point the new dentry.  Ignore if it isn't pointing
++		 * to this dentry.
++		 */
++		if (sd->s_dentry == dentry)
++			sd->s_dentry = NULL;
++		spin_unlock(&sysfs_lock);
+ 		sysfs_put(sd);
+ 	}
+ 	iput(inode);
+@@ -134,7 +146,12 @@ static void sysfs_attach_dentry(struct s
+ {
+ 	dentry->d_op = &sysfs_dentry_ops;
+ 	dentry->d_fsdata = sysfs_get(sd);
++
++	/* protect sd->s_dentry against sysfs_d_iput */
++	spin_lock(&sysfs_lock);
+ 	sd->s_dentry = dentry;
++	spin_unlock(&sysfs_lock);
++
+ 	d_rehash(dentry);
+ }
+ 
+@@ -355,22 +372,19 @@ const struct inode_operations sysfs_dir_
+ 
+ static void remove_dir(struct dentry * d)
+ {
+-	struct dentry * parent = dget(d->d_parent);
+-	struct sysfs_dirent * sd;
++	struct dentry *parent = d->d_parent;
++	struct sysfs_dirent *sd = d->d_fsdata;
+ 
+ 	mutex_lock(&parent->d_inode->i_mutex);
+-	d_delete(d);
+-	sd = d->d_fsdata;
++
+  	list_del_init(&sd->s_sibling);
+-	if (d->d_inode)
+-		simple_rmdir(parent->d_inode,d);
+ 
+ 	pr_debug(" o %s removing done (%d)\n",d->d_name.name,
+ 		 atomic_read(&d->d_count));
+ 
+ 	mutex_unlock(&parent->d_inode->i_mutex);
+-	dput(parent);
+ 
++	sysfs_drop_dentry(sd);
+ 	sysfs_deactivate(sd);
+ 	sysfs_put(sd);
+ }
+@@ -387,7 +401,6 @@ static void __sysfs_remove_dir(struct de
+ 	struct sysfs_dirent * parent_sd;
+ 	struct sysfs_dirent * sd, * tmp;
+ 
+-	dget(dentry);
+ 	if (!dentry)
+ 		return;
+ 
+@@ -398,21 +411,17 @@ static void __sysfs_remove_dir(struct de
+ 		if (!sd->s_type || !(sd->s_type & SYSFS_NOT_PINNED))
+ 			continue;
+ 		list_move(&sd->s_sibling, &removed);
+-		sysfs_drop_dentry(sd, dentry);
+ 	}
+ 	mutex_unlock(&dentry->d_inode->i_mutex);
+ 
+ 	list_for_each_entry_safe(sd, tmp, &removed, s_sibling) {
+ 		list_del_init(&sd->s_sibling);
++		sysfs_drop_dentry(sd);
+ 		sysfs_deactivate(sd);
+ 		sysfs_put(sd);
+ 	}
+ 
+ 	remove_dir(dentry);
+-	/**
+-	 * Drop reference from dget() on entrance.
+-	 */
+-	dput(dentry);
+ }
+ 
+ /**
+--- a/fs/sysfs/inode.c
++++ b/fs/sysfs/inode.c
+@@ -190,28 +190,83 @@ int sysfs_create(struct sysfs_dirent *sd
+ 	return error;
+ }
+ 
+-/*
+- * Unhashes the dentry corresponding to given sysfs_dirent
+- * Called with parent inode's i_mutex held.
++/**
++ *	sysfs_drop_dentry - drop dentry for the specified sysfs_dirent
++ *	@sd: target sysfs_dirent
++ *
++ *	Drop dentry for @sd.  @sd must have been unlinked from its
++ *	parent on entry to this function such that it can't be looked
++ *	up anymore.
++ *
++ *	@sd->s_dentry which is protected with sysfs_lock points to the
++ *	currently associated dentry but we're not holding a reference
++ *	to it and racing with dput().  Grab dcache_lock and verify
++ *	dentry before dropping it.  If @sd->s_dentry is NULL or dput()
++ *	beats us, no need to bother.
+  */
+-void sysfs_drop_dentry(struct sysfs_dirent * sd, struct dentry * parent)
++void sysfs_drop_dentry(struct sysfs_dirent *sd)
+ {
+-	struct dentry * dentry = sd->s_dentry;
++	struct dentry *dentry = NULL, *parent = NULL;
++	struct inode *dir;
++	struct timespec curtime;
++
++	/* We're not holding a reference to ->s_dentry dentry but the
++	 * field will stay valid as long as sysfs_lock is held.
++	 */
++	spin_lock(&sysfs_lock);
++	spin_lock(&dcache_lock);
++
++	if (sd->s_dentry && sd->s_dentry->d_inode) {
++		/* get dentry if it's there and dput() didn't kill it yet */
++		dentry = dget_locked(sd->s_dentry);
++		parent = dentry->d_parent;
++	} else if (sd->s_parent->s_dentry->d_inode) {
++		/* We need to update the parent even if dentry for the
++		 * victim itself doesn't exist.
++		 */
++		parent = dget_locked(sd->s_parent->s_dentry);
++	}
+ 
++	/* drop */
+ 	if (dentry) {
+-		spin_lock(&dcache_lock);
+ 		spin_lock(&dentry->d_lock);
+-		if (!(d_unhashed(dentry) && dentry->d_inode)) {
+-			dget_locked(dentry);
+-			__d_drop(dentry);
+-			spin_unlock(&dentry->d_lock);
+-			spin_unlock(&dcache_lock);
+-			simple_unlink(parent->d_inode, dentry);
+-		} else {
+-			spin_unlock(&dentry->d_lock);
+-			spin_unlock(&dcache_lock);
++		__d_drop(dentry);
++		spin_unlock(&dentry->d_lock);
++	}
++
++	spin_unlock(&dcache_lock);
++	spin_unlock(&sysfs_lock);
++
++	/* nothing to do if the parent isn't in dcache */
++	if (!parent)
++		return;
++
++	/* adjust nlink and update timestamp */
++	dir = parent->d_inode;
++	mutex_lock(&dir->i_mutex);
++
++	curtime = CURRENT_TIME;
++
++	dir->i_ctime = dir->i_mtime = curtime;
++
++	if (dentry) {
++		dentry->d_inode->i_ctime = curtime;
++		drop_nlink(dentry->d_inode);
++		if (sd->s_type & SYSFS_DIR) {
++			drop_nlink(dentry->d_inode);
++			drop_nlink(dir);
++			/* XXX: unpin if directory, this will go away soon */
++			dput(dentry);
+ 		}
+ 	}
++
++	mutex_unlock(&dir->i_mutex);
++
++	/* bye bye */
++	if (dentry)
++		dput(dentry);
++	else
++		dput(parent);
+ }
+ 
+ int sysfs_hash_and_remove(struct dentry * dir, const char * name)
+@@ -234,7 +289,6 @@ int sysfs_hash_and_remove(struct dentry 
+ 			continue;
+ 		if (!strcmp(sd->s_name, name)) {
+ 			list_del_init(&sd->s_sibling);
+-			sysfs_drop_dentry(sd, dir);
+ 			found = 1;
+ 			break;
+ 		}
+@@ -244,7 +298,9 @@ int sysfs_hash_and_remove(struct dentry 
+ 	if (!found)
+ 		return -ENOENT;
+ 
++	sysfs_drop_dentry(sd);
+ 	sysfs_deactivate(sd);
+ 	sysfs_put(sd);
++
+ 	return 0;
+ }
+--- a/fs/sysfs/sysfs.h
++++ b/fs/sysfs/sysfs.h
+@@ -76,9 +76,10 @@ extern struct sysfs_dirent *sysfs_find(s
+ extern int sysfs_create_subdir(struct kobject *, const char *, struct dentry **);
+ extern void sysfs_remove_subdir(struct dentry *);
+ 
+-extern void sysfs_drop_dentry(struct sysfs_dirent *sd, struct dentry *parent);
++extern void sysfs_drop_dentry(struct sysfs_dirent *sd);
+ extern int sysfs_setattr(struct dentry *dentry, struct iattr *iattr);
+ 
++extern spinlock_t sysfs_lock;
+ extern spinlock_t kobj_sysfs_assoc_lock;
+ extern struct rw_semaphore sysfs_rename_sem;
+ extern struct super_block * sysfs_sb;
