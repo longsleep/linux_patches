@@ -1,0 +1,172 @@
+From stern@rowland.harvard.edu  Tue May  8 08:09:21 2007
+Date: Fri, 4 May 2007 11:51:54 -0400 (EDT)
+From: Alan Stern <stern@rowland.harvard.edu>
+To: Greg KH <greg@kroah.com>
+Subject: [PATCH 03/16] USB: move bus_suspend and bus_resume method calls
+Message-ID: <Pine.LNX.4.44L0.0705041151270.4820-100000@iolanthe.rowland.org>
+
+This patch (as885) moves the root-hub bus_suspend() and bus_resume()
+method calls from the hub driver's suspend and resume methods into the
+usb_generic driver methods, where they make just as much sense.
+
+Their old locations were not fully correct.  For example, in a kernel
+compiled without CONFIG_USB_SUSPEND, if one were to do:
+
+	echo -n 1-0:1.0 >/sys/bus/usb/drivers/hub/unbind
+
+to unbind the hub driver from a root hub, there would then be no way
+to suspend that root hub.  Attempts to put the system to sleep would
+fail; the USB controller driver would refuse to suspend because the
+root hub was still active.
+
+The patch also makes a very slight change in the way devices with no
+driver are handled during suspend.  Rather than doing a standard USB
+port-suspend directly, now the suspend routine in usb_generic is
+called.  In practice this should never affect anyone.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/driver.c  |   11 +++++------
+ drivers/usb/core/generic.c |   39 +++++++++++++++++++++++++++++++++++++--
+ drivers/usb/core/hub.c     |   32 +-------------------------------
+ 3 files changed, 43 insertions(+), 39 deletions(-)
+
+--- a/drivers/usb/core/driver.c
++++ b/drivers/usb/core/driver.c
+@@ -802,14 +802,13 @@ static int usb_suspend_device(struct usb
+ 			udev->state == USB_STATE_SUSPENDED)
+ 		goto done;
+ 
+-	/* For devices that don't have a driver, we do a standard suspend. */
+-	if (udev->dev.driver == NULL) {
++	/* For devices that don't have a driver, we do a generic suspend. */
++	if (udev->dev.driver)
++		udriver = to_usb_device_driver(udev->dev.driver);
++	else {
+ 		udev->do_remote_wakeup = 0;
+-		status = usb_port_suspend(udev);
+-		goto done;
++		udriver = &usb_generic_driver;
+ 	}
+-
+-	udriver = to_usb_device_driver(udev->dev.driver);
+ 	status = udriver->suspend(udev, msg);
+ 
+ done:
+--- a/drivers/usb/core/generic.c
++++ b/drivers/usb/core/generic.c
+@@ -19,6 +19,7 @@
+ 
+ #include <linux/usb.h>
+ #include "usb.h"
++#include "hcd.h"
+ 
+ static inline const char *plural(int n)
+ {
+@@ -193,12 +194,46 @@ static void generic_disconnect(struct us
+ 
+ static int generic_suspend(struct usb_device *udev, pm_message_t msg)
+ {
+-	return usb_port_suspend(udev);
++	int rc;
++
++	rc = usb_port_suspend(udev);
++
++	/* Root hubs don't have upstream ports to suspend,
++	 * so the line above won't do much for them.  We have to
++	 * shut down their downstream HC-to-USB interfaces manually,
++	 * by doing a bus (or "global") suspend.
++	 */
++	if (rc == 0 && !udev->parent) {
++		rc = hcd_bus_suspend(udev->bus);
++		if (rc) {
++			dev_dbg(&udev->dev, "'global' suspend %d\n", rc);
++			usb_port_resume(udev);
++		}
++	}
++	return rc;
+ }
+ 
+ static int generic_resume(struct usb_device *udev)
+ {
+-	return usb_port_resume(udev);
++	int rc;
++
++	rc = usb_port_resume(udev);
++
++	/* Root hubs don't have upstream ports to resume or reset,
++	 * so the line above won't do much for them.  We have to
++	 * start up their downstream HC-to-USB interfaces manually,
++	 * by doing a bus (or "global") resume.
++	 */
++	if (rc == 0 && !udev->parent) {
++		rc = hcd_bus_resume(udev->bus);
++		if (rc)
++			dev_dbg(&udev->dev, "'global' resume %d\n", rc);
++		else {
++			/* TRSMRCY = 10 msec */
++			msleep(10);
++		}
++	}
++	return rc;
+ }
+ 
+ #endif	/* CONFIG_PM */
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -1904,7 +1904,6 @@ static int hub_suspend(struct usb_interf
+ 	struct usb_hub		*hub = usb_get_intfdata (intf);
+ 	struct usb_device	*hdev = hub->hdev;
+ 	unsigned		port1;
+-	int			status = 0;
+ 
+ 	/* fail if children aren't already suspended */
+ 	for (port1 = 1; port1 <= hdev->maxchild; port1++) {
+@@ -1930,44 +1929,15 @@ static int hub_suspend(struct usb_interf
+ 
+ 	/* stop khubd and related activity */
+ 	hub_quiesce(hub);
+-
+-	/* "global suspend" of the downstream HC-to-USB interface */
+-	if (!hdev->parent) {
+-		status = hcd_bus_suspend(hdev->bus);
+-		if (status != 0) {
+-			dev_dbg(&hdev->dev, "'global' suspend %d\n", status);
+-			hub_activate(hub);
+-		}
+-	}
+-	return status;
++	return 0;
+ }
+ 
+ static int hub_resume(struct usb_interface *intf)
+ {
+ 	struct usb_hub		*hub = usb_get_intfdata (intf);
+-	struct usb_device	*hdev = hub->hdev;
+-	int			status;
+ 
+ 	dev_dbg(&intf->dev, "%s\n", __FUNCTION__);
+ 
+-	/* "global resume" of the downstream HC-to-USB interface */
+-	if (!hdev->parent) {
+-		struct usb_bus	*bus = hdev->bus;
+-		if (bus) {
+-			status = hcd_bus_resume (bus);
+-			if (status) {
+-				dev_dbg(&intf->dev, "'global' resume %d\n",
+-					status);
+-				return status;
+-			}
+-		} else
+-			return -EOPNOTSUPP;
+-		if (status == 0) {
+-			/* TRSMRCY = 10 msec */
+-			msleep(10);
+-		}
+-	}
+-
+ 	/* tell khubd to look for changes on this hub */
+ 	hub_activate(hub);
+ 	return 0;
