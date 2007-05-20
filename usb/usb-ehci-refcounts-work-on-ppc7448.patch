@@ -1,0 +1,81 @@
+From david-b@pacbell.net Thu May 17 12:26:39 2007
+From: David Brownell <david-b@pacbell.net>
+To: Greg KH <greg@kroah.com>
+Subject: USB: ehci refcounts work on ppc7448
+Date: Thu, 17 May 2007 12:21:19 -0700
+Cc: sjhill1@rockwellcollins.com
+Content-Disposition: inline
+Message-Id: <200705171221.19834.david-b@pacbell.net>
+
+Remove atomic operations on the reference counter for EHCI queue heads.
+On various platforms (including ppc7448), atomic operations are unusable
+with dma-coherent memory.
+
+Signed-off-by: Steven J. Hill <sjhill1@rockwellcollins.com>
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ drivers/usb/host/ehci-mem.c |   11 ++++++-----
+ drivers/usb/host/ehci.h     |    9 ++++++++-
+ 2 files changed, 14 insertions(+), 6 deletions(-)
+
+--- a/drivers/usb/host/ehci-mem.c
++++ b/drivers/usb/host/ehci-mem.c
+@@ -64,9 +64,8 @@ static inline void ehci_qtd_free (struct
+ }
+ 
+ 
+-static void qh_destroy (struct kref *kref)
++static void qh_destroy(struct ehci_qh *qh)
+ {
+-	struct ehci_qh *qh = container_of(kref, struct ehci_qh, kref);
+ 	struct ehci_hcd *ehci = qh->ehci;
+ 
+ 	/* clean qtds first, and know this is not linked */
+@@ -90,7 +89,7 @@ static struct ehci_qh *ehci_qh_alloc (st
+ 		return qh;
+ 
+ 	memset (qh, 0, sizeof *qh);
+-	kref_init(&qh->kref);
++	qh->refcount = 1;
+ 	qh->ehci = ehci;
+ 	qh->qh_dma = dma;
+ 	// INIT_LIST_HEAD (&qh->qh_list);
+@@ -112,13 +111,15 @@ static struct ehci_qh *ehci_qh_alloc (st
+ /* to share a qh (cpu threads, or hc) */
+ static inline struct ehci_qh *qh_get (struct ehci_qh *qh)
+ {
+-	kref_get(&qh->kref);
++	WARN_ON(!qh->refcount);
++	qh->refcount++;
+ 	return qh;
+ }
+ 
+ static inline void qh_put (struct ehci_qh *qh)
+ {
+-	kref_put(&qh->kref, qh_destroy);
++	if (!(qh->refcount--))
++		qh_destroy(qh);
+ }
+ 
+ /*-------------------------------------------------------------------------*/
+--- a/drivers/usb/host/ehci.h
++++ b/drivers/usb/host/ehci.h
+@@ -457,7 +457,14 @@ struct ehci_qh {
+ 	struct ehci_qh		*reclaim;	/* next to reclaim */
+ 
+ 	struct ehci_hcd		*ehci;
+-	struct kref		kref;
++
++	/*
++	 * Do NOT use atomic operations for QH refcounting. On some CPUs
++	 * (PPC7448 for example), atomic operations cannot be performed on
++	 * memory that is cache-inhibited (i.e. being used for DMA).
++	 * Spinlocks are used to protect all QH fields.
++	 */
++	u32			refcount;
+ 	unsigned		stamp;
+ 
+ 	u8			qh_state;
