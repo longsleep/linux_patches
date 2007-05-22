@@ -1,0 +1,327 @@
+From stern@rowland.harvard.edu Fri May  4 08:52:44 2007
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Fri, 4 May 2007 11:52:40 -0400 (EDT)
+Subject: USB: EHCI, OHCI: handover changes
+To: Greg KH <greg@kroah.com>
+Message-ID: <Pine.LNX.4.44L0.0705041152200.4820-100000@iolanthe.rowland.org>
+
+
+This patch (as887) changes the way ehci-hcd and ohci-hcd handle a loss
+of VBUS power during suspend.  In order for the USB-persist facility
+to work correctly, it is necessary for low- and full-speed devices
+attached to a high-speed port to be handed back to the companion
+controller during resume processing.
+
+This entails three changes: adding code to ehci-hcd to perform the
+handover, removing code from ohci-hcd to turn off ports during
+root-hub reinit, and adding code to ohci-hcd to turn on ports during
+PCI controller resume.  (Other bus glue resume methods for platforms
+supporting high-speed controllers would need a similar change, if any
+existed.)
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/ehci-hcd.c |    2 
+ drivers/usb/host/ehci-hub.c |   99 +++++++++++++++++++++++++++++++++++++++++---
+ drivers/usb/host/ehci-pci.c |    7 +--
+ drivers/usb/host/ehci.h     |    3 +
+ drivers/usb/host/ohci-hcd.c |   21 ---------
+ drivers/usb/host/ohci-pci.c |   43 ++++++++++++++++++-
+ 6 files changed, 147 insertions(+), 28 deletions(-)
+
+--- a/drivers/usb/host/ehci-hcd.c
++++ b/drivers/usb/host/ehci-hcd.c
+@@ -399,6 +399,8 @@ static void ehci_port_power (struct ehci
+ 				is_on ? SetPortFeature : ClearPortFeature,
+ 				USB_PORT_FEAT_POWER,
+ 				port--, NULL, 0);
++	/* Flush those writes */
++	ehci_readl(ehci, &ehci->regs->command);
+ 	msleep(20);
+ }
+ 
+--- a/drivers/usb/host/ehci-hub.c
++++ b/drivers/usb/host/ehci-hub.c
+@@ -28,6 +28,87 @@
+ 
+ /*-------------------------------------------------------------------------*/
+ 
++#ifdef	CONFIG_USB_PERSIST
++
++static int ehci_hub_control(
++	struct usb_hcd	*hcd,
++	u16		typeReq,
++	u16		wValue,
++	u16		wIndex,
++	char		*buf,
++	u16		wLength
++);
++
++/* After a power loss, ports that were owned by the companion must be
++ * reset so that the companion can still own them.
++ */
++static void ehci_handover_companion_ports(struct ehci_hcd *ehci)
++{
++	u32 __iomem	*reg;
++	u32		status;
++	int		port;
++	__le32		buf;
++	struct usb_hcd	*hcd = ehci_to_hcd(ehci);
++
++	if (!ehci->owned_ports)
++		return;
++
++	/* Give the connections some time to appear */
++	msleep(20);
++
++	port = HCS_N_PORTS(ehci->hcs_params);
++	while (port--) {
++		if (test_bit(port, &ehci->owned_ports)) {
++			reg = &ehci->regs->port_status[port];
++			status = ehci_readl(ehci, reg);
++
++			/* Port already owned by companion? */
++			if (status & PORT_OWNER)
++				clear_bit(port, &ehci->owned_ports);
++			else
++				ehci_hub_control(hcd, SetPortFeature,
++						USB_PORT_FEAT_RESET, port + 1,
++						NULL, 0);
++		}
++	}
++
++	if (!ehci->owned_ports)
++		return;
++	msleep(90);		/* Wait for resets to complete */
++
++	port = HCS_N_PORTS(ehci->hcs_params);
++	while (port--) {
++		if (test_bit(port, &ehci->owned_ports)) {
++			ehci_hub_control(hcd, GetPortStatus,
++					0, port + 1,
++					(char *) &buf, sizeof(buf));
++
++			/* The companion should now own the port,
++			 * but if something went wrong the port must not
++			 * remain enabled.
++			 */
++			reg = &ehci->regs->port_status[port];
++			status = ehci_readl(ehci, reg) & ~PORT_RWC_BITS;
++			if (status & PORT_OWNER)
++				ehci_writel(ehci, status | PORT_CSC, reg);
++			else {
++				ehci_dbg(ehci, "failed handover port %d: %x\n",
++						port + 1, status);
++				ehci_writel(ehci, status & ~PORT_PE, reg);
++			}
++		}
++	}
++
++	ehci->owned_ports = 0;
++}
++
++#else	/* CONFIG_USB_PERSIST */
++
++static inline void ehci_handover_companion_ports(struct ehci_hcd *ehci)
++{ }
++
++#endif
++
+ #ifdef	CONFIG_PM
+ 
+ static int ehci_bus_suspend (struct usb_hcd *hcd)
+@@ -60,14 +141,16 @@ static int ehci_bus_suspend (struct usb_
+ 	 * then manually resume them in the bus_resume() routine.
+ 	 */
+ 	ehci->bus_suspended = 0;
++	ehci->owned_ports = 0;
+ 	while (port--) {
+ 		u32 __iomem	*reg = &ehci->regs->port_status [port];
+ 		u32		t1 = ehci_readl(ehci, reg) & ~PORT_RWC_BITS;
+ 		u32		t2 = t1;
+ 
+ 		/* keep track of which ports we suspend */
+-		if ((t1 & PORT_PE) && !(t1 & PORT_OWNER) &&
+-				!(t1 & PORT_SUSPEND)) {
++		if (t1 & PORT_OWNER)
++			set_bit(port, &ehci->owned_ports);
++		else if ((t1 & PORT_PE) && !(t1 & PORT_SUSPEND)) {
+ 			t2 |= PORT_SUSPEND;
+ 			set_bit(port, &ehci->bus_suspended);
+ 		}
+@@ -108,6 +191,7 @@ static int ehci_bus_resume (struct usb_h
+ {
+ 	struct ehci_hcd		*ehci = hcd_to_ehci (hcd);
+ 	u32			temp;
++	u32			power_okay;
+ 	int			i;
+ 
+ 	if (time_before (jiffies, ehci->next_statechange))
+@@ -120,8 +204,9 @@ static int ehci_bus_resume (struct usb_h
+ 	 * the last user of the controller, not reset/pm hardware keeping
+ 	 * state we gave to it.
+ 	 */
+-	temp = ehci_readl(ehci, &ehci->regs->intr_enable);
+-	ehci_dbg(ehci, "resume root hub%s\n", temp ? "" : " after power loss");
++	power_okay = ehci_readl(ehci, &ehci->regs->intr_enable);
++	ehci_dbg(ehci, "resume root hub%s\n",
++			power_okay ? "" : " after power loss");
+ 
+ 	/* at least some APM implementations will try to deliver
+ 	 * IRQs right away, so delay them until we're ready.
+@@ -184,6 +269,9 @@ static int ehci_bus_resume (struct usb_h
+ 	ehci_writel(ehci, INTR_MASK, &ehci->regs->intr_enable);
+ 
+ 	spin_unlock_irq (&ehci->lock);
++
++	if (!power_okay)
++		ehci_handover_companion_ports(ehci);
+ 	return 0;
+ }
+ 
+@@ -448,7 +536,8 @@ static int ehci_hub_control (
+ ) {
+ 	struct ehci_hcd	*ehci = hcd_to_ehci (hcd);
+ 	int		ports = HCS_N_PORTS (ehci->hcs_params);
+-	u32 __iomem	*status_reg = &ehci->regs->port_status[wIndex - 1];
++	u32 __iomem	*status_reg = &ehci->regs->port_status[
++				(wIndex & 0xff) - 1];
+ 	u32		temp, status;
+ 	unsigned long	flags;
+ 	int		retval = 0;
+--- a/drivers/usb/host/ehci-pci.c
++++ b/drivers/usb/host/ehci-pci.c
+@@ -313,13 +313,14 @@ static int ehci_pci_resume(struct usb_hc
+ 	ehci_work(ehci);
+ 	spin_unlock_irq(&ehci->lock);
+ 
+-	/* here we "know" root ports should always stay powered */
+-	ehci_port_power(ehci, 1);
+-
+ 	ehci_writel(ehci, ehci->command, &ehci->regs->command);
+ 	ehci_writel(ehci, FLAG_CF, &ehci->regs->configured_flag);
+ 	ehci_readl(ehci, &ehci->regs->command);	/* unblock posted writes */
+ 
++	/* here we "know" root ports should always stay powered */
++	ehci_port_power(ehci, 1);
++	ehci_handover_companion_ports(ehci);
++
+ 	hcd->state = HC_STATE_SUSPENDED;
+ 	return 0;
+ }
+--- a/drivers/usb/host/ehci.h
++++ b/drivers/usb/host/ehci.h
+@@ -96,11 +96,14 @@ struct ehci_hcd {			/* one per controlle
+ 
+ 	/* per root hub port */
+ 	unsigned long		reset_done [EHCI_MAX_ROOT_PORTS];
++
+ 	/* bit vectors (one bit per port) */
+ 	unsigned long		bus_suspended;		/* which ports were
+ 			already suspended at the start of a bus suspend */
+ 	unsigned long		companion_ports;	/* which ports are
+ 			dedicated to the companion controller */
++	unsigned long		owned_ports;		/* which ports are
++			owned by the companion during a bus suspend */
+ 
+ 	/* per-HC memory pools (could be per-bus, but ...) */
+ 	struct dma_pool		*qh_pool;	/* qh per active urb */
+--- a/drivers/usb/host/ohci-hcd.c
++++ b/drivers/usb/host/ohci-hcd.c
+@@ -510,15 +510,7 @@ static int ohci_run (struct ohci_hcd *oh
+ 	// flush the writes
+ 	(void) ohci_readl (ohci, &ohci->regs->control);
+ 	msleep(temp);
+-	temp = roothub_a (ohci);
+-	if (!(temp & RH_A_NPS)) {
+-		/* power down each port */
+-		for (temp = 0; temp < ohci->num_ports; temp++)
+-			ohci_writel (ohci, RH_PS_LSDA,
+-				&ohci->regs->roothub.portstatus [temp]);
+-	}
+-	// flush those writes
+-	(void) ohci_readl (ohci, &ohci->regs->control);
++
+ 	memset (ohci->hcca, 0, sizeof (struct ohci_hcca));
+ 
+ 	/* 2msec timelimit here means no irqs/preempt */
+@@ -826,17 +818,8 @@ static int ohci_restart (struct ohci_hcd
+ 	if ((temp = ohci_run (ohci)) < 0) {
+ 		ohci_err (ohci, "can't restart, %d\n", temp);
+ 		return temp;
+-	} else {
+-		/* here we "know" root ports should always stay powered,
+-		 * and that if we try to turn them back on the root hub
+-		 * will respond to CSC processing.
+-		 */
+-		i = ohci->num_ports;
+-		while (i--)
+-			ohci_writel (ohci, RH_PS_PSS,
+-				&ohci->regs->roothub.portstatus [i]);
+-		ohci_dbg (ohci, "restart complete\n");
+ 	}
++	ohci_dbg(ohci, "restart complete\n");
+ 	return 0;
+ }
+ #endif
+--- a/drivers/usb/host/ohci-pci.c
++++ b/drivers/usb/host/ohci-pci.c
+@@ -202,6 +202,42 @@ static int __devinit ohci_pci_start (str
+ 	return ret;
+ }
+ 
++#if	defined(CONFIG_USB_PERSIST) && (defined(CONFIG_USB_EHCI_HCD) || \
++		defined(CONFIG_USB_EHCI_HCD_MODULE))
++
++/* Following a power loss, we must prepare to regain control of the ports
++ * we used to own.  This means turning on the port power before ehci-hcd
++ * tries to switch ownership.
++ *
++ * This isn't a 100% perfect solution.  On most systems the OHCI controllers
++ * lie at lower PCI addresses than the EHCI controller, so they will be
++ * discovered (and hence resumed) first.  But there is no guarantee things
++ * will always work this way.  If the EHCI controller is resumed first and
++ * the OHCI ports are unpowered, then the handover will fail.
++ */
++static void prepare_for_handover(struct usb_hcd *hcd)
++{
++	struct ohci_hcd	*ohci = hcd_to_ohci(hcd);
++	int		port;
++
++	/* Here we "know" root ports should always stay powered */
++	ohci_dbg(ohci, "powerup ports\n");
++	for (port = 0; port < ohci->num_ports; port++)
++		ohci_writel(ohci, RH_PS_PPS,
++				&ohci->regs->roothub.portstatus[port]);
++
++	/* Flush those writes */
++	ohci_readl(ohci, &ohci->regs->control);
++	msleep(20);
++}
++
++#else
++
++static inline void prepare_for_handover(struct usb_hcd *hcd)
++{ }
++
++#endif	/* CONFIG_USB_PERSIST etc. */
++
+ #ifdef	CONFIG_PM
+ 
+ static int ohci_pci_suspend (struct usb_hcd *hcd, pm_message_t message)
+@@ -241,7 +277,12 @@ static int ohci_pci_suspend (struct usb_
+ static int ohci_pci_resume (struct usb_hcd *hcd)
+ {
+ 	set_bit(HCD_FLAG_HW_ACCESSIBLE, &hcd->flags);
+-	usb_hcd_resume_root_hub(hcd);
++
++	/* FIXME: we should try to detect loss of VBUS power here */
++	prepare_for_handover(hcd);
++
++	/* Force the PM core to resume the root hub */
++	hcd_to_bus(hcd)->root_hub->dev.power.prev_state.event = PM_EVENT_ON;
+ 	return 0;
+ }
+ 
