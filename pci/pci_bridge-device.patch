@@ -1,27 +1,58 @@
+From foo@baz Tue Apr  9 12:12:43 2002
+Date: Tue, 22 May 2007 22:47:54 -0400
+To: Greg KH <greg@kroah.com>
+From: Greg Kroah-Hartman <gregkh@suse.de>
+Subject: PCI: make pci_bus a struct device
+
+This moves the pci_bus class device to be a real struct device and at
+the same time, place it in the device tree in the correct location.
+
+Note, the old "bridge" symlink is now gone, but this was a non-standard
+link and no userspace program used it.  If you need to determine the
+device that the bus is on, follow the standard device symlink, or walk
+up the device tree.
+
+
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
 ---
- drivers/pci/bus.c    |   10 ++++-----
+ drivers/pci/bus.c    |   16 +++++++++---
  drivers/pci/pci.h    |    2 -
- drivers/pci/probe.c  |   54 +++++++++++++++++++++++++--------------------------
- drivers/pci/remove.c |    7 ++----
+ drivers/pci/probe.c  |   64 +++++++++++++++++++--------------------------------
+ drivers/pci/remove.c |    6 +---
  include/linux/pci.h  |    4 +--
- 5 files changed, 38 insertions(+), 39 deletions(-)
+ 5 files changed, 42 insertions(+), 50 deletions(-)
 
 --- a/drivers/pci/bus.c
 +++ b/drivers/pci/bus.c
-@@ -138,11 +138,11 @@ void pci_bus_add_devices(struct pci_bus 
+@@ -108,6 +108,7 @@ int pci_bus_add_device(struct pci_dev *d
+ void pci_bus_add_devices(struct pci_bus *bus)
+ {
+ 	struct pci_dev *dev;
++	struct pci_bus *child_bus;
+ 	int retval;
+ 
+ 	list_for_each_entry(dev, &bus->devices, bus_list) {
+@@ -138,11 +139,18 @@ void pci_bus_add_devices(struct pci_bus 
  			       up_write(&pci_bus_sem);
  			}
  			pci_bus_add_devices(dev->subordinate);
 -			retval = sysfs_create_link(&dev->subordinate->class_dev.kobj,
 -						   &dev->dev.kobj, "bridge");
--			if (retval)
++
++			/* register the bus with sysfs as the parent is now
++			 * properly registered. */
++			child_bus = dev->subordinate;
++			child_bus->dev.parent = child_bus->bridge;
++			retval = device_register(&child_bus->dev);
++			if (!retval)
++				retval = device_create_file(&child_bus->dev,
++							    &dev_attr_cpuaffinity);
+ 			if (retval)
 -				dev_err(&dev->dev, "Error creating sysfs "
 -					"bridge symlink, continuing...\n");
-+//			retval = sysfs_create_link(&dev->subordinate->class_dev.kobj,
-+//						   &dev->dev.kobj, "bridge");
-+//			if (retval)
-+//				dev_err(&dev->dev, "Error creating sysfs "
-+//					"bridge symlink, continuing...\n");
++				dev_err(&dev->dev, "Error registering pci_bus"
++					" device bridge symlink, continuing...\n");
  		}
  	}
  }
@@ -108,34 +139,50 @@
  };
  
  static int __init pcibus_class_init(void)
-@@ -396,13 +397,12 @@ pci_alloc_child_bus(struct pci_bus *pare
+@@ -380,7 +381,6 @@ pci_alloc_child_bus(struct pci_bus *pare
+ {
+ 	struct pci_bus *child;
+ 	int i;
+-	int retval;
+ 
+ 	/*
+ 	 * Allocate a new bus, and inherit stuff from the parent..
+@@ -396,15 +396,12 @@ pci_alloc_child_bus(struct pci_bus *pare
  	child->bus_flags = parent->bus_flags;
  	child->bridge = get_device(&bridge->dev);
  
 -	child->class_dev.class = &pcibus_class;
 -	sprintf(child->class_dev.class_id, "%04x:%02x", pci_domain_nr(child), busnr);
 -	retval = class_device_register(&child->class_dev);
-+	child->dev.class = &pcibus_class;
-+	sprintf(child->dev.bus_id, "%04x:%02x", pci_domain_nr(child), busnr);
-+	retval = device_register(&child->dev);
- 	if (retval)
- 		goto error_register;
+-	if (retval)
+-		goto error_register;
 -	retval = class_device_create_file(&child->class_dev,
 -					  &class_device_attr_cpuaffinity);
-+	retval = device_create_file(&child->dev, &dev_attr_cpuaffinity);
- 	if (retval)
- 		goto error_file_create;
+-	if (retval)
+-		goto error_file_create;
++	/* initialize some portions of the bus device, but don't register it
++	 * now as the parent is not properly set up yet.  This device will get
++	 * registered later in pci_bus_add_devices()
++	 */
++	child->dev.class = &pcibus_class;
++	sprintf(child->dev.bus_id, "%04x:%02x", pci_domain_nr(child), busnr);
  
-@@ -424,7 +424,7 @@ pci_alloc_child_bus(struct pci_bus *pare
+ 	/*
+ 	 * Set up the primary, secondary and subordinate
+@@ -422,12 +419,6 @@ pci_alloc_child_bus(struct pci_bus *pare
+ 	bridge->subordinate = child;
+ 
  	return child;
- 
- error_file_create:
+-
+-error_file_create:
 -	class_device_unregister(&child->class_dev);
-+	device_unregister(&child->dev);
- error_register:
- 	kfree(child);
- 	return NULL;
-@@ -1094,21 +1094,21 @@ struct pci_bus * pci_create_bus(struct d
+-error_register:
+-	kfree(child);
+-	return NULL;
+ }
+ 
+ struct pci_bus *pci_add_new_bus(struct pci_bus *parent, struct pci_dev *dev, int busnr)
+@@ -1094,32 +1085,27 @@ struct pci_bus * pci_create_bus(struct d
  		goto dev_reg_err;
  	b->bridge = get_device(dev);
  
@@ -143,6 +190,7 @@
 -	sprintf(b->class_dev.class_id, "%04x:%02x", pci_domain_nr(b), bus);
 -	error = class_device_register(&b->class_dev);
 +	b->dev.class = &pcibus_class;
++	b->dev.parent = b->bridge;
 +	sprintf(b->dev.bus_id, "%04x:%02x", pci_domain_nr(b), bus);
 +	error = device_register(&b->dev);
  	if (error)
@@ -159,20 +207,17 @@
 -	error = sysfs_create_link(&b->class_dev.kobj, &b->bridge->kobj, "bridge");
 -	if (error)
 -		goto sys_create_link_err;
-+//	error = sysfs_create_link(&b->dev.kobj, &b->bridge->kobj, "bridge");
-+//	if (error)
-+//		goto sys_create_link_err;
- 
+-
  	b->number = b->secondary = bus;
  	b->resource[0] = &ioport_resource;
-@@ -1117,9 +1117,9 @@ struct pci_bus * pci_create_bus(struct d
+ 	b->resource[1] = &iomem_resource;
+ 
  	return b;
  
- sys_create_link_err:
+-sys_create_link_err:
 -	class_device_remove_file(&b->class_dev, &class_device_attr_cpuaffinity);
 -class_dev_create_file_err:
 -	class_device_unregister(&b->class_dev);
-+	device_remove_file(&b->dev, &dev_attr_cpuaffinity);
 +dev_create_file_err:
 +	device_unregister(&b->dev);
  class_dev_reg_err:
@@ -180,7 +225,7 @@
  dev_reg_err:
 --- a/drivers/pci/remove.c
 +++ b/drivers/pci/remove.c
-@@ -74,10 +74,9 @@ void pci_remove_bus(struct pci_bus *pci_
+@@ -74,10 +74,8 @@ void pci_remove_bus(struct pci_bus *pci_
  	list_del(&pci_bus->node);
  	up_write(&pci_bus_sem);
  	pci_remove_legacy_files(pci_bus);
@@ -189,7 +234,6 @@
 -	sysfs_remove_link(&pci_bus->class_dev.kobj, "bridge");
 -	class_device_unregister(&pci_bus->class_dev);
 +	device_remove_file(&pci_bus->dev, &dev_attr_cpuaffinity);
-+//	sysfs_remove_link(&pci_bus->class_dev.kobj, "bridge");
 +	device_unregister(&pci_bus->dev);
  }
  EXPORT_SYMBOL(pci_remove_bus);
