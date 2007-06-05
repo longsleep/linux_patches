@@ -24,23 +24,23 @@ to the disks.
   |-- sda -> ../devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda
   `-- sr0 -> ../devices/pci0000:00/0000:00:1f.2/host1/target1:0:0/1:0:0:0/block/sr0
 
-Signed-off-by: Kay Sievers <kay.sievers@novell.com>
+Signed-off-by: Kay Sievers <kay.sievers@vrfy.org>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
  block/genhd.c              |  430 +++++++++++++++++++--------------------------
  block/ll_rw_blk.c          |    4 
- drivers/base/core.c        |   16 +
+ drivers/base/core.c        |   17 +
  drivers/block/aoe/aoeblk.c |   51 ++---
  drivers/block/nbd.c        |   15 -
  drivers/ide/ide-probe.c    |    2 
  drivers/md/dm.c            |    2 
  drivers/md/md.c            |    8 
  fs/block_dev.c             |    8 
- fs/partitions/check.c      |  304 +++++++++++--------------------
+ fs/partitions/check.c      |  308 +++++++++++---------------------
  include/linux/genhd.h      |   25 +-
  init/do_mounts.c           |  108 -----------
- 12 files changed, 369 insertions(+), 604 deletions(-)
+ 12 files changed, 373 insertions(+), 605 deletions(-)
 
 --- a/block/genhd.c
 +++ b/block/genhd.c
@@ -488,7 +488,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static DEVICE_ATTR(capability, S_IRUGO, disk_capability_show, NULL);
 +static DEVICE_ATTR(stat, S_IRUGO, disk_stat_show, NULL);
 +#ifdef CONFIG_FAIL_MAKE_REQUEST
-+static device_attribute dev_attr_fail =
++static struct device_attribute dev_attr_fail =
 +	__ATTR(make-it-fail, S_IRUGO|S_IWUSR, disk_fail_show, disk_fail_store);
 +#endif
 +
@@ -786,16 +786,17 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		return &dev->class->subsys.kobj;
  	else if (parent)
  		return &parent->kobj;
-@@ -705,7 +713,7 @@ int device_add(struct device *dev)
+@@ -705,7 +713,8 @@ int device_add(struct device *dev)
  		if (dev->kobj.parent != &dev->class->subsys.kobj)
  			sysfs_create_link(&dev->class->subsys.kobj,
  					  &dev->kobj, dev->bus_id);
 -		if (parent) {
++		/* only bus-device parents get a "device"-link */
 +		if (parent && parent->bus) {
  			sysfs_create_link(&dev->kobj, &dev->parent->kobj,
  							"device");
  #ifdef CONFIG_SYSFS_DEPRECATED
-@@ -762,7 +770,7 @@ int device_add(struct device *dev)
+@@ -762,7 +771,7 @@ int device_add(struct device *dev)
  		if (dev->kobj.parent != &dev->class->subsys.kobj)
  			sysfs_remove_link(&dev->class->subsys.kobj,
  					  dev->bus_id);
@@ -804,7 +805,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  #ifdef CONFIG_SYSFS_DEPRECATED
  			char *class_name = make_class_name(dev->class->name,
  							   &dev->kobj);
-@@ -861,7 +869,7 @@ void device_del(struct device * dev)
+@@ -861,7 +870,7 @@ void device_del(struct device * dev)
  		if (dev->kobj.parent != &dev->class->subsys.kobj)
  			sysfs_remove_link(&dev->class->subsys.kobj,
  					  dev->bus_id);
@@ -1162,11 +1163,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			      struct device_attribute *attr, char *buf)
 +{
 +	struct hd_struct *p = dev_to_part(dev);
-+
-+	return sprintf(buf, "%d\n", p->make_it_fail);
-+}
  
 -static ssize_t part_fail_store(struct hd_struct * p,
++	return sprintf(buf, "%d\n", p->make_it_fail);
++}
++
 +static ssize_t part_fail_store(struct device *dev,
 +			       struct device_attribute *attr,
  			       const char *buf, size_t count)
@@ -1194,8 +1195,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static DEVICE_ATTR(size, S_IRUGO, part_size_show, NULL);
 +static DEVICE_ATTR(stat, S_IRUGO, part_stat_show, NULL);
 +#ifdef CONFIG_FAIL_MAKE_REQUEST
-+static struct part_attribute dev_attr_fail =
-+	__ATTR(make-it-fail, S_IRUGO|S_IWUSR, part_fail_store, part_fail_read);
++static struct device_attribute dev_attr_fail =
++	__ATTR(make-it-fail, S_IRUGO|S_IWUSR, part_fail_show, part_fail_store);
  #endif
  
 -static struct attribute * default_attrs[] = {
@@ -1210,9 +1211,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	&dev_attr_stat.attr,
  #ifdef CONFIG_FAIL_MAKE_REQUEST
 -	&part_attr_fail.attr,
-+	&dev_attr_fail,
++	&dev_attr_fail.attr,
  #endif
- 	NULL,
+-	NULL,
++	NULL
  };
  
 -extern struct kset block_subsys;
@@ -1288,7 +1290,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  	p = kmalloc(sizeof(*p), GFP_KERNEL);
  	if (!p)
-@@ -382,90 +337,48 @@ void add_partition(struct gendisk *disk,
+@@ -382,92 +337,52 @@ void add_partition(struct gendisk *disk,
  	p->partno = part;
  	p->policy = disk->policy;
  
@@ -1333,14 +1335,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -	partition_sysfs_add_subdir(p);
 -	disk->part[part-1] = p;
 -}
--
+ 
 -static char *make_block_name(struct gendisk *disk)
 -{
 -	char *name;
 -	static char *block_str = "block:";
 -	int size;
 -	char *s;
- 
+-
 -	size = strlen(block_str) + strlen(disk->disk_name) + 1;
 -	name = kmalloc(size, GFP_KERNEL);
 -	if (!name)
@@ -1357,6 +1359,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		kobject_uevent(&p->dev.kobj, KOBJ_ADD);
  }
  
++#ifndef CONFIG_SYSFS_DEPRECATED
  static int disk_sysfs_symlinks(struct gendisk *disk)
  {
 -	struct device *target = get_device(disk->driverfs_dev);
@@ -1405,8 +1408,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -	}
  	return err;
  }
++#endif
  
-@@ -478,18 +391,27 @@ void register_disk(struct gendisk *disk)
+ /* Not exported, helper to add_disk(). */
+ void register_disk(struct gendisk *disk)
+@@ -478,18 +393,27 @@ void register_disk(struct gendisk *disk)
  	struct hd_struct *p;
  	int err;
  
@@ -1439,7 +1445,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
   	disk_sysfs_add_subdirs(disk);
  
  	/* No minors to use for partitions */
-@@ -504,25 +426,23 @@ void register_disk(struct gendisk *disk)
+@@ -504,25 +428,23 @@ void register_disk(struct gendisk *disk)
  	if (!bdev)
  		goto exit;
  
@@ -1469,7 +1475,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	}
  }
  
-@@ -601,19 +521,15 @@ void del_gendisk(struct gendisk *disk)
+@@ -601,19 +523,15 @@ void del_gendisk(struct gendisk *disk)
  	disk_stat_set_all(disk, 0);
  	disk->stamp = 0;
  
