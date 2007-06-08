@@ -1,0 +1,108 @@
+From zaitcev@redhat.com  Fri Jun  8 13:47:13 2007
+From: Pete Zaitcev <zaitcev@redhat.com>
+Date: Fri, 8 Jun 2007 13:37:49 -0700
+Subject: usb: free DMA mappings if enqueue fails
+To: greg@kroah.com
+Cc: linux-usb-devel@lists.sourceforge.net, zaitcev@redhat.com
+Message-ID: <20070608133749.b34c5f8f.zaitcev@redhat.com>
+
+
+This patch releases DMA resources if enqueue fails in the HCD.
+
+Linux had this bug ever since we converted from virt_to_bus for 2.4.
+It is difficult to hit. A user would need a significant memory pressure
+or some other unusual condition.
+
+It was reported to me by IBM. They ran a management application for
+RSA II adapters which sent Bulk requests to an Interrupt endpoint.
+Submissions got rejected by HCD due to an invalid interval value
+and the swiotlb pool became depleted in the matter of hours.
+
+We fixed the invalid interval issue in devio.c separately, but this
+seems to be a bug worth fixing as well.
+
+Signed-off-by: Pete Zaitcev <zaitcev@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/hcd.c |   47 ++++++++++++++++++++---------------------------
+ 1 file changed, 20 insertions(+), 27 deletions(-)
+
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -903,17 +903,32 @@ EXPORT_SYMBOL (usb_calc_bus_time);
+ 
+ /*-------------------------------------------------------------------------*/
+ 
+-static void urb_unlink (struct urb *urb)
++static void urb_unlink(struct usb_hcd *hcd, struct urb *urb)
+ {
+ 	unsigned long		flags;
++	int at_root_hub = (urb->dev == hcd->self.root_hub);
+ 
+ 	/* clear all state linking urb to this dev (and hcd) */
+-
+ 	spin_lock_irqsave (&hcd_data_lock, flags);
+ 	list_del_init (&urb->urb_list);
+ 	spin_unlock_irqrestore (&hcd_data_lock, flags);
+-}
+ 
++	if (hcd->self.uses_dma && !at_root_hub) {
++		if (usb_pipecontrol (urb->pipe)
++			&& !(urb->transfer_flags & URB_NO_SETUP_DMA_MAP))
++			dma_unmap_single (hcd->self.controller, urb->setup_dma,
++					sizeof (struct usb_ctrlrequest),
++					DMA_TO_DEVICE);
++		if (urb->transfer_buffer_length != 0
++			&& !(urb->transfer_flags & URB_NO_TRANSFER_DMA_MAP))
++			dma_unmap_single (hcd->self.controller,
++					urb->transfer_dma,
++					urb->transfer_buffer_length,
++					usb_pipein (urb->pipe)
++					    ? DMA_FROM_DEVICE
++					    : DMA_TO_DEVICE);
++	}
++}
+ 
+ /* may be called in any context with a valid urb->dev usecount
+  * caller surrenders "ownership" of urb
+@@ -1016,7 +1031,7 @@ doit:
+ 	status = hcd->driver->urb_enqueue (hcd, ep, urb, mem_flags);
+ done:
+ 	if (unlikely (status)) {
+-		urb_unlink (urb);
++		urb_unlink(hcd, urb);
+ 		atomic_dec (&urb->use_count);
+ 		if (urb->reject)
+ 			wake_up (&usb_kill_urb_queue);
+@@ -1400,29 +1415,7 @@ EXPORT_SYMBOL (usb_bus_start_enum);
+  */
+ void usb_hcd_giveback_urb (struct usb_hcd *hcd, struct urb *urb)
+ {
+-	int at_root_hub;
+-
+-	at_root_hub = (urb->dev == hcd->self.root_hub);
+-	urb_unlink (urb);
+-
+-	/* lower level hcd code should use *_dma exclusively if the
+-	 * host controller does DMA */
+-	if (hcd->self.uses_dma && !at_root_hub) {
+-		if (usb_pipecontrol (urb->pipe)
+-			&& !(urb->transfer_flags & URB_NO_SETUP_DMA_MAP))
+-			dma_unmap_single (hcd->self.controller, urb->setup_dma,
+-					sizeof (struct usb_ctrlrequest),
+-					DMA_TO_DEVICE);
+-		if (urb->transfer_buffer_length != 0
+-			&& !(urb->transfer_flags & URB_NO_TRANSFER_DMA_MAP))
+-			dma_unmap_single (hcd->self.controller, 
+-					urb->transfer_dma,
+-					urb->transfer_buffer_length,
+-					usb_pipein (urb->pipe)
+-					    ? DMA_FROM_DEVICE
+-					    : DMA_TO_DEVICE);
+-	}
+-
++	urb_unlink(hcd, urb);
+ 	usbmon_urb_complete (&hcd->self, urb);
+ 	usb_unanchor_urb(urb);
+ 
