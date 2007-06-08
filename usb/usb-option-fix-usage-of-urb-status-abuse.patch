@@ -1,0 +1,123 @@
+From akpm@linux-foundation.org Tue Jun  5 16:46:51 2007
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Tue, 05 Jun 2007 16:46:26 -0700
+Subject: USB: option: fix usage of urb->status abuse
+To: mm-commits@vger.kernel.org
+Cc: stern@rowland.harvard.edu, greg@kroah.com, pfmp.404@gmail.com
+Message-ID: <200706052346.l55NkQAH005348@imap1.linux-foundation.org>
+
+From: Alan Stern <stern@rowland.harvard.edu>
+
+Might fix bug 8561
+
+On Mon, 4 Jun 2007, Paulo Pereira wrote:
+
+> The patch that you send is not resolving the problem... :(
+> I stil have Kernel panic after 45/60 min of work with Ktorrent/Amule...
+>
+> The Drump is:
+>
+> Call Trace:
+> [<c055fb36>] usb_hcd_submit+0xb1/0x763
+> [<f9276488>] ipt_do_table+0x2c7/0x2ef [ip_tables]
+> [<f929a6d7>] nf_ct_deliver_cached_events+0x41/0x96 [nf_conntrak]
+> [<f9288254>] ipv4_confirm+0x36/0c3b [nf_conntrack_ipv4]
+> [<c05ce7c2>] tcp_v4_rcv+0x827/0x899
+> [<c05afcc0>] nf_hook_slow+0x4d/0xb5
+> [<c042826f>] irq_enter+0x19/0x23
+> [<c042826f>] irq_enter+0x19/0x23
+> [<c040794c>] do_IRQ+0xbd/0xd1
+> [<f90893c9>] option_write+0xa7/0xef [option]
+
+Okay, from this it looks like there's a problem in the option.c serial
+driver.  Glancing at the code, it's obvious why: The thing totally
+abuses the USB API.
+
+Try applying this patch; it should help.
+
+From: Alan Stern <stern@rowland.harvard.edu>
+Cc: Paulo Pereira <pfmp.404@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/serial/option.c |   20 +++++++++++++++++---
+ 1 file changed, 17 insertions(+), 3 deletions(-)
+
+--- a/drivers/usb/serial/option.c
++++ b/drivers/usb/serial/option.c
+@@ -38,6 +38,7 @@
+ #include <linux/tty.h>
+ #include <linux/tty_flip.h>
+ #include <linux/module.h>
++#include <linux/bitops.h>
+ #include <linux/usb.h>
+ #include <linux/usb/serial.h>
+ 
+@@ -238,6 +239,7 @@ struct option_port_private {
+ 	/* Output endpoints and buffer for this port */
+ 	struct urb *out_urbs[N_OUT_URB];
+ 	char out_buffer[N_OUT_URB][OUT_BUFLEN];
++	unsigned long out_busy;		/* Bit vector of URBs in use */
+ 
+ 	/* Settings for the port */
+ 	int rts_state;	/* Handshaking pins (outputs) */
+@@ -368,7 +370,7 @@ static int option_write(struct usb_seria
+ 			todo = OUT_BUFLEN;
+ 
+ 		this_urb = portdata->out_urbs[i];
+-		if (this_urb->status == -EINPROGRESS) {
++		if (test_and_set_bit(i, &portdata->out_busy)) {
+ 			if (time_before(jiffies,
+ 					portdata->tx_start_time[i] + 10 * HZ))
+ 				continue;
+@@ -392,6 +394,7 @@ static int option_write(struct usb_seria
+ 			dbg("usb_submit_urb %p (write bulk) failed "
+ 				"(%d, has %d)", this_urb,
+ 				err, this_urb->status);
++			clear_bit(i, &portdata->out_busy);
+ 			continue;
+ 		}
+ 		portdata->tx_start_time[i] = jiffies;
+@@ -444,12 +447,23 @@ static void option_indat_callback(struct
+ static void option_outdat_callback(struct urb *urb)
+ {
+ 	struct usb_serial_port *port;
++	struct option_port_private *portdata;
++	int i;
+ 
+ 	dbg("%s", __FUNCTION__);
+ 
+ 	port = (struct usb_serial_port *) urb->context;
+ 
+ 	usb_serial_port_softint(port);
++
++	portdata = usb_get_serial_port_data(port);
++	for (i = 0; i < N_OUT_URB; ++i) {
++		if (portdata->out_urbs[i] == urb) {
++			smp_mb__before_clear_bit();
++			clear_bit(i, &portdata->out_busy);
++			break;
++		}
++	}
+ }
+ 
+ static void option_instat_callback(struct urb *urb)
+@@ -516,7 +530,7 @@ static int option_write_room(struct usb_
+ 
+ 	for (i=0; i < N_OUT_URB; i++) {
+ 		this_urb = portdata->out_urbs[i];
+-		if (this_urb && this_urb->status != -EINPROGRESS)
++		if (this_urb && !test_bit(i, &portdata->out_busy))
+ 			data_len += OUT_BUFLEN;
+ 	}
+ 
+@@ -535,7 +549,7 @@ static int option_chars_in_buffer(struct
+ 
+ 	for (i=0; i < N_OUT_URB; i++) {
+ 		this_urb = portdata->out_urbs[i];
+-		if (this_urb && this_urb->status == -EINPROGRESS)
++		if (this_urb && test_bit(i, &portdata->out_busy))
+ 			data_len += this_urb->transfer_buffer_length;
+ 	}
+ 	dbg("%s: %d", __FUNCTION__, data_len);
