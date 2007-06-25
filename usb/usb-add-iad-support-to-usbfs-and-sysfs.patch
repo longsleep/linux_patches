@@ -1,0 +1,261 @@
+From craig@nadler.us Fri Jun 15 20:11:01 2007
+From: "Craig W. Nadler" <craig@nadler.us>
+Date: Fri, 15 Jun 2007 23:14:35 -0400
+Subject: USB: add IAD support to usbfs and sysfs
+To: Greg KH <greg@kroah.com>
+Cc: linux-usb-devel@lists.sourceforge.net
+Message-ID: <4673559B.4050609@nadler.us>
+
+
+From: Craig W. Nadler <craig@nadler.us>
+
+USB_IAD: Adds support for USB Interface Association Descriptors.
+
+This patch adds support to the USB host stack for parsing, storing, and
+displaying Interface Association Descriptors. In /proc/bus/usb/devices
+lines starting with A: show the fields in an IAD. In sysfs if an
+interface on a USB device is referenced by an IAD the following files
+will be added to the sysfs directory for that interface:
+iad_bFirstInterface, iad_bInterfaceCount, iad_bFunctionClass, and
+iad_bFunctionSubClass, iad_bFunctionProtocol
+
+Signed-off-by: Craig W. Nadler <craig@nadler.us>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/config.c  |   15 +++++++++++++++
+ drivers/usb/core/devices.c |   26 ++++++++++++++++++++++++++
+ drivers/usb/core/message.c |   31 +++++++++++++++++++++++++++++++
+ drivers/usb/core/sysfs.c   |   34 ++++++++++++++++++++++++++++++++++
+ include/linux/usb.h        |   10 ++++++++++
+ 5 files changed, 116 insertions(+)
+
+--- a/drivers/usb/core/config.c
++++ b/drivers/usb/core/config.c
+@@ -295,6 +295,7 @@ static int usb_parse_configuration(struc
+ 	struct usb_descriptor_header *header;
+ 	int len, retval;
+ 	u8 inums[USB_MAXINTERFACES], nalts[USB_MAXINTERFACES];
++	unsigned iad_num = 0;
+ 
+ 	memcpy(&config->desc, buffer, USB_DT_CONFIG_SIZE);
+ 	if (config->desc.bDescriptorType != USB_DT_CONFIG ||
+@@ -372,6 +373,20 @@ static int usb_parse_configuration(struc
+ 				++n;
+ 			}
+ 
++		} else if (header->bDescriptorType ==
++				USB_DT_INTERFACE_ASSOCIATION) {
++			if (iad_num == USB_MAXIADS) {
++				dev_warn(ddev, "found more Interface "
++					       "Association Descriptors "
++					       "than allocated for in "
++					       "configuration %d\n", cfgno);
++			} else {
++				config->intf_assoc[iad_num] =
++					(struct usb_interface_assoc_descriptor
++					*)header;
++				iad_num++;
++			}
++
+ 		} else if (header->bDescriptorType == USB_DT_DEVICE ||
+ 			    header->bDescriptorType == USB_DT_CONFIG)
+ 			dev_warn(ddev, "config %d contains an unexpected "
+--- a/drivers/usb/core/devices.c
++++ b/drivers/usb/core/devices.c
+@@ -102,6 +102,10 @@ static const char *format_config =
+ /* C:  #Ifs=dd Cfg#=dd Atr=xx MPwr=dddmA */
+   "C:%c #Ifs=%2d Cfg#=%2d Atr=%02x MxPwr=%3dmA\n";
+   
++static const char *format_iad =
++/* A:  FirstIf#=dd IfCount=dd Cls=xx(sssss) Sub=xx Prot=xx */
++  "A:  FirstIf#=%2d IfCount=%2d Cls=%02x(%-5s) Sub=%02x Prot=%02x\n";
++
+ static const char *format_iface =
+ /* I:  If#=dd Alt=dd #EPs=dd Cls=xx(sssss) Sub=xx Prot=xx Driver=xxxx*/
+   "I:%c If#=%2d Alt=%2d #EPs=%2d Cls=%02x(%-5s) Sub=%02x Prot=%02x Driver=%s\n";
+@@ -146,6 +150,7 @@ static const struct class_info clas_info
+ 	{USB_CLASS_STILL_IMAGE,		"still"},
+ 	{USB_CLASS_CSCID,		"scard"},
+ 	{USB_CLASS_CONTENT_SEC,		"c-sec"},
++	{USB_CLASS_VIDEO,		"video"},
+ 	{-1,				"unk."}		/* leave as last */
+ };
+ 
+@@ -286,6 +291,21 @@ static char *usb_dump_interface(
+ 	return start;
+ }
+ 
++static char *usb_dump_iad_descriptor(char *start, char *end,
++	const struct usb_interface_assoc_descriptor *iad)
++{
++	if (start > end)
++		return start;
++	start += sprintf(start, format_iad,
++			 iad->bFirstInterface,
++			 iad->bInterfaceCount,
++			 iad->bFunctionClass,
++			 class_decode(iad->bFunctionClass),
++			 iad->bFunctionSubClass,
++			 iad->bFunctionProtocol);
++	return start;
++}
++
+ /* TBD:
+  * 0. TBDs
+  * 1. marking active interface altsettings (code lists all, but should mark
+@@ -322,6 +342,12 @@ static char *usb_dump_config (
+ 	if (!config)		/* getting these some in 2.3.7; none in 2.3.6 */
+ 		return start + sprintf(start, "(null Cfg. desc.)\n");
+ 	start = usb_dump_config_descriptor(start, end, &config->desc, active);
++	for (i = 0; i < USB_MAXIADS; i++) {
++		if (config->intf_assoc[i] == NULL)
++			break;
++		start = usb_dump_iad_descriptor(start, end,
++					config->intf_assoc[i]);
++	}
+ 	for (i = 0; i < config->desc.bNumInterfaces; i++) {
+ 		intfc = config->intf_cache[i];
+ 		interface = config->interface[i];
+--- a/drivers/usb/core/message.c
++++ b/drivers/usb/core/message.c
+@@ -1384,6 +1384,36 @@ struct device_type usb_if_device_type = 
+ 	.uevent =	usb_if_uevent,
+ };
+ 
++static struct usb_interface_assoc_descriptor *find_iad(struct usb_device *dev,
++						       struct usb_host_config *config,
++						       u8 inum)
++{
++	struct usb_interface_assoc_descriptor *retval = NULL;
++	struct usb_interface_assoc_descriptor *intf_assoc;
++	int first_intf;
++	int last_intf;
++	int i;
++
++	for (i = 0; (i < USB_MAXIADS && config->intf_assoc[i]); i++) {
++		intf_assoc = config->intf_assoc[i];
++		if (intf_assoc->bInterfaceCount == 0)
++			continue;
++
++		first_intf = intf_assoc->bFirstInterface;
++		last_intf = first_intf + (intf_assoc->bInterfaceCount - 1);
++		if (inum >= first_intf && inum <= last_intf) {
++			if (!retval)
++				retval = intf_assoc;
++			else
++				dev_err(&dev->dev, "Interface #%d referenced"
++					" by multiple IADs\n", inum);
++		}
++	}
++
++	return retval;
++}
++
++
+ /*
+  * usb_set_configuration - Makes a particular device setting be current
+  * @dev: the device whose configuration is being updated
+@@ -1530,6 +1560,7 @@ free_interfaces:
+ 		intfc = cp->intf_cache[i];
+ 		intf->altsetting = intfc->altsetting;
+ 		intf->num_altsetting = intfc->num_altsetting;
++		intf->intf_assoc = find_iad(dev, cp, i);
+ 		kref_get(&intfc->ref);
+ 
+ 		alt = usb_altnum_to_altsetting(intf, 0);
+--- a/drivers/usb/core/sysfs.c
++++ b/drivers/usb/core/sysfs.c
+@@ -495,6 +495,25 @@ void usb_remove_sysfs_dev_files(struct u
+ 	sysfs_remove_group(&dev->kobj, &dev_attr_grp);
+ }
+ 
++/* Interface Accociation Descriptor fields */
++#define usb_intf_assoc_attr(field, format_string)			\
++static ssize_t								\
++show_iad_##field (struct device *dev, struct device_attribute *attr,	\
++		char *buf)						\
++{									\
++	struct usb_interface *intf = to_usb_interface (dev);		\
++									\
++	return sprintf (buf, format_string,				\
++			intf->intf_assoc->field); 		\
++}									\
++static DEVICE_ATTR(iad_##field, S_IRUGO, show_iad_##field, NULL);
++
++usb_intf_assoc_attr (bFirstInterface, "%02x\n")
++usb_intf_assoc_attr (bInterfaceCount, "%02d\n")
++usb_intf_assoc_attr (bFunctionClass, "%02x\n")
++usb_intf_assoc_attr (bFunctionSubClass, "%02x\n")
++usb_intf_assoc_attr (bFunctionProtocol, "%02x\n")
++
+ /* Interface fields */
+ #define usb_intf_attr(field, format_string)				\
+ static ssize_t								\
+@@ -558,6 +577,18 @@ static ssize_t show_modalias(struct devi
+ }
+ static DEVICE_ATTR(modalias, S_IRUGO, show_modalias, NULL);
+ 
++static struct attribute *intf_assoc_attrs[] = {
++	&dev_attr_iad_bFirstInterface.attr,
++	&dev_attr_iad_bInterfaceCount.attr,
++	&dev_attr_iad_bFunctionClass.attr,
++	&dev_attr_iad_bFunctionSubClass.attr,
++	&dev_attr_iad_bFunctionProtocol.attr,
++	NULL,
++};
++static struct attribute_group intf_assoc_attr_grp = {
++	.attrs = intf_assoc_attrs,
++};
++
+ static struct attribute *intf_attrs[] = {
+ 	&dev_attr_bInterfaceNumber.attr,
+ 	&dev_attr_bAlternateSetting.attr,
+@@ -609,6 +640,8 @@ int usb_create_sysfs_intf_files(struct u
+ 		alt->string = usb_cache_string(udev, alt->desc.iInterface);
+ 	if (alt->string)
+ 		retval = device_create_file(dev, &dev_attr_interface);
++	if (intf->intf_assoc)
++		retval = sysfs_create_group(&dev->kobj, &intf_assoc_attr_grp);
+ 	usb_create_intf_ep_files(intf, udev);
+ 	return 0;
+ }
+@@ -620,4 +653,5 @@ void usb_remove_sysfs_intf_files(struct 
+ 	usb_remove_intf_ep_files(intf);
+ 	device_remove_file(dev, &dev_attr_interface);
+ 	sysfs_remove_group(&dev->kobj, &intf_attr_grp);
++	sysfs_remove_group(&intf->dev.kobj, &intf_assoc_attr_grp);
+ }
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -146,6 +146,10 @@ struct usb_interface {
+ 					 * active alternate setting */
+ 	unsigned num_altsetting;	/* number of alternate settings */
+ 
++	/* If there is an interface association descriptor then it will list
++	 * the associated interfaces */
++	struct usb_interface_assoc_descriptor *intf_assoc;
++
+ 	int minor;			/* minor number this interface is
+ 					 * bound to */
+ 	enum usb_interface_condition condition;		/* state of binding */
+@@ -175,6 +179,7 @@ void usb_put_intf(struct usb_interface *
+ 
+ /* this maximum is arbitrary */
+ #define USB_MAXINTERFACES	32
++#define USB_MAXIADS		USB_MAXINTERFACES/2
+ 
+ /**
+  * struct usb_interface_cache - long-term representation of a device interface
+@@ -245,6 +250,11 @@ struct usb_host_config {
+ 	struct usb_config_descriptor	desc;
+ 
+ 	char *string;		/* iConfiguration string, if present */
++
++	/* List of any Interface Association Descriptors in this
++	 * configuration. */
++	struct usb_interface_assoc_descriptor *intf_assoc[USB_MAXIADS];
++
+ 	/* the interfaces associated with this configuration,
+ 	 * stored in no particular order */
+ 	struct usb_interface *interface[USB_MAXINTERFACES];
