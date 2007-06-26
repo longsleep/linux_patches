@@ -1,0 +1,1033 @@
+---
+ MAINTAINERS                           |    6 +
+ drivers/Kconfig                       |    2 
+ drivers/Makefile                      |    1 
+ drivers/accessibility/Kconfig         |    7 +
+ drivers/accessibility/Makefile        |    4 
+ drivers/accessibility/accessibility.c |  164 ++++++++++++++++++++++++++++++++
+ drivers/char/keyboard.c               |  107 +++++++++++++++++++++
+ drivers/char/n_tty.c                  |  170 +++++++++++++++++++++++++---------
+ drivers/char/tty_io.c                 |    7 +
+ drivers/char/vt.c                     |   97 +++++++++++++++++++
+ include/linux/accessibility.h         |   98 +++++++++++++++++++
+ init/Kconfig                          |   19 +++
+ 12 files changed, 638 insertions(+), 44 deletions(-)
+
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -176,6 +176,12 @@ M:	A2232@gmx.net
+ L:	linux-m68k@lists.linux-m68k.org
+ S:	Maintained
+ 
++ACCESSIBILITY, ADAPTERS FOR THE DISABLED
++P:	Karl Dahlke
++M:	karl@eklhad.net
++W:	http://www.eklhad.net/linux/jupiter
++S:	Maintained
++
+ AIO
+ P:	Benjamin LaHaise
+ M:	bcrl@kvack.org
+--- a/drivers/Kconfig
++++ b/drivers/Kconfig
+@@ -52,6 +52,8 @@ source "drivers/i2c/Kconfig"
+ 
+ source "drivers/spi/Kconfig"
+ 
++source "drivers/accessibility/Kconfig"
++
+ source "drivers/w1/Kconfig"
+ 
+ source "drivers/hwmon/Kconfig"
+--- a/drivers/Makefile
++++ b/drivers/Makefile
+@@ -58,6 +58,7 @@ obj-$(CONFIG_USB_GADGET)	+= usb/gadget/
+ obj-$(CONFIG_SERIO)		+= input/serio/
+ obj-$(CONFIG_GAMEPORT)		+= input/gameport/
+ obj-$(CONFIG_INPUT)		+= input/
++obj-$(CONFIG_ACCESSIBILITY)	+= accessibility/
+ obj-$(CONFIG_I2O)		+= message/
+ obj-$(CONFIG_RTC_LIB)		+= rtc/
+ obj-y				+= i2c/
+--- /dev/null
++++ b/drivers/accessibility/Kconfig
+@@ -0,0 +1,7 @@
++#
++#  Accessibility adapters
++#
++
++menu "Accessibility Adapters"
++
++endmenu
+--- /dev/null
++++ b/drivers/accessibility/Makefile
+@@ -0,0 +1,4 @@
++#
++# Makefile for the Linux adaptive modules
++#
++obj-$(CONFIG_ACCESSIBILITY)	+= accessibility.o
+--- /dev/null
++++ b/drivers/accessibility/accessibility.c
+@@ -0,0 +1,164 @@
++
++#include <linux/tty.h>
++#include <linux/tty_driver.h>
++#include <linux/vt.h>
++#include <linux/console.h>
++#include <linux/kd.h>
++#include <linux/console_struct.h>
++#include <linux/accessibility.h>
++
++
++struct list_head accmodules = LIST_HEAD_INIT(accmodules);
++
++/* wrapper to call the adapter's polling function */
++static void accessibility_polling_wrapper(unsigned long arg)
++{
++	struct accessibility_device *dev = (struct accessibility_device *)arg;
++
++	/* First thing we're going to do is re-enable the timer. */
++	mod_timer(&dev->polltime, jiffies + dev->ops->period);
++
++	if (dev->pollrunning)
++		return; /* reentrant lock */
++	/* Now call the function in the adapter */
++	dev->pollrunning = 1;
++	dev->ops->polling(dev);
++	dev->pollrunning = 0;
++}
++
++int register_accessibility_device(struct accessibility_device *dev)
++{
++	struct accessibility_operations *ops = dev->ops;
++
++	/* call tty_start for each open tty */
++	if(ops && ops->tty_start) {
++		int index, minor;
++		dev_t ttydev;
++		struct tty_driver *driver;
++		for (minor = 1; minor <= MAX_NR_CONSOLES; ++minor) {
++			ttydev = MKDEV(TTY_MAJOR, minor);
++			driver = get_tty_driver(ttydev, &index);
++			if (!driver)
++				continue;
++			if (!driver->ttys[index])
++				continue;
++			ops->tty_start(dev, minor);
++		}
++	}
++
++	/* make the link */
++	list_add(&dev->link, &accmodules);
++
++	/* start the user polling function */
++	if (ops && ops->polling && ops->period) {
++		static struct timer_list sample_polltime =
++			TIMER_INITIALIZER(accessibility_polling_wrapper, 0, 0);
++		memcpy(&dev->polltime, &sample_polltime, sizeof(sample_polltime));
++		dev->polltime.data = (unsigned long)dev;
++		dev->pollrunning = 0;
++		accessibility_polling_wrapper((unsigned long)dev);
++	}
++
++	/* adapter is attached */
++	return 0;
++}
++EXPORT_SYMBOL_GPL(register_accessibility_device);
++
++void unregister_accessibility_device(struct accessibility_device *dev)
++{
++	struct accessibility_operations *ops;
++
++	if (!dev)
++		return;
++	ops = dev->ops;
++
++	/* kill the polling function */
++	if(ops && ops->polling && ops->period) {
++		del_timer(&dev->polltime);
++		dev->polltime.function = 0;
++	}
++
++	list_del(&dev->link);
++
++	/* Call tty_stop for each open tty. */
++	if(ops && ops->tty_stop) {
++		int index, minor;
++		dev_t ttydev;
++		struct tty_driver *driver;
++		for (minor = 1; minor <= MAX_NR_CONSOLES; ++minor) {
++			ttydev = MKDEV(TTY_MAJOR, minor);
++			driver = get_tty_driver(ttydev, &index);
++			if(!driver)
++				continue;
++			if(!driver->ttys[index])
++				continue;
++			ops->tty_stop(dev, minor);
++		}
++	}
++}
++EXPORT_SYMBOL_GPL(unregister_accessibility_device);
++
++
++void accessibility_tty_start(struct tty_driver *driver, int idx)
++{
++	struct accessibility_device *accdev;
++	struct accessibility_operations *accops;
++	int minor;
++
++	/* make sure this is a console device */
++	minor = driver->minor_start + idx;
++	if ((driver->major == TTY_MAJOR) &&
++	    (minor > 0) &&
++	    (minor < MAX_NR_CONSOLES)) {
++		list_for_each_entry(accdev, &accmodules, link) {
++			accops = accdev->ops;
++			if (accops && accops->tty_start)
++				accops->tty_start(accdev, minor);
++			}
++		}
++}
++
++void accessibility_tty_stop(struct tty_driver *driver, int idx)
++{
++	int minor;
++
++	/* make sure this is a console device */
++	minor = driver->minor_start + idx;
++	if ((driver->major == TTY_MAJOR) &&
++	    (minor > 0) &&
++	    (minor < MAX_NR_CONSOLES)) {
++		struct accessibility_device *accdev;
++		struct accessibility_operations *accops;
++		list_for_each_entry(accdev, &accmodules, link) {
++			accops = accdev->ops;
++			if (accops && accops->tty_stop)
++				accops->tty_stop(accdev, minor);
++			}
++		}
++}
++
++void accessiblity_tty_scroll(struct vc_data *vc, int t, int b, int nr)
++{
++	struct accessibility_device *accdev;
++	struct accessibility_operations *accops;
++
++	list_for_each_entry(accdev, &accmodules, link) {
++		accops = accdev->ops;
++		if (accops && accops->scroll)
++			accops->scroll(accdev, vc->vc_num+1, t, b, nr);
++		}
++}
++
++void accessibility_tty_cursorloc(struct vc_data *vc)
++{
++	struct accessibility_device *accdev;
++	struct accessibility_operations *accops;
++
++	list_for_each_entry(accdev, &accmodules, link) {
++		accops = accdev->ops;
++		if (accops && accops->cursorloc)
++			accops->cursorloc(accdev, vc->vc_num+1, vc->vc_x, vc->vc_y);
++		}
++}
++
++
+--- a/drivers/char/keyboard.c
++++ b/drivers/char/keyboard.c
+@@ -31,6 +31,7 @@
+ #include <linux/mm.h>
+ #include <linux/string.h>
+ #include <linux/init.h>
++#include <linux/accessibility.h>
+ #include <linux/slab.h>
+ #include <linux/irq.h>
+ 
+@@ -40,6 +41,7 @@
+ #include <linux/sysrq.h>
+ #include <linux/input.h>
+ #include <linux/reboot.h>
++#include <asm/io.h>
+ 
+ extern void ctrl_alt_del(void);
+ 
+@@ -241,6 +243,80 @@ void kd_mksound(unsigned int hz, unsigne
+ }
+ 
+ /*
++ * Push notes onto a sound fifo and play them via an asynchronous thread.
++ */
++
++#define SF_LEN 32 /* length of sound fifo */
++static short sf_fifo[SF_LEN];
++static short sf_head, sf_tail;
++
++#define PORT_SPEAKER 0x61
++#define PORT_TIMER2 0x43
++#define PORT_TIMERVAL 0x42
++
++/* Pop the next sound out of the sound fifo. */
++static void popfifo(unsigned long );
++static struct timer_list note_timer =
++		TIMER_INITIALIZER(popfifo, 0, 0);
++static void popfifo(unsigned long notUsed)
++{
++	short i, freq, duration;
++
++	/* Apparently it's ok to delete a timer that has expired, */
++	/* or has never been added in the first place. */
++	/* kd_mksound() does it, so can we. */
++	del_timer(&note_timer);
++
++	if((i = sf_tail) == sf_head) {
++		/* turn off singing speaker */
++		outb(inb_p(PORT_SPEAKER)&0xFC, PORT_SPEAKER);
++		return; /* sound fifo is empty */
++	}
++
++	/* First short holds the frequency */
++	freq = sf_fifo[i++];
++	if(i == SF_LEN) i = 0; /* wrap around */
++	duration = sf_fifo[i++];
++	if(i == SF_LEN) i = 0;
++	sf_tail = i;
++
++	mod_timer(&note_timer, jiffies + duration*(HZ/100));
++
++	local_irq_disable();
++	if(freq < 0) {
++		outb(inb_p(PORT_SPEAKER)&0xFC, PORT_SPEAKER);
++	} else {
++		duration = 1193180 / freq;
++		outb_p(inb_p(PORT_SPEAKER)|3, PORT_SPEAKER);
++		/* set command for counter 2, 2 byte write */
++		outb_p(0xB6, PORT_TIMER2);
++		outb_p(duration & 0xff, PORT_TIMERVAL);
++		outb((duration >> 8) & 0xff, PORT_TIMERVAL);
++	}
++	local_irq_enable();
++} /* popfifo */
++
++/* Put a string of notes into the sound fifo. */
++void kd_mknotes(const short *p)
++{
++	short i;
++
++	local_irq_disable();
++	i = sf_head;
++	/* Copy shorts into the fifo, until the terminating zero. */
++	while(*p) {
++		sf_fifo[i++] = *p++;
++		if(i == SF_LEN) i = 0; /* wrap around */
++		if(i == sf_tail) { local_irq_enable(); return; }
++	}
++	sf_head = i;
++	local_irq_enable();
++
++	/* first sound,  get things started. */
++	if(!timer_pending(&note_timer)) popfifo(0);
++} /* kd_mknotes */
++
++/*
+  * Setting the keyboard rate.
+  */
+ 
+@@ -295,6 +371,19 @@ static void puts_queue(struct vc_data *v
+ 	con_schedule_flip(tty);
+ }
+ 
++/* Pass characters to the tty, e.g. invoking a macro with a singel keystroke */
++void tty_putc(int minor, int ch)
++{
++	struct vc_data *c = vc_cons[minor-1].d;
++	put_queue(c, ch);
++} /* tty_putc */
++
++void tty_puts(int minor, char *cp)
++{
++	struct vc_data *c = vc_cons[minor-1].d;
++	puts_queue(c, cp);
++} /* tty_puts */
++
+ static void applkey(struct vc_data *vc, int key, char mode)
+ {
+ 	static char buf[] = { 0x1b, 'O', 0x00, 0x00 };
+@@ -1180,6 +1269,19 @@ static void kbd_keycode(unsigned int key
+ 		raw_mode = 1;
+ 	}
+ 
++#ifdef CONFIG_ACCESSIBILITY
++	if(!raw_mode) {
++		struct accessibility_device *accdev;
++		struct accessibility_operations *accops;
++		list_for_each_entry(accdev, &accmodules, link) {
++			accops = accdev->ops;
++			if(accops && accops->keystroke &&
++			!accops->keystroke(accdev, &keycode, &shift_state, !down))
++				return; /* eaten by the adapter */
++		}
++	}
++#endif
++
+ 	if (down)
+ 		set_bit(keycode, key_down);
+ 	else
+@@ -1372,3 +1474,8 @@ int __init kbd_init(void)
+ 
+ 	return 0;
+ }
++
++EXPORT_SYMBOL(getledstate);
++EXPORT_SYMBOL(tty_putc);
++EXPORT_SYMBOL(tty_puts);
++EXPORT_SYMBOL(kd_mknotes);
+--- a/drivers/char/n_tty.c
++++ b/drivers/char/n_tty.c
+@@ -44,6 +44,8 @@
+ #include <linux/string.h>
+ #include <linux/slab.h>
+ #include <linux/poll.h>
++#include <linux/accessibility.h>
++#include <linux/vt.h>
+ #include <linux/bitops.h>
+ 
+ #include <asm/uaccess.h>
+@@ -244,6 +246,53 @@ static inline int is_continuation(unsign
+ 	return I_IUTF8(tty) && is_utf8_continuation(c);
+ }
+ 
++/*
++ * put_char() wrapper, modified by Karl Dahlke, Jan 2004.
++ * This wrapper use to call driver->put_char(), and nothing more.
++ * Now if calls the accessibility adapter if appropriate.
++ */
++static void put_char(unsigned char c, struct tty_struct *tty, int isecho)
++{
++#ifdef CONFIG_ACCESSIBILITY
++	int major = tty->driver->major;
++	int minor = tty->driver->minor_start + tty->index;
++	struct accessibility_device *dev;
++	struct accessibility_operations *ops;
++	int escout = 0, n;
++
++	if(major == TTY_MAJOR &&
++	minor > 0 && minor <= MAX_NR_CONSOLES) {
++		list_for_each_entry(dev, &accmodules, link) {
++			ops = dev->ops;
++			if(ops && ops->tty_out) {
++				dev->tty_out_status &= ~3;
++				if(escout) {
++					n = ( dev->tty_out_status |= ops->tty_out(dev, minor, '\33', isecho) );
++				}
++				n = ( dev->tty_out_status |= ops->tty_out(dev, minor, c, isecho) );
++				if(!(n&1)) return; /* char was swallowed */
++				if(n&2) escout = 1;
++			} /* tty_out method provided */
++		} /* loop over devices */
++
++		if(escout) {
++			/* I'll assume the driver has room for escape c.
++			 * We've already tested ahead of time;
++			 * it has room for C, or we would have blocked.
++			 * Does it have room for both characters?
++			 * On a serial or ethernet port, maybe not,
++			 * but on a console screen, it should.
++			 * There's no flow control -- nothing should block.
++			 * So I'm running on faith --
++			 * trying to keep the programming simple. */
++			tty->driver->put_char(tty, '\33');
++		} /* display previous escape */
++	} /* valid major and minor */
++#endif
++
++	tty->driver->put_char(tty, c);
++} /* put_char */
++
+ /**
+  *	opost			-	output post processor
+  *	@c: character (or partial unicode symbol)
+@@ -258,7 +307,7 @@ static inline int is_continuation(unsign
+  *	re-entrantly. Relies on lock_kernel() still.
+  */
+  
+-static int opost(unsigned char c, struct tty_struct *tty)
++static int opost(unsigned char c, struct tty_struct *tty, int isecho)
+ {
+ 	int	space, spaces;
+ 
+@@ -274,7 +323,7 @@ static int opost(unsigned char c, struct
+ 			if (O_ONLCR(tty)) {
+ 				if (space < 2)
+ 					return -1;
+-				tty->driver->put_char(tty, '\r');
++				put_char('\r', tty, 0);
+ 				tty->column = 0;
+ 			}
+ 			tty->canon_column = tty->column;
+@@ -293,10 +342,13 @@ static int opost(unsigned char c, struct
+ 		case '\t':
+ 			spaces = 8 - (tty->column & 7);
+ 			if (O_TABDLY(tty) == XTABS) {
++				int minor = tty->driver->minor_start + tty->index;
+ 				if (space < spaces)
+ 					return -1;
+ 				tty->column += spaces;
+-				tty->driver->write(tty, "        ", spaces);
++				if(minor > 0 && minor <= MAX_NR_CONSOLES) {
++					while(spaces--) put_char(' ', tty, 0);
++				} else tty->driver->write(tty, "        ", spaces);
+ 				return 0;
+ 			}
+ 			tty->column += spaces;
+@@ -313,7 +365,7 @@ static int opost(unsigned char c, struct
+ 			break;
+ 		}
+ 	}
+-	tty->driver->put_char(tty, c);
++	put_char(c, tty, isecho);
+ 	return 0;
+ }
+ 
+@@ -383,19 +435,6 @@ break_out:
+ 
+ 
+ /**
+- *	put_char	-	write character to driver
+- *	@c: character (or part of unicode symbol)
+- *	@tty: terminal device
+- *
+- *	Queue a byte to the driver layer for output
+- */
+- 
+-static inline void put_char(unsigned char c, struct tty_struct *tty)
+-{
+-	tty->driver->put_char(tty, c);
+-}
+-
+-/**
+  *	echo_char	-	echo characters
+  *	@c: unicode byte to echo
+  *	@tty: terminal device
+@@ -407,17 +446,17 @@ static inline void put_char(unsigned cha
+ static void echo_char(unsigned char c, struct tty_struct *tty)
+ {
+ 	if (L_ECHOCTL(tty) && iscntrl(c) && c != '\t') {
+-		put_char('^', tty);
+-		put_char(c ^ 0100, tty);
++		put_char('^', tty, 0);
++		put_char(c ^ 0100, tty, 0);
+ 		tty->column += 2;
+ 	} else
+-		opost(c, tty);
++		opost(c, tty, 1);
+ }
+ 
+ static inline void finish_erasing(struct tty_struct *tty)
+ {
+ 	if (tty->erasing) {
+-		put_char('/', tty);
++		put_char('/', tty, 0);
+ 		tty->column++;
+ 		tty->erasing = 0;
+ 	}
+@@ -440,7 +479,7 @@ static void eraser(unsigned char c, stru
+ 	unsigned long flags;
+ 
+ 	if (tty->read_head == tty->canon_head) {
+-		/* opost('\a', tty); */		/* what do you think? */
++		/* opost('\a', tty, 0); */		/* what do you think? */
+ 		return;
+ 	}
+ 	if (c == ERASE_CHAR(tty))
+@@ -466,7 +505,7 @@ static void eraser(unsigned char c, stru
+ 			echo_char(KILL_CHAR(tty), tty);
+ 			/* Add a newline if ECHOK is on and ECHOKE is off. */
+ 			if (L_ECHOK(tty))
+-				opost('\n', tty);
++				opost('\n', tty, 0);
+ 			return;
+ 		}
+ 		kill_type = KILL;
+@@ -501,7 +540,7 @@ static void eraser(unsigned char c, stru
+ 		if (L_ECHO(tty)) {
+ 			if (L_ECHOPRT(tty)) {
+ 				if (!tty->erasing) {
+-					put_char('\\', tty);
++					put_char('\\', tty, 0);
+ 					tty->column++;
+ 					tty->erasing = 1;
+ 				}
+@@ -509,7 +548,7 @@ static void eraser(unsigned char c, stru
+ 				echo_char(c, tty);
+ 				while (--cnt > 0) {
+ 					head = (head+1) & (N_TTY_BUF_SIZE-1);
+-					put_char(tty->read_buf[head], tty);
++					put_char(tty->read_buf[head], tty, 0);
+ 				}
+ 			} else if (kill_type == ERASE && !L_ECHOE(tty)) {
+ 				echo_char(ERASE_CHAR(tty), tty);
+@@ -537,22 +576,22 @@ static void eraser(unsigned char c, stru
+ 				/* Now backup to that column. */
+ 				while (tty->column > col) {
+ 					/* Can't use opost here. */
+-					put_char('\b', tty);
++					put_char('\b', tty, 0);
+ 					if (tty->column > 0)
+ 						tty->column--;
+ 				}
+ 			} else {
+ 				if (iscntrl(c) && L_ECHOCTL(tty)) {
+-					put_char('\b', tty);
+-					put_char(' ', tty);
+-					put_char('\b', tty);
++					put_char('\b', tty, 0);
++					put_char(' ', tty, 0);
++					put_char('\b', tty, 0);
+ 					if (tty->column > 0)
+ 						tty->column--;
+ 				}
+ 				if (!iscntrl(c) || L_ECHOCTL(tty)) {
+-					put_char('\b', tty);
+-					put_char(' ', tty);
+-					put_char('\b', tty);
++					put_char('\b', tty, 0);
++					put_char(' ', tty, 0);
++					put_char('\b', tty, 0);
+ 					if (tty->column > 0)
+ 						tty->column--;
+ 				}
+@@ -718,7 +757,7 @@ static inline void n_tty_receive_char(st
+ 		tty->lnext = 0;
+ 		if (L_ECHO(tty)) {
+ 			if (tty->read_cnt >= N_TTY_BUF_SIZE-1) {
+-				put_char('\a', tty); /* beep if no space */
++				put_char('\a', tty, 0); /* beep if no space */
+ 				return;
+ 			}
+ 			/* Record the column of first canon char. */
+@@ -775,8 +814,8 @@ send_signal:
+ 			if (L_ECHO(tty)) {
+ 				finish_erasing(tty);
+ 				if (L_ECHOCTL(tty)) {
+-					put_char('^', tty);
+-					put_char('\b', tty);
++					put_char('^', tty, 0);
++					put_char('\b', tty, 0);
+ 				}
+ 			}
+ 			return;
+@@ -787,7 +826,7 @@ send_signal:
+ 
+ 			finish_erasing(tty);
+ 			echo_char(c, tty);
+-			opost('\n', tty);
++			opost('\n', tty, 0);
+ 			while (tail != tty->read_head) {
+ 				echo_char(tty->read_buf[tail], tty);
+ 				tail = (tail+1) & (N_TTY_BUF_SIZE-1);
+@@ -797,8 +836,8 @@ send_signal:
+ 		if (c == '\n') {
+ 			if (L_ECHO(tty) || L_ECHONL(tty)) {
+ 				if (tty->read_cnt >= N_TTY_BUF_SIZE-1)
+-					put_char('\a', tty);
+-				opost('\n', tty);
++					put_char('\a', tty, 0);
++				opost('\n', tty, 0);
+ 			}
+ 			goto handle_newline;
+ 		}
+@@ -815,7 +854,7 @@ send_signal:
+ 			 */
+ 			if (L_ECHO(tty)) {
+ 				if (tty->read_cnt >= N_TTY_BUF_SIZE-1)
+-					put_char('\a', tty);
++					put_char('\a', tty, 0);
+ 				/* Record the column of first canon char. */
+ 				if (tty->canon_head == tty->read_head)
+ 					tty->canon_column = tty->column;
+@@ -845,11 +884,11 @@ send_signal:
+ 	finish_erasing(tty);
+ 	if (L_ECHO(tty)) {
+ 		if (tty->read_cnt >= N_TTY_BUF_SIZE-1) {
+-			put_char('\a', tty); /* beep if no space */
++			put_char('\a', tty, 0); /* beep if no space */
+ 			return;
+ 		}
+ 		if (c == '\n')
+-			opost('\n', tty);
++			opost('\n', tty, 0);
+ 		else {
+ 			/* Record the column of first canon char. */
+ 			if (tty->canon_head == tty->read_head)
+@@ -1433,6 +1472,8 @@ static ssize_t write_chan(struct tty_str
+ 	DECLARE_WAITQUEUE(wait, current);
+ 	int c;
+ 	ssize_t retval = 0;
++	int major = tty->driver->major;
++	int minor = tty->driver->minor_start + tty->index;
+ 
+ 	/* Job control check -- must be done at start (POSIX.1 7.1.1.4). */
+ 	if (L_TOSTOP(tty) && file->f_op->write != redirected_tty_write) {
+@@ -1452,6 +1493,46 @@ static ssize_t write_chan(struct tty_str
+ 			retval = -EIO;
+ 			break;
+ 		}
++
++/* If this is a talking tty, we must run everything through put_char. */
++#ifdef CONFIG_ACCESSIBILITY
++if(!list_empty(&accmodules) &&
++major == TTY_MAJOR &&
++minor > 0 && minor <= MAX_NR_CONSOLES) {
++	struct accessibility_device *accdev;
++	int rtb; /* real time break */
++	/* Set the output status to 0 for each running adapter. */
++	list_for_each_entry(accdev, &accmodules, link)
++		accdev->tty_out_status = 0;
++	while(nr > 0) {
++		int oval;
++		/* Don't call get_user() here; it doesn't work. */
++		c = *b;
++/* If we interrupt the swoop of a carriage return, */
++/* it really sounds weird! */
++		if(c == '\r') set_current_state(TASK_UNINTERRUPTIBLE);
++		oval = opost(c, tty, 0);
++		if(c == '\r') set_current_state(TASK_INTERRUPTIBLE);
++		if(oval < 0) break;
++		++b, --nr;
++		if (tty->driver->flush_chars)
++			tty->driver->flush_chars(tty);
++		/* Did one of the adapters call for a real time break? */
++		rtb = 0;
++		list_for_each_entry(accdev, &accmodules, link)
++			if(accdev->tty_out_status&4) rtb = 1;
++		if(rtb) {
++/* I just don't understand why I have to set this to RUNNING, */
++/* but I do! */
++			current->state = TASK_RUNNING;
++			break;
++		}
++	} /* loop putting characters */
++} else {
++#endif
++
++/* non-accessibility code follows -- takes advantage of opost_block() */
++
+ 		if (O_OPOST(tty) && !(test_bit(TTY_HW_COOK_OUT, &tty->flags))) {
+ 			while (nr > 0) {
+ 				ssize_t num = opost_block(tty, b, nr);
+@@ -1466,7 +1547,7 @@ static ssize_t write_chan(struct tty_str
+ 				if (nr == 0)
+ 					break;
+ 				c = *b;
+-				if (opost(c, tty) < 0)
++				if (opost(c, tty, 0) < 0)
+ 					break;
+ 				b++; nr--;
+ 			}
+@@ -1485,6 +1566,11 @@ static ssize_t write_chan(struct tty_str
+ 				nr -= c;
+ 			}
+ 		}
++
++#ifdef CONFIG_ACCESSIBILITY
++} /* preexisting code or accessibility code */
++#endif
++
+ 		if (!nr)
+ 			break;
+ 		if (file->f_flags & O_NONBLOCK) {
+--- a/drivers/char/tty_io.c
++++ b/drivers/char/tty_io.c
+@@ -94,6 +94,7 @@
+ #include <linux/wait.h>
+ #include <linux/bitops.h>
+ #include <linux/delay.h>
++#include <linux/accessibility.h>
+ 
+ #include <asm/uaccess.h>
+ #include <asm/system.h>
+@@ -2085,7 +2086,9 @@ static int init_dev(struct tty_driver *d
+ 	if (!(driver->flags & TTY_DRIVER_DEVPTS_MEM)) {
+ 		driver->ttys[idx] = tty;
+ 	}
+-	
++
++	accessibility_tty_start(driver, idx);
++
+ 	if (!*tp_loc)
+ 		*tp_loc = tp;
+ 	if (!*ltp_loc)
+@@ -2198,6 +2201,8 @@ static void release_one_tty(struct tty_s
+ 	int devpts = tty->driver->flags & TTY_DRIVER_DEVPTS_MEM;
+ 	struct ktermios *tp;
+ 
++	accessibility_tty_stop(tty->driver, idx);
++
+ 	if (!devpts)
+ 		tty->driver->ttys[idx] = NULL;
+ 
+--- a/drivers/char/vt.c
++++ b/drivers/char/vt.c
+@@ -94,6 +94,7 @@
+ #include <linux/consolemap.h>
+ #include <linux/timer.h>
+ #include <linux/interrupt.h>
++#include <linux/accessibility.h>
+ #include <linux/workqueue.h>
+ #include <linux/bootmem.h>
+ #include <linux/pm.h>
+@@ -266,6 +267,9 @@ static void scrup(struct vc_data *vc, un
+ 		nr = b - t - 1;
+ 	if (b > vc->vc_rows || t >= b || nr < 1)
+ 		return;
++
++	accessiblity_tty_scroll(vc, t, b, nr);
++
+ 	if (CON_IS_VISIBLE(vc) && vc->vc_sw->con_scroll(vc, t, b, SM_UP, nr))
+ 		return;
+ 	d = (unsigned short *)(vc->vc_origin + vc->vc_size_row * t);
+@@ -284,6 +288,9 @@ static void scrdown(struct vc_data *vc, 
+ 		nr = b - t - 1;
+ 	if (b > vc->vc_rows || t >= b || nr < 1)
+ 		return;
++
++	accessiblity_tty_scroll(vc, t, b, -nr);
++
+ 	if (CON_IS_VISIBLE(vc) && vc->vc_sw->con_scroll(vc, t, b, SM_DOWN, nr))
+ 		return;
+ 	s = (unsigned short *)(vc->vc_origin + vc->vc_size_row * t);
+@@ -569,9 +576,17 @@ static void hide_cursor(struct vc_data *
+ 
+ static void set_cursor(struct vc_data *vc)
+ {
+-	if (!IS_FG(vc) || console_blanked ||
++	if (console_blanked ||
+ 	    vc->vc_mode == KD_GRAPHICS)
+ 		return;
++
++	/* Background console adapters may still want to track
++	 * the cursor, so * this call comes before the is_fg test. */
++	accessibility_tty_cursorloc(vc);
++
++	if (!IS_FG(vc))
++		return;
++
+ 	if (vc->vc_deccm) {
+ 		if (vc == sel_cons)
+ 			clear_selection();
+@@ -3953,6 +3968,86 @@ void vcs_scr_writew(struct vc_data *vc, 
+ 	}
+ }
+ 
++int vc_screenItem(int minor, int xx, int yy)
++{
++	int currcons = minor - 1;
++	short nlines, ncols;
++	unsigned short *org;
++	struct vc_data *vc;
++
++	if (!vc_cons_allocated(currcons))
++		return -ENODEV;
++
++	vc = vc_cons[currcons].d;
++	nlines = vc->vc_rows;
++	ncols = vc->vc_cols;
++	if (xx < 0 || xx >= nlines || yy < 0 || yy >= ncols)
++		return -EFAULT;
++	org = screen_pos(vc, xx*ncols, 0);
++	org += yy;
++	return vcs_scr_readw(vc, org);
++}
++EXPORT_SYMBOL_GPL(vc_screenImage);
++
++/* Grab a copy of screen memory. */
++int vc_screenImage(int minor, short *dest, int destsize)
++{
++	int currcons = minor - 1;
++	short nlines, ncols;
++	long p;
++	int row, col;
++	unsigned short *org;
++	struct vc_data *vc;
++
++	if (!vc_cons_allocated(currcons))
++		return -ENODEV;
++
++	if (!dest)
++		return 0;
++
++	vc = vc_cons[currcons].d;
++	nlines = vc->vc_rows;
++	ncols = vc->vc_cols;
++	if (nlines*ncols > destsize)
++		return -ENOMEM;
++
++	p = 0;
++	for (row = 0; row < nlines; ++row) {
++		org = screen_pos(vc, row*ncols, 0);
++		for (col = 0; col < ncols; ++col)
++			dest[p++] = vcs_scr_readw(vc, org++);
++		}
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(vc_screenItem);
++
++/* get the screen parameters */
++int vc_screenParams(int minor, short *nlines_p, short *ncols_p,
++		    short *x_p, short *y_p)
++{
++	int currcons = minor - 1;
++	short nlines, ncols;
++	struct vc_data *vc;
++	char xy[2];
++
++	if (!vc_cons_allocated(currcons))
++		return -ENODEV;
++
++	vc = vc_cons[currcons].d;
++	nlines = vc->vc_rows;
++	ncols = vc->vc_cols;
++	*nlines_p = nlines;
++	*ncols_p = ncols;
++
++	getconsxy(vc, xy);
++	*x_p = xy[0];
++	*y_p = xy[1];
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(vc_screenParams);
++
+ /*
+  *	Visible symbols for modules
+  */
+--- /dev/null
++++ b/include/linux/accessibility.h
+@@ -0,0 +1,98 @@
++/*********************************************************************
++
++accessibility.h: interface to various adapters for disabled users.
++
++Copyright (C) Karl Dahlke, 2001.
++This software may be freely distributed under the GPL, version 2.
++
++Maintained by Karl Dahlke,  karl@eklhad.net.
++
++This header file defines the interface between the Linux kernel and the
++accessibility modules.
++See Documentation/accessibility.txt for more details.
++
++*********************************************************************/
++
++#ifndef __ACCESSIBILITY_H
++#define __ACCESSIBILITY_H
++
++#include <linux/list.h>
++#include <linux/timer.h>
++
++
++struct vc_data;
++
++
++#ifdef CONFIG_ACCESSIBILITY
++
++/*
++ * Accessibility device structure. */
++
++struct accessibility_device
++{
++	struct list_head link; /* support multiple adapters */
++	struct accessibility_operations *ops;
++	struct device *parent_dev;
++	struct timer_list polltime;
++	char pollrunning;
++	char tty_out_status;
++	void *data; /* each adapter links its own structure here */
++};
++
++/*
++ * Here are the operations performed by an accessibility adapter.
++ * Any of these function pointers may be left null, for the default kernel behavior.
++ */
++
++struct accessibility_operations
++{
++	void (*tty_start) (struct accessibility_device *dev, int minor);
++	void (*tty_stop) (struct accessibility_device *dev, int minor);
++	int (*tty_out) (struct accessibility_device *dev, int minor,
++			unsigned char c, int echo);
++	int (*keystroke) (struct accessibility_device *dev, unsigned int *key,
++			  int *shiftstate, int up_flag);
++	void (*scroll) (struct accessibility_device *dev, int minor,
++			int t, int b, int nr);
++	void (*cursorloc) (struct accessibility_device *dev, int minor,
++			   int x, int y);
++	void (*polling) (struct accessibility_device *dev);
++	int period;
++};
++
++extern int register_accessibility_device(struct accessibility_device *dev);
++extern void unregister_accessibility_device(struct accessibility_device *dev);
++
++extern void accessibility_tty_start(struct tty_driver *driver, int idx);
++extern void accessibility_tty_stop(struct tty_driver *driver, int idx);
++extern void accessiblity_tty_scroll(struct vc_data *vc, int t, int b, int nr);
++extern void accessibility_tty_cursorloc(struct vc_data *vc);
++
++extern void tty_putc(int minor, int ch);
++extern void tty_puts(int minor, char *cp);
++extern int vc_screenParams(int minor, short *nrows, short *ncols, short *x, short *y);
++extern int vc_screenItem(int minor, int x, int y);
++extern int vc_screenImage(int minor, short *dest, int destsize);
++extern void kd_mknotes(const short *data);
++
++/* For internal use only - not accessible from adapters. */
++
++#ifndef MODULE
++
++/* This is the list of active accessibility modules. */
++extern struct list_head accmodules;
++
++#endif
++
++#else
++static inline void accessibility_tty_start(struct tty_driver *driver) { }
++static inline void accessibility_tty_stop(struct tty_driver *driver) { }
++static inline void accessiblity_tty_scroll(struct vc_data *vc, int t, int b, int nr) { }
++static inline void accessibility_tty_cursorloc(struct vc_data *vc) { }
++
++
++#endif
++
++
++
++#endif
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -95,6 +95,25 @@ config LOCALVERSION_AUTO
+ 
+ 	  which is done within the script "scripts/setlocalversion".)
+ 
++config ACCESSIBILITY
++	bool "Support for accessibility adapters for disabled users"
++	default y
++	help
++	  An adapter is a peripheral device and/or a specialized device
++	  driver that makes Linux accessible to a disabled user.  Some
++	  adapters redirect output to a speech synthesizer or braille
++	  device for the blind.  Other adapters modify keyboard input
++	  for the motor impaired.  In any case, the adapter must somehow
++	  intercept keyboard input and tty output.
++	  These streams are generally hidden deep within the kernel.
++	  If you say y here, kernel modules will have access to keyboard
++	  input and tty output.  Adapters can then be loaded as modules,
++	  without patching and rebuilding the kernel.  The effect on
++	  kernel size and performance is negligible, so you should
++	  probably say y here.
++
++	  Review Documentation/accessibility.txt for more information.
++
+ config SWAP
+ 	bool "Support for paging of anonymous memory (swap)"
+ 	depends on MMU && BLOCK
