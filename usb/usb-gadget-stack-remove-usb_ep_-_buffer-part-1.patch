@@ -1,0 +1,205 @@
+From david-b@pacbell.net Sun Jul  1 11:07:25 2007
+From: David Brownell <david-b@pacbell.net>
+Date: Sun, 1 Jul 2007 11:04:54 -0700
+Subject: usb gadget stack: remove usb_ep_*_buffer(), part 1
+To: Greg KH <greg@kroah.com>
+Cc: linux-usb-devel@lists.sourceforge.net
+Message-ID: <200707011104.55039.david-b@pacbell.net>
+Content-Disposition: inline
+
+
+Remove usb_ep_{alloc,free}_buffer() calls, for small dma-coherent buffers.
+This patch just removes the interface and its users; later patches will
+remove controller driver support.
+
+  - This interface is invariably not implemented correctly in the
+    controller drivers (e.g. using dma pools, a mechanism which
+    post-dates the interface by several years).
+
+  - At this point no gadget driver really *needs* to use it.  In
+    current kernels, any driver that needs such a mechanism could
+    allocate a dma pool themselves.
+
+Removing this interface is thus a simplification and improvement.
+
+Note that the gmidi.c driver had a bug in this area; fixed.
+
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/gadget/file_storage.c |   19 ++++-------------
+ drivers/usb/gadget/gmidi.c        |    8 -------
+ drivers/usb/gadget/inode.c        |    4 +--
+ drivers/usb/gadget/zero.c         |    9 ++------
+ include/linux/usb_gadget.h        |   41 --------------------------------------
+ 5 files changed, 11 insertions(+), 70 deletions(-)
+
+--- a/drivers/usb/gadget/file_storage.c
++++ b/drivers/usb/gadget/file_storage.c
+@@ -3733,19 +3733,12 @@ static void /* __init_or_exit */ fsg_unb
+ 	}
+ 
+ 	/* Free the data buffers */
+-	for (i = 0; i < NUM_BUFFERS; ++i) {
+-		struct fsg_buffhd	*bh = &fsg->buffhds[i];
+-
+-		if (bh->buf)
+-			usb_ep_free_buffer(fsg->bulk_in, bh->buf, bh->dma,
+-					mod_data.buflen);
+-	}
++	for (i = 0; i < NUM_BUFFERS; ++i)
++		kfree(fsg->buffhds[i].buf);
+ 
+ 	/* Free the request and buffer for endpoint 0 */
+ 	if (req) {
+-		if (req->buf)
+-			usb_ep_free_buffer(fsg->ep0, req->buf,
+-					req->dma, EP0_BUFSIZE);
++		kfree(req->buf);
+ 		usb_ep_free_request(fsg->ep0, req);
+ 	}
+ 
+@@ -3972,8 +3965,7 @@ static int __init fsg_bind(struct usb_ga
+ 	fsg->ep0req = req = usb_ep_alloc_request(fsg->ep0, GFP_KERNEL);
+ 	if (!req)
+ 		goto out;
+-	req->buf = usb_ep_alloc_buffer(fsg->ep0, EP0_BUFSIZE,
+-			&req->dma, GFP_KERNEL);
++	req->buf = kmalloc(EP0_BUFSIZE, GFP_KERNEL);
+ 	if (!req->buf)
+ 		goto out;
+ 	req->complete = ep0_complete;
+@@ -3985,8 +3977,7 @@ static int __init fsg_bind(struct usb_ga
+ 		/* Allocate for the bulk-in endpoint.  We assume that
+ 		 * the buffer will also work with the bulk-out (and
+ 		 * interrupt-in) endpoint. */
+-		bh->buf = usb_ep_alloc_buffer(fsg->bulk_in, mod_data.buflen,
+-				&bh->dma, GFP_KERNEL);
++		bh->buf = kmalloc(mod_data.buflen, GFP_KERNEL);
+ 		if (!bh->buf)
+ 			goto out;
+ 		bh->next = bh + 1;
+--- a/drivers/usb/gadget/gmidi.c
++++ b/drivers/usb/gadget/gmidi.c
+@@ -1248,17 +1248,11 @@ autoconf_fail:
+ 	tasklet_init(&dev->tasklet, gmidi_in_tasklet, (unsigned long)dev);
+ 
+ 	/* preallocate control response and buffer */
+-	dev->req = usb_ep_alloc_request(gadget->ep0, GFP_KERNEL);
++	dev->req = alloc_ep_req(gadget->ep0, USB_BUFSIZ);
+ 	if (!dev->req) {
+ 		err = -ENOMEM;
+ 		goto fail;
+ 	}
+-	dev->req->buf = usb_ep_alloc_buffer(gadget->ep0, USB_BUFSIZ,
+-				&dev->req->dma, GFP_KERNEL);
+-	if (!dev->req->buf) {
+-		err = -ENOMEM;
+-		goto fail;
+-	}
+ 
+ 	dev->req->complete = gmidi_setup_complete;
+ 
+--- a/drivers/usb/gadget/inode.c
++++ b/drivers/usb/gadget/inode.c
+@@ -923,7 +923,7 @@ static void clean_req (struct usb_ep *ep
+ 	struct dev_data		*dev = ep->driver_data;
+ 
+ 	if (req->buf != dev->rbuf) {
+-		usb_ep_free_buffer (ep, req->buf, req->dma, req->length);
++		kfree(req->buf);
+ 		req->buf = dev->rbuf;
+ 		req->dma = DMA_ADDR_INVALID;
+ 	}
+@@ -963,7 +963,7 @@ static int setup_req (struct usb_ep *ep,
+ 		return -EBUSY;
+ 	}
+ 	if (len > sizeof (dev->rbuf))
+-		req->buf = usb_ep_alloc_buffer (ep, len, &req->dma, GFP_ATOMIC);
++		req->buf = kmalloc(len, GFP_ATOMIC);
+ 	if (req->buf == 0) {
+ 		req->buf = dev->rbuf;
+ 		return -ENOMEM;
+--- a/drivers/usb/gadget/zero.c
++++ b/drivers/usb/gadget/zero.c
+@@ -481,8 +481,7 @@ alloc_ep_req (struct usb_ep *ep, unsigne
+ 	req = usb_ep_alloc_request (ep, GFP_ATOMIC);
+ 	if (req) {
+ 		req->length = length;
+-		req->buf = usb_ep_alloc_buffer (ep, length,
+-				&req->dma, GFP_ATOMIC);
++		req->buf = kmalloc(length, GFP_ATOMIC);
+ 		if (!req->buf) {
+ 			usb_ep_free_request (ep, req);
+ 			req = NULL;
+@@ -493,8 +492,7 @@ alloc_ep_req (struct usb_ep *ep, unsigne
+ 
+ static void free_ep_req (struct usb_ep *ep, struct usb_request *req)
+ {
+-	if (req->buf)
+-		usb_ep_free_buffer (ep, req->buf, req->dma, req->length);
++	kfree(req->buf);
+ 	usb_ep_free_request (ep, req);
+ }
+ 
+@@ -1199,8 +1197,7 @@ autoconf_fail:
+ 	dev->req = usb_ep_alloc_request (gadget->ep0, GFP_KERNEL);
+ 	if (!dev->req)
+ 		goto enomem;
+-	dev->req->buf = usb_ep_alloc_buffer (gadget->ep0, USB_BUFSIZ,
+-				&dev->req->dma, GFP_KERNEL);
++	dev->req->buf = kmalloc(USB_BUFSIZ, GFP_KERNEL);
+ 	if (!dev->req->buf)
+ 		goto enomem;
+ 
+--- a/include/linux/usb_gadget.h
++++ b/include/linux/usb_gadget.h
+@@ -235,47 +235,6 @@ usb_ep_free_request (struct usb_ep *ep, 
+ }
+ 
+ /**
+- * usb_ep_alloc_buffer - allocate an I/O buffer
+- * @ep:the endpoint associated with the buffer
+- * @len:length of the desired buffer
+- * @dma:pointer to the buffer's DMA address; must be valid
+- * @gfp_flags:GFP_* flags to use
+- *
+- * Returns a new buffer, or null if one could not be allocated.
+- * The buffer is suitably aligned for dma, if that endpoint uses DMA,
+- * and the caller won't have to care about dma-inconsistency
+- * or any hidden "bounce buffer" mechanism.  No additional per-request
+- * DMA mapping will be required for such buffers.
+- * Free it later with usb_ep_free_buffer().
+- *
+- * You don't need to use this call to allocate I/O buffers unless you
+- * want to make sure drivers don't incur costs for such "bounce buffer"
+- * copies or per-request DMA mappings.
+- */
+-static inline void *
+-usb_ep_alloc_buffer (struct usb_ep *ep, unsigned len, dma_addr_t *dma,
+-	gfp_t gfp_flags)
+-{
+-	return ep->ops->alloc_buffer (ep, len, dma, gfp_flags);
+-}
+-
+-/**
+- * usb_ep_free_buffer - frees an i/o buffer
+- * @ep:the endpoint associated with the buffer
+- * @buf:CPU view address of the buffer
+- * @dma:the buffer's DMA address
+- * @len:length of the buffer
+- *
+- * reverses the effect of usb_ep_alloc_buffer().
+- * caller guarantees the buffer will no longer be accessed
+- */
+-static inline void
+-usb_ep_free_buffer (struct usb_ep *ep, void *buf, dma_addr_t dma, unsigned len)
+-{
+-	ep->ops->free_buffer (ep, buf, dma, len);
+-}
+-
+-/**
+  * usb_ep_queue - queues (submits) an I/O request to an endpoint.
+  * @ep:the endpoint associated with the request
+  * @req:the request being submitted

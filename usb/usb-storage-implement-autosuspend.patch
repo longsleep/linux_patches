@@ -1,0 +1,145 @@
+From stern@rowland.harvard.edu Fri Jul  6 11:24:35 2007
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Fri, 6 Jul 2007 14:24:27 -0400 (EDT)
+Subject: [PATCH 2/2] usb-storage: implement autosuspend
+To: Greg KH <greg@kroah.com>
+Cc: Matthew Dharm <mdharm-usb@one-eyed-alien.net>,  Oliver Neukum <oliver@neukum.name>,  USB Storage list <usb-storage@lists.one-eyed-alien.net>,  USB development list <linux-usb-devel@lists.sourceforge.net>
+Message-ID: <Pine.LNX.4.44L0.0707061421270.4777-100000@iolanthe.rowland.org>
+
+
+This patch (as930) implements autosuspend for usb-storage.  It is
+adapted from a patch by Oliver Neukum.  Autosuspend is allowed except
+during LUN scanning, resets, and command execution.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/storage/scsiglue.c |   13 +++++++++----
+ drivers/usb/storage/usb.c      |   27 ++++++++++++++++++++-------
+ 2 files changed, 29 insertions(+), 11 deletions(-)
+
+--- a/drivers/usb/storage/scsiglue.c
++++ b/drivers/usb/storage/scsiglue.c
+@@ -285,10 +285,15 @@ static int device_reset(struct scsi_cmnd
+ 
+ 	US_DEBUGP("%s called\n", __FUNCTION__);
+ 
+-	/* lock the device pointers and do the reset */
+-	mutex_lock(&(us->dev_mutex));
+-	result = us->transport_reset(us);
+-	mutex_unlock(&us->dev_mutex);
++	result = usb_autopm_get_interface(us->pusb_intf);
++	if (result == 0) {
++
++		/* lock the device pointers and do the reset */
++		mutex_lock(&(us->dev_mutex));
++		result = us->transport_reset(us);
++		mutex_unlock(&us->dev_mutex);
++		usb_autopm_put_interface(us->pusb_intf);
++	}
+ 
+ 	return result < 0 ? FAILED : SUCCESS;
+ }
+--- a/drivers/usb/storage/usb.c
++++ b/drivers/usb/storage/usb.c
+@@ -191,16 +191,14 @@ static int storage_suspend(struct usb_in
+ {
+ 	struct us_data *us = usb_get_intfdata(iface);
+ 
++	US_DEBUGP("%s\n", __FUNCTION__);
++
+ 	/* Wait until no command is running */
+ 	mutex_lock(&us->dev_mutex);
+ 
+-	US_DEBUGP("%s\n", __FUNCTION__);
+ 	if (us->suspend_resume_hook)
+ 		(us->suspend_resume_hook)(us, US_SUSPEND);
+ 
+-	/* When runtime PM is working, we'll set a flag to indicate
+-	 * whether we should autoresume when a SCSI request arrives. */
+-
+ 	mutex_unlock(&us->dev_mutex);
+ 	return 0;
+ }
+@@ -209,13 +207,11 @@ static int storage_resume(struct usb_int
+ {
+ 	struct us_data *us = usb_get_intfdata(iface);
+ 
+-	mutex_lock(&us->dev_mutex);
+-
+ 	US_DEBUGP("%s\n", __FUNCTION__);
++
+ 	if (us->suspend_resume_hook)
+ 		(us->suspend_resume_hook)(us, US_RESUME);
+ 
+-	mutex_unlock(&us->dev_mutex);
+ 	return 0;
+ }
+ 
+@@ -313,6 +309,7 @@ static int usb_stor_control_thread(void 
+ {
+ 	struct us_data *us = (struct us_data *)__us;
+ 	struct Scsi_Host *host = us_to_host(us);
++	int autopm_rc;
+ 
+ 	current->flags |= PF_NOFREEZE;
+ 
+@@ -323,6 +320,9 @@ static int usb_stor_control_thread(void 
+ 			
+ 		US_DEBUGP("*** thread awakened.\n");
+ 
++		/* Autoresume the device */
++		autopm_rc = usb_autopm_get_interface_burst(us->pusb_intf);
++
+ 		/* lock the device pointers */
+ 		mutex_lock(&(us->dev_mutex));
+ 
+@@ -381,6 +381,12 @@ static int usb_stor_control_thread(void 
+ 			us->srb->result = SAM_STAT_GOOD;
+ 		}
+ 
++		/* Did the autoresume fail? */
++		else if (autopm_rc < 0) {
++			US_DEBUGP("Could not wake device\n");
++			us->srb->result = DID_ERROR << 16;
++		}
++
+ 		/* we've got a command, let's do it! */
+ 		else {
+ 			US_DEBUG(usb_stor_show_command(us->srb));
+@@ -423,6 +429,10 @@ SkipForAbort:
+ 
+ 		/* unlock the device pointers */
+ 		mutex_unlock(&us->dev_mutex);
++
++		/* Start an autosuspend */
++		if (autopm_rc == 0)
++			usb_autopm_put_interface(us->pusb_intf);
+ 	} /* for (;;) */
+ 
+ 	/* Wait until we are told to stop */
+@@ -939,6 +949,7 @@ retry:
+ 	}
+ 
+ 	scsi_host_put(us_to_host(us));
++	usb_autopm_put_interface(us->pusb_intf);
+ 	complete_and_exit(&threads_gone, 0);
+ }
+ 
+@@ -1028,6 +1039,7 @@ static int storage_probe(struct usb_inte
+ 	 * start it up. */
+ 	scsi_host_get(us_to_host(us));
+ 	atomic_inc(&total_threads);
++	usb_autopm_get_interface(intf); /* dropped in the scanning thread */
+ 	wake_up_process(th);
+ 
+ 	return 0;
+@@ -1065,6 +1077,7 @@ static struct usb_driver usb_storage_dri
+ 	.pre_reset =	storage_pre_reset,
+ 	.post_reset =	storage_post_reset,
+ 	.id_table =	storage_usb_ids,
++	.supports_autosuspend = 1,
+ };
+ 
+ static int __init usb_stor_init(void)

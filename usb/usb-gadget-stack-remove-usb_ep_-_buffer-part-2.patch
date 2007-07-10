@@ -1,0 +1,636 @@
+From david-b@pacbell.net Sun Jul  1 12:21:08 2007
+From: David Brownell <david-b@pacbell.net>
+Date: Sun, 1 Jul 2007 12:21:00 -0700
+Subject: usb gadget stack: remove usb_ep_*_buffer(), part 2
+To: Greg KH <greg@kroah.com>
+Cc: linux-usb-devel@lists.sourceforge.net
+Message-ID: <200707011221.00530.david-b@pacbell.net>
+Content-Disposition: inline
+
+
+This patch removes controller driver infrastructure which supported
+the now-removed usb_ep_{alloc,free}_buffer() calls.
+
+As can be seen, many of the implementations of this were broken to
+various degrees.  Many didn't properly return dma-coherent mappings;
+those which did so were necessarily ugly because of bogosity in the
+underlying dma_free_coherent() calls ... which on many platforms
+can't be called from the same contexts (notably in_irq) from which
+their dma_alloc_coherent() sibling can be called.
+
+The main potential downside of removing this is that gadget drivers
+wouldn't have specific knowledge that the controller drivers have:
+endpoints that aren't dma-capable don't need any dma mappings at all.
+
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/gadget/at91_udc.c     |   21 -------
+ drivers/usb/gadget/dummy_hcd.c    |   36 ------------
+ drivers/usb/gadget/fsl_usb2_udc.c |   36 ------------
+ drivers/usb/gadget/goku_udc.c     |   48 ----------------
+ drivers/usb/gadget/lh7a40x_udc.c  |   27 ---------
+ drivers/usb/gadget/net2280.c      |   97 ----------------------------------
+ drivers/usb/gadget/omap_udc.c     |  108 --------------------------------------
+ drivers/usb/gadget/pxa2xx_udc.c   |   23 --------
+ drivers/usb/gadget/s3c2410_udc.c  |   33 -----------
+ include/linux/usb_gadget.h        |    7 --
+ 10 files changed, 436 deletions(-)
+
+--- a/drivers/usb/gadget/at91_udc.c
++++ b/drivers/usb/gadget/at91_udc.c
+@@ -601,25 +601,6 @@ static void at91_ep_free_request(struct 
+ 	kfree(req);
+ }
+ 
+-static void *at91_ep_alloc_buffer(
+-	struct usb_ep *_ep,
+-	unsigned bytes,
+-	dma_addr_t *dma,
+-	gfp_t gfp_flags)
+-{
+-	*dma = ~0;
+-	return kmalloc(bytes, gfp_flags);
+-}
+-
+-static void at91_ep_free_buffer(
+-	struct usb_ep *ep,
+-	void *buf,
+-	dma_addr_t dma,
+-	unsigned bytes)
+-{
+-	kfree(buf);
+-}
+-
+ static int at91_ep_queue(struct usb_ep *_ep,
+ 			struct usb_request *_req, gfp_t gfp_flags)
+ {
+@@ -788,8 +769,6 @@ static const struct usb_ep_ops at91_ep_o
+ 	.disable	= at91_ep_disable,
+ 	.alloc_request	= at91_ep_alloc_request,
+ 	.free_request	= at91_ep_free_request,
+-	.alloc_buffer	= at91_ep_alloc_buffer,
+-	.free_buffer	= at91_ep_free_buffer,
+ 	.queue		= at91_ep_queue,
+ 	.dequeue	= at91_ep_dequeue,
+ 	.set_halt	= at91_ep_set_halt,
+--- a/drivers/usb/gadget/dummy_hcd.c
++++ b/drivers/usb/gadget/dummy_hcd.c
+@@ -497,38 +497,6 @@ dummy_free_request (struct usb_ep *_ep, 
+ 	kfree (req);
+ }
+ 
+-static void *
+-dummy_alloc_buffer (
+-	struct usb_ep *_ep,
+-	unsigned bytes,
+-	dma_addr_t *dma,
+-	gfp_t mem_flags
+-) {
+-	char			*retval;
+-	struct dummy_ep		*ep;
+-	struct dummy		*dum;
+-
+-	ep = usb_ep_to_dummy_ep (_ep);
+-	dum = ep_to_dummy (ep);
+-
+-	if (!dum->driver)
+-		return NULL;
+-	retval = kmalloc (bytes, mem_flags);
+-	*dma = (dma_addr_t) retval;
+-	return retval;
+-}
+-
+-static void
+-dummy_free_buffer (
+-	struct usb_ep *_ep,
+-	void *buf,
+-	dma_addr_t dma,
+-	unsigned bytes
+-) {
+-	if (bytes)
+-		kfree (buf);
+-}
+-
+ static void
+ fifo_complete (struct usb_ep *ep, struct usb_request *req)
+ {
+@@ -659,10 +627,6 @@ static const struct usb_ep_ops dummy_ep_
+ 	.alloc_request	= dummy_alloc_request,
+ 	.free_request	= dummy_free_request,
+ 
+-	.alloc_buffer	= dummy_alloc_buffer,
+-	.free_buffer	= dummy_free_buffer,
+-	/* map, unmap, ... eventually hook the "generic" dma calls */
+-
+ 	.queue		= dummy_queue,
+ 	.dequeue	= dummy_dequeue,
+ 
+--- a/drivers/usb/gadget/fsl_usb2_udc.c
++++ b/drivers/usb/gadget/fsl_usb2_udc.c
+@@ -601,39 +601,6 @@ static void fsl_free_request(struct usb_
+ 		kfree(req);
+ }
+ 
+-/*------------------------------------------------------------------
+- * Allocate an I/O buffer
+-*---------------------------------------------------------------------*/
+-static void *fsl_alloc_buffer(struct usb_ep *_ep, unsigned bytes,
+-		dma_addr_t *dma, gfp_t gfp_flags)
+-{
+-	struct fsl_ep *ep;
+-
+-	if (!_ep)
+-		return NULL;
+-
+-	ep = container_of(_ep, struct fsl_ep, ep);
+-
+-	return dma_alloc_coherent(ep->udc->gadget.dev.parent,
+-			bytes, dma, gfp_flags);
+-}
+-
+-/*------------------------------------------------------------------
+- * frees an i/o buffer
+-*---------------------------------------------------------------------*/
+-static void fsl_free_buffer(struct usb_ep *_ep, void *buf,
+-		dma_addr_t dma, unsigned bytes)
+-{
+-	struct fsl_ep *ep;
+-
+-	if (!_ep)
+-		return;
+-
+-	ep = container_of(_ep, struct fsl_ep, ep);
+-
+-	dma_free_coherent(ep->udc->gadget.dev.parent, bytes, buf, dma);
+-}
+-
+ /*-------------------------------------------------------------------------*/
+ static int fsl_queue_td(struct fsl_ep *ep, struct fsl_req *req)
+ {
+@@ -1047,9 +1014,6 @@ static struct usb_ep_ops fsl_ep_ops = {
+ 	.alloc_request = fsl_alloc_request,
+ 	.free_request = fsl_free_request,
+ 
+-	.alloc_buffer = fsl_alloc_buffer,
+-	.free_buffer = fsl_free_buffer,
+-
+ 	.queue = fsl_ep_queue,
+ 	.dequeue = fsl_ep_dequeue,
+ 
+--- a/drivers/usb/gadget/goku_udc.c
++++ b/drivers/usb/gadget/goku_udc.c
+@@ -296,51 +296,6 @@ goku_free_request(struct usb_ep *_ep, st
+ 
+ /*-------------------------------------------------------------------------*/
+ 
+-/* allocating buffers this way eliminates dma mapping overhead, which
+- * on some platforms will mean eliminating a per-io buffer copy.  with
+- * some kinds of system caches, further tweaks may still be needed.
+- */
+-static void *
+-goku_alloc_buffer(struct usb_ep *_ep, unsigned bytes,
+-			dma_addr_t *dma, gfp_t gfp_flags)
+-{
+-	void		*retval;
+-	struct goku_ep	*ep;
+-
+-	ep = container_of(_ep, struct goku_ep, ep);
+-	if (!_ep)
+-		return NULL;
+-	*dma = DMA_ADDR_INVALID;
+-
+-	if (ep->dma) {
+-		/* the main problem with this call is that it wastes memory
+-		 * on typical 1/N page allocations: it allocates 1-N pages.
+-		 */
+-#warning Using dma_alloc_coherent even with buffers smaller than a page.
+-		retval = dma_alloc_coherent(&ep->dev->pdev->dev,
+-				bytes, dma, gfp_flags);
+-	} else
+-		retval = kmalloc(bytes, gfp_flags);
+-	return retval;
+-}
+-
+-static void
+-goku_free_buffer(struct usb_ep *_ep, void *buf, dma_addr_t dma, unsigned bytes)
+-{
+-	/* free memory into the right allocator */
+-	if (dma != DMA_ADDR_INVALID) {
+-		struct goku_ep	*ep;
+-
+-		ep = container_of(_ep, struct goku_ep, ep);
+-		if (!_ep)
+-			return;
+-		dma_free_coherent(&ep->dev->pdev->dev, bytes, buf, dma);
+-	} else
+-		kfree (buf);
+-}
+-
+-/*-------------------------------------------------------------------------*/
+-
+ static void
+ done(struct goku_ep *ep, struct goku_request *req, int status)
+ {
+@@ -1026,9 +981,6 @@ static struct usb_ep_ops goku_ep_ops = {
+ 	.alloc_request	= goku_alloc_request,
+ 	.free_request	= goku_free_request,
+ 
+-	.alloc_buffer	= goku_alloc_buffer,
+-	.free_buffer	= goku_free_buffer,
+-
+ 	.queue		= goku_queue,
+ 	.dequeue	= goku_dequeue,
+ 
+--- a/drivers/usb/gadget/lh7a40x_udc.c
++++ b/drivers/usb/gadget/lh7a40x_udc.c
+@@ -75,10 +75,6 @@ static int lh7a40x_ep_enable(struct usb_
+ static int lh7a40x_ep_disable(struct usb_ep *ep);
+ static struct usb_request *lh7a40x_alloc_request(struct usb_ep *ep, gfp_t);
+ static void lh7a40x_free_request(struct usb_ep *ep, struct usb_request *);
+-static void *lh7a40x_alloc_buffer(struct usb_ep *ep, unsigned, dma_addr_t *,
+-				  gfp_t);
+-static void lh7a40x_free_buffer(struct usb_ep *ep, void *, dma_addr_t,
+-				unsigned);
+ static int lh7a40x_queue(struct usb_ep *ep, struct usb_request *, gfp_t);
+ static int lh7a40x_dequeue(struct usb_ep *ep, struct usb_request *);
+ static int lh7a40x_set_halt(struct usb_ep *ep, int);
+@@ -104,9 +100,6 @@ static struct usb_ep_ops lh7a40x_ep_ops 
+ 	.alloc_request = lh7a40x_alloc_request,
+ 	.free_request = lh7a40x_free_request,
+ 
+-	.alloc_buffer = lh7a40x_alloc_buffer,
+-	.free_buffer = lh7a40x_free_buffer,
+-
+ 	.queue = lh7a40x_queue,
+ 	.dequeue = lh7a40x_dequeue,
+ 
+@@ -1134,26 +1127,6 @@ static void lh7a40x_free_request(struct 
+ 	kfree(req);
+ }
+ 
+-static void *lh7a40x_alloc_buffer(struct usb_ep *ep, unsigned bytes,
+-				  dma_addr_t * dma, gfp_t gfp_flags)
+-{
+-	char *retval;
+-
+-	DEBUG("%s (%p, %d, %d)\n", __FUNCTION__, ep, bytes, gfp_flags);
+-
+-	retval = kmalloc(bytes, gfp_flags & ~(__GFP_DMA | __GFP_HIGHMEM));
+-	if (retval)
+-		*dma = virt_to_bus(retval);
+-	return retval;
+-}
+-
+-static void lh7a40x_free_buffer(struct usb_ep *ep, void *buf, dma_addr_t dma,
+-				unsigned bytes)
+-{
+-	DEBUG("%s, %p\n", __FUNCTION__, ep);
+-	kfree(buf);
+-}
+-
+ /** Queue one request
+  *  Kickstart transfer if needed
+  *  NOTE: Sets INDEX register
+--- a/drivers/usb/gadget/net2280.c
++++ b/drivers/usb/gadget/net2280.c
+@@ -450,100 +450,6 @@ net2280_free_request (struct usb_ep *_ep
+ 
+ /*-------------------------------------------------------------------------*/
+ 
+-/*
+- * dma-coherent memory allocation (for dma-capable endpoints)
+- *
+- * NOTE: the dma_*_coherent() API calls suck.  Most implementations are
+- * (a) page-oriented, so small buffers lose big; and (b) asymmetric with
+- * respect to calls with irqs disabled:  alloc is safe, free is not.
+- * We currently work around (b), but not (a).
+- */
+-
+-static void *
+-net2280_alloc_buffer (
+-	struct usb_ep		*_ep,
+-	unsigned		bytes,
+-	dma_addr_t		*dma,
+-	gfp_t			gfp_flags
+-)
+-{
+-	void			*retval;
+-	struct net2280_ep	*ep;
+-
+-	ep = container_of (_ep, struct net2280_ep, ep);
+-	if (!_ep)
+-		return NULL;
+-	*dma = DMA_ADDR_INVALID;
+-
+-	if (ep->dma)
+-		retval = dma_alloc_coherent(&ep->dev->pdev->dev,
+-				bytes, dma, gfp_flags);
+-	else
+-		retval = kmalloc(bytes, gfp_flags);
+-	return retval;
+-}
+-
+-static DEFINE_SPINLOCK(buflock);
+-static LIST_HEAD(buffers);
+-
+-struct free_record {
+-	struct list_head	list;
+-	struct device		*dev;
+-	unsigned		bytes;
+-	dma_addr_t		dma;
+-};
+-
+-static void do_free(unsigned long ignored)
+-{
+-	spin_lock_irq(&buflock);
+-	while (!list_empty(&buffers)) {
+-		struct free_record	*buf;
+-
+-		buf = list_entry(buffers.next, struct free_record, list);
+-		list_del(&buf->list);
+-		spin_unlock_irq(&buflock);
+-
+-		dma_free_coherent(buf->dev, buf->bytes, buf, buf->dma);
+-
+-		spin_lock_irq(&buflock);
+-	}
+-	spin_unlock_irq(&buflock);
+-}
+-
+-static DECLARE_TASKLET(deferred_free, do_free, 0);
+-
+-static void
+-net2280_free_buffer (
+-	struct usb_ep *_ep,
+-	void *address,
+-	dma_addr_t dma,
+-	unsigned bytes
+-) {
+-	/* free memory into the right allocator */
+-	if (dma != DMA_ADDR_INVALID) {
+-		struct net2280_ep	*ep;
+-		struct free_record	*buf = address;
+-		unsigned long		flags;
+-
+-		ep = container_of(_ep, struct net2280_ep, ep);
+-		if (!_ep)
+-			return;
+-
+-		ep = container_of (_ep, struct net2280_ep, ep);
+-		buf->dev = &ep->dev->pdev->dev;
+-		buf->bytes = bytes;
+-		buf->dma = dma;
+-
+-		spin_lock_irqsave(&buflock, flags);
+-		list_add_tail(&buf->list, &buffers);
+-		tasklet_schedule(&deferred_free);
+-		spin_unlock_irqrestore(&buflock, flags);
+-	} else
+-		kfree (address);
+-}
+-
+-/*-------------------------------------------------------------------------*/
+-
+ /* load a packet into the fifo we use for usb IN transfers.
+  * works for all endpoints.
+  *
+@@ -1392,9 +1298,6 @@ static const struct usb_ep_ops net2280_e
+ 	.alloc_request	= net2280_alloc_request,
+ 	.free_request	= net2280_free_request,
+ 
+-	.alloc_buffer	= net2280_alloc_buffer,
+-	.free_buffer	= net2280_free_buffer,
+-
+ 	.queue		= net2280_queue,
+ 	.dequeue	= net2280_dequeue,
+ 
+--- a/drivers/usb/gadget/omap_udc.c
++++ b/drivers/usb/gadget/omap_udc.c
+@@ -296,111 +296,6 @@ omap_free_request(struct usb_ep *ep, str
+ 
+ /*-------------------------------------------------------------------------*/
+ 
+-/*
+- * dma-coherent memory allocation (for dma-capable endpoints)
+- *
+- * NOTE: the dma_*_coherent() API calls suck.  Most implementations are
+- * (a) page-oriented, so small buffers lose big; and (b) asymmetric with
+- * respect to calls with irqs disabled:  alloc is safe, free is not.
+- * We currently work around (b), but not (a).
+- */
+-
+-static void *
+-omap_alloc_buffer(
+-	struct usb_ep	*_ep,
+-	unsigned	bytes,
+-	dma_addr_t	*dma,
+-	gfp_t		gfp_flags
+-)
+-{
+-	void		*retval;
+-	struct omap_ep	*ep;
+-
+-	if (!_ep)
+-		return NULL;
+-
+-	ep = container_of(_ep, struct omap_ep, ep);
+-	if (use_dma && ep->has_dma) {
+-		static int	warned;
+-		if (!warned && bytes < PAGE_SIZE) {
+-			dev_warn(ep->udc->gadget.dev.parent,
+-				"using dma_alloc_coherent for "
+-				"small allocations wastes memory\n");
+-			warned++;
+-		}
+-		return dma_alloc_coherent(ep->udc->gadget.dev.parent,
+-				bytes, dma, gfp_flags);
+-	}
+-
+-	retval = kmalloc(bytes, gfp_flags);
+-	if (retval)
+-		*dma = virt_to_phys(retval);
+-	return retval;
+-}
+-
+-static DEFINE_SPINLOCK(buflock);
+-static LIST_HEAD(buffers);
+-
+-struct free_record {
+-	struct list_head	list;
+-	struct device		*dev;
+-	unsigned		bytes;
+-	dma_addr_t		dma;
+-};
+-
+-static void do_free(unsigned long ignored)
+-{
+-	spin_lock_irq(&buflock);
+-	while (!list_empty(&buffers)) {
+-		struct free_record	*buf;
+-
+-		buf = list_entry(buffers.next, struct free_record, list);
+-		list_del(&buf->list);
+-		spin_unlock_irq(&buflock);
+-
+-		dma_free_coherent(buf->dev, buf->bytes, buf, buf->dma);
+-
+-		spin_lock_irq(&buflock);
+-	}
+-	spin_unlock_irq(&buflock);
+-}
+-
+-static DECLARE_TASKLET(deferred_free, do_free, 0);
+-
+-static void omap_free_buffer(
+-	struct usb_ep	*_ep,
+-	void		*buf,
+-	dma_addr_t	dma,
+-	unsigned	bytes
+-)
+-{
+-	if (!_ep) {
+-		WARN_ON(1);
+-		return;
+-	}
+-
+-	/* free memory into the right allocator */
+-	if (dma != DMA_ADDR_INVALID) {
+-		struct omap_ep		*ep;
+-		struct free_record	*rec = buf;
+-		unsigned long		flags;
+-
+-		ep = container_of(_ep, struct omap_ep, ep);
+-
+-		rec->dev = ep->udc->gadget.dev.parent;
+-		rec->bytes = bytes;
+-		rec->dma = dma;
+-
+-		spin_lock_irqsave(&buflock, flags);
+-		list_add_tail(&rec->list, &buffers);
+-		tasklet_schedule(&deferred_free);
+-		spin_unlock_irqrestore(&buflock, flags);
+-	} else
+-		kfree(buf);
+-}
+-
+-/*-------------------------------------------------------------------------*/
+-
+ static void
+ done(struct omap_ep *ep, struct omap_req *req, int status)
+ {
+@@ -1271,9 +1166,6 @@ static struct usb_ep_ops omap_ep_ops = {
+ 	.alloc_request	= omap_alloc_request,
+ 	.free_request	= omap_free_request,
+ 
+-	.alloc_buffer	= omap_alloc_buffer,
+-	.free_buffer	= omap_free_buffer,
+-
+ 	.queue		= omap_ep_queue,
+ 	.dequeue	= omap_ep_dequeue,
+ 
+--- a/drivers/usb/gadget/pxa2xx_udc.c
++++ b/drivers/usb/gadget/pxa2xx_udc.c
+@@ -341,26 +341,6 @@ pxa2xx_ep_free_request (struct usb_ep *_
+ 	kfree(req);
+ }
+ 
+-
+-static void *
+-pxa2xx_ep_alloc_buffer(struct usb_ep *_ep, unsigned bytes,
+-	dma_addr_t *dma, gfp_t gfp_flags)
+-{
+-	char			*retval;
+-
+-	retval = kmalloc (bytes, gfp_flags & ~(__GFP_DMA|__GFP_HIGHMEM));
+-	if (retval)
+-		*dma = (dma_addr_t)~0;
+-	return retval;
+-}
+-
+-static void
+-pxa2xx_ep_free_buffer(struct usb_ep *_ep, void *buf, dma_addr_t dma,
+-		unsigned bytes)
+-{
+-	kfree (buf);
+-}
+-
+ /*-------------------------------------------------------------------------*/
+ 
+ /*
+@@ -927,9 +907,6 @@ static struct usb_ep_ops pxa2xx_ep_ops =
+ 	.alloc_request	= pxa2xx_ep_alloc_request,
+ 	.free_request	= pxa2xx_ep_free_request,
+ 
+-	.alloc_buffer	= pxa2xx_ep_alloc_buffer,
+-	.free_buffer	= pxa2xx_ep_free_buffer,
+-
+ 	.queue		= pxa2xx_ep_queue,
+ 	.dequeue	= pxa2xx_ep_dequeue,
+ 
+--- a/drivers/usb/gadget/s3c2410_udc.c
++++ b/drivers/usb/gadget/s3c2410_udc.c
+@@ -1197,36 +1197,6 @@ s3c2410_udc_free_request(struct usb_ep *
+ }
+ 
+ /*
+- *	s3c2410_udc_alloc_buffer
+- */
+-static void *s3c2410_udc_alloc_buffer(struct usb_ep *_ep,
+-		unsigned bytes, dma_addr_t *dma, gfp_t mem_flags)
+-{
+-	char *retval;
+-
+-	dprintk(DEBUG_VERBOSE, "%s()\n", __func__);
+-
+-	if (!the_controller->driver)
+-		return NULL;
+-
+-	retval = kmalloc (bytes, mem_flags);
+-	*dma = (dma_addr_t) retval;
+-	return retval;
+-}
+-
+-/*
+- * s3c2410_udc_free_buffer
+- */
+-static void s3c2410_udc_free_buffer (struct usb_ep *_ep, void *buf,
+-		dma_addr_t dma, unsigned bytes)
+-{
+-	dprintk(DEBUG_VERBOSE, "%s()\n", __func__);
+-
+-	if (bytes)
+-		kfree (buf);
+-}
+-
+-/*
+  *	s3c2410_udc_queue
+  */
+ static int s3c2410_udc_queue(struct usb_ep *_ep, struct usb_request *_req,
+@@ -1441,9 +1411,6 @@ static const struct usb_ep_ops s3c2410_e
+ 	.alloc_request	= s3c2410_udc_alloc_request,
+ 	.free_request	= s3c2410_udc_free_request,
+ 
+-	.alloc_buffer	= s3c2410_udc_alloc_buffer,
+-	.free_buffer	= s3c2410_udc_free_buffer,
+-
+ 	.queue		= s3c2410_udc_queue,
+ 	.dequeue	= s3c2410_udc_dequeue,
+ 
+--- a/include/linux/usb_gadget.h
++++ b/include/linux/usb_gadget.h
+@@ -110,13 +110,6 @@ struct usb_ep_ops {
+ 		gfp_t gfp_flags);
+ 	void (*free_request) (struct usb_ep *ep, struct usb_request *req);
+ 
+-	void *(*alloc_buffer) (struct usb_ep *ep, unsigned bytes,
+-		dma_addr_t *dma, gfp_t gfp_flags);
+-	void (*free_buffer) (struct usb_ep *ep, void *buf, dma_addr_t dma,
+-		unsigned bytes);
+-	// NOTE:  on 2.6, drivers may also use dma_map() and
+-	// dma_sync_single_*() to directly manage dma overhead. 
+-
+ 	int (*queue) (struct usb_ep *ep, struct usb_request *req,
+ 		gfp_t gfp_flags);
+ 	int (*dequeue) (struct usb_ep *ep, struct usb_request *req);
