@@ -1,0 +1,89 @@
+From oliver@neukum.org Tue Jul 24 06:11:50 2007
+From: Oliver Neukum <oliver@neukum.org>
+Date: Tue, 24 Jul 2007 15:13:42 +0200
+Subject: USB: fix BUG: sleeping function called from invalid context at /home/jeremy/hg/xen/paravirt/linux/drivers/usb/core/urb.c:524, in_atomic():1, irqs_disabled():0
+To: Alan Stern <stern@rowland.harvard.edu>
+Cc: Jeremy Fitzhardinge <jeremy@goop.org>, Kevin Lloyd <linux@sierrawireless.com>, Greg KH <gregkh@suse.de>, Linux Kernel Mailing List <linux-kernel@vger.kernel.org>, USB development list <linux-usb-devel@lists.sourceforge.net>
+Message-ID: <200707241513.42892.oliver@neukum.org>
+Content-Disposition: inline
+
+
+
+Clearly there's a bug in
+drivers/usb/serial/usb-serial.c:usb_serial_put().  It shouldn't call
+kref_put() while holding a spinlock.
+
+Signed-off-by: Oliver Neukum <oneukum@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/serial/usb-serial.c |   17 ++++++++---------
+ 1 file changed, 8 insertions(+), 9 deletions(-)
+
+--- a/drivers/usb/serial/usb-serial.c
++++ b/drivers/usb/serial/usb-serial.c
+@@ -60,19 +60,19 @@ static struct usb_driver usb_serial_driv
+ 
+ static int debug;
+ static struct usb_serial *serial_table[SERIAL_TTY_MINORS];	/* initially all NULL */
+-static spinlock_t table_lock;
++static DEFINE_MUTEX(table_lock);
+ static LIST_HEAD(usb_serial_driver_list);
+ 
+ struct usb_serial *usb_serial_get_by_index(unsigned index)
+ {
+ 	struct usb_serial *serial;
+ 
+-	spin_lock(&table_lock);
++	mutex_lock(&table_lock);
+ 	serial = serial_table[index];
+ 
+ 	if (serial)
+ 		kref_get(&serial->kref);
+-	spin_unlock(&table_lock);
++	mutex_unlock(&table_lock);
+ 	return serial;
+ }
+ 
+@@ -84,7 +84,7 @@ static struct usb_serial *get_free_seria
+ 	dbg("%s %d", __FUNCTION__, num_ports);
+ 
+ 	*minor = 0;
+-	spin_lock(&table_lock);
++	mutex_lock(&table_lock);
+ 	for (i = 0; i < SERIAL_TTY_MINORS; ++i) {
+ 		if (serial_table[i])
+ 			continue;
+@@ -106,10 +106,10 @@ static struct usb_serial *get_free_seria
+ 			serial_table[i] = serial;
+ 			serial->port[j++]->number = i;
+ 		}
+-		spin_unlock(&table_lock);
++		mutex_unlock(&table_lock);
+ 		return serial;
+ 	}
+-	spin_unlock(&table_lock);
++	mutex_unlock(&table_lock);
+ 	return NULL;
+ }
+ 
+@@ -172,9 +172,9 @@ static void destroy_serial(struct kref *
+ 
+ void usb_serial_put(struct usb_serial *serial)
+ {
+-	spin_lock(&table_lock);
++	mutex_lock(&table_lock);
+ 	kref_put(&serial->kref, destroy_serial);
+-	spin_unlock(&table_lock);
++	mutex_unlock(&table_lock);
+ }
+ 
+ /*****************************************************************************
+@@ -1129,7 +1129,6 @@ static int __init usb_serial_init(void)
+ 		return -ENOMEM;
+ 
+ 	/* Initialize our global data */
+-	spin_lock_init(&table_lock);
+ 	for (i = 0; i < SERIAL_TTY_MINORS; ++i) {
+ 		serial_table[i] = NULL;
+ 	}
