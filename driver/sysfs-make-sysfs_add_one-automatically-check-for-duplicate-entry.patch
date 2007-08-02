@@ -1,0 +1,148 @@
+From htejun@gmail.com  Thu Aug  2 14:30:35 2007
+From: Tejun Heo <htejun@gmail.com>
+Date: Thu, 2 Aug 2007 21:38:03 +0900
+Subject: [PATCH 4/5] sysfs: make sysfs_add_one() automatically check for duplicate entry
+To: ebiederm@xmission.com, gregkh@suse.de, linux-kernel@vger.kernel.org, satyam@infradead.org, cornelia.huck@de.ibm.com, stern@rowland.harvard.edu, htejun@gmail.com
+Cc: Tejun Heo <htejun@gmail.com>
+Message-ID: <11860582831609-git-send-email-htejun@gmail.com>
+
+
+Make sysfs_add_one() check for duplicate entry and return -EEXIST if
+such entry exists.  This simplifies node addition code a bit.
+
+This patch doesn't introduce any noticeable behavior change.
+
+Signed-off-by: Tejun Heo <htejun@gmail.com>
+Acked-by: Cornelia Huck <cornelia.huck@de.ibm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ fs/sysfs/dir.c     |   26 +++++++++++++++++---------
+ fs/sysfs/file.c    |   12 +++++-------
+ fs/sysfs/symlink.c |    9 +++------
+ fs/sysfs/sysfs.h   |    2 +-
+ 4 files changed, 26 insertions(+), 23 deletions(-)
+
+--- a/fs/sysfs/dir.c
++++ b/fs/sysfs/dir.c
+@@ -491,9 +491,16 @@ void sysfs_addrm_start(struct sysfs_addr
+  *
+  *	LOCKING:
+  *	Determined by sysfs_addrm_start().
++ *
++ *	RETURNS:
++ *	0 on success, -EEXIST if entry with the given name already
++ *	exists.
+  */
+-void sysfs_add_one(struct sysfs_addrm_cxt *acxt, struct sysfs_dirent *sd)
++int sysfs_add_one(struct sysfs_addrm_cxt *acxt, struct sysfs_dirent *sd)
+ {
++	if (sysfs_find_dirent(acxt->parent_sd, sd->s_name))
++		return -EEXIST;
++
+ 	sd->s_parent = sysfs_get(acxt->parent_sd);
+ 
+ 	if (sysfs_type(sd) == SYSFS_DIR && acxt->parent_inode)
+@@ -502,6 +509,8 @@ void sysfs_add_one(struct sysfs_addrm_cx
+ 	acxt->cnt++;
+ 
+ 	sysfs_link_sibling(sd);
++
++	return 0;
+ }
+ 
+ /**
+@@ -691,6 +700,7 @@ static int create_dir(struct kobject *ko
+ 	umode_t mode = S_IFDIR| S_IRWXU | S_IRUGO | S_IXUGO;
+ 	struct sysfs_addrm_cxt acxt;
+ 	struct sysfs_dirent *sd;
++	int rc;
+ 
+ 	/* allocate */
+ 	sd = sysfs_new_dirent(name, mode, SYSFS_DIR);
+@@ -700,17 +710,15 @@ static int create_dir(struct kobject *ko
+ 
+ 	/* link in */
+ 	sysfs_addrm_start(&acxt, parent_sd);
++	rc = sysfs_add_one(&acxt, sd);
++	sysfs_addrm_finish(&acxt);
+ 
+-	if (!sysfs_find_dirent(parent_sd, name))
+-		sysfs_add_one(&acxt, sd);
+-
+-	if (!sysfs_addrm_finish(&acxt)) {
++	if (rc == 0)
++		*p_sd = sd;
++	else
+ 		sysfs_put(sd);
+-		return -EEXIST;
+-	}
+ 
+-	*p_sd = sd;
+-	return 0;
++	return rc;
+ }
+ 
+ int sysfs_create_subdir(struct kobject *kobj, const char *name,
+--- a/fs/sysfs/file.c
++++ b/fs/sysfs/file.c
+@@ -397,6 +397,7 @@ int sysfs_add_file(struct sysfs_dirent *
+ 	umode_t mode = (attr->mode & S_IALLUGO) | S_IFREG;
+ 	struct sysfs_addrm_cxt acxt;
+ 	struct sysfs_dirent *sd;
++	int rc;
+ 
+ 	sd = sysfs_new_dirent(attr->name, mode, type);
+ 	if (!sd)
+@@ -404,16 +405,13 @@ int sysfs_add_file(struct sysfs_dirent *
+ 	sd->s_elem.attr.attr = (void *)attr;
+ 
+ 	sysfs_addrm_start(&acxt, dir_sd);
++	rc = sysfs_add_one(&acxt, sd);
++	sysfs_addrm_finish(&acxt);
+ 
+-	if (!sysfs_find_dirent(dir_sd, attr->name))
+-		sysfs_add_one(&acxt, sd);
+-
+-	if (!sysfs_addrm_finish(&acxt)) {
++	if (rc)
+ 		sysfs_put(sd);
+-		return -EEXIST;
+-	}
+ 
+-	return 0;
++	return rc;
+ }
+ 
+ 
+--- a/fs/sysfs/symlink.c
++++ b/fs/sysfs/symlink.c
+@@ -91,14 +91,11 @@ int sysfs_create_link(struct kobject * k
+ 	target_sd = NULL;	/* reference is now owned by the symlink */
+ 
+ 	sysfs_addrm_start(&acxt, parent_sd);
++	error = sysfs_add_one(&acxt, sd);
++	sysfs_addrm_finish(&acxt);
+ 
+-	if (!sysfs_find_dirent(parent_sd, name))
+-		sysfs_add_one(&acxt, sd);
+-
+-	if (!sysfs_addrm_finish(&acxt)) {
+-		error = -EEXIST;
++	if (error)
+ 		goto out_put;
+-	}
+ 
+ 	return 0;
+ 
+--- a/fs/sysfs/sysfs.h
++++ b/fs/sysfs/sysfs.h
+@@ -62,7 +62,7 @@ extern struct sysfs_dirent *sysfs_get_ac
+ extern void sysfs_put_active_two(struct sysfs_dirent *sd);
+ extern void sysfs_addrm_start(struct sysfs_addrm_cxt *acxt,
+ 			      struct sysfs_dirent *parent_sd);
+-extern void sysfs_add_one(struct sysfs_addrm_cxt *acxt,
++extern int sysfs_add_one(struct sysfs_addrm_cxt *acxt,
+ 			  struct sysfs_dirent *sd);
+ extern void sysfs_remove_one(struct sysfs_addrm_cxt *acxt,
+ 			     struct sysfs_dirent *sd);

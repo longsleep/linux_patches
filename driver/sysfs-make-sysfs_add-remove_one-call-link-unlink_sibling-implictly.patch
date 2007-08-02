@@ -1,0 +1,176 @@
+From htejun@gmail.com  Thu Aug  2 14:30:25 2007
+From: Tejun Heo <htejun@gmail.com>
+Date: Thu, 2 Aug 2007 21:38:03 +0900
+Subject: [PATCH 3/5] sysfs: make sysfs_add/remove_one() call link/unlink_sibling() implictly
+To: ebiederm@xmission.com, gregkh@suse.de, linux-kernel@vger.kernel.org, satyam@infradead.org, cornelia.huck@de.ibm.com, stern@rowland.harvard.edu, htejun@gmail.com
+Cc: Tejun Heo <htejun@gmail.com>
+Message-ID: <11860582831967-git-send-email-htejun@gmail.com>
+
+
+When adding or removing a sysfs_dirent, the user used to be required
+to call link/unlink separately.  It was for two reasons - code looked
+like that before sysfs_addrm_cxt conversion and to avoid looping
+through parent_sd->children list twice during removal.
+
+Performance optimization during removal just isn't worth it.  Make
+sysfs_add/remove_one() call sysfs_link/unlink_sibing() implicitly.
+This makes code simpler albeit slightly less efficient.  This change
+doesn't introduce any noticeable behavior change.
+
+Signed-off-by: Tejun Heo <htejun@gmail.com>
+Acked-by: Cornelia Huck <cornelia.huck@de.ibm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ fs/sysfs/dir.c     |   21 ++++++++++-----------
+ fs/sysfs/file.c    |    4 +---
+ fs/sysfs/inode.c   |   17 ++++-------------
+ fs/sysfs/symlink.c |    4 +---
+ fs/sysfs/sysfs.h   |    2 --
+ 5 files changed, 16 insertions(+), 32 deletions(-)
+
+--- a/fs/sysfs/dir.c
++++ b/fs/sysfs/dir.c
+@@ -30,7 +30,7 @@ static DEFINE_IDA(sysfs_ino_ida);
+  *	Locking:
+  *	mutex_lock(sysfs_mutex)
+  */
+-void sysfs_link_sibling(struct sysfs_dirent *sd)
++static void sysfs_link_sibling(struct sysfs_dirent *sd)
+ {
+ 	struct sysfs_dirent *parent_sd = sd->s_parent;
+ 
+@@ -49,7 +49,7 @@ void sysfs_link_sibling(struct sysfs_dir
+  *	Locking:
+  *	mutex_lock(sysfs_mutex)
+  */
+-void sysfs_unlink_sibling(struct sysfs_dirent *sd)
++static void sysfs_unlink_sibling(struct sysfs_dirent *sd)
+ {
+ 	struct sysfs_dirent **pos;
+ 
+@@ -500,6 +500,8 @@ void sysfs_add_one(struct sysfs_addrm_cx
+ 		inc_nlink(acxt->parent_inode);
+ 
+ 	acxt->cnt++;
++
++	sysfs_link_sibling(sd);
+ }
+ 
+ /**
+@@ -521,7 +523,9 @@ void sysfs_add_one(struct sysfs_addrm_cx
+  */
+ void sysfs_remove_one(struct sysfs_addrm_cxt *acxt, struct sysfs_dirent *sd)
+ {
+-	BUG_ON(sd->s_sibling || (sd->s_flags & SYSFS_FLAG_REMOVED));
++	BUG_ON(sd->s_flags & SYSFS_FLAG_REMOVED);
++
++	sysfs_unlink_sibling(sd);
+ 
+ 	sd->s_flags |= SYSFS_FLAG_REMOVED;
+ 	sd->s_sibling = acxt->removed;
+@@ -697,10 +701,8 @@ static int create_dir(struct kobject *ko
+ 	/* link in */
+ 	sysfs_addrm_start(&acxt, parent_sd);
+ 
+-	if (!sysfs_find_dirent(parent_sd, name)) {
++	if (!sysfs_find_dirent(parent_sd, name))
+ 		sysfs_add_one(&acxt, sd);
+-		sysfs_link_sibling(sd);
+-	}
+ 
+ 	if (!sysfs_addrm_finish(&acxt)) {
+ 		sysfs_put(sd);
+@@ -821,7 +823,6 @@ static void remove_dir(struct sysfs_dire
+ 	struct sysfs_addrm_cxt acxt;
+ 
+ 	sysfs_addrm_start(&acxt, sd->s_parent);
+-	sysfs_unlink_sibling(sd);
+ 	sysfs_remove_one(&acxt, sd);
+ 	sysfs_addrm_finish(&acxt);
+ }
+@@ -846,11 +847,9 @@ static void __sysfs_remove_dir(struct sy
+ 	while (*pos) {
+ 		struct sysfs_dirent *sd = *pos;
+ 
+-		if (sysfs_type(sd) && sysfs_type(sd) != SYSFS_DIR) {
+-			*pos = sd->s_sibling;
+-			sd->s_sibling = NULL;
++		if (sysfs_type(sd) && sysfs_type(sd) != SYSFS_DIR)
+ 			sysfs_remove_one(&acxt, sd);
+-		} else
++		else
+ 			pos = &(*pos)->s_sibling;
+ 	}
+ 	sysfs_addrm_finish(&acxt);
+--- a/fs/sysfs/file.c
++++ b/fs/sysfs/file.c
+@@ -405,10 +405,8 @@ int sysfs_add_file(struct sysfs_dirent *
+ 
+ 	sysfs_addrm_start(&acxt, dir_sd);
+ 
+-	if (!sysfs_find_dirent(dir_sd, attr->name)) {
++	if (!sysfs_find_dirent(dir_sd, attr->name))
+ 		sysfs_add_one(&acxt, sd);
+-		sysfs_link_sibling(sd);
+-	}
+ 
+ 	if (!sysfs_addrm_finish(&acxt)) {
+ 		sysfs_put(sd);
+--- a/fs/sysfs/inode.c
++++ b/fs/sysfs/inode.c
+@@ -189,25 +189,16 @@ void sysfs_instantiate(struct dentry *de
+ int sysfs_hash_and_remove(struct sysfs_dirent *dir_sd, const char *name)
+ {
+ 	struct sysfs_addrm_cxt acxt;
+-	struct sysfs_dirent **pos, *sd;
++	struct sysfs_dirent *sd;
+ 
+ 	if (!dir_sd)
+ 		return -ENOENT;
+ 
+ 	sysfs_addrm_start(&acxt, dir_sd);
+ 
+-	for (pos = &dir_sd->s_children; *pos; pos = &(*pos)->s_sibling) {
+-		sd = *pos;
+-
+-		if (!sysfs_type(sd))
+-			continue;
+-		if (!strcmp(sd->s_name, name)) {
+-			*pos = sd->s_sibling;
+-			sd->s_sibling = NULL;
+-			sysfs_remove_one(&acxt, sd);
+-			break;
+-		}
+-	}
++	sd = sysfs_find_dirent(dir_sd, name);
++	if (sd)
++		sysfs_remove_one(&acxt, sd);
+ 
+ 	if (sysfs_addrm_finish(&acxt))
+ 		return 0;
+--- a/fs/sysfs/symlink.c
++++ b/fs/sysfs/symlink.c
+@@ -92,10 +92,8 @@ int sysfs_create_link(struct kobject * k
+ 
+ 	sysfs_addrm_start(&acxt, parent_sd);
+ 
+-	if (!sysfs_find_dirent(parent_sd, name)) {
++	if (!sysfs_find_dirent(parent_sd, name))
+ 		sysfs_add_one(&acxt, sd);
+-		sysfs_link_sibling(sd);
+-	}
+ 
+ 	if (!sysfs_addrm_finish(&acxt)) {
+ 		error = -EEXIST;
+--- a/fs/sysfs/sysfs.h
++++ b/fs/sysfs/sysfs.h
+@@ -56,8 +56,6 @@ extern struct sysfs_dirent sysfs_root;
+ extern struct kmem_cache *sysfs_dir_cachep;
+ 
+ extern struct dentry *sysfs_get_dentry(struct sysfs_dirent *sd);
+-extern void sysfs_link_sibling(struct sysfs_dirent *sd);
+-extern void sysfs_unlink_sibling(struct sysfs_dirent *sd);
+ extern struct sysfs_dirent *sysfs_get_active(struct sysfs_dirent *sd);
+ extern void sysfs_put_active(struct sysfs_dirent *sd);
+ extern struct sysfs_dirent *sysfs_get_active_two(struct sysfs_dirent *sd);

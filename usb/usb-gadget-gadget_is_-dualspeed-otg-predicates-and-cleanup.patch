@@ -1,0 +1,269 @@
+From david-b@pacbell.net  Thu Aug  2 14:27:08 2007
+From: David Brownell <david-b@pacbell.net>
+Date: Wed, 1 Aug 2007 23:58:22 -0700
+Subject: USB: gadget: gadget_is_{dualspeed,otg} predicates and cleanup
+To: Greg KH <greg@kroah.com>
+Cc: linux-usb-devel@lists.sourceforge.net
+Message-ID: <200708012358.22981.david-b@pacbell.net>
+Content-Disposition: inline
+
+
+This adds two small inlines to the gadget stack, which will
+often evaluate to compile-time constants.  That can help
+shrink object code and remove #ifdeffery.
+
+ - gadget_is_dualspeed(), currently always a compile-time
+   constant (depending on which controller is selected).
+
+ - gadget_is_otg(), usually a compile time "false", but this
+   is a runtime test if the platform enables OTG (since it's
+   reasonable to populate boards with different USB sockets).
+
+It also updates two peripheral controller drivers to use these:
+
+ - fsl_usb2_udc, mostly OTG-related bugfixes:  non-OTG devices
+   must follow the rules about drawing VBUS power, and OTG ones
+   need to reject invalid SET_FEATURE requests.
+
+ - omap_udc, just scrubbing a bit of #ifdeffery.
+
+And also gadgetfs, which lost some #ifdefs and moved to a more
+standard handling of DEBUG and VERBOSE_DEBUG.
+
+The main benefits come from patches which will follow.
+
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/gadget/fsl_usb2_udc.c |    9 ++-----
+ drivers/usb/gadget/inode.c        |   44 +++++++++++++++++---------------------
+ drivers/usb/gadget/omap_udc.c     |   10 ++------
+ include/linux/usb_gadget.h        |   33 ++++++++++++++++++++++++++++
+ 4 files changed, 59 insertions(+), 37 deletions(-)
+
+--- a/drivers/usb/gadget/fsl_usb2_udc.c
++++ b/drivers/usb/gadget/fsl_usb2_udc.c
+@@ -1090,14 +1090,11 @@ static int fsl_vbus_session(struct usb_g
+  */
+ static int fsl_vbus_draw(struct usb_gadget *gadget, unsigned mA)
+ {
+-#ifdef CONFIG_USB_OTG
+ 	struct fsl_udc *udc;
+ 
+ 	udc = container_of(gadget, struct fsl_udc, gadget);
+-
+ 	if (udc->transceiver)
+ 		return otg_set_power(udc->transceiver, mA);
+-#endif
+ 	return -ENOTSUPP;
+ }
+ 
+@@ -1319,7 +1316,7 @@ static void setup_received_irq(struct fs
+ 				== USB_RECIP_DEVICE) {
+ 			/* Note: The driver has not include OTG support yet.
+ 			 * This will be set when OTG support is added */
+-			if (!udc->gadget.is_otg)
++			if (!gadget_is_otg(udc->gadget))
+ 				break;
+ 			else if (setup->bRequest == USB_DEVICE_B_HNP_ENABLE)
+ 				udc->gadget.b_hnp_enable = 1;
+@@ -1328,6 +1325,8 @@ static void setup_received_irq(struct fs
+ 			else if (setup->bRequest ==
+ 					USB_DEVICE_A_ALT_HNP_SUPPORT)
+ 				udc->gadget.a_alt_hnp_support = 1;
++			else
++				break;
+ 			rc = 0;
+ 		}
+ 		if (rc == 0) {
+@@ -1835,10 +1834,8 @@ int usb_gadget_unregister_driver(struct 
+ 	if (!driver || driver != udc_controller->driver || !driver->unbind)
+ 		return -EINVAL;
+ 
+-#ifdef CONFIG_USB_OTG
+ 	if (udc_controller->transceiver)
+ 		(void)otg_set_peripheral(udc_controller->transceiver, 0);
+-#endif
+ 
+ 	/* stop DR, disable intr */
+ 	dr_controller_stop(udc_controller);
+--- a/drivers/usb/gadget/inode.c
++++ b/drivers/usb/gadget/inode.c
+@@ -20,8 +20,7 @@
+  */
+ 
+ 
+-// #define	DEBUG			/* data to help fault diagnosis */
+-// #define	VERBOSE		/* extra debug messages (success too) */
++/* #define VERBOSE_DEBUG */
+ 
+ #include <linux/init.h>
+ #include <linux/module.h>
+@@ -253,7 +252,7 @@ static const char *CHIP;
+ 	do { } while (0)
+ #endif /* DEBUG */
+ 
+-#ifdef VERBOSE
++#ifdef VERBOSE_DEBUG
+ #define VDEBUG	DBG
+ #else
+ #define VDEBUG(dev,fmt,args...) \
+@@ -1010,11 +1009,12 @@ ep0_read (struct file *fd, char __user *
+ 			/* assume that was SET_CONFIGURATION */
+ 			if (dev->current_config) {
+ 				unsigned power;
+-#ifdef	CONFIG_USB_GADGET_DUALSPEED
+-				if (dev->gadget->speed == USB_SPEED_HIGH)
++
++				if (gadget_is_dualspeed(dev->gadget)
++						&& (dev->gadget->speed
++							== USB_SPEED_HIGH))
+ 					power = dev->hs_config->bMaxPower;
+ 				else
+-#endif
+ 					power = dev->config->bMaxPower;
+ 				usb_gadget_vbus_draw(dev->gadget, 2 * power);
+ 			}
+@@ -1355,24 +1355,21 @@ static int
+ config_buf (struct dev_data *dev, u8 type, unsigned index)
+ {
+ 	int		len;
+-#ifdef CONFIG_USB_GADGET_DUALSPEED
+-	int		hs;
+-#endif
++	int		hs = 0;
+ 
+ 	/* only one configuration */
+ 	if (index > 0)
+ 		return -EINVAL;
+ 
+-#ifdef CONFIG_USB_GADGET_DUALSPEED
+-	hs = (dev->gadget->speed == USB_SPEED_HIGH);
+-	if (type == USB_DT_OTHER_SPEED_CONFIG)
+-		hs = !hs;
++	if (gadget_is_dualspeed(dev->gadget)) {
++		hs = (dev->gadget->speed == USB_SPEED_HIGH);
++		if (type == USB_DT_OTHER_SPEED_CONFIG)
++			hs = !hs;
++	}
+ 	if (hs) {
+ 		dev->req->buf = dev->hs_config;
+ 		len = le16_to_cpu(dev->hs_config->wTotalLength);
+-	} else
+-#endif
+-	{
++	} else {
+ 		dev->req->buf = dev->config;
+ 		len = le16_to_cpu(dev->config->wTotalLength);
+ 	}
+@@ -1393,13 +1390,13 @@ gadgetfs_setup (struct usb_gadget *gadge
+ 	spin_lock (&dev->lock);
+ 	dev->setup_abort = 0;
+ 	if (dev->state == STATE_DEV_UNCONNECTED) {
+-#ifdef	CONFIG_USB_GADGET_DUALSPEED
+-		if (gadget->speed == USB_SPEED_HIGH && dev->hs_config == NULL) {
++		if (gadget_is_dualspeed(gadget)
++				&& gadget->speed == USB_SPEED_HIGH
++				&& dev->hs_config == NULL) {
+ 			spin_unlock(&dev->lock);
+ 			ERROR (dev, "no high speed config??\n");
+ 			return -EINVAL;
+ 		}
+-#endif	/* CONFIG_USB_GADGET_DUALSPEED */
+ 
+ 		dev->state = STATE_DEV_CONNECTED;
+ 		dev->dev->bMaxPacketSize0 = gadget->ep0->maxpacket;
+@@ -1469,13 +1466,12 @@ gadgetfs_setup (struct usb_gadget *gadge
+ 			// user mode expected to disable endpoints
+ 		} else {
+ 			u8	config, power;
+-#ifdef	CONFIG_USB_GADGET_DUALSPEED
+-			if (gadget->speed == USB_SPEED_HIGH) {
++
++			if (gadget_is_dualspeed(gadget)
++					&& gadget->speed == USB_SPEED_HIGH) {
+ 				config = dev->hs_config->bConfigurationValue;
+ 				power = dev->hs_config->bMaxPower;
+-			} else
+-#endif
+-			{
++			} else {
+ 				config = dev->config->bConfigurationValue;
+ 				power = dev->config->bMaxPower;
+ 			}
+--- a/drivers/usb/gadget/omap_udc.c
++++ b/drivers/usb/gadget/omap_udc.c
+@@ -1241,19 +1241,15 @@ static void pullup_enable(struct omap_ud
+ 	udc->gadget.dev.parent->power.power_state = PMSG_ON;
+ 	udc->gadget.dev.power.power_state = PMSG_ON;
+ 	UDC_SYSCON1_REG |= UDC_PULLUP_EN;
+-#ifndef CONFIG_USB_OTG
+-	if (!cpu_is_omap15xx())
++	if (!gadget_is_otg(udc->gadget) && !cpu_is_omap15xx())
+ 		OTG_CTRL_REG |= OTG_BSESSVLD;
+-#endif
+ 	UDC_IRQ_EN_REG = UDC_DS_CHG_IE;
+ }
+ 
+ static void pullup_disable(struct omap_udc *udc)
+ {
+-#ifndef CONFIG_USB_OTG
+-	if (!cpu_is_omap15xx())
++	if (!gadget_is_otg(udc->gadget) && !cpu_is_omap15xx())
+ 		OTG_CTRL_REG &= ~OTG_BSESSVLD;
+-#endif
+ 	UDC_IRQ_EN_REG = UDC_DS_CHG_IE;
+ 	UDC_SYSCON1_REG &= ~UDC_PULLUP_EN;
+ }
+@@ -1390,7 +1386,7 @@ static void update_otg(struct omap_udc *
+ {
+ 	u16	devstat;
+ 
+-	if (!udc->gadget.is_otg)
++	if (!gadget_is_otg(udc->gadget))
+ 		return;
+ 
+ 	if (OTG_CTRL_REG & OTG_ID)
+--- a/include/linux/usb_gadget.h
++++ b/include/linux/usb_gadget.h
+@@ -480,6 +480,39 @@ static inline void *get_gadget_data (str
+ 
+ 
+ /**
++ * gadget_is_dualspeed - return true iff the hardware handles high speed
++ * @gadget: controller that might support both high and full speeds
++ */
++static inline int gadget_is_dualspeed(struct usb_gadget *g)
++{
++#ifdef CONFIG_USB_GADGET_DUALSPEED
++	/* runtime test would check "g->is_dualspeed" ... that might be
++	 * useful to work around hardware bugs, but is mostly pointless
++	 */
++	return 1;
++#else
++	return 0;
++#endif
++}
++
++/**
++ * gadget_is_otg - return true iff the hardware is OTG-ready
++ * @gadget: controller that might have a Mini-AB connector
++ *
++ * This is a runtime test, since kernels with a USB-OTG stack sometimes
++ * run on boards which only have a Mini-B (or Mini-A) connector.
++ */
++static inline int gadget_is_otg(struct usb_gadget *g)
++{
++#ifdef CONFIG_USB_OTG
++	return g->is_otg;
++#else
++	return 0;
++#endif
++}
++
++
++/**
+  * usb_gadget_frame_number - returns the current frame number
+  * @gadget: controller that reports the frame number
+  *
