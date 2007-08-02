@@ -1,0 +1,65 @@
+From Stuart_Hayes@Dell.com  Wed Aug  1 15:44:06 2007
+From: Stuart Hayes <stuart_hayes@dell.com>
+Date: Wed, 1 Aug 2007 10:55:41 -0500
+Subject: USB: fix bug with EHCI cpufreq patch on nVidia controllers
+To: <greg@kroah.com>, <zaitcev@redhat.com>
+Cc: <stern@rowland.harvard.edu>, <linux-usb-devel@lists.sourceforge.net>
+Message-ID: <DFEF91B22ED07447AB6AA4B237F913F9B18D98@ausx3mpc125.aus.amer.dell.com>
+
+This patch fixes a bug with the cpu frequency change notifier and nVidia
+EHCI controllers.  The nVidia controllers write the transfer overlay
+back to the qtd when they see the "inactivate" bit set in the qh, which
+clears the "active" bit in qtd->hw_token.  When the qh was reactivated,
+the "active" bit in the overlay's hw_token was turned back on, but not
+the one in the qtd.  This caused qh_completions to think that qtd was
+finished even though it wasn't.
+
+Signed-off-by: Stuart Hayes <stuart_hayes@dell.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/ehci-sched.c |   20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+--- a/drivers/usb/host/ehci-sched.c
++++ b/drivers/usb/host/ehci-sched.c
+@@ -548,6 +548,17 @@ static void qh_inactivate_split_intr_qhs
+ 	wmb();
+ }
+ 
++static inline struct ehci_qtd *current_qtd (struct ehci_qh *qh)
++{
++	struct ehci_qtd		*qtd;
++
++	list_for_each_entry (qtd, &qh->qtd_list, qtd_list) {
++		if (cpu_to_le32 (qtd->qtd_dma) == qh->hw_current)
++			return qtd;
++	}
++	return NULL;
++}
++
+ static void qh_reactivate_split_intr_qhs (struct ehci_hcd *ehci)
+ {
+ 	struct ehci_qh	*qh;
+@@ -570,12 +581,21 @@ static void qh_reactivate_split_intr_qhs
+ 			if (safe == 0) {
+ 				not_done = 1;
+ 			} else if (safe > 0) {
++				struct ehci_qtd *qtd;
++
+ 				/* See EHCI 1.0 section 4.15.2.4. */
++				qtd = current_qtd(qh);
+ 				token = qh->hw_token;
+ 				qh->hw_token = (token | halt) & ~active;
+ 				wmb();
+ 				qh->hw_info1 &= ~inactivate;
+ 				wmb();
++				/*
++				 * nVidia controllers write overlay back to qtd
++				 * when qh is inactivated, so reactivate it too.
++				 */
++				if (qtd)
++					qtd->hw_token = token | qh->was_active;
+ 				qh->hw_token = (token & ~halt) | qh->was_active;
+ 			}
+ 		}
