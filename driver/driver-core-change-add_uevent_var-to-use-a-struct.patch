@@ -1,0 +1,2100 @@
+From kay.sievers@vrfy.org  Tue Aug 14 16:02:51 2007
+From: Kay Sievers <kay.sievers@vrfy.org>
+Date: Tue, 14 Aug 2007 15:15:12 +0200
+Subject: Driver core: change add_uevent_var to use a struct
+To: Greg KH <gregkh@suse.de>
+Cc: Pavel Emelyanov <xemul@openvz.org>, Cornelia Huck <cornelia.huck@de.ibm.com>
+Message-ID: <1187097312.4312.21.camel@lov.localdomain>
+
+From: Kay Sievers <kay.sievers@vrfy.org>
+
+this changes the uevent buffer stuff to use a struct instead
+of tons of parameters. It does no longer require the caller to
+do the proper buffer termination and size accounting, which is
+currently wrong in a lot of places.
+
+This tells everything:
+ arch/ia64/sn/kernel/tiocx.c                 |    3 
+ arch/powerpc/kernel/of_device.c             |   37 ++------
+ arch/powerpc/kernel/vio.c                   |   14 ---
+ arch/powerpc/platforms/ps3/system-bus.c     |    9 -
+ block/genhd.c                               |   35 +------
+ drivers/acpi/scan.c                         |   16 +--
+ drivers/amba/bus.c                          |    9 -
+ drivers/base/class.c                        |   44 ++-------
+ drivers/base/core.c                         |   83 +++++-------------
+ drivers/base/firmware_class.c               |   10 --
+ drivers/base/memory.c                       |    3 
+ drivers/base/platform.c                     |    6 -
+ drivers/eisa/eisa-bus.c                     |    9 -
+ drivers/firewire/fw-device.c                |    9 -
+ drivers/firmware/dmi-id.c                   |   14 +--
+ drivers/i2c/i2c-core.c                      |    8 -
+ drivers/ide/ide.c                           |   15 ---
+ drivers/ieee1394/nodemgr.c                  |   17 ---
+ drivers/infiniband/core/sysfs.c             |    9 -
+ drivers/input/input.c                       |   62 ++++---------
+ drivers/input/serio/serio.c                 |   11 --
+ drivers/media/video/pvrusb2/pvrusb2-sysfs.c |    4 
+ drivers/misc/tifm_core.c                    |    9 -
+ drivers/mmc/core/bus.c                      |   11 --
+ drivers/pci/hotplug.c                       |   28 +-----
+ drivers/pci/pci-driver.c                    |    3 
+ drivers/pci/pci.h                           |    3 
+ drivers/pcmcia/cs.c                         |   10 --
+ drivers/pcmcia/ds.c                         |   26 +----
+ drivers/power/power_supply.h                |    3 
+ drivers/power/power_supply_sysfs.c          |   16 +--
+ drivers/s390/cio/ccwgroup.c                 |    3 
+ drivers/s390/cio/device.c                   |   18 +--
+ drivers/s390/crypto/ap_bus.c                |   14 ---
+ drivers/scsi/scsi_sysfs.c                   |    9 -
+ drivers/spi/spi.c                           |    7 -
+ drivers/usb/core/driver.c                   |   29 +-----
+ drivers/usb/core/message.c                  |   17 ---
+ drivers/w1/w1.c                             |   18 +--
+ include/asm-powerpc/of_device.h             |    2 
+ include/linux/device.h                      |   15 +--
+ include/linux/kobject.h                     |   23 +++--
+ lib/kobject_uevent.c                        |  127 +++++++++-------------------
+ net/atm/atm_sysfs.c                         |    7 -
+ net/core/net-sysfs.c                        |   14 ---
+ net/wireless/sysfs.c                        |    3 
+ sound/aoa/soundbus/core.c                   |   27 +----
+ 47 files changed, 264 insertions(+), 605 deletions(-)
+
+Signed-off-by: Kay Sievers <kay.sievers@vrfy.org>
+Cc: Cornelia Huck <cornelia.huck@de.ibm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+--- a/arch/ia64/sn/kernel/tiocx.c
++++ b/arch/ia64/sn/kernel/tiocx.c
+@@ -66,8 +66,7 @@ static int tiocx_match(struct device *de
+ 
+ }
+ 
+-static int tiocx_uevent(struct device *dev, char **envp, int num_envp,
+-			 char *buffer, int buffer_size)
++static int tiocx_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	return -ENODEV;
+ }
+--- a/arch/powerpc/kernel/of_device.c
++++ b/arch/powerpc/kernel/of_device.c
+@@ -57,26 +57,21 @@ ssize_t of_device_get_modalias(struct of
+ 	return tsize;
+ }
+ 
+-int of_device_uevent(struct device *dev,
+-		char **envp, int num_envp, char *buffer, int buffer_size)
++int of_device_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	struct of_device *ofdev;
+ 	const char *compat;
+-	int i = 0, length = 0, seen = 0, cplen, sl;
++	int seen = 0, cplen, sl;
+ 
+ 	if (!dev)
+ 		return -ENODEV;
+ 
+ 	ofdev = to_of_device(dev);
+ 
+-	if (add_uevent_var(envp, num_envp, &i,
+-			   buffer, buffer_size, &length,
+-			   "OF_NAME=%s", ofdev->node->name))
++	if (add_uevent_var(env, "OF_NAME=%s", ofdev->node->name))
+ 		return -ENOMEM;
+ 
+-	if (add_uevent_var(envp, num_envp, &i,
+-			   buffer, buffer_size, &length,
+-			   "OF_TYPE=%s", ofdev->node->type))
++	if (add_uevent_var(env, "OF_TYPE=%s", ofdev->node->type))
+ 		return -ENOMEM;
+ 
+         /* Since the compatible field can contain pretty much anything
+@@ -85,9 +80,7 @@ int of_device_uevent(struct device *dev,
+ 
+ 	compat = of_get_property(ofdev->node, "compatible", &cplen);
+ 	while (compat && *compat && cplen > 0) {
+-		if (add_uevent_var(envp, num_envp, &i,
+-				   buffer, buffer_size, &length,
+-				   "OF_COMPATIBLE_%d=%s", seen, compat))
++		if (add_uevent_var(env, "OF_COMPATIBLE_%d=%s", seen, compat))
+ 			return -ENOMEM;
+ 
+ 		sl = strlen (compat) + 1;
+@@ -96,25 +89,17 @@ int of_device_uevent(struct device *dev,
+ 		seen++;
+ 	}
+ 
+-	if (add_uevent_var(envp, num_envp, &i,
+-			   buffer, buffer_size, &length,
+-			   "OF_COMPATIBLE_N=%d", seen))
++	if (add_uevent_var(env, "OF_COMPATIBLE_N=%d", seen))
+ 		return -ENOMEM;
+ 
+ 	/* modalias is trickier, we add it in 2 steps */
+-	if (add_uevent_var(envp, num_envp, &i,
+-			   buffer, buffer_size, &length,
+-			   "MODALIAS="))
++	if (add_uevent_var(env, "MODALIAS="))
+ 		return -ENOMEM;
+-
+-	sl = of_device_get_modalias(ofdev, &buffer[length-1],
+-					buffer_size-length);
+-	if (sl >= (buffer_size-length))
++	sl = of_device_get_modalias(ofdev, &env->buf[env->buflen-1],
++				    sizeof(env->buf) - env->buflen);
++	if (sl >= (sizeof(env->buf) - env->buflen))
+ 		return -ENOMEM;
+-
+-	length += sl;
+-
+-	envp[i] = NULL;
++	env->buflen += sl + 1;
+ 
+ 	return 0;
+ }
+--- a/arch/powerpc/kernel/vio.c
++++ b/arch/powerpc/kernel/vio.c
+@@ -364,16 +364,11 @@ static int vio_bus_match(struct device *
+ 	return (ids != NULL) && (vio_match_device(ids, vio_dev) != NULL);
+ }
+ 
+-static int vio_hotplug(struct device *dev, char **envp, int num_envp,
+-			char *buffer, int buffer_size)
++static int vio_hotplug(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	const struct vio_dev *vio_dev = to_vio_dev(dev);
+ 	struct device_node *dn;
+ 	const char *cp;
+-	int length;
+-
+-	if (!num_envp)
+-		return -ENOMEM;
+ 
+ 	dn = dev->archdata.of_node;
+ 	if (!dn)
+@@ -382,12 +377,7 @@ static int vio_hotplug(struct device *de
+ 	if (!cp)
+ 		return -ENODEV;
+ 
+-	envp[0] = buffer;
+-	length = scnprintf(buffer, buffer_size, "MODALIAS=vio:T%sS%s",
+-				vio_dev->type, cp);
+-	if ((buffer_size - length) <= 0)
+-		return -ENOMEM;
+-	envp[1] = NULL;
++	add_uevent_var(env, "MODALIAS=vio:T%sS%s", vio_dev->type, cp);
+ 	return 0;
+ }
+ 
+--- a/arch/powerpc/platforms/ps3/system-bus.c
++++ b/arch/powerpc/platforms/ps3/system-bus.c
+@@ -437,18 +437,13 @@ static void ps3_system_bus_shutdown(stru
+ 	dev_dbg(&dev->core, " <- %s:%d\n", __func__, __LINE__);
+ }
+ 
+-static int ps3_system_bus_uevent(struct device *_dev, char **envp,
+-				 int num_envp, char *buffer, int buffer_size)
++static int ps3_system_bus_uevent(struct device *_dev, struct kobj_uevent_env *env)
+ {
+ 	struct ps3_system_bus_device *dev = ps3_dev_to_system_bus_dev(_dev);
+ 	int i = 0, length = 0;
+ 
+-	if (add_uevent_var(envp, num_envp, &i, buffer, buffer_size,
+-			   &length, "MODALIAS=ps3:%d",
+-			   dev->match_id))
++	if (add_uevent_var(env, "MODALIAS=ps3:%d", dev->match_id))
+ 		return -ENOMEM;
+-
+-	envp[i] = NULL;
+ 	return 0;
+ }
+ 
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -540,61 +540,42 @@ static int block_uevent_filter(struct ks
+ 	return ((ktype == &ktype_block) || (ktype == &ktype_part));
+ }
+ 
+-static int block_uevent(struct kset *kset, struct kobject *kobj, char **envp,
+-			 int num_envp, char *buffer, int buffer_size)
++static int block_uevent(struct kset *kset, struct kobject *kobj,
++			struct kobj_uevent_env *env)
+ {
+ 	struct kobj_type *ktype = get_ktype(kobj);
+ 	struct device *physdev;
+ 	struct gendisk *disk;
+ 	struct hd_struct *part;
+-	int length = 0;
+-	int i = 0;
+ 
+ 	if (ktype == &ktype_block) {
+ 		disk = container_of(kobj, struct gendisk, kobj);
+-		add_uevent_var(envp, num_envp, &i, buffer, buffer_size,
+-			       &length, "MINOR=%u", disk->first_minor);
++		add_uevent_var(env, "MINOR=%u", disk->first_minor);
+ 	} else if (ktype == &ktype_part) {
+ 		disk = container_of(kobj->parent, struct gendisk, kobj);
+ 		part = container_of(kobj, struct hd_struct, kobj);
+-		add_uevent_var(envp, num_envp, &i, buffer, buffer_size,
+-			       &length, "MINOR=%u",
++		add_uevent_var(env, "MINOR=%u",
+ 			       disk->first_minor + part->partno);
+ 	} else
+ 		return 0;
+ 
+-	add_uevent_var(envp, num_envp, &i, buffer, buffer_size, &length,
+-		       "MAJOR=%u", disk->major);
++	add_uevent_var(env, "MAJOR=%u", disk->major);
+ 
+ 	/* add physical device, backing this device  */
+ 	physdev = disk->driverfs_dev;
+ 	if (physdev) {
+ 		char *path = kobject_get_path(&physdev->kobj, GFP_KERNEL);
+ 
+-		add_uevent_var(envp, num_envp, &i, buffer, buffer_size,
+-			       &length, "PHYSDEVPATH=%s", path);
++		add_uevent_var(env, "PHYSDEVPATH=%s", path);
+ 		kfree(path);
+ 
+ 		if (physdev->bus)
+-			add_uevent_var(envp, num_envp, &i,
+-				       buffer, buffer_size, &length,
+-				       "PHYSDEVBUS=%s",
+-				       physdev->bus->name);
++			add_uevent_var(env, "PHYSDEVBUS=%s", physdev->bus->name);
+ 
+ 		if (physdev->driver)
+-			add_uevent_var(envp, num_envp, &i,
+-				       buffer, buffer_size, &length,
+-				       "PHYSDEVDRIVER=%s",
+-				       physdev->driver->name);
++			add_uevent_var(env, physdev->driver->name);
+ 	}
+ 
+-	/* terminate, set to next free slot, shrink available space */
+-	envp[i] = NULL;
+-	envp = &envp[i];
+-	num_envp -= i;
+-	buffer = &buffer[length];
+-	buffer_size -= length;
+-
+ 	return 0;
+ }
+ 
+--- a/drivers/acpi/scan.c
++++ b/drivers/acpi/scan.c
+@@ -318,16 +318,18 @@ static int acpi_bus_match(struct device 
+ 	return !acpi_match_device_ids(acpi_dev, acpi_drv->ids);
+ }
+ 
+-static int acpi_device_uevent(struct device *dev, char **envp, int num_envp,
+-			      char *buffer, int buffer_size)
++static int acpi_device_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	struct acpi_device *acpi_dev = to_acpi_device(dev);
++	int len;
+ 
+-	strcpy(buffer, "MODALIAS=");
+-	if (create_modalias(acpi_dev, buffer + 9, buffer_size - 9) > 0) {
+-		envp[0] = buffer;
+-		envp[1] = NULL;
+-	}
++	if (add_uevent_var(env, "MODALIAS="))
++		return -ENOMEM;
++	len = create_modalias(acpi_dev, &env->buf[env->buflen - 1],
++			      sizeof(env->buf) - env->buflen);
++	if (len >= (sizeof(env->buf) - env->buflen))
++		return -ENOMEM;
++	env->buflen += len + 1;
+ 	return 0;
+ }
+ 
+--- a/drivers/amba/bus.c
++++ b/drivers/amba/bus.c
+@@ -44,15 +44,12 @@ static int amba_match(struct device *dev
+ }
+ 
+ #ifdef CONFIG_HOTPLUG
+-static int amba_uevent(struct device *dev, char **envp, int nr_env, char *buf, int bufsz)
++static int amba_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	struct amba_device *pcdev = to_amba_device(dev);
+-	int retval = 0, i = 0, len = 0;
++	int retval = 0;
+ 
+-	retval = add_uevent_var(envp, nr_env, &i,
+-				buf, bufsz, &len,
+-				"AMBA_ID=%08x", pcdev->periphid);
+-	envp[i] = NULL;
++	retval = add_uevent_var(env, "AMBA_ID=%08x", pcdev->periphid);
+ 	return retval;
+ }
+ #else
+--- a/drivers/base/class.c
++++ b/drivers/base/class.c
+@@ -180,8 +180,7 @@ static void class_device_create_release(
+ 
+ /* needed to allow these devices to have parent class devices */
+ static int class_device_create_uevent(struct class_device *class_dev,
+-				       char **envp, int num_envp,
+-				       char *buffer, int buffer_size)
++				      struct kobj_uevent_env *env)
+ {
+ 	pr_debug("%s called for %s\n", __FUNCTION__, class_dev->class_id);
+ 	return 0;
+@@ -403,64 +402,43 @@ static void remove_deprecated_class_devi
+ { }
+ #endif
+ 
+-static int class_uevent(struct kset *kset, struct kobject *kobj, char **envp,
+-			 int num_envp, char *buffer, int buffer_size)
++static int class_uevent(struct kset *kset, struct kobject *kobj,
++			struct kobj_uevent_env *env)
+ {
+ 	struct class_device *class_dev = to_class_dev(kobj);
+ 	struct device *dev = class_dev->dev;
+-	int i = 0;
+-	int length = 0;
+ 	int retval = 0;
+ 
+ 	pr_debug("%s - name = %s\n", __FUNCTION__, class_dev->class_id);
+ 
+ 	if (MAJOR(class_dev->devt)) {
+-		add_uevent_var(envp, num_envp, &i,
+-			       buffer, buffer_size, &length,
+-			       "MAJOR=%u", MAJOR(class_dev->devt));
+-
+-		add_uevent_var(envp, num_envp, &i,
+-			       buffer, buffer_size, &length,
+-			       "MINOR=%u", MINOR(class_dev->devt));
++		add_uevent_var(env, "MAJOR=%u", MAJOR(class_dev->devt));
++
++		add_uevent_var(env, "MINOR=%u", MINOR(class_dev->devt));
+ 	}
+ 
+ 	if (dev) {
+ 		const char *path = kobject_get_path(&dev->kobj, GFP_KERNEL);
+ 		if (path) {
+-			add_uevent_var(envp, num_envp, &i,
+-				       buffer, buffer_size, &length,
+-				       "PHYSDEVPATH=%s", path);
++			add_uevent_var(env, "PHYSDEVPATH=%s", path);
+ 			kfree(path);
+ 		}
+ 
+ 		if (dev->bus)
+-			add_uevent_var(envp, num_envp, &i,
+-				       buffer, buffer_size, &length,
+-				       "PHYSDEVBUS=%s", dev->bus->name);
++			add_uevent_var(env, "PHYSDEVBUS=%s", dev->bus->name);
+ 
+ 		if (dev->driver)
+-			add_uevent_var(envp, num_envp, &i,
+-				       buffer, buffer_size, &length,
+-				       "PHYSDEVDRIVER=%s", dev->driver->name);
++			add_uevent_var(env, "PHYSDEVDRIVER=%s", dev->driver->name);
+ 	}
+ 
+-	/* terminate, set to next free slot, shrink available space */
+-	envp[i] = NULL;
+-	envp = &envp[i];
+-	num_envp -= i;
+-	buffer = &buffer[length];
+-	buffer_size -= length;
+-
+ 	if (class_dev->uevent) {
+ 		/* have the class device specific function add its stuff */
+-		retval = class_dev->uevent(class_dev, envp, num_envp,
+-					    buffer, buffer_size);
++		retval = class_dev->uevent(class_dev, env);
+ 		if (retval)
+ 			pr_debug("class_dev->uevent() returned %d\n", retval);
+ 	} else if (class_dev->class->uevent) {
+ 		/* have the class specific function add its stuff */
+-		retval = class_dev->class->uevent(class_dev, envp, num_envp,
+-						   buffer, buffer_size);
++		retval = class_dev->class->uevent(class_dev, env);
+ 		if (retval)
+ 			pr_debug("class->uevent() returned %d\n", retval);
+ 	}
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@ -141,33 +141,23 @@ static const char *dev_uevent_name(struc
+ 	return NULL;
+ }
+ 
+-static int dev_uevent(struct kset *kset, struct kobject *kobj, char **envp,
+-			int num_envp, char *buffer, int buffer_size)
++static int dev_uevent(struct kset *kset, struct kobject *kobj,
++		      struct kobj_uevent_env *env)
+ {
+ 	struct device *dev = to_dev(kobj);
+-	int i = 0;
+-	int length = 0;
+ 	int retval = 0;
+ 
+ 	/* add the major/minor if present */
+ 	if (MAJOR(dev->devt)) {
+-		add_uevent_var(envp, num_envp, &i,
+-			       buffer, buffer_size, &length,
+-			       "MAJOR=%u", MAJOR(dev->devt));
+-		add_uevent_var(envp, num_envp, &i,
+-			       buffer, buffer_size, &length,
+-			       "MINOR=%u", MINOR(dev->devt));
++		add_uevent_var(env, "MAJOR=%u", MAJOR(dev->devt));
++		add_uevent_var(env, "MINOR=%u", MINOR(dev->devt));
+ 	}
+ 
+ 	if (dev->type && dev->type->name)
+-		add_uevent_var(envp, num_envp, &i,
+-			       buffer, buffer_size, &length,
+-			       "DEVTYPE=%s", dev->type->name);
++		add_uevent_var(env, "DEVTYPE=%s", dev->type->name);
+ 
+ 	if (dev->driver)
+-		add_uevent_var(envp, num_envp, &i,
+-			       buffer, buffer_size, &length,
+-			       "DRIVER=%s", dev->driver->name);
++		add_uevent_var(env, "DRIVER=%s", dev->driver->name);
+ 
+ #ifdef CONFIG_SYSFS_DEPRECATED
+ 	if (dev->class) {
+@@ -181,59 +171,43 @@ static int dev_uevent(struct kset *kset,
+ 
+ 			path = kobject_get_path(&parent->kobj, GFP_KERNEL);
+ 			if (path) {
+-				add_uevent_var(envp, num_envp, &i,
+-					       buffer, buffer_size, &length,
+-					       "PHYSDEVPATH=%s", path);
++				add_uevent_var(env, "PHYSDEVPATH=%s", path);
+ 				kfree(path);
+ 			}
+ 
+-			add_uevent_var(envp, num_envp, &i,
+-				       buffer, buffer_size, &length,
+-				       "PHYSDEVBUS=%s", parent->bus->name);
++			add_uevent_var(env, "PHYSDEVBUS=%s", parent->bus->name);
+ 
+ 			if (parent->driver)
+-				add_uevent_var(envp, num_envp, &i,
+-					       buffer, buffer_size, &length,
+-					       "PHYSDEVDRIVER=%s", parent->driver->name);
++				add_uevent_var(env, "PHYSDEVDRIVER=%s",
++					       parent->driver->name);
+ 		}
+ 	} else if (dev->bus) {
+-		add_uevent_var(envp, num_envp, &i,
+-			       buffer, buffer_size, &length,
+-			       "PHYSDEVBUS=%s", dev->bus->name);
++		add_uevent_var(env, "PHYSDEVBUS=%s", dev->bus->name);
+ 
+ 		if (dev->driver)
+-			add_uevent_var(envp, num_envp, &i,
+-				       buffer, buffer_size, &length,
+-				       "PHYSDEVDRIVER=%s", dev->driver->name);
++			add_uevent_var(env, "PHYSDEVDRIVER=%s", dev->driver->name);
+ 	}
+ #endif
+ 
+-	/* terminate, set to next free slot, shrink available space */
+-	envp[i] = NULL;
+-	envp = &envp[i];
+-	num_envp -= i;
+-	buffer = &buffer[length];
+-	buffer_size -= length;
+-
++	/* have the bus specific function add its stuff */
+ 	if (dev->bus && dev->bus->uevent) {
+-		/* have the bus specific function add its stuff */
+-		retval = dev->bus->uevent(dev, envp, num_envp, buffer, buffer_size);
++		retval = dev->bus->uevent(dev, env);
+ 		if (retval)
+ 			pr_debug ("%s: bus uevent() returned %d\n",
+ 				  __FUNCTION__, retval);
+ 	}
+ 
++	/* have the class specific function add its stuff */
+ 	if (dev->class && dev->class->dev_uevent) {
+-		/* have the class specific function add its stuff */
+-		retval = dev->class->dev_uevent(dev, envp, num_envp, buffer, buffer_size);
++		retval = dev->class->dev_uevent(dev, env);
+ 		if (retval)
+ 			pr_debug("%s: class uevent() returned %d\n",
+ 				 __FUNCTION__, retval);
+ 	}
+ 
++	/* have the device type specific fuction add its stuff */
+ 	if (dev->type && dev->type->uevent) {
+-		/* have the device type specific fuction add its stuff */
+-		retval = dev->type->uevent(dev, envp, num_envp, buffer, buffer_size);
++		retval = dev->type->uevent(dev, env);
+ 		if (retval)
+ 			pr_debug("%s: dev_type uevent() returned %d\n",
+ 				 __FUNCTION__, retval);
+@@ -253,9 +227,7 @@ static ssize_t show_uevent(struct device
+ {
+ 	struct kobject *top_kobj;
+ 	struct kset *kset;
+-	char *envp[32];
+-	char *data = NULL;
+-	char *pos;
++	struct kobj_uevent_env *env = NULL;
+ 	int i;
+ 	size_t count = 0;
+ 	int retval;
+@@ -278,25 +250,20 @@ static ssize_t show_uevent(struct device
+ 		if (!kset->uevent_ops->filter(kset, &dev->kobj))
+ 			goto out;
+ 
+-	data = (char *)get_zeroed_page(GFP_KERNEL);
+-	if (!data)
++	env = kzalloc(sizeof(struct kobj_uevent_env), GFP_KERNEL);
++	if (!env)
+ 		return -ENOMEM;
+ 
+ 	/* let the kset specific function add its keys */
+-	pos = data;
+-	retval = kset->uevent_ops->uevent(kset, &dev->kobj,
+-					  envp, ARRAY_SIZE(envp),
+-					  pos, PAGE_SIZE);
++	retval = kset->uevent_ops->uevent(kset, &dev->kobj, env);
+ 	if (retval)
+ 		goto out;
+ 
+ 	/* copy keys to file */
+-	for (i = 0; envp[i]; i++) {
+-		pos = &buf[count];
+-		count += sprintf(pos, "%s\n", envp[i]);
+-	}
++	for (i = 0; i < env->envp_idx; i++)
++		count += sprintf(&buf[count], "%s\n", env->envp[i]);
+ out:
+-	free_page((unsigned long)data);
++	kfree(env);
+ 	return count;
+ }
+ 
+--- a/drivers/base/firmware_class.c
++++ b/drivers/base/firmware_class.c
+@@ -88,19 +88,15 @@ static CLASS_ATTR(timeout, 0644, firmwar
+ 
+ static void fw_dev_release(struct device *dev);
+ 
+-static int firmware_uevent(struct device *dev, char **envp, int num_envp,
+-			   char *buffer, int buffer_size)
++static int firmware_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	struct firmware_priv *fw_priv = dev_get_drvdata(dev);
+ 	int i = 0, len = 0;
+ 
+-	if (add_uevent_var(envp, num_envp, &i, buffer, buffer_size, &len,
+-			   "FIRMWARE=%s", fw_priv->fw_id))
++	if (add_uevent_var(env, "FIRMWARE=%s", fw_priv->fw_id))
+ 		return -ENOMEM;
+-	if (add_uevent_var(envp, num_envp, &i, buffer, buffer_size, &len,
+-			   "TIMEOUT=%i", loading_timeout))
++	if (add_uevent_var(env, "TIMEOUT=%i", loading_timeout))
+ 		return -ENOMEM;
+-	envp[i] = NULL;
+ 
+ 	return 0;
+ }
+--- a/drivers/base/memory.c
++++ b/drivers/base/memory.c
+@@ -34,8 +34,7 @@ static const char *memory_uevent_name(st
+ 	return MEMORY_CLASS_NAME;
+ }
+ 
+-static int memory_uevent(struct kset *kset, struct kobject *kobj, char **envp,
+-			int num_envp, char *buffer, int buffer_size)
++static int memory_uevent(struct kset *kset, struct kobj_uevent_env *env)
+ {
+ 	int retval = 0;
+ 
+--- a/drivers/base/platform.c
++++ b/drivers/base/platform.c
+@@ -540,13 +540,11 @@ static struct device_attribute platform_
+ 	__ATTR_NULL,
+ };
+ 
+-static int platform_uevent(struct device *dev, char **envp, int num_envp,
+-		char *buffer, int buffer_size)
++static int platform_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	struct platform_device	*pdev = to_platform_device(dev);
+ 
+-	envp[0] = buffer;
+-	snprintf(buffer, buffer_size, "MODALIAS=%s", pdev->name);
++	add_uevent_var(env, "MODALIAS=%s", pdev->name);
+ 	return 0;
+ }
+ 
+--- a/drivers/eisa/eisa-bus.c
++++ b/drivers/eisa/eisa-bus.c
+@@ -128,16 +128,11 @@ static int eisa_bus_match (struct device
+ 	return 0;
+ }
+ 
+-static int eisa_bus_uevent(struct device *dev, char **envp, int num_envp,
+-			   char *buffer, int buffer_size)
++static int eisa_bus_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	struct eisa_device *edev = to_eisa_device(dev);
+-	int i = 0;
+-	int length = 0;
+ 
+-	add_uevent_var(envp, num_envp, &i, buffer, buffer_size, &length,
+-		       "MODALIAS=" EISA_DEVICE_MODALIAS_FMT, edev->id.sig);
+-	envp[i] = NULL;
++	add_uevent_var(env, "MODALIAS=" EISA_DEVICE_MODALIAS_FMT, edev->id.sig);
+ 	return 0;
+ }
+ 
+--- a/drivers/firewire/fw-device.c
++++ b/drivers/firewire/fw-device.c
+@@ -130,8 +130,7 @@ static int get_modalias(struct fw_unit *
+ }
+ 
+ static int
+-fw_unit_uevent(struct device *dev, char **envp, int num_envp,
+-	       char *buffer, int buffer_size)
++fw_unit_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	struct fw_unit *unit = fw_unit(dev);
+ 	char modalias[64];
+@@ -140,13 +139,9 @@ fw_unit_uevent(struct device *dev, char 
+ 
+ 	get_modalias(unit, modalias, sizeof(modalias));
+ 
+-	if (add_uevent_var(envp, num_envp, &i,
+-			   buffer, buffer_size, &length,
+-			   "MODALIAS=%s", modalias))
++	if (add_uevent_var(env, "MODALIAS=%s", modalias))
+ 		return -ENOMEM;
+ 
+-	envp[i] = NULL;
+-
+ 	return 0;
+ }
+ 
+--- a/drivers/firmware/dmi-id.c
++++ b/drivers/firmware/dmi-id.c
+@@ -134,14 +134,16 @@ static struct attribute_group* sys_dmi_a
+ 	NULL
+ };
+ 
+-static int dmi_dev_uevent(struct device *dev, char **envp,
+-			    int num_envp, char *buffer, int buffer_size)
++static int dmi_dev_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+-	strcpy(buffer, "MODALIAS=");
+-	get_modalias(buffer+9, buffer_size-9);
+-	envp[0] = buffer;
+-	envp[1] = NULL;
++	ssize_t len;
+ 
++	if (add_uevent_var(env, "MODALIAS="))
++		return -ENOMEM;
++	len = get_modalias(&env->buf[env->buflen - 1],
++			   sizeof(env->buf) - env->buflen);
++	if (len >= (sizeof(env->buf) - env->buflen))
++		return -ENOMEM;
+ 	return 0;
+ }
+ 
+--- a/drivers/i2c/i2c-core.c
++++ b/drivers/i2c/i2c-core.c
+@@ -67,20 +67,16 @@ static int i2c_device_match(struct devic
+ #ifdef	CONFIG_HOTPLUG
+ 
+ /* uevent helps with hotplug: modprobe -q $(MODALIAS) */
+-static int i2c_device_uevent(struct device *dev, char **envp, int num_envp,
+-		      char *buffer, int buffer_size)
++static int i2c_device_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	struct i2c_client	*client = to_i2c_client(dev);
+-	int			i = 0, length = 0;
+ 
+ 	/* by definition, legacy drivers can't hotplug */
+ 	if (dev->driver || !client->driver_name)
+ 		return 0;
+ 
+-	if (add_uevent_var(envp, num_envp, &i, buffer, buffer_size, &length,
+-			"MODALIAS=%s", client->driver_name))
++	if (add_uevent_var(env, "MODALIAS=%s", client->driver_name))
+ 		return -ENOMEM;
+-	envp[i] = NULL;
+ 	dev_dbg(dev, "uevent\n");
+ 	return 0;
+ }
+--- a/drivers/ide/ide.c
++++ b/drivers/ide/ide.c
+@@ -1651,20 +1651,13 @@ static struct device_attribute ide_dev_a
+ 	__ATTR_NULL
+ };
+ 
+-static int ide_uevent(struct device *dev, char **envp, int num_envp,
+-		      char *buffer, int buffer_size)
++static int ide_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	ide_drive_t *drive = to_ide_device(dev);
+-	int i = 0;
+-	int length = 0;
+ 
+-	add_uevent_var(envp, num_envp, &i, buffer, buffer_size, &length,
+-		       "MEDIA=%s", media_string(drive));
+-	add_uevent_var(envp, num_envp, &i, buffer, buffer_size, &length,
+-		       "DRIVENAME=%s", drive->name);
+-	add_uevent_var(envp, num_envp, &i, buffer, buffer_size, &length,
+-		       "MODALIAS=ide:m-%s", media_string(drive));
+-	envp[i] = NULL;
++	add_uevent_var(env, "MEDIA=%s", media_string(drive));
++	add_uevent_var(env, "DRIVENAME=%s", drive->name);
++	add_uevent_var(env, "MODALIAS=ide:m-%s", media_string(drive));
+ 	return 0;
+ }
+ 
+--- a/drivers/ieee1394/nodemgr.c
++++ b/drivers/ieee1394/nodemgr.c
+@@ -153,8 +153,7 @@ struct host_info {
+ };
+ 
+ static int nodemgr_bus_match(struct device * dev, struct device_driver * drv);
+-static int nodemgr_uevent(struct device *dev, char **envp, int num_envp,
+-			  char *buffer, int buffer_size);
++static int nodemgr_uevent(struct device *dev, struct kobj_uevent_env *env);
+ static void nodemgr_resume_ne(struct node_entry *ne);
+ static void nodemgr_remove_ne(struct node_entry *ne);
+ static struct node_entry *find_entry_by_guid(u64 guid);
+@@ -1160,12 +1159,9 @@ static void nodemgr_process_root_directo
+ 
+ #ifdef CONFIG_HOTPLUG
+ 
+-static int nodemgr_uevent(struct device *dev, char **envp, int num_envp,
+-			  char *buffer, int buffer_size)
++static int nodemgr_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	struct unit_directory *ud;
+-	int i = 0;
+-	int length = 0;
+ 	int retval = 0;
+ 	/* ieee1394:venNmoNspNverN */
+ 	char buf[8 + 1 + 3 + 8 + 2 + 8 + 2 + 8 + 3 + 8 + 1];
+@@ -1180,9 +1176,7 @@ static int nodemgr_uevent(struct device 
+ 
+ #define PUT_ENVP(fmt,val) 					\
+ do {								\
+-	retval = add_uevent_var(envp, num_envp, &i,		\
+-				buffer, buffer_size, &length,	\
+-				fmt, val);			\
++	retval = add_uevent_var(env, fmt, val);		\
+ 	if (retval)						\
+ 		return retval;					\
+ } while (0)
+@@ -1201,15 +1195,12 @@ do {								\
+ 
+ #undef PUT_ENVP
+ 
+-	envp[i] = NULL;
+-
+ 	return 0;
+ }
+ 
+ #else
+ 
+-static int nodemgr_uevent(struct device *dev, char **envp, int num_envp,
+-			  char *buffer, int buffer_size)
++static int nodemgr_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	return -ENODEV;
+ }
+--- a/drivers/infiniband/core/sysfs.c
++++ b/drivers/infiniband/core/sysfs.c
+@@ -434,21 +434,18 @@ static void ib_device_release(struct cla
+ 	kfree(dev);
+ }
+ 
+-static int ib_device_uevent(struct class_device *cdev, char **envp,
+-			    int num_envp, char *buf, int size)
++static int ib_device_uevent(struct class_device *cdev,
++			    struct kobj_uevent_env *env)
+ {
+ 	struct ib_device *dev = container_of(cdev, struct ib_device, class_dev);
+-	int i = 0, len = 0;
+ 
+-	if (add_uevent_var(envp, num_envp, &i, buf, size, &len,
+-			   "NAME=%s", dev->name))
++	if (add_uevent_var(env, "NAME=%s", dev->name))
+ 		return -ENOMEM;
+ 
+ 	/*
+ 	 * It would be nice to pass the node GUID with the event...
+ 	 */
+ 
+-	envp[i] = NULL;
+ 	return 0;
+ }
+ 
+--- a/drivers/input/input.c
++++ b/drivers/input/input.c
+@@ -859,87 +859,66 @@ static void input_dev_release(struct dev
+  * Input uevent interface - loading event handlers based on
+  * device bitfields.
+  */
+-static int input_add_uevent_bm_var(char **envp, int num_envp, int *cur_index,
+-				   char *buffer, int buffer_size, int *cur_len,
++static int input_add_uevent_bm_var(struct kobj_uevent_env *env,
+ 				   const char *name, unsigned long *bitmap, int max)
+ {
+-	if (*cur_index >= num_envp - 1)
+-		return -ENOMEM;
+-
+-	envp[*cur_index] = buffer + *cur_len;
++	int len;
+ 
+-	*cur_len += snprintf(buffer + *cur_len, max(buffer_size - *cur_len, 0), name);
+-	if (*cur_len >= buffer_size)
++	if (add_uevent_var(env, "%s=", name))
+ 		return -ENOMEM;
+ 
+-	*cur_len += input_print_bitmap(buffer + *cur_len,
+-					max(buffer_size - *cur_len, 0),
+-					bitmap, max, 0) + 1;
+-	if (*cur_len > buffer_size)
++	len = input_print_bitmap(&env->buf[env->buflen - 1],
++				 sizeof(env->buf) - env->buflen,
++				 bitmap, max, 0);
++	if (len >= (sizeof(env->buf) - env->buflen))
+ 		return -ENOMEM;
+ 
+-	(*cur_index)++;
++	env->buflen += len + 1;
+ 	return 0;
+ }
+ 
+-static int input_add_uevent_modalias_var(char **envp, int num_envp, int *cur_index,
+-					 char *buffer, int buffer_size, int *cur_len,
++static int input_add_uevent_modalias_var(struct kobj_uevent_env *env,
+ 					 struct input_dev *dev)
+ {
+-	if (*cur_index >= num_envp - 1)
+-		return -ENOMEM;
+-
+-	envp[*cur_index] = buffer + *cur_len;
++	int len;
+ 
+-	*cur_len += snprintf(buffer + *cur_len, max(buffer_size - *cur_len, 0),
+-			     "MODALIAS=");
+-	if (*cur_len >= buffer_size)
++	if (add_uevent_var(env, "MODALIAS="))
+ 		return -ENOMEM;
+ 
+-	*cur_len += input_print_modalias(buffer + *cur_len,
+-					 max(buffer_size - *cur_len, 0),
+-					 dev, 0) + 1;
+-	if (*cur_len > buffer_size)
++	len = input_print_modalias(&env->buf[env->buflen - 1],
++				   sizeof(env->buf) - env->buflen,
++				   dev, 0);
++	if (len >= (sizeof(env->buf) - env->buflen))
+ 		return -ENOMEM;
+ 
+-	(*cur_index)++;
++	env->buflen += len + 1;
+ 	return 0;
+ }
+ 
+ #define INPUT_ADD_HOTPLUG_VAR(fmt, val...)				\
+ 	do {								\
+-		int err = add_uevent_var(envp, num_envp, &i,		\
+-					buffer, buffer_size, &len,	\
+-					fmt, val);			\
++		int err = add_uevent_var(env, fmt, val);		\
+ 		if (err)						\
+ 			return err;					\
+ 	} while (0)
+ 
+ #define INPUT_ADD_HOTPLUG_BM_VAR(name, bm, max)				\
+ 	do {								\
+-		int err = input_add_uevent_bm_var(envp, num_envp, &i,	\
+-					buffer, buffer_size, &len,	\
+-					name, bm, max);			\
++		int err = input_add_uevent_bm_var(env, name, bm, max);	\
+ 		if (err)						\
+ 			return err;					\
+ 	} while (0)
+ 
+ #define INPUT_ADD_HOTPLUG_MODALIAS_VAR(dev)				\
+ 	do {								\
+-		int err = input_add_uevent_modalias_var(envp,		\
+-					num_envp, &i,			\
+-					buffer, buffer_size, &len,	\
+-					dev);				\
++		int err = input_add_uevent_modalias_var(env, dev);	\
+ 		if (err)						\
+ 			return err;					\
+ 	} while (0)
+ 
+-static int input_dev_uevent(struct device *device, char **envp,
+-			    int num_envp, char *buffer, int buffer_size)
++static int input_dev_uevent(struct device *device, struct kobj_uevent_env *env)
+ {
+ 	struct input_dev *dev = to_input_dev(device);
+-	int i = 0;
+-	int len = 0;
+ 
+ 	INPUT_ADD_HOTPLUG_VAR("PRODUCT=%x/%x/%x/%x",
+ 				dev->id.bustype, dev->id.vendor,
+@@ -971,7 +950,6 @@ static int input_dev_uevent(struct devic
+ 
+ 	INPUT_ADD_HOTPLUG_MODALIAS_VAR(dev);
+ 
+-	envp[i] = NULL;
+ 	return 0;
+ }
+ 
+--- a/drivers/input/serio/serio.c
++++ b/drivers/input/serio/serio.c
+@@ -876,18 +876,14 @@ static int serio_bus_match(struct device
+ 
+ #define SERIO_ADD_UEVENT_VAR(fmt, val...)				\
+ 	do {								\
+-		int err = add_uevent_var(envp, num_envp, &i,	\
+-					buffer, buffer_size, &len,	\
+-					fmt, val);			\
++		int err = add_uevent_var(env, fmt, val);		\
+ 		if (err)						\
+ 			return err;					\
+ 	} while (0)
+ 
+-static int serio_uevent(struct device *dev, char **envp, int num_envp, char *buffer, int buffer_size)
++static int serio_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	struct serio *serio;
+-	int i = 0;
+-	int len = 0;
+ 
+ 	if (!dev)
+ 		return -ENODEV;
+@@ -900,7 +896,6 @@ static int serio_uevent(struct device *d
+ 	SERIO_ADD_UEVENT_VAR("SERIO_EXTRA=%02x", serio->id.extra);
+ 	SERIO_ADD_UEVENT_VAR("MODALIAS=serio:ty%02Xpr%02Xid%02Xex%02X",
+ 				serio->id.type, serio->id.proto, serio->id.id, serio->id.extra);
+-	envp[i] = NULL;
+ 
+ 	return 0;
+ }
+@@ -908,7 +903,7 @@ static int serio_uevent(struct device *d
+ 
+ #else
+ 
+-static int serio_uevent(struct device *dev, char **envp, int num_envp, char *buffer, int buffer_size)
++static int serio_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	return -ENODEV;
+ }
+--- a/drivers/media/video/pvrusb2/pvrusb2-sysfs.c
++++ b/drivers/media/video/pvrusb2/pvrusb2-sysfs.c
+@@ -886,8 +886,8 @@ struct pvr2_sysfs *pvr2_sysfs_create(str
+ }
+ 
+ 
+-static int pvr2_sysfs_hotplug(struct class_device *cd,char **envp,
+-			      int numenvp,char *buf,int size)
++static int pvr2_sysfs_hotplug(struct class_device *cd,
++			      struct kobj_uevent_env *env)
+ {
+ 	/* Even though we don't do anything here, we still need this function
+ 	   because sysfs will still try to call it. */
+--- a/drivers/misc/tifm_core.c
++++ b/drivers/misc/tifm_core.c
+@@ -57,16 +57,11 @@ static int tifm_bus_match(struct device 
+ 	return 0;
+ }
+ 
+-static int tifm_uevent(struct device *dev, char **envp, int num_envp,
+-		       char *buffer, int buffer_size)
++static int tifm_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	struct tifm_dev *sock = container_of(dev, struct tifm_dev, dev);
+-	int i = 0;
+-	int length = 0;
+ 
+-	if (add_uevent_var(envp, num_envp, &i, buffer, buffer_size, &length,
+-			   "TIFM_CARD_TYPE=%s",
+-			   tifm_media_type_name(sock->type, 1)))
++	if (add_uevent_var(env, "TIFM_CARD_TYPE=%s", tifm_media_type_name(sock->type, 1)))
+ 		return -ENOMEM;
+ 
+ 	return 0;
+--- a/drivers/mmc/core/bus.c
++++ b/drivers/mmc/core/bus.c
+@@ -55,16 +55,13 @@ static int mmc_bus_match(struct device *
+ }
+ 
+ static int
+-mmc_bus_uevent(struct device *dev, char **envp, int num_envp, char *buf,
+-		int buf_size)
++mmc_bus_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	struct mmc_card *card = dev_to_mmc_card(dev);
+-	int retval = 0, i = 0, length = 0;
++	int retval = 0;
+ 
+ #define add_env(fmt,val) do {					\
+-	retval = add_uevent_var(envp, num_envp, &i,		\
+-				buf, buf_size, &length,		\
+-				fmt, val);			\
++	retval = add_uevent_var(env, fmt, val);			\
+ 	if (retval)						\
+ 		return retval;					\
+ } while (0);
+@@ -82,8 +79,6 @@ mmc_bus_uevent(struct device *dev, char 
+ 
+ #undef add_env
+ 
+-	envp[i] = NULL;
+-
+ 	return 0;
+ }
+ 
+--- a/drivers/pci/hotplug.c
++++ b/drivers/pci/hotplug.c
+@@ -3,12 +3,9 @@
+ #include <linux/module.h>
+ #include "pci.h"
+ 
+-int pci_uevent(struct device *dev, char **envp, int num_envp,
+-	       char *buffer, int buffer_size)
++int pci_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	struct pci_dev *pdev;
+-	int i = 0;
+-	int length = 0;
+ 
+ 	if (!dev)
+ 		return -ENODEV;
+@@ -17,37 +14,24 @@ int pci_uevent(struct device *dev, char 
+ 	if (!pdev)
+ 		return -ENODEV;
+ 
+-	if (add_uevent_var(envp, num_envp, &i,
+-			   buffer, buffer_size, &length,
+-			   "PCI_CLASS=%04X", pdev->class))
++	if (add_uevent_var(env, "PCI_CLASS=%04X", pdev->class))
+ 		return -ENOMEM;
+ 
+-	if (add_uevent_var(envp, num_envp, &i,
+-			   buffer, buffer_size, &length,
+-			   "PCI_ID=%04X:%04X", pdev->vendor, pdev->device))
++	if (add_uevent_var(env, "PCI_ID=%04X:%04X", pdev->vendor, pdev->device))
+ 		return -ENOMEM;
+ 
+-	if (add_uevent_var(envp, num_envp, &i,
+-			   buffer, buffer_size, &length,
+-			   "PCI_SUBSYS_ID=%04X:%04X", pdev->subsystem_vendor,
++	if (add_uevent_var(env, "PCI_SUBSYS_ID=%04X:%04X", pdev->subsystem_vendor,
+ 			   pdev->subsystem_device))
+ 		return -ENOMEM;
+ 
+-	if (add_uevent_var(envp, num_envp, &i,
+-			   buffer, buffer_size, &length,
+-			   "PCI_SLOT_NAME=%s", pci_name(pdev)))
++	if (add_uevent_var(env, "PCI_SLOT_NAME=%s", pci_name(pdev)))
+ 		return -ENOMEM;
+ 
+-	if (add_uevent_var(envp, num_envp, &i,
+-			   buffer, buffer_size, &length,
+-			   "MODALIAS=pci:v%08Xd%08Xsv%08Xsd%08Xbc%02Xsc%02Xi%02x",
++	if (add_uevent_var(env, "MODALIAS=pci:v%08Xd%08Xsv%08Xsd%08Xbc%02Xsc%02Xi%02x",
+ 			   pdev->vendor, pdev->device,
+ 			   pdev->subsystem_vendor, pdev->subsystem_device,
+ 			   (u8)(pdev->class >> 16), (u8)(pdev->class >> 8),
+ 			   (u8)(pdev->class)))
+ 		return -ENOMEM;
+-
+-	envp[i] = NULL;
+-
+ 	return 0;
+ }
+--- a/drivers/pci/pci-driver.c
++++ b/drivers/pci/pci-driver.c
+@@ -532,8 +532,7 @@ void pci_dev_put(struct pci_dev *dev)
+ }
+ 
+ #ifndef CONFIG_HOTPLUG
+-int pci_uevent(struct device *dev, char **envp, int num_envp,
+-	       char *buffer, int buffer_size)
++int pci_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	return -ENODEV;
+ }
+--- a/drivers/pci/pci.h
++++ b/drivers/pci/pci.h
+@@ -1,7 +1,6 @@
+ /* Functions internal to the PCI core code */
+ 
+-extern int pci_uevent(struct device *dev, char **envp, int num_envp,
+-		      char *buffer, int buffer_size);
++extern int pci_uevent(struct device *dev, struct kobj_uevent_env *env);
+ extern int pci_create_sysfs_dev_files(struct pci_dev *pdev);
+ extern void pci_remove_sysfs_dev_files(struct pci_dev *pdev);
+ extern void pci_cleanup_rom(struct pci_dev *dev);
+--- a/drivers/pcmcia/cs.c
++++ b/drivers/pcmcia/cs.c
+@@ -907,18 +907,14 @@ int pcmcia_insert_card(struct pcmcia_soc
+ EXPORT_SYMBOL(pcmcia_insert_card);
+ 
+ 
+-static int pcmcia_socket_uevent(struct device *dev, char **envp,
+-			        int num_envp, char *buffer, int buffer_size)
++static int pcmcia_socket_uevent(struct device *dev,
++				struct kobj_uevent_env *env)
+ {
+ 	struct pcmcia_socket *s = container_of(dev, struct pcmcia_socket, dev);
+-	int i = 0, length = 0;
+ 
+-	if (add_uevent_var(envp, num_envp, &i, buffer, buffer_size,
+-			   &length, "SOCKET_NO=%u", s->sock))
++	if (add_uevent_var(env, "SOCKET_NO=%u", s->sock))
+ 		return -ENOMEM;
+ 
+-	envp[i] = NULL;
+-
+ 	return 0;
+ }
+ 
+--- a/drivers/pcmcia/ds.c
++++ b/drivers/pcmcia/ds.c
+@@ -1064,11 +1064,10 @@ static int pcmcia_bus_match(struct devic
+ 
+ #ifdef CONFIG_HOTPLUG
+ 
+-static int pcmcia_bus_uevent(struct device *dev, char **envp, int num_envp,
+-			     char *buffer, int buffer_size)
++static int pcmcia_bus_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	struct pcmcia_device *p_dev;
+-	int i, length = 0;
++	int i;
+ 	u32 hash[4] = { 0, 0, 0, 0};
+ 
+ 	if (!dev)
+@@ -1083,23 +1082,13 @@ static int pcmcia_bus_uevent(struct devi
+ 		hash[i] = crc32(0, p_dev->prod_id[i], strlen(p_dev->prod_id[i]));
+ 	}
+ 
+-	i = 0;
+-
+-	if (add_uevent_var(envp, num_envp, &i,
+-			   buffer, buffer_size, &length,
+-			   "SOCKET_NO=%u",
+-			   p_dev->socket->sock))
++	if (add_uevent_var(env, "SOCKET_NO=%u", p_dev->socket->sock))
+ 		return -ENOMEM;
+ 
+-	if (add_uevent_var(envp, num_envp, &i,
+-			   buffer, buffer_size, &length,
+-			   "DEVICE_NO=%02X",
+-			   p_dev->device_no))
++	if (add_uevent_var(env, "DEVICE_NO=%02X", p_dev->device_no))
+ 		return -ENOMEM;
+ 
+-	if (add_uevent_var(envp, num_envp, &i,
+-			   buffer, buffer_size, &length,
+-			   "MODALIAS=pcmcia:m%04Xc%04Xf%02Xfn%02Xpfn%02X"
++	if (add_uevent_var(env, "MODALIAS=pcmcia:m%04Xc%04Xf%02Xfn%02Xpfn%02X"
+ 			   "pa%08Xpb%08Xpc%08Xpd%08X",
+ 			   p_dev->has_manf_id ? p_dev->manf_id : 0,
+ 			   p_dev->has_card_id ? p_dev->card_id : 0,
+@@ -1112,15 +1101,12 @@ static int pcmcia_bus_uevent(struct devi
+ 			   hash[3]))
+ 		return -ENOMEM;
+ 
+-	envp[i] = NULL;
+-
+ 	return 0;
+ }
+ 
+ #else
+ 
+-static int pcmcia_bus_uevent(struct device *dev, char **envp, int num_envp,
+-			      char *buffer, int buffer_size)
++static int pcmcia_bus_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	return -ENODEV;
+ }
+--- a/drivers/power/power_supply.h
++++ b/drivers/power/power_supply.h
+@@ -14,8 +14,7 @@
+ 
+ extern int power_supply_create_attrs(struct power_supply *psy);
+ extern void power_supply_remove_attrs(struct power_supply *psy);
+-extern int power_supply_uevent(struct device *dev, char **envp, int num_envp,
+-			       char *buffer, int buffer_size);
++extern int power_supply_uevent(struct device *dev, struct kobj_uevent_env *env);
+ 
+ #else
+ 
+--- a/drivers/power/power_supply_sysfs.c
++++ b/drivers/power/power_supply_sysfs.c
+@@ -195,11 +195,10 @@ static char *kstruprdup(const char *str,
+ 	return ret;
+ }
+ 
+-int power_supply_uevent(struct device *dev, char **envp, int num_envp,
+-			char *buffer, int buffer_size)
++int power_supply_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	struct power_supply *psy = dev_get_drvdata(dev);
+-	int i = 0, length = 0, ret = 0, j;
++	int ret = 0, j;
+ 	char *prop_buf;
+ 	char *attrname;
+ 
+@@ -212,8 +211,7 @@ int power_supply_uevent(struct device *d
+ 
+ 	dev_dbg(dev, "POWER_SUPPLY_NAME=%s\n", psy->name);
+ 
+-	ret = add_uevent_var(envp, num_envp, &i, buffer, buffer_size,
+-			     &length, "POWER_SUPPLY_NAME=%s", psy->name);
++	ret = add_uevent_var(env, "POWER_SUPPLY_NAME=%s", psy->name);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -243,9 +241,7 @@ int power_supply_uevent(struct device *d
+ 
+ 		dev_dbg(dev, "Static prop %s=%s\n", attrname, prop_buf);
+ 
+-		ret = add_uevent_var(envp, num_envp, &i, buffer, buffer_size,
+-				     &length, "POWER_SUPPLY_%s=%s",
+-				     attrname, prop_buf);
++		ret = add_uevent_var(env, "POWER_SUPPLY_%s=%s", attrname, prop_buf);
+ 		kfree(attrname);
+ 		if (ret)
+ 			goto out;
+@@ -282,9 +278,7 @@ int power_supply_uevent(struct device *d
+ 
+ 		dev_dbg(dev, "prop %s=%s\n", attrname, prop_buf);
+ 
+-		ret = add_uevent_var(envp, num_envp, &i, buffer, buffer_size,
+-				     &length, "POWER_SUPPLY_%s=%s",
+-				     attrname, prop_buf);
++		ret = add_uevent_var(env, "POWER_SUPPLY_%s=%s", attrname, prop_buf);
+ 		kfree(attrname);
+ 		if (ret)
+ 			goto out;
+--- a/drivers/s390/cio/ccwgroup.c
++++ b/drivers/s390/cio/ccwgroup.c
+@@ -44,8 +44,7 @@ ccwgroup_bus_match (struct device * dev,
+ 	return 0;
+ }
+ static int
+-ccwgroup_uevent (struct device *dev, char **envp, int num_envp, char *buffer,
+-		  int buffer_size)
++ccwgroup_uevent (struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	/* TODO */
+ 	return 0;
+--- a/drivers/s390/cio/device.c
++++ b/drivers/s390/cio/device.c
+@@ -78,8 +78,7 @@ static int snprint_alias(char *buf, size
+ 
+ /* Set up environment variables for ccw device uevent. Return 0 on success,
+  * non-zero otherwise. */
+-static int ccw_uevent(struct device *dev, char **envp, int num_envp,
+-		      char *buffer, int buffer_size)
++static int ccw_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	struct ccw_device *cdev = to_ccwdev(dev);
+ 	struct ccw_device_id *id = &(cdev->id);
+@@ -89,34 +88,29 @@ static int ccw_uevent(struct device *dev
+ 	char modalias_buf[30];
+ 
+ 	/* CU_TYPE= */
+-	ret = add_uevent_var(envp, num_envp, &i, buffer, buffer_size, &len,
+-			     "CU_TYPE=%04X", id->cu_type);
++	ret = add_uevent_var(env, "CU_TYPE=%04X", id->cu_type);
+ 	if (ret)
+ 		return ret;
+ 
+ 	/* CU_MODEL= */
+-	ret = add_uevent_var(envp, num_envp, &i, buffer, buffer_size, &len,
+-			     "CU_MODEL=%02X", id->cu_model);
++	ret = add_uevent_var(env, "CU_MODEL=%02X", id->cu_model);
+ 	if (ret)
+ 		return ret;
+ 
+ 	/* The next two can be zero, that's ok for us */
+ 	/* DEV_TYPE= */
+-	ret = add_uevent_var(envp, num_envp, &i, buffer, buffer_size, &len,
+-			     "DEV_TYPE=%04X", id->dev_type);
++	ret = add_uevent_var(env, "DEV_TYPE=%04X", id->dev_type);
+ 	if (ret)
+ 		return ret;
+ 
+ 	/* DEV_MODEL= */
+-	ret = add_uevent_var(envp, num_envp, &i, buffer, buffer_size, &len,
+-			     "DEV_MODEL=%02X", id->dev_model);
++	ret = add_uevent_var(env, "DEV_MODEL=%02X", id->dev_model);
+ 	if (ret)
+ 		return ret;
+ 
+ 	/* MODALIAS=  */
+ 	snprint_alias(modalias_buf, sizeof(modalias_buf), id, "");
+-	ret = add_uevent_var(envp, num_envp, &i, buffer, buffer_size, &len,
+-			     "MODALIAS=%s", modalias_buf);
++	ret = add_uevent_var(env, "MODALIAS=%s", modalias_buf);
+ 	return ret;
+ }
+ 
+--- a/drivers/s390/crypto/ap_bus.c
++++ b/drivers/s390/crypto/ap_bus.c
+@@ -458,28 +458,22 @@ static int ap_bus_match(struct device *d
+  * uevent function for AP devices. It sets up a single environment
+  * variable DEV_TYPE which contains the hardware device type.
+  */
+-static int ap_uevent (struct device *dev, char **envp, int num_envp,
+-		       char *buffer, int buffer_size)
++static int ap_uevent (struct device *dev, struct kobj_uevent_env)
+ {
+ 	struct ap_device *ap_dev = to_ap_dev(dev);
+-	int retval = 0, length = 0, i = 0;
++	int retval = 0;
+ 
+ 	if (!ap_dev)
+ 		return -ENODEV;
+ 
+ 	/* Set up DEV_TYPE environment variable. */
+-	retval = add_uevent_var(envp, num_envp, &i,
+-				buffer, buffer_size, &length,
+-				"DEV_TYPE=%04X", ap_dev->device_type);
++	retval = add_uevent_var(env, "DEV_TYPE=%04X", ap_dev->device_type);
+ 	if (retval)
+ 		return retval;
+ 
+ 	/* Add MODALIAS= */
+-	retval = add_uevent_var(envp, num_envp, &i,
+-				buffer, buffer_size, &length,
+-				"MODALIAS=ap:t%02X", ap_dev->device_type);
++	retval = add_uevent_var(env, "MODALIAS=ap:t%02X", ap_dev->device_type);
+ 
+-	envp[i] = NULL;
+ 	return retval;
+ }
+ 
+--- a/drivers/scsi/scsi_sysfs.c
++++ b/drivers/scsi/scsi_sysfs.c
+@@ -277,16 +277,11 @@ static int scsi_bus_match(struct device 
+ 	return (sdp->inq_periph_qual == SCSI_INQ_PQ_CON)? 1: 0;
+ }
+ 
+-static int scsi_bus_uevent(struct device *dev, char **envp, int num_envp,
+-		           char *buffer, int buffer_size)
++static int scsi_bus_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	struct scsi_device *sdev = to_scsi_device(dev);
+-	int i = 0;
+-	int length = 0;
+ 
+-	add_uevent_var(envp, num_envp, &i, buffer, buffer_size, &length,
+-		       "MODALIAS=" SCSI_DEVICE_MODALIAS_FMT, sdev->type);
+-	envp[i] = NULL;
++	add_uevent_var(env, "MODALIAS=" SCSI_DEVICE_MODALIAS_FMT, sdev->type);
+ 	return 0;
+ }
+ 
+--- a/drivers/spi/spi.c
++++ b/drivers/spi/spi.c
+@@ -67,14 +67,11 @@ static int spi_match_device(struct devic
+ 	return strncmp(spi->modalias, drv->name, BUS_ID_SIZE) == 0;
+ }
+ 
+-static int spi_uevent(struct device *dev, char **envp, int num_envp,
+-		char *buffer, int buffer_size)
++static int spi_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	const struct spi_device		*spi = to_spi_device(dev);
+ 
+-	envp[0] = buffer;
+-	snprintf(buffer, buffer_size, "MODALIAS=%s", spi->modalias);
+-	envp[1] = NULL;
++	add_uevent_var("MODALIAS=%s", spi->modalias);
+ 	return 0;
+ }
+ 
+--- a/drivers/usb/core/driver.c
++++ b/drivers/usb/core/driver.c
+@@ -576,12 +576,9 @@ static int usb_device_match(struct devic
+ }
+ 
+ #ifdef	CONFIG_HOTPLUG
+-static int usb_uevent(struct device *dev, char **envp, int num_envp,
+-		      char *buffer, int buffer_size)
++static int usb_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	struct usb_device *usb_dev;
+-	int i = 0;
+-	int length = 0;
+ 
+ 	if (!dev)
+ 		return -ENODEV;
+@@ -610,51 +607,39 @@ static int usb_uevent(struct device *dev
+ 	 * all the device descriptors we don't tell them about.  Or
+ 	 * act as usermode drivers.
+ 	 */
+-	if (add_uevent_var(envp, num_envp, &i,
+-			   buffer, buffer_size, &length,
+-			   "DEVICE=/proc/bus/usb/%03d/%03d",
++	if (add_uevent_var(env, "DEVICE=/proc/bus/usb/%03d/%03d",
+ 			   usb_dev->bus->busnum, usb_dev->devnum))
+ 		return -ENOMEM;
+ #endif
+ 
+ 	/* per-device configurations are common */
+-	if (add_uevent_var(envp, num_envp, &i,
+-			   buffer, buffer_size, &length,
+-			   "PRODUCT=%x/%x/%x",
++	if (add_uevent_var(env, "PRODUCT=%x/%x/%x",
+ 			   le16_to_cpu(usb_dev->descriptor.idVendor),
+ 			   le16_to_cpu(usb_dev->descriptor.idProduct),
+ 			   le16_to_cpu(usb_dev->descriptor.bcdDevice)))
+ 		return -ENOMEM;
+ 
+ 	/* class-based driver binding models */
+-	if (add_uevent_var(envp, num_envp, &i,
+-			   buffer, buffer_size, &length,
+-			   "TYPE=%d/%d/%d",
++	if (add_uevent_var(env, "TYPE=%d/%d/%d",
+ 			   usb_dev->descriptor.bDeviceClass,
+ 			   usb_dev->descriptor.bDeviceSubClass,
+ 			   usb_dev->descriptor.bDeviceProtocol))
+ 		return -ENOMEM;
+ 
+-	if (add_uevent_var(envp, num_envp, &i,
+-			   buffer, buffer_size, &length,
+-			   "BUSNUM=%03d",
++	if (add_uevent_var(env, "BUSNUM=%03d",
+ 			   usb_dev->bus->busnum))
+ 		return -ENOMEM;
+ 
+-	if (add_uevent_var(envp, num_envp, &i,
+-			   buffer, buffer_size, &length,
+-			   "DEVNUM=%03d",
++	if (add_uevent_var(env, "DEVNUM=%03d",
+ 			   usb_dev->devnum))
+ 		return -ENOMEM;
+ 
+-	envp[i] = NULL;
+ 	return 0;
+ }
+ 
+ #else
+ 
+-static int usb_uevent(struct device *dev, char **envp,
+-		      int num_envp, char *buffer, int buffer_size)
++static int usb_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	return -ENODEV;
+ }
+--- a/drivers/usb/core/message.c
++++ b/drivers/usb/core/message.c
+@@ -1339,14 +1339,11 @@ void usb_release_interface(struct device
+ }
+ 
+ #ifdef	CONFIG_HOTPLUG
+-static int usb_if_uevent(struct device *dev, char **envp, int num_envp,
+-		 char *buffer, int buffer_size)
++static int usb_if_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	struct usb_device *usb_dev;
+ 	struct usb_interface *intf;
+ 	struct usb_host_interface *alt;
+-	int i = 0;
+-	int length = 0;
+ 
+ 	if (!dev)
+ 		return -ENODEV;
+@@ -1358,17 +1355,13 @@ static int usb_if_uevent(struct device *
+ 	usb_dev = interface_to_usbdev(intf);
+ 	alt = intf->cur_altsetting;
+ 
+-	if (add_uevent_var(envp, num_envp, &i,
+-		   buffer, buffer_size, &length,
+-		   "INTERFACE=%d/%d/%d",
++	if (add_uevent_var(env, "INTERFACE=%d/%d/%d",
+ 		   alt->desc.bInterfaceClass,
+ 		   alt->desc.bInterfaceSubClass,
+ 		   alt->desc.bInterfaceProtocol))
+ 		return -ENOMEM;
+ 
+-	if (add_uevent_var(envp, num_envp, &i,
+-		   buffer, buffer_size, &length,
+-		   "MODALIAS=usb:v%04Xp%04Xd%04Xdc%02Xdsc%02Xdp%02Xic%02Xisc%02Xip%02X",
++	if (add_uevent_var(env, "MODALIAS=usb:v%04Xp%04Xd%04Xdc%02Xdsc%02Xdp%02Xic%02Xisc%02Xip%02X",
+ 		   le16_to_cpu(usb_dev->descriptor.idVendor),
+ 		   le16_to_cpu(usb_dev->descriptor.idProduct),
+ 		   le16_to_cpu(usb_dev->descriptor.bcdDevice),
+@@ -1380,14 +1373,12 @@ static int usb_if_uevent(struct device *
+ 		   alt->desc.bInterfaceProtocol))
+ 		return -ENOMEM;
+ 
+-	envp[i] = NULL;
+ 	return 0;
+ }
+ 
+ #else
+ 
+-static int usb_if_uevent(struct device *dev, char **envp,
+-			 int num_envp, char *buffer, int buffer_size)
++static int usb_if_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	return -ENODEV;
+ }
+--- a/drivers/w1/w1.c
++++ b/drivers/w1/w1.c
+@@ -197,7 +197,7 @@ static struct w1_family w1_default_famil
+ 	.fops = &w1_default_fops,
+ };
+ 
+-static int w1_uevent(struct device *dev, char **envp, int num_envp, char *buffer, int buffer_size);
++static int w1_uevent(struct device *dev, struct kobj_uevent_env *env);
+ 
+ static struct bus_type w1_bus_type = {
+ 	.name = "w1",
+@@ -396,13 +396,12 @@ static void w1_destroy_master_attributes
+ }
+ 
+ #ifdef CONFIG_HOTPLUG
+-static int w1_uevent(struct device *dev, char **envp, int num_envp,
+-			char *buffer, int buffer_size)
++static int w1_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	struct w1_master *md = NULL;
+ 	struct w1_slave *sl = NULL;
+ 	char *event_owner, *name;
+-	int err, cur_index=0, cur_len=0;
++	int err;
+ 
+ 	if (dev->driver == &w1_master_driver) {
+ 		md = container_of(dev, struct w1_master, dev);
+@@ -423,22 +422,19 @@ static int w1_uevent(struct device *dev,
+ 	if (dev->driver != &w1_slave_driver || !sl)
+ 		return 0;
+ 
+-	err = add_uevent_var(envp, num_envp, &cur_index, buffer, buffer_size,
+-			&cur_len, "W1_FID=%02X", sl->reg_num.family);
++	err = add_uevent_var(env, "W1_FID=%02X", sl->reg_num.family);
+ 	if (err)
+ 		return err;
+ 
+-	err = add_uevent_var(envp, num_envp, &cur_index, buffer, buffer_size,
+-			&cur_len, "W1_SLAVE_ID=%024LX",
+-			(unsigned long long)sl->reg_num.id);
++	err = add_uevent_var(env, "W1_SLAVE_ID=%024LX",
++			     (unsigned long long)sl->reg_num.id);
+ 	if (err)
+ 		return err;
+ 
+ 	return 0;
+ };
+ #else
+-static int w1_uevent(struct device *dev, char **envp, int num_envp,
+-			char *buffer, int buffer_size)
++static int w1_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	return 0;
+ }
+--- a/include/asm-powerpc/of_device.h
++++ b/include/asm-powerpc/of_device.h
+@@ -20,7 +20,7 @@ struct of_device
+ extern ssize_t of_device_get_modalias(struct of_device *ofdev,
+ 					char *str, ssize_t len);
+ extern int of_device_uevent(struct device *dev,
+-	char **envp, int num_envp, char *buffer, int buffer_size);
++			    struct kobj_uevent_env *env);
+ 
+ /* This is just here during the transition */
+ #include <linux/of_device.h>
+--- a/include/linux/device.h
++++ b/include/linux/device.h
+@@ -66,8 +66,7 @@ struct bus_type {
+ 	struct driver_attribute	* drv_attrs;
+ 
+ 	int		(*match)(struct device * dev, struct device_driver * drv);
+-	int		(*uevent)(struct device *dev, char **envp,
+-				  int num_envp, char *buffer, int buffer_size);
++	int		(*uevent)(struct device *dev, struct kobj_uevent_env *env);
+ 	int		(*probe)(struct device * dev);
+ 	int		(*remove)(struct device * dev);
+ 	void		(*shutdown)(struct device * dev);
+@@ -187,10 +186,8 @@ struct class {
+ 	struct class_device_attribute	* class_dev_attrs;
+ 	struct device_attribute		* dev_attrs;
+ 
+-	int	(*uevent)(struct class_device *dev, char **envp,
+-			   int num_envp, char *buffer, int buffer_size);
+-	int	(*dev_uevent)(struct device *dev, char **envp, int num_envp,
+-				char *buffer, int buffer_size);
++	int	(*uevent)(struct class_device *dev, struct kobj_uevent_env *env);
++	int	(*dev_uevent)(struct device *dev, struct kobj_uevent_env *env);
+ 
+ 	void	(*release)(struct class_device *dev);
+ 	void	(*class_release)(struct class *class);
+@@ -266,8 +263,7 @@ struct class_device {
+ 	struct attribute_group  ** groups;	/* optional groups */
+ 
+ 	void	(*release)(struct class_device *dev);
+-	int	(*uevent)(struct class_device *dev, char **envp,
+-			   int num_envp, char *buffer, int buffer_size);
++	int	(*uevent)(struct class_device *dev, struct kobj_uevent_env *env);
+ 	char	class_id[BUS_ID_SIZE];	/* unique to this class */
+ };
+ 
+@@ -335,8 +331,7 @@ extern void class_device_destroy(struct 
+ struct device_type {
+ 	const char *name;
+ 	struct attribute_group **groups;
+-	int (*uevent)(struct device *dev, char **envp, int num_envp,
+-		      char *buffer, int buffer_size);
++	int (*uevent)(struct device *dev, struct kobj_uevent_env *env);
+ 	void (*release)(struct device *dev);
+ 	int (*suspend)(struct device * dev, pm_message_t state);
+ 	int (*resume)(struct device * dev);
+--- a/include/linux/kobject.h
++++ b/include/linux/kobject.h
+@@ -29,6 +29,8 @@
+ 
+ #define KOBJ_NAME_LEN			20
+ #define UEVENT_HELPER_PATH_LEN		256
++#define UEVENT_NUM_ENVP			32	/* number of env pointers */
++#define UEVENT_BUFFER_SIZE		2048	/* buffer for the variables */
+ 
+ /* path to the userspace helper executed on an event */
+ extern char uevent_helper[];
+@@ -111,11 +113,18 @@ struct kobj_type {
+ 	struct attribute	** default_attrs;
+ };
+ 
++struct kobj_uevent_env {
++	char *envp[UEVENT_NUM_ENVP];
++	int envp_idx;
++	char buf[UEVENT_BUFFER_SIZE];
++	int buflen;
++};
++
+ struct kset_uevent_ops {
+ 	int (*filter)(struct kset *kset, struct kobject *kobj);
+ 	const char *(*name)(struct kset *kset, struct kobject *kobj);
+-	int (*uevent)(struct kset *kset, struct kobject *kobj, char **envp,
+-			int num_envp, char *buffer, int buffer_size);
++	int (*uevent)(struct kset *kset, struct kobject *kobj,
++		      struct kobj_uevent_env *env);
+ };
+ 
+ /*
+@@ -275,10 +284,8 @@ int kobject_uevent(struct kobject *kobj,
+ int kobject_uevent_env(struct kobject *kobj, enum kobject_action action,
+ 			char *envp[]);
+ 
+-int add_uevent_var(char **envp, int num_envp, int *cur_index,
+-			char *buffer, int buffer_size, int *cur_len,
+-			const char *format, ...)
+-	__attribute__((format (printf, 7, 8)));
++int add_uevent_var(struct kobj_uevent_env *env, const char *format, ...)
++	__attribute__((format (printf, 2, 3)));
+ #else
+ static inline int kobject_uevent(struct kobject *kobj, enum kobject_action action)
+ { return 0; }
+@@ -287,9 +294,7 @@ static inline int kobject_uevent_env(str
+ 				      char *envp[])
+ { return 0; }
+ 
+-static inline int add_uevent_var(char **envp, int num_envp, int *cur_index,
+-				      char *buffer, int buffer_size, int *cur_len, 
+-				      const char *format, ...)
++static inline int add_uevent_var(struct kobj_uevent_env *env, const char *format, ...)
+ { return 0; }
+ #endif
+ 
+--- a/lib/kobject_uevent.c
++++ b/lib/kobject_uevent.c
+@@ -22,8 +22,6 @@
+ #include <linux/kobject.h>
+ #include <net/sock.h>
+ 
+-#define BUFFER_SIZE	2048	/* buffer for the variables */
+-#define NUM_ENVP	32	/* number of env pointers */
+ 
+ /* the strings here must match the enum in include/linux/kobject.h */
+ const char *kobject_actions[] = {
+@@ -54,31 +52,21 @@ static struct sock *uevent_sock;
+  * corresponding error when it fails.
+  */
+ int kobject_uevent_env(struct kobject *kobj, enum kobject_action action,
+-			char *envp_ext[])
++		       char *envp_ext[])
+ {
+-	char **envp;
+-	char *buffer;
+-	char *scratch;
+-	const char *action_string;
++	struct kobj_uevent_env *env;
++	const char *action_string = kobject_actions[action];
+ 	const char *devpath = NULL;
+ 	const char *subsystem;
+ 	struct kobject *top_kobj;
+ 	struct kset *kset;
+ 	struct kset_uevent_ops *uevent_ops;
+ 	u64 seq;
+-	char *seq_buff;
+ 	int i = 0;
+ 	int retval = 0;
+-	int j;
+ 
+ 	pr_debug("%s\n", __FUNCTION__);
+ 
+-	action_string = kobject_actions[action];
+-	if (!action_string) {
+-		pr_debug("kobject attempted to send uevent without action_string!\n");
+-		return -EINVAL;
+-	}
+-
+ 	/* search the kset we belong to */
+ 	top_kobj = kobj;
+ 	while (!top_kobj->kset && top_kobj->parent) {
+@@ -92,7 +80,7 @@ int kobject_uevent_env(struct kobject *k
+ 	kset = top_kobj->kset;
+ 	uevent_ops = kset->uevent_ops;
+ 
+-	/*  skip the event, if the filter returns zero. */
++	/* skip the event, if the filter returns zero. */
+ 	if (uevent_ops && uevent_ops->filter)
+ 		if (!uevent_ops->filter(kset, kobj)) {
+ 			pr_debug("kobject filter function caused the event to drop!\n");
+@@ -109,18 +97,11 @@ int kobject_uevent_env(struct kobject *k
+ 		return 0;
+ 	}
+ 
+-	/* environment index */
+-	envp = kzalloc(NUM_ENVP * sizeof (char *), GFP_KERNEL);
+-	if (!envp)
++	/* environment buffer */
++	env = kzalloc(sizeof(struct kobj_uevent_env), GFP_KERNEL);
++	if (!env)
+ 		return -ENOMEM;
+ 
+-	/* environment values */
+-	buffer = kmalloc(BUFFER_SIZE, GFP_KERNEL);
+-	if (!buffer) {
+-		retval = -ENOMEM;
+-		goto exit;
+-	}
+-
+ 	/* complete object path */
+ 	devpath = kobject_get_path(kobj, GFP_KERNEL);
+ 	if (!devpath) {
+@@ -128,29 +109,19 @@ int kobject_uevent_env(struct kobject *k
+ 		goto exit;
+ 	}
+ 
+-	/* event environemnt for helper process only */
+-	envp[i++] = "HOME=/";
+-	envp[i++] = "PATH=/sbin:/bin:/usr/sbin:/usr/bin";
+-
+ 	/* default keys */
+-	scratch = buffer;
+-	envp [i++] = scratch;
+-	scratch += sprintf(scratch, "ACTION=%s", action_string) + 1;
+-	envp [i++] = scratch;
+-	scratch += sprintf (scratch, "DEVPATH=%s", devpath) + 1;
+-	envp [i++] = scratch;
+-	scratch += sprintf(scratch, "SUBSYSTEM=%s", subsystem) + 1;
+-	for (j = 0; envp_ext && envp_ext[j]; j++)
+-		envp[i++] = envp_ext[j];
+-	/* just reserve the space, overwrite it after kset call has returned */
+-	envp[i++] = seq_buff = scratch;
+-	scratch += strlen("SEQNUM=18446744073709551616") + 1;
++	add_uevent_var(env, "ACTION=%s", action_string);
++	add_uevent_var(env, "DEVPATH=%s", devpath);
++	add_uevent_var(env, "SUBSYSTEM=%s", subsystem);
++
++	/* keys passed in from the caller */
++	if (envp_ext)
++		for (i = 0; envp_ext[i]; i++)
++			add_uevent_var(env, envp_ext[i]);
+ 
+ 	/* let the kset specific function add its stuff */
+ 	if (uevent_ops && uevent_ops->uevent) {
+-		retval = uevent_ops->uevent(kset, kobj,
+-				  &envp[i], NUM_ENVP - i, scratch,
+-				  BUFFER_SIZE - (scratch - buffer));
++		retval = uevent_ops->uevent(kset, kobj, env);
+ 		if (retval) {
+ 			pr_debug ("%s - uevent() returned %d\n",
+ 				  __FUNCTION__, retval);
+@@ -158,11 +129,11 @@ int kobject_uevent_env(struct kobject *k
+ 		}
+ 	}
+ 
+-	/* we will send an event, request a new sequence number */
++	/* we will send an event, so request a new sequence number */
+ 	spin_lock(&sequence_lock);
+ 	seq = ++uevent_seqnum;
+ 	spin_unlock(&sequence_lock);
+-	sprintf(seq_buff, "SEQNUM=%llu", (unsigned long long)seq);
++	add_uevent_var(env, "SEQNUM=%llu", (unsigned long long)seq);
+ 
+ #if defined(CONFIG_NET)
+ 	/* send netlink message */
+@@ -172,17 +143,19 @@ int kobject_uevent_env(struct kobject *k
+ 
+ 		/* allocate message with the maximum possible size */
+ 		len = strlen(action_string) + strlen(devpath) + 2;
+-		skb = alloc_skb(len + BUFFER_SIZE, GFP_KERNEL);
++		skb = alloc_skb(len + env->buflen, GFP_KERNEL);
+ 		if (skb) {
++			char *scratch;
++
+ 			/* add header */
+ 			scratch = skb_put(skb, len);
+ 			sprintf(scratch, "%s@%s", action_string, devpath);
+ 
+ 			/* copy keys to our continuous event payload buffer */
+-			for (i = 2; envp[i]; i++) {
+-				len = strlen(envp[i]) + 1;
++			for (i = 0; i < env->envp_idx; i++) {
++				len = strlen(env->envp[i]) + 1;
+ 				scratch = skb_put(skb, len);
+-				strcpy(scratch, envp[i]);
++				strcpy(scratch, env->envp[i]);
+ 			}
+ 
+ 			NETLINK_CB(skb).dst_group = 1;
+@@ -198,13 +171,15 @@ int kobject_uevent_env(struct kobject *k
+ 		argv [0] = uevent_helper;
+ 		argv [1] = (char *)subsystem;
+ 		argv [2] = NULL;
+-		call_usermodehelper (argv[0], argv, envp, UMH_WAIT_EXEC);
++		add_uevent_var(env, "HOME=/");
++		add_uevent_var(env, "PATH=/sbin:/bin:/usr/sbin:/usr/bin");
++
++		call_usermodehelper (argv[0], argv, env->envp, UMH_WAIT_EXEC);
+ 	}
+ 
+ exit:
+ 	kfree(devpath);
+-	kfree(buffer);
+-	kfree(envp);
++	kfree(env);
+ 	return retval;
+ }
+ 
+@@ -227,52 +202,32 @@ int kobject_uevent(struct kobject *kobj,
+ EXPORT_SYMBOL_GPL(kobject_uevent);
+ 
+ /**
+- * add_uevent_var - helper for creating event variables
+- * @envp: Pointer to table of environment variables, as passed into
+- * uevent() method.
+- * @num_envp: Number of environment variable slots available, as
+- * passed into uevent() method.
+- * @cur_index: Pointer to current index into @envp.  It should be
+- * initialized to 0 before the first call to add_uevent_var(),
+- * and will be incremented on success.
+- * @buffer: Pointer to buffer for environment variables, as passed
+- * into uevent() method.
+- * @buffer_size: Length of @buffer, as passed into uevent() method.
+- * @cur_len: Pointer to current length of space used in @buffer.
+- * Should be initialized to 0 before the first call to
+- * add_uevent_var(), and will be incremented on success.
+- * @format: Format for creating environment variable (of the form
+- * "XXX=%x") for snprintf().
++ * add_uevent_var - add key value string to the environment buffer
++ * @env: environment buffer structure
++ * @format: printf format for the key=value pair
+  *
+  * Returns 0 if environment variable was added successfully or -ENOMEM
+  * if no space was available.
+  */
+-int add_uevent_var(char **envp, int num_envp, int *cur_index,
+-		   char *buffer, int buffer_size, int *cur_len,
+-		   const char *format, ...)
++int add_uevent_var(struct kobj_uevent_env *env, const char *format, ...)
+ {
+ 	va_list args;
++	int len;
+ 
+-	/*
+-	 * We check against num_envp - 1 to make sure there is at
+-	 * least one slot left after we return, since kobject_uevent()
+-	 * needs to set the last slot to NULL.
+-	 */
+-	if (*cur_index >= num_envp - 1)
++	if (env->envp_idx >= ARRAY_SIZE(env->envp))
+ 		return -ENOMEM;
+ 
+-	envp[*cur_index] = buffer + *cur_len;
+-
+ 	va_start(args, format);
+-	*cur_len += vsnprintf(envp[*cur_index],
+-			      max(buffer_size - *cur_len, 0),
+-			      format, args) + 1;
++	len = vsnprintf(&env->buf[env->buflen],
++			sizeof(env->buf) - env->buflen,
++			format, args);
+ 	va_end(args);
+ 
+-	if (*cur_len > buffer_size)
++	if (len + 1 >= (sizeof(env->buf) - env->buflen))
+ 		return -ENOMEM;
+ 
+-	(*cur_index)++;
++	env->envp[env->envp_idx++] = &env->buf[env->buflen];
++	env->buflen += len + 1;
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(add_uevent_var);
+--- a/net/atm/atm_sysfs.c
++++ b/net/atm/atm_sysfs.c
+@@ -105,10 +105,9 @@ static struct class_device_attribute *at
+ 	NULL
+ };
+ 
+-static int atm_uevent(struct class_device *cdev, char **envp, int num_envp, char *buf, int size)
++static int atm_uevent(struct class_device *cdev, struct kobj_uevent_env *env)
+ {
+ 	struct atm_dev *adev;
+-	int i = 0, len = 0;
+ 
+ 	if (!cdev)
+ 		return -ENODEV;
+@@ -117,11 +116,9 @@ static int atm_uevent(struct class_devic
+ 	if (!adev)
+ 		return -ENODEV;
+ 
+-	if (add_uevent_var(envp, num_envp, &i, buf, size, &len,
+-			   "NAME=%s%d", adev->type, adev->number))
++	if (add_uevent_var(env, "NAME=%s%d", adev->type, adev->number))
+ 		return -ENOMEM;
+ 
+-	envp[i] = NULL;
+ 	return 0;
+ }
+ 
+--- a/net/core/net-sysfs.c
++++ b/net/core/net-sysfs.c
+@@ -408,28 +408,22 @@ static struct attribute_group wireless_g
+ #endif
+ 
+ #ifdef CONFIG_HOTPLUG
+-static int netdev_uevent(struct device *d, char **envp,
+-			 int num_envp, char *buf, int size)
++static int netdev_uevent(struct device *d, struct kobj_uevent_env *env)
+ {
+ 	struct net_device *dev = to_net_dev(d);
+-	int retval, len = 0, i = 0;
++	int retval;
+ 
+ 	/* pass interface to uevent. */
+-	retval = add_uevent_var(envp, num_envp, &i,
+-				buf, size, &len,
+-				"INTERFACE=%s", dev->name);
++	retval = add_uevent_var(env, "INTERFACE=%s", dev->name);
+ 	if (retval)
+ 		goto exit;
+ 
+ 	/* pass ifindex to uevent.
+ 	 * ifindex is useful as it won't change (interface name may change)
+ 	 * and is what RtNetlink uses natively. */
+-	retval = add_uevent_var(envp, num_envp, &i,
+-				buf, size, &len,
+-				"IFINDEX=%d", dev->ifindex);
++	retval = add_uevent_var(env, "IFINDEX=%d", dev->ifindex);
+ 
+ exit:
+-	envp[i] = NULL;
+ 	return retval;
+ }
+ #endif
+--- a/net/wireless/sysfs.c
++++ b/net/wireless/sysfs.c
+@@ -52,8 +52,7 @@ static void wiphy_dev_release(struct dev
+ 	cfg80211_dev_free(rdev);
+ }
+ 
+-static int wiphy_uevent(struct device *dev, char **envp,
+-			int num_envp, char *buf, int size)
++static int wiphy_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	/* TODO, we probably need stuff here */
+ 	return 0;
+--- a/sound/aoa/soundbus/core.c
++++ b/sound/aoa/soundbus/core.c
+@@ -56,13 +56,12 @@ static int soundbus_probe(struct device 
+ }
+ 
+ 
+-static int soundbus_uevent(struct device *dev, char **envp, int num_envp,
+-			   char *buffer, int buffer_size)
++static int soundbus_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	struct soundbus_dev * soundbus_dev;
+ 	struct of_device * of;
+ 	const char *compat;
+-	int retval = 0, i = 0, length = 0;
++	int retval = 0;
+ 	int cplen, seen = 0;
+ 
+ 	if (!dev)
+@@ -75,15 +74,11 @@ static int soundbus_uevent(struct device
+ 	of = &soundbus_dev->ofdev;
+ 
+ 	/* stuff we want to pass to /sbin/hotplug */
+-	retval = add_uevent_var(envp, num_envp, &i,
+-				buffer, buffer_size, &length,
+-				"OF_NAME=%s", of->node->name);
++	retval = add_uevent_var(env, "OF_NAME=%s", of->node->name);
+ 	if (retval)
+ 		return retval;
+ 
+-	retval = add_uevent_var(envp, num_envp, &i,
+-				buffer, buffer_size, &length,
+-				"OF_TYPE=%s", of->node->type);
++	retval = add_uevent_var(env, "OF_TYPE=%s", of->node->type);
+ 	if (retval)
+ 		return retval;
+ 
+@@ -94,9 +89,7 @@ static int soundbus_uevent(struct device
+ 	compat = of_get_property(of->node, "compatible", &cplen);
+ 	while (compat && cplen > 0) {
+ 		int tmp = length;
+-		retval = add_uevent_var(envp, num_envp, &i,
+-					buffer, buffer_size, &length,
+-					"OF_COMPATIBLE_%d=%s", seen, compat);
++		retval = add_uevent_var(env, "OF_COMPATIBLE_%d=%s", seen, compat);
+ 		if (retval)
+ 			return retval;
+ 		compat += length - tmp;
+@@ -104,16 +97,10 @@ static int soundbus_uevent(struct device
+ 		seen += 1;
+ 	}
+ 
+-	retval = add_uevent_var(envp, num_envp, &i,
+-				buffer, buffer_size, &length,
+-				"OF_COMPATIBLE_N=%d", seen);
++	retval = add_uevent_var(env, "OF_COMPATIBLE_N=%d", seen);
+ 	if (retval)
+ 		return retval;
+-	retval = add_uevent_var(envp, num_envp, &i,
+-				buffer, buffer_size, &length,
+-				"MODALIAS=%s", soundbus_dev->modalias);
+-
+-	envp[i] = NULL;
++	retval = add_uevent_var(env, "MODALIAS=%s", soundbus_dev->modalias);
+ 
+ 	return retval;
+ }
