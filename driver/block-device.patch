@@ -2,7 +2,6 @@ From kay.sievers@vrfy.org Mon May 21 13:15:45 2007
 From: Kay Sievers <kay.sievers@vrfy.org>
 Subject: Driver core: convert block from raw kobjects to core devices
 Date: Mon, 21 May 2007 22:08:01 +0200
-Message-Id: <1179778081.3437.4.camel@lov.localdomain>
 
 This moves the block devices to /sys/class/block. It will create a
 flat list of all block devices, with the disks and partitions in one
@@ -26,21 +25,20 @@ to the disks.
 
 Signed-off-by: Kay Sievers <kay.sievers@vrfy.org>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
-
 ---
- block/genhd.c              |  430 +++++++++++++++++++--------------------------
+ block/genhd.c              |  411 +++++++++++++++++++--------------------------
  block/ll_rw_blk.c          |    4 
- drivers/base/core.c        |   14 +
+ drivers/base/core.c        |   23 +-
  drivers/block/aoe/aoeblk.c |   51 ++---
  drivers/block/nbd.c        |   15 -
  drivers/ide/ide-probe.c    |    2 
  drivers/md/dm.c            |    2 
  drivers/md/md.c            |    8 
  fs/block_dev.c             |    8 
- fs/partitions/check.c      |  308 +++++++++++---------------------
- include/linux/genhd.h      |   25 +-
+ fs/partitions/check.c      |  308 ++++++++++++---------------------
+ include/linux/genhd.h      |   29 +--
  init/do_mounts.c           |  108 -----------
- 12 files changed, 371 insertions(+), 604 deletions(-)
+ 12 files changed, 379 insertions(+), 590 deletions(-)
 
 --- a/block/genhd.c
 +++ b/block/genhd.c
@@ -355,9 +353,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -
 -static ssize_t disk_uevent_store(struct gendisk * disk,
 -				 const char *buf, size_t count)
-+static ssize_t disk_size_show(struct device *dev,
-+			      struct device_attribute *attr, char *buf)
- {
+-{
 -	kobject_uevent(&disk->kobj, KOBJ_ADD);
 -	return count;
 -}
@@ -367,7 +363,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -	return print_dev_t(page, base);
 -}
 -static ssize_t disk_range_read(struct gendisk * disk, char *page)
--{
++static ssize_t disk_size_show(struct device *dev,
++			      struct device_attribute *attr, char *buf)
+ {
 -	return sprintf(page, "%d\n", disk->minors);
 -}
 -static ssize_t disk_removable_read(struct gendisk * disk, char *page)
@@ -445,11 +443,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			      struct device_attribute *attr, char *buf)
 +{
 +	struct gendisk *disk = dev_to_disk(dev);
- 
--static ssize_t disk_fail_store(struct gendisk * disk,
++
 +	return sprintf(buf, "%d\n", disk->flags & GENHD_FL_FAIL ? 1 : 0);
 +}
-+
+ 
+-static ssize_t disk_fail_store(struct gendisk * disk,
 +static ssize_t disk_fail_store(struct device *dev,
 +			       struct device_attribute *attr,
  			       const char *buf, size_t count)
@@ -458,7 +456,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	int i;
  
  	if (count > 0 && sscanf(buf, "%d", &i) > 0) {
-@@ -490,155 +458,101 @@ static ssize_t disk_fail_store(struct ge
+@@ -490,136 +458,101 @@ static ssize_t disk_fail_store(struct ge
  
  	return count;
  }
@@ -508,14 +506,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +static struct attribute_group disk_attr_group = {
 +	.attrs = disk_attrs,
-+};
-+
-+static struct attribute_group *disk_attr_groups[] = {
-+	&disk_attr_group,
-+	NULL
  };
  
 -static void disk_release(struct kobject * kobj)
++static struct attribute_group *disk_attr_groups[] = {
++	&disk_attr_group,
++	NULL
++};
++
 +static void disk_release(struct device *dev)
  {
 -	struct gendisk *disk = to_disk(kobj);
@@ -544,60 +542,41 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -	return ((ktype == &ktype_block) || (ktype == &ktype_part));
 -}
 -
--static int block_uevent(struct kset *kset, struct kobject *kobj, char **envp,
--			 int num_envp, char *buffer, int buffer_size)
+-static int block_uevent(struct kset *kset, struct kobject *kobj,
+-			struct kobj_uevent_env *env)
 -{
 -	struct kobj_type *ktype = get_ktype(kobj);
 -	struct device *physdev;
 -	struct gendisk *disk;
 -	struct hd_struct *part;
--	int length = 0;
--	int i = 0;
 -
 -	if (ktype == &ktype_block) {
 -		disk = container_of(kobj, struct gendisk, kobj);
--		add_uevent_var(envp, num_envp, &i, buffer, buffer_size,
--			       &length, "MINOR=%u", disk->first_minor);
+-		add_uevent_var(env, "MINOR=%u", disk->first_minor);
 -	} else if (ktype == &ktype_part) {
 -		disk = container_of(kobj->parent, struct gendisk, kobj);
 -		part = container_of(kobj, struct hd_struct, kobj);
--		add_uevent_var(envp, num_envp, &i, buffer, buffer_size,
--			       &length, "MINOR=%u",
+-		add_uevent_var(env, "MINOR=%u",
 -			       disk->first_minor + part->partno);
 -	} else
 -		return 0;
 -
--	add_uevent_var(envp, num_envp, &i, buffer, buffer_size, &length,
--		       "MAJOR=%u", disk->major);
+-	add_uevent_var(env, "MAJOR=%u", disk->major);
 -
 -	/* add physical device, backing this device  */
 -	physdev = disk->driverfs_dev;
 -	if (physdev) {
 -		char *path = kobject_get_path(&physdev->kobj, GFP_KERNEL);
 -
--		add_uevent_var(envp, num_envp, &i, buffer, buffer_size,
--			       &length, "PHYSDEVPATH=%s", path);
+-		add_uevent_var(env, "PHYSDEVPATH=%s", path);
 -		kfree(path);
 -
 -		if (physdev->bus)
--			add_uevent_var(envp, num_envp, &i,
--				       buffer, buffer_size, &length,
--				       "PHYSDEVBUS=%s",
--				       physdev->bus->name);
+-			add_uevent_var(env, "PHYSDEVBUS=%s", physdev->bus->name);
 -
 -		if (physdev->driver)
--			add_uevent_var(envp, num_envp, &i,
--				       buffer, buffer_size, &length,
--				       "PHYSDEVDRIVER=%s",
--				       physdev->driver->name);
+-			add_uevent_var(env, physdev->driver->name);
 -	}
--
--	/* terminate, set to next free slot, shrink available space */
--	envp[i] = NULL;
--	envp = &envp[i];
--	num_envp -= i;
--	buffer = &buffer[length];
--	buffer_size -= length;
 -
 -	return 0;
 -}
@@ -668,7 +647,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  }
  
  static int diskstats_show(struct seq_file *s, void *v)
-@@ -648,7 +562,7 @@ static int diskstats_show(struct seq_fil
+@@ -629,7 +562,7 @@ static int diskstats_show(struct seq_fil
  	int n = 0;
  
  	/*
@@ -677,7 +656,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		seq_puts(s,	"major minor name"
  				"     rio rmerge rsect ruse wio wmerge "
  				"wsect wuse running use aveq"
-@@ -702,7 +616,7 @@ static void media_change_notify_thread(s
+@@ -683,7 +616,7 @@ static void media_change_notify_thread(s
  	 * set enviroment vars to indicate which event this is for
  	 * so that user space will know to go check the media status.
  	 */
@@ -686,7 +665,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	put_device(gd->driverfs_dev);
  }
  
-@@ -713,6 +627,25 @@ void genhd_media_change_notify(struct ge
+@@ -694,6 +627,25 @@ void genhd_media_change_notify(struct ge
  }
  EXPORT_SYMBOL_GPL(genhd_media_change_notify);
  
@@ -712,7 +691,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  struct gendisk *alloc_disk(int minors)
  {
  	return alloc_disk_node(minors, -1);
-@@ -739,9 +672,10 @@ struct gendisk *alloc_disk_node(int mino
+@@ -720,9 +672,10 @@ struct gendisk *alloc_disk_node(int mino
  			}
  		}
  		disk->minors = minors;
@@ -725,7 +704,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		INIT_WORK(&disk->async_notify,
  			media_change_notify_thread);
  	}
-@@ -761,7 +695,7 @@ struct kobject *get_disk(struct gendisk 
+@@ -742,7 +695,7 @@ struct kobject *get_disk(struct gendisk 
  	owner = disk->fops->owner;
  	if (owner && !try_module_get(owner))
  		return NULL;
@@ -734,7 +713,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	if (kobj == NULL) {
  		module_put(owner);
  		return NULL;
-@@ -775,7 +709,7 @@ EXPORT_SYMBOL(get_disk);
+@@ -756,7 +709,7 @@ EXPORT_SYMBOL(get_disk);
  void put_disk(struct gendisk *disk)
  {
  	if (disk)
@@ -764,43 +743,69 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  }
 --- a/drivers/base/core.c
 +++ b/drivers/base/core.c
-@@ -582,12 +582,20 @@ void device_initialize(struct device *de
- }
+@@ -18,7 +18,7 @@
+ #include <linux/string.h>
+ #include <linux/kdev_t.h>
+ #include <linux/notifier.h>
+-
++#include <linux/genhd.h>
+ #include <asm/semaphore.h>
  
- #ifdef CONFIG_SYSFS_DEPRECATED
-+extern struct kobject block_depr;
-+extern struct device_type disk_type;
-+extern struct device_type part_type;
-+
+ #include "base.h"
+@@ -552,10 +552,16 @@ void device_initialize(struct device *de
  static struct kobject * get_device_parent(struct device *dev,
  					  struct device *parent)
  {
- 	/* Set the parent to the class, not the parent device */
- 	/* this keeps sysfs from having a symlink to make old udevs happy */
+-	/* Set the parent to the class, not the parent device */
+-	/* this keeps sysfs from having a symlink to make old udevs happy */
 -	if (dev->class)
++	/* partitions are childs of the disk */
 +	if (dev->type == &part_type)
 +		return &dev->parent->kobj;
++	/* disks live in its own top-level directory */
 +	else if (dev->type == &disk_type)
 +		return &block_depr;
++	/* class devices live in their class directory */
 +	else if (dev->class)
  		return &dev->class->subsys.kobj;
++	/* all other devices keep their parent */
  	else if (parent)
  		return &parent->kobj;
-@@ -837,7 +845,7 @@ int device_add(struct device *dev)
+ 
+@@ -645,7 +651,8 @@ static int device_add_class_symlinks(str
+ 		if (error)
+ 			goto out_subsys;
+ 	}
+-	if (dev->parent) {
++	/* partitions must not have a device link */
++	if (dev->parent && dev->type != &part_type) {
+ 		error = sysfs_create_link(&dev->kobj, &dev->parent->kobj,
+ 					  "device");
+ 		if (error)
+@@ -667,7 +674,7 @@ static int device_add_class_symlinks(str
+ 
+ #ifdef CONFIG_SYSFS_DEPRECATED
+ out_device:
+-	if (dev->parent)
++	if (dev->parent && dev->type != &part_type)
+ 		sysfs_remove_link(&dev->kobj, "device");
+ #endif
+ out_busid:
+@@ -804,7 +811,7 @@ int device_add(struct device *dev)
  		if (dev->kobj.parent != &dev->class->subsys.kobj)
  			sysfs_remove_link(&dev->class->subsys.kobj,
  					  dev->bus_id);
 -		if (parent) {
-+		if (parent && parent->bus) {
++		if (parent && dev->type != &part_type) {
  #ifdef CONFIG_SYSFS_DEPRECATED
  			char *class_name = make_class_name(dev->class->name,
  							   &dev->kobj);
-@@ -936,7 +944,7 @@ void device_del(struct device * dev)
+@@ -903,7 +910,7 @@ void device_del(struct device * dev)
  		if (dev->kobj.parent != &dev->class->subsys.kobj)
  			sysfs_remove_link(&dev->class->subsys.kobj,
  					  dev->bus_id);
 -		if (parent) {
-+		if (parent && parent->bus) {
++		if (parent && dev->type != &part_type) {
  #ifdef CONFIG_SYSFS_DEPRECATED
  			char *class_name = make_class_name(dev->class->name,
  							   &dev->kobj);
@@ -1493,7 +1498,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  }
 --- a/include/linux/genhd.h
 +++ b/include/linux/genhd.h
-@@ -13,6 +13,10 @@
+@@ -13,6 +13,14 @@
  
  #ifdef CONFIG_BLOCK
  
@@ -1501,10 +1506,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#define dev_to_disk(device) container_of(device, struct gendisk, dev)
 +#define dev_to_part(device) container_of(device, struct hd_struct, dev)
 +
++extern struct device_type disk_type;
++extern struct device_type part_type;
++extern struct kobject block_depr;
++
  enum {
  /* These three have identical behaviour; use the second one if DOS FDISK gets
     confused about extended/logical partitions starting past cylinder 1023. */
-@@ -84,7 +88,7 @@ struct partition {
+@@ -84,7 +92,7 @@ struct partition {
  struct hd_struct {
  	sector_t start_sect;
  	sector_t nr_sects;
@@ -1513,7 +1522,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	struct kobject *holder_dir;
  	unsigned ios[2], sectors[2];	/* READs and WRITEs */
  	int policy, partno;
-@@ -117,15 +121,14 @@ struct gendisk {
+@@ -117,15 +125,14 @@ struct gendisk {
                                           * disks that can't be partitioned. */
  	char disk_name[32];		/* name of major driver */
  	struct hd_struct **part;	/* [indexed by minor] */
@@ -1531,7 +1540,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	struct kobject *holder_dir;
  	struct kobject *slave_dir;
  
-@@ -143,13 +146,6 @@ struct gendisk {
+@@ -143,13 +150,6 @@ struct gendisk {
  	struct work_struct async_notify;
  };
  
@@ -1545,7 +1554,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  /* 
   * Macros to operate on percpu disk statistics:
   *
-@@ -411,7 +407,8 @@ struct unixware_disklabel {
+@@ -411,7 +411,8 @@ struct unixware_disklabel {
  #define ADDPART_FLAG_RAID	1
  #define ADDPART_FLAG_WHOLEDISK	2
  
@@ -1555,7 +1564,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  extern int rescan_partitions(struct gendisk *disk, struct block_device *bdev);
  extern void add_partition(struct gendisk *, int, sector_t, sector_t, int);
-@@ -423,12 +420,12 @@ extern struct gendisk *alloc_disk(int mi
+@@ -423,12 +424,12 @@ extern struct gendisk *alloc_disk(int mi
  extern struct kobject *get_disk(struct gendisk *disk);
  extern void put_disk(struct gendisk *disk);
  extern void genhd_media_change_notify(struct gendisk *disk);
