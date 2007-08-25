@@ -1,0 +1,233 @@
+From stern@rowland.harvard.edu Fri Aug 24 12:40:43 2007
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Fri, 24 Aug 2007 15:40:34 -0400 (EDT)
+Subject: USB: reorganize urb->status use in ohci-hcd
+To: Greg KH <greg@kroah.com>
+Cc: David Brownell <david-b@pacbell.net>,  USB development list <linux-usb-devel@lists.sourceforge.net>
+Message-ID: <Pine.LNX.4.44L0.0708241530220.2605-100000@iolanthe.rowland.org>
+
+
+This patch (as975) reorganizes the way ohci-hcd sets urb->status.  It
+now keeps the information in a local variable until the last moment.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+CC: David Brownell <david-b@pacbell.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/ohci-dbg.c |    8 ++++----
+ drivers/usb/host/ohci-hcd.c |   15 +++++++--------
+ drivers/usb/host/ohci-q.c   |   38 +++++++++++++++++---------------------
+ 3 files changed, 28 insertions(+), 33 deletions(-)
+
+--- a/drivers/usb/host/ohci-dbg.c
++++ b/drivers/usb/host/ohci-dbg.c
+@@ -24,7 +24,7 @@
+  * small: 0) header + data packets 1) just header
+  */
+ static void __maybe_unused
+-urb_print (struct urb * urb, char * str, int small)
++urb_print(struct urb * urb, char * str, int small, int status)
+ {
+ 	unsigned int pipe= urb->pipe;
+ 
+@@ -34,7 +34,7 @@ urb_print (struct urb * urb, char * str,
+ 	}
+ 
+ #ifndef	OHCI_VERBOSE_DEBUG
+-	if (urb->status != 0)
++	if (status != 0)
+ #endif
+ 	dbg("%s %p dev=%d ep=%d%s-%s flags=%x len=%d/%d stat=%d",
+ 		    str,
+@@ -46,7 +46,7 @@ urb_print (struct urb * urb, char * str,
+ 		    urb->transfer_flags,
+ 		    urb->actual_length,
+ 		    urb->transfer_buffer_length,
+-		    urb->status);
++		    status);
+ 
+ #ifdef	OHCI_VERBOSE_DEBUG
+ 	if (!small) {
+@@ -66,7 +66,7 @@ urb_print (struct urb * urb, char * str,
+ 						urb->transfer_buffer_length: urb->actual_length;
+ 			for (i = 0; i < 16 && i < len; i++)
+ 				printk (" %02x", ((__u8 *) urb->transfer_buffer) [i]);
+-			printk ("%s stat:%d\n", i < len? "...": "", urb->status);
++			printk ("%s stat:%d\n", i < len? "...": "", status);
+ 		}
+ 	}
+ #endif
+--- a/drivers/usb/host/ohci-hcd.c
++++ b/drivers/usb/host/ohci-hcd.c
+@@ -129,7 +129,7 @@ static int ohci_urb_enqueue (
+ 	int		retval = 0;
+ 
+ #ifdef OHCI_VERBOSE_DEBUG
+-	urb_print (urb, "SUB", usb_pipein (pipe));
++	urb_print(urb, "SUB", usb_pipein(pipe), -EINPROGRESS);
+ #endif
+ 
+ 	/* every endpoint has a ed, locate and maybe (re)initialize it */
+@@ -240,8 +240,8 @@ fail:
+ }
+ 
+ /*
+- * decouple the URB from the HC queues (TDs, urb_priv); it's
+- * already marked using urb->status.  reporting is always done
++ * decouple the URB from the HC queues (TDs, urb_priv).
++ * reporting is always done
+  * asynchronously, and we might be dealing with an urb that's
+  * partially transferred, or an ED with other urbs being unlinked.
+  */
+@@ -252,7 +252,7 @@ static int ohci_urb_dequeue(struct usb_h
+ 	int			rc;
+ 
+ #ifdef OHCI_VERBOSE_DEBUG
+-	urb_print (urb, "UNLINK", 1);
++	urb_print(urb, "UNLINK", 1, status);
+ #endif
+ 
+ 	spin_lock_irqsave (&ohci->lock, flags);
+@@ -277,7 +277,7 @@ static int ohci_urb_dequeue(struct usb_h
+ 		 * any more ... just clean up every urb's memory.
+ 		 */
+ 		if (urb->hcpriv)
+-			finish_urb (ohci, urb);
++			finish_urb(ohci, urb, status);
+ 	}
+ 	spin_unlock_irqrestore (&ohci->lock, flags);
+ 	return rc;
+@@ -927,9 +927,8 @@ static int ohci_restart (struct ohci_hcd
+ 					ed, ed->state);
+ 		}
+ 
+-		spin_lock (&urb->lock);
+-		urb->status = -ESHUTDOWN;
+-		spin_unlock (&urb->lock);
++		if (!urb->unlinked)
++			urb->unlinked = -ESHUTDOWN;
+ 	}
+ 	finish_unlinks (ohci, 0);
+ 	spin_unlock_irq(&ohci->lock);
+--- a/drivers/usb/host/ohci-q.c
++++ b/drivers/usb/host/ohci-q.c
+@@ -36,18 +36,15 @@ static void urb_free_priv (struct ohci_h
+  * PRECONDITION:  ohci lock held, irqs blocked.
+  */
+ static void
+-finish_urb (struct ohci_hcd *ohci, struct urb *urb)
++finish_urb(struct ohci_hcd *ohci, struct urb *urb, int status)
+ __releases(ohci->lock)
+ __acquires(ohci->lock)
+ {
+ 	// ASSERT (urb->hcpriv != 0);
+ 
+ 	urb_free_priv (ohci, urb->hcpriv);
+-
+-	spin_lock (&urb->lock);
+-	if (likely (urb->status == -EINPROGRESS))
+-		urb->status = 0;
+-	spin_unlock (&urb->lock);
++	if (likely(status == -EINPROGRESS))
++		status = 0;
+ 
+ 	switch (usb_pipetype (urb->pipe)) {
+ 	case PIPE_ISOCHRONOUS:
+@@ -59,12 +56,13 @@ __acquires(ohci->lock)
+ 	}
+ 
+ #ifdef OHCI_VERBOSE_DEBUG
+-	urb_print (urb, "RET", usb_pipeout (urb->pipe));
++	urb_print(urb, "RET", usb_pipeout (urb->pipe), status);
+ #endif
+ 
+ 	/* urb->complete() can reenter this HCD */
+ 	usb_hcd_unlink_urb_from_ep(ohci_to_hcd(ohci), urb);
+ 	spin_unlock (&ohci->lock);
++	urb->status = status;
+ 	usb_hcd_giveback_urb (ohci_to_hcd(ohci), urb);
+ 	spin_lock (&ohci->lock);
+ 
+@@ -702,19 +700,18 @@ static void td_submit_urb (
+  * Done List handling functions
+  *-------------------------------------------------------------------------*/
+ 
+-/* calculate transfer length/status and update the urb
+- * PRECONDITION:  irqsafe (only for urb->status locking)
+- */
+-static void td_done (struct ohci_hcd *ohci, struct urb *urb, struct td *td)
++/* calculate transfer length/status and update the urb */
++static int td_done(struct ohci_hcd *ohci, struct urb *urb, struct td *td)
+ {
+ 	u32	tdINFO = hc32_to_cpup (ohci, &td->hwINFO);
+ 	int	cc = 0;
++	int	status = -EINPROGRESS;
+ 
+ 	list_del (&td->td_list);
+ 
+ 	/* ISO ... drivers see per-TD length/status */
+ 	if (tdINFO & TD_ISO) {
+-		u16	tdPSW = ohci_hwPSW (ohci, td, 0);
++		u16	tdPSW = ohci_hwPSW(ohci, td, 0);
+ 		int	dlen = 0;
+ 
+ 		/* NOTE:  assumes FC in tdINFO == 0, and that
+@@ -723,7 +720,7 @@ static void td_done (struct ohci_hcd *oh
+ 
+ 		cc = (tdPSW >> 12) & 0xF;
+ 		if (tdINFO & TD_CC)	/* hc didn't touch? */
+-			return;
++			return status;
+ 
+ 		if (usb_pipeout (urb->pipe))
+ 			dlen = urb->iso_frame_desc [td->index].length;
+@@ -756,11 +753,8 @@ static void td_done (struct ohci_hcd *oh
+ 		if (cc == TD_DATAUNDERRUN
+ 				&& !(urb->transfer_flags & URB_SHORT_NOT_OK))
+ 			cc = TD_CC_NOERROR;
+-		if (cc != TD_CC_NOERROR && cc < 0x0E) {
+-			spin_lock (&urb->lock);
+-			urb->status = cc_to_error[cc];
+-			spin_unlock (&urb->lock);
+-		}
++		if (cc != TD_CC_NOERROR && cc < 0x0E)
++			status = cc_to_error[cc];
+ 
+ 		/* count all non-empty packets except control SETUP packet */
+ 		if ((type != PIPE_CONTROL || td->index != 0) && tdBE != 0) {
+@@ -779,6 +773,7 @@ static void td_done (struct ohci_hcd *oh
+ 				urb->actual_length,
+ 				urb->transfer_buffer_length);
+ 	}
++	return status;
+ }
+ 
+ /*-------------------------------------------------------------------------*/
+@@ -979,7 +974,7 @@ rescan_this:
+ 			/* if URB is done, clean up */
+ 			if (urb_priv->td_cnt == urb_priv->length) {
+ 				modified = completed = 1;
+-				finish_urb (ohci, urb);
++				finish_urb(ohci, urb, 0);
+ 			}
+ 		}
+ 		if (completed && !list_empty (&ed->td_list))
+@@ -1062,14 +1057,15 @@ static void takeback_td(struct ohci_hcd 
+ 	struct urb	*urb = td->urb;
+ 	urb_priv_t	*urb_priv = urb->hcpriv;
+ 	struct ed	*ed = td->ed;
++	int		status;
+ 
+ 	/* update URB's length and status from TD */
+-	td_done(ohci, urb, td);
++	status = td_done(ohci, urb, td);
+ 	urb_priv->td_cnt++;
+ 
+ 	/* If all this urb's TDs are done, call complete() */
+ 	if (urb_priv->td_cnt == urb_priv->length)
+-		finish_urb(ohci, urb);
++		finish_urb(ohci, urb, status);
+ 
+ 	/* clean schedule:  unlink EDs that are no longer busy */
+ 	if (list_empty(&ed->td_list)) {

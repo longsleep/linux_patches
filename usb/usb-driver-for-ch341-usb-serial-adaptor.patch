@@ -1,9 +1,10 @@
-From linux-usb-devel-bounces@lists.sourceforge.net Tue Aug 21 13:14:04 2007
+From linux-usb-devel-bounces@lists.sourceforge.net Wed Aug 22 12:49:44 2007
 From: Frank Kingswood <frank@kingswood-consulting.co.uk>
-Date: Tue, 21 Aug 2007 21:13:45 +0100
+Date: Wed, 22 Aug 2007 20:48:58 +0100
 Subject: USB: Driver for CH341 USB-serial adaptor
 To: frank@kingswood-consulting.co.uk, linux-usb-devel@lists.sourceforge.net, stern@rowland.harvard.edu
-Message-ID: <courier.46CB4779.000039C5@moonrock.kingswood-consulting.co.uk>
+Message-ID: <courier.46CC932A.00007A67@moonrock.kingswood-consulting.co.uk>
+
 
 From: Frank A Kingswood <frank@kingswood-consulting.co.uk>
 
@@ -13,6 +14,7 @@ parallel port, I2C and SPI, but that is not supported by the driver.
 
 Signed-off-by: Frank A Kingswood <frank@kingswood-consulting.co.uk>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
 
 ---
  Documentation/usb/usb-serial.txt |   11 +
@@ -97,6 +99,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#include <linux/serial.h>
 +
 +#define DEFAULT_BAUD_RATE 2400
++#define DEFAULT_TIMEOUT   1000
 +
 +static int debug;
 +
@@ -121,7 +124,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	r = usb_control_msg(dev, usb_sndctrlpipe(dev, 0), request,
 +			    USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_OUT,
-+			    value, index, NULL, 0, 1000);
++			    value, index, NULL, 0, DEFAULT_TIMEOUT);
 +
 +	return r;
 +}
@@ -136,7 +139,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	r = usb_control_msg(dev, usb_rcvctrlpipe(dev, 0), request,
 +			    USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_IN,
-+			    value, index, buf, bufsize, 1000);
++			    value, index, buf, bufsize, DEFAULT_TIMEOUT);
 +	return r;
 +}
 +
@@ -192,17 +195,22 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +int ch341_get_status(struct usb_device *dev)
 +{
 +	char *buffer;
-+	int r = -ENOMEM;
++	int r;
 +	const unsigned size = 8;
 +
 +	dbg("ch341_get_status()");
 +
 +	buffer = kmalloc(size, GFP_KERNEL);
 +	if (!buffer)
-+		goto out;
++		return -ENOMEM;
 +
 +	r = ch341_control_in(dev, 0x95, 0x0706, 0, buffer, size);
-+	/* return value ignored */
++	if ( r < 0)
++		goto out;
++
++	/* Not having the datasheet for the CH341, we ignore the bytes returned
++	 * from the device. Return error if the device did not respond in time.
++	 */
 +	r = 0;
 +
 +out:	kfree(buffer);
@@ -214,14 +222,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +int ch341_configure(struct usb_device *dev, struct ch341_private *priv)
 +{
 +	char *buffer;
-+	int r = -ENOMEM;
++	int r;
 +	const unsigned size = 8;
 +
 +	dbg("ch341_configure()");
 +
 +	buffer = kmalloc(size, GFP_KERNEL);
 +	if (!buffer)
-+		goto out;
++		return -ENOMEM;
 +
 +	/* expect two bytes 0x27 0x00 */
 +	r = ch341_control_in(dev, 0x5f, 0, 0, buffer, size);
@@ -288,11 +296,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	r = ch341_configure(serial->dev, priv);
 +	if (r < 0)
-+		return r;
++		goto error;
 +
 +	usb_set_serial_port_data(serial->port[0], priv);
-+
 +	return 0;
++
++error:	kfree(priv);
++	return r;
 +}
 +
 +/* open this device, set default parameters */
@@ -321,8 +331,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		goto out;
 +
 +	r = usb_serial_generic_open(port, filp);
-+out:
-+	return r;
++
++out:	return r;
 +}
 +
 +/* Old_termios contains the original termios settings and
@@ -333,18 +343,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +{
 +	struct ch341_private *priv = usb_get_serial_port_data(port);
 +	struct tty_struct *tty = port->tty;
-+	unsigned cflag;
 +	unsigned baud_rate;
 +
-+	dbg("ch341_set_termios(%p,%p)", port, old_termios);
++	dbg("ch341_set_termios()");
 +
-+	if (!port->tty || !port->tty->termios)
-+		return;
-+
-+	cflag = tty->termios->c_cflag;
-+
-+	/* check that they really want us to change something */
-+	if (old_termios && cflag == old_termios->c_cflag)
++	if (!tty || !tty->termios)
 +		return;
 +
 +	baud_rate = tty_get_baud_rate(tty);
@@ -359,7 +362,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		priv->baud_rate = baud_rate;
 +		break;
 +	default:
-+		dbg("Rate %d not supported, using %d", baud_rate, DEFAULT_BAUD_RATE);
++		dbg("Rate %d not supported, using %d",
++			baud_rate, DEFAULT_BAUD_RATE);
 +		priv->baud_rate = DEFAULT_BAUD_RATE;
 +	}
 +
@@ -370,8 +374,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	 * (cflag & PARENB) : parity {NONE, EVEN, ODD}
 +	 * (cflag & CSTOPB) : stop bits [1, 2]
 +	 */
-+
-+	return;
 +}
 +
 +static struct usb_driver ch341_driver = {

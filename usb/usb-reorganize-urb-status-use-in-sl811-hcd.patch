@@ -1,0 +1,85 @@
+From stern@rowland.harvard.edu Fri Aug 24 12:40:54 2007
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Fri, 24 Aug 2007 15:40:47 -0400 (EDT)
+Subject: USB: reorganize urb->status use in sl811-hcd
+To: Greg KH <greg@kroah.com>
+Cc: David Brownell <david-b@pacbell.net>,  USB development list <linux-usb-devel@lists.sourceforge.net>
+Message-ID: <Pine.LNX.4.44L0.0708241530540.2605-100000@iolanthe.rowland.org>
+
+
+This patch (as976) reorganizes the way sl811-hcd sets urb->status.  It
+now keeps the information in a local variable until the last moment.
+
+The patch also improves the handling of faults during the status stage
+of a control transfer, since it no longer needs to retain the error
+information from the earlier stages.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+CC: David Brownell <david-b@pacbell.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/sl811-hcd.c |   32 +++++++++++---------------------
+ 1 file changed, 11 insertions(+), 21 deletions(-)
+
+--- a/drivers/usb/host/sl811-hcd.c
++++ b/drivers/usb/host/sl811-hcd.c
+@@ -435,11 +435,8 @@ static void finish_request(
+ 	if (usb_pipecontrol(urb->pipe))
+ 		ep->nextpid = USB_PID_SETUP;
+ 
+-	spin_lock(&urb->lock);
+-	urb->status = status;
+-	spin_unlock(&urb->lock);
+-
+ 	usb_hcd_unlink_urb_from_ep(sl811_to_hcd(sl811), urb);
++	urb->status = status;
+ 	spin_unlock(&sl811->lock);
+ 	usb_hcd_giveback_urb(sl811_to_hcd(sl811), urb);
+ 	spin_lock(&sl811->lock);
+@@ -537,27 +534,20 @@ done(struct sl811 *sl811, struct sl811h_
+ 						bank + SL11H_XFERCNTREG);
+ 			if (len > ep->length) {
+ 				len = ep->length;
+-				urb->status = -EOVERFLOW;
++				urbstat = -EOVERFLOW;
+ 			}
+ 			urb->actual_length += len;
+ 			sl811_read_buf(sl811, SL811HS_PACKET_BUF(bank == 0),
+ 					buf, len);
+ 			usb_dotoggle(udev, ep->epnum, 0);
+-			if (urb->actual_length == urb->transfer_buffer_length
+-					|| len < ep->maxpacket)
+-				urbstat = 0;
+-			if (usb_pipecontrol(urb->pipe) && urbstat == 0) {
+-
+-				/* NOTE if the status stage STALLs (why?),
+-				 * this reports the wrong urb status.
+-				 */
+-				spin_lock(&urb->lock);
+-				if (urb->status == -EINPROGRESS)
+-					urb->status = urbstat;
+-				spin_unlock(&urb->lock);
+-
+-				urb = NULL;
+-				ep->nextpid = USB_PID_ACK;
++			if (urbstat == -EINPROGRESS &&
++					(len < ep->maxpacket ||
++						urb->actual_length ==
++						urb->transfer_buffer_length)) {
++				if (usb_pipecontrol(urb->pipe))
++					ep->nextpid = USB_PID_ACK;
++				else
++					urbstat = 0;
+ 			}
+ 			break;
+ 		case USB_PID_SETUP:
+@@ -597,7 +587,7 @@ done(struct sl811 *sl811, struct sl811h_
+ 				bank, status, ep, urbstat);
+ 	}
+ 
+-	if (urb && (urbstat != -EINPROGRESS || urb->unlinked))
++	if (urbstat != -EINPROGRESS || urb->unlinked)
+ 		finish_request(sl811, ep, urb, urbstat);
+ }
+ 
