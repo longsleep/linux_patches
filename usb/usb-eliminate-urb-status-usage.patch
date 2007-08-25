@@ -1,0 +1,498 @@
+From stern@rowland.harvard.edu Fri Aug 24 12:42:29 2007
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Fri, 24 Aug 2007 15:42:24 -0400 (EDT)
+Subject: USB: Eliminate urb->status usage!
+To: Greg KH <greg@kroah.com>
+Cc: David Brownell <david-b@pacbell.net>, Olav Kongas <ok@artecdesign.ee>,  Yoshihiro Shimoda <shimoda.yoshihiro@renesas.com>,  Tony Olech <tony.olech@elandigitalsystems.com>,  USB development list <linux-usb-devel@lists.sourceforge.net>
+Message-ID: <Pine.LNX.4.44L0.0708241534000.2605-100000@iolanthe.rowland.org>
+
+
+This patch (as979) removes the last vestiges of urb->status from the
+host controller drivers and the root-hub emulator.  Now the field
+doesn't get set until just before the URB's completion routine is
+called.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+CC: David Brownell <david-b@pacbell.net>
+CC: Olav Kongas <ok@artecdesign.ee>
+CC: Yoshihiro Shimoda <shimoda.yoshihiro@renesas.com>
+CC: Tony Olech <tony.olech@elandigitalsystems.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/hcd.c          |   22 +++++++++++-----------
+ drivers/usb/core/hcd.h          |    3 ++-
+ drivers/usb/gadget/dummy_hcd.c  |    3 +--
+ drivers/usb/host/ehci-q.c       |    3 +--
+ drivers/usb/host/isp116x-hcd.c  |   15 +++++----------
+ drivers/usb/host/ohci-q.c       |    3 +--
+ drivers/usb/host/r8a66597-hcd.c |    8 +++-----
+ drivers/usb/host/sl811-hcd.c    |    3 +--
+ drivers/usb/host/u132-hcd.c     |   36 +++++++++++++++++-------------------
+ drivers/usb/host/uhci-hcd.h     |   15 ---------------
+ drivers/usb/host/uhci-q.c       |   12 ++++--------
+ 11 files changed, 46 insertions(+), 77 deletions(-)
+
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -532,7 +532,6 @@ error:
+ 
+ 	/* any errors get returned through the urb completion */
+ 	spin_lock_irq(&hcd_root_hub_lock);
+-	urb->status = status;
+ 	usb_hcd_unlink_urb_from_ep(hcd, urb);
+ 
+ 	/* This peculiar use of spinlocks echoes what real HC drivers do.
+@@ -540,7 +539,7 @@ error:
+ 	 * RT-friendly.
+ 	 */
+ 	spin_unlock(&hcd_root_hub_lock);
+-	usb_hcd_giveback_urb(hcd, urb);
++	usb_hcd_giveback_urb(hcd, urb, status);
+ 	spin_lock(&hcd_root_hub_lock);
+ 
+ 	spin_unlock_irq(&hcd_root_hub_lock);
+@@ -578,13 +577,12 @@ void usb_hcd_poll_rh_status(struct usb_h
+ 		if (urb) {
+ 			hcd->poll_pending = 0;
+ 			hcd->status_urb = NULL;
+-			urb->status = 0;
+ 			urb->actual_length = length;
+ 			memcpy(urb->transfer_buffer, buffer, length);
+ 
+ 			usb_hcd_unlink_urb_from_ep(hcd, urb);
+ 			spin_unlock(&hcd_root_hub_lock);
+-			usb_hcd_giveback_urb(hcd, urb);
++			usb_hcd_giveback_urb(hcd, urb, 0);
+ 			spin_lock(&hcd_root_hub_lock);
+ 		} else {
+ 			length = 0;
+@@ -677,7 +675,7 @@ static int usb_rh_urb_dequeue(struct usb
+ 			usb_hcd_unlink_urb_from_ep(hcd, urb);
+ 
+ 			spin_unlock(&hcd_root_hub_lock);
+-			usb_hcd_giveback_urb(hcd, urb);
++			usb_hcd_giveback_urb(hcd, urb, status);
+ 			spin_lock(&hcd_root_hub_lock);
+ 		}
+ 	}
+@@ -1252,6 +1250,7 @@ int usb_hcd_unlink_urb (struct urb *urb,
+  * usb_hcd_giveback_urb - return URB from HCD to device driver
+  * @hcd: host controller returning the URB
+  * @urb: urb being returned to the USB device driver.
++ * @status: completion status code for the URB.
+  * Context: in_interrupt()
+  *
+  * This hands the URB from HCD to its USB device driver, using its
+@@ -1260,25 +1259,26 @@ int usb_hcd_unlink_urb (struct urb *urb,
+  * the device driver won't cause problems if it frees, modifies,
+  * or resubmits this URB.
+  *
+- * If @urb was unlinked, the value of @urb->status will be overridden by
++ * If @urb was unlinked, the value of @status will be overridden by
+  * @urb->unlinked.  Erroneous short transfers are detected in case
+  * the HCD hasn't checked for them.
+  */
+-void usb_hcd_giveback_urb (struct usb_hcd *hcd, struct urb *urb)
++void usb_hcd_giveback_urb(struct usb_hcd *hcd, struct urb *urb, int status)
+ {
+ 	urb->hcpriv = NULL;
+ 	if (unlikely(urb->unlinked))
+-		urb->status = urb->unlinked;
++		status = urb->unlinked;
+ 	else if (unlikely((urb->transfer_flags & URB_SHORT_NOT_OK) &&
+ 			urb->actual_length < urb->transfer_buffer_length &&
+-			!urb->status))
+-		urb->status = -EREMOTEIO;
++			!status))
++		status = -EREMOTEIO;
+ 
+ 	unmap_urb_for_dma(hcd, urb);
+-	usbmon_urb_complete(&hcd->self, urb, urb->status);
++	usbmon_urb_complete(&hcd->self, urb, status);
+ 	usb_unanchor_urb(urb);
+ 
+ 	/* pass ownership to the completion handler */
++	urb->status = status;
+ 	urb->complete (urb);
+ 	atomic_dec (&urb->use_count);
+ 	if (unlikely (urb->reject))
+--- a/drivers/usb/core/hcd.h
++++ b/drivers/usb/core/hcd.h
+@@ -217,7 +217,8 @@ extern void usb_hcd_unlink_urb_from_ep(s
+ 
+ extern int usb_hcd_submit_urb (struct urb *urb, gfp_t mem_flags);
+ extern int usb_hcd_unlink_urb (struct urb *urb, int status);
+-extern void usb_hcd_giveback_urb (struct usb_hcd *hcd, struct urb *urb);
++extern void usb_hcd_giveback_urb(struct usb_hcd *hcd, struct urb *urb,
++		int status);
+ extern void usb_hcd_endpoint_disable (struct usb_device *udev,
+ 		struct usb_host_endpoint *ep);
+ extern int usb_hcd_get_frame_number (struct usb_device *udev);
+--- a/drivers/usb/gadget/dummy_hcd.c
++++ b/drivers/usb/gadget/dummy_hcd.c
+@@ -1511,8 +1511,7 @@ return_urb:
+ 
+ 		usb_hcd_unlink_urb_from_ep(dummy_to_hcd(dum), urb);
+ 		spin_unlock (&dum->lock);
+-		urb->status = status;
+-		usb_hcd_giveback_urb (dummy_to_hcd(dum), urb);
++		usb_hcd_giveback_urb(dummy_to_hcd(dum), urb, status);
+ 		spin_lock (&dum->lock);
+ 
+ 		goto restart;
+--- a/drivers/usb/host/ehci-q.c
++++ b/drivers/usb/host/ehci-q.c
+@@ -256,8 +256,7 @@ __acquires(ehci->lock)
+ 	/* complete() can reenter this HCD */
+ 	usb_hcd_unlink_urb_from_ep(ehci_to_hcd(ehci), urb);
+ 	spin_unlock (&ehci->lock);
+-	urb->status = status;
+-	usb_hcd_giveback_urb (ehci_to_hcd(ehci), urb);
++	usb_hcd_giveback_urb(ehci_to_hcd(ehci), urb, status);
+ 	spin_lock (&ehci->lock);
+ }
+ 
+--- a/drivers/usb/host/isp116x-hcd.c
++++ b/drivers/usb/host/isp116x-hcd.c
+@@ -277,7 +277,7 @@ static void preproc_atl_queue(struct isp
+   processed urbs.
+ */
+ static void finish_request(struct isp116x *isp116x, struct isp116x_ep *ep,
+-			   struct urb *urb)
++			   struct urb *urb, int status)
+ __releases(isp116x->lock) __acquires(isp116x->lock)
+ {
+ 	unsigned i;
+@@ -291,7 +291,7 @@ __releases(isp116x->lock) __acquires(isp
+ 
+ 	usb_hcd_unlink_urb_from_ep(isp116x_to_hcd(isp116x), urb);
+ 	spin_unlock(&isp116x->lock);
+-	usb_hcd_giveback_urb(isp116x_to_hcd(isp116x), urb);
++	usb_hcd_giveback_urb(isp116x_to_hcd(isp116x), urb, status);
+ 	spin_lock(&isp116x->lock);
+ 
+ 	/* take idle endpoints out of the schedule */
+@@ -453,13 +453,8 @@ static void postproc_atl_queue(struct is
+ 		}
+ 
+  done:
+-		if (status != -EINPROGRESS) {
+-			spin_lock(&urb->lock);
+-			urb->status = status;
+-			spin_unlock(&urb->lock);
+-		}
+-		if (urb->status != -EINPROGRESS || urb->unlinked)
+-			finish_request(isp116x, ep, urb);
++		if (status != -EINPROGRESS || urb->unlinked)
++			finish_request(isp116x, ep, urb, status);
+ 	}
+ }
+ 
+@@ -853,7 +848,7 @@ static int isp116x_urb_dequeue(struct us
+ 			}
+ 
+ 	if (urb)
+-		finish_request(isp116x, ep, urb);
++		finish_request(isp116x, ep, urb, status);
+  done:
+ 	spin_unlock_irqrestore(&isp116x->lock, flags);
+ 	return rc;
+--- a/drivers/usb/host/ohci-q.c
++++ b/drivers/usb/host/ohci-q.c
+@@ -62,8 +62,7 @@ __acquires(ohci->lock)
+ 	/* urb->complete() can reenter this HCD */
+ 	usb_hcd_unlink_urb_from_ep(ohci_to_hcd(ohci), urb);
+ 	spin_unlock (&ohci->lock);
+-	urb->status = status;
+-	usb_hcd_giveback_urb (ohci_to_hcd(ohci), urb);
++	usb_hcd_giveback_urb(ohci_to_hcd(ohci), urb, status);
+ 	spin_lock (&ohci->lock);
+ 
+ 	/* stop periodic dma if it's not needed */
+--- a/drivers/usb/host/r8a66597-hcd.c
++++ b/drivers/usb/host/r8a66597-hcd.c
+@@ -782,12 +782,12 @@ static void force_dequeue(struct r8a6659
+ 		kfree(td);
+ 
+ 		if (urb) {
+-			urb->status = -ENODEV;
+ 			usb_hcd_unlink_urb_from_ep(r8a66597_to_hcd(r8a66597),
+ 					urb);
+ 
+ 			spin_unlock(&r8a66597->lock);
+-			usb_hcd_giveback_urb(r8a66597_to_hcd(r8a66597), urb);
++			usb_hcd_giveback_urb(r8a66597_to_hcd(r8a66597), urb,
++					-ENODEV);
+ 			spin_lock(&r8a66597->lock);
+ 		}
+ 		break;
+@@ -1134,10 +1134,8 @@ __releases(r8a66597->lock) __acquires(r8
+ 			urb->start_frame = r8a66597_get_frame(hcd);
+ 
+ 		usb_hcd_unlink_urb_from_ep(r8a66597_to_hcd(r8a66597), urb);
+-
+-		urb->status = status;
+ 		spin_unlock(&r8a66597->lock);
+-		usb_hcd_giveback_urb(hcd, urb);
++		usb_hcd_giveback_urb(hcd, urb, status);
+ 		spin_lock(&r8a66597->lock);
+ 	}
+ 
+--- a/drivers/usb/host/sl811-hcd.c
++++ b/drivers/usb/host/sl811-hcd.c
+@@ -436,9 +436,8 @@ static void finish_request(
+ 		ep->nextpid = USB_PID_SETUP;
+ 
+ 	usb_hcd_unlink_urb_from_ep(sl811_to_hcd(sl811), urb);
+-	urb->status = status;
+ 	spin_unlock(&sl811->lock);
+-	usb_hcd_giveback_urb(sl811_to_hcd(sl811), urb);
++	usb_hcd_giveback_urb(sl811_to_hcd(sl811), urb, status);
+ 	spin_lock(&sl811->lock);
+ 
+ 	/* leave active endpoints in the schedule */
+--- a/drivers/usb/host/u132-hcd.c
++++ b/drivers/usb/host/u132-hcd.c
+@@ -518,7 +518,6 @@ static void u132_hcd_giveback_urb(struct
+         unsigned long irqs;
+         struct usb_hcd *hcd = u132_to_hcd(u132);
+         urb->error_count = 0;
+-        urb->status = status;
+         spin_lock_irqsave(&endp->queue_lock.slock, irqs);
+ 	usb_hcd_unlink_urb_from_ep(hcd, urb);
+         endp->queue_next += 1;
+@@ -542,7 +541,7 @@ static void u132_hcd_giveback_urb(struct
+         u132_ring_queue_work(u132, ring, 0);
+         up(&u132->scheduler_lock);
+         u132_endp_put_kref(u132, endp);
+-        usb_hcd_giveback_urb(hcd, urb);
++	usb_hcd_giveback_urb(hcd, urb, status);
+         return;
+ }
+ 
+@@ -558,7 +557,6 @@ static void u132_hcd_abandon_urb(struct 
+         unsigned long irqs;
+         struct usb_hcd *hcd = u132_to_hcd(u132);
+         urb->error_count = 0;
+-        urb->status = status;
+         spin_lock_irqsave(&endp->queue_lock.slock, irqs);
+ 	usb_hcd_unlink_urb_from_ep(hcd, urb);
+         endp->queue_next += 1;
+@@ -575,7 +573,7 @@ static void u132_hcd_abandon_urb(struct 
+                 endp->active = 0;
+                 spin_unlock_irqrestore(&endp->queue_lock.slock, irqs);
+                 kfree(urbq);
+-        } usb_hcd_giveback_urb(hcd, urb);
++	} usb_hcd_giveback_urb(hcd, urb, status);
+         return;
+ }
+ 
+@@ -719,7 +717,7 @@ static void u132_hcd_interrupt_recv(void
+ 		dev_err(&u132->platform_dev->dev, "CALLBACK called urb=%p "
+ 				"unlinked=%d\n", urb, urb->unlinked);
+                 up(&u132->scheduler_lock);
+-                u132_hcd_giveback_urb(u132, endp, urb, urb->status);
++		u132_hcd_giveback_urb(u132, endp, urb, 0);
+                 return;
+         }
+ }
+@@ -771,7 +769,7 @@ static void u132_hcd_bulk_output_sent(vo
+ 		dev_err(&u132->platform_dev->dev, "CALLBACK called urb=%p "
+ 				"unlinked=%d\n", urb, urb->unlinked);
+                 up(&u132->scheduler_lock);
+-                u132_hcd_giveback_urb(u132, endp, urb, urb->status);
++		u132_hcd_giveback_urb(u132, endp, urb, 0);
+                 return;
+         }
+ }
+@@ -874,7 +872,7 @@ static void u132_hcd_bulk_input_recv(voi
+ 		dev_err(&u132->platform_dev->dev, "CALLBACK called urb=%p "
+ 				"unlinked=%d\n", urb, urb->unlinked);
+                 up(&u132->scheduler_lock);
+-                u132_hcd_giveback_urb(u132, endp, urb, urb->status);
++		u132_hcd_giveback_urb(u132, endp, urb, 0);
+                 return;
+         }
+ }
+@@ -911,7 +909,7 @@ static void u132_hcd_configure_empty_sen
+ 		dev_err(&u132->platform_dev->dev, "CALLBACK called urb=%p "
+ 				"unlinked=%d\n", urb, urb->unlinked);
+                 up(&u132->scheduler_lock);
+-                u132_hcd_giveback_urb(u132, endp, urb, urb->status);
++		u132_hcd_giveback_urb(u132, endp, urb, 0);
+                 return;
+         }
+ }
+@@ -983,7 +981,7 @@ static void u132_hcd_configure_input_rec
+ 		dev_err(&u132->platform_dev->dev, "CALLBACK called urb=%p "
+ 				"unlinked=%d\n", urb, urb->unlinked);
+                 up(&u132->scheduler_lock);
+-                u132_hcd_giveback_urb(u132, endp, urb, urb->status);
++		u132_hcd_giveback_urb(u132, endp, urb, 0);
+                 return;
+         }
+ }
+@@ -1020,7 +1018,7 @@ static void u132_hcd_configure_empty_rec
+ 		dev_err(&u132->platform_dev->dev, "CALLBACK called urb=%p "
+ 				"unlinked=%d\n", urb, urb->unlinked);
+                 up(&u132->scheduler_lock);
+-                u132_hcd_giveback_urb(u132, endp, urb, urb->status);
++		u132_hcd_giveback_urb(u132, endp, urb, 0);
+                 return;
+         }
+ }
+@@ -1080,7 +1078,7 @@ static void u132_hcd_configure_setup_sen
+ 		dev_err(&u132->platform_dev->dev, "CALLBACK called urb=%p "
+ 				"unlinked=%d\n", urb, urb->unlinked);
+                 up(&u132->scheduler_lock);
+-                u132_hcd_giveback_urb(u132, endp, urb, urb->status);
++		u132_hcd_giveback_urb(u132, endp, urb, 0);
+                 return;
+         }
+ }
+@@ -1121,7 +1119,7 @@ static void u132_hcd_enumeration_empty_r
+ 		dev_err(&u132->platform_dev->dev, "CALLBACK called urb=%p "
+ 				"unlinked=%d\n", urb, urb->unlinked);
+                 up(&u132->scheduler_lock);
+-                u132_hcd_giveback_urb(u132, endp, urb, urb->status);
++		u132_hcd_giveback_urb(u132, endp, urb, 0);
+                 return;
+         }
+ }
+@@ -1165,7 +1163,7 @@ static void u132_hcd_enumeration_address
+ 		dev_err(&u132->platform_dev->dev, "CALLBACK called urb=%p "
+ 				"unlinked=%d\n", urb, urb->unlinked);
+                 up(&u132->scheduler_lock);
+-                u132_hcd_giveback_urb(u132, endp, urb, urb->status);
++		u132_hcd_giveback_urb(u132, endp, urb, 0);
+                 return;
+         }
+ }
+@@ -1202,7 +1200,7 @@ static void u132_hcd_initial_empty_sent(
+ 		dev_err(&u132->platform_dev->dev, "CALLBACK called urb=%p "
+ 				"unlinked=%d\n", urb, urb->unlinked);
+                 up(&u132->scheduler_lock);
+-                u132_hcd_giveback_urb(u132, endp, urb, urb->status);
++		u132_hcd_giveback_urb(u132, endp, urb, 0);
+                 return;
+         }
+ }
+@@ -1254,7 +1252,7 @@ static void u132_hcd_initial_input_recv(
+ 		dev_err(&u132->platform_dev->dev, "CALLBACK called urb=%p "
+ 				"unlinked=%d\n", urb, urb->unlinked);
+                 up(&u132->scheduler_lock);
+-                u132_hcd_giveback_urb(u132, endp, urb, urb->status);
++		u132_hcd_giveback_urb(u132, endp, urb, 0);
+                 return;
+         }
+ }
+@@ -1299,7 +1297,7 @@ static void u132_hcd_initial_setup_sent(
+ 		dev_err(&u132->platform_dev->dev, "CALLBACK called urb=%p "
+ 				"unlinked=%d\n", urb, urb->unlinked);
+                 up(&u132->scheduler_lock);
+-                u132_hcd_giveback_urb(u132, endp, urb, urb->status);
++		u132_hcd_giveback_urb(u132, endp, urb, 0);
+                 return;
+         }
+ }
+@@ -2428,7 +2426,7 @@ static int dequeue_from_overflow_chain(s
+                         list_del(scan);
+                         endp->queue_size -= 1;
+                         urb->error_count = 0;
+-                        usb_hcd_giveback_urb(hcd, urb);
++			usb_hcd_giveback_urb(hcd, urb, 0);
+                         return 0;
+                 } else
+                         continue;
+@@ -2472,7 +2470,7 @@ static int u132_endp_urb_dequeue(struct 
+                         return 0;
+                 } else {
+                         spin_unlock_irqrestore(&endp->queue_lock.slock, irqs);
+-                        u132_hcd_abandon_urb(u132, endp, urb, urb->status);
++			u132_hcd_abandon_urb(u132, endp, urb, status);
+                         return 0;
+                 }
+         } else {
+@@ -2513,7 +2511,7 @@ static int u132_endp_urb_dequeue(struct 
+                                         irqs);
+                                 kfree(urbq);
+                         } urb->error_count = 0;
+-                        usb_hcd_giveback_urb(hcd, urb);
++			usb_hcd_giveback_urb(hcd, urb, status);
+                         return 0;
+                 } else if (list_empty(&endp->urb_more)) {
+                         dev_err(&u132->platform_dev->dev, "urb=%p not found in "
+--- a/drivers/usb/host/uhci-hcd.h
++++ b/drivers/usb/host/uhci-hcd.h
+@@ -456,21 +456,6 @@ struct urb_priv {
+ };
+ 
+ 
+-/*
+- * Locking in uhci.c
+- *
+- * Almost everything relating to the hardware schedule and processing
+- * of URBs is protected by uhci->lock.  urb->status is protected by
+- * urb->lock; that's the one exception.
+- *
+- * To prevent deadlocks, never lock uhci->lock while holding urb->lock.
+- * The safe order of locking is:
+- *
+- * #1 uhci->lock
+- * #2 urb->lock
+- */
+-
+-
+ /* Some special IDs */
+ 
+ #define PCI_VENDOR_ID_GENESYS		0x17a0
+--- a/drivers/usb/host/uhci-q.c
++++ b/drivers/usb/host/uhci-q.c
+@@ -1480,7 +1480,7 @@ done:
+  * Finish unlinking an URB and give it back
+  */
+ static void uhci_giveback_urb(struct uhci_hcd *uhci, struct uhci_qh *qh,
+-		struct urb *urb)
++		struct urb *urb, int status)
+ __releases(uhci->lock)
+ __acquires(uhci->lock)
+ {
+@@ -1520,7 +1520,7 @@ __acquires(uhci->lock)
+ 	usb_hcd_unlink_urb_from_ep(uhci_to_hcd(uhci), urb);
+ 
+ 	spin_unlock(&uhci->lock);
+-	usb_hcd_giveback_urb(uhci_to_hcd(uhci), urb);
++	usb_hcd_giveback_urb(uhci_to_hcd(uhci), urb, status);
+ 	spin_lock(&uhci->lock);
+ 
+ 	/* If the queue is now empty, we can unlink the QH and give up its
+@@ -1556,10 +1556,6 @@ static void uhci_scan_qh(struct uhci_hcd
+ 		if (status == -EINPROGRESS)
+ 			break;
+ 
+-		spin_lock(&urb->lock);
+-		urb->status = status;
+-		spin_unlock(&urb->lock);
+-
+ 		/* Dequeued but completed URBs can't be given back unless
+ 		 * the QH is stopped or has finished unlinking. */
+ 		if (urb->unlinked) {
+@@ -1569,7 +1565,7 @@ static void uhci_scan_qh(struct uhci_hcd
+ 				return;
+ 		}
+ 
+-		uhci_giveback_urb(uhci, qh, urb);
++		uhci_giveback_urb(uhci, qh, urb, status);
+ 		if (status < 0)
+ 			break;
+ 	}
+@@ -1594,7 +1590,7 @@ restart:
+ 				qh->is_stopped = 0;
+ 				return;
+ 			}
+-			uhci_giveback_urb(uhci, qh, urb);
++			uhci_giveback_urb(uhci, qh, urb, 0);
+ 			goto restart;
+ 		}
+ 	}
