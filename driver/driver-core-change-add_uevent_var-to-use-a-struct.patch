@@ -8,68 +8,70 @@ Message-ID: <1187097312.4312.21.camel@lov.localdomain>
 
 From: Kay Sievers <kay.sievers@vrfy.org>
 
-this changes the uevent buffer stuff to use a struct instead
-of tons of parameters. It does no longer require the caller to
-do the proper buffer termination and size accounting, which is
-currently wrong in a lot of places.
+This changes the uevent buffer functions to use a struct instead of a
+long list of parameters. It does no longer require the caller to do the
+proper buffer termination and size accounting, which is currently wrong
+in some places. It fixes a known bug where parts of the uevent
+environment are overwritten because of wrong index calculations.
 
-This tells everything:
- 269 insertions(+), 616 deletions(-)
+Many thanks to Mathieu Desnoyers for finding bugs and improving the
+error handling.
 
 Signed-off-by: Kay Sievers <kay.sievers@vrfy.org>
+Cc: Mathieu Desnoyers <mathieu.desnoyers@polymtl.ca>
 Cc: Cornelia Huck <cornelia.huck@de.ibm.com>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 
 ---
  arch/ia64/sn/kernel/tiocx.c                 |    3 
- arch/powerpc/kernel/of_device.c             |   37 ++------
+ arch/powerpc/kernel/of_device.c             |   37 ++----
  arch/powerpc/kernel/vio.c                   |   16 ---
  arch/powerpc/platforms/ps3/system-bus.c     |    9 -
- block/genhd.c                               |   35 +------
+ block/genhd.c                               |   35 +-----
  drivers/acpi/scan.c                         |   16 +--
  drivers/amba/bus.c                          |    9 -
- drivers/base/class.c                        |   44 ++-------
- drivers/base/core.c                         |   83 +++++-------------
+ drivers/base/class.c                        |   44 ++------
+ drivers/base/core.c                         |   83 ++++-----------
  drivers/base/firmware_class.c               |   11 --
  drivers/base/memory.c                       |    3 
  drivers/base/platform.c                     |    6 -
  drivers/eisa/eisa-bus.c                     |    9 -
- drivers/firewire/fw-device.c                |    9 -
- drivers/firmware/dmi-id.c                   |   15 +--
+ drivers/firewire/fw-device.c                |   11 --
+ drivers/firmware/dmi-id.c                   |   15 +-
  drivers/i2c/i2c-core.c                      |    8 -
- drivers/ide/ide.c                           |   15 ---
+ drivers/ide/ide.c                           |   15 --
  drivers/ieee1394/nodemgr.c                  |   17 ---
  drivers/infiniband/core/sysfs.c             |    9 -
- drivers/input/input.c                       |   62 ++++---------
+ drivers/input/input.c                       |   62 +++--------
  drivers/input/serio/serio.c                 |   11 --
  drivers/media/video/pvrusb2/pvrusb2-sysfs.c |    4 
  drivers/misc/tifm_core.c                    |    9 -
  drivers/mmc/core/bus.c                      |   11 --
- drivers/pci/hotplug.c                       |   28 +-----
+ drivers/pci/hotplug.c                       |   28 +----
  drivers/pci/pci-driver.c                    |    3 
  drivers/pci/pci.h                           |    3 
- drivers/pcmcia/cs.c                         |   10 --
- drivers/pcmcia/ds.c                         |   26 +----
+ drivers/pcmcia/cs.c                         |   10 -
+ drivers/pcmcia/ds.c                         |   26 +---
  drivers/power/power_supply.h                |    3 
- drivers/power/power_supply_sysfs.c          |   16 +--
+ drivers/power/power_supply_sysfs.c          |   16 ---
  drivers/s390/cio/ccwgroup.c                 |    3 
- drivers/s390/cio/device.c                   |   25 +----
- drivers/s390/crypto/ap_bus.c                |   14 ---
+ drivers/s390/cio/device.c                   |   25 +---
+ drivers/s390/crypto/ap_bus.c                |   14 --
  drivers/scsi/scsi_sysfs.c                   |    9 -
  drivers/spi/spi.c                           |    7 -
- drivers/usb/core/driver.c                   |   29 +-----
- drivers/usb/core/message.c                  |   28 +-----
+ drivers/usb/core/driver.c                   |   29 +----
+ drivers/usb/core/message.c                  |   28 +----
  drivers/w1/w1.c                             |   18 +--
  include/asm-powerpc/of_device.h             |    2 
- include/linux/device.h                      |   15 +--
- include/linux/kobject.h                     |   23 +++--
- lib/kobject_uevent.c                        |  127 +++++++++-------------------
+ include/linux/device.h                      |   15 --
+ include/linux/kobject.h                     |   23 ++--
+ lib/kobject_uevent.c                        |  149 +++++++++++-----------------
  net/atm/atm_sysfs.c                         |    7 -
- net/core/net-sysfs.c                        |   14 ---
+ net/core/net-sysfs.c                        |   14 --
  net/wireless/sysfs.c                        |    3 
- sound/aoa/soundbus/core.c                   |   33 ++-----
- 47 files changed, 273 insertions(+), 624 deletions(-)
+ sound/aoa/soundbus/core.c                   |   33 +-----
+ 47 files changed, 295 insertions(+), 626 deletions(-)
 
 --- a/arch/ia64/sn/kernel/tiocx.c
 +++ b/arch/ia64/sn/kernel/tiocx.c
@@ -292,7 +294,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
 --- a/drivers/acpi/scan.c
 +++ b/drivers/acpi/scan.c
-@@ -318,16 +318,18 @@ static int acpi_bus_match(struct device 
+@@ -319,16 +319,18 @@ static int acpi_bus_match(struct device 
  	return !acpi_match_device_ids(acpi_dev, acpi_drv->ids);
  }
  
@@ -661,7 +663,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
 --- a/drivers/firewire/fw-device.c
 +++ b/drivers/firewire/fw-device.c
-@@ -130,8 +130,7 @@ static int get_modalias(struct fw_unit *
+@@ -130,23 +130,16 @@ static int get_modalias(struct fw_unit *
  }
  
  static int
@@ -671,7 +673,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  {
  	struct fw_unit *unit = fw_unit(dev);
  	char modalias[64];
-@@ -140,13 +139,9 @@ fw_unit_uevent(struct device *dev, char 
+-	int length = 0;
+-	int i = 0;
  
  	get_modalias(unit, modalias, sizeof(modalias));
  
@@ -1836,7 +1839,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	/* complete object path */
  	devpath = kobject_get_path(kobj, GFP_KERNEL);
  	if (!devpath) {
-@@ -128,29 +109,19 @@ int kobject_uevent_env(struct kobject *k
+@@ -128,29 +109,29 @@ int kobject_uevent_env(struct kobject *k
  		goto exit;
  	}
  
@@ -1857,14 +1860,24 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -	/* just reserve the space, overwrite it after kset call has returned */
 -	envp[i++] = seq_buff = scratch;
 -	scratch += strlen("SEQNUM=18446744073709551616") + 1;
-+	add_uevent_var(env, "ACTION=%s", action_string);
-+	add_uevent_var(env, "DEVPATH=%s", devpath);
-+	add_uevent_var(env, "SUBSYSTEM=%s", subsystem);
++	retval = add_uevent_var(env, "ACTION=%s", action_string);
++	if (retval)
++		goto exit;
++	retval = add_uevent_var(env, "DEVPATH=%s", devpath);
++	if (retval)
++		goto exit;
++	retval = add_uevent_var(env, "SUBSYSTEM=%s", subsystem);
++	if (retval)
++		goto exit;
 +
 +	/* keys passed in from the caller */
-+	if (envp_ext)
-+		for (i = 0; envp_ext[i]; i++)
-+			add_uevent_var(env, envp_ext[i]);
++	if (envp_ext) {
++		for (i = 0; envp_ext[i]; i++) {
++			retval = add_uevent_var(env, envp_ext[i]);
++			if (retval)
++				goto exit;
++		}
++	}
  
  	/* let the kset specific function add its stuff */
  	if (uevent_ops && uevent_ops->uevent) {
@@ -1875,7 +1888,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		if (retval) {
  			pr_debug ("%s - uevent() returned %d\n",
  				  __FUNCTION__, retval);
-@@ -158,11 +129,11 @@ int kobject_uevent_env(struct kobject *k
+@@ -158,11 +139,13 @@ int kobject_uevent_env(struct kobject *k
  		}
  	}
  
@@ -1885,11 +1898,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	seq = ++uevent_seqnum;
  	spin_unlock(&sequence_lock);
 -	sprintf(seq_buff, "SEQNUM=%llu", (unsigned long long)seq);
-+	add_uevent_var(env, "SEQNUM=%llu", (unsigned long long)seq);
++	retval = add_uevent_var(env, "SEQNUM=%llu", (unsigned long long)seq);
++	if (retval)
++		goto exit;
  
  #if defined(CONFIG_NET)
  	/* send netlink message */
-@@ -172,17 +143,19 @@ int kobject_uevent_env(struct kobject *k
+@@ -172,17 +155,19 @@ int kobject_uevent_env(struct kobject *k
  
  		/* allocate message with the maximum possible size */
  		len = strlen(action_string) + strlen(devpath) + 2;
@@ -1913,13 +1928,17 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  			}
  
  			NETLINK_CB(skb).dst_group = 1;
-@@ -198,13 +171,15 @@ int kobject_uevent_env(struct kobject *k
+@@ -198,13 +183,19 @@ int kobject_uevent_env(struct kobject *k
  		argv [0] = uevent_helper;
  		argv [1] = (char *)subsystem;
  		argv [2] = NULL;
 -		call_usermodehelper (argv[0], argv, envp, UMH_WAIT_EXEC);
-+		add_uevent_var(env, "HOME=/");
-+		add_uevent_var(env, "PATH=/sbin:/bin:/usr/sbin:/usr/bin");
++		retval = add_uevent_var(env, "HOME=/");
++		if (retval)
++			goto exit;
++		retval = add_uevent_var(env, "PATH=/sbin:/bin:/usr/sbin:/usr/bin");
++		if (retval)
++			goto exit;
 +
 +		call_usermodehelper (argv[0], argv, env->envp, UMH_WAIT_EXEC);
  	}
@@ -1932,7 +1951,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	return retval;
  }
  
-@@ -227,52 +202,32 @@ int kobject_uevent(struct kobject *kobj,
+@@ -227,52 +218,38 @@ int kobject_uevent(struct kobject *kobj,
  EXPORT_SYMBOL_GPL(kobject_uevent);
  
  /**
@@ -1973,11 +1992,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -	 * needs to set the last slot to NULL.
 -	 */
 -	if (*cur_index >= num_envp - 1)
-+	if (env->envp_idx >= ARRAY_SIZE(env->envp))
++	if (env->envp_idx >= ARRAY_SIZE(env->envp)) {
++		printk(KERN_ERR "add_uevent_var: too many keys\n");
++		WARN_ON(1);
  		return -ENOMEM;
- 
--	envp[*cur_index] = buffer + *cur_len;
 -
+-	envp[*cur_index] = buffer + *cur_len;
++	}
+ 
  	va_start(args, format);
 -	*cur_len += vsnprintf(envp[*cur_index],
 -			      max(buffer_size - *cur_len, 0),
@@ -1988,8 +2010,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	va_end(args);
  
 -	if (*cur_len > buffer_size)
-+	if (len >= (sizeof(env->buf) - env->buflen))
++	if (len >= (sizeof(env->buf) - env->buflen)) {
++		printk(KERN_ERR "add_uevent_var: buffer size too small\n");
++		WARN_ON(1);
  		return -ENOMEM;
++	}
  
 -	(*cur_index)++;
 +	env->envp[env->envp_idx++] = &env->buf[env->buflen];
