@@ -1,0 +1,129 @@
+From goecke@upb.de  Tue Sep 11 00:46:52 2007
+From: Johannes Goecke <goecke@upb.de>
+Date: Mon, 10 Sep 2007 10:46:52 +0200
+Subject: PCI: re-enable onboard sound on "MSI K8T Neo2-FIR"
+To: Greg KH <greg@kroah.com>
+Cc: Jean Delvare <khali@linux-fr.org>, linux-pci@atrey.karlin.mff.cuni.cz, Greg Kroah-Hartman <gregkh@suse.de>, Chris Wedgwood <cw@f00f.org>
+Message-ID: <46E5047C.7000208@upb.de>
+
+
+From: Johannes Goecke <goecke@upb.de>
+
+On the "MSI K8T Neo2-FIR" board the BIOS disables the onboard
+soundcard, if a second PCI soundcard is present.
+
+This patch sets the korrect register bit to enable the onboard sound.
+
+Removed old code in /drivers/pci/quirks.c that only checks for the
+PCI-ID and fires on any Board with VIA 8237.
+
+New code in /arch/i386/pci/fixup.c checks the DMI-tables and only runs
+on the specific board.
+
+
+Signed-off-by: Johannes Goecke <goecke@upb.de>
+Cc: Jean Delvare <khali@linux-fr.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ arch/i386/pci/fixup.c |   47 +++++++++++++++++++++++++++++++++++++++++++++++
+ drivers/pci/quirks.c  |   32 --------------------------------
+ 2 files changed, 47 insertions(+), 32 deletions(-)
+
+--- a/arch/i386/pci/fixup.c
++++ b/arch/i386/pci/fixup.c
+@@ -353,6 +353,53 @@ static void __devinit pci_fixup_video(st
+ }
+ DECLARE_PCI_FIXUP_FINAL(PCI_ANY_ID, PCI_ANY_ID, pci_fixup_video);
+ 
++
++static struct dmi_system_id __devinitdata msi_k8t_dmi_table[] = {
++	{
++		.ident = "MSI-K8T-Neo2Fir",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "MSI"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "MS-6702E"),
++		},
++	},
++	{}
++};
++
++/*
++ * The AMD-Athlon64 board MSI "K8T Neo2-FIR" disables the onboard sound
++ * card if a PCI-soundcard is added.
++ *
++ * The BIOS only gives options "DISABLED" and "AUTO". This code sets
++ * the corresponding register-value to enable the soundcard.
++ *
++ * The soundcard is only enabled, if the mainborad is identified
++ * via DMI-tables and the soundcard is detected to be off.
++ */
++static void __devinit pci_fixup_msi_k8t_onboard_sound(struct pci_dev *dev)
++{
++	unsigned char val;
++	if (!dmi_check_system(msi_k8t_dmi_table))
++		return; /* only applies to MSI K8T Neo2-FIR */
++
++	pci_read_config_byte(dev, 0x50, &val);
++	if (val & 0x40) {
++		pci_write_config_byte(dev, 0x50, val & (~0x40));
++
++		/* verify the change for status output */
++		pci_read_config_byte(dev, 0x50, &val);
++		if (val & 0x40)
++			printk(KERN_INFO "PCI: Detected MSI K8T Neo2-FIR, "
++					"can't enable onboard soundcard!\n");
++		else
++			printk(KERN_INFO "PCI: Detected MSI K8T Neo2-FIR, "
++					"enabled onboard soundcard.\n");
++	}
++}
++DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_VIA, PCI_DEVICE_ID_VIA_8237,
++		pci_fixup_msi_k8t_onboard_sound);
++DECLARE_PCI_FIXUP_RESUME(PCI_VENDOR_ID_VIA, PCI_DEVICE_ID_VIA_8237,
++		pci_fixup_msi_k8t_onboard_sound);
++
+ /*
+  * Some Toshiba laptops need extra code to enable their TI TSB43AB22/A.
+  *
+--- a/drivers/pci/quirks.c
++++ b/drivers/pci/quirks.c
+@@ -925,38 +925,6 @@ static void __init quirk_eisa_bridge(str
+ }
+ DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_INTEL,	PCI_DEVICE_ID_INTEL_82375,	quirk_eisa_bridge );
+ 
+-/*
+- * On the MSI-K8T-Neo2Fir Board, the internal Soundcard is disabled
+- * when a PCI-Soundcard is added. The BIOS only gives Options
+- * "Disabled" and "AUTO". This Quirk Sets the corresponding
+- * Register-Value to enable the Soundcard.
+- *
+- * FIXME: Presently this quirk will run on anything that has an 8237
+- * which isn't correct, we need to check DMI tables or something in
+- * order to make sure it only runs on the MSI-K8T-Neo2Fir.  Because it
+- * runs everywhere at present we suppress the printk output in most
+- * irrelevant cases.
+- */
+-static void k8t_sound_hostbridge(struct pci_dev *dev)
+-{
+-	unsigned char val;
+-
+-	pci_read_config_byte(dev, 0x50, &val);
+-	if (val == 0xc8) {
+-		/* Assume it's probably a MSI-K8T-Neo2Fir */
+-		printk(KERN_INFO "PCI: MSI-K8T-Neo2Fir, attempting to turn soundcard ON\n");
+-		pci_write_config_byte(dev, 0x50, val & (~0x40));
+-
+-		/* Verify the Change for Status output */
+-		pci_read_config_byte(dev, 0x50, &val);
+-		if (val & 0x40)
+-			printk(KERN_INFO "PCI: MSI-K8T-Neo2Fir, soundcard still off\n");
+-		else
+-			printk(KERN_INFO "PCI: MSI-K8T-Neo2Fir, soundcard on\n");
+-	}
+-}
+-DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_VIA, PCI_DEVICE_ID_VIA_8237, k8t_sound_hostbridge);
+-DECLARE_PCI_FIXUP_RESUME(PCI_VENDOR_ID_VIA, PCI_DEVICE_ID_VIA_8237, k8t_sound_hostbridge);
+ 
+ /*
+  * On ASUS P4B boards, the SMBus PCI Device within the ICH2/4 southbridge

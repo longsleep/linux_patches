@@ -1,0 +1,127 @@
+From stern@rowland.harvard.edu  Tue Sep 11 00:50:02 2007
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Mon, 10 Sep 2007 11:34:26 -0400 (EDT)
+Subject: USB: flush outstanding URBs when suspending
+To: Greg KH <greg@kroah.com>
+Cc: USB development list <linux-usb-devel@lists.sourceforge.net>
+Message-ID: <Pine.LNX.4.44L0.0709101133060.2732-100000@iolanthe.rowland.org>
+
+
+This patch (as989) makes usbcore flush all outstanding URBs for each
+device as the device is suspended.  This will be true even when
+CONFIG_USB_SUSPEND is not enabled.
+
+In addition, an extra can_submit flag is added to the usb_device
+structure.  That flag will be turned off whenever a suspend request
+has been received for the device, even if the device isn't actually
+suspended because CONFIG_USB_SUSPEND isn't set.
+
+It's no longer necessary to check for the device state being equal to
+USB_STATE_SUSPENDED during URB submission; that check can be replaced
+by a check of the can_submit flag.  This also permits us to remove
+some questionable references to the deprecated power.power_state field.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/driver.c |   10 +++++++++-
+ drivers/usb/core/hcd.c    |    5 +++++
+ drivers/usb/core/hub.c    |    9 +--------
+ drivers/usb/core/urb.c    |    3 ---
+ drivers/usb/core/usb.c    |    1 +
+ include/linux/usb.h       |    1 +
+ 6 files changed, 17 insertions(+), 12 deletions(-)
+
+--- a/drivers/usb/core/driver.c
++++ b/drivers/usb/core/driver.c
+@@ -1087,9 +1087,16 @@ static int usb_suspend_both(struct usb_d
+ 		if (udev->auto_pm)
+ 			autosuspend_check(udev);
+ 
+-	/* If the suspend succeeded, propagate it up the tree */
++	/* If the suspend succeeded then prevent any more URB submissions,
++	 * flush any outstanding URBs, and propagate the suspend up the tree.
++	 */
+ 	} else {
+ 		cancel_delayed_work(&udev->autosuspend);
++		udev->can_submit = 0;
++		for (i = 0; i < 16; ++i) {
++			usb_hcd_flush_endpoint(udev, udev->ep_out[i]);
++			usb_hcd_flush_endpoint(udev, udev->ep_in[i]);
++		}
+ 		if (parent)
+ 			usb_autosuspend_device(parent);
+ 	}
+@@ -1139,6 +1146,7 @@ static int usb_resume_both(struct usb_de
+ 		status = -ENODEV;
+ 		goto done;
+ 	}
++	udev->can_submit = 1;
+ 
+ 	/* Propagate the resume up the tree, if necessary */
+ 	if (udev->state == USB_STATE_SUSPENDED) {
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -1014,6 +1014,11 @@ int usb_hcd_link_urb_to_ep(struct usb_hc
+ 		goto done;
+ 	}
+ 
++	if (unlikely(!urb->dev->can_submit)) {
++		rc = -EHOSTUNREACH;
++		goto done;
++	}
++
+ 	/*
+ 	 * Check the host controller's state and add the URB to the
+ 	 * endpoint's queue.
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -1955,14 +1955,7 @@ static int hub_suspend(struct usb_interf
+ 		struct usb_device	*udev;
+ 
+ 		udev = hdev->children [port1-1];
+-		if (udev && msg.event == PM_EVENT_SUSPEND &&
+-#ifdef	CONFIG_USB_SUSPEND
+-				udev->state != USB_STATE_SUSPENDED
+-#else
+-				udev->dev.power.power_state.event
+-					== PM_EVENT_ON
+-#endif
+-				) {
++		if (udev && udev->can_submit) {
+ 			if (!hdev->auto_pm)
+ 				dev_dbg(&intf->dev, "port %d nyet suspended\n",
+ 						port1);
+--- a/drivers/usb/core/urb.c
++++ b/drivers/usb/core/urb.c
+@@ -286,9 +286,6 @@ int usb_submit_urb(struct urb *urb, gfp_
+ 		return -EINVAL;
+ 	if (!(dev = urb->dev) || dev->state < USB_STATE_DEFAULT)
+ 		return -ENODEV;
+-	if (dev->bus->controller->power.power_state.event != PM_EVENT_ON
+-			|| dev->state == USB_STATE_SUSPENDED)
+-		return -EHOSTUNREACH;
+ 
+ 	/* For now, get the endpoint from the pipe.  Eventually drivers
+ 	 * will be required to set urb->ep directly and we will eliminate
+--- a/drivers/usb/core/usb.c
++++ b/drivers/usb/core/usb.c
+@@ -272,6 +272,7 @@ usb_alloc_dev(struct usb_device *parent,
+ 	dev->ep0.desc.bDescriptorType = USB_DT_ENDPOINT;
+ 	/* ep0 maxpacket comes later, from device descriptor */
+ 	usb_enable_endpoint(dev, &dev->ep0);
++	dev->can_submit = 1;
+ 
+ 	/* Save readable and stable topology id, distinguishing devices
+ 	 * by location for diagnostics, tools, driver model, etc.  The
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -383,6 +383,7 @@ struct usb_device {
+ 	u8 portnum;			/* Parent port number (origin 1) */
+ 	u8 level;			/* Number of USB hub ancestors */
+ 
++	unsigned can_submit:1;		/* URBs may be submitted */
+ 	unsigned discon_suspended:1;	/* Disconnected while suspended */
+ 	unsigned have_langid:1;		/* whether string_langid is valid */
+ 	unsigned authorized:1;		/* Policy has determined we can use it */
