@@ -12,16 +12,18 @@ at least it builds with no warnings on i386 now...
 
 Thanks to Arnaud Patard <apatard@mandriva.com> for help with bugfixing.
 Thanks to Alan Cox for a lot of tty fixes.
+Thanks to Satyam Sharma <satyam@infradead.org> for fixing buildbreakage.
 Thanks to Frank Seidel <fseidel@suse.de> for a lot of bugfixes and
 rewriting to make it a sane Linux driver
 
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+Signed-off-by: Frank Seidel <fseidel@suse.de>
 
 ---
  drivers/char/Kconfig  |   10 
  drivers/char/Makefile |    1 
- drivers/char/nozomi.c | 2287 ++++++++++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 2298 insertions(+)
+ drivers/char/nozomi.c | 2348 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 2359 insertions(+)
 
 --- a/drivers/char/Kconfig
 +++ b/drivers/char/Kconfig
@@ -54,7 +56,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  obj-$(CONFIG_MOXA_INTELLIO)	+= moxa.o
 --- /dev/null
 +++ b/drivers/char/nozomi.c
-@@ -0,0 +1,2287 @@
+@@ -0,0 +1,2348 @@
 +/*
 + * nozomi.c  -- HSDPA driver Broadband Wireless Data Card - Globe Trotter
 + *
@@ -154,13 +156,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#include <linux/init.h>
 +#include <linux/kfifo.h>
 +#include <linux/list.h>
-+#include <asm/uaccess.h>
++#include <linux/uaccess.h>
 +#include <asm/atomic.h>
 +
 +#include <linux/delay.h>
 +
 +
-+#define VERSION_STRING DRIVER_DESC " 2.1 (build date: " __DATE__ " " __TIME__ ")"
++#define VERSION_STRING DRIVER_DESC " 2.1b (build date: " \
++					__DATE__ " " __TIME__ ")"
 +
 +/*    Macros definitions */
 +
@@ -189,13 +192,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +/* Do we need this settable at runtime? */
 +static int debug = NOZOMI_DEBUG_LEVEL;
 +
-+#define D(lvl, args...)  do {if(lvl & debug) NFO(KERN_DEBUG, ##args );} while (0)
++#define D(lvl, args...)  do {if (lvl & debug) NFO(KERN_DEBUG, ##args); } \
++				while (0)
 +#define D_(lvl, args...) D(lvl, ##args)
 +
 +/* These printouts are always printed */
 +
 +#else
-+static int debug = 0;
++static int debug;
 +#define D_(lvl, args...)
 +#endif
 +
@@ -205,16 +209,16 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +#define DUMP(buf__,len__) \
 +  do {  \
-+    char tbuf[TMP_BUF_MAX]={0};\
-+    if (len__>1) {\
-+        snprintf(tbuf, len__ > TMP_BUF_MAX ? TMP_BUF_MAX : len__, "%s",buf__);\
-+        if(tbuf[len__-2] == '\r') {\
-+            tbuf[len__-2] = 'r';\
-+        }\
-+        DBG1( "SENDING: '%s' (%d+n)", tbuf, len__);\
++    char tbuf[TMP_BUF_MAX] = {0};\
++    if (len__ > 1) {\
++	snprintf(tbuf, len__ > TMP_BUF_MAX ? TMP_BUF_MAX : len__, "%s", buf__);\
++	if (tbuf[len__-2] == '\r') {\
++		tbuf[len__-2] = 'r';\
++	} \
++	DBG1("SENDING: '%s' (%d+n)", tbuf, len__);\
 +    } else {\
-+        DBG1( "SENDING: '%s' (%d)", tbuf, len__);\
-+    }\
++	DBG1("SENDING: '%s' (%d)", tbuf, len__);\
++    } \
 +} while (0)
 +
 +/*    Defines */
@@ -285,7 +289,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + */
 +enum card_type {
 +	F32_2 = 2048,	/* 512 bytes downlink + uplink * 2 -> 2048 */
-+	F32_8 = 8192,	/* 3072 bytes downlink + 1024 bytes uplink * 2 -> 8192 */
++	F32_8 = 8192,	/* 3072 bytes downl. + 1024 bytes uplink * 2 -> 8192 */
 +};
 +
 +/* Two different toggle channels exist */
@@ -318,8 +322,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +/* Big endian */
 +
 +struct toggles {
-+	unsigned enabled:5;	/* Toggle fields are valid if enabled is 0, else A-channels
-+				   must always be used. */
++	unsigned enabled:5;	/*
++				 * Toggle fields are valid if enabled is 0,
++				 * else A-channels must always be used.
++				 */
 +	unsigned diag_dl:1;
 +	unsigned mdm_dl:1;
 +	unsigned mdm_ul:1;
@@ -334,11 +340,17 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	u8 pad3[3];
 +	struct toggles toggle;
 +	u8 pad1[4];
-+	u16 dl_mdm_len1;	/* If this is 64, it can hold 60 bytes + 4 that is length field */
++	u16 dl_mdm_len1;	/*
++				 * If this is 64, it can hold
++				 * 60 bytes + 4 that is length field
++				 */
 +	u16 dl_start;
 +
 +	u16 dl_diag_len1;
-+	u16 dl_mdm_len2;	/* If this is 64, it can hold 60 bytes + 4 that is length field */
++	u16 dl_mdm_len2;	/*
++				 * If this is 64, it can hold
++				 * 60 bytes + 4 that is length field
++				 */
 +	u16 dl_app1_len;
 +
 +	u16 dl_diag_len2;
@@ -380,8 +392,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	unsigned mdm_ul:1;
 +	unsigned mdm_dl:1;
 +	unsigned diag_dl:1;
-+	unsigned enabled:5;	/* Toggle fields are valid if enabled is 0, else A-channels
-+				   must always be used. */
++	unsigned enabled:5;	/*
++				 * Toggle fields are valid if enabled is 0,
++				 * else A-channels must always be used.
++				 */
 +} __attribute__ ((packed));
 +
 +/* Configuration table to read at startup of card */
@@ -392,7 +406,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	struct toggles toggle;
 +	u8 pad1[7];
 +	u16 dl_start;
-+	u16 dl_mdm_len1;	/* If this is 64, it can hold 60 bytes + 4 that is length field */
++	u16 dl_mdm_len1;	/*
++				 * If this is 64, it can hold
++				 * 60 bytes + 4 that is length field
++				 */
 +	u16 dl_mdm_len2;
 +	u16 dl_diag_len1;
 +	u16 dl_diag_len2;
@@ -477,7 +494,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	struct ktermios *tty_termios[NTTY_TTY_MINORS];
 +	struct ktermios *tty_termios_locked[NTTY_TTY_MINORS];
-+	spinlock_t spin_mutex;
++	spinlock_t spin_mutex;	/* secures access to registers and tty */
 +
 +	u32 open_ttys;
 +};
@@ -524,14 +541,15 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	int devidx;
 +
 +	if (likely(atomic_read(&cards_found) == 1)) {
-+		curdev = list_first_entry(&my_devices, struct nozomi_devices, list);
++		curdev = list_first_entry(&my_devices,
++					struct nozomi_devices, list);
 +		return curdev->my_dev;
 +	} else {
 +		devidx = index - (index % NTTY_TTY_MINORS);
 +
 +		list_for_each(p, &my_devices) {
 +			curdev = list_entry(p, struct nozomi_devices, list);
-+			if (curdev->index_start == devidx )
++			if (curdev->index_start == devidx)
 +				return curdev->my_dev;
 +		}
 +	}
@@ -558,7 +576,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + * -Optimize
 + * -Rewrite cleaner
 + */
-+static void read_mem32(u32 *buf, const void __iomem *mem_addr_start, u32 size_bytes)
++static void read_mem32(u32 *buf, const void __iomem *mem_addr_start,
++			u32 size_bytes)
 +{
 +	u32 i = 0;
 +#ifdef __ARMEB__
@@ -568,7 +587,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#endif
 +	u16 *buf16;
 +
-+	if (!ptr || !buf || !size_bytes)
++	if (unlikely(!ptr || !buf))
 +		goto out;
 +
 +	/* shortcut for extremely often used cases */
@@ -623,7 +642,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + * -Optimize
 + * -Rewrite cleaner
 + */
-+static u32 write_mem32(void __iomem *mem_addr_start, u32 *buf, u32 size_bytes)
++static u32 write_mem32(void __iomem *mem_addr_start, u32 *buf,
++			u32 size_bytes)
 +{
 +	u32 i = 0;
 +#ifdef __ARMEB__
@@ -633,7 +653,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#endif
 +	u16 *buf16;
 +
-+	if (!ptr || !buf || !size_bytes)
++	if (unlikely(!ptr || !buf))
 +		return 0;
 +
 +	/* shortcut for extremely often used cases */
@@ -679,63 +699,89 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		buf++;
 +		ptr++;
 +	}
-+	return size_bytes;
++	return i;
 +}
 +
 +/* Setup pointers to different channels and also setup buffer sizes. */
 +static void setup_memory(struct nozomi *dc)
 +{
 +	void __iomem *offset = dc->base_addr + dc->config_table.dl_start;
-+	/* The length reported is including the length field of 4 bytes, hence subtract with 4. */
++	/* The length reported is including the length field of 4 bytes,
++	 * hence subtract with 4.
++	 */
 +	const u16 buff_offset = 4;
 +
 +	/* Modem port dl configuration */
 +	dc->port[PORT_MDM].dl_addr[CH_A] = offset;
-+	dc->port[PORT_MDM].dl_addr[CH_B] = (offset += dc->config_table.dl_mdm_len1);
-+	dc->port[PORT_MDM].dl_size[CH_A] = dc->config_table.dl_mdm_len1 - buff_offset;
-+	dc->port[PORT_MDM].dl_size[CH_B] = dc->config_table.dl_mdm_len2 - buff_offset;
++	dc->port[PORT_MDM].dl_addr[CH_B] =
++				(offset += dc->config_table.dl_mdm_len1);
++	dc->port[PORT_MDM].dl_size[CH_A] =
++				dc->config_table.dl_mdm_len1 - buff_offset;
++	dc->port[PORT_MDM].dl_size[CH_B] =
++				dc->config_table.dl_mdm_len2 - buff_offset;
 +
 +	/* Diag port dl configuration */
-+	dc->port[PORT_DIAG].dl_addr[CH_A] = (offset += dc->config_table.dl_mdm_len2);
-+	dc->port[PORT_DIAG].dl_size[CH_A] = dc->config_table.dl_diag_len1 - buff_offset;
-+	dc->port[PORT_DIAG].dl_addr[CH_B] = (offset += dc->config_table.dl_diag_len1);
-+	dc->port[PORT_DIAG].dl_size[CH_B] = dc->config_table.dl_diag_len2 - buff_offset;
++	dc->port[PORT_DIAG].dl_addr[CH_A] =
++				(offset += dc->config_table.dl_mdm_len2);
++	dc->port[PORT_DIAG].dl_size[CH_A] =
++				dc->config_table.dl_diag_len1 - buff_offset;
++	dc->port[PORT_DIAG].dl_addr[CH_B] =
++				(offset += dc->config_table.dl_diag_len1);
++	dc->port[PORT_DIAG].dl_size[CH_B] =
++				dc->config_table.dl_diag_len2 - buff_offset;
 +
 +	/* App1 port dl configuration */
-+	dc->port[PORT_APP1].dl_addr[CH_A] = (offset += dc->config_table.dl_diag_len2);
-+	dc->port[PORT_APP1].dl_size[CH_A] = dc->config_table.dl_app1_len - buff_offset;
++	dc->port[PORT_APP1].dl_addr[CH_A] =
++				(offset += dc->config_table.dl_diag_len2);
++	dc->port[PORT_APP1].dl_size[CH_A] =
++				dc->config_table.dl_app1_len - buff_offset;
 +
 +	/* App2 port dl configuration */
-+	dc->port[PORT_APP2].dl_addr[CH_A] = (offset += dc->config_table.dl_app1_len);
-+	dc->port[PORT_APP2].dl_size[CH_A] = dc->config_table.dl_app2_len - buff_offset;
++	dc->port[PORT_APP2].dl_addr[CH_A] =
++				(offset += dc->config_table.dl_app1_len);
++	dc->port[PORT_APP2].dl_size[CH_A] =
++				dc->config_table.dl_app2_len - buff_offset;
 +
 +	/* Ctrl dl configuration */
-+	dc->port[PORT_CTRL].dl_addr[CH_A] = (offset += dc->config_table.dl_app2_len);
-+	dc->port[PORT_CTRL].dl_size[CH_A] = dc->config_table.dl_ctrl_len - buff_offset;
++	dc->port[PORT_CTRL].dl_addr[CH_A] =
++				(offset += dc->config_table.dl_app2_len);
++	dc->port[PORT_CTRL].dl_size[CH_A] =
++				dc->config_table.dl_ctrl_len - buff_offset;
 +
 +	offset = dc->base_addr + dc->config_table.ul_start;
 +
 +	/* Modem Port ul configuration */
 +	dc->port[PORT_MDM].ul_addr[CH_A] = offset;
-+	dc->port[PORT_MDM].ul_size[CH_A] = dc->config_table.ul_mdm_len1 - buff_offset;
-+	dc->port[PORT_MDM].ul_addr[CH_B] = (offset += dc->config_table.ul_mdm_len1);
-+	dc->port[PORT_MDM].ul_size[CH_B] = dc->config_table.ul_mdm_len2 - buff_offset;
++	dc->port[PORT_MDM].ul_size[CH_A] =
++				dc->config_table.ul_mdm_len1 - buff_offset;
++	dc->port[PORT_MDM].ul_addr[CH_B] =
++				(offset += dc->config_table.ul_mdm_len1);
++	dc->port[PORT_MDM].ul_size[CH_B] =
++				dc->config_table.ul_mdm_len2 - buff_offset;
 +
 +	/* Diag port ul configuration */
-+	dc->port[PORT_DIAG].ul_addr[CH_A] = (offset += dc->config_table.ul_mdm_len2);
-+	dc->port[PORT_DIAG].ul_size[CH_A] = dc->config_table.ul_diag_len - buff_offset;
++	dc->port[PORT_DIAG].ul_addr[CH_A] =
++				(offset += dc->config_table.ul_mdm_len2);
++	dc->port[PORT_DIAG].ul_size[CH_A] =
++				dc->config_table.ul_diag_len - buff_offset;
 +
 +	/* App1 port ul configuration */
-+	dc->port[PORT_APP1].ul_addr[CH_A] = (offset += dc->config_table.ul_diag_len);
-+	dc->port[PORT_APP1].ul_size[CH_A] = dc->config_table.ul_app1_len - buff_offset;
++	dc->port[PORT_APP1].ul_addr[CH_A] =
++				(offset += dc->config_table.ul_diag_len);
++	dc->port[PORT_APP1].ul_size[CH_A] =
++				dc->config_table.ul_app1_len - buff_offset;
 +
 +	/* App2 port ul configuration */
-+	dc->port[PORT_APP2].ul_addr[CH_A] = (offset += dc->config_table.ul_app1_len);
-+	dc->port[PORT_APP2].ul_size[CH_A] = dc->config_table.ul_app2_len - buff_offset;
++	dc->port[PORT_APP2].ul_addr[CH_A] =
++				(offset += dc->config_table.ul_app1_len);
++	dc->port[PORT_APP2].ul_size[CH_A] =
++				dc->config_table.ul_app2_len - buff_offset;
 +
 +	/* Ctrl ul configuration */
-+	dc->port[PORT_CTRL].ul_addr[CH_A] = (offset += dc->config_table.ul_app2_len);
-+	dc->port[PORT_CTRL].ul_size[CH_A] = dc->config_table.ul_ctrl_len - buff_offset;
++	dc->port[PORT_CTRL].ul_addr[CH_A] =
++				(offset += dc->config_table.ul_app2_len);
++	dc->port[PORT_CTRL].ul_size[CH_A] =
++				dc->config_table.ul_ctrl_len - buff_offset;
 +}
 +
 +/* Dump config table under initalization phase */
@@ -744,7 +790,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +{
 +	DBG3("signature: 0x%08X", dc->config_table.signature);
 +	DBG3("version: 0x%04X", dc->config_table.version);
-+	DBG3("product_information: 0x%04X", dc->config_table.product_information);
++	DBG3("product_information: 0x%04X", \
++				dc->config_table.product_information);
 +	DBG3("toggle enabled: %d", dc->config_table.toggle.enabled);
 +	DBG3("toggle up_mdm: %d", dc->config_table.toggle.mdm_ul);
 +	DBG3("toggle dl_mdm: %d", dc->config_table.toggle.mdm_dl);
@@ -790,9 +837,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + */
 +static int nozomi_read_config_table(struct nozomi *dc)
 +{
-+	read_mem32((u32*) &dc->config_table, dc->base_addr + 0, sizeof(struct config_table));
-+
-+	/* DBG1( "0x%08X == 0x%08X ", dc->config_table.signature, CONFIG_MAGIC); */
++	read_mem32((u32 *) &dc->config_table, dc->base_addr + 0,
++						sizeof(struct config_table));
 +
 +	if (dc->config_table.signature != CONFIG_MAGIC) {
 +		dev_err(&dc->pdev->dev, "ConfigTable Bad! 0x%08X != 0x%08X\n",
@@ -849,9 +895,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +		/* push upload modem buffers */
 +		write_mem32(dc->port[PORT_MDM].ul_addr[CH_A],
-+			(u32*) &offset, 4);
++			(u32 *) &offset, 4);
 +		write_mem32(dc->port[PORT_MDM].ul_addr[CH_B],
-+			(u32*) &offset, 4);
++			(u32 *) &offset, 4);
 +
 +		writew(MDM_UL | DIAG_DL | MDM_DL, dc->reg_fcr);
 +
@@ -1000,8 +1046,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	/* DUMP(buf, size); */
 +
 +	/* Write length + data */
-+	write_mem32(addr, (u32*) &size, 4);
-+	write_mem32(addr + 4, (u32*) dc->send_buf, size);
++	write_mem32(addr, (u32 *) &size, 4);
++	write_mem32(addr + 4, (u32 *) dc->send_buf, size);
 +
 +	if (tty)
 +		tty_wakeup(tty);
@@ -1020,12 +1066,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	struct tty_struct *tty = port->tty;
 +	int i;
 +
-+	if (!tty) {
++	if (unlikely(!tty)) {
 +		DBG1("tty not open for port: %d?", index);
 +		return 1;
 +	}
 +
-+	read_mem32((u32*) &size, addr, 4);
++	read_mem32((u32 *) &size, addr, 4);
 +	/*  DBG1( "%d bytes port: %d", size, index); */
 +
 +	if (test_bit(TTY_THROTTLED, &tty->flags)) {
@@ -1044,16 +1090,19 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	port->rx_data += size;
 +
++	tty_buffer_request_room(tty, size);
++
 +	while (size > 0) {
-+		read_mem32((u32*) buf, addr + offset, RECEIVE_BUF_MAX);
++		read_mem32((u32 *) buf, addr + offset, RECEIVE_BUF_MAX);
 +
 +		if (size == 1) {
 +			tty_insert_flip_char(tty, buf[0], TTY_NORMAL);
 +			size = 0;
 +		} else if (size < RECEIVE_BUF_MAX) {
-+			size -= tty_insert_flip_string(tty, (char*) buf, size);
++			size -= tty_insert_flip_string(tty, (char *) buf, size);
 +		} else {
-+			i = tty_insert_flip_string(tty, (char*) buf, RECEIVE_BUF_MAX);
++			i = tty_insert_flip_string(tty, \
++						(char *) buf, RECEIVE_BUF_MAX);
 +			size -= i;
 +			offset += i;
 +		}
@@ -1077,8 +1126,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	interrupt & MDM_UL1 ? p += snprintf(p, TMP_BUF_MAX, "MDM_UL1 ") : NULL;
 +	interrupt & MDM_UL2 ? p += snprintf(p, TMP_BUF_MAX, "MDM_UL2 ") : NULL;
 +
-+	interrupt & DIAG_DL1 ? p += snprintf(p, TMP_BUF_MAX, "DIAG_DL1 ") : NULL;
-+	interrupt & DIAG_DL2 ? p += snprintf(p, TMP_BUF_MAX, "DIAG_DL2 ") : NULL;
++	interrupt & DIAG_DL1 ? p += snprintf(p, \
++					TMP_BUF_MAX, "DIAG_DL1 ") : NULL;
++	interrupt & DIAG_DL2 ? p += snprintf(p, \
++					TMP_BUF_MAX, "DIAG_DL2 ") : NULL;
 +
 +	interrupt & DIAG_UL ? p += snprintf(p, TMP_BUF_MAX, "DIAG_UL ") : NULL;
 +
@@ -1108,7 +1159,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	struct ctrl_dl old_ctrl;
 +	u16 enable_ier = 0;
 +
-+	read_mem32((u32*) &ctrl_dl, dc->port[PORT_CTRL].dl_addr[CH_A], 2);
++	read_mem32((u32 *) &ctrl_dl, dc->port[PORT_CTRL].dl_addr[CH_A], 2);
 +
 +	switch (ctrl_dl.port) {
 +	case CTRL_CMD:
@@ -1167,18 +1218,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		return 1;
 +	}
 +	/* Update statistics */
-+	if (old_ctrl.CTS != ctrl_dl.CTS) {
++	if (old_ctrl.CTS != ctrl_dl.CTS)
 +		dc->port[port].tty_icount.cts++;
-+	}
-+	if (old_ctrl.DSR != ctrl_dl.DSR) {
++	if (old_ctrl.DSR != ctrl_dl.DSR)
 +		dc->port[port].tty_icount.dsr++;
-+	}
-+	if (old_ctrl.RI != ctrl_dl.RI) {
++	if (old_ctrl.RI != ctrl_dl.RI)
 +		dc->port[port].tty_icount.rng++;
-+	}
-+	if (old_ctrl.DCD != ctrl_dl.DCD) {
++	if (old_ctrl.DCD != ctrl_dl.DCD)
 +		dc->port[port].tty_icount.dcd++;
-+	}
 +	DBG1("port: %d DCD(%d), CTS(%d), RI(%d), DSR(%d)",
 +	   port,
 +	   dc->port[port].tty_icount.dcd, dc->port[port].tty_icount.cts,
@@ -1187,7 +1234,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return 1;
 +}
 +
-+static enum ctrl_port_type port2ctrl(enum port_type port, const struct nozomi *dc)
++static enum ctrl_port_type port2ctrl(enum port_type port,
++					const struct nozomi *dc)
 +{
 +	switch (port) {
 +	case PORT_MDM:
@@ -1200,7 +1248,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		return CTRL_APP2;
 +	default:
 +		dev_err(&dc->pdev->dev,
-+			"ERROR: send flow control received for non-existing port\n");
++			"ERROR: send flow control " \
++			"received for non-existing port\n");
 +	};
 +	return CTRL_ERROR;
 +}
@@ -1223,8 +1272,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			}
 +			dc->port[i].ctrl_ul.port = port2ctrl(i, dc);
 +			ctrl = (u16 *) & dc->port[i].ctrl_ul;
-+			write_mem32(dc->port[PORT_CTRL].ul_addr[0], (u32*) ctrl,
-+				2);
++			write_mem32(dc->port[PORT_CTRL].ul_addr[0], \
++				(u32 *) ctrl, 2);
 +			dc->port[i].update_flow_control = 0;
 +			more_flow_control_to_be_updated = 1;
 +		}
@@ -1296,7 +1345,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			writew(dc->last_ier, dc->reg_ier);
 +			if (send_data(port, dc)) {
 +				writew(MDM_UL2, dc->reg_fcr);
-+				dc->last_ier = (dc->last_ier & ~MDM_UL) | MDM_UL;
++				dc->last_ier = \
++					(dc->last_ier & ~MDM_UL) | MDM_UL;
 +				writew(dc->last_ier, dc->reg_ier);
 +				*toggle = !*toggle;
 +			}
@@ -1317,7 +1367,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			writew(dc->last_ier, dc->reg_ier);
 +			if (send_data(port, dc)) {
 +				writew(MDM_UL1, dc->reg_fcr);
-+				dc->last_ier = (dc->last_ier & ~MDM_UL) | MDM_UL;
++				dc->last_ier = \
++					(dc->last_ier & ~MDM_UL) | MDM_UL;
 +				writew(dc->last_ier, dc->reg_ier);
 +				*toggle = !*toggle;
 +			}
@@ -1333,11 +1384,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static irqreturn_t interrupt_handler(int irq, void *dev_id)
 +{
 +	struct nozomi_devices *ndev = dev_id;
-+	struct nozomi *dc = ndev->my_dev;
-+	struct irq *m = &ndev->my_irq;
++	struct nozomi *dc;
++	struct irq *m;
 +
-+	if (!dc)
++	if (!ndev)
 +		return IRQ_NONE;
++
++	dc = ndev->my_dev;
++	m = &ndev->my_irq;
 +
 +	spin_lock(&dc->spin_mutex);
 +	m->read_iir = readw(dc->reg_iir);
@@ -1345,8 +1399,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	/* Card removed */
 +	if (m->read_iir == (u16)-1)
 +		goto none;
-+
-+	/* Just handle interrupt enabled in IER (by masking with dc->last_ier) */
++	/*
++	 * Just handle interrupt enabled in IER
++	 * (by masking with dc->last_ier)
++	 */
 +	m->read_iir &= dc->last_ier;
 +
 +	if (m->read_iir == 0)
@@ -1453,8 +1509,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +{
 +	int rval;
 +
-+	rval = request_irq(ndev->my_dev->pdev->irq, &interrupt_handler, IRQF_SHARED,
-+			   NOZOMI_NAME, ndev);
++	rval = request_irq(ndev->my_dev->pdev->irq, &interrupt_handler,
++				IRQF_SHARED, NOZOMI_NAME, ndev);
 +	if (unlikely(rval))
 +		dev_err(&ndev->my_dev->pdev->dev, "Cannot open because IRQ %d "
 +			"is already in use.\n", ndev->my_dev->pdev->irq);
@@ -1493,7 +1549,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	dc->port[PORT_APP2].token_dl = APP2_DL;
 +
 +	for (i = PORT_MDM; i < MAX_PORT; ++i) {
-+		dc->port[i].rx_data = dc->port[i].tx_data = 0;
++		dc->port[i].rx_data = 0;
++		dc->port[i].tx_data = 0;
 +		dc->port[i].tty_dont_flip = 0;
 +	}
 +}
@@ -1564,7 +1621,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	int i;
 +
 +	atomic_inc(&cards_found);
-+	dev_dbg(&pdev->dev, "Init, cards_found: %d\n", atomic_read(&cards_found));
++	dev_dbg(&pdev->dev, "Init, cards_found: %d\n",
++		atomic_read(&cards_found));
 +
 +	dc = kzalloc(sizeof(struct nozomi), GFP_KERNEL);
 +	if (unlikely(!dc)) {
@@ -1656,17 +1714,19 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			dc->port[i].tty_open_count = 0;
 +			dc->port[i].tty = NULL;
 +			tty_register_device(dc->tty_driver,
-+				i + (atomic_read(&cards_found) * NTTY_TTY_MINORS),
++				i + (atomic_read(&cards_found)
++							* NTTY_TTY_MINORS),
 +				&dc->pdev->dev);
 +		}
-+		newdev->index_start = atomic_read(&cards_found) * NTTY_TTY_MINORS;
-+        }
++		newdev->index_start =
++				atomic_read(&cards_found) * NTTY_TTY_MINORS;
++	}
 +
 +	/* Enable  RESET interrupt. */
 +	dc->last_ier = RESET;
 +	writew(dc->last_ier, dc->reg_ier);
 +
-+        INIT_LIST_HEAD(&newdev->list);
++	INIT_LIST_HEAD(&newdev->list);
 +	list_add_tail(&newdev->list, &my_devices);
 +
 +	pci_set_drvdata(pdev, newdev);
@@ -1724,7 +1784,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	for (i = ndev->index_start; i < ndev->index_start + NTTY_TTY_MINORS; \
 +									++i)
-+		if (dc->port[i].tty && list_empty(&dc->port[i].tty->hangup_work.entry))
++		if (dc->port[i].tty && \
++				list_empty(&dc->port[i].tty->hangup_work.entry))
 +			tty_hangup(dc->port[i].tty);
 +
 +	while (dc->open_ttys)
@@ -1765,7 +1826,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	/* Setup dc->reg addresses to we can use defines here */
 +	nozomi_setup_private_data(dc);
-+	write_mem32(dc->port[PORT_CTRL].ul_addr[0], (u32*) & ctrl, 2);
++	write_mem32(dc->port[PORT_CTRL].ul_addr[0], (u32 *) & ctrl, 2);
 +	writew(CTRL_UL, dc->reg_fcr);	/* push the token to the card. */
 +
 +	DBG1("pci_release_regions");
@@ -1830,9 +1891,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	struct nozomi *dc = get_dc_by_tty(tty);
 +	unsigned long flags;
 +
-+	if (down_interruptible(&port->tty_sem)) {
++	if (down_interruptible(&port->tty_sem))
 +		return -ERESTARTSYS;
-+	}
 +
 +	port->tty_open_count++;
 +	dc->open_ttys++;
@@ -1843,10 +1903,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		tty->driver_data = port;
 +		port->tty = tty;
 +		port->tty_index = tty->index;
-+		port->rx_data = port->tx_data = 0;
++		port->rx_data = 0;
++		port->tx_data = 0;
 +		DBG1("open: %d", port->token_dl);
 +		spin_lock_irqsave(&dc->spin_mutex, flags);
-+		dc->last_ier = (dc->last_ier & ~(port->token_dl)) | port->token_dl;
++		dc->last_ier =
++			(dc->last_ier & ~(port->token_dl)) | port->token_dl;
 +		writew(dc->last_ier, dc->reg_ier);
 +		spin_unlock_irqrestore(&dc->spin_mutex, flags);
 +	}
@@ -1935,16 +1997,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	int room = 0;
 +	struct nozomi *dc = get_dc_by_tty(tty);
 +
-+	if (!dc || !port) {
++	if (!dc || !port)
 +		return 0;
-+	}
-+	if (down_trylock(&port->tty_sem)) {
++	if (down_trylock(&port->tty_sem))
 +		return 0;
-+	}
 +
-+	if (!port->tty_open_count) {
++	if (!port->tty_open_count)
 +		goto exit;
-+	}
 +
 +	room = port->fifo_ul->size - __kfifo_len(port->fifo_ul);
 +
@@ -2048,11 +2107,15 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +{
 +	struct port *port = (struct port *)tty->driver_data;
 +
-+	if(set & TIOCM_RTS) set_rts(port->tty_index, 1);
-+	else if(clear & TIOCM_RTS) set_rts(port->tty_index, 0);
++	if (set & TIOCM_RTS)
++		set_rts(port->tty_index, 1);
++	else if (clear & TIOCM_RTS)
++		set_rts(port->tty_index, 0);
 +
-+	if(set & TIOCM_DTR) set_dtr(port->tty_index, 1);
-+	else if(clear & TIOCM_DTR) set_dtr(port->tty_index, 0);
++	if (set & TIOCM_DTR)
++		set_dtr(port->tty_index, 1);
++	else if (clear & TIOCM_DTR)
++		set_dtr(port->tty_index, 0);
 +
 +	return 0;
 +}
@@ -2085,9 +2148,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			if (((arg & TIOCM_RNG) && (cnow.rng != cprev.rng)) ||
 +			    ((arg & TIOCM_DSR) && (cnow.dsr != cprev.dsr)) ||
 +			    ((arg & TIOCM_CD) && (cnow.dcd != cprev.dcd)) ||
-+			    ((arg & TIOCM_CTS) && (cnow.cts != cprev.cts))) {
++			    ((arg & TIOCM_CTS) && (cnow.cts != cprev.cts)))
 +				return 0;
-+			}
++
 +			cprev = cnow;
 +		}
 +
@@ -2320,7 +2383,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	.name = NOZOMI_NAME,
 +	.id_table = nozomi_pci_tbl,
 +	.probe = nozomi_card_init,
-+	.remove = __devexit(nozomi_card_exit),
++	.remove = __devexit_p(nozomi_card_exit),
 +};
 +
 +static __init int nozomi_init(void)
