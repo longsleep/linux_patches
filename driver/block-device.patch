@@ -28,17 +28,17 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 ---
  block/genhd.c              |  411 +++++++++++++++++++--------------------------
  block/ll_rw_blk.c          |    4 
- drivers/base/core.c        |   23 +-
+ drivers/base/core.c        |   22 +-
  drivers/block/aoe/aoeblk.c |   51 ++---
  drivers/block/nbd.c        |   15 -
  drivers/ide/ide-probe.c    |    2 
  drivers/md/dm.c            |    2 
  drivers/md/md.c            |    8 
  fs/block_dev.c             |    8 
- fs/partitions/check.c      |  308 ++++++++++++---------------------
+ fs/partitions/check.c      |  316 +++++++++++-----------------------
  include/linux/genhd.h      |   29 +--
  init/do_mounts.c           |  108 -----------
- 12 files changed, 379 insertions(+), 590 deletions(-)
+ 12 files changed, 373 insertions(+), 603 deletions(-)
 
 --- a/block/genhd.c
 +++ b/block/genhd.c
@@ -724,7 +724,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  EXPORT_SYMBOL(put_disk);
 --- a/block/ll_rw_blk.c
 +++ b/block/ll_rw_blk.c
-@@ -4090,7 +4090,7 @@ int blk_register_queue(struct gendisk *d
+@@ -4101,7 +4101,7 @@ int blk_register_queue(struct gendisk *d
  	if (!q || !q->request_fn)
  		return -ENXIO;
  
@@ -733,7 +733,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  	ret = kobject_add(&q->kobj);
  	if (ret < 0)
-@@ -4117,6 +4117,6 @@ void blk_unregister_queue(struct gendisk
+@@ -4128,6 +4128,6 @@ void blk_unregister_queue(struct gendisk
  
  		kobject_uevent(&q->kobj, KOBJ_REMOVE);
  		kobject_del(&q->kobj);
@@ -752,7 +752,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  #include <asm/semaphore.h>
  
  #include "base.h"
-@@ -552,10 +552,16 @@ void device_initialize(struct device *de
+@@ -542,10 +542,16 @@ void device_initialize(struct device *de
  static struct kobject * get_device_parent(struct device *dev,
  					  struct device *parent)
  {
@@ -772,17 +772,16 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	else if (parent)
  		return &parent->kobj;
  
-@@ -645,7 +651,8 @@ static int device_add_class_symlinks(str
- 		if (error)
- 			goto out_subsys;
+@@ -637,7 +643,7 @@ static int device_add_class_symlinks(str
  	}
--	if (dev->parent) {
-+	/* partitions must not have a device link */
-+	if (dev->parent && dev->type != &part_type) {
- 		error = sysfs_create_link(&dev->kobj, &dev->parent->kobj,
- 					  "device");
- 		if (error)
-@@ -667,7 +674,7 @@ static int device_add_class_symlinks(str
+ 	if (dev->parent) {
+ #ifdef CONFIG_SYSFS_DEPRECATED
+-		{
++		if (dev->parent && dev->type != &part_type) {
+ 			struct device *parent = dev->parent;
+ 			char *class_name;
+ 
+@@ -674,7 +680,7 @@ static int device_add_class_symlinks(str
  
  #ifdef CONFIG_SYSFS_DEPRECATED
  out_device:
@@ -791,7 +790,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		sysfs_remove_link(&dev->kobj, "device");
  #endif
  out_busid:
-@@ -804,7 +811,7 @@ int device_add(struct device *dev)
+@@ -811,7 +817,7 @@ int device_add(struct device *dev)
  		if (dev->kobj.parent != &dev->class->subsys.kobj)
  			sysfs_remove_link(&dev->class->subsys.kobj,
  					  dev->bus_id);
@@ -800,7 +799,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  #ifdef CONFIG_SYSFS_DEPRECATED
  			char *class_name = make_class_name(dev->class->name,
  							   &dev->kobj);
-@@ -903,7 +910,7 @@ void device_del(struct device * dev)
+@@ -910,7 +916,7 @@ void device_del(struct device * dev)
  		if (dev->kobj.parent != &dev->class->subsys.kobj)
  			sysfs_remove_link(&dev->class->subsys.kobj,
  					  dev->bus_id);
@@ -993,10 +992,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	mutex_unlock(&disks_mutex);
 -	mddev->kobj.parent = &disk->kobj;
 +	mddev->kobj.parent = &disk->dev.kobj;
- 	mddev->kobj.k_name = NULL;
- 	snprintf(mddev->kobj.name, KOBJ_NAME_LEN, "%s", "md");
+ 	kobject_set_name(&mddev->kobj, "%s", "md");
  	mddev->kobj.ktype = &md_ktype;
-@@ -3362,7 +3362,7 @@ static int do_md_run(mddev_t * mddev)
+ 	if (kobject_register(&mddev->kobj))
+@@ -3361,7 +3361,7 @@ static int do_md_run(mddev_t * mddev)
  
  	mddev->changed = 1;
  	md_new_event(mddev);
@@ -1216,13 +1215,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static struct attribute_group part_attr_group = {
 +	.attrs = part_attrs,
 +};
-+
+ 
+-static void part_release(struct kobject *kobj)
 +static struct attribute_group *part_attr_groups[] = {
 +	&part_attr_group,
 +	NULL
 +};
- 
--static void part_release(struct kobject *kobj)
++
 +static void part_release(struct device *dev)
  {
 -	struct hd_struct * p = container_of(kobj,struct hd_struct,kobj);
@@ -1285,17 +1284,19 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  	p = kzalloc(sizeof(*p), GFP_KERNEL);
  	if (!p)
-@@ -381,92 +336,52 @@ void add_partition(struct gendisk *disk,
+@@ -381,93 +336,37 @@ void add_partition(struct gendisk *disk,
  	p->partno = part;
  	p->policy = disk->policy;
  
--	if (isdigit(disk->kobj.name[strlen(disk->kobj.name)-1]))
--		snprintf(p->kobj.name,KOBJ_NAME_LEN,"%sp%d",disk->kobj.name,part);
+-	if (isdigit(disk->kobj.k_name[strlen(disk->kobj.k_name)-1]))
+-		kobject_set_name(&p->kobj, "%sp%d",
+-				 kobject_name(&disk->kobj), part);
 +	if (isdigit(disk->dev.bus_id[strlen(disk->dev.bus_id)-1]))
 +		snprintf(p->dev.bus_id, BUS_ID_SIZE,
 +			 "%sp%d", disk->dev.bus_id, part);
  	else
--		snprintf(p->kobj.name,KOBJ_NAME_LEN,"%s%d",disk->kobj.name,part);
+-		kobject_set_name(&p->kobj, "%s%d",
+-				 kobject_name(&disk->kobj),part);
 -	p->kobj.parent = &disk->kobj;
 -	p->kobj.ktype = &ktype_part;
 -	kobject_init(&p->kobj);
@@ -1330,14 +1331,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -	partition_sysfs_add_subdir(p);
 -	disk->part[part-1] = p;
 -}
- 
+-
 -static char *make_block_name(struct gendisk *disk)
 -{
 -	char *name;
 -	static char *block_str = "block:";
 -	int size;
 -	char *s;
--
+ 
 -	size = strlen(block_str) + strlen(disk->disk_name) + 1;
 -	name = kmalloc(size, GFP_KERNEL);
 -	if (!name)
@@ -1349,20 +1350,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -	if (s)
 -		*s = '!';
 -	return name;
-+	/* suppress uevent if the disk supresses it */
-+	if (!disk->dev.uevent_suppress)
-+		kobject_uevent(&p->dev.kobj, KOBJ_ADD);
- }
- 
-+#ifndef CONFIG_SYSFS_DEPRECATED
- static int disk_sysfs_symlinks(struct gendisk *disk)
- {
+-}
+-
+-static int disk_sysfs_symlinks(struct gendisk *disk)
+-{
 -	struct device *target = get_device(disk->driverfs_dev);
 -	int err;
 -	char *disk_name = NULL;
-+	int err = 0;
-+	struct device *target = get_device(disk->dev.parent);
- 
+-
 -	if (target) {
 -		disk_name = make_block_name(disk);
 -		if (!disk_name) {
@@ -1396,24 +1391,22 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -err_out_disk_name:
 -		kfree(disk_name);
 -err_out:
-+	err = sysfs_create_link(&block_depr, &disk->dev.kobj,
-+				disk->dev.kobj.name);
-+	if (err && target)
- 		put_device(target);
+-		put_device(target);
 -	}
- 	return err;
+-	return err;
++	/* suppress uevent if the disk supresses it */
++	if (!disk->dev.uevent_suppress)
++		kobject_uevent(&p->dev.kobj, KOBJ_ADD);
  }
-+#endif
  
  /* Not exported, helper to add_disk(). */
- void register_disk(struct gendisk *disk)
-@@ -477,18 +392,27 @@ void register_disk(struct gendisk *disk)
+@@ -479,18 +378,28 @@ void register_disk(struct gendisk *disk)
  	struct hd_struct *p;
  	int err;
  
--	strlcpy(disk->kobj.name,disk->disk_name,KOBJ_NAME_LEN);
+-	kobject_set_name(&disk->kobj, "%s", disk->disk_name);
 -	/* ewww... some of these buggers have / in name... */
--	s = strchr(disk->kobj.name, '/');
+-	s = strchr(disk->kobj.k_name, '/');
 +	disk->dev.parent = disk->driverfs_dev;
 +	disk->dev.devt = MKDEV(disk->major, disk->first_minor);
 +
@@ -1429,8 +1422,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	if (device_add(&disk->dev))
  		return;
+-	err = disk_sysfs_symlinks(disk);
 +#ifndef CONFIG_SYSFS_DEPRECATED
- 	err = disk_sysfs_symlinks(disk);
++	err = sysfs_create_link(&block_depr, &disk->dev.kobj,
++				kobject_name(&disk->dev.kobj));
  	if (err) {
 -		kobject_del(&disk->kobj);
 +		device_del(&disk->dev);
@@ -1440,7 +1435,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
   	disk_sysfs_add_subdirs(disk);
  
  	/* No minors to use for partitions */
-@@ -503,25 +427,23 @@ void register_disk(struct gendisk *disk)
+@@ -505,25 +414,23 @@ void register_disk(struct gendisk *disk)
  	if (!bdev)
  		goto exit;
  
@@ -1470,14 +1465,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	}
  }
  
-@@ -600,19 +522,15 @@ void del_gendisk(struct gendisk *disk)
+@@ -602,19 +509,12 @@ void del_gendisk(struct gendisk *disk)
  	disk_stat_set_all(disk, 0);
  	disk->stamp = 0;
  
 -	kobject_uevent(&disk->kobj, KOBJ_REMOVE);
  	kobject_unregister(disk->holder_dir);
  	kobject_unregister(disk->slave_dir);
- 	if (disk->driverfs_dev) {
+-	if (disk->driverfs_dev) {
 -		char *disk_name = make_block_name(disk);
 -		sysfs_remove_link(&disk->kobj, "device");
 -		if (disk_name) {
@@ -1485,16 +1480,16 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -			kfree(disk_name);
 -		}
 -		put_device(disk->driverfs_dev);
-+		put_device(disk->dev.parent);
-+		disk->dev.parent = NULL;
- 		disk->driverfs_dev = NULL;
- 	}
+-		disk->driverfs_dev = NULL;
+-	}
 -	sysfs_remove_link(&disk->kobj, "subsystem");
 -	kobject_del(&disk->kobj);
++	disk->driverfs_dev = NULL;
 +#ifndef CONFIG_SYSFS_DEPRECATED
 +	sysfs_remove_link(&block_depr, disk->dev.bus_id);
 +#endif
 +	device_del(&disk->dev);
++	put_device(&disk->dev);
  }
 --- a/include/linux/genhd.h
 +++ b/include/linux/genhd.h
