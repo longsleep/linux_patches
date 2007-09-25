@@ -14,37 +14,61 @@ One _really_ nice thing this patch does, is us the kallsyms
 mechanism to print out exactly which symbol is being complained
 about:
 
-The kobject at, or inside devices_subsys+0x14/0x60 is not dynamically allocated.
+	The kobject at, or inside 'statickobj.2'@(0xc040d020) is not dynamically allocated.
 
-There are not very many architectures that actually place a
-_sdata or _data symbol in their vmlinux.lds.S.  This patch
-causes link errors in all these cases.  Is there an
-alternative symbol that we can use, or can we use weak
-symbols and detect them, so that they are at least skipped?
+This patch replaces the previous implementation's use of a
+_sdata symbol in favor of using kallsyms_lookup().  If a
+kobject's address is a resolvable symbol, then it isn't
+dynamically allocated.
 
-Does kernel/kallsyms.c:is_kernel() do the trick, so that we
-don't need to use the asm-generic/sections.h variables at all?
+The one exception to this is init symbols.  The patch also
+checks to see whether __init memory has been freed and if
+it has will allow kobjects in those sections.
 
-
+Signed-off-by: Dave Hansen <haveblue@us.ibm.com>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 
 ---
- arch/i386/kernel/vmlinux.lds.S |    2 +
- lib/kobject.c                  |   43 +++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 45 insertions(+)
+ include/linux/init.h |    1 
+ init/main.c          |    9 ++++++++
+ lib/kobject.c        |   56 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 66 insertions(+)
 
---- a/arch/i386/kernel/vmlinux.lds.S
-+++ b/arch/i386/kernel/vmlinux.lds.S
-@@ -71,6 +71,8 @@ SECTIONS
-   	__tracedata_end = .;
-   }
+--- a/include/linux/init.h
++++ b/include/linux/init.h
+@@ -83,6 +83,7 @@ extern initcall_t __security_initcall_st
+ extern char __initdata boot_command_line[];
+ extern char *saved_command_line;
+ extern unsigned int reset_devices;
++extern int initmem_now_dynamic;
  
-+  _sdata = .;			/* End of text section */
+ /* used by init/main.c */
+ void setup_arch(char **);
+--- a/init/main.c
++++ b/init/main.c
+@@ -768,12 +768,21 @@ static void run_init_process(char *init_
+ 	kernel_execve(init_filename, argv_init, envp_init);
+ }
+ 
++/*
++ * __init/__init_data sections are turned into normal
++ * dynamically allocated memory later in boot.  When
++ * this is 0, the memory is for the __init purposes,
++ * when it it some other value, the memory is dynamic.
++ */
++int initmem_now_dynamic;
 +
-   RODATA
- 
-   /* writeable */
+ /* This is a non __init function. Force it to be noinline otherwise gcc
+  * makes it inline to init() and it becomes part of init.text section
+  */
+ static int noinline init_post(void)
+ {
+ 	free_initmem();
++	initmem_now_dynamic = 1;
+ 	unlock_kernel();
+ 	mark_rodata_ro();
+ 	system_state = SYSTEM_RUNNING;
 --- a/lib/kobject.c
 +++ b/lib/kobject.c
 @@ -15,6 +15,8 @@
@@ -56,7 +80,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  /**
   *	populate_dir - populate directory with attributes.
-@@ -121,6 +123,46 @@ char *kobject_get_path(struct kobject *k
+@@ -121,6 +123,59 @@ char *kobject_get_path(struct kobject *k
  }
  EXPORT_SYMBOL_GPL(kobject_get_path);
  
@@ -76,23 +100,36 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return 0;
 +}
 +
-+static void verify_dynamic_kobject_allocation(struct kobject *kobj)
++void verify_dynamic_kobject_allocation(struct kobject *kobj)
 +{
-+	if (ptr_in_range(kobj, &_sdata[0], &_edata[0]))
-+		goto warn;
-+	if (ptr_in_range(kobj, &__bss_start[0], &__bss_stop[0]))
-+		goto warn;
-+	return;
-+warn:
++	char *namebuf;
++	const char *ret;
++
++	namebuf = kzalloc(KSYM_NAME_LEN, GFP_KERNEL);
++	ret = kallsyms_lookup((unsigned long)kobj, NULL, NULL, NULL,
++			namebuf);
++	/*
++	 * This is the X86_32-only part of this function.
++	 * This is here because it is valid to have a kobject
++	 * in an __init section, but only after those
++	 * sections have been freed back to the dynamic pool.
++	 */
++	if (!initmem_now_dynamic &&
++	    ptr_in_range(kobj, __init_begin, __init_end))
++		goto out;
++	if (!ret || !strlen(ret))
++		goto out;
 +	pr_debug("---- begin silly warning ----\n");
 +	pr_debug("This is a janitorial warning, not a kernel bug.\n");
 +#ifdef CONFIG_DEBUG_KOBJECT
-+	print_symbol("The kobject at, or inside %s is not dynamically allocated.\n",
-+			(unsigned long)kobj);
++	pr_debug("The kobject at, or inside '%s'@(0x%p) is not dynamically allocated.\n",
++			namebuf, kobj);
 +#endif
 +	pr_debug("kobjects must be dynamically allocated, not static\n");
 +	/* dump_stack(); */
 +	pr_debug("---- end silly warning ----\n");
++out:
++	kfree(namebuf);
 +}
 +#else
 +static void verify_dynamic_kobject_allocation(struct kobject *kobj)
@@ -103,7 +140,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  /**
   *	kobject_init - initialize object.
   *	@kobj:	object in question.
-@@ -130,6 +172,7 @@ void kobject_init(struct kobject * kobj)
+@@ -130,6 +185,7 @@ void kobject_init(struct kobject * kobj)
  	if (!kobj)
  		return;
  	WARN_ON(atomic_read(&kobj->kref.refcount));
