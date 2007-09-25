@@ -1,0 +1,177 @@
+From htejun@gmail.com Thu Sep 20 00:05:23 2007
+From: Tejun Heo <htejun@gmail.com>
+Date: Thu, 20 Sep 2007 16:05:10 +0900
+Subject: sysfs: kill sysfs_update_file()
+To: ebiederm@xmission.com, cornelia.huck@de.ibm.com, greg@kroah.com, stern@rowland.harvard.edu, kay.sievers@vrfy.org, linux-kernel@vger.kernel.org, htejun@gmail.com
+Cc: Tejun Heo <htejun@gmail.com>
+Message-ID: <11902719103333-git-send-email-htejun@gmail.com>
+
+
+sysfs_update_file() depends on inode->i_mtime but sysfs iondes are now
+reclaimable making the reported modification time unreliable.  There's
+only one user (pci hotplug) of this notification mechanism and it
+reportedly isn't utilized from userland.
+
+Kill sysfs_update_file().
+
+Signed-off-by: Tejun Heo <htejun@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/pci/hotplug/pci_hotplug_core.c |   60 ---------------------------------
+ fs/sysfs/file.c                        |   40 ----------------------
+ include/linux/sysfs.h                  |    7 ---
+ 3 files changed, 107 deletions(-)
+
+--- a/drivers/pci/hotplug/pci_hotplug_core.c
++++ b/drivers/pci/hotplug/pci_hotplug_core.c
+@@ -694,66 +694,6 @@ int __must_check pci_hp_change_slot_info
+ 	if ((slot == NULL) || (info == NULL))
+ 		return -ENODEV;
+ 
+-	/*
+-	* check all fields in the info structure, and update timestamps
+-	* for the files referring to the fields that have now changed.
+-	*/
+-	if ((has_power_file(slot) == 0) &&
+-	    (slot->info->power_status != info->power_status)) {
+-		retval = sysfs_update_file(&slot->kobj,
+-					   &hotplug_slot_attr_power.attr);
+-		if (retval)
+-			return retval;
+-	}
+-
+-	if ((has_attention_file(slot) == 0) &&
+-	    (slot->info->attention_status != info->attention_status)) {
+-		retval = sysfs_update_file(&slot->kobj,
+-					   &hotplug_slot_attr_attention.attr);
+-		if (retval)
+-			return retval;
+-	}
+-
+-	if ((has_latch_file(slot) == 0) &&
+-	    (slot->info->latch_status != info->latch_status)) {
+-		retval = sysfs_update_file(&slot->kobj,
+-					   &hotplug_slot_attr_latch.attr);
+-		if (retval)
+-			return retval;
+-	}
+-
+-	if ((has_adapter_file(slot) == 0) &&
+-	    (slot->info->adapter_status != info->adapter_status)) {
+-		retval = sysfs_update_file(&slot->kobj,
+-					   &hotplug_slot_attr_presence.attr);
+-		if (retval)
+-			return retval;
+-	}
+-
+-	if ((has_address_file(slot) == 0) &&
+-	    (slot->info->address != info->address)) {
+-		retval = sysfs_update_file(&slot->kobj,
+-					   &hotplug_slot_attr_address.attr);
+-		if (retval)
+-			return retval;
+-	}
+-
+-	if ((has_max_bus_speed_file(slot) == 0) &&
+-	    (slot->info->max_bus_speed != info->max_bus_speed)) {
+-		retval = sysfs_update_file(&slot->kobj,
+-					   &hotplug_slot_attr_max_bus_speed.attr);
+-		if (retval)
+-			return retval;
+-	}
+-
+-	if ((has_cur_bus_speed_file(slot) == 0) &&
+-	    (slot->info->cur_bus_speed != info->cur_bus_speed)) {
+-		retval = sysfs_update_file(&slot->kobj,
+-					   &hotplug_slot_attr_cur_bus_speed.attr);
+-		if (retval)
+-			return retval;
+-	}
+-
+ 	memcpy (slot->info, info, sizeof (struct hotplug_slot_info));
+ 
+ 	return 0;
+--- a/fs/sysfs/file.c
++++ b/fs/sysfs/file.c
+@@ -3,7 +3,6 @@
+  */
+ 
+ #include <linux/module.h>
+-#include <linux/fsnotify.h>
+ #include <linux/kobject.h>
+ #include <linux/namei.h>
+ #include <linux/poll.h>
+@@ -453,44 +452,6 @@ int sysfs_add_file_to_group(struct kobje
+ }
+ EXPORT_SYMBOL_GPL(sysfs_add_file_to_group);
+ 
+-
+-/**
+- * sysfs_update_file - update the modified timestamp on an object attribute.
+- * @kobj: object we're acting for.
+- * @attr: attribute descriptor.
+- */
+-int sysfs_update_file(struct kobject * kobj, const struct attribute * attr)
+-{
+-	struct sysfs_dirent *victim_sd = NULL;
+-	struct dentry *victim = NULL;
+-	int rc;
+-
+-	rc = -ENOENT;
+-	victim_sd = sysfs_get_dirent(kobj->sd, attr->name);
+-	if (!victim_sd)
+-		goto out;
+-
+-	mutex_lock(&sysfs_rename_mutex);
+-	victim = sysfs_get_dentry(victim_sd);
+-	mutex_unlock(&sysfs_rename_mutex);
+-	if (IS_ERR(victim)) {
+-		rc = PTR_ERR(victim);
+-		victim = NULL;
+-		goto out;
+-	}
+-
+-	mutex_lock(&victim->d_inode->i_mutex);
+-	victim->d_inode->i_mtime = CURRENT_TIME;
+-	fsnotify_modify(victim);
+-	mutex_unlock(&victim->d_inode->i_mutex);
+-	rc = 0;
+- out:
+-	dput(victim);
+-	sysfs_put(victim_sd);
+-	return rc;
+-}
+-
+-
+ /**
+  * sysfs_chmod_file - update the modified mode value on an object attribute.
+  * @kobj: object we're acting for.
+@@ -641,4 +602,3 @@ EXPORT_SYMBOL_GPL(sysfs_schedule_callbac
+ 
+ EXPORT_SYMBOL_GPL(sysfs_create_file);
+ EXPORT_SYMBOL_GPL(sysfs_remove_file);
+-EXPORT_SYMBOL_GPL(sysfs_update_file);
+--- a/include/linux/sysfs.h
++++ b/include/linux/sysfs.h
+@@ -87,8 +87,6 @@ int __must_check sysfs_move_dir(struct k
+ 
+ int __must_check sysfs_create_file(struct kobject *kobj,
+ 				   const struct attribute *attr);
+-int __must_check sysfs_update_file(struct kobject *kobj,
+-				   const struct attribute *attr);
+ int __must_check sysfs_chmod_file(struct kobject *kobj, struct attribute *attr,
+ 				  mode_t mode);
+ void sysfs_remove_file(struct kobject *kobj, const struct attribute *attr);
+@@ -149,11 +147,6 @@ static inline int sysfs_create_file(stru
+ 	return 0;
+ }
+ 
+-static inline int sysfs_update_file(struct kobject *kobj,
+-				    const struct attribute *attr)
+-{
+-	return 0;
+-}
+ static inline int sysfs_chmod_file(struct kobject *kobj,
+ 				   struct attribute *attr, mode_t mode)
+ {
