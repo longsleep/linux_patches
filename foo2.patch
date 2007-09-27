@@ -1,0 +1,176 @@
+---
+ drivers/base/bus.c      |    5 +++--
+ drivers/base/class.c    |    8 +++++---
+ drivers/base/core.c     |    4 +++-
+ drivers/base/sys.c      |    3 ++-
+ include/linux/kobject.h |   12 +++---------
+ lib/kobject.c           |    1 -
+ 6 files changed, 16 insertions(+), 17 deletions(-)
+
+--- a/drivers/base/bus.c
++++ b/drivers/base/bus.c
+@@ -166,7 +166,7 @@ static struct kset_uevent_ops bus_uevent
+ 	.filter = bus_uevent_filter,
+ };
+ 
+-static decl_subsys(bus, &bus_ktype, &bus_uevent_ops);
++static decl_subsys(bus, &bus_uevent_ops);
+ 
+ 
+ #ifdef CONFIG_HOTPLUG
+@@ -639,6 +639,7 @@ int bus_add_driver(struct device_driver 
+ 	if (error)
+ 		goto out_put_bus;
+ 	drv->kobj.kset = &bus->drivers;
++	drv->kobj.ktype = &ktype_driver;
+ 	error = kobject_register(&drv->kobj);
+ 	if (error)
+ 		goto out_put_bus;
+@@ -851,6 +852,7 @@ int bus_register(struct bus_type * bus)
+ 		goto out;
+ 
+ 	bus->subsys.kobj.kset = &bus_subsys;
++	bus->subsys.kobj.ktype = &bus_ktype;
+ 
+ 	retval = subsystem_register(&bus->subsys);
+ 	if (retval)
+@@ -868,7 +870,6 @@ int bus_register(struct bus_type * bus)
+ 
+ 	kobject_set_name(&bus->drivers.kobj, "drivers");
+ 	bus->drivers.kobj.parent = &bus->subsys.kobj;
+-	bus->drivers.ktype = &ktype_driver;
+ 	retval = kset_register(&bus->drivers);
+ 	if (retval)
+ 		goto bus_drivers_fail;
+--- a/drivers/base/class.c
++++ b/drivers/base/class.c
+@@ -71,7 +71,7 @@ static struct kobj_type ktype_class = {
+ };
+ 
+ /* Hotplug events for classes go to the class_obj subsys */
+-static decl_subsys(class, &ktype_class, NULL);
++static decl_subsys(class, NULL);
+ 
+ 
+ int class_create_file(struct class * cls, const struct class_attribute * attr)
+@@ -150,6 +150,7 @@ int class_register(struct class * cls)
+ 		return error;
+ 
+ 	cls->subsys.kobj.kset = &class_subsys;
++	cls->subsys.kobj.ktype = &ktype_class;
+ 
+ 	error = subsystem_register(&cls->subsys);
+ 	if (!error) {
+@@ -452,7 +453,7 @@ static struct kset_uevent_ops class_ueve
+ 	.uevent =	class_uevent,
+ };
+ 
+-static decl_subsys(class_obj, &ktype_class_device, &class_uevent_ops);
++static decl_subsys(class_obj, &class_uevent_ops);
+ 
+ 
+ static int class_device_add_attrs(struct class_device * cd)
+@@ -537,7 +538,8 @@ static struct class_device_attribute cla
+ 
+ void class_device_initialize(struct class_device *class_dev)
+ {
+-	kobj_set_kset_s(class_dev, class_obj_subsys);
++	class_dev->kobj.kset = &class_obj_subsys;
++	class_dev->kobj.ktype = &ktype_class_device;
+ 	kobject_init(&class_dev->kobj);
+ 	INIT_LIST_HEAD(&class_dev->node);
+ }
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@ -405,7 +405,7 @@ static struct device_attribute devt_attr
+  *	devices_subsys - structure to be registered with kobject core.
+  */
+ 
+-decl_subsys(devices, &ktype_device, &device_uevent_ops);
++decl_subsys(devices, &device_uevent_ops);
+ 
+ 
+ /**
+@@ -526,6 +526,8 @@ static void klist_children_put(struct kl
+ void device_initialize(struct device *dev)
+ {
+ 	kobj_set_kset_s(dev, devices_subsys);
++	dev->kobj.kset = &devices_subsys;
++	dev->kobj.ktype = &ktype_device;
+ 	kobject_init(&dev->kobj);
+ 	klist_init(&dev->klist_children, klist_children_get,
+ 		   klist_children_put);
+--- a/drivers/base/sys.c
++++ b/drivers/base/sys.c
+@@ -131,7 +131,7 @@ EXPORT_SYMBOL_GPL(sysdev_class_remove_fi
+ /*
+  * declare system_subsys
+  */
+-static decl_subsys(system, &ktype_sysdev_class, NULL);
++static decl_subsys(system, NULL);
+ 
+ int sysdev_class_register(struct sysdev_class * cls)
+ {
+@@ -139,6 +139,7 @@ int sysdev_class_register(struct sysdev_
+ 		 kobject_name(&cls->kset.kobj));
+ 	INIT_LIST_HEAD(&cls->drivers);
+ 	cls->kset.kobj.parent = &system_subsys.kobj;
++	cls->kset.kobj.ktype = &ktype_sysdev_class;
+ 	cls->kset.kobj.kset = &system_subsys;
+ 	return kset_register(&cls->kset);
+ }
+--- a/include/linux/kobject.h
++++ b/include/linux/kobject.h
+@@ -126,7 +126,6 @@ struct kset_uevent_ops {
+  * define the attribute callbacks and other common events that happen to
+  * a kobject.
+  *
+- * @ktype: the struct kobj_type for this specific kset
+  * @list: the list of all kobjects for this kset
+  * @list_lock: a lock for iterating over the kobjects
+  * @kobj: the embedded kobject for this kset (recursion, isn't it fun...)
+@@ -136,7 +135,6 @@ struct kset_uevent_ops {
+  * desired.
+  */
+ struct kset {
+-	struct kobj_type	*ktype;
+ 	struct list_head	list;
+ 	spinlock_t		list_lock;
+ 	struct kobject		kobj;
+@@ -168,12 +166,9 @@ static inline void kset_put(struct kset 
+ 	kobject_put(&k->kobj);
+ }
+ 
+-static inline struct kobj_type * get_ktype(struct kobject * k)
++static inline struct kobj_type *get_ktype(struct kobject *kobj)
+ {
+-	if (k->kset && k->kset->ktype)
+-		return k->kset->ktype;
+-	else 
+-		return k->ktype;
++	return kobj->ktype;
+ }
+ 
+ extern struct kobject * kset_find_obj(struct kset *, const char *);
+@@ -186,10 +181,9 @@ extern struct kobject * kset_find_obj(st
+ #define set_kset_name(str)	.kset = { .kobj = { .k_name = str } }
+ 
+ 
+-#define decl_subsys(_name,_type,_uevent_ops) \
++#define decl_subsys(_name,_uevent_ops) \
+ struct kset _name##_subsys = { \
+ 	.kobj = { .k_name = __stringify(_name) }, \
+-	.ktype = _type, \
+ 	.uevent_ops =_uevent_ops, \
+ }
+ #define decl_subsys_name(_varname,_name,_type,_uevent_ops) \
+--- a/lib/kobject.c
++++ b/lib/kobject.c
+@@ -722,7 +722,6 @@ struct kset *kset_create(const char *nam
+ 	if (!kset)
+ 		return ERR_PTR(-ENOMEM);
+ 	kobject_set_name(&kset->kobj, name);
+-	kset->ktype = ktype;
+ 	kset->uevent_ops = uevent_ops;
+ 
+ 	return kset;
