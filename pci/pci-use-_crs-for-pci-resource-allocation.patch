@@ -1,0 +1,235 @@
+From garyhade@us.ibm.com Wed Oct  3 15:57:01 2007
+From: Gary Hade <garyhade@us.ibm.com>
+Date: Wed, 3 Oct 2007 15:56:51 -0700
+Subject: PCI: use _CRS for PCI resource allocation
+To: linux-pci@atrey.karlin.mff.cuni.cz, gregkh@suse.de
+Cc: pcihpd-discuss@lists.sourceforge.net, garyhade@us.ibm.com, lcm@us.ibm.com
+Message-ID: <20071003225651.GG6071@us.ibm.com>
+Content-Disposition: inline
+
+
+
+Use _CRS for PCI resource allocation
+
+This patch resolves an issue where incorrect PCI memory and i/o ranges
+are being assigned to hotplugged PCI devices on some IBM systems.  The
+resource mis-allocation not only makes the PCI device unuseable but
+often makes the entire system unuseable due to resulting machine checks.
+
+The hotplug capable PCI slots on the affected systems are not located
+under a standard P2P bridge but are instead located under PCI root
+bridges or subtractive decode P2P bridges.  For example, the IBM x3850
+contains 2 hotplug capable PCI-X slots and 4 hotplug capable PCIe slots
+with the PCI-X slots each located under a PCI root bridge and the PCIe
+slots each located under a subtractive decode P2P bridge.
+
+The current i386/x86_64 PCI resource allocation code does not use _CRS
+returned resource information.  No other resource information source is
+available for slots that are not below a standard P2P bridge so
+incorrect ranges are being allocated from e820 hole causing the bad
+result.
+
+This patch causes the kernel to use _CRS returned resource info.  It is
+roughly based on a change provided by Matthew Wilcox for the ia64 kernel
+in 2005.  Due to possible buggy BIOS factor and possible yet to be
+discovered kernel issues the function is disabled by default and can be
+enabled with pci=use_crs.
+
+Signed-off-by: Gary Hade <gary.hade@us.ibm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ Documentation/kernel-parameters.txt |    2 
+ arch/i386/pci/acpi.c                |  139 ++++++++++++++++++++++++++++++++++++
+ arch/i386/pci/common.c              |    3 
+ arch/i386/pci/pci.h                 |    1 
+ 4 files changed, 145 insertions(+)
+
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@ -1317,6 +1317,8 @@ and is between 256 and 4096 characters. 
+ 				IRQ routing is enabled.
+ 		noacpi		[X86-32] Do not use ACPI for IRQ routing
+ 				or for PCI scanning.
++		use_crs		[X86-32] Use _CRS for PCI resource
++				allocation.
+ 		routeirq	Do IRQ routing for all PCI devices.
+ 				This is normally done in pci_enable_device(),
+ 				so this option is a temporary workaround
+--- a/arch/i386/pci/acpi.c
++++ b/arch/i386/pci/acpi.c
+@@ -45,6 +45,142 @@ static struct dmi_system_id acpi_pciprob
+ 	{}
+ };
+ 
++struct pci_root_info {
++	char *name;
++	unsigned int res_num;
++	struct resource *res;
++	struct pci_bus *bus;
++	int busnum;
++};
++
++static acpi_status
++resource_to_addr(struct acpi_resource *resource,
++			struct acpi_resource_address64 *addr)
++{
++	acpi_status status;
++
++	status = acpi_resource_to_address64(resource, addr);
++	if (ACPI_SUCCESS(status) &&
++	    (addr->resource_type == ACPI_MEMORY_RANGE ||
++	    addr->resource_type == ACPI_IO_RANGE) &&
++	    addr->address_length > 0 &&
++	    addr->producer_consumer == ACPI_PRODUCER) {
++		return AE_OK;
++	}
++	return AE_ERROR;
++}
++
++static acpi_status
++count_resource(struct acpi_resource *acpi_res, void *data)
++{
++	struct pci_root_info *info = data;
++	struct acpi_resource_address64 addr;
++	acpi_status status;
++
++	status = resource_to_addr(acpi_res, &addr);
++	if (ACPI_SUCCESS(status))
++		info->res_num++;
++	return AE_OK;
++}
++
++static acpi_status
++setup_resource(struct acpi_resource *acpi_res, void *data)
++{
++	struct pci_root_info *info = data;
++	struct resource *res;
++	struct acpi_resource_address64 addr;
++	acpi_status status;
++	unsigned long flags;
++	struct resource *root;
++
++	status = resource_to_addr(acpi_res, &addr);
++	if (!ACPI_SUCCESS(status))
++		return AE_OK;
++
++	if (addr.resource_type == ACPI_MEMORY_RANGE) {
++		root = &iomem_resource;
++		flags = IORESOURCE_MEM;
++		if (addr.info.mem.caching == ACPI_PREFETCHABLE_MEMORY)
++			flags |= IORESOURCE_PREFETCH;
++	} else if (addr.resource_type == ACPI_IO_RANGE) {
++		root = &ioport_resource;
++		flags = IORESOURCE_IO;
++	} else
++		return AE_OK;
++
++	res = &info->res[info->res_num];
++	res->name = info->name;
++	res->flags = flags;
++	res->start = addr.minimum + addr.translation_offset;
++	res->end = res->start + addr.address_length - 1;
++	res->child = NULL;
++
++	if (insert_resource(root, res)) {
++		printk(KERN_ERR "PCI: Failed to allocate 0x%lx-0x%lx "
++			"from %s for %s\n", (unsigned long) res->start,
++			(unsigned long) res->end, root->name, info->name);
++	} else {
++		info->bus->resource[info->res_num] = res;
++		info->res_num++;
++	}
++	return AE_OK;
++}
++
++static void
++adjust_transparent_bridge_resources(struct pci_bus *bus)
++{
++	struct pci_dev *dev;
++
++	list_for_each_entry(dev, &bus->devices, bus_list) {
++		int i;
++		u16 class = dev->class >> 8;
++
++		if (class == PCI_CLASS_BRIDGE_PCI && dev->transparent) {
++			for(i = 3; i < PCI_BUS_NUM_RESOURCES; i++)
++				dev->subordinate->resource[i] =
++						dev->bus->resource[i - 3];
++		}
++	}
++}
++
++static void
++get_current_resources(struct acpi_device *device, int busnum,
++			struct pci_bus *bus)
++{
++	struct pci_root_info info;
++	size_t size;
++
++	info.bus = bus;
++	info.res_num = 0;
++	acpi_walk_resources(device->handle, METHOD_NAME__CRS, count_resource,
++				&info);
++	if (!info.res_num)
++		return;
++
++	size = sizeof(*info.res) * info.res_num;
++	info.res = kmalloc(size, GFP_KERNEL);
++	if (!info.res)
++		goto res_alloc_fail;
++
++	info.name = kmalloc(12, GFP_KERNEL);
++	if (!info.name)
++		goto name_alloc_fail;
++	sprintf(info.name, "PCI Bus #%02x", busnum);
++
++	info.res_num = 0;
++	acpi_walk_resources(device->handle, METHOD_NAME__CRS, setup_resource,
++				&info);
++	if (info.res_num)
++		adjust_transparent_bridge_resources(bus);
++
++	return;
++
++name_alloc_fail:
++	kfree(info.res);
++res_alloc_fail:
++	return;
++}
++
+ struct pci_bus * __devinit pci_acpi_scan_root(struct acpi_device *device, int domain, int busnum)
+ {
+ 	struct pci_bus *bus;
+@@ -89,6 +225,9 @@ struct pci_bus * __devinit pci_acpi_scan
+ 		}
+ 	}
+ #endif
++
++	if (bus && (pci_probe & PCI_USE__CRS))
++		get_current_resources(device, busnum, bus);
+ 	
+ 	return bus;
+ }
+--- a/arch/i386/pci/common.c
++++ b/arch/i386/pci/common.c
+@@ -436,6 +436,9 @@ char * __devinit  pcibios_setup(char *st
+ 	} else if (!strcmp(str, "assign-busses")) {
+ 		pci_probe |= PCI_ASSIGN_ALL_BUSSES;
+ 		return NULL;
++	} else if (!strcmp(str, "use_crs")) {
++		pci_probe |= PCI_USE__CRS;
++		return NULL;
+ 	} else if (!strcmp(str, "routeirq")) {
+ 		pci_routeirq = 1;
+ 		return NULL;
+--- a/arch/i386/pci/pci.h
++++ b/arch/i386/pci/pci.h
+@@ -27,6 +27,7 @@
+ #define PCI_BIOS_IRQ_SCAN	0x2000
+ #define PCI_ASSIGN_ALL_BUSSES	0x4000
+ #define PCI_CAN_SKIP_ISA_ALIGN	0x8000
++#define PCI_USE__CRS		0x10000
+ 
+ extern unsigned int pci_probe;
+ extern unsigned long pirq_table_addr;
