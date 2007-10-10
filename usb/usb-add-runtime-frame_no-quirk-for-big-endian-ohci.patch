@@ -1,0 +1,99 @@
+From david-b@pacbell.net Tue Oct  9 15:00:16 2007
+From: Valentine Barshak <vbarshak@ru.mvista.com>
+Date: Tue, 9 Oct 2007 15:00:05 -0700
+Subject: USB: add runtime frame_no quirk for big-endian OHCI
+To: Greg KH <greg@kroah.com>
+Cc: Valentine Barshak <vbarshak@ru.mvista.com>, "Dale Farnsworth" <dale@farnsworth.org>
+Message-ID: <200710091500.05730.david-b@pacbell.net>
+Content-Disposition: inline
+
+
+From: Valentine Barshak <vbarshak@ru.mvista.com>
+
+Add OHCI big endian frame_no quirk.  The frame_no value stored in the
+HCCA is a 16 bit field at a specific offset, but since not all CPUs can
+do 16-bit memory accesses it's used as a 32 bit field.  And that's why
+big-endian OHCI must shift 16 bits ... unless the spec is not followed.
+
+Currently there's one MPC52xx platform that doesn't need the shift. This
+patch adds a new "big endian frame_no" quirk to control that at runtime.
+
+Signed-off-by: Valentine Barshak <vbarshak@ru.mvista.com>
+Acked-by: Dale Farnsworth <dale@farnsworth.org>
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/ohci-ppc-of.c  |    5 ++++-
+ drivers/usb/host/ohci-ppc-soc.c |    5 +++++
+ drivers/usb/host/ohci.h         |   13 ++++++-------
+ 3 files changed, 15 insertions(+), 8 deletions(-)
+
+--- a/drivers/usb/host/ohci-ppc-of.c
++++ b/drivers/usb/host/ohci-ppc-of.c
+@@ -134,8 +134,11 @@ ohci_hcd_ppc_of_probe(struct of_device *
+ 	}
+ 
+ 	ohci = hcd_to_ohci(hcd);
+-	if (is_bigendian)
++	if (is_bigendian) {
+ 		ohci->flags |= OHCI_QUIRK_BE_MMIO | OHCI_QUIRK_BE_DESC;
++		if (of_device_is_compatible(dn, "mpc5200-ohci"))
++			ohci->flags |= OHCI_QUIRK_FRAME_NO;
++	}
+ 
+ 	ohci_hcd_init(ohci);
+ 
+--- a/drivers/usb/host/ohci-ppc-soc.c
++++ b/drivers/usb/host/ohci-ppc-soc.c
+@@ -73,6 +73,11 @@ static int usb_hcd_ppc_soc_probe(const s
+ 
+ 	ohci = hcd_to_ohci(hcd);
+ 	ohci->flags |= OHCI_QUIRK_BE_MMIO | OHCI_QUIRK_BE_DESC;
++
++#ifdef CONFIG_PPC_MPC52xx
++	/* MPC52xx doesn't need frame_no shift */
++	ohci->flags |= OHCI_QUIRK_FRAME_NO;
++#endif
+ 	ohci_hcd_init(ohci);
+ 
+ 	retval = usb_add_hcd(hcd, irq, IRQF_DISABLED);
+--- a/drivers/usb/host/ohci.h
++++ b/drivers/usb/host/ohci.h
+@@ -398,6 +398,7 @@ struct ohci_hcd {
+ #define	OHCI_QUIRK_BE_MMIO	0x10			/* BE registers */
+ #define	OHCI_QUIRK_ZFMICRO	0x20			/* Compaq ZFMicro chipset*/
+ #define	OHCI_QUIRK_NEC		0x40			/* lost interrupts */
++#define	OHCI_QUIRK_FRAME_NO	0x80			/* no big endian frame_no shift */
+ 	// there are also chip quirks/bugs in init logic
+ 
+ 	struct work_struct	nec_work;	/* Worker for NEC quirk */
+@@ -633,15 +634,12 @@ static inline u32 hc32_to_cpup (const st
+ /* HCCA frame number is 16 bits, but is accessed as 32 bits since not all
+  * hardware handles 16 bit reads.  That creates a different confusion on
+  * some big-endian SOC implementations.  Same thing happens with PSW access.
+- *
+- * FIXME: Deal with that as a runtime quirk when STB03xxx is ported over
+- * to arch/powerpc
+  */
+ 
+-#ifdef CONFIG_STB03xxx
+-#define OHCI_BE_FRAME_NO_SHIFT	16
++#ifdef CONFIG_PPC_MPC52xx
++#define big_endian_frame_no_quirk(ohci)	(ohci->flags & OHCI_QUIRK_FRAME_NO)
+ #else
+-#define OHCI_BE_FRAME_NO_SHIFT	0
++#define big_endian_frame_no_quirk(ohci)	0
+ #endif
+ 
+ static inline u16 ohci_frame_no(const struct ohci_hcd *ohci)
+@@ -649,7 +647,8 @@ static inline u16 ohci_frame_no(const st
+ 	u32 tmp;
+ 	if (big_endian_desc(ohci)) {
+ 		tmp = be32_to_cpup((__force __be32 *)&ohci->hcca->frame_no);
+-		tmp >>= OHCI_BE_FRAME_NO_SHIFT;
++		if (!big_endian_frame_no_quirk(ohci))
++			tmp >>= 16;
+ 	} else
+ 		tmp = le32_to_cpup((__force __le32 *)&ohci->hcca->frame_no);
+ 
