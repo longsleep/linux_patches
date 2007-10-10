@@ -1,0 +1,123 @@
+From stern@rowland.harvard.edu Wed Oct 10 13:24:14 2007
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Wed, 10 Oct 2007 16:24:06 -0400 (EDT)
+Subject: [PATCH] USB: serial core should respect driver requirements
+To: Greg KH <greg@kroah.com>
+Cc: USB development list <linux-usb-devel@lists.sourceforge.net>
+Message-ID: <Pine.LNX.4.44L0.0710101621100.2739-100000@iolanthe.rowland.org>
+
+
+This patch (as997) fixes a bug in the USB serial core.  The core needs
+to pay attention to drivers' requirements regarding the number and
+type of endpoints a device has.
+
+At the same time, the patch changes the NUM_DONT_CARE constant (which
+is stored in a single-byte field) from -1 to a safer, unsigned value.
+It also improves the kerneldoc for several fields in the
+usb_serial_driver structure.
+
+Finally, the patch replaces a list_for_each() with list_for_each_entry().
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ drivers/usb/serial/usb-serial.c |   31 ++++++++++++++++++++++---------
+ include/linux/usb/serial.h      |   20 +++++++++++++-------
+ 2 files changed, 35 insertions(+), 16 deletions(-)
+
+--- a/drivers/usb/serial/usb-serial.c
++++ b/drivers/usb/serial/usb-serial.c
+@@ -662,16 +662,14 @@ exit:
+ 
+ static struct usb_serial_driver *search_serial_device(struct usb_interface *iface)
+ {
+-	struct list_head *p;
+ 	const struct usb_device_id *id;
+-	struct usb_serial_driver *t;
++	struct usb_serial_driver *drv;
+ 
+ 	/* Check if the usb id matches a known device */
+-	list_for_each(p, &usb_serial_driver_list) {
+-		t = list_entry(p, struct usb_serial_driver, driver_list);
+-		id = get_iface_id(t, iface);
++	list_for_each_entry(drv, &usb_serial_driver_list, driver_list) {
++		id = get_iface_id(drv, iface);
+ 		if (id)
+-			return t;
++			return drv;
+ 	}
+ 
+ 	return NULL;
+@@ -811,9 +809,6 @@ int usb_serial_probe(struct usb_interfac
+ 	/* END HORRIBLE HACK FOR PL2303 */
+ #endif
+ 
+-	/* found all that we need */
+-	dev_info(&interface->dev, "%s converter detected\n", type->description);
+-
+ #ifdef CONFIG_USB_SERIAL_GENERIC
+ 	if (type == &usb_serial_generic_device) {
+ 		num_ports = num_bulk_out;
+@@ -847,6 +842,24 @@ int usb_serial_probe(struct usb_interfac
+ 	serial->num_interrupt_in = num_interrupt_in;
+ 	serial->num_interrupt_out = num_interrupt_out;
+ 
++	/* check that the device meets the driver's requirements */
++	if ((type->num_interrupt_in != NUM_DONT_CARE &&
++				type->num_interrupt_in != num_interrupt_in)
++			|| (type->num_interrupt_out != NUM_DONT_CARE &&
++				type->num_interrupt_out != num_interrupt_out)
++			|| (type->num_bulk_in != NUM_DONT_CARE &&
++				type->num_bulk_in != num_bulk_in)
++			|| (type->num_bulk_out != NUM_DONT_CARE &&
++				type->num_bulk_out != num_bulk_out)) {
++		dbg("wrong number of endpoints");
++		kfree(serial);
++		return -EIO;
++	}
++
++	/* found all that we need */
++	dev_info(&interface->dev, "%s converter detected\n",
++			type->description);
++
+ 	/* create our ports, we need as many as the max endpoints */
+ 	/* we don't use num_ports here cauz some devices have more endpoint pairs than ports */
+ 	max_endpoints = max(num_bulk_in, num_bulk_out);
+--- a/include/linux/usb/serial.h
++++ b/include/linux/usb/serial.h
+@@ -141,7 +141,7 @@ struct usb_serial {
+ };
+ #define to_usb_serial(d) container_of(d, struct usb_serial, kref)
+ 
+-#define NUM_DONT_CARE	(-1)
++#define NUM_DONT_CARE	99
+ 
+ /* get and set the serial private data pointer helper functions */
+ static inline void *usb_get_serial_data (struct usb_serial *serial)
+@@ -160,12 +160,18 @@ static inline void usb_set_serial_data (
+  *	in the syslog messages when a device is inserted or removed.
+  * @id_table: pointer to a list of usb_device_id structures that define all
+  *	of the devices this structure can support.
+- * @num_interrupt_in: the number of interrupt in endpoints this device will
+- *	have.
+- * @num_interrupt_out: the number of interrupt out endpoints this device will
+- *	have.
+- * @num_bulk_in: the number of bulk in endpoints this device will have.
+- * @num_bulk_out: the number of bulk out endpoints this device will have.
++ * @num_interrupt_in: If a device doesn't have this many interrupt-in
++ *	endpoints, it won't be sent to the driver's attach() method.
++ *	(But it might still be sent to the probe() method.)
++ * @num_interrupt_out: If a device doesn't have this many interrupt-out
++ *	endpoints, it won't be sent to the driver's attach() method.
++ *	(But it might still be sent to the probe() method.)
++ * @num_bulk_in: If a device doesn't have this many bulk-in
++ *	endpoints, it won't be sent to the driver's attach() method.
++ *	(But it might still be sent to the probe() method.)
++ * @num_bulk_out: If a device doesn't have this many bulk-out
++ *	endpoints, it won't be sent to the driver's attach() method.
++ *	(But it might still be sent to the probe() method.)
+  * @num_ports: the number of different ports this device will have.
+  * @calc_num_ports: pointer to a function to determine how many ports this
+  *	device has dynamically.  It will be called after the probe()

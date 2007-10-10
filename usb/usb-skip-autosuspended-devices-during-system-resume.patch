@@ -1,0 +1,81 @@
+From stern@rowland.harvard.edu Wed Oct 10 13:30:13 2007
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Wed, 10 Oct 2007 16:30:12 -0400 (EDT)
+Subject: USB: skip autosuspended devices during system resume
+To: Greg KH <greg@kroah.com>
+Message-ID: <Pine.LNX.4.44L0.0710101629040.2739-100000@iolanthe.rowland.org>
+
+
+System suspends and hibernation are supposed to be as transparent as
+possible.  By this reasoning, if a USB device is already autosuspended
+before the system sleep begins then it should remain autosuspended
+after the system wakes up.
+
+This patch (as1001) adds a skip_sys_resume flag to the usb_device
+structure and uses it to avoid waking up devices which were suspended
+when a system sleep began.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/driver.c |   27 ++++++++++++++++++++-------
+ include/linux/usb.h       |    1 +
+ 2 files changed, 21 insertions(+), 7 deletions(-)
+
+--- a/drivers/usb/core/driver.c
++++ b/drivers/usb/core/driver.c
+@@ -1525,9 +1525,21 @@ int usb_external_resume_device(struct us
+ 
+ static int usb_suspend(struct device *dev, pm_message_t message)
+ {
++	struct usb_device	*udev;
++
+ 	if (!is_usb_device(dev))	/* Ignore PM for interfaces */
+ 		return 0;
+-	return usb_external_suspend_device(to_usb_device(dev), message);
++	udev = to_usb_device(dev);
++
++	/* If udev is already suspended, we can skip this suspend and
++	 * we should also skip the upcoming system resume. */
++	if (udev->state == USB_STATE_SUSPENDED) {
++		udev->skip_sys_resume = 1;
++		return 0;
++	}
++
++	udev->skip_sys_resume = 0;
++	return usb_external_suspend_device(udev, message);
+ }
+ 
+ static int usb_resume(struct device *dev)
+@@ -1538,13 +1550,14 @@ static int usb_resume(struct device *dev
+ 		return 0;
+ 	udev = to_usb_device(dev);
+ 
+-	/* If autoresume is disabled then we also want to prevent resume
+-	 * during system wakeup.  However, a "persistent-device" reset-resume
+-	 * after power loss counts as a wakeup event.  So allow a
+-	 * reset-resume to occur if remote wakeup is enabled. */
+-	if (udev->autoresume_disabled) {
++	/* If udev->skip_sys_resume is set then udev was already suspended
++	 * when the system suspend started, so we don't want to resume
++	 * udev during this system wakeup.  However a reset-resume counts
++	 * as a wakeup event, so allow a reset-resume to occur if remote
++	 * wakeup is enabled. */
++	if (udev->skip_sys_resume) {
+ 		if (!(udev->reset_resume && udev->do_remote_wakeup))
+-			return -EPERM;
++			return -EHOSTUNREACH;
+ 	}
+ 	return usb_external_resume_device(udev);
+ }
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -430,6 +430,7 @@ struct usb_device {
+ 	unsigned persist_enabled:1;	/* USB_PERSIST enabled for this dev */
+ 	unsigned autosuspend_disabled:1; /* autosuspend and autoresume */
+ 	unsigned autoresume_disabled:1;  /*  disabled by the user */
++	unsigned skip_sys_resume:1;	/* skip the next system resume */
+ #endif
+ };
+ #define	to_usb_device(d) container_of(d, struct usb_device, dev)
