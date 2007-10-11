@@ -1,0 +1,101 @@
+From stern@rowland.harvard.edu Thu Oct 11 13:47:47 2007
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Thu, 11 Oct 2007 16:47:36 -0400 (EDT)
+Subject: USB: fix race in autosuspend reschedule
+To: Greg KH <greg@kroah.com>
+Cc: USB development list <linux-usb-devel@lists.sourceforge.net>
+Message-ID: <Pine.LNX.4.44L0.0710111645120.6334-100000@iolanthe.rowland.org>
+
+
+This patch (as1002) fixes a small race which can occur when a driver
+expects usbcore to reschedule an autosuspend request.  If the request
+arrives too late, it won't be rescheduled.  The patch adds an extra
+argument to autosuspend_check(), indicating that a reschedule is
+needed no matter how much time has elapsed.
+
+It also tries to avoid letting asynchronous changes to the value of
+jiffies cause a delay to become negative, by caching a local copy of
+the current time.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/driver.c |   32 ++++++++++++++++----------------
+ 1 file changed, 16 insertions(+), 16 deletions(-)
+
+--- a/drivers/usb/core/driver.c
++++ b/drivers/usb/core/driver.c
+@@ -935,11 +935,11 @@ done:
+ #ifdef	CONFIG_USB_SUSPEND
+ 
+ /* Internal routine to check whether we may autosuspend a device. */
+-static int autosuspend_check(struct usb_device *udev)
++static int autosuspend_check(struct usb_device *udev, int reschedule)
+ {
+ 	int			i;
+ 	struct usb_interface	*intf;
+-	unsigned long		suspend_time;
++	unsigned long		suspend_time, j;
+ 
+ 	/* For autosuspend, fail fast if anything is in use or autosuspend
+ 	 * is disabled.  Also fail if any interfaces require remote wakeup
+@@ -981,20 +981,20 @@ static int autosuspend_check(struct usb_
+ 	}
+ 
+ 	/* If everything is okay but the device hasn't been idle for long
+-	 * enough, queue a delayed autosuspend request.
++	 * enough, queue a delayed autosuspend request.  If the device
++	 * _has_ been idle for long enough and the reschedule flag is set,
++	 * likewise queue a delayed (1 second) autosuspend request.
+ 	 */
+-	if (time_after(suspend_time, jiffies)) {
++	j = jiffies;
++	if (time_before(j, suspend_time))
++		reschedule = 1;
++	else
++		suspend_time = j + HZ;
++	if (reschedule) {
+ 		if (!timer_pending(&udev->autosuspend.timer)) {
+-
+-			/* The value of jiffies may change between the
+-			 * time_after() comparison above and the subtraction
+-			 * below.  That's okay; the system behaves sanely
+-			 * when a timer is registered for the present moment
+-			 * or for the past.
+-			 */
+ 			queue_delayed_work(ksuspend_usb_wq, &udev->autosuspend,
+-				round_jiffies_relative(suspend_time - jiffies));
+-			}
++				round_jiffies_relative(suspend_time - j));
++		}
+ 		return -EAGAIN;
+ 	}
+ 	return 0;
+@@ -1002,7 +1002,7 @@ static int autosuspend_check(struct usb_
+ 
+ #else
+ 
+-static inline int autosuspend_check(struct usb_device *udev)
++static inline int autosuspend_check(struct usb_device *udev, int reschedule)
+ {
+ 	return 0;
+ }
+@@ -1059,7 +1059,7 @@ static int usb_suspend_both(struct usb_d
+ 	udev->do_remote_wakeup = device_may_wakeup(&udev->dev);
+ 
+ 	if (udev->auto_pm) {
+-		status = autosuspend_check(udev);
++		status = autosuspend_check(udev, 0);
+ 		if (status < 0)
+ 			goto done;
+ 	}
+@@ -1085,7 +1085,7 @@ static int usb_suspend_both(struct usb_d
+ 
+ 		/* Try another autosuspend when the interfaces aren't busy */
+ 		if (udev->auto_pm)
+-			autosuspend_check(udev);
++			autosuspend_check(udev, status == -EBUSY);
+ 
+ 	/* If the suspend succeeded then prevent any more URB submissions,
+ 	 * flush any outstanding URBs, and propagate the suspend up the tree.
