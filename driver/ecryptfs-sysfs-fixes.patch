@@ -1,0 +1,160 @@
+From foo@baz Tue Apr  9 12:12:43 2002
+Date: Mon, 15 Oct 2007 15:01:24 -0700 (PDT)
+To: Greg KH <greg@kroah.com>
+From: Greg Kroah-Hartman <gregkh@suse.de>
+Subject: ecryptfs: clean up attribute mess
+
+It isn't that hard to add simple kset attributes, so don't go through
+all the gyrations of creating your own object type and show and store
+functions.  Just use the functions that are already present.  This makes
+things much simpler.
+
+Note, the version_str string violates the "one value per file" rule for
+sysfs.  I suggest changing this now (individual files per type supported
+is one suggested way.)
+
+
+Cc: Michael A. Halcrow <mahalcro@us.ibm.com>
+Cc: Michael C. Thompson <mcthomps@us.ibm.com>
+Cc: Tyler Hicks <tyhicks@ou.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ fs/ecryptfs/main.c |   88 ++++++++++++-----------------------------------------
+ 1 file changed, 20 insertions(+), 68 deletions(-)
+
+--- a/fs/ecryptfs/main.c
++++ b/fs/ecryptfs/main.c
+@@ -689,58 +689,14 @@ static int ecryptfs_init_kmem_caches(voi
+ 	return 0;
+ }
+ 
+-struct ecryptfs_obj {
+-	char *name;
+-	struct list_head slot_list;
+-	struct kobject kobj;
+-};
+-
+-struct ecryptfs_attribute {
+-	struct attribute attr;
+-	ssize_t(*show) (struct ecryptfs_obj *, char *);
+-	ssize_t(*store) (struct ecryptfs_obj *, const char *, size_t);
+-};
+-
+-static ssize_t
+-ecryptfs_attr_store(struct kobject *kobj,
+-		    struct attribute *attr, const char *buf, size_t len)
+-{
+-	struct ecryptfs_obj *obj = container_of(kobj, struct ecryptfs_obj,
+-						kobj);
+-	struct ecryptfs_attribute *attribute =
+-		container_of(attr, struct ecryptfs_attribute, attr);
+-
+-	return (attribute->store ? attribute->store(obj, buf, len) : 0);
+-}
++static decl_subsys(ecryptfs, NULL, NULL);
+ 
+-static ssize_t
+-ecryptfs_attr_show(struct kobject *kobj, struct attribute *attr, char *buf)
+-{
+-	struct ecryptfs_obj *obj = container_of(kobj, struct ecryptfs_obj,
+-						kobj);
+-	struct ecryptfs_attribute *attribute =
+-		container_of(attr, struct ecryptfs_attribute, attr);
+-
+-	return (attribute->show ? attribute->show(obj, buf) : 0);
+-}
+-
+-static struct sysfs_ops ecryptfs_sysfs_ops = {
+-	.show = ecryptfs_attr_show,
+-	.store = ecryptfs_attr_store
+-};
+-
+-static struct kobj_type ecryptfs_ktype = {
+-	.sysfs_ops = &ecryptfs_sysfs_ops
+-};
+-
+-static decl_subsys(ecryptfs, &ecryptfs_ktype, NULL);
+-
+-static ssize_t version_show(struct ecryptfs_obj *obj, char *buff)
++static ssize_t version_show(struct kset *kset, char *buff)
+ {
+ 	return snprintf(buff, PAGE_SIZE, "%d\n", ECRYPTFS_VERSIONING_MASK);
+ }
+ 
+-static struct ecryptfs_attribute sysfs_attr_version = __ATTR_RO(version);
++static struct subsys_attribute version_attr = __ATTR_RO(version);
+ 
+ static struct ecryptfs_version_str_map_elem {
+ 	u32 flag;
+@@ -753,7 +709,7 @@ static struct ecryptfs_version_str_map_e
+ 	{ECRYPTFS_VERSIONING_XATTR, "metadata in extended attribute"}
+ };
+ 
+-static ssize_t version_str_show(struct ecryptfs_obj *obj, char *buff)
++static ssize_t version_str_show(struct kset *kset, char *buff)
+ {
+ 	int i;
+ 	int remaining = PAGE_SIZE;
+@@ -780,34 +736,33 @@ out:
+ 	return total_written;
+ }
+ 
+-static struct ecryptfs_attribute sysfs_attr_version_str = __ATTR_RO(version_str);
++static struct subsys_attribute version_attr_str = __ATTR_RO(version_str);
++
++static struct attribute *attributes[] = {
++	&version_attr.attr,
++	&version_attr_str.attr,
++	NULL,
++};
++
++static struct attribute_group attr_group = {
++	.attrs = attributes,
++};
+ 
+ static int do_sysfs_registration(void)
+ {
+ 	int rc;
+ 
+-	if ((rc = subsystem_register(&ecryptfs_subsys))) {
+-		printk(KERN_ERR
+-		       "Unable to register ecryptfs sysfs subsystem\n");
+-		goto out;
+-	}
+-	rc = sysfs_create_file(&ecryptfs_subsys.kobj,
+-			       &sysfs_attr_version.attr);
++	rc = subsystem_register(&ecryptfs_subsys);
+ 	if (rc) {
+ 		printk(KERN_ERR
+-		       "Unable to create ecryptfs version attribute\n");
+-		subsystem_unregister(&ecryptfs_subsys);
++		       "Unable to register ecryptfs sysfs subsystem\n");
+ 		goto out;
+ 	}
+-	rc = sysfs_create_file(&ecryptfs_subsys.kobj,
+-			       &sysfs_attr_version_str.attr);
++	rc = sysfs_create_group(&ecryptfs_subsys.kobj, &attr_group);
+ 	if (rc) {
+ 		printk(KERN_ERR
+-		       "Unable to create ecryptfs version_str attribute\n");
+-		sysfs_remove_file(&ecryptfs_subsys.kobj,
+-				  &sysfs_attr_version.attr);
++		       "Unable to create ecryptfs version attributes\n");
+ 		subsystem_unregister(&ecryptfs_subsys);
+-		goto out;
+ 	}
+ out:
+ 	return rc;
+@@ -815,10 +770,7 @@ out:
+ 
+ static void do_sysfs_unregistration(void)
+ {
+-	sysfs_remove_file(&ecryptfs_subsys.kobj,
+-			  &sysfs_attr_version.attr);
+-	sysfs_remove_file(&ecryptfs_subsys.kobj,
+-			  &sysfs_attr_version_str.attr);
++	sysfs_remove_group(&ecryptfs_subsys.kobj, &attr_group);
+ 	subsystem_unregister(&ecryptfs_subsys);
+ }
+ 
