@@ -22,8 +22,8 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 ---
  drivers/char/Kconfig  |   10 
  drivers/char/Makefile |    1 
- drivers/char/nozomi.c | 2348 ++++++++++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 2359 insertions(+)
+ drivers/char/nozomi.c | 2230 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 2241 insertions(+)
 
 --- a/drivers/char/Kconfig
 +++ b/drivers/char/Kconfig
@@ -56,7 +56,7 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
  obj-$(CONFIG_MOXA_INTELLIO)	+= moxa.o
 --- /dev/null
 +++ b/drivers/char/nozomi.c
-@@ -0,0 +1,2348 @@
+@@ -0,0 +1,2230 @@
 +/*
 + * nozomi.c  -- HSDPA driver Broadband Wireless Data Card - Globe Trotter
 + *
@@ -466,7 +466,6 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +	struct async_icount tty_icount;
 +	int tty_index;
 +	u32 rx_data, tx_data;
-+	u8 tty_dont_flip;
 +
 +};
 +
@@ -488,9 +487,6 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +	u8 *send_buf;
 +
 +	struct tty_driver *tty_driver;
-+
-+	struct workqueue_struct *tty_flip_wq;
-+	struct work_struct tty_flip_wq_struct;
 +
 +	struct ktermios *tty_termios[NTTY_TTY_MINORS];
 +	struct ktermios *tty_termios_locked[NTTY_TTY_MINORS];
@@ -576,6 +572,7 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 + * -Optimize
 + * -Rewrite cleaner
 + */
++
 +static void read_mem32(u32 *buf, const void __iomem *mem_addr_start,
 +			u32 size_bytes)
 +{
@@ -1551,26 +1548,6 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +	for (i = PORT_MDM; i < MAX_PORT; ++i) {
 +		dc->port[i].rx_data = 0;
 +		dc->port[i].tx_data = 0;
-+		dc->port[i].tty_dont_flip = 0;
-+	}
-+}
-+
-+static void tty_flip_queue_function(struct work_struct *work)
-+{
-+	struct nozomi *dc = container_of(work, struct nozomi,
-+						tty_flip_wq_struct);
-+	int i;
-+	unsigned long flags;
-+
-+	/* Enable interrupt for that port */
-+	for (i = 0; i < MAX_PORT; i++) {
-+		if (dc->port[i].tty_dont_flip) {
-+			DBG6("Enable for port: %d", i);
-+			dc->port[i].tty_dont_flip = 0;
-+			spin_lock_irqsave(&dc->spin_mutex, flags);
-+			enable_transmit_dl(dc->port[i].tty_index, dc);
-+			spin_unlock_irqrestore(&dc->spin_mutex, flags);
-+		}
 +	}
 +}
 +
@@ -1644,22 +1621,22 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +	nozomi_get_card_type(dc);
 +
 +	if (pci_enable_device(dc->pdev)) {
-+		dev_err(&pdev->dev, "Not possible to enable PCI Device\n");
++		dev_err(&pdev->dev, "Failed to enable PCI Device\n");
 +		kfree(dc);
 +		kfree(newdev);
 +		return -ENODEV;
 +	}
 +
 +	start = pci_resource_start(dc->pdev, 0);
-+	if (start == 0x0000) {
-+		dev_err(&pdev->dev, "No I/O-Address for card detected\n");
++	if (start == 0) {
++		dev_err(&pdev->dev, "No I/O address for card detected\n");
 +		ret = -ENODEV;
 +		goto err_disable_device;
 +	}
 +
 +	dc->base_addr = ioremap(start, dc->card_type);
 +	if (!dc->base_addr) {
-+		dev_err(&pdev->dev, "No I/O-Address for card detected\n");
++		dev_err(&pdev->dev, "Unable to map card MMIO\n");
 +		ret = -ENODEV;
 +		goto err_disable_device;
 +	}
@@ -1692,13 +1669,6 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +	}
 +
 +	DBG1("base_addr: %p", dc->base_addr);
-+
-+	dc->tty_flip_wq = create_singlethread_workqueue(NOZOMI_NAME);
-+	if (!dc->tty_flip_wq) {
-+		dev_err(&dc->pdev->dev, "Could not create workqueue?\n");
-+		return -ENOMEM;
-+	}
-+	INIT_WORK(&dc->tty_flip_wq_struct, tty_flip_queue_function);
 +
 +	spin_lock_init(&dc->spin_mutex);
 +
@@ -1789,7 +1759,7 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +			tty_hangup(dc->port[i].tty);
 +
 +	while (dc->open_ttys)
-+		msleep_interruptible(1);
++		msleep(1);
 +
 +	for (i = ndev->index_start; i < ndev->index_start + NTTY_TTY_MINORS; \
 +									++i)
@@ -1846,8 +1816,6 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +	kfree(dc->send_buf);
 +
 +	remove_sysfs_files(dc);
-+
-+	destroy_workqueue(dc->tty_flip_wq);
 +
 +	kfree(dc);
 +	deventry->my_dev = 0;
@@ -2012,80 +1980,6 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +	return room;
 +}
 +
-+/* Sets termios flags, called by the tty layer. */
-+static void ntty_set_termios(struct tty_struct *tty,
-+			     struct ktermios *old_termios)
-+{
-+	unsigned int cflag;
-+
-+	cflag = tty->termios->c_cflag;
-+
-+	/* get the byte size */
-+	switch (cflag & CSIZE) {
-+	case CS5:
-+		DBG1(" - data bits = 5");
-+		break;
-+	case CS6:
-+		DBG1(" - data bits = 6");
-+		break;
-+	case CS7:
-+		DBG1(" - data bits = 7");
-+		break;
-+	default:
-+	case CS8:
-+		DBG1(" - data bits = 8");
-+		break;
-+	}
-+
-+	/* determine the parity */
-+	if (cflag & PARENB) {
-+		if (cflag & PARODD) {
-+			DBG1(" - parity = odd");
-+		} else {
-+			DBG1(" - parity = even");
-+		}
-+	} else {
-+		DBG1(" - parity = none");
-+	}
-+
-+	/* figure out the stop bits requested */
-+	if (cflag & CSTOPB) {
-+		DBG1(" - stop bits = 2");
-+	} else {
-+		DBG1(" - stop bits = 1");
-+	}
-+
-+	/* figure out the hardware flow control settings */
-+	if (cflag & CRTSCTS) {
-+		DBG1(" - RTS/CTS is enabled");
-+	} else {
-+		DBG1(" - RTS/CTS is disabled");
-+	}
-+
-+	/* determine software flow control */
-+	/* if we are implementing XON/XOFF, set the start and
-+	 * stop character in the device */
-+	if (I_IXOFF(tty) || I_IXON(tty)) {
-+		/* if we are implementing INBOUND XON/XOFF */
-+		if (I_IXOFF(tty))
-+			DBG1(" - INBOUND XON/XOFF is enabled, "
-+			   "XON = %2x, XOFF = %2x",
-+			   START_CHAR(tty), STOP_CHAR(tty));
-+		else
-+			DBG1(" - INBOUND XON/XOFF is disabled");
-+
-+		/* if we are implementing OUTBOUND XON/XOFF */
-+		if (I_IXON(tty))
-+			DBG1(" - OUTBOUND XON/XOFF is enabled, "
-+			   "XON = %2x, XOFF = %2x",
-+			   START_CHAR(tty), STOP_CHAR(tty));
-+		else
-+			DBG1(" - OUTBOUND XON/XOFF is disabled");
-+	}
-+
-+	return;
-+}
-+
 +/* Gets io control parameters */
 +static int ntty_tiocmget(struct tty_struct *tty, struct file *file)
 +{
@@ -2198,14 +2092,6 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +	DBG1("******** IOCTL, cmd: %d", cmd);
 +
 +	switch (cmd) {
-+	case TCGETS:
-+		DBG1("IOCTL TCGETS ...");
-+		rval = -ENOIOCTLCMD;
-+		break;
-+	case TCSETS:
-+		DBG1("IOCTL TCSETS ...");
-+		rval = -ENOIOCTLCMD;
-+		break;
 +	case TIOCMIWAIT:
 +		rval = ntty_ioctl_tiocmiwait(tty, file, cmd, arg);
 +		break;
@@ -2245,11 +2131,6 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +		spin_unlock_irqrestore(&dc->spin_mutex, flags);
 +		rval = 0;
 +		break;
-+	case TCFLSH:
-+		DBG1("IOCTL TCFLSH ...");
-+		rval = -ENOIOCTLCMD;
-+		break;
-+
 +	default:
 +		DBG1("ERR: 0x%08X, %d", cmd, cmd);
 +		break;
@@ -2295,6 +2176,7 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +/* just to discard single character writes */
 +static void ntty_put_char(struct tty_struct *tty, unsigned char c)
 +{
++	/* FIXME !!! */
 +	DBG2("PUT CHAR Function: %c", c);
 +}
 +
@@ -2330,7 +2212,6 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +	.write_room = ntty_write_room,
 +	.unthrottle = ntty_unthrottle,
 +	.throttle = ntty_throttle,
-+	.set_termios = ntty_set_termios,
 +	.chars_in_buffer = ntty_chars_in_buffer,
 +	.put_char = ntty_put_char,
 +	.tiocmset = ntty_tiocmset,
@@ -2356,7 +2237,8 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +	td->flags = TTY_DRIVER_REAL_RAW | TTY_DRIVER_DYNAMIC_DEV;
 +	td->init_termios = tty_std_termios;
 +	td->init_termios.c_cflag = B115200 | CS8 | CREAD | HUPCL | CLOCAL;
-+
++	td->init_termios.c_ispeed = 115200;
++	td->init_termios.c_ospeed = 115200;
 +	td->termios = dc->tty_termios;
 +	td->termios_locked = dc->tty_termios_locked;
 +	tty_set_operations(dc->tty_driver, &tty_ops);
