@@ -1,0 +1,221 @@
+From foo@baz Tue Apr  9 12:12:43 2002
+Date: Thu, 25 Oct 2007 16:20:48 +0200
+To: Greg KH <greg@kroah.com>
+From: Greg Kroah-Hartman <gregkh@suse.de>
+Subject: USB: add usb_nokia_dku usb-serial driver
+
+From: Greg Kroah-Hartman <gregkh@suse.de>
+
+Originally written by "C Kemp"
+
+Cleaned up a bit by Greg and ported over time by Matthias.
+
+Cc: Dirk Meul <dirk.meul@rwth-aachen.de>
+Cc: Matthias Blaesing <matthias.blaesing@rwth-aachen.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/serial/Kconfig          |    9 +
+ drivers/usb/serial/Makefile         |    1 
+ drivers/usb/serial/usb_nokia_dku2.c |  168 ++++++++++++++++++++++++++++++++++++
+ 3 files changed, 178 insertions(+)
+
+--- a/drivers/usb/serial/Kconfig
++++ b/drivers/usb/serial/Kconfig
+@@ -546,6 +546,15 @@ config USB_SERIAL_XIRCOM
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called keyspan_pda.
+ 
++config USB_SERIAL_NOKIA_DKU2
++	tristate "USB Nokia DKU2 Serial Driver"
++	depends on USB_SERIAL
++	help
++	  Say Y here if you want to use a Nokia DKU2 phone as a USB device.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called usb_nokia_dku2.
++
+ config USB_SERIAL_OPTION
+ 	tristate "USB driver for GSM and CDMA modems"
+ 	depends on USB_SERIAL
+--- a/drivers/usb/serial/Makefile
++++ b/drivers/usb/serial/Makefile
+@@ -39,6 +39,7 @@ obj-$(CONFIG_USB_SERIAL_MCT_U232)		+= mc
+ obj-$(CONFIG_USB_SERIAL_MOS7720)		+= mos7720.o
+ obj-$(CONFIG_USB_SERIAL_MOS7840)		+= mos7840.o
+ obj-$(CONFIG_USB_SERIAL_NAVMAN)			+= navman.o
++obj-$(CONFIG_USB_SERIAL_NOKIA_DKU2)		+= usb_nokia_dku2.o
+ obj-$(CONFIG_USB_SERIAL_OMNINET)		+= omninet.o
+ obj-$(CONFIG_USB_SERIAL_OPTION)			+= option.o
+ obj-$(CONFIG_USB_SERIAL_OTI6858)		+= oti6858.o
+--- /dev/null
++++ b/drivers/usb/serial/usb_nokia_dku2.c
+@@ -0,0 +1,168 @@
++/*
++ *  Nokia DKU2 USB driver
++ *
++ *  Copyright (C) 2004
++ *  Author: C Kemp
++ *
++ *  This program is largely derived from work by the linux-usb group
++ *  and associated source files.  Please see the usb/serial files for
++ *  individual credits and copyrights.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *
++ */
++#include <linux/kernel.h>
++#include <linux/errno.h>
++#include <linux/init.h>
++#include <linux/slab.h>
++#include <linux/tty.h>
++#include <linux/tty_driver.h>
++#include <linux/tty_flip.h>
++#include <linux/module.h>
++#include <linux/usb.h>
++#include <linux/usb/serial.h>
++
++#ifdef CONFIG_USB_SERIAL_DEBUG
++	static int debug = 1;
++#else
++	static int debug;
++#endif
++
++/*
++ * Version Information
++ */
++#define DRIVER_VERSION	"v0.3"
++#define DRIVER_AUTHOR	"C Kemp"
++#define DRIVER_DESC	"Nokia DKU2 Driver"
++
++
++#define NOKIA_VENDOR_ID		0x0421
++#define NOKIA7600_PRODUCT_ID	0x0400
++#define NOKIA6230_PRODUCT_ID	0x040f
++#define NOKIA6170_PRODUCT_ID	0x0416
++#define NOKIA6230i_PRODUCT_ID	0x0428
++
++#define NOKIA_AT_PORT	0x82
++#define NOKIA_FBUS_PORT	0x86
++
++static struct usb_device_id id_table [] = {
++	{ USB_DEVICE(NOKIA_VENDOR_ID, NOKIA7600_PRODUCT_ID) },
++	{ USB_DEVICE(NOKIA_VENDOR_ID, NOKIA6230_PRODUCT_ID) },
++	{ USB_DEVICE(NOKIA_VENDOR_ID, NOKIA6170_PRODUCT_ID) },
++	{ USB_DEVICE(NOKIA_VENDOR_ID, NOKIA6230i_PRODUCT_ID) },
++	{ }			/* Terminating entry */
++};
++
++MODULE_DEVICE_TABLE(usb, id_table);
++
++/* The only thing which makes this device different from a generic
++ * device is that we have to set an alternative configuration to make
++ * the relevant endpoints available. In 2.6 this is really easy...
++ */
++
++static int nokia_probe(struct usb_serial *serial,
++		       const struct usb_device_id *id)
++{
++	int retval = -ENODEV;
++	struct usb_interface *intf = serial->interface;
++
++	dbg("%s", __FUNCTION__);
++
++	if (intf->altsetting[0].endpoint[0].desc.bEndpointAddress ==
++	    NOKIA_AT_PORT) {
++		/* the AT port */
++		printk(KERN_INFO "Nokia AT Port:\n");
++		retval = 0;
++
++	} else if ((intf->num_altsetting == 2) &&
++		   (intf->altsetting[1].endpoint[0].desc.bEndpointAddress ==
++		    0x83)) {
++		/* The FBUS port on my 6230i */
++		printk(KERN_INFO "Nokia Port (FBUS on 6230i):\n");
++		usb_set_interface(serial->dev, 4, 1);
++		retval = 0;
++	} else if ((intf->num_altsetting == 2) &&
++		   (intf->altsetting[1].endpoint[0].desc.bEndpointAddress ==
++		    0x84)) {
++		/* dunno */
++		printk(KERN_INFO "Nokia Port:\n");
++		usb_set_interface(serial->dev, 6, 1);
++		retval = 0;
++	} else if ((intf->num_altsetting == 2) &&
++		   (intf->altsetting[1].endpoint[0].desc.bEndpointAddress ==
++		    0x85)) {
++		/* dunno */
++		printk(KERN_INFO "Nokia Port:\n");
++		usb_set_interface(serial->dev, 8, 1);
++		retval = 0;
++
++	} else if ((intf->num_altsetting == 2) &&
++		   (intf->altsetting[1].endpoint[0].desc.bEndpointAddress ==
++		    NOKIA_FBUS_PORT)) {
++		/* the FBUS port on older phones */
++		printk(KERN_INFO "Nokia Port (FBUS on most):\n");
++		usb_set_interface(serial->dev, 10, 1);
++		retval = 0;
++	}
++
++	return retval;
++}
++
++static struct usb_driver nokia_driver = {
++	.name =		"Nokia DKU2",
++	.probe =	usb_serial_probe,
++	.disconnect =	usb_serial_disconnect,
++	.id_table =	id_table,
++};
++
++static struct usb_serial_driver nokia_device = {
++	.driver = {
++		.owner =	THIS_MODULE,
++		.name =		"Nokia DKU2",
++	},
++	.description =		"Nokia 7600/6230/6230i/6170 DKU2 driver",
++	.usb_driver =		&nokia_driver,
++	.id_table =		id_table,
++	.num_interrupt_in =	1,
++	.num_bulk_in =		1,
++	.num_bulk_out =		1,
++	.num_ports =		1,
++	.probe =		nokia_probe,
++};
++
++
++static int __init nokia_init(void)
++{
++	int retval = 0;
++
++	retval = usb_serial_register(&nokia_device);
++	if (retval)
++		return retval;
++
++	retval = usb_register(&nokia_driver);
++	if (retval) {
++		usb_serial_deregister(&nokia_device);
++		return retval;
++	}
++
++	return retval;
++}
++
++static void __exit nokia_exit(void)
++{
++	usb_deregister(&nokia_driver);
++	usb_serial_deregister(&nokia_device);
++}
++
++module_init(nokia_init);
++module_exit(nokia_exit);
++
++MODULE_AUTHOR(DRIVER_AUTHOR);
++MODULE_DESCRIPTION(DRIVER_DESC);
++MODULE_LICENSE("GPL");
++
++module_param(debug, bool, S_IRUGO | S_IWUSR);
++MODULE_PARM_DESC(debug, "Debug enabled or not");
