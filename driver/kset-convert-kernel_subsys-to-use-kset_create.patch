@@ -1,0 +1,182 @@
+From foo@baz Tue Apr  9 12:12:43 2002
+Date: Mon, 29 Oct 2007 20:13:17 +0100
+To: Greg KH <greg@kroah.com>
+From: Greg Kroah-Hartman <gregkh@suse.de>
+Subject: kset: convert kernel_subsys to use kset_create
+
+Dynamically create the kset instead of declaring it statically.  We also
+rename kernel_subsys to kernel_kset to catch all users of this symbol
+with a build error instead of an easy-to-ignore build warning.
+
+Cc: Kay Sievers <kay.sievers@vrfy.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ fs/configfs/mount.c         |    2 -
+ fs/debugfs/inode.c          |    2 -
+ fs/dlm/lockspace.c          |    2 -
+ fs/gfs2/locking/dlm/sysfs.c |    2 -
+ include/linux/kobject.h     |    4 +--
+ kernel/ksysfs.c             |   45 +++++++++++++++++++++++++++++++++-----------
+ kernel/user.c               |    4 +--
+ security/inode.c            |    2 -
+ 8 files changed, 43 insertions(+), 20 deletions(-)
+
+--- a/fs/configfs/mount.c
++++ b/fs/configfs/mount.c
+@@ -140,7 +140,7 @@ static int __init configfs_init(void)
+ 	if (!configfs_dir_cachep)
+ 		goto out;
+ 
+-	config_kset = kset_create("config", NULL, &kernel_subsys);
++	config_kset = kset_create("config", NULL, kernel_kset);
+ 	if (IS_ERR(config_kset))
+ 		goto kset_error;
+ 	err = kset_register(config_kset);
+--- a/fs/debugfs/inode.c
++++ b/fs/debugfs/inode.c
+@@ -432,7 +432,7 @@ static int __init debugfs_init(void)
+ {
+ 	int retval;
+ 
+-	debug_kset = kset_create("debug", NULL, &kernel_subsys);
++	debug_kset = kset_create("debug", NULL, kernel_kset);
+ 	if (IS_ERR(debug_kset))
+ 		return PTR_ERR(debug_kset);
+ 	retval = kset_register(debug_kset);
+--- a/fs/dlm/lockspace.c
++++ b/fs/dlm/lockspace.c
+@@ -225,7 +225,7 @@ int dlm_lockspace_init(void)
+ 	INIT_LIST_HEAD(&lslist);
+ 	spin_lock_init(&lslist_lock);
+ 
+-	dlm_kset = kset_create("dlm", NULL, &kernel_subsys);
++	dlm_kset = kset_create("dlm", NULL, kernel_kset);
+ 	if (IS_ERR(dlm_kset)) {
+ 		error = PTR_ERR(dlm_kset);
+ 		printk(KERN_WARNING "%s: can not create kset %d\n",
+--- a/fs/gfs2/locking/dlm/sysfs.c
++++ b/fs/gfs2/locking/dlm/sysfs.c
+@@ -221,7 +221,7 @@ int gdlm_sysfs_init(void)
+ {
+ 	int error;
+ 
+-	gdlm_kset = kset_create("lock_dlm", NULL, &kernel_subsys);
++	gdlm_kset = kset_create("lock_dlm", NULL, kernel_kset);
+ 	if (IS_ERR(gdlm_kset)) {
+ 		error = PTR_ERR(gdlm_kset);
+ 		printk(KERN_WARNING "%s: can not create kset %d\n",
+--- a/include/linux/kobject.h
++++ b/include/linux/kobject.h
+@@ -192,8 +192,8 @@ struct kset _varname##_subsys = { \
+ 	.uevent_ops =_uevent_ops, \
+ }
+ 
+-/* The global /sys/kernel/ subsystem for people to chain off of */
+-extern struct kset kernel_subsys;
++/* The global /sys/kernel/ kset for people to chain off of */
++extern struct kset *kernel_kset;
+ /* The global /sys/hypervisor/ subsystem  */
+ extern struct kset hypervisor_subsys;
+ 
+--- a/kernel/ksysfs.c
++++ b/kernel/ksysfs.c
+@@ -15,6 +15,7 @@
+ #include <linux/init.h>
+ #include <linux/kexec.h>
+ #include <linux/sched.h>
++#include <linux/err.h>
+ 
+ #define KERNEL_ATTR_RO(_name) \
+ static struct subsys_attribute _name##_attr = __ATTR_RO(_name)
+@@ -94,8 +95,8 @@ static struct bin_attribute notes_attr =
+ 	.read = &notes_read,
+ };
+ 
+-decl_subsys(kernel, NULL);
+-EXPORT_SYMBOL_GPL(kernel_subsys);
++struct kset *kernel_kset;
++EXPORT_SYMBOL_GPL(kernel_kset);
+ 
+ static struct attribute * kernel_attrs[] = {
+ #if defined(CONFIG_HOTPLUG) && defined(CONFIG_NET)
+@@ -116,24 +117,46 @@ static struct attribute_group kernel_att
+ 
+ static int __init ksysfs_init(void)
+ {
+-	int error = subsystem_register(&kernel_subsys);
+-	if (!error)
+-		error = sysfs_create_group(&kernel_subsys.kobj,
+-					   &kernel_attr_group);
++	int error;
+ 
+-	if (!error && notes_size > 0) {
++	kernel_kset = kset_create("kernel", NULL, NULL);
++	if (IS_ERR(kernel_kset)) {
++		error = PTR_ERR(kernel_kset);
++		goto exit;
++	}
++	error = kset_register(kernel_kset);
++	if (error)
++		goto exit;
++	error = sysfs_create_group(&kernel_kset->kobj, &kernel_attr_group);
++	if (error)
++		goto kset_exit;
++
++	if (notes_size > 0) {
+ 		notes_attr.size = notes_size;
+-		error = sysfs_create_bin_file(&kernel_subsys.kobj,
+-					      &notes_attr);
++		error = sysfs_create_bin_file(&kernel_kset->kobj, &notes_attr);
++		if (error)
++			goto group_exit;
+ 	}
+ 
+ 	/*
+ 	 * Create "/sys/kernel/uids" directory and corresponding root user's
+ 	 * directory under it.
+ 	 */
+-	if (!error)
+-		error = uids_kobject_init();
++	error = uids_kobject_init();
++	if (error)
++		goto notes_exit;
++
++	return 0;
++
++notes_exit:
++	if (notes_size > 0)
++		sysfs_remove_bin_file(&kernel_kset->kobj, &notes_attr);
++group_exit:
++	sysfs_remove_group(&kernel_kset->kobj, &kernel_attr_group);
++kset_exit:
++	kset_unregister(kernel_kset);
+ 
++exit:
+ 	return error;
+ }
+ 
+--- a/kernel/user.c
++++ b/kernel/user.c
+@@ -198,8 +198,8 @@ int __init uids_kobject_init(void)
+ 	int error;
+ 
+ 	/* create under /sys/kernel dir */
+-	uids_kobject.parent = &kernel_subsys.kobj;
+-	uids_kobject.kset = &kernel_subsys;
++	uids_kobject.parent = &kernel_kset->kobj;
++	uids_kobject.kset = kernel_kset;
+ 	kobject_set_name(&uids_kobject, "uids");
+ 	kobject_init(&uids_kobject);
+ 
+--- a/security/inode.c
++++ b/security/inode.c
+@@ -321,7 +321,7 @@ static int __init securityfs_init(void)
+ {
+ 	int retval;
+ 
+-	security_kset = kset_create("security", NULL, &kernel_subsys);
++	security_kset = kset_create("security", NULL, kernel_kset);
+ 	if (IS_ERR(security_kset))
+ 		return PTR_ERR(security_kset);
+ 	retval = kset_register(security_kset);
