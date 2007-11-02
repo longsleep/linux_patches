@@ -1,0 +1,232 @@
+From foo@baz Tue Apr  9 12:12:43 2002
+Date: Fri, 2 Nov 2007 17:17:00 -0400
+To: Greg KH <greg@kroah.com>
+From: Greg Kroah-Hartman <gregkh@suse.de>
+Subject: kset: convert s390 ipl.c to use kset_create
+
+Dynamically create the kset instead of declaring it statically.
+This makes the kobject attributes now work properly that I broke in the
+previous patch.
+
+Cc: Kay Sievers <kay.sievers@vrfy.org>
+Cc: Michael Holzheu <holzheu@de.ibm.com>
+Cc: Heiko Carstens <heiko.carstens@de.ibm.com>
+Cc: Volker Sameske <sameske@de.ibm.com>
+Cc: Cornelia Huck <cornelia.huck@de.ibm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ arch/s390/kernel/ipl.c |   75 +++++++++++++++++++++++++------------------------
+ 1 file changed, 39 insertions(+), 36 deletions(-)
+
+--- a/arch/s390/kernel/ipl.c
++++ b/arch/s390/kernel/ipl.c
+@@ -14,6 +14,7 @@
+ #include <linux/delay.h>
+ #include <linux/reboot.h>
+ #include <linux/ctype.h>
++#include <linux/err.h>
+ #include <asm/ipl.h>
+ #include <asm/smp.h>
+ #include <asm/setup.h>
+@@ -426,7 +427,7 @@ static struct attribute_group ipl_unknow
+ 	.attrs = ipl_unknown_attrs,
+ };
+ 
+-static decl_subsys(ipl, NULL);
++static struct kset *ipl_kset;
+ 
+ /*
+  * reipl section
+@@ -602,7 +603,7 @@ static ssize_t reipl_type_store(struct k
+ static struct kobj_attribute reipl_type_attr =
+ 		__ATTR(reipl_type, 0644, reipl_type_show, reipl_type_store);
+ 
+-static decl_subsys(reipl, NULL);
++static struct kset *reipl_kset;
+ 
+ /*
+  * dump section
+@@ -699,13 +700,13 @@ static ssize_t dump_type_store(struct ko
+ static struct kobj_attribute dump_type_attr =
+ 		__ATTR(dump_type, 0644, dump_type_show, dump_type_store);
+ 
+-static decl_subsys(dump, NULL);
++static struct kset *dump_kset;
+ 
+ /*
+  * Shutdown actions section
+  */
+ 
+-static decl_subsys(shutdown_actions, NULL);
++static struct kset *shutdown_actions_kset;
+ 
+ /* on panic */
+ 
+@@ -830,23 +831,23 @@ static int __init ipl_register_fcp_files
+ {
+ 	int rc;
+ 
+-	rc = sysfs_create_group(&ipl_subsys.kobj,
++	rc = sysfs_create_group(&ipl_kset->kobj,
+ 				&ipl_fcp_attr_group);
+ 	if (rc)
+ 		goto out;
+-	rc = sysfs_create_bin_file(&ipl_subsys.kobj,
++	rc = sysfs_create_bin_file(&ipl_kset->kobj,
+ 				   &ipl_parameter_attr);
+ 	if (rc)
+ 		goto out_ipl_parm;
+-	rc = sysfs_create_bin_file(&ipl_subsys.kobj,
++	rc = sysfs_create_bin_file(&ipl_kset->kobj,
+ 				   &ipl_scp_data_attr);
+ 	if (!rc)
+ 		goto out;
+ 
+-	sysfs_remove_bin_file(&ipl_subsys.kobj, &ipl_parameter_attr);
++	sysfs_remove_bin_file(&ipl_kset->kobj, &ipl_parameter_attr);
+ 
+ out_ipl_parm:
+-	sysfs_remove_group(&ipl_subsys.kobj, &ipl_fcp_attr_group);
++	sysfs_remove_group(&ipl_kset->kobj, &ipl_fcp_attr_group);
+ out:
+ 	return rc;
+ }
+@@ -855,12 +856,12 @@ static int __init ipl_init(void)
+ {
+ 	int rc;
+ 
+-	rc = firmware_register(&ipl_subsys);
+-	if (rc)
+-		return rc;
++	ipl_kset = kset_create_and_register("ipl", NULL, NULL, firmware_kset);
++	if (IS_ERR(ipl_kset))
++		return PTR_ERR(ipl_kset);
+ 	switch (ipl_info.type) {
+ 	case IPL_TYPE_CCW:
+-		rc = sysfs_create_group(&ipl_subsys.kobj,
++		rc = sysfs_create_group(&ipl_kset->kobj,
+ 					&ipl_ccw_attr_group);
+ 		break;
+ 	case IPL_TYPE_FCP:
+@@ -868,16 +869,16 @@ static int __init ipl_init(void)
+ 		rc = ipl_register_fcp_files();
+ 		break;
+ 	case IPL_TYPE_NSS:
+-		rc = sysfs_create_group(&ipl_subsys.kobj,
++		rc = sysfs_create_group(&ipl_kset->kobj,
+ 					&ipl_nss_attr_group);
+ 		break;
+ 	default:
+-		rc = sysfs_create_group(&ipl_subsys.kobj,
++		rc = sysfs_create_group(&ipl_kset->kobj,
+ 					&ipl_unknown_attr_group);
+ 		break;
+ 	}
+ 	if (rc)
+-		firmware_unregister(&ipl_subsys);
++		kset_unregister(ipl_kset);
+ 	return rc;
+ }
+ 
+@@ -899,7 +900,7 @@ static int __init reipl_nss_init(void)
+ 
+ 	if (!MACHINE_IS_VM)
+ 		return 0;
+-	rc = sysfs_create_group(&reipl_subsys.kobj, &reipl_nss_attr_group);
++	rc = sysfs_create_group(&reipl_kset->kobj, &reipl_nss_attr_group);
+ 	if (rc)
+ 		return rc;
+ 	strncpy(reipl_nss_name, kernel_nss_name, NSS_NAME_SIZE + 1);
+@@ -914,7 +915,7 @@ static int __init reipl_ccw_init(void)
+ 	reipl_block_ccw = (void *) get_zeroed_page(GFP_KERNEL);
+ 	if (!reipl_block_ccw)
+ 		return -ENOMEM;
+-	rc = sysfs_create_group(&reipl_subsys.kobj, &reipl_ccw_attr_group);
++	rc = sysfs_create_group(&reipl_kset->kobj, &reipl_ccw_attr_group);
+ 	if (rc) {
+ 		free_page((unsigned long)reipl_block_ccw);
+ 		return rc;
+@@ -952,7 +953,7 @@ static int __init reipl_fcp_init(void)
+ 	reipl_block_fcp = (void *) get_zeroed_page(GFP_KERNEL);
+ 	if (!reipl_block_fcp)
+ 		return -ENOMEM;
+-	rc = sysfs_create_group(&reipl_subsys.kobj, &reipl_fcp_attr_group);
++	rc = sysfs_create_group(&reipl_kset->kobj, &reipl_fcp_attr_group);
+ 	if (rc) {
+ 		free_page((unsigned long)reipl_block_fcp);
+ 		return rc;
+@@ -974,12 +975,12 @@ static int __init reipl_init(void)
+ {
+ 	int rc;
+ 
+-	rc = firmware_register(&reipl_subsys);
+-	if (rc)
+-		return rc;
+-	rc = sysfs_create_file(&reipl_subsys.kobj, &reipl_type_attr);
++	reipl_kset = kset_create_and_register("reipl", NULL, NULL, firmware_kset);
++	if (IS_ERR(reipl_kset))
++		return PTR_ERR(reipl_kset);
++	rc = sysfs_create_file(&reipl_kset->kobj, &reipl_type_attr);
+ 	if (rc) {
+-		firmware_unregister(&reipl_subsys);
++		kset_unregister(reipl_kset);
+ 		return rc;
+ 	}
+ 	rc = reipl_ccw_init();
+@@ -1004,7 +1005,7 @@ static int __init dump_ccw_init(void)
+ 	dump_block_ccw = (void *) get_zeroed_page(GFP_KERNEL);
+ 	if (!dump_block_ccw)
+ 		return -ENOMEM;
+-	rc = sysfs_create_group(&dump_subsys.kobj, &dump_ccw_attr_group);
++	rc = sysfs_create_group(&dump_kset->kobj, &dump_ccw_attr_group);
+ 	if (rc) {
+ 		free_page((unsigned long)dump_block_ccw);
+ 		return rc;
+@@ -1028,7 +1029,7 @@ static int __init dump_fcp_init(void)
+ 	dump_block_fcp = (void *) get_zeroed_page(GFP_KERNEL);
+ 	if (!dump_block_fcp)
+ 		return -ENOMEM;
+-	rc = sysfs_create_group(&dump_subsys.kobj, &dump_fcp_attr_group);
++	rc = sysfs_create_group(&dump_kset->kobj, &dump_fcp_attr_group);
+ 	if (rc) {
+ 		free_page((unsigned long)dump_block_fcp);
+ 		return rc;
+@@ -1063,12 +1064,12 @@ static int __init dump_init(void)
+ {
+ 	int rc;
+ 
+-	rc = firmware_register(&dump_subsys);
+-	if (rc)
+-		return rc;
+-	rc = sysfs_create_file(&dump_subsys.kobj, &dump_type_attr);
++	dump_kset = kset_create_and_register("dump", NULL, NULL, firmware_kset);
++	if (IS_ERR(dump_kset))
++		return PTR_ERR(dump_kset);
++	rc = sysfs_create_file(&dump_kset->kobj, &dump_type_attr);
+ 	if (rc) {
+-		firmware_unregister(&dump_subsys);
++		kset_unregister(dump_kset);
+ 		return rc;
+ 	}
+ 	rc = dump_ccw_init();
+@@ -1085,12 +1086,14 @@ static int __init shutdown_actions_init(
+ {
+ 	int rc;
+ 
+-	rc = firmware_register(&shutdown_actions_subsys);
+-	if (rc)
+-		return rc;
+-	rc = sysfs_create_file(&shutdown_actions_subsys.kobj, &on_panic_attr);
++	shutdown_actions_kset = kset_create_and_register("shutdown_actions",
++							 NULL, NULL,
++							 firmware_kset);
++	if (IS_ERR(shutdown_actions_kset))
++		return PTR_ERR(shutdown_actions_kset);
++	rc = sysfs_create_file(&shutdown_actions_kset->kobj, &on_panic_attr);
+ 	if (rc) {
+-		firmware_unregister(&shutdown_actions_subsys);
++		kset_unregister(shutdown_actions_kset);
+ 		return rc;
+ 	}
+ 	atomic_notifier_chain_register(&panic_notifier_list,
