@@ -1,10 +1,8 @@
-#From foo@baz Tue Apr  9 12:12:43 2002
-#Date: Thu, 01 Nov 2007 13:31:26 -0700
-#To: Greg KH <greg@kroah.com>
-#From: Greg Kroah-Hartman <gregkh@suse.de>
-#Subject: driver core: remove fields from struct bus_type
-
-DOES NOT BUILD AND IS NOT FULLY TESTED!!!
+From foo@baz Tue Apr  9 12:12:43 2002
+Date: Thu, 1 Nov 2007 19:41:16 -0700
+To: Greg KH <greg@kroah.com>
+From: Greg Kroah-Hartman <gregkh@suse.de>
+Subject: driver core: remove fields from struct bus_type
 
 struct bus_type is static everywhere in the kernel.  This moves the
 kobject in the structure out of it, and a bunch of other private only to
@@ -16,13 +14,15 @@ bus_type as there are no fields they can improperly access.
 Cc: Kay Sievers <kay.sievers@vrfy.org>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
-
 ---
- drivers/base/base.h    |   30 ++++++++++++-
- drivers/base/bus.c     |  110 ++++++++++++++++++++++++++++---------------------
- drivers/base/core.c    |    6 +-
- include/linux/device.h |   12 -----
- 4 files changed, 97 insertions(+), 61 deletions(-)
+ drivers/base/base.h     |   30 +++++++++++-
+ drivers/base/bus.c      |  120 +++++++++++++++++++++++++++---------------------
+ drivers/base/core.c     |    6 +-
+ drivers/base/dd.c       |    4 -
+ drivers/base/driver.c   |    2 
+ drivers/base/platform.c |    4 -
+ include/linux/device.h  |   12 ----
+ 7 files changed, 107 insertions(+), 71 deletions(-)
 
 --- a/drivers/base/base.h
 +++ b/drivers/base/base.h
@@ -211,7 +211,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  out_id:
  	device_remove_attrs(bus, dev);
  out_put:
-@@ -493,7 +497,7 @@ void bus_attach_device(struct device * d
+@@ -489,11 +493,11 @@ void bus_attach_device(struct device * d
+ 
+ 	if (bus) {
+ 		dev->is_registered = 1;
+-		if (bus->drivers_autoprobe)
++		if (bus->p->drivers_autoprobe)
  			ret = device_attach(dev);
  		WARN_ON(ret < 0);
  		if (ret >= 0)
@@ -229,7 +234,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		device_remove_attrs(dev->bus, dev);
  		if (dev->is_registered) {
  			dev->is_registered = 0;
-@@ -639,7 +643,7 @@ int bus_add_driver(struct device_driver 
+@@ -639,18 +643,18 @@ int bus_add_driver(struct device_driver 
  	error = kobject_set_name(&drv->kobj, "%s", drv->name);
  	if (error)
  		goto out_put_bus;
@@ -238,7 +243,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	drv->kobj.ktype = &driver_ktype;
  	error = kobject_register(&drv->kobj);
  	if (error)
-@@ -650,7 +654,7 @@ int bus_add_driver(struct device_driver 
+ 		goto out_put_bus;
+ 
+-	if (drv->bus->drivers_autoprobe) {
++	if (drv->bus->p->drivers_autoprobe) {
+ 		error = driver_attach(drv);
  		if (error)
  			goto out_unregister;
  	}
@@ -256,7 +265,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	return count;
  }
  static BUS_ATTR(uevent, S_IWUSR, NULL, bus_uevent_store);
-@@ -845,17 +849,25 @@ static BUS_ATTR(uevent, S_IWUSR, NULL, b
+@@ -845,17 +849,26 @@ static BUS_ATTR(uevent, S_IWUSR, NULL, b
  int bus_register(struct bus_type * bus)
  {
  	int retval;
@@ -281,13 +290,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -	bus->subsys.kobj.ktype = &bus_ktype;
 +	priv->subsys.kobj.kset = bus_kset;
 +	priv->subsys.kobj.ktype = &bus_ktype;
++	priv->drivers_autoprobe = 1;
  
 -	retval = subsystem_register(&bus->subsys);
 +	retval = subsystem_register(&priv->subsys);
  	if (retval)
  		goto out;
  
-@@ -863,22 +875,24 @@ int bus_register(struct bus_type * bus)
+@@ -863,24 +876,25 @@ int bus_register(struct bus_type * bus)
  	if (retval)
  		goto bus_uevent_fail;
  
@@ -320,8 +330,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	klist_init(&priv->klist_devices, klist_devices_get, klist_devices_put);
 +	klist_init(&priv->klist_drivers, NULL, NULL);
  
- 	bus->drivers_autoprobe = 1;
+-	bus->drivers_autoprobe = 1;
  	retval = add_probe_files(bus);
+ 	if (retval)
+ 		goto bus_probe_files_fail;
 @@ -895,13 +909,14 @@ int bus_register(struct bus_type * bus)
  bus_attrs_fail:
  	remove_probe_files(bus);
@@ -340,7 +352,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  out:
  	return retval;
  }
-@@ -918,21 +933,22 @@ void bus_unregister(struct bus_type * bu
+@@ -918,33 +933,34 @@ void bus_unregister(struct bus_type * bu
  	pr_debug("bus %s: unregistering\n", bus->name);
  	bus_remove_attrs(bus);
  	remove_probe_files(bus);
@@ -368,9 +380,23 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  }
  EXPORT_SYMBOL_GPL(bus_unregister_notifier);
  
+ struct kset *bus_get_kset(struct bus_type *bus)
+ {
+-	return &bus->subsys;
++	return &bus->p->subsys;
+ }
+ EXPORT_SYMBOL_GPL(bus_get_kset);
+ 
+ struct klist *bus_get_device_klist(struct bus_type *bus)
+ {
+-	return &bus->klist_devices;
++	return &bus->p->klist_devices;
+ }
+ EXPORT_SYMBOL_GPL(bus_get_device_klist);
+ 
 --- a/drivers/base/core.c
 +++ b/drivers/base/core.c
-@@ -762,7 +762,7 @@ int device_add(struct device *dev)
+@@ -755,7 +755,7 @@ int device_add(struct device *dev)
  
  	/* notify clients of device entry (new way) */
  	if (dev->bus)
@@ -379,7 +405,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  					     BUS_NOTIFY_ADD_DEVICE, dev);
  
  	error = device_create_file(dev, &uevent_attr);
-@@ -811,7 +811,7 @@ int device_add(struct device *dev)
+@@ -804,7 +804,7 @@ int device_add(struct device *dev)
  	device_pm_remove(dev);
   PMError:
  	if (dev->bus)
@@ -388,7 +414,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  					     BUS_NOTIFY_DEL_DEVICE, dev);
  	device_remove_attrs(dev);
   AttrsError:
-@@ -990,7 +990,7 @@ void device_del(struct device * dev)
+@@ -982,7 +982,7 @@ void device_del(struct device * dev)
  	if (platform_notify_remove)
  		platform_notify_remove(dev);
  	if (dev->bus)
@@ -397,6 +423,54 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  					     BUS_NOTIFY_DEL_DEVICE, dev);
  	device_pm_remove(dev);
  	kobject_uevent(&dev->kobj, KOBJ_REMOVE);
+--- a/drivers/base/dd.c
++++ b/drivers/base/dd.c
+@@ -38,7 +38,7 @@ static void driver_bound(struct device *
+ 		 dev->bus_id, dev->driver->name);
+ 
+ 	if (dev->bus)
+-		blocking_notifier_call_chain(&dev->bus->bus_notifier,
++		blocking_notifier_call_chain(&dev->bus->p->bus_notifier,
+ 					     BUS_NOTIFY_BOUND_DRIVER, dev);
+ 
+ 	klist_add_tail(&dev->knode_driver, &dev->driver->klist_devices);
+@@ -296,7 +296,7 @@ static void __device_release_driver(stru
+ 		klist_remove(&dev->knode_driver);
+ 
+ 		if (dev->bus)
+-			blocking_notifier_call_chain(&dev->bus->bus_notifier,
++			blocking_notifier_call_chain(&dev->bus->p->bus_notifier,
+ 						     BUS_NOTIFY_UNBIND_DRIVER,
+ 						     dev);
+ 
+--- a/drivers/base/driver.c
++++ b/drivers/base/driver.c
+@@ -185,7 +185,7 @@ void driver_unregister(struct device_dri
+  */
+ struct device_driver *driver_find(const char *name, struct bus_type *bus)
+ {
+-	struct kobject *k = kset_find_obj(bus->drivers_kset, name);
++	struct kobject *k = kset_find_obj(bus->p->drivers_kset, name);
+ 	if (k)
+ 		return to_drv(k);
+ 	return NULL;
+--- a/drivers/base/platform.c
++++ b/drivers/base/platform.c
+@@ -497,12 +497,12 @@ int __init_or_module platform_driver_pro
+ 	 * if the probe was successful, and make sure any forced probes of
+ 	 * new devices fail.
+ 	 */
+-	spin_lock(&platform_bus_type.klist_drivers.k_lock);
++	spin_lock(&platform_bus_type.p->klist_drivers.k_lock);
+ 	drv->probe = NULL;
+ 	if (code == 0 && list_empty(&drv->driver.klist_devices.k_list))
+ 		retval = -ENODEV;
+ 	drv->driver.probe = platform_drv_probe_fail;
+-	spin_unlock(&platform_bus_type.klist_drivers.k_lock);
++	spin_unlock(&platform_bus_type.p->klist_drivers.k_lock);
+ 
+ 	if (code != retval)
+ 		platform_driver_unregister(drv);
 --- a/include/linux/device.h
 +++ b/include/linux/device.h
 @@ -35,6 +35,7 @@ struct device_driver;
