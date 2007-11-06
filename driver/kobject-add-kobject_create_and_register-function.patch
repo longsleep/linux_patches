@@ -10,9 +10,9 @@ Cc: Kay Sievers <kay.sievers@vrfy.org>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
- include/linux/kobject.h |    3 ++
- lib/kobject.c           |   62 ++++++++++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 65 insertions(+)
+ include/linux/kobject.h |    3 +
+ lib/kobject.c           |   82 +++++++++++++++++++++++++++++++++++++++---------
+ 2 files changed, 71 insertions(+), 14 deletions(-)
 
 --- a/include/linux/kobject.h
 +++ b/include/linux/kobject.h
@@ -28,21 +28,25 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
 --- a/lib/kobject.c
 +++ b/lib/kobject.c
-@@ -553,6 +553,68 @@ struct kobject *kobject_add_dir(struct k
- 	return kobject_kset_add_dir(NULL, parent, name);
+@@ -499,13 +499,73 @@ static void dir_release(struct kobject *
+ 	kfree(kobj);
  }
  
+-static struct kobj_type dir_ktype = {
+-	.release	= dir_release,
+-	.sysfs_ops	= NULL,
+-	.default_attrs	= NULL,
 +static void dynamic_kobj_release(struct kobject *kobj)
 +{
-+	pr_debug("freeing %s\n", kobject_name(kobj));
++	pr_debug("%s: freeing %s\n", __FUNCTION__, kobject_name(kobj));
 +	kfree(kobj);
 +}
 +
 +static struct kobj_type dynamic_kobj_ktype = {
 +	.release = dynamic_kobj_release,
-+};
-+
-+/**
+ };
+ 
+ /**
 + * kobject_create - create a struct kobject dynamically
 + *
 + * @name: the name for the kset
@@ -51,15 +55,17 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + * This function creates a kobject structure dynamically and sets it up
 + * to be a "dynamic" kobject with a default release function set up.
 + */
-+static struct kobject *kobject_create(const char *name, struct kobject *parent)
++static struct kobject *kobject_create(const char *name,
++				      struct kobject *parent)
 +{
 +	struct kobject *kobj;
 +
 +	kobj = kzalloc(sizeof(*kobj), GFP_KERNEL);
 +	if (!kobj)
-+		return ERR_PTR(-ENOMEM);
++		return NULL;
 +
 +	kobject_set_name(kobj, name);
++	kobj->parent = parent;
 +	kobj->ktype = &dynamic_kobj_ktype;
 +	return kobj;
 +}
@@ -82,18 +88,57 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	int retval;
 +
 +	kobj = kobject_create(name, parent);
-+	if (IS_ERR(kobj))
-+		return kobj;
++	if (!kobj)
++		return NULL;
 +
 +	retval = kobject_register(kobj);
 +	if (retval) {
++		printk(KERN_WARNING "%s: kobject_register error: %d\n",
++		       __FUNCTION__, retval);
 +		kfree(kobj);
-+		return ERR_PTR(retval);
++		kobj = NULL;
 +	}
 +	return kobj;
 +}
 +EXPORT_SYMBOL_GPL(kobject_create_and_register);
 +
++/**
+  *	kobject_kset_add_dir - add sub directory of object.
+  *	@kset:		kset the directory is belongs to.
+  *	@parent:	object in which a directory is created.
+@@ -519,23 +579,17 @@ struct kobject *kobject_kset_add_dir(str
+ 	struct kobject *k;
+ 	int ret;
+ 
+-	if (!parent)
+-		return NULL;
+-
+-	k = kzalloc(sizeof(*k), GFP_KERNEL);
++	k = kobject_create(name, parent);
+ 	if (!k)
+ 		return NULL;
+ 
+ 	k->kset = kset;
+-	k->parent = parent;
+-	k->ktype = &dir_ktype;
+-	kobject_set_name(k, name);
+ 	ret = kobject_register(k);
+ 	if (ret < 0) {
+ 		printk(KERN_WARNING "%s: kobject_register error: %d\n",
+ 			__func__, ret);
+-		kobject_del(k);
+-		return NULL;
++		kfree(k);
++		k = NULL;
+ 	}
+ 
+ 	return k;
+@@ -550,7 +604,7 @@ struct kobject *kobject_kset_add_dir(str
+  */
+ struct kobject *kobject_add_dir(struct kobject *parent, const char *name)
+ {
+-	return kobject_kset_add_dir(NULL, parent, name);
++	return kobject_create_and_register(name, parent);
+ }
+ 
  /**
-  *	kset_init - initialize a kset for use
-  *	@k:	kset 
