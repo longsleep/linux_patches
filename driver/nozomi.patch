@@ -22,8 +22,8 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 ---
  drivers/char/Kconfig  |   10 
  drivers/char/Makefile |    1 
- drivers/char/nozomi.c | 2230 ++++++++++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 2241 insertions(+)
+ drivers/char/nozomi.c | 2282 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 2293 insertions(+)
 
 --- a/drivers/char/Kconfig
 +++ b/drivers/char/Kconfig
@@ -56,7 +56,7 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
  obj-$(CONFIG_MOXA_INTELLIO)	+= moxa.o
 --- /dev/null
 +++ b/drivers/char/nozomi.c
-@@ -0,0 +1,2230 @@
+@@ -0,0 +1,2282 @@
 +/*
 + * nozomi.c  -- HSDPA driver Broadband Wireless Data Card - Globe Trotter
 + *
@@ -99,6 +99,11 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +
 +/*
 + * CHANGELOG
++ * Version 2.1c
++ * 30-October-2007 Frank Seidel
++ * - Completed multicard support
++ * - Minor cleanups
++ *
 + * Version 2.1b
 + * 07-August-2007 Frank Seidel
 + * - Minor cleanups
@@ -143,7 +148,7 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +/* Enable this to have a lot of debug printouts */
 +#define DEBUG
 +
-+
++#include <linux/kernel.h>
 +#include <linux/module.h>
 +#include <linux/pci.h>
 +#include <linux/ioport.h>
@@ -162,7 +167,7 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +#include <linux/delay.h>
 +
 +
-+#define VERSION_STRING DRIVER_DESC " 2.1b (build date: " \
++#define VERSION_STRING DRIVER_DESC " 2.1c (build date: " \
 +					__DATE__ " " __TIME__ ")"
 +
 +/*    Macros definitions */
@@ -228,6 +233,7 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +
 +#define NTTY_TTY_MAJOR		241
 +#define NTTY_TTY_MINORS		MAX_PORT
++#define NTTY_TTY_MAXMINORS	256
 +#define NTTY_FIFO_BUFFER_SIZE	8192
 +
 +/* Must be power of 2 */
@@ -559,12 +565,39 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +static struct port *get_port_by_tty(const struct tty_struct *tty)
 +{
 +	struct nozomi *ndev = get_dc_by_index(tty->index);
-+	return ndev ? &ndev->port[tty->index] : NULL;
++	return ndev ? &ndev->port[tty->index % NTTY_TTY_MINORS] : NULL;
 +}
 +
 +static struct nozomi *get_dc_by_tty(const struct tty_struct *tty)
 +{
 +	return get_dc_by_index(tty->index);
++}
++
++static int get_free_index(void)
++{
++	struct list_head *p;
++	struct nozomi_devices *curdev;
++	u8 busy;
++	int new_index;
++
++	for (new_index = 0; new_index < NTTY_TTY_MAXMINORS; new_index += 4) {
++		busy = 0;
++		list_for_each(p, &my_devices) {
++			curdev = list_entry(p, struct nozomi_devices, list);
++			if (curdev->index_start == new_index) {
++				++busy;
++				break;
++			}
++		}
++
++		if (!busy)
++			break;
++	}
++
++	if (new_index >= NTTY_TTY_MAXMINORS)
++		return -ENODEV;
++
++	return new_index;
 +}
 +
 +/*
@@ -1118,28 +1151,39 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +	char *p = buf;
 +
 +	interrupt & MDM_DL1 ? p += snprintf(p, TMP_BUF_MAX, "MDM_DL1 ") : NULL;
-+	interrupt & MDM_DL2 ? p += snprintf(p, TMP_BUF_MAX, "MDM_DL2 ") : NULL;
++	interrupt & MDM_DL2 ? p += snprintf(p, TMP_BUF_MAX - (p - buf),
++					"MDM_DL2 ") : NULL;
 +
-+	interrupt & MDM_UL1 ? p += snprintf(p, TMP_BUF_MAX, "MDM_UL1 ") : NULL;
-+	interrupt & MDM_UL2 ? p += snprintf(p, TMP_BUF_MAX, "MDM_UL2 ") : NULL;
++	interrupt & MDM_UL1 ? p += snprintf(p, TMP_BUF_MAX - (p - buf),
++					"MDM_UL1 ") : NULL;
++	interrupt & MDM_UL2 ? p += snprintf(p, TMP_BUF_MAX - (p - buf),
++					"MDM_UL2 ") : NULL;
 +
-+	interrupt & DIAG_DL1 ? p += snprintf(p, \
-+					TMP_BUF_MAX, "DIAG_DL1 ") : NULL;
-+	interrupt & DIAG_DL2 ? p += snprintf(p, \
-+					TMP_BUF_MAX, "DIAG_DL2 ") : NULL;
++	interrupt & DIAG_DL1 ? p += snprintf(p, TMP_BUF_MAX - (p - buf),
++					"DIAG_DL1 ") : NULL;
++	interrupt & DIAG_DL2 ? p += snprintf(p, TMP_BUF_MAX - (p - buf),
++					"DIAG_DL2 ") : NULL;
 +
-+	interrupt & DIAG_UL ? p += snprintf(p, TMP_BUF_MAX, "DIAG_UL ") : NULL;
++	interrupt & DIAG_UL ? p += snprintf(p, TMP_BUF_MAX - (p - buf),
++					"DIAG_UL ") : NULL;
 +
-+	interrupt & APP1_DL ? p += snprintf(p, TMP_BUF_MAX, "APP1_DL ") : NULL;
-+	interrupt & APP2_DL ? p += snprintf(p, TMP_BUF_MAX, "APP2_DL ") : NULL;
++	interrupt & APP1_DL ? p += snprintf(p, TMP_BUF_MAX - (p - buf),
++					"APP1_DL ") : NULL;
++	interrupt & APP2_DL ? p += snprintf(p, TMP_BUF_MAX - (p - buf),
++					"APP2_DL ") : NULL;
 +
-+	interrupt & APP1_UL ? p += snprintf(p, TMP_BUF_MAX, "APP1_UL ") : NULL;
-+	interrupt & APP2_UL ? p += snprintf(p, TMP_BUF_MAX, "APP2_UL ") : NULL;
++	interrupt & APP1_UL ? p += snprintf(p, TMP_BUF_MAX - (p - buf),
++					"APP1_UL ") : NULL;
++	interrupt & APP2_UL ? p += snprintf(p, TMP_BUF_MAX - (p - buf),
++					"APP2_UL ") : NULL;
 +
-+	interrupt & CTRL_DL ? p += snprintf(p, TMP_BUF_MAX, "CTRL_DL ") : NULL;
-+	interrupt & CTRL_UL ? p += snprintf(p, TMP_BUF_MAX, "CTRL_UL ") : NULL;
++	interrupt & CTRL_DL ? p += snprintf(p, TMP_BUF_MAX - (p - buf),
++					"CTRL_DL ") : NULL;
++	interrupt & CTRL_UL ? p += snprintf(p, TMP_BUF_MAX - (p - buf),
++					"CTRL_UL ") : NULL;
 +
-+	interrupt & RESET ? p += snprintf(p, TMP_BUF_MAX, "RESET ") : NULL;
++	interrupt & RESET ? p += snprintf(p, TMP_BUF_MAX - (p - buf),
++					"RESET ") : NULL;
 +
 +	return buf;
 +}
@@ -1186,8 +1230,8 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +		return 0;
 +	};
 +
-+	DBG1("0x%04X->0x%04X", *((u16 *) & dc->port[port].ctrl_dl),
-+	   *((u16 *) & ctrl_dl));
++	DBG1("0x%04X->0x%04X", *((u16 *)&dc->port[port].ctrl_dl),
++	   *((u16 *)&ctrl_dl));
 +
 +	old_ctrl = dc->port[port].ctrl_dl;
 +	dc->port[port].ctrl_dl = ctrl_dl;
@@ -1210,7 +1254,7 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +		}
 +	}
 +
-+	if (*(u16 *) & old_ctrl == *(u16 *) & ctrl_dl) {
++	if (*(u16 *)&old_ctrl == *(u16 *)&ctrl_dl) {
 +		DBG1(" No change in mctrl");
 +		return 1;
 +	}
@@ -1268,7 +1312,7 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +				return 1;
 +			}
 +			dc->port[i].ctrl_ul.port = port2ctrl(i, dc);
-+			ctrl = (u16 *) & dc->port[i].ctrl_ul;
++			ctrl = (u16 *)&dc->port[i].ctrl_ul;
 +			write_mem32(dc->port[PORT_CTRL].ul_addr[0], \
 +				(u32 *) ctrl, 2);
 +			dc->port[i].update_flow_control = 0;
@@ -1595,6 +1639,8 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +	int ret = -EIO;
 +	struct nozomi *dc = NULL;
 +	struct nozomi_devices *newdev = NULL;
++	struct nozomi_devices *first = NULL;
++	int new_index;
 +	int i;
 +
 +	atomic_inc(&cards_found);
@@ -1612,10 +1658,10 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +		kfree(dc);
 +		return -ENOMEM;
 +	}
-+	dc->pdev = pdev;
-+	pci_set_drvdata(pdev, dc);
 +
++	dc->pdev = pdev;
 +	newdev->my_dev = dc;
++	pci_set_drvdata(pdev, newdev);
 +
 +	/* Find out what card type it is */
 +	nozomi_get_card_type(dc);
@@ -1672,25 +1718,31 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +
 +	spin_lock_init(&dc->spin_mutex);
 +
++	new_index = get_free_index();
++	if (new_index < 0) {
++		dev_err(&pdev->dev, "already reached maximum card count.\n");
++		ret = -EIO;
++		goto err_disable_regions;
++	}
++
 +	make_sysfs_files(dc);
 +
 +	if (atomic_read(&cards_found) == 1) {
 +		ntty_tty_init(dc);
-+		newdev->index_start = 0;
 +	} else {
-+		dc->tty_driver->num += NTTY_TTY_MINORS;
-+		for (i = 0; i < NTTY_TTY_MINORS; i++) {
-+			init_MUTEX(&dc->port[i].tty_sem);
-+			dc->port[i].tty_open_count = 0;
-+			dc->port[i].tty = NULL;
-+			tty_register_device(dc->tty_driver,
-+				i + (atomic_read(&cards_found)
-+							* NTTY_TTY_MINORS),
-+				&dc->pdev->dev);
-+		}
-+		newdev->index_start =
-+				atomic_read(&cards_found) * NTTY_TTY_MINORS;
++		first = list_first_entry(&my_devices, struct nozomi_devices,
++									list);
++		dc->tty_driver = first->my_dev->tty_driver;
 +	}
++
++	for (i = 0; i < NTTY_TTY_MINORS; i++) {
++		init_MUTEX(&dc->port[i].tty_sem);
++		dc->port[i].tty_open_count = 0;
++		dc->port[i].tty = NULL;
++		tty_register_device(dc->tty_driver, new_index + i,
++							&dc->pdev->dev);
++	}
++	newdev->index_start = new_index;
 +
 +	/* Enable  RESET interrupt. */
 +	dc->last_ier = RESET;
@@ -1752,8 +1804,7 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +
 +	flush_scheduled_work();
 +
-+	for (i = ndev->index_start; i < ndev->index_start + NTTY_TTY_MINORS; \
-+									++i)
++	for (i = 0; i < NTTY_TTY_MINORS; ++i)
 +		if (dc->port[i].tty && \
 +				list_empty(&dc->port[i].tty->hangup_work.entry))
 +			tty_hangup(dc->port[i].tty);
@@ -1765,11 +1816,14 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +									++i)
 +		tty_unregister_device(dc->tty_driver, i);
 +
-+	ret = tty_unregister_driver(dc->tty_driver);
-+	if (ret)
-+		printk(KERN_ERR "Unable to unregister the tty driver !"
++	/* only unregister ttydriver if its the last card available */
++	if (atomic_read(&cards_found) == 1) {
++		ret = tty_unregister_driver(dc->tty_driver);
++		if (ret)
++			printk(KERN_ERR "Unable to unregister the tty driver !"
 +							" (%d)\n", ret);
-+	put_tty_driver(dc->tty_driver);
++		put_tty_driver(dc->tty_driver);
++	}
 +}
 +
 +/* Deallocate memory for one device */
@@ -1792,11 +1846,11 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +	ctrl.reserved = 0;
 +	ctrl.RTS = 0;
 +	ctrl.DTR = 1;
-+	DBG1("sending flow control 0x%04X", *((u16 *) & ctrl));
++	DBG1("sending flow control 0x%04X", *((u16 *)&ctrl));
 +
 +	/* Setup dc->reg addresses to we can use defines here */
 +	nozomi_setup_private_data(dc);
-+	write_mem32(dc->port[PORT_CTRL].ul_addr[0], (u32 *) & ctrl, 2);
++	write_mem32(dc->port[PORT_CTRL].ul_addr[0], (u32 *)&ctrl, 2);
 +	writew(CTRL_UL, dc->reg_fcr);	/* push the token to the card. */
 +
 +	DBG1("pci_release_regions");
@@ -1829,20 +1883,22 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +static void set_rts(int index, int rts)
 +{
 +	struct nozomi *dc = get_dc_by_index(index);
++	int devindex = index % NTTY_TTY_MINORS;
 +
-+	dc->port[index].ctrl_ul.RTS = rts;
-+	dc->port[index].update_flow_control = 1;
++	dc->port[devindex].ctrl_ul.RTS = rts;
++	dc->port[devindex].update_flow_control = 1;
 +	enable_transmit_ul(PORT_CTRL, dc);
 +}
 +
 +static void set_dtr(int index, int dtr)
 +{
 +	struct nozomi *dc = get_dc_by_index(index);
++	int devindex = index % NTTY_TTY_MINORS;
 +
 +	DBG1("SETTING DTR index: %d, dtr: %d", index, dtr);
 +
-+	dc->port[index].ctrl_ul.DTR = dtr;
-+	dc->port[index].update_flow_control = 1;
++	dc->port[devindex].ctrl_ul.DTR = dtr;
++	dc->port[devindex].update_flow_control = 1;
 +	enable_transmit_ul(PORT_CTRL, dc);
 +}
 +
@@ -1858,6 +1914,9 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +	struct port *port = get_port_by_tty(tty);
 +	struct nozomi *dc = get_dc_by_tty(tty);
 +	unsigned long flags;
++
++	if (!port || !dc)
++		return -ENODEV;
 +
 +	if (down_interruptible(&port->tty_sem))
 +		return -ERESTARTSYS;
@@ -1938,13 +1997,14 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +	if (port == &(dc->port[PORT_MDM])) {
 +		if (port->ctrl_dl.CTS) {
 +			DBG4("Enable interrupt");
-+			enable_transmit_ul(port->tty_index, dc);
++			enable_transmit_ul(port->tty_index % NTTY_TTY_MINORS,
++									dc);
 +		} else {
 +			dev_err(&dc->pdev->dev,
 +				"CTS not active on modem port?\n");
 +		}
 +	} else {
-+		enable_transmit_ul(port->tty_index, dc);
++		enable_transmit_ul(port->tty_index % NTTY_TTY_MINORS, dc);
 +	}
 +	spin_unlock_irqrestore(&dc->spin_mutex, flags);
 +
@@ -2151,7 +2211,7 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +
 +	DBG1("UNTHROTTLE");
 +	spin_lock_irqsave(&dc->spin_mutex, flags);
-+	enable_transmit_dl(port->tty_index, dc);
++	enable_transmit_dl(port->tty_index % NTTY_TTY_MINORS, dc);
 +	set_rts(port->tty_index, 1);
 +
 +	spin_unlock_irqrestore(&dc->spin_mutex, flags);
@@ -2222,9 +2282,8 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +{
 +	struct tty_driver *td;
 +	int rval;
-+	int i;
 +
-+	dc->tty_driver = alloc_tty_driver(NTTY_TTY_MINORS);
++	dc->tty_driver = alloc_tty_driver(NTTY_TTY_MAXMINORS);
 +	if (!dc->tty_driver)
 +		return -ENOMEM;
 +	td = dc->tty_driver;
@@ -2247,13 +2306,6 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +	if (rval) {
 +		dev_err(&dc->pdev->dev, "failed to register ntty tty driver\n");
 +		return rval;
-+	}
-+
-+	for (i = 0; i < NTTY_TTY_MINORS; i++) {
-+		init_MUTEX(&dc->port[i].tty_sem);
-+		dc->port[i].tty_open_count = 0;
-+		dc->port[i].tty = NULL;
-+		tty_register_device(td, i, &dc->pdev->dev);
 +	}
 +
 +	dev_info(&dc->pdev->dev, DRIVER_DESC " " NOZOMI_NAME_TTY "\n");
