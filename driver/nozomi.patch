@@ -13,15 +13,18 @@ Thanks to Alan Cox for a lot of tty fixes.
 Thanks to Satyam Sharma <satyam@infradead.org> for fixing buildbreakage.
 Thanks to Frank Seidel <fseidel@suse.de> for a lot of bugfixes and
 rewriting to make it a sane Linux driver
+Thanks to Jiri Slaby <jirislaby@gmail.com> for a lot bugfixes, cleanups
+and rewrites that make it much more readable.
 
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 Signed-off-by: Frank Seidel <fseidel@suse.de>
+Signed-off-by: Jiri Slaby <jirislaby@gmail.com>
 
 ---
  drivers/char/Kconfig  |   10 
  drivers/char/Makefile |    1 
- drivers/char/nozomi.c | 2221 ++++++++++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 2232 insertions(+)
+ drivers/char/nozomi.c | 1993 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 2004 insertions(+)
 
 --- a/drivers/char/Kconfig
 +++ b/drivers/char/Kconfig
@@ -54,7 +57,7 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
  obj-$(CONFIG_MOXA_INTELLIO)	+= moxa.o
 --- /dev/null
 +++ b/drivers/char/nozomi.c
-@@ -0,0 +1,2221 @@
+@@ -0,0 +1,1993 @@
 +/*
 + * nozomi.c  -- HSDPA driver Broadband Wireless Data Card - Globe Trotter
 + *
@@ -97,6 +100,12 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +
 +/*
 + * CHANGELOG
++ * Version 2.1d
++ * 11-November-2007 Jiri Slaby, Frank Seidel
++ * - Big rework of multicard support by Jiri
++ * - Major cleanups (semaphore to mutex, endianess, no major reservation)
++ * - Optimizations
++ *
 + * Version 2.1c
 + * 30-October-2007 Frank Seidel
 + * - Completed multicard support
@@ -158,14 +167,13 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +#include <linux/kmod.h>
 +#include <linux/init.h>
 +#include <linux/kfifo.h>
-+#include <linux/list.h>
 +#include <linux/uaccess.h>
-+#include <asm/atomic.h>
++#include <asm/byteorder.h>
 +
 +#include <linux/delay.h>
 +
 +
-+#define VERSION_STRING DRIVER_DESC " 2.1c (build date: " \
++#define VERSION_STRING DRIVER_DESC " 2.1d (build date: " \
 +					__DATE__ " " __TIME__ ")"
 +
 +/*    Macros definitions */
@@ -229,8 +237,6 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +#define NOZOMI_NAME_TTY		"nozomi_tty"
 +#define DRIVER_DESC		"Nozomi driver"
 +
-+#define NTTY_TTY_MAJOR		241
-+#define NTTY_TTY_MINORS		MAX_PORT
 +#define NTTY_TTY_MAXMINORS	256
 +#define NTTY_FIFO_BUFFER_SIZE	8192
 +
@@ -284,6 +290,7 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +
 +#define MAX_PORT		4
 +#define NOZOMI_MAX_PORTS	5
++#define NOZOMI_MAX_CARDS	(NTTY_TTY_MAXMINORS / MAX_PORT)
 +
 +/*    Type definitions */
 +
@@ -322,7 +329,7 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +	PORT_ERROR	= -1,
 +};
 +
-+#ifdef __ARMEB__
++#ifdef __BIG_ENDIAN
 +/* Big endian */
 +
 +struct toggles {
@@ -465,18 +472,16 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +
 +	struct tty_struct *tty;
 +	int tty_open_count;
-+	struct semaphore tty_sem;
++	/* mutex to ensure one access patch to this port */
++	struct mutex tty_sem;
 +	wait_queue_head_t tty_wait;
 +	struct async_icount tty_icount;
-+	int tty_index;
-+	u32 rx_data, tx_data;
-+
 +};
 +
 +/* Private data one for each card in the system */
 +struct nozomi {
 +	void __iomem *base_addr;
-+	u8 closing;
++	unsigned long flip;
 +
 +	/* Pointers to registers */
 +	void __iomem *reg_iir;
@@ -490,12 +495,9 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +	struct port port[NOZOMI_MAX_PORTS];
 +	u8 *send_buf;
 +
-+	struct tty_driver *tty_driver;
-+
-+	struct ktermios *tty_termios[NTTY_TTY_MINORS];
-+	struct ktermios *tty_termios_locked[NTTY_TTY_MINORS];
 +	spinlock_t spin_mutex;	/* secures access to registers and tty */
 +
++	unsigned int index_start;
 +	u32 open_ttys;
 +};
 +
@@ -505,9 +507,6 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +	u8 *data;
 +} __attribute__ ((packed));
 +
-+/*    Function declarations */
-+static int ntty_tty_init(struct nozomi *dc);
-+
 +/*    Global variables */
 +static struct pci_device_id nozomi_pci_tbl[] = {
 +	{PCI_DEVICE(VENDOR1, DEVICE1)},
@@ -516,86 +515,21 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +
 +MODULE_DEVICE_TABLE(pci, nozomi_pci_tbl);
 +
-+/* Used to store interrupt variables */
-+struct irq {
-+	u16 read_iir;		/* Holds current interrupt tokens */
-+};
-+
-+/* Representing the pci device of interest */
-+struct nozomi_devices {
-+	struct list_head list;
-+	struct nozomi *my_dev;
-+	struct irq my_irq;
-+	int index_start;
-+};
-+static atomic_t cards_found = ATOMIC_INIT(0);
-+static LIST_HEAD(my_devices);
++static struct nozomi *ndevs[NOZOMI_MAX_CARDS];
++static struct tty_driver *ntty_driver;
 +
 +/*
 + * find card by tty_index
 + */
-+static struct nozomi *get_dc_by_index(s32 index)
++static inline struct nozomi *get_dc_by_tty(const struct tty_struct *tty)
 +{
-+	struct list_head *p;
-+	struct nozomi_devices *curdev;
-+	int devidx;
-+
-+	if (likely(atomic_read(&cards_found) == 1)) {
-+		curdev = list_first_entry(&my_devices,
-+					struct nozomi_devices, list);
-+		return curdev->my_dev;
-+	} else {
-+		devidx = index - (index % NTTY_TTY_MINORS);
-+
-+		list_for_each(p, &my_devices) {
-+			curdev = list_entry(p, struct nozomi_devices, list);
-+			if (curdev->index_start == devidx)
-+				return curdev->my_dev;
-+		}
-+	}
-+
-+	printk(KERN_ALERT "Fatal error: could not find device" \
-+		" for tty-index %d\n", index);
-+
-+	return NULL;
++	return tty ? ndevs[tty->index / MAX_PORT] : NULL;
 +}
 +
-+static struct port *get_port_by_tty(const struct tty_struct *tty)
++static inline struct port *get_port_by_tty(const struct tty_struct *tty)
 +{
-+	struct nozomi *ndev = get_dc_by_index(tty->index);
-+	return ndev ? &ndev->port[tty->index % NTTY_TTY_MINORS] : NULL;
-+}
-+
-+static struct nozomi *get_dc_by_tty(const struct tty_struct *tty)
-+{
-+	return get_dc_by_index(tty->index);
-+}
-+
-+static int get_free_index(void)
-+{
-+	struct list_head *p;
-+	struct nozomi_devices *curdev;
-+	u8 busy;
-+	int new_index;
-+
-+	for (new_index = 0; new_index < NTTY_TTY_MAXMINORS; new_index += 4) {
-+		busy = 0;
-+		list_for_each(p, &my_devices) {
-+			curdev = list_entry(p, struct nozomi_devices, list);
-+			if (curdev->index_start == new_index) {
-+				++busy;
-+				break;
-+			}
-+		}
-+
-+		if (!busy)
-+			break;
-+	}
-+
-+	if (new_index >= NTTY_TTY_MAXMINORS)
-+		return -ENODEV;
-+
-+	return new_index;
++	struct nozomi *ndev = get_dc_by_tty(tty);
++	return ndev ? &ndev->port[tty->index % MAX_PORT] : NULL;
 +}
 +
 +/*
@@ -608,11 +542,7 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +			u32 size_bytes)
 +{
 +	u32 i = 0;
-+#ifdef __ARMEB__
-+	const u32 *ptr = (u32 *) mem_addr_start;
-+#else
 +	const u32 *ptr = (__force u32 *) mem_addr_start;
-+#endif
 +	u16 *buf16;
 +
 +	if (unlikely(!ptr || !buf))
@@ -622,19 +552,11 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +	switch (size_bytes) {
 +	case 2:	/* 2 bytes */
 +		buf16 = (u16 *) buf;
-+#ifdef __ARMEB__
-+		*buf16 = __le16_to_cpu(readw(ptr));
-+#else
-+		*buf16 = readw((void __iomem *)ptr);
-+#endif
++		*buf16 = __le16_to_cpu(readw((void __iomem *)ptr));
 +		goto out;
 +		break;
 +	case 4:	/* 4 bytes */
-+#ifdef __ARMEB__
-+		*(buf) = __le32_to_cpu(readl(ptr));
-+#else
-+		*(buf) = readl((void __iomem *)ptr);
-+#endif
++		*(buf) = __le32_to_cpu(readl((void __iomem *)ptr));
 +		goto out;
 +		break;
 +	}
@@ -643,19 +565,11 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +		if (size_bytes - i == 2) {
 +			/* Handle 2 bytes in the end */
 +			buf16 = (u16 *) buf;
-+#ifdef __ARMEB__
-+			*(buf16) = __le16_to_cpu(readw(ptr));
-+#else
-+			*(buf16) = readw((void __iomem *)ptr);
-+#endif
++			*(buf16) = __le16_to_cpu(readw((void __iomem *)ptr));
 +			i += 2;
 +		} else {
 +			/* Read 4 bytes */
-+#ifdef __ARMEB__
-+			*(buf) = __le32_to_cpu(readl(ptr));
-+#else
-+			*(buf) = readl((void __iomem *)ptr);
-+#endif
++			*(buf) = __le32_to_cpu(readl((void __iomem *)ptr));
 +			i += 4;
 +		}
 +		buf++;
@@ -674,11 +588,7 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +			u32 size_bytes)
 +{
 +	u32 i = 0;
-+#ifdef __ARMEB__
-+	u32 *ptr = (u32 *) mem_addr_start;
-+#else
 +	u32 *ptr = (__force u32 *) mem_addr_start;
-+#endif
 +	u16 *buf16;
 +
 +	if (unlikely(!ptr || !buf))
@@ -688,19 +598,15 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +	switch (size_bytes) {
 +	case 2:	/* 2 bytes */
 +		buf16 = (u16 *) buf;
-+#ifdef __ARMEB__
-+		writew(__le16_to_cpu(*buf16), ptr);
-+#else
-+		writew(*buf16, (void __iomem *)ptr);
-+#endif
++		writew(__cpu_to_le16(*buf16), (void __iomem *)ptr);
 +		return 2;
 +		break;
++	case 1: /*
++		 * also needs to write 4 bytes in this case
++		 * so falling through..
++		 */
 +	case 4: /* 4 bytes */
-+#ifdef __ARMEB__
-+		writel(__cpu_to_le32(*buf), ptr);
-+#else
-+		writel(*buf, (void __iomem *)ptr);
-+#endif
++		writel(__cpu_to_le32(*buf), (void __iomem *)ptr);
 +		return 4;
 +		break;
 +	}
@@ -709,19 +615,11 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +		if (size_bytes - i == 2) {
 +			/* 2 bytes */
 +			buf16 = (u16 *) buf;
-+#ifdef __ARMEB__
-+			writew(__le16_to_cpu(*buf16), ptr);
-+#else
-+			writew(*buf16, (void __iomem *)ptr);
-+#endif
++			writew(__cpu_to_le16(*buf16), (void __iomem *)ptr);
 +			i += 2;
 +		} else {
 +			/* 4 bytes */
-+#ifdef __ARMEB__
-+			writel(__cpu_to_le32(*buf), ptr);
-+#else
-+			writel(*buf, (void __iomem *)ptr);
-+#endif
++			writel(__cpu_to_le32(*buf), (void __iomem *)ptr);
 +			i += 4;
 +		}
 +		buf++;
@@ -938,7 +836,8 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +/* Enable uplink interrupts  */
 +static void enable_transmit_ul(enum port_type port, struct nozomi *dc)
 +{
-+	u16 mask[NOZOMI_MAX_PORTS] = {MDM_UL, DIAG_UL, APP1_UL, APP2_UL, CTRL_UL};
++	u16 mask[NOZOMI_MAX_PORTS] = \
++			{MDM_UL, DIAG_UL, APP1_UL, APP2_UL, CTRL_UL};
 +
 +	if (port < NOZOMI_MAX_PORTS) {
 +		dc->last_ier |= mask[port];
@@ -965,7 +864,8 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +/* Enable downlink interrupts */
 +static void enable_transmit_dl(enum port_type port, struct nozomi *dc)
 +{
-+	u16 mask[NOZOMI_MAX_PORTS] = {MDM_DL, DIAG_DL, APP1_DL, APP2_DL, CTRL_DL};
++	u16 mask[NOZOMI_MAX_PORTS] = \
++			{MDM_DL, DIAG_DL, APP1_DL, APP2_DL, CTRL_DL};
 +
 +	if (port < NOZOMI_MAX_PORTS) {
 +		dc->last_ier |= mask[port];
@@ -1010,8 +910,6 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +		DBG4("No more data to send, disable link:");
 +		return 0;
 +	}
-+
-+	port->tx_data += size;
 +
 +	/* DUMP(buf, size); */
 +
@@ -1058,8 +956,6 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +		return 1;
 +	}
 +
-+	port->rx_data += size;
-+
 +	tty_buffer_request_room(tty, size);
 +
 +	while (size > 0) {
@@ -1078,7 +974,7 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +		}
 +	}
 +
-+	tty_flip_buffer_push(tty);
++	set_bit(index, &dc->flip);
 +
 +	return 1;
 +}
@@ -1133,7 +1029,7 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 + * Receive flow control
 + * Return 1 - If ok, else 0
 + */
-+static int receive_flow_control(struct nozomi *dc, struct irq *m)
++static int receive_flow_control(struct nozomi *dc)
 +{
 +	enum port_type port = PORT_MDM;
 +	struct ctrl_dl ctrl_dl;
@@ -1207,6 +1103,9 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +		dc->port[port].tty_icount.rng++;
 +	if (old_ctrl.DCD != ctrl_dl.DCD)
 +		dc->port[port].tty_icount.dcd++;
++
++	wake_up_interruptible(&dc->port[port].tty_wait);
++
 +	DBG1("port: %d DCD(%d), CTS(%d), RI(%d), DSR(%d)",
 +	   port,
 +	   dc->port[port].tty_icount.dcd, dc->port[port].tty_icount.cts,
@@ -1267,28 +1166,28 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 + * Return 1 - ok
 + * Return 0 - toggle fields are out of sync
 + */
-+static int handle_data_dl(struct nozomi *dc, struct irq *m, enum port_type port,
-+			  u8 *toggle, u16 mask1, u16 mask2)
++static int handle_data_dl(struct nozomi *dc, enum port_type port, u8 *toggle,
++			u16 read_iir, u16 mask1, u16 mask2)
 +{
-+	if (*toggle == 0 && m->read_iir & mask1) {
++	if (*toggle == 0 && read_iir & mask1) {
 +		if (receive_data(port, dc)) {
 +			writew(mask1, dc->reg_fcr);
 +			*toggle = !(*toggle);
 +		}
 +
-+		if (m->read_iir & mask2) {
++		if (read_iir & mask2) {
 +			if (receive_data(port, dc)) {
 +				writew(mask2, dc->reg_fcr);
 +				*toggle = !(*toggle);
 +			}
 +		}
-+	} else if (*toggle == 1 && m->read_iir & mask2) {
++	} else if (*toggle == 1 && read_iir & mask2) {
 +		if (receive_data(port, dc)) {
 +			writew(mask2, dc->reg_fcr);
 +			*toggle = !(*toggle);
 +		}
 +
-+		if (m->read_iir & mask1) {
++		if (read_iir & mask1) {
 +			if (receive_data(port, dc)) {
 +				writew(mask1, dc->reg_fcr);
 +				*toggle = !(*toggle);
@@ -1307,11 +1206,11 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 + * Return 1 - ok
 + * Return 0 - toggle field are out of sync
 + */
-+static int handle_data_ul(struct nozomi *dc, struct irq *m, enum port_type port)
++static int handle_data_ul(struct nozomi *dc, enum port_type port, u16 read_iir)
 +{
 +	u8 *toggle = &(dc->port[port].toggle_ul);
 +
-+	if (*toggle == 0 && m->read_iir & MDM_UL1) {
++	if (*toggle == 0 && read_iir & MDM_UL1) {
 +		dc->last_ier &= ~MDM_UL;
 +		writew(dc->last_ier, dc->reg_ier);
 +		if (send_data(port, dc)) {
@@ -1321,7 +1220,7 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +			*toggle = !*toggle;
 +		}
 +
-+		if (m->read_iir & MDM_UL2) {
++		if (read_iir & MDM_UL2) {
 +			dc->last_ier &= ~MDM_UL;
 +			writew(dc->last_ier, dc->reg_ier);
 +			if (send_data(port, dc)) {
@@ -1332,7 +1231,7 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +			}
 +		}
 +
-+	} else if (*toggle == 1 && m->read_iir & MDM_UL2) {
++	} else if (*toggle == 1 && read_iir & MDM_UL2) {
 +		dc->last_ier &= ~MDM_UL;
 +		writew(dc->last_ier, dc->reg_ier);
 +		if (send_data(port, dc)) {
@@ -1342,7 +1241,7 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +			*toggle = !*toggle;
 +		}
 +
-+		if (m->read_iir & MDM_UL1) {
++		if (read_iir & MDM_UL1) {
 +			dc->last_ier &= ~MDM_UL;
 +			writew(dc->last_ier, dc->reg_ier);
 +			if (send_data(port, dc)) {
@@ -1353,7 +1252,7 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +			}
 +		}
 +	} else {
-+		writew(m->read_iir & MDM_UL, dc->reg_fcr);
++		writew(read_iir & MDM_UL, dc->reg_fcr);
 +		dev_err(&dc->pdev->dev, "port out of sync!\n");
 +		return 0;
 +	}
@@ -1362,36 +1261,33 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +
 +static irqreturn_t interrupt_handler(int irq, void *dev_id)
 +{
-+	struct nozomi_devices *ndev = dev_id;
-+	struct nozomi *dc;
-+	struct irq *m;
++	struct nozomi *dc = dev_id;
++	unsigned int a;
++	u16 read_iir;
 +
-+	if (!ndev)
++	if (!dc)
 +		return IRQ_NONE;
 +
-+	dc = ndev->my_dev;
-+	m = &ndev->my_irq;
-+
 +	spin_lock(&dc->spin_mutex);
-+	m->read_iir = readw(dc->reg_iir);
++	read_iir = readw(dc->reg_iir);
 +
 +	/* Card removed */
-+	if (m->read_iir == (u16)-1)
++	if (read_iir == (u16)-1)
 +		goto none;
 +	/*
 +	 * Just handle interrupt enabled in IER
 +	 * (by masking with dc->last_ier)
 +	 */
-+	m->read_iir &= dc->last_ier;
++	read_iir &= dc->last_ier;
 +
-+	if (m->read_iir == 0)
++	if (read_iir == 0)
 +		goto none;
 +
 +
-+	DBG4("%s irq:0x%04X, prev:0x%04X", interrupt2str(m->read_iir),
-+	   m->read_iir, dc->last_ier);
++	DBG4("%s irq:0x%04X, prev:0x%04X", interrupt2str(read_iir), read_iir,
++		dc->last_ier);
 +
-+	if (m->read_iir & RESET) {
++	if (read_iir & RESET) {
 +		if (unlikely(!nozomi_read_config_table(dc))) {
 +			dc->last_ier = 0x0;
 +			writew(dc->last_ier, dc->reg_ier);
@@ -1403,7 +1299,7 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +		/* No more useful info if this was the reset interrupt. */
 +		goto exit_handler;
 +	}
-+	if (m->read_iir & CTRL_UL) {
++	if (read_iir & CTRL_UL) {
 +		DBG1("CTRL_UL");
 +		dc->last_ier &= ~CTRL_UL;
 +		writew(dc->last_ier, dc->reg_ier);
@@ -1413,33 +1309,33 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +			writew(dc->last_ier, dc->reg_ier);
 +		}
 +	}
-+	if (m->read_iir & CTRL_DL) {
-+		receive_flow_control(dc, m);
++	if (read_iir & CTRL_DL) {
++		receive_flow_control(dc);
 +		writew(CTRL_DL, dc->reg_fcr);
 +	}
-+	if (m->read_iir & MDM_DL) {
-+		if (!handle_data_dl(dc, m, PORT_MDM,
-+				&(dc->port[PORT_MDM].toggle_dl), MDM_DL1,
-+				MDM_DL2)) {
++	if (read_iir & MDM_DL) {
++		if (!handle_data_dl(dc, PORT_MDM,
++				&(dc->port[PORT_MDM].toggle_dl), read_iir,
++				MDM_DL1, MDM_DL2)) {
 +			dev_err(&dc->pdev->dev, "MDM_DL out of sync!\n");
 +			goto exit_handler;
 +		}
 +	}
-+	if (m->read_iir & MDM_UL) {
-+		if (!handle_data_ul(dc, m, PORT_MDM)) {
++	if (read_iir & MDM_UL) {
++		if (!handle_data_ul(dc, PORT_MDM, read_iir)) {
 +			dev_err(&dc->pdev->dev, "MDM_UL out of sync!\n");
 +			goto exit_handler;
 +		}
 +	}
-+	if (m->read_iir & DIAG_DL) {
-+		if (!handle_data_dl(dc, m, PORT_DIAG,
-+				&(dc->port[PORT_DIAG].toggle_dl), DIAG_DL1,
-+				DIAG_DL2)) {
++	if (read_iir & DIAG_DL) {
++		if (!handle_data_dl(dc, PORT_DIAG,
++				&(dc->port[PORT_DIAG].toggle_dl), read_iir,
++				DIAG_DL1, DIAG_DL2)) {
 +			dev_err(&dc->pdev->dev, "DIAG_DL out of sync!\n");
 +			goto exit_handler;
 +		}
 +	}
-+	if (m->read_iir & DIAG_UL) {
++	if (read_iir & DIAG_UL) {
 +		dc->last_ier &= ~DIAG_UL;
 +		writew(dc->last_ier, dc->reg_ier);
 +		if (send_data(PORT_DIAG, dc)) {
@@ -1448,11 +1344,11 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +			writew(dc->last_ier, dc->reg_ier);
 +		}
 +	}
-+	if (m->read_iir & APP1_DL) {
++	if (read_iir & APP1_DL) {
 +		if (receive_data(PORT_APP1, dc))
 +			writew(APP1_DL, dc->reg_fcr);
 +	}
-+	if (m->read_iir & APP1_UL) {
++	if (read_iir & APP1_UL) {
 +		dc->last_ier &= ~APP1_UL;
 +		writew(dc->last_ier, dc->reg_ier);
 +		if (send_data(PORT_APP1, dc)) {
@@ -1461,11 +1357,11 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +			writew(dc->last_ier, dc->reg_ier);
 +		}
 +	}
-+	if (m->read_iir & APP2_DL) {
++	if (read_iir & APP2_DL) {
 +		if (receive_data(PORT_APP2, dc))
 +			writew(APP2_DL, dc->reg_fcr);
 +	}
-+	if (m->read_iir & APP2_UL) {
++	if (read_iir & APP2_UL) {
 +		dc->last_ier &= ~APP2_UL;
 +		writew(dc->last_ier, dc->reg_ier);
 +		if (send_data(PORT_APP2, dc)) {
@@ -1477,24 +1373,13 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +
 +exit_handler:
 +	spin_unlock(&dc->spin_mutex);
++	for (a = 0; a < NOZOMI_MAX_PORTS; a++)
++		if (test_and_clear_bit(a, &dc->flip))
++			tty_flip_buffer_push(dc->port[a].tty);
 +	return IRQ_HANDLED;
 +none:
 +	spin_unlock(&dc->spin_mutex);
 +	return IRQ_NONE;
-+}
-+
-+/* Request a shared IRQ from system */
-+static int nozomi_setup_interrupt(struct nozomi_devices *ndev)
-+{
-+	int rval;
-+
-+	rval = request_irq(ndev->my_dev->pdev->irq, &interrupt_handler,
-+				IRQF_SHARED, NOZOMI_NAME, ndev);
-+	if (unlikely(rval))
-+		dev_err(&ndev->my_dev->pdev->dev, "Cannot open because IRQ %d "
-+			"is already in use.\n", ndev->my_dev->pdev->irq);
-+
-+	return rval;
 +}
 +
 +static void nozomi_get_card_type(struct nozomi *dc)
@@ -1514,42 +1399,38 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +static void nozomi_setup_private_data(struct nozomi *dc)
 +{
 +	void __iomem *offset = dc->base_addr + dc->card_type / 2;
-+	int i;
++	unsigned int i;
 +
 +	dc->reg_fcr = (void __iomem *)(offset + R_FCR);
 +	dc->reg_iir = (void __iomem *)(offset + R_IIR);
 +	dc->reg_ier = (void __iomem *)(offset + R_IER);
 +	dc->last_ier = 0;
-+	dc->closing = 0;
++	dc->flip = 0;
 +
 +	dc->port[PORT_MDM].token_dl = MDM_DL;
 +	dc->port[PORT_DIAG].token_dl = DIAG_DL;
 +	dc->port[PORT_APP1].token_dl = APP1_DL;
 +	dc->port[PORT_APP2].token_dl = APP2_DL;
 +
-+	for (i = PORT_MDM; i < MAX_PORT; ++i) {
-+		dc->port[i].rx_data = 0;
-+		dc->port[i].tx_data = 0;
-+	}
++	for (i = 0; i < MAX_PORT; i++)
++		init_waitqueue_head(&dc->port[i].tty_wait);
 +}
 +
 +static ssize_t card_type_show(struct device *dev, struct device_attribute *attr,
 +			  char *buf)
 +{
-+	struct pci_dev *pdev = to_pci_dev(dev);
-+	struct nozomi_devices *deventry = pci_get_drvdata(pdev);
++	struct nozomi *dc = pci_get_drvdata(to_pci_dev(dev));
 +
-+	return sprintf(buf, "%d\n", deventry->my_dev->card_type);
++	return sprintf(buf, "%d\n", dc->card_type);
 +}
 +static DEVICE_ATTR(card_type, 0444, card_type_show, NULL);
 +
 +static ssize_t open_ttys_show(struct device *dev, struct device_attribute *attr,
 +			  char *buf)
 +{
-+	struct pci_dev *pdev = to_pci_dev(dev);
-+	struct nozomi_devices *deventry = pci_get_drvdata(pdev);
++	struct nozomi *dc = pci_get_drvdata(to_pci_dev(dev));
 +
-+	return sprintf(buf, "%u\n", deventry->my_dev->open_ttys);
++	return sprintf(buf, "%u\n", dc->open_ttys);
 +}
 +static DEVICE_ATTR(open_ttys, 0444, open_ttys_show, NULL);
 +
@@ -1574,41 +1455,39 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +				      const struct pci_device_id *ent)
 +{
 +	resource_size_t start;
-+	int ret = -EIO;
++	int ret;
 +	struct nozomi *dc = NULL;
-+	struct nozomi_devices *newdev = NULL;
-+	struct nozomi_devices *first = NULL;
-+	int new_index;
++	int ndev_idx;
 +	int i;
 +
-+	atomic_inc(&cards_found);
-+	dev_dbg(&pdev->dev, "Init, cards_found: %d\n",
-+		atomic_read(&cards_found));
++	dev_dbg(&pdev->dev, "Init, new card found\n");
++
++	for (ndev_idx = 0; ndev_idx < ARRAY_SIZE(ndevs); ndev_idx++)
++		if (!ndevs[ndev_idx])
++			break;
++
++	if (ndev_idx >= ARRAY_SIZE(ndevs)) {
++		dev_err(&pdev->dev, "no free tty range for this card left\n");
++		ret = -EIO;
++		goto err;
++	}
 +
 +	dc = kzalloc(sizeof(struct nozomi), GFP_KERNEL);
 +	if (unlikely(!dc)) {
 +		dev_err(&pdev->dev, "Could not allocate memory\n");
-+		return -ENOMEM;
-+	}
-+	newdev = kzalloc(sizeof(struct nozomi_devices), GFP_KERNEL);
-+	if (unlikely(!newdev)) {
-+		dev_err(&pdev->dev, "Could not allocate memory\n");
-+		kfree(dc);
-+		return -ENOMEM;
++		ret = -ENOMEM;
++		goto err_free;
 +	}
 +
 +	dc->pdev = pdev;
-+	newdev->my_dev = dc;
-+	pci_set_drvdata(pdev, newdev);
 +
 +	/* Find out what card type it is */
 +	nozomi_get_card_type(dc);
 +
-+	if (pci_enable_device(dc->pdev)) {
++	ret = pci_enable_device(dc->pdev);
++	if (ret) {
 +		dev_err(&pdev->dev, "Failed to enable PCI Device\n");
-+		kfree(dc);
-+		kfree(newdev);
-+		return -ENODEV;
++		goto err_free;
 +	}
 +
 +	start = pci_resource_start(dc->pdev, 0);
@@ -1618,131 +1497,87 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +		goto err_disable_device;
 +	}
 +
++	ret = pci_request_regions(dc->pdev, NOZOMI_NAME);
++	if (ret) {
++		dev_err(&pdev->dev, "I/O address 0x%04x already in use\n",
++			(int) /* nozomi_private.io_addr */ 0);
++		goto err_disable_device;
++	}
++
 +	dc->base_addr = ioremap(start, dc->card_type);
 +	if (!dc->base_addr) {
 +		dev_err(&pdev->dev, "Unable to map card MMIO\n");
 +		ret = -ENODEV;
-+		goto err_disable_device;
-+	}
-+
-+	dc->open_ttys = 0;
-+
-+	nozomi_setup_private_data(dc);
-+
-+	if (pci_request_regions(dc->pdev, NOZOMI_NAME)) {
-+		dev_err(&pdev->dev, "I/O address 0x%04x already in use\n",
-+			(int) /* nozomi_private.io_addr */ 0);
-+		ret = -EIO;
-+		goto err_disable_regions;
++		goto err_rel_regs;
 +	}
 +
 +	dc->send_buf = kmalloc(SEND_BUF_MAX, GFP_KERNEL);
 +	if (!dc->send_buf) {
 +		dev_err(&pdev->dev, "Could not allocate send buffer?\n");
-+		goto err_disable_regions;
++		ret = -ENOMEM;
++		goto err_free_sbuf;
 +	}
++
++	spin_lock_init(&dc->spin_mutex);
++
++	nozomi_setup_private_data(dc);
 +
 +	/* Disable all interrupts */
 +	dc->last_ier = 0;
 +	writew(dc->last_ier, dc->reg_ier);
 +
-+	/* Setup interrupt handler */
-+	if (nozomi_setup_interrupt(newdev)) {
-+		ret = -EIO;
-+		goto err_disable_regions;
++	ret = request_irq(pdev->irq, &interrupt_handler, IRQF_SHARED,
++			NOZOMI_NAME, dc);
++	if (unlikely(ret)) {
++		dev_err(&pdev->dev, "can't request irq %d\n", pdev->irq);
++		goto err_free_sbuf;
 +	}
 +
 +	DBG1("base_addr: %p", dc->base_addr);
 +
-+	spin_lock_init(&dc->spin_mutex);
-+
-+	new_index = get_free_index();
-+	if (new_index < 0) {
-+		dev_err(&pdev->dev, "already reached maximum card count.\n");
-+		ret = -EIO;
-+		goto err_disable_regions;
-+	}
-+
 +	make_sysfs_files(dc);
 +
-+	if (atomic_read(&cards_found) == 1) {
-+		ntty_tty_init(dc);
-+	} else {
-+		first = list_first_entry(&my_devices, struct nozomi_devices,
-+									list);
-+		dc->tty_driver = first->my_dev->tty_driver;
-+	}
++	dc->index_start = ndev_idx * MAX_PORT;
++	ndevs[ndev_idx] = dc;
 +
-+	for (i = 0; i < NTTY_TTY_MINORS; i++) {
-+		init_MUTEX(&dc->port[i].tty_sem);
++	for (i = 0; i < MAX_PORT; i++) {
++		mutex_init(&dc->port[i].tty_sem);
 +		dc->port[i].tty_open_count = 0;
 +		dc->port[i].tty = NULL;
-+		tty_register_device(dc->tty_driver, new_index + i,
-+							&dc->pdev->dev);
++		tty_register_device(ntty_driver, dc->index_start + i,
++							&pdev->dev);
 +	}
-+	newdev->index_start = new_index;
 +
 +	/* Enable  RESET interrupt. */
 +	dc->last_ier = RESET;
 +	writew(dc->last_ier, dc->reg_ier);
 +
-+	INIT_LIST_HEAD(&newdev->list);
-+	list_add_tail(&newdev->list, &my_devices);
-+
-+	pci_set_drvdata(pdev, newdev);
++	pci_set_drvdata(pdev, dc);
 +
 +	return 0;
 +
-+err_disable_regions:
-+	pci_release_regions(pdev);
++err_free_sbuf:
++	kfree(dc->send_buf);
 +	iounmap(dc->base_addr);
-+	dc->base_addr = NULL;
-+
++err_rel_regs:
++	pci_release_regions(pdev);
 +err_disable_device:
 +	pci_disable_device(pdev);
++err_free:
 +	kfree(dc);
-+	kfree(newdev);
++err:
 +	return ret;
 +}
 +
-+static void tty_do_close(struct nozomi *dc, struct port *port)
++static void __devexit tty_exit(struct nozomi *dc)
 +{
-+	unsigned long flags;
-+
-+	if (!dc || !port)
-+		return;
-+
-+	if (down_interruptible(&port->tty_sem))
-+		return;
-+
-+	if (!port->tty_open_count)
-+		goto exit;
-+
-+	dc->open_ttys--;
-+	port->tty_open_count--;
-+
-+	if (port->tty_open_count == 0) {
-+		DBG1("close: %d", port->token_dl);
-+		spin_lock_irqsave(&dc->spin_mutex, flags);
-+		dc->last_ier &= ~(port->token_dl);
-+		writew(dc->last_ier, dc->reg_ier);
-+		spin_unlock_irqrestore(&dc->spin_mutex, flags);
-+	}
-+
-+exit:
-+	up(&port->tty_sem);
-+}
-+
-+static void __devexit tty_exit(struct nozomi_devices *ndev)
-+{
-+	struct nozomi *dc = ndev->my_dev;
-+	int i, ret;
++	unsigned int i;
 +
 +	DBG1(" ");
 +
 +	flush_scheduled_work();
 +
-+	for (i = 0; i < NTTY_TTY_MINORS; ++i)
++	for (i = 0; i < MAX_PORT; ++i)
 +		if (dc->port[i].tty && \
 +				list_empty(&dc->port[i].tty->hangup_work.entry))
 +			tty_hangup(dc->port[i].tty);
@@ -1750,18 +1585,8 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +	while (dc->open_ttys)
 +		msleep(1);
 +
-+	for (i = ndev->index_start; i < ndev->index_start + NTTY_TTY_MINORS; \
-+									++i)
-+		tty_unregister_device(dc->tty_driver, i);
-+
-+	/* only unregister ttydriver if its the last card available */
-+	if (atomic_read(&cards_found) == 1) {
-+		ret = tty_unregister_driver(dc->tty_driver);
-+		if (ret)
-+			printk(KERN_ERR "Unable to unregister the tty driver !"
-+							" (%d)\n", ret);
-+		put_tty_driver(dc->tty_driver);
-+	}
++	for (i = dc->index_start; i < dc->index_start + MAX_PORT; ++i)
++		tty_unregister_device(ntty_driver, i);
 +}
 +
 +/* Deallocate memory for one device */
@@ -1769,14 +1594,13 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +{
 +	int i;
 +	struct ctrl_ul ctrl;
-+	struct nozomi_devices *deventry = pci_get_drvdata(pdev);
-+	struct nozomi *dc = deventry->my_dev;
++	struct nozomi *dc = pci_get_drvdata(pdev);
 +
 +	/* Disable all interrupts */
 +	dc->last_ier = 0;
 +	writew(dc->last_ier, dc->reg_ier);
 +
-+	tty_exit(deventry);
++	tty_exit(dc);
 +
 +	/* Send 0x0001, command card to resend the reset token.  */
 +	/* This is to get the reset when the module is reloaded. */
@@ -1787,57 +1611,48 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +	DBG1("sending flow control 0x%04X", *((u16 *)&ctrl));
 +
 +	/* Setup dc->reg addresses to we can use defines here */
-+	nozomi_setup_private_data(dc);
 +	write_mem32(dc->port[PORT_CTRL].ul_addr[0], (u32 *)&ctrl, 2);
 +	writew(CTRL_UL, dc->reg_fcr);	/* push the token to the card. */
 +
-+	DBG1("pci_release_regions");
-+	pci_release_regions(pdev);
++	remove_sysfs_files(dc);
 +
-+	if (dc->base_addr)
-+		iounmap(dc->base_addr);
++	free_irq(pdev->irq, dc);
 +
-+	DBG1("pci_disable_device");
-+	pci_disable_device(pdev);
-+
-+	free_irq(pdev->irq, deventry);
-+
-+	for (i = PORT_MDM; i < MAX_PORT; i++)
-+		kfree(dc->port[i].fifo_ul);
++	for (i = 0; i < MAX_PORT; i++)
++		if (dc->port[i].fifo_ul)
++			kfifo_free(dc->port[i].fifo_ul);
 +
 +	kfree(dc->send_buf);
 +
-+	remove_sysfs_files(dc);
++	iounmap(dc->base_addr);
++
++	pci_release_regions(pdev);
++
++	pci_disable_device(pdev);
++
++	ndevs[dc->index_start / MAX_PORT] = NULL;
 +
 +	kfree(dc);
-+	deventry->my_dev = NULL;
-+
-+	list_del(&deventry->list);
-+	kfree(deventry);
-+
-+	atomic_dec(&cards_found);
 +}
 +
-+static void set_rts(int index, int rts)
++static void set_rts(const struct tty_struct *tty, int rts)
 +{
-+	struct nozomi *dc = get_dc_by_index(index);
-+	int devindex = index % NTTY_TTY_MINORS;
++	struct port *port = get_port_by_tty(tty);
 +
-+	dc->port[devindex].ctrl_ul.RTS = rts;
-+	dc->port[devindex].update_flow_control = 1;
-+	enable_transmit_ul(PORT_CTRL, dc);
++	port->ctrl_ul.RTS = rts;
++	port->update_flow_control = 1;
++	enable_transmit_ul(PORT_CTRL, get_dc_by_tty(tty));
 +}
 +
-+static void set_dtr(int index, int dtr)
++static void set_dtr(const struct tty_struct *tty, int dtr)
 +{
-+	struct nozomi *dc = get_dc_by_index(index);
-+	int devindex = index % NTTY_TTY_MINORS;
++	struct port *port = get_port_by_tty(tty);
 +
-+	DBG1("SETTING DTR index: %d, dtr: %d", index, dtr);
++	DBG1("SETTING DTR index: %d, dtr: %d", tty->index, dtr);
 +
-+	dc->port[devindex].ctrl_ul.DTR = dtr;
-+	dc->port[devindex].update_flow_control = 1;
-+	enable_transmit_ul(PORT_CTRL, dc);
++	port->ctrl_ul.DTR = dtr;
++	port->update_flow_control = 1;
++	enable_transmit_ul(PORT_CTRL, get_dc_by_tty(tty));
 +}
 +
 +/*
@@ -1856,7 +1671,7 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +	if (!port || !dc)
 +		return -ENODEV;
 +
-+	if (down_interruptible(&port->tty_sem))
++	if (mutex_lock_interruptible(&port->tty_sem))
 +		return -ERESTARTSYS;
 +
 +	port->tty_open_count++;
@@ -1867,9 +1682,6 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +		tty->low_latency = 1;
 +		tty->driver_data = port;
 +		port->tty = tty;
-+		port->tty_index = tty->index;
-+		port->rx_data = 0;
-+		port->tx_data = 0;
 +		DBG1("open: %d", port->token_dl);
 +		spin_lock_irqsave(&dc->spin_mutex, flags);
 +		dc->last_ier = dc->last_ier | port->token_dl;
@@ -1877,7 +1689,7 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +		spin_unlock_irqrestore(&dc->spin_mutex, flags);
 +	}
 +
-+	up(&port->tty_sem);
++	mutex_unlock(&port->tty_sem);
 +
 +	return 0;
 +}
@@ -1886,7 +1698,31 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +static void ntty_close(struct tty_struct *tty, struct file *file)
 +{
 +	struct nozomi *dc = get_dc_by_tty(tty);
-+	tty_do_close(dc, (struct port *)tty->driver_data);
++	struct port *port = tty->driver_data;
++	unsigned long flags;
++
++	if (!dc || !port)
++		return;
++
++	if (mutex_lock_interruptible(&port->tty_sem))
++		return;
++
++	if (!port->tty_open_count)
++		goto exit;
++
++	dc->open_ttys--;
++	port->tty_open_count--;
++
++	if (port->tty_open_count == 0) {
++		DBG1("close: %d", port->token_dl);
++		spin_lock_irqsave(&dc->spin_mutex, flags);
++		dc->last_ier &= ~(port->token_dl);
++		writew(dc->last_ier, dc->reg_ier);
++		spin_unlock_irqrestore(&dc->spin_mutex, flags);
++	}
++
++exit:
++	mutex_unlock(&port->tty_sem);
 +}
 +
 +/*
@@ -1898,7 +1734,7 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +{
 +	int rval = -EINVAL;
 +	struct nozomi *dc = get_dc_by_tty(tty);
-+	struct port *port = (struct port *)tty->driver_data;
++	struct port *port = tty->driver_data;
 +	unsigned long flags;
 +
 +	/* DBG1( "WRITEx: %d, index = %d", count, index); */
@@ -1906,14 +1742,14 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +	if (!dc || !port)
 +		return -ENODEV;
 +
-+	if (unlikely(down_trylock(&port->tty_sem))) {
++	if (unlikely(!mutex_trylock(&port->tty_sem))) {
 +		/*
 +		 * must test lock as tty layer wraps calls
 +		 * to this function with BKL
 +		 */
 +		dev_err(&dc->pdev->dev, "Would have deadlocked - "
-+			"return ERESTARTSYS\n");
-+		return -ERESTARTSYS;
++			"return EAGAIN\n");
++		return -EAGAIN;
 +	}
 +
 +	if (unlikely(!port->tty_open_count)) {
@@ -1934,19 +1770,18 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +	if (port == &(dc->port[PORT_MDM])) {
 +		if (port->ctrl_dl.CTS) {
 +			DBG4("Enable interrupt");
-+			enable_transmit_ul(port->tty_index % NTTY_TTY_MINORS,
-+									dc);
++			enable_transmit_ul(tty->index % MAX_PORT, dc);
 +		} else {
 +			dev_err(&dc->pdev->dev,
 +				"CTS not active on modem port?\n");
 +		}
 +	} else {
-+		enable_transmit_ul(port->tty_index % NTTY_TTY_MINORS, dc);
++		enable_transmit_ul(tty->index % MAX_PORT, dc);
 +	}
 +	spin_unlock_irqrestore(&dc->spin_mutex, flags);
 +
 +exit:
-+	up(&port->tty_sem);
++	mutex_unlock(&port->tty_sem);
 +	return rval;
 +}
 +
@@ -1958,13 +1793,13 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 + */
 +static int ntty_write_room(struct tty_struct *tty)
 +{
-+	struct port *port = (struct port *)tty->driver_data;
++	struct port *port = tty->driver_data;
 +	int room = 0;
 +	struct nozomi *dc = get_dc_by_tty(tty);
 +
 +	if (!dc || !port)
 +		return 0;
-+	if (down_trylock(&port->tty_sem))
++	if (!mutex_trylock(&port->tty_sem))
 +		return 0;
 +
 +	if (!port->tty_open_count)
@@ -1973,7 +1808,7 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +	room = port->fifo_ul->size - __kfifo_len(port->fifo_ul);
 +
 +exit:
-+	up(&port->tty_sem);
++	mutex_unlock(&port->tty_sem);
 +	return room;
 +}
 +
@@ -1984,149 +1819,85 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +	struct ctrl_dl *ctrl_dl = &port->ctrl_dl;
 +	struct ctrl_ul *ctrl_ul = &port->ctrl_ul;
 +
-+	return 0 | (ctrl_ul->RTS ? TIOCM_RTS : 0)
-+	    | (ctrl_ul->DTR ? TIOCM_DTR : 0)
-+	    | (ctrl_dl->DCD ? TIOCM_CAR : 0)
-+	    | (ctrl_dl->RI ? TIOCM_RNG : 0)
-+	    | (ctrl_dl->DSR ? TIOCM_DSR : 0)
-+	    | (ctrl_dl->CTS ? TIOCM_CTS : 0);
++	return	(ctrl_ul->RTS ? TIOCM_RTS : 0) |
++		(ctrl_ul->DTR ? TIOCM_DTR : 0) |
++		(ctrl_dl->DCD ? TIOCM_CAR : 0) |
++		(ctrl_dl->RI  ? TIOCM_RNG : 0) |
++		(ctrl_dl->DSR ? TIOCM_DSR : 0) |
++		(ctrl_dl->CTS ? TIOCM_CTS : 0);
 +}
 +
 +/* Sets io controls parameters */
 +static int ntty_tiocmset(struct tty_struct *tty, struct file *file,
 +	unsigned int set, unsigned int clear)
 +{
-+	struct port *port = (struct port *)tty->driver_data;
-+
 +	if (set & TIOCM_RTS)
-+		set_rts(port->tty_index, 1);
++		set_rts(tty, 1);
 +	else if (clear & TIOCM_RTS)
-+		set_rts(port->tty_index, 0);
++		set_rts(tty, 0);
 +
 +	if (set & TIOCM_DTR)
-+		set_dtr(port->tty_index, 1);
++		set_dtr(tty, 1);
 +	else if (clear & TIOCM_DTR)
-+		set_dtr(port->tty_index, 0);
++		set_dtr(tty, 0);
 +
 +	return 0;
 +}
 +
-+static int ntty_ioctl_tiocmiwait(struct tty_struct *tty, struct file *file,
-+				 unsigned int cmd, unsigned long arg)
++static int ntty_cflags_changed(struct port *port, unsigned long flags,
++		struct async_icount *cprev)
 +{
-+	struct port *port = (struct port *)tty->driver_data;
++	struct async_icount cnow = port->tty_icount;
++	int ret;
 +
-+	if (cmd == TIOCMIWAIT) {
-+		DECLARE_WAITQUEUE(wait, current);
-+		struct async_icount cnow;
-+		struct async_icount cprev;
++	ret =	((flags & TIOCM_RNG) && (cnow.rng != cprev->rng)) ||
++		((flags & TIOCM_DSR) && (cnow.dsr != cprev->dsr)) ||
++		((flags & TIOCM_CD)  && (cnow.dcd != cprev->dcd)) ||
++		((flags & TIOCM_CTS) && (cnow.cts != cprev->cts));
 +
-+		cprev = port->tty_icount;
-+		while (1) {
-+			add_wait_queue(&port->tty_wait, &wait);
-+			set_current_state(TASK_INTERRUPTIBLE);
-+			schedule();
-+			remove_wait_queue(&port->tty_wait, &wait);
++	*cprev = cnow;
 +
-+			/* see if a signal woke us up */
-+			if (signal_pending(current))
-+				return -ERESTARTSYS;
-+
-+			cnow = port->tty_icount;
-+			if (cnow.rng == cprev.rng && cnow.dsr == cprev.dsr &&
-+			    cnow.dcd == cprev.dcd && cnow.cts == cprev.cts)
-+				return -EIO;	/* no change => error */
-+			if (((arg & TIOCM_RNG) && (cnow.rng != cprev.rng)) ||
-+			    ((arg & TIOCM_DSR) && (cnow.dsr != cprev.dsr)) ||
-+			    ((arg & TIOCM_CD) && (cnow.dcd != cprev.dcd)) ||
-+			    ((arg & TIOCM_CTS) && (cnow.cts != cprev.cts)))
-+				return 0;
-+
-+			cprev = cnow;
-+		}
-+
-+	}
-+	return -ENOIOCTLCMD;
++	return ret;
 +}
 +
-+static int ntty_ioctl_tiocgicount(struct tty_struct *tty, struct file *file,
-+				  unsigned int cmd, void __user *arg)
++static int ntty_ioctl_tiocgicount(struct port *port, void __user *argp)
 +{
-+	struct port *port = (struct port *)tty->driver_data;
++	struct async_icount cnow = port->tty_icount;
++	struct serial_icounter_struct icount;
 +
-+	if (cmd == TIOCGICOUNT) {
-+		struct async_icount cnow = port->tty_icount;
-+		struct serial_icounter_struct icount;
++	icount.cts = cnow.cts;
++	icount.dsr = cnow.dsr;
++	icount.rng = cnow.rng;
++	icount.dcd = cnow.dcd;
++	icount.rx = cnow.rx;
++	icount.tx = cnow.tx;
++	icount.frame = cnow.frame;
++	icount.overrun = cnow.overrun;
++	icount.parity = cnow.parity;
++	icount.brk = cnow.brk;
++	icount.buf_overrun = cnow.buf_overrun;
 +
-+		icount.cts = cnow.cts;
-+		icount.dsr = cnow.dsr;
-+		icount.rng = cnow.rng;
-+		icount.dcd = cnow.dcd;
-+		icount.rx = cnow.rx;
-+		icount.tx = cnow.tx;
-+		icount.frame = cnow.frame;
-+		icount.overrun = cnow.overrun;
-+		icount.parity = cnow.parity;
-+		icount.brk = cnow.brk;
-+		icount.buf_overrun = cnow.buf_overrun;
-+
-+		if (copy_to_user(arg, &icount, sizeof(icount)))
-+			return -EFAULT;
-+		return 0;
-+	}
-+	return -ENOIOCTLCMD;
++	return copy_to_user(argp, &icount, sizeof(icount));
 +}
 +
 +static int ntty_ioctl(struct tty_struct *tty, struct file *file,
 +		      unsigned int cmd, unsigned long arg)
 +{
 +	struct port *port = tty->driver_data;
-+	struct nozomi *dc = get_dc_by_tty(tty);
-+	unsigned long flags;
-+	int mask;
++	void __user *argp = (void __user *)arg;
 +	int rval = -ENOIOCTLCMD;
 +
 +	DBG1("******** IOCTL, cmd: %d", cmd);
 +
 +	switch (cmd) {
-+	case TIOCMIWAIT:
-+		rval = ntty_ioctl_tiocmiwait(tty, file, cmd, arg);
-+		break;
-+	case TIOCGICOUNT:
-+		rval =
-+		    ntty_ioctl_tiocgicount(tty, file, cmd, (void __user *)arg);
-+		break;
-+	case TIOCMGET:
-+		spin_lock_irqsave(&dc->spin_mutex, flags);
-+		rval = ntty_tiocmget(tty, file);
-+		spin_unlock_irqrestore(&dc->spin_mutex, flags);
-+		break;
-+	case TIOCMSET:
-+		rval = ntty_tiocmset(tty, file, arg, ~arg);
-+		break;
-+	case TIOCMBIC:
-+		if (get_user(mask, (unsigned long __user *)arg))
-+			return -EFAULT;
++	case TIOCMIWAIT: {
++		struct async_icount cprev = port->tty_icount;
 +
-+		spin_lock_irqsave(&dc->spin_mutex, flags);
-+		if (mask & TIOCM_RTS)
-+			set_rts(port->tty_index, 0);
-+		if (mask & TIOCM_DTR)
-+			set_dtr(port->tty_index, 0);
-+		spin_unlock_irqrestore(&dc->spin_mutex, flags);
-+		rval = 0;
++		rval = wait_event_interruptible(port->tty_wait,
++				ntty_cflags_changed(port, arg, &cprev));
 +		break;
-+	case TIOCMBIS:
-+		if (get_user(mask, (unsigned long __user *)arg))
-+			return -EFAULT;
-+
-+		spin_lock_irqsave(&dc->spin_mutex, flags);
-+		if (mask & TIOCM_RTS)
-+			set_rts(port->tty_index, 1);
-+		if (mask & TIOCM_DTR)
-+			set_dtr(port->tty_index, 1);
-+		spin_unlock_irqrestore(&dc->spin_mutex, flags);
-+		rval = 0;
++	} case TIOCGICOUNT:
++		rval = ntty_ioctl_tiocgicount(port, argp);
 +		break;
 +	default:
 +		DBG1("ERR: 0x%08X, %d", cmd, cmd);
@@ -2142,14 +1913,13 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 + */
 +static void ntty_unthrottle(struct tty_struct *tty)
 +{
-+	struct port *port = (struct port *)tty->driver_data;
 +	struct nozomi *dc = get_dc_by_tty(tty);
 +	unsigned long flags;
 +
 +	DBG1("UNTHROTTLE");
 +	spin_lock_irqsave(&dc->spin_mutex, flags);
-+	enable_transmit_dl(port->tty_index % NTTY_TTY_MINORS, dc);
-+	set_rts(port->tty_index, 1);
++	enable_transmit_dl(tty->index % MAX_PORT, dc);
++	set_rts(tty, 1);
 +
 +	spin_unlock_irqrestore(&dc->spin_mutex, flags);
 +}
@@ -2160,13 +1930,12 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 + */
 +static void ntty_throttle(struct tty_struct *tty)
 +{
-+	struct port *port = (struct port *)tty->driver_data;
 +	struct nozomi *dc = get_dc_by_tty(tty);
 +	unsigned long flags;
 +
 +	DBG1("THROTTLE");
 +	spin_lock_irqsave(&dc->spin_mutex, flags);
-+	set_rts(port->tty_index, 0);
++	set_rts(tty, 0);
 +	spin_unlock_irqrestore(&dc->spin_mutex, flags);
 +}
 +
@@ -2180,7 +1949,7 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +/* Returns number of chars in buffer, called by tty layer */
 +static s32 ntty_chars_in_buffer(struct tty_struct *tty)
 +{
-+	struct port *port = (struct port *)tty->driver_data;
++	struct port *port = tty->driver_data;
 +	struct nozomi *dc = get_dc_by_tty(tty);
 +	s32 rval;
 +
@@ -2211,43 +1980,9 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +	.throttle = ntty_throttle,
 +	.chars_in_buffer = ntty_chars_in_buffer,
 +	.put_char = ntty_put_char,
++	.tiocmget = ntty_tiocmget,
 +	.tiocmset = ntty_tiocmset,
 +};
-+
-+/* Initializes the tty */
-+static int ntty_tty_init(struct nozomi *dc)
-+{
-+	struct tty_driver *td;
-+	int rval;
-+
-+	dc->tty_driver = alloc_tty_driver(NTTY_TTY_MAXMINORS);
-+	if (!dc->tty_driver)
-+		return -ENOMEM;
-+	td = dc->tty_driver;
-+	td->owner = THIS_MODULE;
-+	td->driver_name = NOZOMI_NAME_TTY;
-+	td->name = "noz";
-+	td->major = NTTY_TTY_MAJOR;
-+	td->type = TTY_DRIVER_TYPE_SERIAL;
-+	td->subtype = SERIAL_TYPE_NORMAL;
-+	td->flags = TTY_DRIVER_REAL_RAW | TTY_DRIVER_DYNAMIC_DEV;
-+	td->init_termios = tty_std_termios;
-+	td->init_termios.c_cflag = B115200 | CS8 | CREAD | HUPCL | CLOCAL;
-+	td->init_termios.c_ispeed = 115200;
-+	td->init_termios.c_ospeed = 115200;
-+	td->termios = dc->tty_termios;
-+	td->termios_locked = dc->tty_termios_locked;
-+	tty_set_operations(dc->tty_driver, &tty_ops);
-+
-+	rval = tty_register_driver(td);
-+	if (rval) {
-+		dev_err(&dc->pdev->dev, "failed to register ntty tty driver\n");
-+		return rval;
-+	}
-+
-+	dev_info(&dc->pdev->dev, DRIVER_DESC " " NOZOMI_NAME_TTY "\n");
-+	return rval;
-+}
 +
 +/* Module initialization */
 +static struct pci_driver nozomi_driver = {
@@ -2259,14 +1994,54 @@ Signed-off-by: Frank Seidel <fseidel@suse.de>
 +
 +static __init int nozomi_init(void)
 +{
++	int ret;
++
 +	printk(KERN_INFO "Initializing %s\n", VERSION_STRING);
-+	return pci_register_driver(&nozomi_driver);
++
++	ntty_driver = alloc_tty_driver(NTTY_TTY_MAXMINORS);
++	if (!ntty_driver)
++		return -ENOMEM;
++
++	ntty_driver->owner = THIS_MODULE;
++	ntty_driver->driver_name = NOZOMI_NAME_TTY;
++	ntty_driver->name = "noz";
++	ntty_driver->major = 0;
++	ntty_driver->type = TTY_DRIVER_TYPE_SERIAL;
++	ntty_driver->subtype = SERIAL_TYPE_NORMAL;
++	ntty_driver->flags = TTY_DRIVER_REAL_RAW | TTY_DRIVER_DYNAMIC_DEV;
++	ntty_driver->init_termios = tty_std_termios;
++	ntty_driver->init_termios.c_cflag = B115200 | CS8 | CREAD | \
++						HUPCL | CLOCAL;
++	ntty_driver->init_termios.c_ispeed = 115200;
++	ntty_driver->init_termios.c_ospeed = 115200;
++	tty_set_operations(ntty_driver, &tty_ops);
++
++	ret = tty_register_driver(ntty_driver);
++	if (ret) {
++		printk(KERN_ERR "Nozomi: failed to register ntty driver\n");
++		goto free_tty;
++	}
++
++	ret = pci_register_driver(&nozomi_driver);
++	if (ret) {
++		printk(KERN_ERR "Nozomi: can't register pci driver\n");
++		goto unr_tty;
++	}
++
++	return 0;
++unr_tty:
++	tty_unregister_driver(ntty_driver);
++free_tty:
++	put_tty_driver(ntty_driver);
++	return ret;
 +}
 +
 +static __exit void nozomi_exit(void)
 +{
 +	printk(KERN_INFO "Unloading %s\n", DRIVER_DESC);
 +	pci_unregister_driver(&nozomi_driver);
++	tty_unregister_driver(ntty_driver);
++	put_tty_driver(ntty_driver);
 +}
 +
 +module_init(nozomi_init);
