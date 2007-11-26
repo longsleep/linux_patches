@@ -1,0 +1,196 @@
+From akpm@linux-foundation.org  Mon Nov 26 15:07:12 2007
+From: Linas Vepstas <linas@austin.ibm.com>
+Date: Sun, 25 Nov 2007 23:51:37 -0800
+Subject: pci hotplug: fix rpaphp directory naming
+To: mm-commits@vger.kernel.org
+Cc: linas@austin.ibm.com, greg@kroah.com, kristen.c.accardi@intel.com, strosake@us.ibm.com
+Message-ID: <200711260751.lAQ7pbis023028@imap1.linux-foundation.org>
+
+From: Linas Vepstas <linas@austin.ibm.com>
+
+Fix presentation of the slot number in the /sys/bus/pci/slots
+directory to match that used in the majority of other drivers.
+
+> Greg said:
+> How is anyone supposed to write sane managability tools in the
+> presence
+> of such anarchy?
+>
+> > ~ # cat /sys/bus/pci/slots/0000:00:02.2/phy_location
+> > U787A.001.DNZ00Z5-P1-C2
+>
+> Right.  This should look like:
+>
+> # cat /sys/bus/pci/slots/U787A.001.DNZ00Z5-P1-C2/address
+> 0000:00:02
+
+This patch implements exactly what you describe. Boot tested.
+I assume you really mean it -- if so, then please review and
+ack the patch !?
+
+I have absolutely no clue if this breaks any existing IBM tools.
+I'm pretty sure it doesn't ... but attention Mike Strosaker! does it?
+
+Signed-off-by: Linas Vepstas <linas@austin.ibm.com>
+Cc: Kristen Carlson Accardi <kristen.c.accardi@intel.com>
+Cc: <strosake@us.ibm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/pci/hotplug/rpaphp.h      |    1 
+ drivers/pci/hotplug/rpaphp_pci.c  |   14 -----------
+ drivers/pci/hotplug/rpaphp_slot.c |   47 +++++++++++++++++++-------------------
+ 3 files changed, 24 insertions(+), 38 deletions(-)
+
+--- a/drivers/pci/hotplug/rpaphp.h
++++ b/drivers/pci/hotplug/rpaphp.h
+@@ -74,7 +74,6 @@ struct slot {
+ 	u32 type;
+ 	u32 power_domain;
+ 	char *name;
+-	char *location;
+ 	struct device_node *dn;
+ 	struct pci_bus *bus;
+ 	struct list_head *pci_devs;
+--- a/drivers/pci/hotplug/rpaphp_pci.c
++++ b/drivers/pci/hotplug/rpaphp_pci.c
+@@ -64,19 +64,6 @@ int rpaphp_get_sensor_state(struct slot 
+ 	return rc;
+ }
+ 
+-static void set_slot_name(struct slot *slot)
+-{
+-	struct pci_bus *bus = slot->bus;
+-	struct pci_dev *bridge;
+-
+-	bridge = bus->self;
+-	if (bridge)
+-		strcpy(slot->name, pci_name(bridge));
+-	else
+-		sprintf(slot->name, "%04x:%02x:00.0", pci_domain_nr(bus),
+-			bus->number);
+-}
+-
+ /**
+  * rpaphp_enable_slot - record slot state, config pci device
+  *
+@@ -114,7 +101,6 @@ int rpaphp_enable_slot(struct slot *slot
+ 	info->adapter_status = EMPTY;
+ 	slot->bus = bus;
+ 	slot->pci_devs = &bus->devices;
+-	set_slot_name(slot);
+ 
+ 	/* if there's an adapter in the slot, go add the pci devices */
+ 	if (state == PRESENT) {
+--- a/drivers/pci/hotplug/rpaphp_slot.c
++++ b/drivers/pci/hotplug/rpaphp_slot.c
+@@ -33,23 +33,31 @@
+ #include <asm/rtas.h>
+ #include "rpaphp.h"
+ 
+-static ssize_t location_read_file (struct hotplug_slot *php_slot, char *buf)
++static ssize_t address_read_file (struct hotplug_slot *php_slot, char *buf)
+ {
+-	char *value;
+-	int retval = -ENOENT;
++	int retval;
+ 	struct slot *slot = (struct slot *)php_slot->private;
++	struct pci_bus *bus;
+ 
+ 	if (!slot)
+-		return retval;
++		return -ENOENT;
++
++	bus = slot->bus;
++	if (!bus)
++		return -ENOENT;
++
++	if (bus->self)
++		retval = sprintf(buf, pci_name(bus->self));
++	else
++		retval = sprintf(buf, "%04x:%02x:00.0",
++		        pci_domain_nr(bus), bus->number);
+ 
+-	value = slot->location;
+-	retval = sprintf (buf, "%s\n", value);
+ 	return retval;
+ }
+ 
+-static struct hotplug_slot_attribute php_attr_location = {
+-	.attr = {.name = "phy_location", .mode = S_IFREG | S_IRUGO},
+-	.show = location_read_file,
++static struct hotplug_slot_attribute php_attr_address = {
++	.attr = {.name = "address", .mode = S_IFREG | S_IRUGO},
++	.show = address_read_file,
+ };
+ 
+ /* free up the memory used by a slot */
+@@ -64,7 +72,6 @@ void dealloc_slot_struct(struct slot *sl
+ 	kfree(slot->hotplug_slot->info);
+ 	kfree(slot->hotplug_slot->name);
+ 	kfree(slot->hotplug_slot);
+-	kfree(slot->location);
+ 	kfree(slot);
+ }
+ 
+@@ -83,16 +90,13 @@ struct slot *alloc_slot_struct(struct de
+ 					   GFP_KERNEL);
+ 	if (!slot->hotplug_slot->info)
+ 		goto error_hpslot;
+-	slot->hotplug_slot->name = kmalloc(BUS_ID_SIZE + 1, GFP_KERNEL);
++	slot->hotplug_slot->name = kmalloc(strlen(drc_name) + 1, GFP_KERNEL);
+ 	if (!slot->hotplug_slot->name)
+ 		goto error_info;	
+-	slot->location = kmalloc(strlen(drc_name) + 1, GFP_KERNEL);
+-	if (!slot->location)
+-		goto error_name;
+ 	slot->name = slot->hotplug_slot->name;
++	strcpy(slot->name, drc_name);
+ 	slot->dn = dn;
+ 	slot->index = drc_index;
+-	strcpy(slot->location, drc_name);
+ 	slot->power_domain = power_domain;
+ 	slot->hotplug_slot->private = slot;
+ 	slot->hotplug_slot->ops = &rpaphp_hotplug_slot_ops;
+@@ -100,8 +104,6 @@ struct slot *alloc_slot_struct(struct de
+ 	
+ 	return (slot);
+ 
+-error_name:
+-	kfree(slot->hotplug_slot->name);
+ error_info:
+ 	kfree(slot->hotplug_slot->info);
+ error_hpslot:
+@@ -133,8 +135,8 @@ int rpaphp_deregister_slot(struct slot *
+ 
+ 	list_del(&slot->rpaphp_slot_list);
+ 	
+-	/* remove "phy_location" file */
+-	sysfs_remove_file(&php_slot->kobj, &php_attr_location.attr);
++	/* remove "address" file */
++	sysfs_remove_file(&php_slot->kobj, &php_attr_address.attr);
+ 
+ 	retval = pci_hp_deregister(php_slot);
+ 	if (retval)
+@@ -166,8 +168,8 @@ int rpaphp_register_slot(struct slot *sl
+ 		return retval;
+ 	}
+ 
+-	/* create "phy_location" file */
+-	retval = sysfs_create_file(&php_slot->kobj, &php_attr_location.attr);
++	/* create "address" file */
++	retval = sysfs_create_file(&php_slot->kobj, &php_attr_address.attr);
+ 	if (retval) {
+ 		err("sysfs_create_file failed with error %d\n", retval);
+ 		goto sysfs_fail;
+@@ -175,8 +177,7 @@ int rpaphp_register_slot(struct slot *sl
+ 
+ 	/* add slot to our internal list */
+ 	list_add(&slot->rpaphp_slot_list, &rpaphp_slot_head);
+-	info("Slot [%s](PCI location=%s) registered\n", slot->name,
+-			slot->location);
++	info("Slot [%s] registered\n", slot->name);
+ 	return 0;
+ 
+ sysfs_fail:
