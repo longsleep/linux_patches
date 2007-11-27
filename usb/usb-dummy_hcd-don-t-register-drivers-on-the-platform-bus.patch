@@ -1,0 +1,85 @@
+From stern@rowland.harvard.edu  Mon Nov 26 23:03:12 2007
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Tue, 20 Nov 2007 16:28:55 -0500 (EST)
+Subject: USB: dummy_hcd: don't register drivers on the platform bus
+To: Greg KH <greg@kroah.com>, David Brownell <david-b@pacbell.net>
+Cc: USB development list <linux-usb-devel@lists.sourceforge.net>
+Message-ID: <Pine.LNX.4.44L0.0711201627080.2789-100000@iolanthe.rowland.org>
+
+
+This patch (as1017) makes dummy_hcd behave more like the other USB
+peripheral controller drivers by no longer registering its
+gadget driver on the platform bus.  Doing that has always been a
+mistake, since a usb_gadget_driver isn't a platform_driver.  Instead
+the gadget driver is left unregistered in sysfs.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+CC: David Brownell <david-b@pacbell.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/gadget/dummy_hcd.c |   33 ++++++++-------------------------
+ 1 file changed, 8 insertions(+), 25 deletions(-)
+
+--- a/drivers/usb/gadget/dummy_hcd.c
++++ b/drivers/usb/gadget/dummy_hcd.c
+@@ -772,18 +772,17 @@ usb_gadget_register_driver (struct usb_g
+ 	list_del_init (&dum->ep [0].ep.ep_list);
+ 	INIT_LIST_HEAD(&dum->fifo_req.queue);
+ 
++	driver->driver.bus = NULL;
+ 	dum->driver = driver;
+ 	dum->gadget.dev.driver = &driver->driver;
+ 	dev_dbg (udc_dev(dum), "binding gadget driver '%s'\n",
+ 			driver->driver.name);
+-	if ((retval = driver->bind (&dum->gadget)) != 0)
+-		goto err_bind_gadget;
+-
+-	driver->driver.bus = dum->gadget.dev.parent->bus;
+-	if ((retval = driver_register (&driver->driver)) != 0)
+-		goto err_register;
+-	if ((retval = device_bind_driver (&dum->gadget.dev)) != 0)
+-		goto err_bind_driver;
++	retval = driver->bind(&dum->gadget);
++	if (retval) {
++		dum->driver = NULL;
++		dum->gadget.dev.driver = NULL;
++		return retval;
++	}
+ 
+ 	/* khubd will enumerate this in a while */
+ 	spin_lock_irq (&dum->lock);
+@@ -793,20 +792,6 @@ usb_gadget_register_driver (struct usb_g
+ 
+ 	usb_hcd_poll_rh_status (dummy_to_hcd (dum));
+ 	return 0;
+-
+-err_bind_driver:
+-	driver_unregister (&driver->driver);
+-err_register:
+-	if (driver->unbind)
+-		driver->unbind (&dum->gadget);
+-	spin_lock_irq (&dum->lock);
+-	dum->pullup = 0;
+-	set_link_state (dum);
+-	spin_unlock_irq (&dum->lock);
+-err_bind_gadget:
+-	dum->driver = NULL;
+-	dum->gadget.dev.driver = NULL;
+-	return retval;
+ }
+ EXPORT_SYMBOL (usb_gadget_register_driver);
+ 
+@@ -830,11 +815,9 @@ usb_gadget_unregister_driver (struct usb
+ 	spin_unlock_irqrestore (&dum->lock, flags);
+ 
+ 	driver->unbind (&dum->gadget);
++	dum->gadget.dev.driver = NULL;
+ 	dum->driver = NULL;
+ 
+-	device_release_driver (&dum->gadget.dev);
+-	driver_unregister (&driver->driver);
+-
+ 	spin_lock_irqsave (&dum->lock, flags);
+ 	dum->pullup = 0;
+ 	set_link_state (dum);
