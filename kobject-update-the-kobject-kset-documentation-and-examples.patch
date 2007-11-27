@@ -1,0 +1,676 @@
+From foo@baz Tue Apr  9 12:12:43 2002
+Date: Tue, 27 Nov 2007 11:28:26 -0800
+To: Greg KH <greg@kroah.com>
+From: Greg Kroah-Hartman <gregkh@suse.de>
+Subject: kobject: update the kobject/kset documentation and examples
+
+This provides a much-needed kobject and kset documentation update.
+
+It also provides two example modules for people to use in the future to
+cut-and-paste code from, kobject-example.c and kset-example.c
+
+Cc: Kay Sievers <kay.sievers@vrfy.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ Documentation/foo.txt             |  352 ++++++++++++++++++++++++++++++++++++++
+ samples/Kconfig                   |   10 +
+ samples/Makefile                  |    2 
+ samples/kobject/Makefile          |    1 
+ samples/kobject/kobject-example.c |  132 ++++++++++++++
+ samples/kobject/kset-example.c    |  132 ++++++++++++++
+ 6 files changed, 628 insertions(+), 1 deletion(-)
+
+--- /dev/null
++++ b/Documentation/foo.txt
+@@ -0,0 +1,352 @@
++Everything you never wanted to know about kobjects, ksets, and ktypes
++
++Greg Kroah-Hartman <gregkh@suse.de>
++
++Based on an original article by Jon Corbet for lwn.net written October 1,
++2003 and located at http://lwn.net/Articles/51437/
++
++Last updated November 27, 2008
++
++
++Part of the difficulty in understanding the driver model - and the kobject
++abstraction upon which it is built - is that there is no obvious starting
++place. Dealing with kobjects requires understanding a few different types,
++all of which make reference to each other. In an attempt to make things
++easier, we'll take a multi-pass approach, starting with vague terms and
++adding detail as we go. To that end, here are some quick definitions of
++some terms we will be working with.
++
++ * A kobject is an object of type struct kobject.  Kobjects have a name
++   and a reference count.  A kobject also has a parent pointer (allowing
++   objects to be arranged into hierarchies), a specific type, and,
++   usually, a representation in the sysfs virtual filesystem.
++
++   Kobjects are generally not interesting on their own; instead, they are
++   usually embedded within some other structure which contains the stuff
++   the code is really interested in.
++
++ * A ktype is a type associated with a kobject. The ktype controls what
++   happens when a kobject is no longer referenced and the kobject's default
++   representation in sysfs.
++
++ - A kset is a group of kobjects.  These kobjects can be of the same ktype
++   or belong to different ktypes.  The kset is the basic container type for
++   collections of kobjects. Ksets contain their own kobjects, but you can
++   safely ignore that implementation detail as the kset core code handles
++   this kobject automatically.
++
++   When you see a sysfs directory full of entries, generally each of those
++   entries corresponds to a kobject in the same kset.
++
++We'll look at how to create and manipulate all of these types. A bottom-up
++approach will be taken, so we'll go back to kobjects.
++
++
++Embedding kobjects
++
++It is rare (even unknown) for kernel code to create a standalone kobject;
++with one major exception explained below.  Instead, kobjects are used to
++control access to a larger, domain-specific object.  To this end, kobjects
++will be found embedded in other structures.  If you are used to thinking of
++things in object-oriented terms, kobjects can be seen as a top-level,
++abstract class from which other classes are derived.  A kobject implements
++a set of capabilities which are not particularly useful by themselves, but
++which are nice to have in other objects.  The C language does not allow for
++the direct expression of inheritance, so other techniques - such as
++structure embedding - must be used.
++
++So, for example, UIO code has a structure that defines the memory region
++associated with a uio device:
++
++struct uio_mem {
++	struct kobject kobj;
++	unsigned long addr;
++	unsigned long size;
++	int memtype;
++	void __iomem *internal_addr;
++};
++
++If you have a struct uio_mem structure, finding its embedded kobject is just a
++matter of using the kobj pointer.  Code that works with kobjects will often
++have the opposite problem, however: given a struct kobject pointer, what is
++the pointer to the containing structure?  You must avoid tricks (such as
++assuming that the kobject is at the beginning of the structure) and,
++instead, use the container_of() macro, found in <linux/kernel.h>:
++
++	container_of(pointer, type, member)
++
++where pointer is the pointer to the embedded kobject, type is the type of
++the containing structure, and member is the name of the structure field to
++which pointer points.  The return value from container_of() is a pointer to
++the given type. So, for example, a pointer to a struct kobject embedded
++within a struct cdev called "kp" could be converted to a pointer to the
++containing structure with:
++
++    struct uio_mem *u_mem = container_of(kp, struct uio_mem, kobj);
++
++Programmers will often define a simple macro for "back-casting" kobject
++pointers to the containing type.
++
++
++Initialization of kobjects
++
++Code which creates a kobject must, of course, initialize that object. Some
++of the internal fields are setup with a (mandatory) call to kobject_init():
++
++    void kobject_init(struct kobject *kobj);
++
++Among other things, kobject_init() sets the kobject's reference count to
++one.  Calling kobject_init() is not sufficient, however. Kobject users
++must, at a minimum, set the name of the kobject; this is the name that will
++be used in sysfs entries.  To set the name of a kobject properly, do not
++attempt to manipulate the internal name field, but instead use:
++
++    int kobject_set_name(struct kobject *kobj, const char *format, ...);
++
++This function takes a printk-style variable argument list. Believe it or
++not, it is actually possible for this operation to fail; conscientious code
++should check the return value and react accordingly.
++
++The other kobject fields which should be set, directly or indirectly, by
++the creator are its ktype, kset, and parent. We will get to those shortly,
++however please note that the ktype and kset must be set before the
++kobject_init() function is called.
++
++
++
++Reference counts
++
++One of the key functions of a kobject is to serve as a reference counter
++for the object in which it is embedded. As long as references to the object
++exist, the object (and the code which supports it) must continue to exist.
++The low-level functions for manipulating a kobject's reference counts are:
++
++    struct kobject *kobject_get(struct kobject *kobj);
++    void kobject_put(struct kobject *kobj);
++
++A successful call to kobject_get() will increment the kobject's reference
++counter and return the pointer to the kobject. If, however, the kobject is
++already in the process of being destroyed, the operation will fail and
++kobject_get() will return NULL. This return value must always be tested, or
++no end of unpleasant race conditions could result.
++
++When a reference is released, the call to kobject_put() will decrement the
++reference count and, possibly, free the object. Note that kobject_init()
++sets the reference count to one, so the code which sets up the kobject will
++need to do a kobject_put() eventually to release that reference.
++
++Because kobjects are dynamic, they must not be declared statically or on
++the stack, but instead, always from the heap.  Future versions of the
++kernel will contain a run-time check for kobjects that are created
++statically and will warn the developer of this improper usage.
++
++
++Hooking into sysfs
++
++An initialized kobject will perform reference counting without trouble, but
++it will not appear in sysfs. To create sysfs entries, kernel code must pass
++the object to kobject_add():
++
++    int kobject_add(struct kobject *kobj);
++
++As always, this operation can fail. The function:
++
++    void kobject_del(struct kobject *kobj);
++
++will remove the kobject from sysfs.
++
++There is a kobject_register() function, which is really just the
++combination of the calls to kobject_init() and kobject_add(). Similarly,
++kobject_unregister() will call kobject_del(), then call kobject_put() to
++release the initial reference created with kobject_register() (or really
++kobject_init()).
++
++
++Creating "simple" kobjects
++
++Sometimes all that a developer wants is a way to create a simple directory
++in the sysfs heirachy, and not have to mess with the whole complication of
++ksets, show and store functions, and other details.  To create such an
++entry, use the function:
++
++    struct kobject *kobject_create_and_register(char *name, struct kobject *parent);
++
++This function will create a kobject and place it in sysfs in the location
++underneath the specified parent kobject.  To create simple attributes
++associated with this kobject, use:
++
++    int sysfs_create_file(struct kobject *kobj, struct attribute *attr);
++or
++    int sysfs_create_group(struct kobject *kobj, struct attribute_group *grp);
++
++Both types of attributes used here, with a kobject that has been created
++with the kobject_create_and_register() can be of type kobj_attribute, no
++special custom attribute is needed to be created.
++
++See the example module, samples/kobject/kobject-example.c for an
++implementation of a simple kobject and attributes.
++
++
++
++ktypes and release methods
++
++One important thing still missing from the discussion is what happens to a
++kobject when its reference count reaches zero. The code which created the
++kobject generally does not know when that will happen; if it did, there
++would be little point in using a kobject in the first place. Even
++predicatable object lifecycles become more complicated when sysfs is
++brought in; user-space programs can keep a reference to a kobject (by
++keeping one of its associated sysfs files open) for an arbitrary period of
++time.
++
++The end result is that a structure protected by a kobject cannot be freed
++before its reference count goes to zero. The reference count is not under
++the direct control of the code which created the kobject. So that code must
++be notified asynchronously whenever the last reference to one of its
++kobjects goes away.
++
++This notification is done through a kobject's release() method. Usually
++such a method has a form like:
++
++    void my_object_release(struct kobject *kobj)
++    {
++    	    struct my_object *mine = container_of(kobj, struct my_object, kobj);
++
++	    /* Perform any additional cleanup on this object, then... */
++	    kfree (mine);
++    }
++
++One important point cannot be overstated: every kobject must have a
++release() method, and the kobject must persist (in a consistent state)
++until that method is called. If these constraints are not met, the code is
++flawed.  Note that the kernel will warn you if you forget to provide a
++release() method.  Do not try to get rid of this warning by providing an
++"empty" release function, you will be mocked merciously by the kobject
++maintainer if you attempt this.
++
++Interestingly, the release() method is not stored in the kobject itself;
++instead, it is associated with the ktype. So let us introduce struct
++kobj_type:
++
++    struct kobj_type {
++	    void (*release)(struct kobject *);
++	    struct sysfs_ops	*sysfs_ops;
++	    struct attribute	**default_attrs;
++    };
++
++This structure is used to describe a particular type of kobject (or, more
++correctly, of containing object). Every kobject needs to have an associated
++kobj_type structure; a pointer to that structure can be placed in the
++kobject's ktype field at initialization time, or (more likely) it can be
++defined by the kobject's containing kset.
++
++The release field in struct kobj_type is, of course, a pointer to the
++release() method for this type of kobject. The other two fields (sysfs_ops
++and default_attrs) control how objects of this type are represented in
++sysfs; they are beyond the scope of this document.
++
++
++ksets
++
++A kset is merely a collection of kobjects that want to be associated with
++each other.  There is no restriction that they be of the same ktype, but be
++very careful if they are not.
++
++A kset serves these functions:
++
++ - It serves as a bag containing a group of objects. A kset can be used by
++   the kernel to track "all block devices" or "all PCI device drivers."
++
++ - A kset is also a subdirectory in sysfs, where the associated kobjects
++   with the kset will show up.  Every kset contains a kobject which can be
++   set up to be the parent of other kobjects; in this way the device model
++   hierarchy is constructed.
++
++ - Ksets can support the "hotplugging" of kobjects and influence how
++   uevent events are reported to user space.
++
++ - A kset can provide a set of default attributes that all kobjects that
++   belong to it automatically inherit and have created whenever a kobject
++   is registered belonging to the kset.
++
++In object-oriented terms, "kset" is the top-level container class; ksets
++contain their own kobject, but that kobject is managed by the kset code and
++should not be manipulated by any other user.
++
++A kset keeps its children in a standard kernel linked list.  Kobjects point
++back to their containing kset via their kset field. In almost all cases,
++the contained kobjects also have a pointer to the kset (or, strictly, its
++embedded kobject) in their parent field.
++
++As a kset contains a kobject within it, it should always be dynamically
++created and never declared statically or on the stack.  To create a new
++kset use:
++  struct kset *kset_create_and_register(char *name,
++					struct kset_uevent_ops *u,
++					struct kobject *parent);
++
++When you are finished with the kset, call:
++  void kset_unregister(struct kset *kset);
++to destroy it.
++
++An example of using a kset can be seen in the
++samples/kobject/kset-example.c file in the kernel tree.
++
++If a kset wishes to control the uevent operations of the kobjects
++associated with it, it can use the struct kset_uevent_ops to handle it:
++
++struct kset_uevent_ops {
++        int (*filter)(struct kset *kset, struct kobject *kobj);
++        const char *(*name)(struct kset *kset, struct kobject *kobj);
++        int (*uevent)(struct kset *kset, struct kobject *kobj,
++                      struct kobj_uevent_env *env);
++};
++
++
++The filter function allows a kset to prevent a uevent from being emitted to
++userspace for a specific kobject.  If the function returns 0, the uevent
++will not be emitted.
++
++The name function will be called to override the default name of the kset
++that the uevent sends to userspace.  By default, the name will be the same
++as the kset itself, but this function, if present, can override that name.
++
++The uevent function will be called when the uevent is about to be sent to
++userspace to allow more environment variables to be added to the uevent.
++
++One might ask how, exactly, a kobject is added to a kset, given that no
++functions which perform that function have been presented. The answer is
++that this task is handled by kobject_add(). When a kobject is passed to
++kobject_add(), its kset member should point to the kset to which the
++kobject will belong. kobject_add() will handle the rest. There is currently
++no other way to add a kobject to a kset without directly messing with the
++list pointers.
++
++
++Kobject initialization again
++
++Now that we have covered all of that stuff, we can talk in detail about how
++a kobject should be prepared for its existence in the kernel. Here are all
++of the struct kobject fields which must be initialized somehow:
++
++ - k_name - the name of the object. This fields should always be
++   initialized with kobject_set_name(), or specified in the original call
++   to kobject_create_and_register().
++
++ - refcount is the kobject's reference count; it is initialized by kobject_init()
++
++ - parent is the kobject's parent in whatever hierarchy it belongs to. It
++   can be set explicitly by the creator. If parent is NULL when
++   kobject_add() is called, it will be set to the kobject of the containing
++   kset.
++
++ - kset is a pointer to the kset which will contain this kobject; it should
++   be set prior to calling kobject_init().
++
++ - ktype is the type of the kobject; it should be set prior to calling
++   kobject_init().
++
++Often, much of the initialization of a kobject is handled by the layer that
++manages the containing kset.  See the sample/kobject/kset-example.c for how
++this is usually handled.
++
+--- a/samples/Kconfig
++++ b/samples/Kconfig
+@@ -13,4 +13,14 @@ config SAMPLE_MARKERS
+ 	help
+ 	  This build markers example modules.
+ 
++config SAMPLE_KOBJECT
++	tristate "Build kobject examples"
++	help
++	  This config option will allow you to build a number of
++	  different kobject sample modules showing how to use kobjects,
++	  ksets, and ktypes properly.
++
++	  If in doubt, say "N" here.
++
+ endif # SAMPLES
++
+--- a/samples/Makefile
++++ b/samples/Makefile
+@@ -1,3 +1,3 @@
+ # Makefile for Linux samples code
+ 
+-obj-$(CONFIG_SAMPLES)	+= markers/
++obj-$(CONFIG_SAMPLES)	+= markers/ kobject/
+--- /dev/null
++++ b/samples/kobject/Makefile
+@@ -0,0 +1 @@
++obj-$(CONFIG_SAMPLE_KOBJECT) += kobject-example.o kset-example.o
+--- /dev/null
++++ b/samples/kobject/kobject-example.c
+@@ -0,0 +1,132 @@
++/*
++ * Sample kobject implementation
++ *
++ * Copyright (C) 2004-2007 Greg Kroah-Hartman <greg@kroah.com>
++ * Copyright (C) 2007 Novell Inc.
++ *
++ * Released under the GPL version 2 only.
++ *
++ */
++#include <linux/kobject.h>
++#include <linux/string.h>
++#include <linux/sysfs.h>
++#include <linux/module.h>
++#include <linux/init.h>
++
++/*
++ * This module shows how to create a simple subdirectory in sysfs called
++ * /sys/kernel/kobject-example  In that directory, 3 files are created:
++ * "foo", "baz", and "bar".  If an integer is written to these files, it can be
++ * later read out of it.
++ */
++
++static int foo;
++static int baz;
++static int bar;
++
++/*
++ * The "foo" file where a static variable is read from and written to.
++ */
++static ssize_t foo_show(struct kobject *kobj, struct kobj_attribute *attr,
++			char *buf)
++{
++	return sprintf(buf, "%d\n", foo);
++}
++
++static ssize_t foo_store(struct kobject *kobj, struct kobj_attribute *attr,
++			 const char *buf, size_t count)
++{
++	sscanf(buf, "%du", &foo);
++	return count;
++}
++
++static struct kobj_attribute foo_attribute =
++	__ATTR(foo, 0666, foo_show, foo_store);
++
++/*
++ * More complex function where we determine which varible is being accessed by
++ * looking at the attribute for the "baz" and "bar" files.
++ */
++static ssize_t b_show(struct kobject *kobj, struct kobj_attribute *attr,
++		      char *buf)
++{
++	int var;
++
++	if (strcmp(attr->attr.name, "baz") == 0)
++		var = baz;
++	else
++		var = bar;
++	return sprintf(buf, "%d\n", var);
++}
++
++static ssize_t b_store(struct kobject *kobj, struct kobj_attribute *attr,
++		       const char *buf, size_t count)
++{
++	int var;
++
++	sscanf(buf, "%du", &var);
++	if (strcmp(attr->attr.name, "baz") == 0)
++		baz = var;
++	else
++		bar = var;
++	return count;
++}
++
++static struct kobj_attribute baz_attribute =
++	__ATTR(baz, 0666, b_show, b_store);
++static struct kobj_attribute bar_attribute =
++	__ATTR(bar, 0666, b_show, b_store);
++
++
++/*
++ * Create a group of attributes so that we can create and destory them all
++ * at once.
++ */
++static struct attribute *attrs[] = {
++	&foo_attribute.attr,
++	&baz_attribute.attr,
++	&bar_attribute.attr,
++	NULL,	/* need to NULL terminate the list of attributes */
++};
++
++/*
++ * An unnamed attribute group will put all of the attributes directly in
++ * the kobject directory.  If we specify a name, a subdirectory will be
++ * created for the attributes with the directory being the name of the
++ * attribute group.
++ */
++static struct attribute_group attr_group = {
++	.attrs = attrs,
++};
++
++static struct kobject *example_kobj;
++
++static int example_init(void)
++{
++	int retval;
++
++	/*
++	 * Create a simple kobject with the name of "kobject_example",
++	 * located under /sys/kernel/
++	 */
++	example_kobj = kobject_create_and_register("kobject_example",
++						   kernel_kobj);
++	if (!example_kobj)
++		return -ENOMEM;
++
++	retval = sysfs_create_group(example_kobj, &attr_group);
++	if (retval)
++		kobject_unregister(example_kobj);
++
++	return retval;
++}
++
++static void example_exit(void)
++{
++	kobject_unregister(example_kobj);
++}
++
++module_init(example_init);
++module_exit(example_exit);
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Greg Kroah-Hartman <greg@kroah.com>");
+--- /dev/null
++++ b/samples/kobject/kset-example.c
+@@ -0,0 +1,132 @@
++/*
++ * Sample kobject implementation
++ *
++ * Copyright (C) 2004-2007 Greg Kroah-Hartman <greg@kroah.com>
++ * Copyright (C) 2007 Novell Inc.
++ *
++ * Released under the GPL version 2 only.
++ *
++ */
++#include <linux/kobject.h>
++#include <linux/string.h>
++#include <linux/sysfs.h>
++#include <linux/module.h>
++#include <linux/init.h>
++
++/*
++ * This module shows how to create a simple subdirectory in sysfs called
++ * /sys/kernel/kobject-example  In that directory, 3 files are created:
++ * "foo", "baz", and "bar".  If an integer is written to these files, it can be
++ * later read out of it.
++ */
++
++static int foo;
++static int baz;
++static int bar;
++
++/*
++ * The "foo" file where a static variable is read from and written to.
++ */
++static ssize_t foo_show(struct kobject *kobj, struct kobj_attribute *attr,
++			char *buf)
++{
++	return sprintf(buf, "%d\n", foo);
++}
++
++static ssize_t foo_store(struct kobject *kobj, struct kobj_attribute *attr,
++			 const char *buf, size_t count)
++{
++	sscanf(buf, "%du", &foo);
++	return count;
++}
++
++static struct kobj_attribute foo_attribute =
++	__ATTR(foo, 0666, foo_show, foo_store);
++
++/*
++ * More complex function where we determine which varible is being accessed by
++ * looking at the attribute for the "baz" and "bar" files.
++ */
++static ssize_t b_show(struct kobject *kobj, struct kobj_attribute *attr,
++		      char *buf)
++{
++	int var;
++
++	if (strcmp(attr->attr.name, "baz") == 0)
++		var = baz;
++	else
++		var = bar;
++	return sprintf(buf, "%d\n", var);
++}
++
++static ssize_t b_store(struct kobject *kobj, struct kobj_attribute *attr,
++		       const char *buf, size_t count)
++{
++	int var;
++
++	sscanf(buf, "%du", &var);
++	if (strcmp(attr->attr.name, "baz") == 0)
++		baz = var;
++	else
++		bar = var;
++	return count;
++}
++
++static struct kobj_attribute baz_attribute =
++	__ATTR(baz, 0666, b_show, b_store);
++static struct kobj_attribute bar_attribute =
++	__ATTR(bar, 0666, b_show, b_store);
++
++
++/*
++ * Create a group of attributes so that we can create and destory them all
++ * at once.
++ */
++static struct attribute *attrs[] = {
++	&foo_attribute.attr,
++	&baz_attribute.attr,
++	&bar_attribute.attr,
++	NULL,	/* need to NULL terminate the list of attributes */
++};
++
++/*
++ * An unnamed attribute group will put all of the attributes directly in
++ * the kobject directory.  If we specify a name, a subdirectory will be
++ * created for the attributes with the directory being the name of the
++ * attribute group.
++ */
++static struct attribute_group attr_group = {
++	.attrs = attrs,
++};
++
++static struct kobject *example_kobj;
++
++static int example_init(void)
++{
++	int retval;
++
++	/*
++	 * Create a simple kobject with the name of "kobject_example",
++	 * located under /sys/kernel/
++	 */
++	example_kobj = kobject_create_and_register("kobject_example",
++						   kernel_kobj);
++	if (!example_kobj)
++		return -ENOMEM;
++
++	retval = sysfs_create_group(example_kobj, &attr_group);
++	if (retval)
++		kobject_unregister(example_kobj);
++
++	return retval;
++}
++
++static void example_exit(void)
++{
++	kobject_unregister(example_kobj);
++}
++
++module_init(example_init);
++module_exit(example_exit);
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Greg Kroah-Hartman <greg@kroah.com>");
