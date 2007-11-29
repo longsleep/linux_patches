@@ -1,0 +1,79 @@
+From stern@rowland.harvard.edu  Thu Nov 29 13:12:08 2007
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Mon, 19 Nov 2007 10:53:40 -0500 (EST)
+Subject: Kobject: drop child->parent ref at unregistration
+To: Greg KH <greg@kroah.com>, Kay Sievers <kay.sievers@vrfy.org>
+Cc: Kernel development list <linux-kernel@vger.kernel.org>
+Message-ID: <Pine.LNX.4.44L0.0711191047230.4806-100000@iolanthe.rowland.org>
+
+
+This patch (as1015) reverts changes that were made to the driver core
+about four years ago.  The intent back then was to avoid certain kinds
+of invalid memory accesses by leaving kernel objects allocated as long
+as any of their children were still allocated.  The original and
+correct approach was to wait only as long as any children were still
+_registered_; that's what this patch reinstates.
+
+This fixes a problem in the SCSI core made visible by the class_device
+to regular device conversion: A reference loop (scsi_device holds
+reference to request_queue, which is the child of a gendisk, which is
+the child of the scsi_device) prevents the data structures from being
+released, even though they are deregistered okay.
+
+It's possible that this change will cause a few bugs to surface,
+things that have been hidden for several years.  They can be fixed
+easily enough by having the child device take an explicit reference to
+the parent whenever needed.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Cc: Kay Sievers <kay.sievers@vrfy.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ lib/kobject.c |    7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+--- a/lib/kobject.c
++++ b/lib/kobject.c
+@@ -149,12 +149,16 @@ void kobject_init(struct kobject * kobj)
+ 
+ static void unlink(struct kobject * kobj)
+ {
++	struct kobject *parent = kobj->parent;
++
+ 	if (kobj->kset) {
+ 		spin_lock(&kobj->kset->list_lock);
+ 		list_del_init(&kobj->entry);
+ 		spin_unlock(&kobj->kset->list_lock);
+ 	}
++	kobj->parent = NULL;
+ 	kobject_put(kobj);
++	kobject_put(parent);
+ }
+ 
+ /**
+@@ -208,7 +212,6 @@ int kobject_add(struct kobject * kobj)
+ 	if (error) {
+ 		/* unlink does the kobject_put() for us */
+ 		unlink(kobj);
+-		kobject_put(parent);
+ 
+ 		/* be noisy on error issues */
+ 		if (error == -EEXIST)
+@@ -463,7 +466,6 @@ void kobject_cleanup(struct kobject * ko
+ {
+ 	struct kobj_type * t = get_ktype(kobj);
+ 	struct kset * s = kobj->kset;
+-	struct kobject * parent = kobj->parent;
+ 	const char *name = kobj->k_name;
+ 
+ 	pr_debug("kobject: '%s' (%p): %s\n",
+@@ -477,7 +479,6 @@ void kobject_cleanup(struct kobject * ko
+ 	}
+ 	if (s)
+ 		kset_put(s);
+-	kobject_put(parent);
+ }
+ 
+ static void kobject_release(struct kref *kref)
