@@ -10,12 +10,12 @@ Cc: Kay Sievers <kay.sievers@vrfy.org>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
- Documentation/kobject.txt |  357 ++++++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 357 insertions(+)
+ Documentation/kobject.txt |  370 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 370 insertions(+)
 
 --- /dev/null
 +++ b/Documentation/kobject.txt
-@@ -0,0 +1,357 @@
+@@ -0,0 +1,370 @@
 +Everything you never wanted to know about kobjects, ksets, and ktypes
 +
 +Greg Kroah-Hartman <gregkh@suse.de>
@@ -67,19 +67,19 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +Embedding kobjects
 +
-+It is rare (even unknown) for kernel code to create a standalone kobject;
-+with one major exception explained below.  Instead, kobjects are used to
-+control access to a larger, domain-specific object.  To this end, kobjects
-+will be found embedded in other structures.  If you are used to thinking of
-+things in object-oriented terms, kobjects can be seen as a top-level,
-+abstract class from which other classes are derived.  A kobject implements
-+a set of capabilities which are not particularly useful by themselves, but
-+which are nice to have in other objects.  The C language does not allow for
-+the direct expression of inheritance, so other techniques - such as
-+structure embedding - must be used.
++It is rare for kernel code to create a standalone kobject; with one major
++exception explained below.  Instead, kobjects are used to control access to
++a larger, domain-specific object.  To this end, kobjects will be found
++embedded in other structures.  If you are used to thinking of things in
++object-oriented terms, kobjects can be seen as a top-level, abstract class
++from which other classes are derived.  A kobject implements a set of
++capabilities which are not particularly useful by themselves, but which are
++nice to have in other objects.  The C language does not allow for the
++direct expression of inheritance, so other techniques - such as structure
++embedding - must be used.
 +
-+So, for example, UIO code has a structure that defines the memory region
-+associated with a uio device:
++So, for example, the UIO code has a structure that defines the memory
++region associated with a uio device:
 +
 +struct uio_mem {
 +	struct kobject kobj;
@@ -89,12 +89,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	void __iomem *internal_addr;
 +};
 +
-+If you have a struct uio_mem structure, finding its embedded kobject is just a
-+matter of using the kobj pointer.  Code that works with kobjects will often
-+have the opposite problem, however: given a struct kobject pointer, what is
-+the pointer to the containing structure?  You must avoid tricks (such as
-+assuming that the kobject is at the beginning of the structure) and,
-+instead, use the container_of() macro, found in <linux/kernel.h>:
++If you have a struct uio_mem structure, finding its embedded kobject is
++just a matter of using the kobj structure.  Code that works with kobjects
++will often have the opposite problem, however: given a struct kobject
++pointer, what is the pointer to the containing structure?  You must avoid
++tricks (such as assuming that the kobject is at the beginning of the
++structure) and, instead, use the container_of() macro, found in
++<linux/kernel.h>:
 +
 +	container_of(pointer, type, member)
 +
@@ -102,7 +103,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +the containing structure, and member is the name of the structure field to
 +which pointer points.  The return value from container_of() is a pointer to
 +the given type. So, for example, a pointer to a struct kobject embedded
-+within a struct cdev called "kp" could be converted to a pointer to the
++within a struct uio_mem called "kp" could be converted to a pointer to the
 +containing structure with:
 +
 +    struct uio_mem *u_mem = container_of(kp, struct uio_mem, kobj);
@@ -148,10 +149,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +    void kobject_put(struct kobject *kobj);
 +
 +A successful call to kobject_get() will increment the kobject's reference
-+counter and return the pointer to the kobject. If, however, the kobject is
-+already in the process of being destroyed, the operation will fail and
-+kobject_get() will return NULL. This return value must always be tested, or
-+no end of unpleasant race conditions could result.
++counter and return the pointer to the kobject.
 +
 +When a reference is released, the call to kobject_put() will decrement the
 +reference count and, possibly, free the object. Note that kobject_init()
@@ -159,10 +157,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +need to do a kobject_put() eventually to release that reference.
 +
 +Because kobjects are dynamic, they must not be declared statically or on
-+the stack, but instead, always from the heap.  Future versions of the
-+kernel will contain a run-time check for kobjects that are created
++the stack, but instead, always allocated from the heap.  Future versions of
++the kernel will contain a run-time check for kobjects that are created
 +statically and will warn the developer of this improper usage.
 +
++If all that you are wanting to use a kobject for is to provide a reference
++counter for your structure, please use the struct kref instead, a kobject
++would be overkill.  For more information on how to use struct kref, please
++see the file, Documentation/kref.txt in the Linux kernel source tree.
 +
 +Hooking into sysfs
 +
@@ -178,18 +180,23 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +will remove the kobject from sysfs.
 +
-+There is a kobject_register() function, which is really just the
-+combination of the calls to kobject_init() and kobject_add(). Similarly,
-+kobject_unregister() will call kobject_del(), then call kobject_put() to
-+release the initial reference created with kobject_register() (or really
-+kobject_init()).
++There is a kobject_register() function, which is a combination of the calls
++to kobject_init() and kobject_add() as well as a uevent for the kobject.
++If kobject_init() and kobject_add() are called on their own, the caller
++must make sure to call kobject_uevent() at the proper time after the
++kobject has been fully populated.
++
++Like kobject_register(), kobject_unregister() will call kobject_uevent(),
++then kobject_del(), and then call kobject_put() to release the initial
++reference created with kobject_register() (or really kobject_init()).
 +
 +
 +Creating "simple" kobjects
 +
 +Sometimes all that a developer wants is a way to create a simple directory
-+in the sysfs heirachy, and not have to mess with the whole complication of
-+ksets, show and store functions, and other details.  To create such an
++in the sysfs hierarchy, and not have to mess with the whole complication of
++ksets, show and store functions, and other details.  This is the one
++exception where a single kobject should be created.  To create such an
 +entry, use the function:
 +
 +    struct kobject *kobject_create_and_register(char *name, struct kobject *parent);
@@ -217,16 +224,20 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +kobject when its reference count reaches zero. The code which created the
 +kobject generally does not know when that will happen; if it did, there
 +would be little point in using a kobject in the first place. Even
-+predictable object lifecycles become more complicated when sysfs is
-+brought in; user-space programs can keep a reference to a kobject (by
-+keeping one of its associated sysfs files open) for an arbitrary period of
-+time.
++predictable object lifecycles become more complicated when sysfs is brought
++in as other portions of the kernel can get a reference on any kobject that
++is registered in the system.
 +
 +The end result is that a structure protected by a kobject cannot be freed
 +before its reference count goes to zero. The reference count is not under
 +the direct control of the code which created the kobject. So that code must
 +be notified asynchronously whenever the last reference to one of its
 +kobjects goes away.
++
++Once you registered your kobject via kobject_add(), you must never use
++kfree() to free it directly. The only safe way is to use kobject_put(). It
++is good practice to always use kobject_put() after kobject_init() to avoid
++errors creeping in.
 +
 +This notification is done through a kobject's release() method. Usually
 +such a method has a form like:
@@ -268,6 +279,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +and default_attrs) control how objects of this type are represented in
 +sysfs; they are beyond the scope of this document.
 +
++The default_attrs pointer is a list of default attributes that will be
++automatically created for any kobject that is registered with this ktype.
++
 +
 +ksets
 +
@@ -287,10 +301,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 + - Ksets can support the "hotplugging" of kobjects and influence how
 +   uevent events are reported to user space.
-+
-+ - A kset can provide a set of default attributes that all kobjects that
-+   belong to it automatically inherit and have created whenever a kobject
-+   is registered belonging to the kset.
 +
 +In object-oriented terms, "kset" is the top-level container class; ksets
 +contain their own kobject, but that kobject is managed by the kset code and
@@ -338,12 +348,17 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +userspace to allow more environment variables to be added to the uevent.
 +
 +One might ask how, exactly, a kobject is added to a kset, given that no
-+functions which perform that function have been presented. The answer is
-+that this task is handled by kobject_add(). When a kobject is passed to
++functions which perform that function have been presented.  The answer is
++that this task is handled by kobject_add().  When a kobject is passed to
 +kobject_add(), its kset member should point to the kset to which the
-+kobject will belong. kobject_add() will handle the rest. There is currently
-+no other way to add a kobject to a kset without directly messing with the
-+list pointers.
++kobject will belong.  kobject_add() will handle the rest.
++
++If the kobject belonging to a kset has no parent kobject set, it will be
++added to the kset's directory.  Not all members of a kset do necessarily
++live in the kset directory.  If an explicit parent kobject is assigned
++before the kobject is added, the kobject is registered with the kset, but
++added below the parent kobject.
++
 +
 +
 +Kobject initialization again
@@ -355,8 +370,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + - k_name - the name of the object. This fields should always be
 +   initialized with kobject_set_name(), or specified in the original call
 +   to kobject_create_and_register().
-+
-+ - refcount is the kobject's reference count; it is initialized by kobject_init()
 +
 + - parent is the kobject's parent in whatever hierarchy it belongs to. It
 +   can be set explicitly by the creator. If parent is NULL when
