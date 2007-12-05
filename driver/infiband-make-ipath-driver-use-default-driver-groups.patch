@@ -1,0 +1,148 @@
+From foo@baz Tue Apr  9 12:12:43 2002
+Date: Tue, 4 Dec 2007 22:53:16 -0800
+To: Greg KH <greg@kroah.com>
+From: Greg Kroah-Hartman <gregkh@suse.de>
+Subject: Infiband: make ipath driver use default driver groups.
+
+Make the ipath driver use the new driver functions so that it does not
+touch the sysfs portion of the driver structure.
+
+We also remove the redundant symlink from the device back to the driver,
+as it is already in the sysfs tree.  Any userspace tools should be using
+the standard symlink, not some driver specific one.
+
+Cc: Roland Dreier <rdreier@cisco.com>
+Cc: Bryan O'Sullivan <bryan.osullivan@qlogic.com>
+Cc: Arthur Jones <arthur.jones@qlogic.com>
+Cc: Cornelia Huck <cornelia.huck@de.ibm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/infiniband/hw/ipath/ipath_driver.c |   17 +++-------------
+ drivers/infiniband/hw/ipath/ipath_kernel.h |    3 --
+ drivers/infiniband/hw/ipath/ipath_sysfs.c  |   30 ++++-------------------------
+ 3 files changed, 10 insertions(+), 40 deletions(-)
+
+--- a/drivers/infiniband/hw/ipath/ipath_driver.c
++++ b/drivers/infiniband/hw/ipath/ipath_driver.c
+@@ -121,6 +121,9 @@ static struct pci_driver ipath_driver = 
+ 	.probe = ipath_init_one,
+ 	.remove = __devexit_p(ipath_remove_one),
+ 	.id_table = ipath_pci_tbl,
++	.driver = {
++		.groups = ipath_driver_attr_groups,
++	},
+ };
+ 
+ static void ipath_check_status(struct work_struct *work)
+@@ -2217,25 +2220,15 @@ static int __init infinipath_init(void)
+ 		goto bail_unit;
+ 	}
+ 
+-	ret = ipath_driver_create_group(&ipath_driver.driver);
+-	if (ret < 0) {
+-		printk(KERN_ERR IPATH_DRV_NAME ": Unable to create driver "
+-		       "sysfs entries: error %d\n", -ret);
+-		goto bail_pci;
+-	}
+-
+ 	ret = ipath_init_ipathfs();
+ 	if (ret < 0) {
+ 		printk(KERN_ERR IPATH_DRV_NAME ": Unable to create "
+ 		       "ipathfs: error %d\n", -ret);
+-		goto bail_group;
++		goto bail_pci;
+ 	}
+ 
+ 	goto bail;
+ 
+-bail_group:
+-	ipath_driver_remove_group(&ipath_driver.driver);
+-
+ bail_pci:
+ 	pci_unregister_driver(&ipath_driver);
+ 
+@@ -2250,8 +2243,6 @@ static void __exit infinipath_cleanup(vo
+ {
+ 	ipath_exit_ipathfs();
+ 
+-	ipath_driver_remove_group(&ipath_driver.driver);
+-
+ 	ipath_cdbg(VERBOSE, "Unregistering pci driver\n");
+ 	pci_unregister_driver(&ipath_driver);
+ 
+--- a/drivers/infiniband/hw/ipath/ipath_kernel.h
++++ b/drivers/infiniband/hw/ipath/ipath_kernel.h
+@@ -938,8 +938,7 @@ struct device_driver;
+ 
+ extern const char ib_ipath_version[];
+ 
+-int ipath_driver_create_group(struct device_driver *);
+-void ipath_driver_remove_group(struct device_driver *);
++struct attribute_group *ipath_driver_attr_groups[];
+ 
+ int ipath_device_create_group(struct device *, struct ipath_devdata *);
+ void ipath_device_remove_group(struct device *, struct ipath_devdata *);
+--- a/drivers/infiniband/hw/ipath/ipath_sysfs.c
++++ b/drivers/infiniband/hw/ipath/ipath_sysfs.c
+@@ -683,6 +683,11 @@ static struct attribute_group driver_att
+ 	.attrs = driver_attributes
+ };
+ 
++struct attribute_group *ipath_driver_attr_groups[] = {
++	&driver_attr_group,
++	NULL,
++};
++
+ static DEVICE_ATTR(guid, S_IWUSR | S_IRUGO, show_guid, store_guid);
+ static DEVICE_ATTR(lmc, S_IWUSR | S_IRUGO, show_lmc, store_lmc);
+ static DEVICE_ATTR(lid, S_IWUSR | S_IRUGO, show_lid, store_lid);
+@@ -753,24 +758,9 @@ int ipath_expose_reset(struct device *de
+ 	return ret;
+ }
+ 
+-int ipath_driver_create_group(struct device_driver *drv)
+-{
+-	int ret;
+-
+-	ret = sysfs_create_group(&drv->kobj, &driver_attr_group);
+-
+-	return ret;
+-}
+-
+-void ipath_driver_remove_group(struct device_driver *drv)
+-{
+-	sysfs_remove_group(&drv->kobj, &driver_attr_group);
+-}
+-
+ int ipath_device_create_group(struct device *dev, struct ipath_devdata *dd)
+ {
+ 	int ret;
+-	char unit[5];
+ 
+ 	ret = sysfs_create_group(&dev->kobj, &dev_attr_group);
+ 	if (ret)
+@@ -780,11 +770,6 @@ int ipath_device_create_group(struct dev
+ 	if (ret)
+ 		goto bail_attrs;
+ 
+-	snprintf(unit, sizeof(unit), "%02d", dd->ipath_unit);
+-	ret = sysfs_create_link(&dev->driver->kobj, &dev->kobj, unit);
+-	if (ret == 0)
+-		goto bail;
+-
+ 	sysfs_remove_group(&dev->kobj, &dev_counter_attr_group);
+ bail_attrs:
+ 	sysfs_remove_group(&dev->kobj, &dev_attr_group);
+@@ -794,11 +779,6 @@ bail:
+ 
+ void ipath_device_remove_group(struct device *dev, struct ipath_devdata *dd)
+ {
+-	char unit[5];
+-
+-	snprintf(unit, sizeof(unit), "%02d", dd->ipath_unit);
+-	sysfs_remove_link(&dev->driver->kobj, unit);
+-
+ 	sysfs_remove_group(&dev->kobj, &dev_counter_attr_group);
+ 	sysfs_remove_group(&dev->kobj, &dev_attr_group);
+ 
