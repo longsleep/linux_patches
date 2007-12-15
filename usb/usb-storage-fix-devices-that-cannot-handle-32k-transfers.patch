@@ -1,0 +1,80 @@
+From dwm@enoyolf.org Wed Dec  5 21:36:47 2007
+From: Doug Maxey <dwm@enoyolf.org>
+Date: Wed, 05 Dec 2007 23:36:45 -0600
+Subject: usb-storage: Fix devices that cannot handle 32k transfers
+To: Greg Kroah-Hartman <greg@kroah.com>
+Cc: Alan Stern <stern@rowland.harvard.edu>, Matthew Dharm <mdharm-usb@one-eyed-alien.net>, Pete Zaitcev <zaitcev@redhat.com>, linux-usb-devel@lists.sourceforge.net
+Message-ID: <15712.1196919405@bebe.enoyolf.org>
+
+
+When a device cannot handle the smallest previously limited transfer
+size (64 blocks) without stalling, limit the device to the amount of
+packets that fit in a platform native page.
+
+The lowest possible limit is PAGE_CACHE_SIZE, so if the device is ever
+used on a platform that has larger than 8K pages, you lose unless you
+can convince the device firmware folks to fix the issue.
+
+Cc: Mathew Dharm <mdharm-scsi@one-eyed-alien.net>
+Cc: Alan Stern <stern@rowland.harvard.edu>
+Cc: Pete Zaitcev <zaitcev@redhat.com>
+Signed-off-by: Doug Maxey <dwm@austin.ibm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/storage/scsiglue.c     |   12 +++++++++---
+ drivers/usb/storage/unusual_devs.h |    7 +++++++
+ include/linux/usb_usual.h          |    5 ++++-
+ 3 files changed, 20 insertions(+), 4 deletions(-)
+
+--- a/drivers/usb/storage/scsiglue.c
++++ b/drivers/usb/storage/scsiglue.c
+@@ -114,9 +114,15 @@ static int slave_configure(struct scsi_d
+ 	 * while others have trouble with more than 64K. At this time we
+ 	 * are limiting both to 32K (64 sectores).
+ 	 */
+-	if ((us->flags & US_FL_MAX_SECTORS_64) &&
+-			sdev->request_queue->max_sectors > 64)
+-		blk_queue_max_sectors(sdev->request_queue, 64);
++	if (us->flags & (US_FL_MAX_SECTORS_64 | US_FL_MAX_SECTORS_MIN)) {
++		unsigned int max_sectors = 64;
++
++		if (us->flags & US_FL_MAX_SECTORS_MIN)
++			max_sectors = PAGE_CACHE_SIZE >> 9;
++		if (sdev->request_queue->max_sectors > max_sectors)
++			blk_queue_max_sectors(sdev->request_queue,
++					      max_sectors);
++	}
+ 
+ 	/* We can't put these settings in slave_alloc() because that gets
+ 	 * called before the device type is known.  Consequently these
+--- a/drivers/usb/storage/unusual_devs.h
++++ b/drivers/usb/storage/unusual_devs.h
+@@ -376,6 +376,13 @@ UNUSUAL_DEV(  0x04b0, 0x0417, 0x0100, 0x
+ 		US_SC_DEVICE, US_PR_DEVICE, NULL,
+ 		US_FL_FIX_CAPACITY),
+ 
++/* Reported by Doug Maxey (dwm@austin.ibm.com) */
++UNUSUAL_DEV(  0x04b3, 0x4001, 0x0110, 0x0110,
++		"IBM",
++		"IBM RSA2",
++		US_SC_DEVICE, US_PR_CB, NULL,
++		US_FL_MAX_SECTORS_MIN),
++
+ /* BENQ DC5330
+  * Reported by Manuel Fombuena <mfombuena@ya.com> and
+  * Frank Copeland <fjc@thingy.apana.org.au> */
+--- a/include/linux/usb_usual.h
++++ b/include/linux/usb_usual.h
+@@ -48,7 +48,10 @@
+ 	US_FLAG(IGNORE_DEVICE,	0x00000800)			\
+ 		/* Don't claim device */			\
+ 	US_FLAG(CAPACITY_HEURISTICS,	0x00001000)		\
+-		/* sometimes sizes is too big */
++		/* sometimes sizes is too big */		\
++	US_FLAG(MAX_SECTORS_MIN,0x00002000)			\
++		/* Sets max_sectors to arch min */
++
+ 
+ #define US_FLAG(name, value)	US_FL_##name = value ,
+ enum { US_DO_ALL_FLAGS };
