@@ -1,0 +1,126 @@
+From linux-usb-owner@vger.kernel.org Thu Dec  6 11:48:39 2007
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Thu, 6 Dec 2007 14:47:08 -0500 (EST)
+Subject: USB: use IRQF_DISABLED for HCD interrupt handlers
+To: Greg KH <greg@kroah.com>
+Cc: USB list <linux-usb@vger.kernel.org>, USB development list <linux-usb-devel@lists.sourceforge.net>
+Message-ID: <Pine.LNX.4.44L0.0712061252210.4308-100000@iolanthe.rowland.org>
+
+From: Alan Stern <stern@rowland.harvard.edu>
+
+Host controller IRQs are supposed to be serviced with interrupts
+disabled.  This patch (as1026) adds an IRQF_DISABLED flag to all the
+controller drivers that lack it.  It also replaces the
+spin_lock_irqsave() and spin_unlock_irqrestore() calls in uhci_irq()
+with simple spin_lock() and spin_unlock().
+
+This fixes Bugzilla #9335.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Acked-by: David Brownell <david-b@pacbell.net>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/hcd-pci.c      |    2 +-
+ drivers/usb/host/ehci-fsl.c     |    2 +-
+ drivers/usb/host/ohci-ppc-of.c  |    2 +-
+ drivers/usb/host/ohci-ssb.c     |    2 +-
+ drivers/usb/host/r8a66597-hcd.c |    2 +-
+ drivers/usb/host/uhci-hcd.c     |    9 ++++-----
+ 6 files changed, 9 insertions(+), 10 deletions(-)
+
+--- a/drivers/usb/core/hcd-pci.c
++++ b/drivers/usb/core/hcd-pci.c
+@@ -125,7 +125,7 @@ int usb_hcd_pci_probe (struct pci_dev *d
+ 
+ 	pci_set_master (dev);
+ 
+-	retval = usb_add_hcd (hcd, dev->irq, IRQF_SHARED);
++	retval = usb_add_hcd(hcd, dev->irq, IRQF_DISABLED | IRQF_SHARED);
+ 	if (retval != 0)
+ 		goto err4;
+ 	return retval;
+--- a/drivers/usb/host/ehci-fsl.c
++++ b/drivers/usb/host/ehci-fsl.c
+@@ -122,7 +122,7 @@ int usb_hcd_fsl_probe(const struct hc_dr
+ 	temp = in_le32(hcd->regs + 0x1a8);
+ 	out_le32(hcd->regs + 0x1a8, temp | 0x3);
+ 
+-	retval = usb_add_hcd(hcd, irq, IRQF_SHARED);
++	retval = usb_add_hcd(hcd, irq, IRQF_DISABLED | IRQF_SHARED);
+ 	if (retval != 0)
+ 		goto err4;
+ 	return retval;
+--- a/drivers/usb/host/ohci-ppc-of.c
++++ b/drivers/usb/host/ohci-ppc-of.c
+@@ -142,7 +142,7 @@ ohci_hcd_ppc_of_probe(struct of_device *
+ 
+ 	ohci_hcd_init(ohci);
+ 
+-	rv = usb_add_hcd(hcd, irq, 0);
++	rv = usb_add_hcd(hcd, irq, IRQF_DISABLED);
+ 	if (rv == 0)
+ 		return 0;
+ 
+--- a/drivers/usb/host/ohci-ssb.c
++++ b/drivers/usb/host/ohci-ssb.c
+@@ -160,7 +160,7 @@ static int ssb_ohci_attach(struct ssb_de
+ 	hcd->regs = ioremap_nocache(hcd->rsrc_start, hcd->rsrc_len);
+ 	if (!hcd->regs)
+ 		goto err_put_hcd;
+-	err = usb_add_hcd(hcd, dev->irq, IRQF_SHARED);
++	err = usb_add_hcd(hcd, dev->irq, IRQF_DISABLED | IRQF_SHARED);
+ 	if (err)
+ 		goto err_iounmap;
+ 
+--- a/drivers/usb/host/r8a66597-hcd.c
++++ b/drivers/usb/host/r8a66597-hcd.c
+@@ -2197,7 +2197,7 @@ static int __init r8a66597_probe(struct 
+ 	INIT_LIST_HEAD(&r8a66597->child_device);
+ 
+ 	hcd->rsrc_start = res->start;
+-	ret = usb_add_hcd(hcd, irq, 0);
++	ret = usb_add_hcd(hcd, irq, IRQF_DISABLED);
+ 	if (ret != 0) {
+ 		err("Failed to add hcd");
+ 		goto clean_up;
+--- a/drivers/usb/host/uhci-hcd.c
++++ b/drivers/usb/host/uhci-hcd.c
+@@ -378,7 +378,6 @@ static irqreturn_t uhci_irq(struct usb_h
+ {
+ 	struct uhci_hcd *uhci = hcd_to_uhci(hcd);
+ 	unsigned short status;
+-	unsigned long flags;
+ 
+ 	/*
+ 	 * Read the interrupt status, and write it back to clear the
+@@ -398,7 +397,7 @@ static irqreturn_t uhci_irq(struct usb_h
+ 			dev_err(uhci_dev(uhci), "host controller process "
+ 					"error, something bad happened!\n");
+ 		if (status & USBSTS_HCH) {
+-			spin_lock_irqsave(&uhci->lock, flags);
++			spin_lock(&uhci->lock);
+ 			if (uhci->rh_state >= UHCI_RH_RUNNING) {
+ 				dev_err(uhci_dev(uhci),
+ 					"host controller halted, "
+@@ -415,16 +414,16 @@ static irqreturn_t uhci_irq(struct usb_h
+ 				 * pending unlinks */
+ 				mod_timer(&hcd->rh_timer, jiffies);
+ 			}
+-			spin_unlock_irqrestore(&uhci->lock, flags);
++			spin_unlock(&uhci->lock);
+ 		}
+ 	}
+ 
+ 	if (status & USBSTS_RD)
+ 		usb_hcd_poll_rh_status(hcd);
+ 	else {
+-		spin_lock_irqsave(&uhci->lock, flags);
++		spin_lock(&uhci->lock);
+ 		uhci_scan_schedule(uhci);
+-		spin_unlock_irqrestore(&uhci->lock, flags);
++		spin_unlock(&uhci->lock);
+ 	}
+ 
+ 	return IRQ_HANDLED;

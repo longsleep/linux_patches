@@ -1,0 +1,71 @@
+From david-b@pacbell.net Thu Dec  6 13:29:54 2007
+From: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Date: Thu, 6 Dec 2007 13:28:25 -0800
+Subject: usb: Remove broken optimisation in OHCI IRQ handler
+To: Greg KH <greg@kroah.com>
+Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>, linux-usb-devel@lists.sourceforge.net, linuxppc-dev@ozlabs.org
+Message-ID: <200712061328.26235.david-b@pacbell.net>
+Content-Disposition: inline
+
+From: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+Subject: [PATCH 1/2] usb: Remove broken optimisation in OHCI IRQ handler
+
+The OHCI IRQ handler has an optimisation that avoids reading some
+chip registers when the controller reports that the interrupt was
+triggered *only* because completed requests were written into the
+controller's "done list" and handed to the host.
+
+This mechanism can't be used on some controllers.  Among others, it
+fails for the SA1111 and the AMCC 440EP PowerPC processor.
+
+This patch removes the optimisation and makes the code clearer.
+
+Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/ohci-hcd.c |   23 +++++++++++++----------
+ 1 file changed, 13 insertions(+), 10 deletions(-)
+
+--- a/drivers/usb/host/ohci-hcd.c
++++ b/drivers/usb/host/ohci-hcd.c
+@@ -732,24 +732,27 @@ static irqreturn_t ohci_irq (struct usb_
+ 	struct ohci_regs __iomem *regs = ohci->regs;
+ 	int			ints;
+ 
+-	/* we can eliminate a (slow) ohci_readl()
+-	 * if _only_ WDH caused this irq
++	/* Read interrupt status (and flush pending writes).  We ignore the
++	 * optimization of checking the LSB of hcca->done_head; it doesn't
++	 * work on all systems (edge triggering for OHCI can be a factor).
+ 	 */
+-	if ((ohci->hcca->done_head != 0)
+-			&& ! (hc32_to_cpup (ohci, &ohci->hcca->done_head)
+-				& 0x01)) {
+-		ints =  OHCI_INTR_WDH;
++	ints = ohci_readl(ohci, &regs->intrstatus);
+ 
+-	/* cardbus/... hardware gone before remove() */
+-	} else if ((ints = ohci_readl (ohci, &regs->intrstatus)) == ~(u32)0) {
++	/* Check for an all 1's result which is a typical consequence
++	 * of dead, unclocked, or unplugged (CardBus...) devices
++	 */
++	if (ints == ~(u32)0) {
+ 		disable (ohci);
+ 		ohci_dbg (ohci, "device removed!\n");
+ 		return IRQ_HANDLED;
++	}
++
++	/* We only care about interrupts that are enabled */
++	ints &= ohci_readl(ohci, &regs->intrenable);
+ 
+ 	/* interrupt for some other device? */
+-	} else if ((ints &= ohci_readl (ohci, &regs->intrenable)) == 0) {
++	if (ints == 0)
+ 		return IRQ_NOTMINE;
+-	}
+ 
+ 	if (ints & OHCI_INTR_UE) {
+ 		// e.g. due to PCI Master/Target Abort

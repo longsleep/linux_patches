@@ -1,0 +1,69 @@
+From 2621bb9026d66810a2b445a135d23ea2cd4b0c8f Mon Sep 17 00:00:00 2001
+From: Mark Lord <lkml@rtr.ca>
+Date: Wed, 28 Nov 2007 15:12:00 -0800
+Subject: PCIE: Make use of the previously split out pcie_init_enable_events() function
+
+Make use of the previously split out pcie_init_enable_events() function
+to reinitialize the hotplug hardware on resume from suspend, but only
+when pciehp_force==1.  Otherwise behaviour is unmodified.
+
+Signed-off-by: Mark Lord <mlord@pobox.com>
+Signed-off-by: Kristen Carlson Accardi <kristen.c.accardi@intel.com>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Theodore Ts'o <tytso@mit.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/pci/hotplug/pciehp.h      |    2 ++
+ drivers/pci/hotplug/pciehp_core.c |   18 ++++++++++++++++++
+ drivers/pci/hotplug/pciehp_ctrl.c |    1 -
+ 3 files changed, 20 insertions(+), 1 deletion(-)
+
+--- a/drivers/pci/hotplug/pciehp.h
++++ b/drivers/pci/hotplug/pciehp.h
+@@ -162,6 +162,8 @@ extern int pciehp_unconfigure_device(str
+ extern void pciehp_queue_pushbutton_work(struct work_struct *work);
+ int pcie_init(struct controller *ctrl, struct pcie_device *dev);
+ int pciehp_enable_slot(struct slot *p_slot);
++int pciehp_disable_slot(struct slot *p_slot);
++int pcie_init_hardware(struct controller *ctrl, struct pcie_device *dev);
+ 
+ static inline struct slot *pciehp_find_slot(struct controller *ctrl, u8 device)
+ {
+--- a/drivers/pci/hotplug/pciehp_core.c
++++ b/drivers/pci/hotplug/pciehp_core.c
+@@ -514,6 +514,24 @@ static int pciehp_suspend (struct pcie_d
+ static int pciehp_resume (struct pcie_device *dev)
+ {
+ 	printk("%s ENTRY\n", __FUNCTION__);
++	if (pciehp_force) {
++		struct pci_dev *pdev = dev->port;
++		struct controller *ctrl = pci_get_drvdata(pdev);
++		struct slot *t_slot;
++		u8 status;
++
++		/* reinitialize the chipset's event detection logic */
++		pcie_init_hardware(ctrl, dev);
++
++		t_slot = pciehp_find_slot(ctrl, ctrl->slot_device_offset);
++
++		/* Check if slot is occupied */
++		t_slot->hpc_ops->get_adapter_status(t_slot, &status);
++		if (status)
++			pciehp_enable_slot(t_slot);
++		else
++			pciehp_disable_slot(t_slot);
++	}
+ 	return 0;
+ }
+ #endif
+--- a/drivers/pci/hotplug/pciehp_ctrl.c
++++ b/drivers/pci/hotplug/pciehp_ctrl.c
+@@ -37,7 +37,6 @@
+ #include "pciehp.h"
+ 
+ static void interrupt_event_handler(struct work_struct *work);
+-static int pciehp_disable_slot(struct slot *p_slot);
+ 
+ static int queue_interrupt_event(struct slot *p_slot, u32 event_type)
+ {
