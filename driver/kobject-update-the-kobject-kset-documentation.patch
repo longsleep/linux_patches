@@ -10,12 +10,12 @@ Cc: Kay Sievers <kay.sievers@vrfy.org>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
- Documentation/kobject.txt |  370 ++++++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 370 insertions(+)
+ Documentation/kobject.txt |  381 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 381 insertions(+)
 
 --- /dev/null
 +++ b/Documentation/kobject.txt
-@@ -0,0 +1,370 @@
+@@ -0,0 +1,381 @@
 +Everything you never wanted to know about kobjects, ksets, and ktypes
 +
 +Greg Kroah-Hartman <gregkh@suse.de>
@@ -23,7 +23,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +Based on an original article by Jon Corbet for lwn.net written October 1,
 +2003 and located at http://lwn.net/Articles/51437/
 +
-+Last updated November 27, 2007
++Last updated December 19, 2007
 +
 +
 +Part of the difficulty in understanding the driver model - and the kobject
@@ -117,25 +117,64 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +Code which creates a kobject must, of course, initialize that object. Some
 +of the internal fields are setup with a (mandatory) call to kobject_init():
 +
-+    void kobject_init(struct kobject *kobj);
++    void kobject_init(struct kobject *kobj, struct kobj_type *ktype);
 +
-+Among other things, kobject_init() sets the kobject's reference count to
-+one.  Calling kobject_init() is not sufficient, however. Kobject users
-+must, at a minimum, set the name of the kobject; this is the name that will
-+be used in sysfs entries.  To set the name of a kobject properly, do not
-+attempt to manipulate the internal name field, but instead use:
++The ktype is required for a kobject to be created properly, as every kobject
++must have an associated kobj_type.  Among other things, kobject_init() sets
++the kobject's reference count to one.  After calling kobject_init(), to
++register the kobject with sysfs, the function kobject_add() must be called:
 +
-+    int kobject_set_name(struct kobject *kobj, const char *format, ...);
++    int kobject_add(struct kobject *kobj, struct kobject *parent, const char *fmt, ...);
 +
-+This function takes a printk-style variable argument list. Believe it or
-+not, it is actually possible for this operation to fail; conscientious code
-+should check the return value and react accordingly.
++This sets up the parent of the kobject, and the name for the kobject
++properly.  If the kobject is to be associated with a specific kset, that
++assignment must be done before calling kobject_add().  If a kset is
++associated with a kobject, then the parent for the kobject can be set to
++NULL in the call to kobject_add() and then the kobject will be placed under
++the kset itself.
 +
-+The other kobject fields which should be set, directly or indirectly, by
-+the creator are its ktype, kset, and parent. We will get to those shortly,
-+however please note that the ktype and kset must be set before the
-+kobject_init() function is called.
++As the name of the kobject is set when it is added to the kernel, the name
++of the kobject should never be manipulated directly.  If you must change
++the name of the kobject, call kobject_rename():
 +
++    int kobject_rename(struct kobject *kobj, const char *new_name);
++
++There is a function called kobject_set_name() but that is legacy cruft and
++is being removed.  If your code needs to call this function, it is
++incorrect and needs to be fixed.
++
++To properly access the name of the kobject, use the function
++kobject_name():
++
++    const char *kobject_name(const struct kobject * kobj);
++
++There is a helper function to both initialize and add the kobject to the
++kernel at the same time, called supprisingly enough kobject_init_and_add():
++
++    int kobject_init_and_add(struct kobject *kobj, struct kobj_type *ktype,
++                             struct kobject *parent, const char *fmt, ...);
++
++The arguments are the same as the individual kobject_init() and
++kobject_add() functions described above.
++
++
++Uevents
++
++After a kobject has been registered with the kobject core, it needs to be
++announced to the world that it has been created.  This can be done with
++call to kobject_uevent():
++
++    int kobject_uevent(struct kobject *kobj, enum kobject_action action);
++
++Use the KOBJ_ADD action for when the kobject is first added to the kernel.
++This should be done only after any attributes or children of the kobject
++have been initialized properly, as userspace will instantly start to look
++for them when this call happens.
++
++When the kobject is removed from the kernel (details on how to do that is
++below), the uevent for KOBJ_REMOVE will be automatically created by the
++kobject core, so the caller does not have to worry about doing that by
++hand.
 +
 +
 +Reference counts
@@ -165,30 +204,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +counter for your structure, please use the struct kref instead, a kobject
 +would be overkill.  For more information on how to use struct kref, please
 +see the file, Documentation/kref.txt in the Linux kernel source tree.
-+
-+Hooking into sysfs
-+
-+An initialized kobject will perform reference counting without trouble, but
-+it will not appear in sysfs. To create sysfs entries, kernel code must pass
-+the object to kobject_add():
-+
-+    int kobject_add(struct kobject *kobj);
-+
-+As always, this operation can fail. The function:
-+
-+    void kobject_del(struct kobject *kobj);
-+
-+will remove the kobject from sysfs.
-+
-+There is a kobject_register() function, which is a combination of the calls
-+to kobject_init() and kobject_add() as well as a uevent for the kobject.
-+If kobject_init() and kobject_add() are called on their own, the caller
-+must make sure to call kobject_uevent() at the proper time after the
-+kobject has been fully populated.
-+
-+Like kobject_register(), kobject_unregister() will call kobject_uevent(),
-+then kobject_del(), and then call kobject_put() to release the initial
-+reference created with kobject_register() (or really kobject_init()).
 +
 +
 +Creating "simple" kobjects
@@ -257,6 +272,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +release() method.  Do not try to get rid of this warning by providing an
 +"empty" release function, you will be mocked mercilessly by the kobject
 +maintainer if you attempt this.
++
++Note, the name of the kobject is available in the release function, but it
++must NOT be changed within this callback.  Otherwise there will be a memory
++leak in the kobject core, which makes people unhappy.
 +
 +Interestingly, the release() method is not stored in the kobject itself;
 +instead, it is associated with the ktype. So let us introduce struct
@@ -360,29 +379,21 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +added below the parent kobject.
 +
 +
++Kobject cleaning up
 +
-+Kobject initialization again
++After a kobject has been registered with the kobject core successfully, it
++must be cleaned up when the code is finished with it.  To do that, call
++kobject_unregister(), or kobject_del() followed with a call to
++kobject_put().
 +
-+Now that we have covered all of that stuff, we can talk in detail about how
-+a kobject should be prepared for its existence in the kernel. Here are all
-+of the struct kobject fields which must be initialized somehow:
++Any initialization of the kobject that has been done will be automatically
++cleaned up by the kobject core.  If a KOBJ_ADD uevent has been sent for
++the object, a corrisponding KOBJ_REMOVE uevent will be sent, and any other
++sysfs housekeeping will be handled for the caller properly.
 +
-+ - k_name - the name of the object. This fields should always be
-+   initialized with kobject_set_name(), or specified in the original call
-+   to kobject_create_and_add().
++In the future, the kobject_unregister() call will be going away to help
++clean up the kobject api.
 +
-+ - parent is the kobject's parent in whatever hierarchy it belongs to. It
-+   can be set explicitly by the creator. If parent is NULL when
-+   kobject_add() is called, it will be set to the kobject of the containing
-+   kset.
 +
-+ - kset is a pointer to the kset which will contain this kobject; it should
-+   be set prior to calling kobject_init().
-+
-+ - ktype is the type of the kobject; it should be set prior to calling
-+   kobject_init().
-+
-+Often, much of the initialization of a kobject is handled by the layer that
-+manages the containing kset.  See the sample/kobject/kset-example.c for how
-+this is usually handled.
-+
++For a more complete example of using ksets and kobjects properly, see the
++sample/kobject/kset-example.c code.
