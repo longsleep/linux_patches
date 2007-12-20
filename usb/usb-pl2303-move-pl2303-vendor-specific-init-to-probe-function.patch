@@ -1,0 +1,111 @@
+From saharabeara@gmail.com Fri Dec 14 14:08:22 2007
+From: Sarah Sharp <saharabeara@gmail.com>
+Date: Fri, 14 Dec 2007 14:08:35 -0800
+Subject: USB: pl2303: Move pl2303 vendor specific init to probe function.
+To: Greg KH <greg@kroah.com>, linux-usb@vger.kernel.org
+Message-ID: <0f912f6852b90aa4b7f9a6e2f9d11a88c8a053c0.1197668212.git.saharabeara@gmail.com>
+Content-Disposition: inline
+
+
+Without this fix, the pl2303 usb-serial adapter would not suspend properly
+unless it had been opened first.  A pl2303 type_1 chip will still break if the
+system is hibernated while the RS-232 connector is powered by another system.
+This was broken before, and a reset resume does not fix it.  All other suspend
+and autosuspend scenarios work with ATEN pl2303 adaptors with HX and type_1 chips.
+
+Signed-off-by: Sarah Sharp <saharabeara@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/serial/pl2303.c |   49 +++++++++++++++++++++-----------------------
+ 1 file changed, 24 insertions(+), 25 deletions(-)
+
+--- a/drivers/usb/serial/pl2303.c
++++ b/drivers/usb/serial/pl2303.c
+@@ -336,8 +336,13 @@ static int pl2303_startup(struct usb_ser
+ {
+ 	struct pl2303_private *priv;
+ 	enum pl2303_type type = type_0;
++	unsigned char *buf;
+ 	int i;
+ 
++	buf = kmalloc(10, GFP_KERNEL);
++	if (buf == NULL)
++		return -ENOMEM;
++
+ 	if (serial->dev->descriptor.bDeviceClass == 0x02)
+ 		type = type_0;
+ 	else if (serial->dev->descriptor.bMaxPacketSize0 == 0x40)
+@@ -362,9 +367,27 @@ static int pl2303_startup(struct usb_ser
+ 		priv->type = type;
+ 		usb_set_serial_port_data(serial->port[i], priv);
+ 	}
++
++	pl2303_vendor_read(0x8484, 0, serial, buf);
++	pl2303_vendor_write(0x0404, 0, serial);
++	pl2303_vendor_read(0x8484, 0, serial, buf);
++	pl2303_vendor_read(0x8383, 0, serial, buf);
++	pl2303_vendor_read(0x8484, 0, serial, buf);
++	pl2303_vendor_write(0x0404, 1, serial);
++	pl2303_vendor_read(0x8484, 0, serial, buf);
++	pl2303_vendor_read(0x8383, 0, serial, buf);
++	pl2303_vendor_write(0, 1, serial);
++	pl2303_vendor_write(1, 0, serial);
++	if (type == HX)
++		pl2303_vendor_write(2, 0x44, serial);
++	else
++		pl2303_vendor_write(2, 0x24, serial);
++
++	kfree(buf);
+ 	return 0;
+ 
+ cleanup:
++	kfree(buf);
+ 	for (--i; i>=0; --i) {
+ 		priv = usb_get_serial_port_data(serial->port[i]);
+ 		pl2303_buf_free(priv->buf);
+@@ -681,7 +704,6 @@ static int pl2303_open(struct usb_serial
+ 	struct ktermios tmp_termios;
+ 	struct usb_serial *serial = port->serial;
+ 	struct pl2303_private *priv = usb_get_serial_port_data(port);
+-	unsigned char *buf;
+ 	int result;
+ 
+ 	dbg("%s -  port %d", __FUNCTION__, port->number);
+@@ -689,35 +711,12 @@ static int pl2303_open(struct usb_serial
+ 	if (priv->type != HX) {
+ 		usb_clear_halt(serial->dev, port->write_urb->pipe);
+ 		usb_clear_halt(serial->dev, port->read_urb->pipe);
+-	}
+-
+-	buf = kmalloc(10, GFP_KERNEL);
+-	if (buf==NULL)
+-		return -ENOMEM;
+-
+-	pl2303_vendor_read(0x8484, 0, serial, buf);
+-	pl2303_vendor_write(0x0404, 0, serial);
+-	pl2303_vendor_read(0x8484, 0, serial, buf);
+-	pl2303_vendor_read(0x8383, 0, serial, buf);
+-	pl2303_vendor_read(0x8484, 0, serial, buf);
+-	pl2303_vendor_write(0x0404, 1, serial);
+-	pl2303_vendor_read(0x8484, 0, serial, buf);
+-	pl2303_vendor_read(0x8383, 0, serial, buf);
+-	pl2303_vendor_write(0, 1, serial);
+-	pl2303_vendor_write(1, 0, serial);
+-
+-	if (priv->type == HX) {
+-		/* HX chip */
+-		pl2303_vendor_write(2, 0x44, serial);
++	} else {
+ 		/* reset upstream data pipes */
+ 		pl2303_vendor_write(8, 0, serial);
+ 		pl2303_vendor_write(9, 0, serial);
+-	} else {
+-		pl2303_vendor_write(2, 0x24, serial);
+ 	}
+ 
+-	kfree(buf);
+-
+ 	/* Setup termios */
+ 	if (port->tty) {
+ 		pl2303_set_termios(port, &tmp_termios);

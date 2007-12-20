@@ -1,0 +1,97 @@
+From linux-usb-owner@vger.kernel.org Mon Dec  3 12:45:08 2007
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Mon, 3 Dec 2007 15:44:29 -0500 (EST)
+Subject: USB: updates to usb_reset_composite_device()
+To: Greg KH <greg@kroah.com>
+Message-ID: <Pine.LNX.4.44L0.0712031543120.2944-100000@iolanthe.rowland.org>
+
+
+This patch (as1023) updates the code in usb_reset_composite_device():
+
+	Some local variable declarations are moved to inner loops.
+
+	The interface locks are not acquired.  This isn't necessary
+	any more; its only reason was to prevent an interface from
+	being suspended or resumed during the reset.  But now
+	interface power management is controlled by the USB device
+	lock, not by the interface lock.
+
+	The check for whether the interface is registered is removed.
+	There doesn't seem to be any reason for checking; a driver
+	for a non-registered interface deserves to be informed of
+	device resets just as much as any other.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/hub.c |   32 +++++++++-----------------------
+ 1 file changed, 9 insertions(+), 23 deletions(-)
+
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -3125,16 +3125,12 @@ EXPORT_SYMBOL(usb_reset_device);
+  * this from a driver probe() routine after downloading new firmware.
+  * For calls that might not occur during probe(), drivers should lock
+  * the device using usb_lock_device_for_reset().
+- *
+- * The interface locks are acquired during the pre_reset stage and released
+- * during the post_reset stage.  However if iface is not NULL and is
+- * currently being probed, we assume that the caller already owns its
+- * lock.
+  */
+ int usb_reset_composite_device(struct usb_device *udev,
+ 		struct usb_interface *iface)
+ {
+ 	int ret;
++	int i;
+ 	struct usb_host_config *config = udev->actconfig;
+ 
+ 	if (udev->state == USB_STATE_NOTATTACHED ||
+@@ -3151,16 +3147,11 @@ int usb_reset_composite_device(struct us
+ 		iface = NULL;
+ 
+ 	if (config) {
+-		int i;
+-		struct usb_interface *cintf;
+-		struct usb_driver *drv;
+-
+ 		for (i = 0; i < config->desc.bNumInterfaces; ++i) {
+-			cintf = config->interface[i];
+-			if (cintf != iface)
+-				down(&cintf->dev.sem);
+-			if (device_is_registered(&cintf->dev) &&
+-					cintf->dev.driver) {
++			struct usb_interface *cintf = config->interface[i];
++			struct usb_driver *drv;
++
++			if (cintf->dev.driver) {
+ 				drv = to_usb_driver(cintf->dev.driver);
+ 				if (drv->pre_reset)
+ 					(drv->pre_reset)(cintf);
+@@ -3172,21 +3163,16 @@ int usb_reset_composite_device(struct us
+ 	ret = usb_reset_device(udev);
+ 
+ 	if (config) {
+-		int i;
+-		struct usb_interface *cintf;
+-		struct usb_driver *drv;
+-
+ 		for (i = config->desc.bNumInterfaces - 1; i >= 0; --i) {
+-			cintf = config->interface[i];
+-			if (device_is_registered(&cintf->dev) &&
+-					cintf->dev.driver) {
++			struct usb_interface *cintf = config->interface[i];
++			struct usb_driver *drv;
++
++			if (cintf->dev.driver) {
+ 				drv = to_usb_driver(cintf->dev.driver);
+ 				if (drv->post_reset)
+ 					(drv->post_reset)(cintf);
+ 	/* FIXME: Unbind if post_reset returns an error or isn't defined */
+ 			}
+-			if (cintf != iface)
+-				up(&cintf->dev.sem);
+ 		}
+ 	}
+ 
