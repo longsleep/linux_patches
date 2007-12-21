@@ -1,0 +1,100 @@
+From linux-usb-owner@vger.kernel.org Sun Dec 16 22:37:54 2007
+From: Masashi Kimoto <Masashi_Kimoto@hq.scei.sony.co.jp>
+Date: Sun, 16 Dec 2007 22:37:40 -0800
+Subject: USB: PS3: Fix EHCI ISO transfer bug
+To: dbrownell@users.sourceforge.net
+Cc: linux-usb@vger.kernel.org, David Woodhouse <dwmw2@infradead.org>, greg@kroah.com
+Message-ID: <47661934.5070302@am.sony.com>
+
+
+From: Masashi Kimoto <Masashi_Kimoto@hq.scei.sony.co.jp>
+
+The EHCI host controller in the Cell Processor's Super Companion
+Chip has a hardware errata in its handling of ISO TDs.  The
+controller will continue to access the TD after the transaction
+active bit has been cleared.  The condition can be avoided by
+delaying the reuse of the TD until the frame number changes.
+This change adds a static helper routine itd_in_use() to the EHCI
+host controller driver which is conditionaly compiled to include
+the check.
+
+The following errors are typical of those seen with the PS3's
+built-in USB Bluetooth controller: 
+
+  ps3-ehci-driver sb_04: port 1 resume error -19
+  hub 2-0:1.0: hub_port_status failed (err = -32)
+
+From: Masashi Kimoto <Masashi_Kimoto@hq.scei.sony.co.jp>
+Signed-off-by: Geoff Levand <geoffrey.levand@am.sony.com>
+Cc: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/ehci-sched.c |   42 ++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 38 insertions(+), 4 deletions(-)
+
+--- a/drivers/usb/host/ehci-sched.c
++++ b/drivers/usb/host/ehci-sched.c
+@@ -1069,6 +1069,32 @@ iso_stream_find (struct ehci_hcd *ehci, 
+ 	return stream;
+ }
+ 
++/**
++ * itd_in_use -  Fix for Cell Super Companion Chip ISO transfers
++ *
++ * The EHCI host controller in the Cell Processor's Super Companion
++ * Chip has a hardware errata in its handling of ISO TDs.  The
++ * controller will continue to access the TD after the transaction
++ * active bit has been cleared.  The condition can be avoided by
++ * delaying the reuse of the TD until the frame number changes.
++ */
++
++#if defined(CONFIG_PPC_PS3)
++#include <asm/firmware.h>
++
++static int itd_in_use(struct ehci_hcd *ehci, unsigned int itd_frame)
++{
++	return (firmware_has_feature(FW_FEATURE_PS3_LV1)
++		&& (itd_frame == (ehci_readl(ehci,
++		&ehci->regs->frame_index) >> 3) % ehci->periodic_size));
++}
++#else
++static int itd_in_use(struct ehci_hcd *ehci, unsigned int itd_frame)
++{
++	return 0;
++}
++#endif /* defined(CONFIG_PPC_PS3) */
++
+ /*-------------------------------------------------------------------------*/
+ 
+ /* ehci_iso_sched ops can be ITD-only or SITD-only */
+@@ -1180,8 +1206,12 @@ itd_urb_transaction (
+ 		if (likely (!list_empty(&stream->free_list))) {
+ 			itd = list_entry (stream->free_list.prev,
+ 					struct ehci_itd, itd_list);
+-			list_del (&itd->itd_list);
+-			itd_dma = itd->itd_dma;
++			if (itd_in_use(ehci, itd->frame))
++				itd = NULL;
++			else {
++				list_del (&itd->itd_list);
++				itd_dma = itd->itd_dma;
++			}
+ 		} else
+ 			itd = NULL;
+ 
+@@ -1807,8 +1837,12 @@ sitd_urb_transaction (
+ 		if (!list_empty(&stream->free_list)) {
+ 			sitd = list_entry (stream->free_list.prev,
+ 					 struct ehci_sitd, sitd_list);
+-			list_del (&sitd->sitd_list);
+-			sitd_dma = sitd->sitd_dma;
++			if (itd_in_use(ehci, sitd->frame))
++				sitd = NULL;
++			else {
++				list_del (&sitd->sitd_list);
++				sitd_dma = sitd->sitd_dma;
++			}
+ 		} else
+ 			sitd = NULL;
+ 
