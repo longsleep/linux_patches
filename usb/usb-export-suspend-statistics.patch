@@ -1,0 +1,155 @@
+From saharabeara@gmail.com  Fri Jan 11 10:36:23 2008
+From: Sarah Sharp <saharabeara@gmail.com>
+Date: Fri, 21 Dec 2007 16:54:15 -0800
+Subject: USB: Export suspend statistics
+To: Greg KH <greg@kroah.com>
+Cc: linux-usb@vger.kernel.org, Arjan Van De Ven <arjan@linux.intel.com>
+Message-ID: <20071222005415.GA4228@localdomain>
+Content-Disposition: inline
+
+
+This patch exports two statistics to userspace:
+/sys/bus/usb/device/.../power/connected_duration
+/sys/bus/usb/device/.../power/active_duration
+
+connected_duration is the total time (in jiffies) that the device has
+been connected.  active_duration is the total time the device has not
+been suspended.  With these two statistics, tools like PowerTOP can
+calculate the percentage time that a device is active, i.e. not
+suspended or auto-suspended.
+
+Users can also use the active_duration to check if a device is actually
+autosuspended.  Currently, they can set power/level to auto and
+power/autosuspend to a positive timeout, but there's no way to know from
+userspace if a device was actually autosuspended without looking at the
+dmesg output.  These statistics will be useful in creating an automated
+userspace script to test autosuspend for USB devices.
+
+Signed-off-by: Sarah Sharp <saharabeara@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/hub.c   |   10 +++++++++-
+ drivers/usb/core/sysfs.c |   46 ++++++++++++++++++++++++++++++++++++++++++++++
+ drivers/usb/core/usb.c   |    2 ++
+ include/linux/usb.h      |    2 ++
+ 4 files changed, 59 insertions(+), 1 deletion(-)
+
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -1034,8 +1034,10 @@ static void recursively_mark_NOTATTACHED
+ 		if (udev->children[i])
+ 			recursively_mark_NOTATTACHED(udev->children[i]);
+ 	}
+-	if (udev->state == USB_STATE_SUSPENDED)
++	if (udev->state == USB_STATE_SUSPENDED) {
+ 		udev->discon_suspended = 1;
++		udev->active_duration -= jiffies;
++	}
+ 	udev->state = USB_STATE_NOTATTACHED;
+ }
+ 
+@@ -1084,6 +1086,12 @@ void usb_set_device_state(struct usb_dev
+ 			else
+ 				device_init_wakeup(&udev->dev, 0);
+ 		}
++		if (udev->state == USB_STATE_SUSPENDED &&
++			new_state != USB_STATE_SUSPENDED)
++			udev->active_duration -= jiffies;
++		else if (new_state == USB_STATE_SUSPENDED &&
++				udev->state != USB_STATE_SUSPENDED)
++			udev->active_duration += jiffies;
+ 		udev->state = new_state;
+ 	} else
+ 		recursively_mark_NOTATTACHED(udev);
+--- a/drivers/usb/core/sysfs.c
++++ b/drivers/usb/core/sysfs.c
+@@ -249,6 +249,38 @@ static void remove_persist_attributes(st
+ #ifdef	CONFIG_USB_SUSPEND
+ 
+ static ssize_t
++show_connected_duration(struct device *dev, struct device_attribute *attr,
++		char *buf)
++{
++	struct usb_device *udev = to_usb_device(dev);
++
++	return sprintf(buf, "%lu\n", jiffies - udev->connect_time);
++}
++
++static DEVICE_ATTR(connected_duration, S_IRUGO, show_connected_duration, NULL);
++
++/*
++ * If the device is resumed, the last time the device was suspended has
++ * been pre-subtracted from active_duration.  We add the current time to
++ * get the duration that the device was actually active.
++ *
++ * If the device is suspended, the active_duration is up-to-date.
++ */
++static ssize_t
++show_active_duration(struct device *dev, struct device_attribute *attr,
++		char *buf)
++{
++	struct usb_device *udev = to_usb_device(dev);
++
++	if (udev->state != USB_STATE_SUSPENDED)
++		return sprintf(buf, "%lu\n", jiffies + udev->active_duration);
++	else
++		return sprintf(buf, "%lu\n", udev->active_duration);
++}
++
++static DEVICE_ATTR(active_duration, S_IRUGO, show_active_duration, NULL);
++
++static ssize_t
+ show_autosuspend(struct device *dev, struct device_attribute *attr, char *buf)
+ {
+ 	struct usb_device *udev = to_usb_device(dev);
+@@ -365,6 +397,14 @@ static int add_power_attributes(struct d
+ 			rc = sysfs_add_file_to_group(&dev->kobj,
+ 					&dev_attr_level.attr,
+ 					power_group);
++		if (rc == 0)
++			rc = sysfs_add_file_to_group(&dev->kobj,
++					&dev_attr_connected_duration.attr,
++					power_group);
++		if (rc == 0)
++			rc = sysfs_add_file_to_group(&dev->kobj,
++					&dev_attr_active_duration.attr,
++					power_group);
+ 	}
+ 	return rc;
+ }
+@@ -372,6 +412,12 @@ static int add_power_attributes(struct d
+ static void remove_power_attributes(struct device *dev)
+ {
+ 	sysfs_remove_file_from_group(&dev->kobj,
++			&dev_attr_active_duration.attr,
++			power_group);
++	sysfs_remove_file_from_group(&dev->kobj,
++			&dev_attr_connected_duration.attr,
++			power_group);
++	sysfs_remove_file_from_group(&dev->kobj,
+ 			&dev_attr_level.attr,
+ 			power_group);
+ 	sysfs_remove_file_from_group(&dev->kobj,
+--- a/drivers/usb/core/usb.c
++++ b/drivers/usb/core/usb.c
+@@ -339,6 +339,8 @@ usb_alloc_dev(struct usb_device *parent,
+ 	mutex_init(&dev->pm_mutex);
+ 	INIT_DELAYED_WORK(&dev->autosuspend, usb_autosuspend_work);
+ 	dev->autosuspend_delay = usb_autosuspend_delay * HZ;
++	dev->connect_time = jiffies;
++	dev->active_duration = -jiffies;
+ #endif
+ 	if (root_hub)	/* Root hub always ok [and always wired] */
+ 		dev->authorized = 1;
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -425,6 +425,8 @@ struct usb_device {
+ 
+ 	unsigned long last_busy;	/* time of last use */
+ 	int autosuspend_delay;		/* in jiffies */
++	unsigned long active_duration;	/* total time device is not suspended */
++	unsigned long connect_time;	/* time device was first connected */
+ 
+ 	unsigned auto_pm:1;		/* autosuspend/resume in progress */
+ 	unsigned do_remote_wakeup:1;	/* remote wakeup should be enabled */
