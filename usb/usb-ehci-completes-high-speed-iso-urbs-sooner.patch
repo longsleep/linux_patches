@@ -1,0 +1,132 @@
+From david-b@pacbell.net  Fri Jan 11 16:51:43 2008
+From: David Brownell <david-b@pacbell.net>
+Date: Mon, 7 Jan 2008 00:47:42 -0800
+Subject: USB: ehci completes high speed ISO URBs sooner
+To: linux-usb@vger.kernel.org
+Cc: Karsten Wiese <fzu@wemgehoertderstaat.de>
+Message-ID: <200801070047.43039.david-b@pacbell.net>
+Content-Disposition: inline
+
+
+This has some bugfixes for the EHCI driver's ISO transfer scanning
+logic.  It was leaving ITDs and SITDs on the schedule too long, for
+a few different reasons, which caused trouble.
+
+  (a)	Look at all microframes for high speed transfers, not just
+	the ones we expect to have finished.  This way transfers
+	ending mid-frame will complete without needing another IRQ.
+	This also minimizes bogus scheduling underruns (e.g. EL2NSYNC).
+
+  (b)	When we encounter an ISO transfer (either speed, but this
+	hits mostly at full speed) that's not yet been completed,
+	immediately stop scanning; we've caught up to the hardware,
+	no matter what other indications might say.
+
+  (c)	Always clean up ITDs (for high speed transfers) when the HC
+	is no longer running.
+
+I'm not sure whether the last one has been observed before, but both
+the others have been reported with "real world" audio and video code.
+
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/ehci-sched.c |   41 +++++++++++++++++++++++++++--------------
+ 1 file changed, 27 insertions(+), 14 deletions(-)
+
+--- a/drivers/usb/host/ehci-sched.c
++++ b/drivers/usb/host/ehci-sched.c
+@@ -2131,17 +2131,9 @@ scan_periodic (struct ehci_hcd *ehci)
+ 	for (;;) {
+ 		union ehci_shadow	q, *q_p;
+ 		__hc32			type, *hw_p;
+-		unsigned		uframes;
++		unsigned		incomplete = false;
+ 
+-		/* don't scan past the live uframe */
+ 		frame = now_uframe >> 3;
+-		if (frame == (clock >> 3))
+-			uframes = now_uframe & 0x07;
+-		else {
+-			/* safe to scan the whole frame at once */
+-			now_uframe |= 0x07;
+-			uframes = 8;
+-		}
+ 
+ restart:
+ 		/* scan each element in frame's queue for completions */
+@@ -2179,12 +2171,15 @@ restart:
+ 				q = q.fstn->fstn_next;
+ 				break;
+ 			case Q_TYPE_ITD:
+-				/* skip itds for later in the frame */
++				/* If this ITD is still active, leave it for
++				 * later processing ... check the next entry.
++				 */
+ 				rmb ();
+-				for (uf = live ? uframes : 8; uf < 8; uf++) {
++				for (uf = 0; uf < 8 && live; uf++) {
+ 					if (0 == (q.itd->hw_transaction [uf]
+ 							& ITD_ACTIVE(ehci)))
+ 						continue;
++					incomplete = true;
+ 					q_p = &q.itd->itd_next;
+ 					hw_p = &q.itd->hw_next;
+ 					type = Q_NEXT_TYPE(ehci,
+@@ -2192,10 +2187,12 @@ restart:
+ 					q = *q_p;
+ 					break;
+ 				}
+-				if (uf != 8)
++				if (uf < 8 && live)
+ 					break;
+ 
+-				/* this one's ready ... HC won't cache the
++				/* Take finished ITDs out of the schedule
++				 * and process them:  recycle, maybe report
++				 * URB completion.  HC won't cache the
+ 				 * pointer for much longer, if at all.
+ 				 */
+ 				*q_p = q.itd->itd_next;
+@@ -2206,8 +2203,12 @@ restart:
+ 				q = *q_p;
+ 				break;
+ 			case Q_TYPE_SITD:
++				/* If this SITD is still active, leave it for
++				 * later processing ... check the next entry.
++				 */
+ 				if ((q.sitd->hw_results & SITD_ACTIVE(ehci))
+ 						&& live) {
++					incomplete = true;
+ 					q_p = &q.sitd->sitd_next;
+ 					hw_p = &q.sitd->hw_next;
+ 					type = Q_NEXT_TYPE(ehci,
+@@ -2215,6 +2216,11 @@ restart:
+ 					q = *q_p;
+ 					break;
+ 				}
++
++				/* Take finished SITDs out of the schedule
++				 * and process them:  recycle, maybe report
++				 * URB completion.
++				 */
+ 				*q_p = q.sitd->sitd_next;
+ 				*hw_p = q.sitd->hw_next;
+ 				type = Q_NEXT_TYPE(ehci, q.sitd->hw_next);
+@@ -2240,7 +2246,14 @@ restart:
+ 			}
+ 		}
+ 
+-		/* stop when we catch up to the HC */
++		/* If we can tell we caught up to the hardware, stop now.
++		 * We can't advance our scan without collecting the ISO
++		 * transfers that are still pending in this frame.
++		 */
++		if (incomplete && HC_IS_RUNNING(ehci_to_hcd(ehci)->state)) {
++			ehci->next_uframe = now_uframe;
++			break;
++		}
+ 
+ 		// FIXME:  this assumes we won't get lapped when
+ 		// latencies climb; that should be rare, but...
