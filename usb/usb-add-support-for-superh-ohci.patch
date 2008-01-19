@@ -1,0 +1,201 @@
+From shimoda.yoshihiro@renesas.com  Fri Jan 18 16:49:00 2008
+From: Yoshihiro Shimoda <shimoda.yoshihiro@renesas.com>
+Date: Fri, 11 Jan 2008 22:56:15 +0900
+Subject: USB: add support for SuperH OHCI
+To: greg@kroah.com
+Cc: linux-usb-devel@lists.sourceforge.net
+Message-ID: <4787757F.10503@renesas.com>
+
+
+add support for SuperH OHCI.
+
+supported CPU are:
+ - SH7720
+ - SH7721
+ - SH7763
+
+Signed-off-by: Yoshihiro Shimoda <shimoda.yoshihiro@renesas.com>
+Cc: David Brownell <david-b@pacbell.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/Kconfig         |    4 +
+ drivers/usb/host/ohci-hcd.c |    7 ++
+ drivers/usb/host/ohci-sh.c  |  143 ++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 154 insertions(+)
+
+--- a/drivers/usb/Kconfig
++++ b/drivers/usb/Kconfig
+@@ -41,6 +41,10 @@ config USB_ARCH_HAS_OHCI
+ 	default y if PPC_MPC52xx
+ 	# MIPS:
+ 	default y if SOC_AU1X00
++	# SH:
++	default y if CPU_SUBTYPE_SH7720
++	default y if CPU_SUBTYPE_SH7721
++	default y if CPU_SUBTYPE_SH7763
+ 	# more:
+ 	default PCI
+ 
+--- a/drivers/usb/host/ohci-hcd.c
++++ b/drivers/usb/host/ohci-hcd.c
+@@ -1029,6 +1029,13 @@ MODULE_LICENSE ("GPL");
+ #define PLATFORM_DRIVER		usb_hcd_pnx4008_driver
+ #endif
+ 
++#if defined(CONFIG_CPU_SUBTYPE_SH7720) || \
++    defined(CONFIG_CPU_SUBTYPE_SH7721) || \
++    defined(CONFIG_CPU_SUBTYPE_SH7763)
++#include "ohci-sh.c"
++#define PLATFORM_DRIVER		ohci_hcd_sh_driver
++#endif
++
+ 
+ #ifdef CONFIG_USB_OHCI_HCD_PPC_OF
+ #include "ohci-ppc-of.c"
+--- /dev/null
++++ b/drivers/usb/host/ohci-sh.c
+@@ -0,0 +1,143 @@
++/*
++ * OHCI HCD (Host Controller Driver) for USB.
++ *
++ * Copyright (C) 2008 Renesas Solutions Corp.
++ *
++ * Author : Yoshihiro Shimoda <shimoda.yoshihiro@renesas.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
++ *
++ */
++
++#include <linux/platform_device.h>
++
++static int ohci_sh_start(struct usb_hcd *hcd)
++{
++	struct ohci_hcd	*ohci = hcd_to_ohci(hcd);
++
++	ohci_hcd_init(ohci);
++	ohci_init(ohci);
++	ohci_run(ohci);
++	hcd->state = HC_STATE_RUNNING;
++	return 0;
++}
++
++static const struct hc_driver ohci_sh_hc_driver = {
++	.description =		hcd_name,
++	.product_desc =		"SuperH OHCI",
++	.hcd_priv_size =	sizeof(struct ohci_hcd),
++
++	/*
++	 * generic hardware linkage
++	 */
++	.irq =			ohci_irq,
++	.flags =		HCD_USB11 | HCD_MEMORY,
++
++	/*
++	 * basic lifecycle operations
++	 */
++	.start =		ohci_sh_start,
++	.stop =			ohci_stop,
++	.shutdown =		ohci_shutdown,
++
++	/*
++	 * managing i/o requests and associated device resources
++	 */
++	.urb_enqueue =		ohci_urb_enqueue,
++	.urb_dequeue =		ohci_urb_dequeue,
++	.endpoint_disable =	ohci_endpoint_disable,
++
++	/*
++	 * scheduling support
++	 */
++	.get_frame_number =	ohci_get_frame,
++
++	/*
++	 * root hub support
++	 */
++	.hub_status_data =	ohci_hub_status_data,
++	.hub_control =		ohci_hub_control,
++	.hub_irq_enable =	ohci_rhsc_enable,
++#ifdef	CONFIG_PM
++	.bus_suspend =		ohci_bus_suspend,
++	.bus_resume =		ohci_bus_resume,
++#endif
++	.start_port_reset =	ohci_start_port_reset,
++};
++
++/*-------------------------------------------------------------------------*/
++
++#define resource_len(r) (((r)->end - (r)->start) + 1)
++static int ohci_hcd_sh_probe(struct platform_device *pdev)
++{
++	struct resource *res = NULL;
++	struct usb_hcd *hcd = NULL;
++	int irq = -1;
++	int ret;
++
++	if (usb_disabled())
++		return -ENODEV;
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res) {
++		err("platform_get_resource error.");
++		return -ENODEV;
++	}
++
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0) {
++		err("platform_get_irq error.");
++		return -ENODEV;
++	}
++
++	/* initialize hcd */
++	hcd = usb_create_hcd(&ohci_sh_hc_driver, &pdev->dev, (char *)hcd_name);
++	if (!hcd) {
++		err("Failed to create hcd");
++		return -ENOMEM;
++	}
++
++	hcd->regs = (void __iomem *)res->start;
++	hcd->rsrc_start = res->start;
++	hcd->rsrc_len = resource_len(res);
++	ret = usb_add_hcd(hcd, irq, IRQF_DISABLED);
++	if (ret != 0) {
++		err("Failed to add hcd");
++		usb_put_hcd(hcd);
++		return ret;
++	}
++
++	return ret;
++}
++
++static int ohci_hcd_sh_remove(struct platform_device *pdev)
++{
++	struct usb_hcd *hcd = platform_get_drvdata(pdev);
++
++	usb_remove_hcd(hcd);
++	usb_put_hcd(hcd);
++
++	return 0;
++}
++
++static struct platform_driver ohci_hcd_sh_driver = {
++	.probe		= ohci_hcd_sh_probe,
++	.remove		= ohci_hcd_sh_remove,
++	.shutdown	= usb_hcd_platform_shutdown,
++	.driver		= {
++		.name	= "sh_ohci",
++		.owner	= THIS_MODULE,
++	},
++};
++
