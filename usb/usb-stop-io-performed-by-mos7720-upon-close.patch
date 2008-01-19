@@ -1,0 +1,139 @@
+From oliver@neukum.org  Fri Jan 18 17:29:50 2008
+From: Oliver Neukum <oliver@neukum.org>
+Date: Wed, 16 Jan 2008 17:18:52 +0100
+Subject: USB: stop io performed by mos7720 upon close()
+To: Alan Stern <stern@rowland.harvard.edu>
+Cc: linux-usb@vger.kernel.org, Greg KH <greg@kroah.com>, Sarah Sharp <saharabeara@gmail.com>, Vijaya Kumar <vijaykumar.gn@gmail.com>, Ajay Kumar <naanuajay@yahoo.com>, Gurudeva <ngurudeva@yahoo.com>
+Message-ID: <200801161718.53765.oliver@neukum.org>
+Content-Disposition: inline
+
+This fixes a problem where the mos7720 driver will make io to a device from
+which it has been logically disconnected. It does so by introducing a flag by
+which the generic usb serial code can signal the subdrivers their
+disconnection and appropriate locking.
+
+Signed-off-by: Oliver Neukum <oneukum@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ drivers/usb/serial/mos7720.c    |   33 ++++++++++++++++++---------------
+ drivers/usb/serial/usb-serial.c |   28 ++++++++++++++--------------
+ include/linux/usb/serial.h      |    2 ++
+ 3 files changed, 34 insertions(+), 29 deletions(-)
+
+--- a/drivers/usb/serial/mos7720.c
++++ b/drivers/usb/serial/mos7720.c
+@@ -564,22 +564,25 @@ static void mos7720_close(struct usb_ser
+ 	}
+ 
+ 	/* While closing port, shutdown all bulk read, write  *
+-	 * and interrupt read if they exists                  */
+-	if (serial->dev) {
+-		dbg("Shutdown bulk write");
+-		usb_kill_urb(port->write_urb);
+-		dbg("Shutdown bulk read");
+-		usb_kill_urb(port->read_urb);
++	 * and interrupt read if they exists, otherwise nop   */
++	dbg("Shutdown bulk write");
++	usb_kill_urb(port->write_urb);
++	dbg("Shutdown bulk read");
++	usb_kill_urb(port->read_urb);
++
++	mutex_lock(&serial->disc_mutex);
++	/* these commands must not be issued if the device has
++	 * been disconnected */
++	if (!serial->disconnected) {
++		data = 0x00;
++		send_mos_cmd(serial, MOS_WRITE, port->number - port->serial->minor,
++			     0x04, &data);
++
++		data = 0x00;
++		send_mos_cmd(serial, MOS_WRITE, port->number - port->serial->minor,
++			     0x01, &data);
+ 	}
+-
+-	data = 0x00;
+-	send_mos_cmd(serial, MOS_WRITE, port->number - port->serial->minor,
+-		     0x04, &data);
+-
+-	data = 0x00;
+-	send_mos_cmd(serial, MOS_WRITE, port->number - port->serial->minor,
+-		     0x01, &data);
+-
++	mutex_unlock(&serial->disc_mutex);
+ 	mos7720_port->open = 0;
+ 
+ 	dbg("Leaving %s", __FUNCTION__);
+--- a/drivers/usb/serial/usb-serial.c
++++ b/drivers/usb/serial/usb-serial.c
+@@ -634,6 +634,7 @@ static struct usb_serial * create_serial
+ 	serial->type = driver;
+ 	serial->interface = interface;
+ 	kref_init(&serial->kref);
++	mutex_init(&serial->disc_mutex);
+ 
+ 	return serial;
+ }
+@@ -1089,20 +1090,22 @@ void usb_serial_disconnect(struct usb_in
+ 	usb_serial_console_disconnect(serial);
+ 	dbg ("%s", __FUNCTION__);
+ 
++	mutex_lock(&serial->disc_mutex);
+ 	usb_set_intfdata (interface, NULL);
+-	if (serial) {
+-		for (i = 0; i < serial->num_ports; ++i) {
+-			port = serial->port[i];
+-			if (port) {
+-				if (port->tty)
+-					tty_hangup(port->tty);
+-				kill_traffic(port);
+-			}
++	/* must set a flag, to signal subdrivers */
++	serial->disconnected = 1;
++	for (i = 0; i < serial->num_ports; ++i) {
++		port = serial->port[i];
++		if (port) {
++			if (port->tty)
++				tty_hangup(port->tty);
++			kill_traffic(port);
+ 		}
+-		/* let the last holder of this object 
+-		 * cause it to be cleaned up */
+-		usb_serial_put(serial);
+ 	}
++	/* let the last holder of this object
++	 * cause it to be cleaned up */
++	mutex_unlock(&serial->disc_mutex);
++	usb_serial_put(serial);
+ 	dev_info(dev, "device disconnected\n");
+ }
+ 
+@@ -1112,9 +1115,6 @@ int usb_serial_suspend(struct usb_interf
+ 	struct usb_serial_port *port;
+ 	int i, r = 0;
+ 
+-	if (!serial) /* device has been disconnected */
+-		return 0;
+-
+ 	for (i = 0; i < serial->num_ports; ++i) {
+ 		port = serial->port[i];
+ 		if (port)
+--- a/include/linux/usb/serial.h
++++ b/include/linux/usb/serial.h
+@@ -129,6 +129,7 @@ struct usb_serial {
+ 	struct usb_device *		dev;
+ 	struct usb_serial_driver *	type;
+ 	struct usb_interface *		interface;
++	unsigned char			disconnected;
+ 	unsigned char			minor;
+ 	unsigned char			num_ports;
+ 	unsigned char			num_port_pointers;
+@@ -138,6 +139,7 @@ struct usb_serial {
+ 	char				num_bulk_out;
+ 	struct usb_serial_port *	port[MAX_NUM_PORTS];
+ 	struct kref			kref;
++	struct mutex			disc_mutex;
+ 	void *				private;
+ };
+ #define to_usb_serial(d) container_of(d, struct usb_serial, kref)
