@@ -1,0 +1,137 @@
+From oliver@neukum.org  Tue Jan 22 14:12:35 2008
+From: Oliver Neukum <oliver@neukum.org>
+Date: Mon, 21 Jan 2008 17:44:10 +0100
+Subject: USB: make sure usb serial drivers don't flush to logically disconnected devices
+To: Greg KH <greg@kroah.com>, linux-usb@vger.kernel.org
+Message-ID: <200801211744.11066.oliver@neukum.org>
+Content-Disposition: inline
+
+
+If disconnect() is called for a logical disconnect, no more IO must be
+done after disconnect() returns, or the old and new drivers may conflict.
+This patch avoids this by using the flag and lock introduced by the earlier
+patch for the mos7720 driver.
+
+Signed-off-by: Oliver Neukum <oneukum@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/serial/mct_u232.c  |   17 +++++++++--------
+ drivers/usb/serial/option.c    |    5 ++++-
+ drivers/usb/serial/sierra.c    |    5 ++++-
+ drivers/usb/serial/visor.c     |   22 +++++++++++++---------
+ drivers/usb/serial/whiteheat.c |    7 +++++--
+ 5 files changed, 35 insertions(+), 21 deletions(-)
+
+--- a/drivers/usb/serial/mct_u232.c
++++ b/drivers/usb/serial/mct_u232.c
+@@ -487,21 +487,22 @@ error:
+ static void mct_u232_close (struct usb_serial_port *port, struct file *filp)
+ {
+ 	unsigned int c_cflag;
+-	unsigned long flags;
+ 	unsigned int control_state;
+ 	struct mct_u232_private *priv = usb_get_serial_port_data(port);
+ 	dbg("%s port %d", __FUNCTION__, port->number);
+ 
+    	if (port->tty) {
+ 		c_cflag = port->tty->termios->c_cflag;
+-		if (c_cflag & HUPCL) {
+-		   /* drop DTR and RTS */
+-		   spin_lock_irqsave(&priv->lock, flags);
+-		   priv->control_state &= ~(TIOCM_DTR | TIOCM_RTS);
+-		   control_state = priv->control_state;
+-		   spin_unlock_irqrestore(&priv->lock, flags);
+-		   mct_u232_set_modem_ctrl(port->serial, control_state);
++		mutex_lock(&port->serial->disc_mutex);
++		if (c_cflag & HUPCL && !port->serial->disconnected) {
++			/* drop DTR and RTS */
++			spin_lock_irq(&priv->lock);
++			priv->control_state &= ~(TIOCM_DTR | TIOCM_RTS);
++			control_state = priv->control_state;
++			spin_unlock_irq(&priv->lock);
++			mct_u232_set_modem_ctrl(port->serial, control_state);
+ 		}
++		mutex_unlock(&port->serial->disc_mutex);
+ 	}
+ 
+ 
+--- a/drivers/usb/serial/option.c
++++ b/drivers/usb/serial/option.c
+@@ -640,7 +640,10 @@ static void option_close(struct usb_seri
+ 	portdata->dtr_state = 0;
+ 
+ 	if (serial->dev) {
+-		option_send_setup(port);
++		mutex_lock(&serial->disc_mutex);
++		if (!serial->disconnected)
++			option_send_setup(port);
++		mutex_unlock(&serial->disc_mutex);
+ 
+ 		/* Stop reading/writing urbs */
+ 		for (i = 0; i < N_IN_URB; i++)
+--- a/drivers/usb/serial/sierra.c
++++ b/drivers/usb/serial/sierra.c
+@@ -597,7 +597,10 @@ static void sierra_close(struct usb_seri
+ 	portdata->dtr_state = 0;
+ 
+ 	if (serial->dev) {
+-		sierra_send_setup(port);
++		mutex_lock(&serial->disc_mutex);
++		if (!serial->disconnected)
++			sierra_send_setup(port);
++		mutex_unlock(&serial->disc_mutex);
+ 
+ 		/* Stop reading/writing urbs */
+ 		for (i = 0; i < N_IN_URB; i++)
+--- a/drivers/usb/serial/visor.c
++++ b/drivers/usb/serial/visor.c
+@@ -349,16 +349,20 @@ static void visor_close (struct usb_seri
+ 	usb_kill_urb(port->read_urb);
+ 	usb_kill_urb(port->interrupt_in_urb);
+ 
+-	/* Try to send shutdown message, if the device is gone, this will just fail. */
+-	transfer_buffer =  kmalloc (0x12, GFP_KERNEL);
+-	if (transfer_buffer) {
+-		usb_control_msg (port->serial->dev,
+-				 usb_rcvctrlpipe(port->serial->dev, 0),
+-				 VISOR_CLOSE_NOTIFICATION, 0xc2,
+-				 0x0000, 0x0000, 
+-				 transfer_buffer, 0x12, 300);
+-		kfree (transfer_buffer);
++	mutex_lock(&port->serial->disc_mutex);
++	if (!port->serial->disconnected) {
++		/* Try to send shutdown message, unless the device is gone */
++		transfer_buffer =  kmalloc (0x12, GFP_KERNEL);
++		if (transfer_buffer) {
++			usb_control_msg (port->serial->dev,
++					 usb_rcvctrlpipe(port->serial->dev, 0),
++					 VISOR_CLOSE_NOTIFICATION, 0xc2,
++					 0x0000, 0x0000,
++					 transfer_buffer, 0x12, 300);
++			kfree (transfer_buffer);
++		}
+ 	}
++	mutex_lock(&port->serial->disc_mutex);
+ 
+ 	if (stats)
+ 		dev_info(&port->dev, "Bytes In = %d  Bytes Out = %d\n",
+--- a/drivers/usb/serial/whiteheat.c
++++ b/drivers/usb/serial/whiteheat.c
+@@ -658,11 +658,14 @@ static void whiteheat_close(struct usb_s
+ 	struct list_head *tmp2;
+ 
+ 	dbg("%s - port %d", __FUNCTION__, port->number);
+-	
++
++	mutex_lock(&port->serial->disc_mutex);
+ 	/* filp is NULL when called from usb_serial_disconnect */
+-	if (filp && (tty_hung_up_p(filp))) {
++	if ((filp && (tty_hung_up_p(filp))) || port->serial->disconnected) {
++		mutex_unlock(&port->serial->disc_mutex);
+ 		return;
+ 	}
++	mutex_unlock(&port->serial->disc_mutex);
+ 
+ 	port->tty->closing = 1;
+ 
