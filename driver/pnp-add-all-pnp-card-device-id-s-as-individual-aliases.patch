@@ -1,0 +1,159 @@
+From kay.sievers@vrfy.org Wed Feb 20 16:29:23 2008
+From: Kay Sievers <kay.sievers@vrfy.org>
+Date: Thu, 21 Feb 2008 00:35:54 +0100
+Subject: PNP: add all PNP card device id's as individual aliases
+Message-ID: <1203550554.2894.6.camel@lov.site>
+
+
+The current PNP combined card + devices module aliase can
+never ever match anything, because these values are not available
+all at the same time to request a module.
+
+Instead of adding the combined alias, we add the device id's
+all as individual aliases. Device id's are exported by the PNP
+bus and can now properly used to request the loading of a
+matching module.
+
+The module snd-sbawe currently exports aliases, which can never
+match anything:
+  alias: pnp:cCTLXXXXdCTL0045dCTL0022*
+  alias: pnp:cCTLXXXXdCTL0044dCTL0023*
+  alias: pnp:cCTLXXXXdCTL0042dCTL0022*
+  alias: pnp:cCTLXXXXdCTL0041dCTL0021*
+  alias: pnp:cCTLXXXXdCTL0031dCTL0021*
+  alias: pnp:cCTL00eddCTL0041dCTL0070*
+  alias: pnp:cCTL00e9dCTL0045dCTL0022*
+  alias: pnp:cCTL00e4dCTL0045dCTL0022*
+  alias: pnp:cCTL00c7dCTL0045dCTL0022*
+  alias: pnp:cCTL00c5dCTL0045dCTL0022*
+  alias: pnp:cCTL00c3dCTL0045dCTL0022*
+  alias: pnp:cCTL00c1dCTL0042dCTL0022*
+  alias: pnp:cCTL00b2dCTL0044dCTL0023*
+  alias: pnp:cCTL009edCTL0044dCTL0023*
+  alias: pnp:cCTL009ddCTL0042dCTL0022*
+  alias: pnp:cCTL009fdCTL0041dCTL0021*
+  alias: pnp:cCTL009cdCTL0041dCTL0021*
+  alias: pnp:cCTL009adCTL0041dCTL0021*
+  alias: pnp:cCTL0054dCTL0031dCTL0021*
+  alias: pnp:cCTL0048dCTL0031dCTL0021*
+  alias: pnp:cCTL0047dCTL0031dCTL0021*
+  alias: pnp:cCTL0046dCTL0031dCTL0021*
+  alias: pnp:cCTL0045dCTL0031dCTL0021*
+  alias: pnp:cCTL0044dCTL0031dCTL0021*
+  alias: pnp:cCTL0043dCTL0031dCTL0021*
+  alias: pnp:cCTL0042dCTL0031dCTL0021*
+  alias: pnp:cCTL0039dCTL0031dCTL0021*
+  alias: pnp:cCTL0035dCTL0031dCTL0021*
+
+With this patch it exports only the device id's, as properly
+matchable aliases:
+  alias: pnp:dCTL0070*
+  alias: pnp:dCTL0045*
+  alias: pnp:dCTL0023*
+  alias: pnp:dCTL0044*
+  alias: pnp:dCTL0022*
+  alias: pnp:dCTL0042*
+  alias: pnp:dCTL0041*
+  alias: pnp:dCTL0021*
+  alias: pnp:dCTL0031*
+
+Now, the exported value of the PNP bus can be used to autoload
+a matching module:
+  $ modprobe --first-time -n -v pnp:dCTL0045
+  insmod /lib/modules/2.6.24-rc6-g5b825ed2-dirty/kernel/sound/core/snd-rawmidi.ko
+  insmod /lib/modules/2.6.24-rc6-g5b825ed2-dirty/kernel/sound/drivers/mpu401/snd-mpu401-uart.ko
+  insmod /lib/modules/2.6.24-rc6-g5b825ed2-dirty/kernel/sound/core/snd-hwdep.ko
+  insmod /lib/modules/2.6.24-rc6-g5b825ed2-dirty/kernel/sound/isa/sb/snd-sb-common.ko
+  insmod /lib/modules/2.6.24-rc6-g5b825ed2-dirty/kernel/sound/isa/sb/snd-sb16-csp.ko
+  insmod /lib/modules/2.6.24-rc6-g5b825ed2-dirty/kernel/sound/isa/sb/snd-sb16-dsp.ko
+  insmod /lib/modules/2.6.24-rc6-g5b825ed2-dirty/kernel/sound/drivers/opl3/snd-opl3-lib.ko
+  insmod /lib/modules/2.6.24-rc6-g5b825ed2-dirty/kernel/sound/isa/sb/snd-sbawe.ko
+
+  $ grep CTL0045 /sys/bus/pnp/devices/*/id
+  /sys/bus/pnp/devices/01:01.00/id:CTL0045
+
+Signed-off-by: Kay Sievers <kay.sievers@vrfy.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ scripts/mod/file2alias.c |   61 +++++++++++++++++++++++++++++++++++------------
+ 1 file changed, 46 insertions(+), 15 deletions(-)
+
+--- a/scripts/mod/file2alias.c
++++ b/scripts/mod/file2alias.c
+@@ -324,19 +324,52 @@ static int do_pnp_entry(const char *file
+ 	return 1;
+ }
+ 
+-/* looks like: "pnp:cCdD..." */
+-static int do_pnp_card_entry(const char *filename,
+-			struct pnp_card_device_id *id, char *alias)
+-{
+-	int i;
+-
+-	sprintf(alias, "pnp:c%s", id->id);
+-	for (i = 0; i < PNP_MAX_DEVICES; i++) {
+-		if (! *id->devs[i].id)
+-			break;
+-		sprintf(alias + strlen(alias), "d%s", id->devs[i].id);
++/* looks like: "pnp:dD" for every device of the card */
++static void do_pnp_card_entries(void *symval, unsigned long size,
++				struct module *mod)
++{
++	const unsigned long id_size = sizeof(struct pnp_card_device_id);
++	const unsigned int count = (size / id_size)-1;
++	const struct pnp_card_device_id *cards = symval;
++	unsigned int i;
++
++	device_id_check(mod->name, "pnp", size, id_size, symval);
++
++	for (i = 0; i < count; i++) {
++		unsigned int j;
++		const struct pnp_card_device_id *card = &cards[i];
++
++		for (j = 0; j < PNP_MAX_DEVICES; j++) {
++			const char *id = (char *)card->devs[j].id;
++			int i2, j2;
++			int dup = 0;
++
++			if (!id[0])
++				break;
++
++			/* find duplicate, already added value */
++			for (i2 = 0; i2 < i && !dup; i2++) {
++				const struct pnp_card_device_id *card2 = &cards[i2];
++
++				for (j2 = 0; j2 < PNP_MAX_DEVICES; j2++) {
++					const char *id2 = (char *)card2->devs[j2].id;
++
++					if (!id2[0])
++						break;
++
++					if (!strcmp(id, id2)) {
++						dup = 1;
++						break;
++					}
++				}
++			}
++
++			/* add an individual alias for every device entry */
++			if (!dup)
++				buf_printf(&mod->dev_table_buf,
++					   "MODULE_ALIAS(\"pnp:d%s*\");\n", id);
++		}
+ 	}
+-	return 1;
+ }
+ 
+ /* Looks like: pcmcia:mNcNfNfnNpfnNvaNvbNvcNvdN. */
+@@ -630,9 +663,7 @@ void handle_moddevtable(struct module *m
+ 			 sizeof(struct pnp_device_id), "pnp",
+ 			 do_pnp_entry, mod);
+ 	else if (sym_is(symname, "__mod_pnp_card_device_table"))
+-		do_table(symval, sym->st_size,
+-			 sizeof(struct pnp_card_device_id), "pnp_card",
+-			 do_pnp_card_entry, mod);
++		do_pnp_card_entries(symval, sym->st_size, mod);
+ 	else if (sym_is(symname, "__mod_pcmcia_device_table"))
+ 		do_table(symval, sym->st_size,
+ 			 sizeof(struct pcmcia_device_id), "pcmcia",
