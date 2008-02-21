@@ -1,0 +1,57 @@
+From kaneshige.kenji@jp.fujitsu.com  Thu Feb 21 13:36:36 2008
+From: Kenji Kaneshige <kaneshige.kenji@jp.fujitsu.com>
+Date: Thu, 21 Feb 2008 15:24:16 +0900
+Subject: PCI: Fix wrong reference counter check for proc_dir_entry
+To: linux-pci@atrey.karlin.mff.cuni.cz
+Cc: Greg KH <gregkh@suse.de>
+Message-ID: <47BD1910.2020202@jp.fujitsu.com>
+
+
+Fix wrong counter check for proc_dir_entry in pci_proc_detach_device().
+
+The pci_proc_detach_device() returns with -EBUSY before calling
+remove_proc_entry() if the reference counter of proc_dir_entry is not
+0. But this check is wrong and pci_proc_detach_device() always fails
+because the reference counter of proc_dir_entry is initialized with 1
+at creating time and decremented in remove_proc_entry(). This bug
+cause strange behaviour as followings:
+
+- Accessing /proc/bus/pci/XXXX/YY file after hot-removing pci adapter
+  card causes kernel panic.
+
+- Repeating hot-add/hot-remove of pci adapter card increases files
+  with the same name under /proc/bus/pci/XXXX/ directory. For example:
+
+    # pwd
+    /proc/bus/pci/0002:09
+    # ls
+    01.0
+    # for i in `seq 5`
+    > do
+    > echo 0 > /sys/bus/pci/slots/0009_0032/power
+    > echo 1 > /sys/bus/pci/slots/0009_0032/power
+    > done
+    # ls
+    01.0  01.0  01.0  01.0  01.0  01.0
+
+The pci_proc_detach_device() should check if the reference counter is
+not larger than 1 instead.
+
+Signed-off-by: Kenji Kaneshige <kaneshige.kenji@jp.fujitsu.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/pci/proc.c |    2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+--- a/drivers/pci/proc.c
++++ b/drivers/pci/proc.c
+@@ -422,7 +422,7 @@ int pci_proc_detach_device(struct pci_de
+ 	struct proc_dir_entry *e;
+ 
+ 	if ((e = dev->procent)) {
+-		if (atomic_read(&e->count))
++		if (atomic_read(&e->count) > 1)
+ 			return -EBUSY;
+ 		remove_proc_entry(e->name, dev->bus->procdir);
+ 		dev->procent = NULL;
