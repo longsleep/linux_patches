@@ -1,0 +1,95 @@
+From bjorn.helgaas@hp.com  Tue Mar  4 16:08:42 2008
+From: Bjorn Helgaas <bjorn.helgaas@hp.com>
+Date: Tue, 04 Mar 2008 11:56:47 -0700
+Subject: PCI: add generic pci_enable_resources()
+To: linux-pci@atrey.karlin.mff.cuni.cz
+To: linux-arch@vger.kernel.org
+Cc: Russell King <rmk@arm.linux.org.uk>
+Cc: linux-arm-kernel@lists.arm.linux.org.uk
+Cc: Kyle McMartin <kyle@parisc-linux.org>
+Cc: Matthew Wilcox <matthew@wil.cx>
+Cc: Grant Grundler <grundler@parisc-linux.org>
+Cc: linux-parisc@vger.kernel.org
+Cc: Paul Mackerras <paulus@samba.org>
+Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Cc: linuxppc-dev@ozlabs.org
+Cc: Chris Zankel <chris@zankel.net>
+Message-ID: <20080304185819.885549413@ldl.fc.hp.com>
+
+
+Each architecture has its own pcibios_enable_resources() implementation.
+These differ in many minor ways that have nothing to do with actual
+architectural differences.  Follow-on patches will make most arches
+use this generic version instead.
+
+This version is based on powerpc, which seemed most up-to-date.  The only
+functional difference from the x86 version is that this uses "!r->parent"
+to check for resource collisions instead of "!r->start && r->end".
+
+Signed-off-by: Bjorn Helgaas <bjorn.helgaas@hp.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/pci/setup-res.c |   43 +++++++++++++++++++++++++++++++++++++++++++
+ include/linux/pci.h     |    1 +
+ 2 files changed, 44 insertions(+)
+
+--- a/drivers/pci/setup-res.c
++++ b/drivers/pci/setup-res.c
+@@ -263,3 +263,46 @@ void pdev_sort_resources(struct pci_dev 
+ 		}
+ 	}
+ }
++
++int pci_enable_resources(struct pci_dev *dev, int mask)
++{
++	u16 cmd, old_cmd;
++	int i;
++	struct resource *r;
++
++	pci_read_config_word(dev, PCI_COMMAND, &cmd);
++	old_cmd = cmd;
++
++	for (i = 0; i < PCI_NUM_RESOURCES; i++) {
++		if (!(mask & (1 << i)))
++			continue;
++
++		r = &dev->resource[i];
++
++		if (!(r->flags & (IORESOURCE_IO | IORESOURCE_MEM)))
++			continue;
++		if ((i == PCI_ROM_RESOURCE) &&
++				(!(r->flags & IORESOURCE_ROM_ENABLE)))
++			continue;
++
++		if (!r->parent) {
++			dev_err(&dev->dev, "device not available because of "
++				"BAR %d [%llx:%llx] collisions\n", i,
++				(unsigned long long) r->start,
++				(unsigned long long) r->end);
++			return -EINVAL;
++		}
++
++		if (r->flags & IORESOURCE_IO)
++			cmd |= PCI_COMMAND_IO;
++		if (r->flags & IORESOURCE_MEM)
++			cmd |= PCI_COMMAND_MEMORY;
++	}
++
++	if (cmd != old_cmd) {
++		dev_info(&dev->dev, "enabling device (%04x -> %04x)\n",
++			 old_cmd, cmd);
++		pci_write_config_word(dev, PCI_COMMAND, cmd);
++	}
++	return 0;
++}
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@ -624,6 +624,7 @@ int pci_claim_resource(struct pci_dev *,
+ void pci_assign_unassigned_resources(void);
+ void pdev_enable_device(struct pci_dev *);
+ void pdev_sort_resources(struct pci_dev *, struct resource_list *);
++int pci_enable_resources(struct pci_dev *, int mask);
+ void pci_fixup_irqs(u8 (*)(struct pci_dev *, u8 *),
+ 		    int (*)(struct pci_dev *, u8, u8));
+ #define HAVE_PCI_REQ_REGIONS	2
