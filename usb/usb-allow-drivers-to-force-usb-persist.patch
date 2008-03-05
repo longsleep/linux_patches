@@ -1,0 +1,111 @@
+From stern@rowland.harvard.edu  Wed Mar  5 12:05:06 2008
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Mon, 3 Mar 2008 15:16:11 -0500 (EST)
+Subject: USB: allow drivers to force USB-PERSIST
+To: Greg KH <greg@kroah.com>
+Cc: USB list <linux-usb@vger.kernel.org>
+Message-ID: <Pine.LNX.4.44L0.0803031508020.7094-100000@iolanthe.rowland.org>
+
+
+This patch (as1049) adds a mechanism whereby drivers can force a USB
+device to undergo USB-PERSIST processing, even if the user has not set
+the device's power/persist attribute.  A later patch makes usb-storage
+use this mechanism whenever any of its descendant SCSI devices has
+been opened as a block device (for example, if it holds a mounted
+filesystem).
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/driver.c |    3 +++
+ drivers/usb/core/hub.c    |   25 +++++++++++++++++++++++--
+ include/linux/usb.h       |    3 +++
+ 3 files changed, 29 insertions(+), 2 deletions(-)
+
+--- a/drivers/usb/core/driver.c
++++ b/drivers/usb/core/driver.c
+@@ -233,6 +233,7 @@ static int usb_probe_interface(struct de
+ 		if (error) {
+ 			mark_quiesced(intf);
+ 			intf->needs_remote_wakeup = 0;
++			intf->wants_persist = 0;
+ 			intf->condition = USB_INTERFACE_UNBOUND;
+ 		} else
+ 			intf->condition = USB_INTERFACE_BOUND;
+@@ -271,6 +272,7 @@ static int usb_unbind_interface(struct d
+ 	intf->condition = USB_INTERFACE_UNBOUND;
+ 	mark_quiesced(intf);
+ 	intf->needs_remote_wakeup = 0;
++	intf->wants_persist = 0;
+ 
+ 	if (!error)
+ 		usb_autosuspend_device(udev);
+@@ -368,6 +370,7 @@ void usb_driver_release_interface(struct
+ 	iface->condition = USB_INTERFACE_UNBOUND;
+ 	mark_quiesced(iface);
+ 	iface->needs_remote_wakeup = 0;
++	iface->wants_persist = 0;
+ 	usb_pm_unlock(udev);
+ }
+ EXPORT_SYMBOL_GPL(usb_driver_release_interface);
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -625,6 +625,27 @@ static void hub_port_logical_disconnect(
+  	kick_khubd(hub);
+ }
+ 
++/* Should USB-PERSIST be enabled for this device? */
++static bool persist_enabled(struct usb_device *udev)
++{
++	struct usb_host_config *config;
++	int i;
++
++	if (udev->persist_enabled)
++		return true;
++
++	config = udev->actconfig;
++	if (config) {
++		for (i = 0; i < config->desc.bNumInterfaces; ++i) {
++			struct usb_interface *intf = config->interface[i];
++
++			if (intf->wants_persist)
++				return true;
++		}
++	}
++	return false;
++}
++
+ /* caller has locked the hub device */
+ static void hub_stop(struct usb_hub *hub)
+ {
+@@ -688,8 +709,8 @@ static void hub_restart(struct usb_hub *
+ 		 * turn off the various status changes to prevent
+ 		 * khubd from disconnecting it later.
+ 		 */
+-		if (udev->persist_enabled && status == 0 &&
+-				!(portstatus & USB_PORT_STAT_ENABLE)) {
++		if (status == 0 && !(portstatus & USB_PORT_STAT_ENABLE) &&
++				persist_enabled(udev)) {
+ 			if (portchange & USB_PORT_STAT_C_ENABLE)
+ 				clear_port_feature(hub->hdev, port1,
+ 						USB_PORT_FEAT_C_ENABLE);
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -109,6 +109,8 @@ enum usb_interface_condition {
+  * @sysfs_files_created: sysfs attributes exist
+  * @needs_remote_wakeup: flag set when the driver requires remote-wakeup
+  *	capability during autosuspend.
++ * @wants_persist: USB-PERSIST handling should be enabled for the device,
++ *	even if the user has turned off udev->persist_enabled.
+  * @dev: driver model's view of this device
+  * @usb_dev: if an interface is bound to the USB major, this will point
+  *	to the sysfs representation for that device.
+@@ -159,6 +161,7 @@ struct usb_interface {
+ 	unsigned is_active:1;		/* the interface is not suspended */
+ 	unsigned sysfs_files_created:1;	/* the sysfs attributes exist */
+ 	unsigned needs_remote_wakeup:1;	/* driver requires remote wakeup */
++	unsigned wants_persist:1;	/* driver wants USB-PERSIST handling */
+ 
+ 	struct device dev;		/* interface specific device info */
+ 	struct device *usb_dev;
