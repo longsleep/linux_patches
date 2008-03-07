@@ -1,0 +1,2779 @@
+From cfd8dccf588f1eb4a81de52cb9dd47fcffef9a60 Mon Sep 17 00:00:00 2001
+From: Greg Kroah-Hartman <gregkh@suse.de>
+Date: Thu, 6 Mar 2008 21:30:23 -0800
+Subject: DVB: add firesat driver
+
+Original code written by Christian Dolzer <c.dolzer@digital-everywhere.com>
+
+Cleaned up by Greg.
+
+
+Cc: Christian Dolzer <c.dolzer@digital-everywhere.com>
+Cc: Andreas Monitzer <andy@monitzer.com>
+Cc: Manu Abraham <manu@linuxtv.org>
+Cc: Fabio De Lorenzo <delorenzo.fabio@gmail.com>
+Cc: Robert Berger <robert.berger@reliableembeddedsystems.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ drivers/media/dvb/Kconfig              |    2 
+ drivers/media/dvb/Makefile             |    2 
+ drivers/media/dvb/firesat/Kconfig      |   11 
+ drivers/media/dvb/firesat/Makefile     |   11 
+ drivers/media/dvb/firesat/avc_api.c    |  813 +++++++++++++++++++++++++++
+ drivers/media/dvb/firesat/avc_api.h    |  380 ++++++++++++
+ drivers/media/dvb/firesat/cmp.c        |  230 +++++++
+ drivers/media/dvb/firesat/cmp.h        |    9 
+ drivers/media/dvb/firesat/firesat-ci.c |   95 +++
+ drivers/media/dvb/firesat/firesat-ci.h |    9 
+ drivers/media/dvb/firesat/firesat-rc.c |   82 ++
+ drivers/media/dvb/firesat/firesat-rc.h |    9 
+ drivers/media/dvb/firesat/firesat.c    |  967 +++++++++++++++++++++++++++++++++
+ drivers/media/dvb/firesat/firesat.h    |   73 ++
+ 14 files changed, 2692 insertions(+), 1 deletion(-)
+
+--- a/drivers/media/dvb/Kconfig
++++ b/drivers/media/dvb/Kconfig
+@@ -36,6 +36,8 @@ comment "Supported Pluto2 Adapters"
+ 	depends on DVB_CORE && PCI && I2C
+ source "drivers/media/dvb/pluto2/Kconfig"
+ 
++source "drivers/media/dvb/firesat/Kconfig"
++
+ comment "Supported DVB Frontends"
+ 	depends on DVB_CORE
+ source "drivers/media/dvb/frontends/Kconfig"
+--- a/drivers/media/dvb/Makefile
++++ b/drivers/media/dvb/Makefile
+@@ -2,4 +2,4 @@
+ # Makefile for the kernel multimedia device drivers.
+ #
+ 
+-obj-y        := dvb-core/ frontends/ ttpci/ ttusb-dec/ ttusb-budget/ b2c2/ bt8xx/ cinergyT2/ dvb-usb/ pluto2/
++obj-y        := dvb-core/ frontends/ ttpci/ ttusb-dec/ ttusb-budget/ b2c2/ bt8xx/ cinergyT2/ dvb-usb/ pluto2/ firesat/
+--- /dev/null
++++ b/drivers/media/dvb/firesat/Kconfig
+@@ -0,0 +1,11 @@
++config DVB_FIRESAT
++	tristate "FireSAT devices"
++	depends on DVB_CORE && IEEE1394
++	help
++	  Support for external IEEE1394 adapters designed by Digital Everywhere and
++	  produced by El Gato, shipped under the brand name 'FireDTV/FloppyDTV'.
++
++	  These devices don't have a MPEG decoder built in, so you need
++	  an external software decoder to watch TV.
++
++	  Say Y if you own such a device and want to use it.
+--- /dev/null
++++ b/drivers/media/dvb/firesat/Makefile
+@@ -0,0 +1,11 @@
++dvb-firesat-objs := firesat.o avc_api.o cmp.o firesat-rc.o firesat-ci.o
++
++obj-$(CONFIG_DVB_FIRESAT) += dvb-firesat.o
++
++EXTRA_CFLAGS := -Idrivers/ieee1394
++EXTRA_CFLAGS += -Idrivers/media/dvb/dvb-core
++#EXTRA_CFLAGS += -I/usr/src/linux-headers-$(shell uname -r)
++#EXTRA_CFLAGS += -I/usr/src/linux-headers-$(shell uname -r)/include
++
++#EXTRA_LFLAGS := -L/proc/kallsyms
++
+--- /dev/null
++++ b/drivers/media/dvb/firesat/avc_api.c
+@@ -0,0 +1,813 @@
++/*
++ * FireSAT AVC driver
++ *
++ * Copyright (c) 2004 Andreas Monitzer <andy@monitzer.com>
++ *
++ *	This program is free software; you can redistribute it and/or
++ *	modify it under the terms of the GNU General Public License as
++ *	published by the Free Software Foundation; either version 2 of
++ *	the License, or (at your option) any later version.
++ */
++
++#include <ieee1394_transactions.h>
++#include <nodemgr.h>
++#include <asm/byteorder.h>
++#include <linux/delay.h>
++#include "firesat.h"
++#include "avc_api.h"
++#include "firesat-rc.h"
++
++#define RESPONSE_REGISTER				0xFFFFF0000D00ULL
++#define COMMAND_REGISTER				0xFFFFF0000B00ULL
++#define PCR_BASE_ADDRESS				0xFFFFF0000900ULL
++
++static int __AVCRegisterRemoteControl(struct firesat*firesat, int internal);
++
++/* Frees an allocated packet */
++static void avc_free_packet(struct hpsb_packet *packet)
++{
++	hpsb_free_tlabel(packet);
++	hpsb_free_packet(packet);
++}
++
++/*
++ * Goofy routine that basically does a down_timeout function.
++ * Stolen from sbp2.c
++ */
++static int avc_down_timeout(atomic_t *done, int timeout)
++{
++	int i;
++
++	for (i = timeout; (i > 0 && atomic_read(done) == 0); i-= HZ/10) {
++		set_current_state(TASK_INTERRUPTIBLE);
++		if (schedule_timeout(HZ/10))	/* 100ms */
++			return(1);
++	}
++	return ((i > 0) ? 0:1);
++}
++
++static int __AVCWrite(struct firesat *firesat, const AVCCmdFrm *CmdFrm, AVCRspFrm *RspFrm) {
++	struct hpsb_packet *packet;
++	struct node_entry *ne;
++
++	ne = firesat->nodeentry;
++	if(!ne) {
++		printk("%s: lost node!\n",__FUNCTION__);
++		return -EIO;
++	}
++
++	/* need all input data */
++	if(!firesat || !ne || !CmdFrm)
++		return -EINVAL;
++
++//	printk(KERN_INFO "AVCWrite command %x\n",CmdFrm->opcode);
++
++//	for(k=0;k<CmdFrm->length;k++)
++//		printk(KERN_INFO "CmdFrm[%d] = %08x\n", k, ((quadlet_t*)CmdFrm)[k]);
++
++	packet=hpsb_make_writepacket(ne->host, ne->nodeid, COMMAND_REGISTER,
++			(quadlet_t*)CmdFrm, CmdFrm->length);
++
++	hpsb_set_packet_complete_task(packet, (void (*)(void*))avc_free_packet,
++				  packet);
++
++	hpsb_node_fill_packet(ne, packet);
++
++	if(RspFrm)
++		atomic_set(&firesat->avc_reply_received, 0);
++
++	if (hpsb_send_packet(packet) < 0) {
++		avc_free_packet(packet);
++		atomic_set(&firesat->avc_reply_received, 1);
++		return -EIO;
++	}
++
++	if(RspFrm) {
++		if(avc_down_timeout(&firesat->avc_reply_received,HZ/2)) {
++		printk("%s: timeout waiting for avc response\n",__FUNCTION__);
++			atomic_set(&firesat->avc_reply_received, 1);
++		return -ETIMEDOUT;
++	}
++
++		memcpy(RspFrm,firesat->respfrm,firesat->resp_length);
++	}
++
++	return 0;
++}
++
++int AVCWrite(struct firesat*firesat, const AVCCmdFrm *CmdFrm, AVCRspFrm *RspFrm) {
++	int ret;
++	if(down_interruptible(&firesat->avc_sem))
++		return -EINTR;
++
++	ret = __AVCWrite(firesat, CmdFrm, RspFrm);
++
++	up(&firesat->avc_sem);
++	return ret;
++}
++
++static void do_schedule_remotecontrol(unsigned long ignored);
++DECLARE_TASKLET(schedule_remotecontrol, do_schedule_remotecontrol, 0);
++
++static void do_schedule_remotecontrol(unsigned long ignored) {
++	struct firesat *firesat;
++	unsigned long flags;
++
++	spin_lock_irqsave(&firesat_list_lock, flags);
++	list_for_each_entry(firesat,&firesat_list,list) {
++		if(atomic_read(&firesat->reschedule_remotecontrol) == 1) {
++			if(down_trylock(&firesat->avc_sem))
++				tasklet_schedule(&schedule_remotecontrol);
++			else {
++				if(__AVCRegisterRemoteControl(firesat, 1) == 0)
++					atomic_set(&firesat->reschedule_remotecontrol, 0);
++				else
++					tasklet_schedule(&schedule_remotecontrol);
++
++				up(&firesat->avc_sem);
++			}
++		}
++	}
++	spin_unlock_irqrestore(&firesat_list_lock, flags);
++}
++
++int AVCRecv(struct firesat *firesat, u8 *data, size_t length) {
++//	printk(KERN_INFO "%s\n",__FUNCTION__);
++
++	// remote control handling
++
++	AVCRspFrm *RspFrm = (AVCRspFrm*)data;
++
++	if(/*RspFrm->length >= 8 && ###*/
++			((RspFrm->operand[0] == SFE_VENDOR_DE_COMPANYID_0 &&
++			RspFrm->operand[1] == SFE_VENDOR_DE_COMPANYID_1 &&
++			RspFrm->operand[2] == SFE_VENDOR_DE_COMPANYID_2)) &&
++			RspFrm->operand[3] == SFE_VENDOR_OPCODE_REGISTER_REMOTE_CONTROL) {
++		if(RspFrm->resp == CHANGED) {
++//			printk(KERN_INFO "%s: code = %02x %02x\n",__FUNCTION__,RspFrm->operand[4],RspFrm->operand[5]);
++			firesat_got_remotecontrolcode((((u16)RspFrm->operand[4]) << 8) | ((u16)RspFrm->operand[5]));
++
++			// schedule
++			atomic_set(&firesat->reschedule_remotecontrol, 1);
++			tasklet_schedule(&schedule_remotecontrol);
++		} else if(RspFrm->resp != INTERIM)
++			printk(KERN_INFO "%s: remote control result = %d\n",__FUNCTION__, RspFrm->resp);
++		return 0;
++	}
++
++	if(atomic_read(&firesat->avc_reply_received) == 1) {
++		printk("%s: received out-of-order AVC response, ignored\n",__FUNCTION__);
++		return -EINVAL;
++	}
++//	AVCRspFrm *resp=(AVCRspFrm *)data;
++//	int k;
++/*
++	printk(KERN_INFO "resp=0x%x\n",resp->resp);
++	printk(KERN_INFO "cts=0x%x\n",resp->cts);
++	printk(KERN_INFO "suid=0x%x\n",resp->suid);
++	printk(KERN_INFO "sutyp=0x%x\n",resp->sutyp);
++	printk(KERN_INFO "opcode=0x%x\n",resp->opcode);
++	printk(KERN_INFO "length=%d\n",resp->length);
++*/
++//	for(k=0;k<2;k++)
++//		printk(KERN_INFO "operand[%d]=%02x\n",k,resp->operand[k]);
++
++	memcpy(firesat->respfrm,data,length);
++	firesat->resp_length=length;
++
++	atomic_set(&firesat->avc_reply_received, 1);
++
++	return 0;
++}
++
++// tuning command for setting the relative LNB frequency (not supported by the AVC standard)
++static void AVCTuner_tuneQPSK(struct firesat *firesat, struct dvb_frontend_parameters *params, AVCCmdFrm *CmdFrm) {
++	memset(CmdFrm, 0, sizeof(AVCCmdFrm));
++
++	CmdFrm->cts = AVC;
++	CmdFrm->ctype = CONTROL;
++	CmdFrm->sutyp = 0x5;
++	CmdFrm->suid = firesat->subunit;
++	CmdFrm->opcode = VENDOR;
++
++	CmdFrm->operand[0]=SFE_VENDOR_DE_COMPANYID_0;
++	CmdFrm->operand[1]=SFE_VENDOR_DE_COMPANYID_1;
++	CmdFrm->operand[2]=SFE_VENDOR_DE_COMPANYID_2;
++	CmdFrm->operand[3]=SFE_VENDOR_OPCODE_TUNE_QPSK;
++
++	printk(KERN_INFO "%s: tuning to frequency %u\n",__FUNCTION__,params->frequency);
++
++	CmdFrm->operand[4] = (params->frequency >> 24) & 0xFF;
++	CmdFrm->operand[5] = (params->frequency >> 16) & 0xFF;
++	CmdFrm->operand[6] = (params->frequency >> 8) & 0xFF;
++	CmdFrm->operand[7] = params->frequency & 0xFF;
++
++	printk(KERN_INFO "%s: symbol rate = %uBd\n",__FUNCTION__,params->u.qpsk.symbol_rate);
++
++	CmdFrm->operand[8] = ((params->u.qpsk.symbol_rate/1000) >> 8) & 0xFF;
++	CmdFrm->operand[9] = (params->u.qpsk.symbol_rate/1000) & 0xFF;
++
++	switch(params->u.qpsk.fec_inner) {
++	case FEC_1_2:
++		CmdFrm->operand[10] = 0x1;
++		break;
++	case FEC_2_3:
++		CmdFrm->operand[10] = 0x2;
++		break;
++	case FEC_3_4:
++		CmdFrm->operand[10] = 0x3;
++		break;
++	case FEC_5_6:
++		CmdFrm->operand[10] = 0x4;
++		break;
++	case FEC_7_8:
++		CmdFrm->operand[10] = 0x5;
++		break;
++	case FEC_4_5:
++	case FEC_8_9:
++	case FEC_AUTO:
++	default:
++		CmdFrm->operand[10] = 0x0;
++	}
++
++	if(firesat->voltage == 0xff)
++		CmdFrm->operand[11] = 0xff;
++	else
++		CmdFrm->operand[11] = (firesat->voltage==SEC_VOLTAGE_18)?0:1; // polarisation
++	if(firesat->tone == 0xff)
++		CmdFrm->operand[12] = 0xff;
++	else
++		CmdFrm->operand[12] = (firesat->tone==SEC_TONE_ON)?1:0; // band
++
++	CmdFrm->length = 16;
++}
++
++int AVCTuner_DSD(struct firesat *firesat, struct dvb_frontend_parameters *params, BYTE *status) {
++	AVCCmdFrm CmdFrm;
++	AVCRspFrm RspFrm;
++	M_VALID_FLAGS flags;
++	int k;
++
++//	printk(KERN_INFO "%s\n", __FUNCTION__);
++
++	if(firesat->type == FireSAT_DVB_S)
++		AVCTuner_tuneQPSK(firesat, params, &CmdFrm);
++	else {
++		if(firesat->type == FireSAT_DVB_T) {
++			flags.Bits_T.GuardInterval = (params->u.ofdm.guard_interval != GUARD_INTERVAL_AUTO);
++			flags.Bits_T.CodeRateLPStream = (params->u.ofdm.code_rate_LP != FEC_AUTO);
++			flags.Bits_T.CodeRateHPStream = (params->u.ofdm.code_rate_HP != FEC_AUTO);
++			flags.Bits_T.HierarchyInfo = (params->u.ofdm.hierarchy_information != HIERARCHY_AUTO);
++			flags.Bits_T.Constellation = (params->u.ofdm.constellation != QAM_AUTO);
++			flags.Bits_T.Bandwidth = (params->u.ofdm.bandwidth != BANDWIDTH_AUTO);
++			flags.Bits_T.CenterFrequency = 1;
++			flags.Bits_T.reserved1 = 0;
++			flags.Bits_T.reserved2 = 0;
++			flags.Bits_T.OtherFrequencyFlag = 0;
++			flags.Bits_T.TransmissionMode = (params->u.ofdm.transmission_mode != TRANSMISSION_MODE_AUTO);
++			flags.Bits_T.NetworkId = 0;
++		} else {
++			flags.Bits.Modulation = 0;
++			if(firesat->type == FireSAT_DVB_S) {
++				flags.Bits.FEC_inner = 1;
++			} else if(firesat->type == FireSAT_DVB_C) {
++				flags.Bits.FEC_inner = 0;
++			}
++			flags.Bits.FEC_outer = 0;
++			flags.Bits.Symbol_Rate = 1;
++			flags.Bits.Frequency = 1;
++			flags.Bits.Orbital_Pos = 0;
++			if(firesat->type == FireSAT_DVB_S) {
++				flags.Bits.Polarisation = 1;
++			} else if(firesat->type == FireSAT_DVB_C) {
++				flags.Bits.Polarisation = 0;
++			}
++			flags.Bits.reserved_fields = 0;
++			flags.Bits.reserved1 = 0;
++			flags.Bits.Network_ID = 0;
++		}
++
++		memset(&CmdFrm, 0, sizeof(AVCCmdFrm));
++
++		CmdFrm.cts	= AVC;
++		CmdFrm.ctype	= CONTROL;
++		CmdFrm.sutyp	= 0x5;
++		CmdFrm.suid	= firesat->subunit;
++		CmdFrm.opcode	= DSD;
++
++		CmdFrm.operand[0]  = 0; // source plug
++		CmdFrm.operand[1]  = 0xD2; // subfunction replace
++		CmdFrm.operand[2]  = 0x20; // system id = DVB
++		CmdFrm.operand[3]  = 0x00; // antenna number
++		CmdFrm.operand[4]  = (firesat->type == FireSAT_DVB_T)?0x0c:0x11; // system_specific_multiplex selection_length
++		CmdFrm.operand[5]  = flags.Valid_Word.ByteHi; // valid_flags [0]
++		CmdFrm.operand[6]  = flags.Valid_Word.ByteLo; // valid_flags [1]
++
++		if(firesat->type == FireSAT_DVB_T) {
++			CmdFrm.operand[7]  = 0x0;
++			CmdFrm.operand[8]  = (params->frequency/10) >> 24;
++			CmdFrm.operand[9]  = ((params->frequency/10) >> 16) & 0xFF;
++			CmdFrm.operand[10] = ((params->frequency/10) >>  8) & 0xFF;
++			CmdFrm.operand[11] = (params->frequency/10) & 0xFF;
++			switch(params->u.ofdm.bandwidth) {
++			case BANDWIDTH_7_MHZ:
++				CmdFrm.operand[12] = 0x20;
++				break;
++			case BANDWIDTH_8_MHZ:
++			case BANDWIDTH_6_MHZ: // not defined by AVC spec
++			case BANDWIDTH_AUTO:
++			default:
++				CmdFrm.operand[12] = 0x00;
++			}
++			switch(params->u.ofdm.constellation) {
++			case QAM_16:
++				CmdFrm.operand[13] = 1 << 6;
++				break;
++			case QAM_64:
++				CmdFrm.operand[13] = 2 << 6;
++				break;
++			case QPSK:
++			default:
++				CmdFrm.operand[13] = 0x00;
++			}
++			switch(params->u.ofdm.hierarchy_information) {
++			case HIERARCHY_1:
++				CmdFrm.operand[13] |= 1 << 3;
++				break;
++			case HIERARCHY_2:
++				CmdFrm.operand[13] |= 2 << 3;
++				break;
++			case HIERARCHY_4:
++				CmdFrm.operand[13] |= 3 << 3;
++				break;
++			case HIERARCHY_AUTO:
++			case HIERARCHY_NONE:
++			default:
++				break;
++			}
++			switch(params->u.ofdm.code_rate_HP) {
++			case FEC_2_3:
++				CmdFrm.operand[13] |= 1;
++				break;
++			case FEC_3_4:
++				CmdFrm.operand[13] |= 2;
++				break;
++			case FEC_5_6:
++				CmdFrm.operand[13] |= 3;
++				break;
++			case FEC_7_8:
++				CmdFrm.operand[13] |= 4;
++				break;
++			case FEC_1_2:
++			default:
++				break;
++			}
++			switch(params->u.ofdm.code_rate_LP) {
++			case FEC_2_3:
++				CmdFrm.operand[14] = 1 << 5;
++				break;
++			case FEC_3_4:
++				CmdFrm.operand[14] = 2 << 5;
++				break;
++			case FEC_5_6:
++				CmdFrm.operand[14] = 3 << 5;
++				break;
++			case FEC_7_8:
++				CmdFrm.operand[14] = 4 << 5;
++				break;
++			case FEC_1_2:
++			default:
++				CmdFrm.operand[14] = 0x00;
++				break;
++			}
++			switch(params->u.ofdm.guard_interval) {
++			case GUARD_INTERVAL_1_16:
++				CmdFrm.operand[14] |= 1 << 3;
++				break;
++			case GUARD_INTERVAL_1_8:
++				CmdFrm.operand[14] |= 2 << 3;
++				break;
++			case GUARD_INTERVAL_1_4:
++				CmdFrm.operand[14] |= 3 << 3;
++				break;
++			case GUARD_INTERVAL_1_32:
++			case GUARD_INTERVAL_AUTO:
++			default:
++				break;
++			}
++			switch(params->u.ofdm.transmission_mode) {
++			case TRANSMISSION_MODE_8K:
++				CmdFrm.operand[14] |= 1 << 1;
++				break;
++			case TRANSMISSION_MODE_2K:
++			case TRANSMISSION_MODE_AUTO:
++			default:
++				break;
++			}
++
++			CmdFrm.operand[15] = 0x00; // network_ID[0]
++			CmdFrm.operand[16] = 0x00; // network_ID[1]
++			CmdFrm.operand[17] = 0x00; // Nr_of_dsd_sel_specs = 0 - > No PIDs are transmitted
++
++			CmdFrm.length = 20;
++		} else {
++			CmdFrm.operand[7]  = 0x00;
++			CmdFrm.operand[8]  = (((firesat->voltage==SEC_VOLTAGE_18)?0:1)<<6); /* 0 = H, 1 = V */
++			CmdFrm.operand[9]  = 0x00;
++			CmdFrm.operand[10] = 0x00;
++
++			if(firesat->type == FireSAT_DVB_S) {
++				/* ### relative frequency -> absolute frequency */
++				CmdFrm.operand[11] = (((params->frequency/4) >> 16) & 0xFF) | (2 << 6);
++				CmdFrm.operand[12] = ((params->frequency/4) >> 8) & 0xFF;
++				CmdFrm.operand[13] = (params->frequency/4) & 0xFF;
++			} else if(firesat->type == FireSAT_DVB_C) {
++				CmdFrm.operand[11] = (((params->frequency/4000) >> 16) & 0xFF) | (2 << 6);
++				CmdFrm.operand[12] = ((params->frequency/4000) >> 8) & 0xFF;
++				CmdFrm.operand[13] = (params->frequency/4000) & 0xFF;
++			}
++
++			CmdFrm.operand[14] = ((params->u.qpsk.symbol_rate/1000) >> 12) & 0xFF;
++			CmdFrm.operand[15] = ((params->u.qpsk.symbol_rate/1000) >> 4) & 0xFF;
++			CmdFrm.operand[16] = ((params->u.qpsk.symbol_rate/1000) << 4) & 0xF0;
++
++			CmdFrm.operand[17] = 0x00;
++			switch(params->u.qpsk.fec_inner) {
++			case FEC_1_2:
++				CmdFrm.operand[18] = 0x1;
++				break;
++			case FEC_2_3:
++				CmdFrm.operand[18] = 0x2;
++				break;
++			case FEC_3_4:
++				CmdFrm.operand[18] = 0x3;
++				break;
++			case FEC_5_6:
++				CmdFrm.operand[18] = 0x4;
++				break;
++			case FEC_7_8:
++				CmdFrm.operand[18] = 0x5;
++				break;
++			case FEC_4_5:
++			case FEC_8_9:
++			case FEC_AUTO:
++			default:
++				CmdFrm.operand[18] = 0x0;
++			}
++			if(firesat->type == FireSAT_DVB_S) {
++				CmdFrm.operand[19] = 0x08; // modulation
++			} else if(firesat->type == FireSAT_DVB_C) {
++				switch(params->u.qam.modulation) {
++				case QAM_16:
++					CmdFrm.operand[19] = 0x08; // modulation
++					break;
++				case QAM_32:
++					CmdFrm.operand[19] = 0x10; // modulation
++					break;
++				case QAM_64:
++					CmdFrm.operand[19] = 0x18; // modulation
++					break;
++				case QAM_128:
++					CmdFrm.operand[19] = 0x20; // modulation
++					break;
++				case QAM_256:
++					CmdFrm.operand[19] = 0x28; // modulation
++					break;
++				case QAM_AUTO:
++				default:
++					CmdFrm.operand[19] = 0x00; // modulation
++				}
++			}
++			CmdFrm.operand[20] = 0x00;
++			CmdFrm.operand[21] = 0x00;
++			CmdFrm.operand[22] = 0x00; // Nr_of_dsd_sel_specs = 0 - > No PIDs are transmitted
++
++			CmdFrm.length=28;
++		}
++	} // AVCTuner_DSD_direct
++
++	if((k=AVCWrite(firesat,&CmdFrm,&RspFrm)))
++		return k;
++
++//	msleep(250);
++	mdelay(500);
++
++	if(status)
++		*status=RspFrm.operand[2];
++	return 0;
++}
++
++int AVCTuner_SetPIDs(struct firesat *firesat, unsigned char pidc, u16 pid[]) {
++	AVCCmdFrm CmdFrm;
++	AVCRspFrm RspFrm;
++	int pos,k;
++
++	printk(KERN_INFO "%s\n", __FUNCTION__);
++
++	if(pidc > 16 && pidc != 0xFF)
++		return -EINVAL;
++
++	memset(&CmdFrm, 0, sizeof(AVCCmdFrm));
++
++	CmdFrm.cts	= AVC;
++	CmdFrm.ctype	= CONTROL;
++	CmdFrm.sutyp	= 0x5;
++	CmdFrm.suid	= firesat->subunit;
++	CmdFrm.opcode	= DSD;
++
++	CmdFrm.operand[0]  = 0; // source plug
++	CmdFrm.operand[1]  = 0xD2; // subfunction replace
++	CmdFrm.operand[2]  = 0x20; // system id = DVB
++	CmdFrm.operand[3]  = 0x00; // antenna number
++	CmdFrm.operand[4]  = 0x11; // system_specific_multiplex selection_length
++	CmdFrm.operand[5]  = 0x00; // valid_flags [0]
++	CmdFrm.operand[6]  = 0x00; // valid_flags [1]
++
++	if(firesat->type == FireSAT_DVB_T) {
++/*		CmdFrm.operand[7]  = 0x00;
++		CmdFrm.operand[8]  = 0x00;//(params->frequency/10) >> 24;
++		CmdFrm.operand[9]  = 0x00;//((params->frequency/10) >> 16) & 0xFF;
++		CmdFrm.operand[10] = 0x00;//((params->frequency/10) >>  8) & 0xFF;
++		CmdFrm.operand[11] = 0x00;//(params->frequency/10) & 0xFF;
++		CmdFrm.operand[12] = 0x00;
++		CmdFrm.operand[13] = 0x00;
++		CmdFrm.operand[14] = 0x00;
++
++		CmdFrm.operand[15] = 0x00; // network_ID[0]
++		CmdFrm.operand[16] = 0x00; // network_ID[1]
++*/		CmdFrm.operand[17] = pidc; // Nr_of_dsd_sel_specs
++
++		pos=18;
++	} else {
++/*		CmdFrm.operand[7]  = 0x00;
++		CmdFrm.operand[8]  = 0x00;
++		CmdFrm.operand[9]  = 0x00;
++		CmdFrm.operand[10] = 0x00;
++
++		CmdFrm.operand[11] = 0x00;//(((params->frequency/4) >> 16) & 0xFF) | (2 << 6);
++		CmdFrm.operand[12] = 0x00;//((params->frequency/4) >> 8) & 0xFF;
++		CmdFrm.operand[13] = 0x00;//(params->frequency/4) & 0xFF;
++
++		CmdFrm.operand[14] = 0x00;//((params->u.qpsk.symbol_rate/1000) >> 12) & 0xFF;
++		CmdFrm.operand[15] = 0x00;//((params->u.qpsk.symbol_rate/1000) >> 4) & 0xFF;
++		CmdFrm.operand[16] = 0x00;//((params->u.qpsk.symbol_rate/1000) << 4) & 0xF0;
++
++		CmdFrm.operand[17] = 0x00;
++		CmdFrm.operand[18] = 0x00;
++		CmdFrm.operand[19] = 0x00; // modulation
++		CmdFrm.operand[20] = 0x00;
++		CmdFrm.operand[21] = 0x00;*/
++		CmdFrm.operand[22] = pidc; // Nr_of_dsd_sel_specs
++
++		pos=23;
++	}
++	if(pidc != 0xFF)
++		for(k=0;k<pidc;k++) {
++			CmdFrm.operand[pos++] = 0x13; // flowfunction relay
++			CmdFrm.operand[pos++] = 0x80; // dsd_sel_spec_valid_flags -> PID
++			CmdFrm.operand[pos++] = (pid[k] >> 8) & 0x1F;
++			CmdFrm.operand[pos++] = pid[k] & 0xFF;
++			CmdFrm.operand[pos++] = 0x00; // tableID
++			CmdFrm.operand[pos++] = 0x00; // filter_length
++		}
++
++	CmdFrm.length = pos+3;
++
++	if((pos+3)%4)
++		CmdFrm.length += 4 - ((pos+3)%4);
++
++	if((k=AVCWrite(firesat,&CmdFrm,&RspFrm)))
++		return k;
++
++	mdelay(250);
++
++	return 0;
++}
++
++int AVCIdentifySubunit(struct firesat *firesat, unsigned char *systemId, int *transport, int *has_ci) {
++	AVCCmdFrm CmdFrm;
++	AVCRspFrm RspFrm;
++
++	memset(&CmdFrm,0,sizeof(AVCCmdFrm));
++
++	CmdFrm.cts = AVC;
++	CmdFrm.ctype = CONTROL;
++	CmdFrm.sutyp = 0x5; // tuner
++	CmdFrm.suid = firesat->subunit;
++	CmdFrm.opcode = READ_DESCRIPTOR;
++
++	CmdFrm.operand[0]=DESCRIPTOR_SUBUNIT_IDENTIFIER;
++	CmdFrm.operand[1]=0xff;
++	CmdFrm.operand[2]=0x00;
++	CmdFrm.operand[3]=0x00; // length highbyte
++	CmdFrm.operand[4]=0x08; // length lowbyte
++	CmdFrm.operand[5]=0x00; // offset highbyte
++	CmdFrm.operand[6]=0x0d; // offset lowbyte
++
++	CmdFrm.length=12;
++
++	if(AVCWrite(firesat,&CmdFrm,&RspFrm)<0)
++		return -EIO;
++
++	if(RspFrm.resp != STABLE && RspFrm.resp != ACCEPTED) {
++		printk("%s: AVCWrite returned error code %d\n",__FUNCTION__,RspFrm.resp);
++		return -EINVAL;
++	}
++	if(((RspFrm.operand[3] << 8) + RspFrm.operand[4]) != 8) {
++		printk("%s: Invalid response length\n",__FUNCTION__);
++		return -EINVAL;
++	}
++	if(systemId)
++		*systemId = RspFrm.operand[7];
++	if(transport)
++		*transport = RspFrm.operand[14] & 0x7;
++	switch(RspFrm.operand[14] & 0x7) {
++		case 1:
++			printk(KERN_INFO "%s: found DVB/S\n",__FUNCTION__);
++			break;
++		case 2:
++			printk(KERN_INFO "%s: found DVB/C\n",__FUNCTION__);
++			break;
++		case 3:
++			printk(KERN_INFO "%s: found DVB/T\n",__FUNCTION__);
++			break;
++		default:
++			printk(KERN_INFO "%s: found unknown tuner id %u\n",__FUNCTION__,RspFrm.operand[14] & 0x7);
++	}
++	if(has_ci)
++		*has_ci = (RspFrm.operand[14] >> 4) & 0x1;
++	return 0;
++}
++
++int AVCTunerStatus(struct firesat *firesat, ANTENNA_INPUT_INFO *antenna_input_info) {
++	AVCCmdFrm CmdFrm;
++	AVCRspFrm RspFrm;
++	int length;
++
++	memset(&CmdFrm, 0, sizeof(AVCCmdFrm));
++
++	CmdFrm.cts=AVC;
++	CmdFrm.ctype=CONTROL;
++	CmdFrm.sutyp=0x05; // tuner
++	CmdFrm.suid=firesat->subunit;
++	CmdFrm.opcode=READ_DESCRIPTOR;
++
++	CmdFrm.operand[0]=DESCRIPTOR_TUNER_STATUS;
++	CmdFrm.operand[1]=0xff;
++	CmdFrm.operand[2]=0x00;
++	CmdFrm.operand[3]=sizeof(ANTENNA_INPUT_INFO) >> 8;
++	CmdFrm.operand[4]=sizeof(ANTENNA_INPUT_INFO) & 0xFF;
++	CmdFrm.operand[5]=0x00;
++	CmdFrm.operand[6]=0x03;
++	CmdFrm.length=12;
++	//Absenden des AVC request und warten auf response
++	if (AVCWrite(firesat,&CmdFrm,&RspFrm) < 0)
++		return -EIO;
++
++	if(RspFrm.resp != STABLE && RspFrm.resp != ACCEPTED) {
++		printk("%s: AVCWrite returned code %d\n",__FUNCTION__,RspFrm.resp);
++		return -EINVAL;
++	}
++
++	length = (RspFrm.operand[3] << 8) + RspFrm.operand[4];
++	if(length == sizeof(ANTENNA_INPUT_INFO))
++	{
++		memcpy(antenna_input_info,&RspFrm.operand[7],length);
++		return 0;
++	}
++	printk("%s: invalid info returned from AVC\n",__FUNCTION__);
++	return -EINVAL;
++}
++
++int AVCLNBControl(struct firesat *firesat, char voltage, char burst,
++		  char conttone, char nrdiseq,
++		  struct dvb_diseqc_master_cmd *diseqcmd)
++{
++	AVCCmdFrm CmdFrm;
++	AVCRspFrm RspFrm;
++	int i,j;
++
++	printk(KERN_INFO "%s: voltage = %x, burst = %x, conttone = %x\n",__FUNCTION__,voltage,burst,conttone);
++
++	memset(&CmdFrm, 0, sizeof(AVCCmdFrm));
++
++	CmdFrm.cts=AVC;
++	CmdFrm.ctype=CONTROL;
++	CmdFrm.sutyp=0x05;
++	CmdFrm.suid=firesat->subunit;
++	CmdFrm.opcode=VENDOR;
++
++	CmdFrm.operand[0]=SFE_VENDOR_DE_COMPANYID_0;
++	CmdFrm.operand[1]=SFE_VENDOR_DE_COMPANYID_1;
++	CmdFrm.operand[2]=SFE_VENDOR_DE_COMPANYID_2;
++	CmdFrm.operand[3]=SFE_VENDOR_OPCODE_LNB_CONTROL;
++
++	CmdFrm.operand[4]=voltage;
++	CmdFrm.operand[5]=nrdiseq;
++
++	i=6;
++
++	for(j=0;j<nrdiseq;j++) {
++		int k;
++		printk(KERN_INFO "%s: diseq %d len %x\n",__FUNCTION__,j,diseqcmd[j].msg_len);
++		CmdFrm.operand[i++]=diseqcmd[j].msg_len;
++
++		for(k=0;k<diseqcmd[j].msg_len;k++) {
++			printk(KERN_INFO "%s: diseq %d msg[%d] = %x\n",__FUNCTION__,j,k,diseqcmd[j].msg[k]);
++			CmdFrm.operand[i++]=diseqcmd[j].msg[k];
++		}
++	}
++
++	CmdFrm.operand[i++]=burst;
++	CmdFrm.operand[i++]=conttone;
++
++	CmdFrm.length=i+3;
++	if((i+3)%4)
++		CmdFrm.length += 4 - ((i+3)%4);
++
++/*	for(j=0;j<CmdFrm.length;j++)
++		printk(KERN_INFO "%s: CmdFrm.operand[%d]=0x%x\n",__FUNCTION__,j,CmdFrm.operand[j]);
++
++	printk(KERN_INFO "%s: cmdfrm.length = %u\n",__FUNCTION__,CmdFrm.length);
++	*/
++	if(AVCWrite(firesat,&CmdFrm,&RspFrm) < 0)
++		return -EIO;
++
++	if(RspFrm.resp != ACCEPTED) {
++		printk("%s: AVCWrite returned code %d\n",__FUNCTION__,RspFrm.resp);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++int AVCSubUnitInfo(struct firesat *firesat, char *subunitcount)
++{
++	AVCCmdFrm CmdFrm;
++	AVCRspFrm RspFrm;
++
++	memset(&CmdFrm, 0, sizeof(AVCCmdFrm));
++
++	CmdFrm.cts = AVC;
++	CmdFrm.ctype = STATUS;
++	CmdFrm.sutyp = 0x1f;
++	CmdFrm.suid = 0x7;
++	CmdFrm.opcode = SUBUNIT_Info;
++
++	CmdFrm.operand[0] = 0x07;
++	CmdFrm.operand[1] = 0xff;
++	CmdFrm.operand[2] = 0xff;
++	CmdFrm.operand[3] = 0xff;
++	CmdFrm.operand[4] = 0xff;
++
++	CmdFrm.length = 8;
++
++	if(AVCWrite(firesat,&CmdFrm,&RspFrm) < 0)
++		return -EIO;
++
++	if(RspFrm.resp != STABLE) {
++		printk("%s: AVCWrite returned code %d\n",__FUNCTION__,RspFrm.resp);
++		return -EINVAL;
++	}
++
++	if(subunitcount)
++		*subunitcount = (RspFrm.operand[1] & 0x7) + 1;
++
++	return 0;
++}
++
++static int __AVCRegisterRemoteControl(struct firesat*firesat, int internal)
++{
++	AVCCmdFrm CmdFrm;
++
++//	printk(KERN_INFO "%s\n",__FUNCTION__);
++
++	memset(&CmdFrm, 0, sizeof(AVCCmdFrm));
++
++	CmdFrm.cts = AVC;
++	CmdFrm.ctype = NOTIFY;
++	CmdFrm.sutyp = 0x1f;
++	CmdFrm.suid = 0x7;
++	CmdFrm.opcode = VENDOR;
++
++	CmdFrm.operand[0] = SFE_VENDOR_DE_COMPANYID_0;
++	CmdFrm.operand[1] = SFE_VENDOR_DE_COMPANYID_1;
++	CmdFrm.operand[2] = SFE_VENDOR_DE_COMPANYID_2;
++	CmdFrm.operand[3] = SFE_VENDOR_OPCODE_REGISTER_REMOTE_CONTROL;
++
++	CmdFrm.length = 8;
++
++	if(internal) {
++		if(__AVCWrite(firesat,&CmdFrm,NULL) < 0)
++			return -EIO;
++	} else
++		if(AVCWrite(firesat,&CmdFrm,NULL) < 0)
++			return -EIO;
++
++	return 0;
++}
++
++int AVCRegisterRemoteControl(struct firesat*firesat)
++{
++	return __AVCRegisterRemoteControl(firesat, 0);
++}
+--- /dev/null
++++ b/drivers/media/dvb/firesat/avc_api.h
+@@ -0,0 +1,380 @@
++/***************************************************************************
++                          avc_api.h  -  description
++                             -------------------
++    begin                : Wed May 1 2000
++    copyright            : (C) 2000 by Manfred Weihs
++    copyright            : (C) 2003 by Philipp Gutgsell
++    email                : 0014guph@edu.fh-kaernten.ac.at
++ ***************************************************************************/
++
++/***************************************************************************
++ *                                                                         *
++ *   This program is free software; you can redistribute it and/or modify  *
++ *   it under the terms of the GNU General Public License as published by  *
++ *   the Free Software Foundation; either version 2 of the License, or     *
++ *   (at your option) any later version.                                   *
++ *                                                                         *
++ ***************************************************************************/
++
++/*
++ This is based on code written by Peter Halwachs,
++ Thomas Groiss and Andreas Monitzer.
++*/
++
++
++#ifndef __AVC_API_H__
++#define __AVC_API_H__
++
++#include <linux/dvb/frontend.h>
++
++#define BYTE	unsigned char
++#define WORD	unsigned short
++#define DWORD	unsigned long
++#define ULONG	unsigned long
++#define LONG	long
++
++
++/*************************************************************
++	FCP Address range
++**************************************************************/
++
++#define RESPONSE_REGISTER	0xFFFFF0000D00ULL
++#define COMMAND_REGISTER	0xFFFFF0000B00ULL
++#define PCR_BASE_ADDRESS	0xFFFFF0000900ULL
++
++
++/************************************************************
++	definition of structures
++*************************************************************/
++typedef struct {
++	   int           Nr_SourcePlugs;
++	   int 	         Nr_DestinationPlugs;
++} TunerInfo;
++
++
++/***********************************************
++
++         supported cts
++
++************************************************/
++
++#define AVC  0x0
++
++// FCP command frame with ctype = 0x0 is AVC command frame
++
++#ifdef __LITTLE_ENDIAN
++
++// Definition FCP Command Frame
++typedef struct _AVCCmdFrm
++{
++		// AV/C command frame
++	BYTE ctype  : 4 ;   // command type
++	BYTE cts    : 4 ;   // always 0x0 for AVC
++	BYTE suid   : 3 ;   // subunit ID
++	BYTE sutyp  : 5 ;   // subunit_typ
++	BYTE opcode : 8 ;   // opcode
++	BYTE operand[509] ; // array of operands [1-507]
++	int length;         //length of the command frame
++} AVCCmdFrm ;
++
++// Definition FCP Response Frame
++typedef struct _AVCRspFrm
++{
++        // AV/C response frame
++	BYTE resp		: 4 ;   // response type
++	BYTE cts		: 4 ;   // always 0x0 for AVC
++	BYTE suid		: 3 ;   // subunit ID
++	BYTE sutyp	: 5 ;   // subunit_typ
++	BYTE opcode	: 8 ;   // opcode
++	BYTE operand[509] ; // array of operands [1-507]
++	int length;         //length of the response frame
++} AVCRspFrm ;
++
++#else
++
++typedef struct _AVCCmdFrm
++{
++	BYTE cts:4;
++	BYTE ctype:4;
++	BYTE sutyp:5;
++	BYTE suid:3;
++	BYTE opcode;
++	BYTE operand[509];
++	int length;
++} AVCCmdFrm;
++
++typedef struct _AVCRspFrm
++{
++	BYTE cts:4;
++	BYTE resp:4;
++	BYTE sutyp:5;
++	BYTE suid:3;
++	BYTE opcode;
++	BYTE operand[509];
++	int length;
++} AVCRspFrm;
++
++#endif
++
++/*************************************************************
++	AVC command types (ctype)
++**************************************************************///
++#define CONTROL    0x00
++#define STATUS     0x01
++#define INQUIRY    0x02
++#define NOTIFY     0x03
++
++/*************************************************************
++	AVC respond types
++**************************************************************///
++#define NOT_IMPLEMENTED 0x8
++#define ACCEPTED        0x9
++#define REJECTED        0xA
++#define STABLE          0xC
++#define CHANGED         0xD
++#define INTERIM         0xF
++
++/*************************************************************
++	AVC opcodes
++**************************************************************///
++#define CONNECT			0x24
++#define DISCONNECT		0x25
++#define UNIT_INFO		0x30
++#define SUBUNIT_Info		0x31
++#define VENDOR			0x00
++
++#define PLUG_INFO		0x02
++#define OPEN_DESCRIPTOR		0x08
++#define READ_DESCRIPTOR		0x09
++#define OBJECT_NUMBER_SELECT	0x0D
++
++/*************************************************************
++	AVCTuner opcodes
++**************************************************************/
++
++#define DSIT				0xC8
++#define DSD				0xCB
++#define DESCRIPTOR_TUNER_STATUS 	0x80
++#define DESCRIPTOR_SUBUNIT_IDENTIFIER	0x00
++
++/*************************************************************
++	AVCTuner list types
++**************************************************************/
++#define Multiplex_List   0x80
++#define Service_List     0x82
++
++/*************************************************************
++	AVCTuner object entries
++**************************************************************/
++#define Multiplex	 			0x80
++#define Service 	 			0x82
++#define Service_with_specified_components	0x83
++#define Preferred_components			0x90
++#define Component				0x84
++
++/*************************************************************
++	Vendor-specific commands
++**************************************************************/
++
++// digital everywhere vendor ID
++#define SFE_VENDOR_DE_COMPANYID_0			0x00
++#define SFE_VENDOR_DE_COMPANYID_1			0x12
++#define SFE_VENDOR_DE_COMPANYID_2			0x87
++
++#define SFE_VENDOR_MAX_NR_COMPONENTS		0x4
++#define SFE_VENDOR_MAX_NR_SERVICES			0x3
++#define SFE_VENDOR_MAX_NR_DSD_ELEMENTS		0x10
++
++// vendor commands
++#define SFE_VENDOR_OPCODE_REGISTER_REMOTE_CONTROL	0x0A
++#define SFE_VENDOR_OPCODE_LNB_CONTROL		0x52
++#define SFE_VENDOR_OPCODE_TUNE_QPSK			0x58	// QPSK command for DVB-S
++
++// TODO: following vendor specific commands needs to be implemented
++#define SFE_VENDOR_OPCODE_GET_FIRMWARE_VERSION	0x00
++#define SFE_VENDOR_OPCODE_HOST2CA				0x56
++#define SFE_VENDOR_OPCODE_CA2HOST				0x57
++#define SFE_VENDOR_OPCODE_CISTATUS				0x59
++#define SFE_VENDOR_OPCODE_TUNE_QPSK2			0x60 // QPSK command for DVB-S2 devices
++
++
++//AVCTuner DVB identifier service_ID
++#define DVB 0x20
++
++/*************************************************************
++						AVC descriptor types
++**************************************************************/
++
++#define Subunit_Identifier_Descriptor		 0x00
++#define Tuner_Status_Descriptor				 0x80
++
++typedef struct {
++	BYTE          Subunit_Type;
++	BYTE          Max_Subunit_ID;
++} SUBUNIT_INFO;
++
++/*************************************************************
++
++		AVCTuner DVB object IDs are 6 byte long
++
++**************************************************************/
++
++typedef struct {
++	BYTE  Byte0;
++	BYTE  Byte1;
++	BYTE  Byte2;
++	BYTE  Byte3;
++	BYTE  Byte4;
++	BYTE  Byte5;
++}OBJECT_ID;
++
++/*************************************************************
++						MULIPLEX Structs
++**************************************************************/
++typedef struct
++{
++#ifdef __LITTLE_ENDIAN
++	BYTE       RF_frequency_hByte:6;
++	BYTE       raster_Frequency:2;//Bit7,6 raster frequency
++#else
++	BYTE raster_Frequency:2;
++	BYTE RF_frequency_hByte:6;
++#endif
++	BYTE       RF_frequency_mByte;
++	BYTE       RF_frequency_lByte;
++
++}FREQUENCY;
++
++#ifdef __LITTLE_ENDIAN
++
++typedef struct
++{
++		 BYTE        Modulation	    :1;
++		 BYTE        FEC_inner	    :1;
++		 BYTE        FEC_outer	    :1;
++		 BYTE        Symbol_Rate    :1;
++		 BYTE        Frequency	    :1;
++		 BYTE        Orbital_Pos	:1;
++		 BYTE        Polarisation	:1;
++		 BYTE        reserved_fields :1;
++		 BYTE        reserved1		:7;
++		 BYTE        Network_ID	:1;
++
++}MULTIPLEX_VALID_FLAGS;
++
++typedef struct
++{
++	BYTE	GuardInterval:1;
++	BYTE	CodeRateLPStream:1;
++	BYTE	CodeRateHPStream:1;
++	BYTE	HierarchyInfo:1;
++	BYTE	Constellation:1;
++	BYTE	Bandwidth:1;
++	BYTE	CenterFrequency:1;
++	BYTE	reserved1:1;
++	BYTE	reserved2:5;
++	BYTE	OtherFrequencyFlag:1;
++	BYTE	TransmissionMode:1;
++	BYTE	NetworkId:1;
++}MULTIPLEX_VALID_FLAGS_DVBT;
++
++#else
++
++typedef struct {
++	BYTE reserved_fields:1;
++	BYTE Polarisation:1;
++	BYTE Orbital_Pos:1;
++	BYTE Frequency:1;
++	BYTE Symbol_Rate:1;
++	BYTE FEC_outer:1;
++	BYTE FEC_inner:1;
++	BYTE Modulation:1;
++	BYTE Network_ID:1;
++	BYTE reserved1:7;
++}MULTIPLEX_VALID_FLAGS;
++
++typedef struct {
++	BYTE reserved1:1;
++	BYTE CenterFrequency:1;
++	BYTE Bandwidth:1;
++	BYTE Constellation:1;
++	BYTE HierarchyInfo:1;
++	BYTE CodeRateHPStream:1;
++	BYTE CodeRateLPStream:1;
++	BYTE GuardInterval:1;
++	BYTE NetworkId:1;
++	BYTE TransmissionMode:1;
++	BYTE OtherFrequencyFlag:1;
++	BYTE reserved2:5;
++}MULTIPLEX_VALID_FLAGS_DVBT;
++
++#endif
++
++typedef union {
++	MULTIPLEX_VALID_FLAGS Bits;
++	MULTIPLEX_VALID_FLAGS_DVBT Bits_T;
++	struct {
++		BYTE	ByteHi;
++		BYTE	ByteLo;
++	} Valid_Word;
++} M_VALID_FLAGS;
++
++typedef struct
++{
++#ifdef __LITTLE_ENDIAN
++  BYTE      ActiveSystem;
++  BYTE      reserved:5;
++  BYTE      NoRF:1;
++  BYTE      Moving:1;
++  BYTE      Searching:1;
++
++  BYTE      SelectedAntenna:7;
++  BYTE      Input:1;
++
++  BYTE      BER[4];
++
++  BYTE      SignalStrength;
++  FREQUENCY Frequency;
++
++  BYTE      ManDepInfoLength;
++#else
++  BYTE ActiveSystem;
++  BYTE Searching:1;
++  BYTE Moving:1;
++  BYTE NoRF:1;
++  BYTE reserved:5;
++
++  BYTE Input:1;
++  BYTE SelectedAntenna:7;
++
++  BYTE BER[4];
++
++  BYTE SignalStrength;
++  FREQUENCY Frequency;
++
++  BYTE ManDepInfoLength;
++#endif
++} ANTENNA_INPUT_INFO; // 11 Byte
++
++#define LNBCONTROL_DONTCARE 0xff
++
++
++extern int AVCWrite(struct firesat *firesat, const AVCCmdFrm *CmdFrm, AVCRspFrm *RspFrm);
++extern int AVCRecv(struct firesat *firesat, u8 *data, size_t length);
++
++extern int AVCTuner_DSIT(struct firesat *firesat,
++                           int Source_Plug,
++						   struct dvb_frontend_parameters *params,
++                           BYTE *status);
++
++extern int AVCTunerStatus(struct firesat *firesat, ANTENNA_INPUT_INFO *antenna_input_info);
++extern int AVCTuner_DSD(struct firesat *firesat, struct dvb_frontend_parameters *params, BYTE *status);
++extern int AVCTuner_SetPIDs(struct firesat *firesat, unsigned char pidc, u16 pid[]);
++
++extern int AVCIdentifySubunit(struct firesat *firesat, unsigned char *systemId, int *transport, int *has_ci);
++extern int AVCLNBControl(struct firesat *firesat, char voltage, char burst, char conttone, char nrdiseq, struct dvb_diseqc_master_cmd *diseqcmd);
++extern int AVCSubUnitInfo(struct firesat *firesat, char *subunitcount);
++extern int AVCRegisterRemoteControl(struct firesat *firesat);
++
++#endif
++
+--- /dev/null
++++ b/drivers/media/dvb/firesat/cmp.c
+@@ -0,0 +1,230 @@
++#include "cmp.h"
++#include <ieee1394.h>
++#include <nodemgr.h>
++#include <highlevel.h>
++#include <ohci1394.h>
++#include <hosts.h>
++#include <ieee1394_core.h>
++#include <ieee1394_transactions.h>
++#include "avc_api.h"
++
++typedef struct _OPCR
++{
++	BYTE PTPConnCount    : 6 ; // Point to point connect. counter
++	BYTE BrConnCount     : 1 ; // Broadcast connection counter
++	BYTE OnLine          : 1 ; // On Line
++
++	BYTE ChNr            : 6 ; // Channel number
++	BYTE Res             : 2 ; // Reserved
++
++	BYTE PayloadHi       : 2 ; // Payoad high bits
++	BYTE OvhdID          : 4 ; // Overhead ID
++	BYTE DataRate        : 2 ; // Data Rate
++
++	BYTE PayloadLo           ; // Payoad low byte
++} OPCR ;
++
++#define FIRESAT_SPEED IEEE1394_SPEED_400
++
++/* hpsb_lock is being removed from the kernel-source,
++ * therefor we define our own 'firesat_hpsb_lock'*/
++
++int send_packet_and_wait(struct hpsb_packet *packet);
++
++int firesat_hpsb_lock(struct hpsb_host *host, nodeid_t node, unsigned int generation,
++		u64 addr, int extcode, quadlet_t * data, quadlet_t arg) {
++
++	struct hpsb_packet *packet;
++	int retval = 0;
++
++	BUG_ON(in_interrupt()); // We can't be called in an interrupt, yet
++
++	packet = hpsb_make_lockpacket(host, node, addr, extcode, data, arg);
++	if (!packet)
++		return -ENOMEM;
++
++	packet->generation = generation;
++	retval = send_packet_and_wait(packet);
++	if (retval < 0)
++		goto hpsb_lock_fail;
++
++	retval = hpsb_packet_success(packet);
++
++	if (retval == 0) {
++		*data = packet->data[0];
++	}
++
++	hpsb_lock_fail:
++	hpsb_free_tlabel(packet);
++	hpsb_free_packet(packet);
++
++	return retval;
++}
++
++
++static int cmp_read(struct firesat *firesat, void *buffer, u64 addr, size_t length) {
++	int ret;
++	if(down_interruptible(&firesat->avc_sem))
++		return -EINTR;
++
++	ret = hpsb_read(firesat->host, firesat->nodeentry->nodeid, firesat->nodeentry->generation,
++		addr, buffer, length);
++
++	up(&firesat->avc_sem);
++	return ret;
++}
++
++static int cmp_lock(struct firesat *firesat, quadlet_t *data, u64 addr, quadlet_t arg, int ext_tcode) {
++	int ret;
++	if(down_interruptible(&firesat->avc_sem))
++		return -EINTR;
++
++	ret = firesat_hpsb_lock(firesat->host, firesat->nodeentry->nodeid, firesat->nodeentry->generation,
++		addr, ext_tcode, data, arg);
++
++	up(&firesat->avc_sem);
++	return ret;
++}
++
++//try establishing a point-to-point connection (may be interrupted by a busreset
++int try_CMPEstablishPPconnection(struct firesat *firesat, int output_plug, int iso_channel) {
++	unsigned int BWU; //bandwidth to allocate
++
++	quadlet_t old_oPCR,test_oPCR = 0x0;
++	u64 oPCR_address=0xfffff0000904ull+(output_plug << 2);
++	int result=cmp_read(firesat, &test_oPCR, oPCR_address, 4);
++
++	printk(KERN_INFO "%s: nodeid = %d\n",__FUNCTION__,firesat->nodeentry->nodeid);
++
++	if (result < 0) {
++		printk("%s: cannot read oPCR\n", __FUNCTION__);
++		return result;
++	} else {
++		printk(KERN_INFO "%s: oPCR = %08x\n",__FUNCTION__,test_oPCR);
++		do {
++			OPCR *hilf= (OPCR*) &test_oPCR;
++
++			if (!hilf->OnLine) {
++				printk("%s: Output offline; oPCR: %08x\n", __FUNCTION__, test_oPCR);
++				return -EBUSY;
++			} else {
++				quadlet_t new_oPCR;
++
++				old_oPCR=test_oPCR;
++				if (hilf->PTPConnCount) {
++					if (hilf->ChNr != iso_channel) {
++						printk("%s: Output plug has already connection on channel %u; cannot change it to channel %u\n",__FUNCTION__,hilf->ChNr,iso_channel);
++						return -EBUSY;
++					} else
++						printk(KERN_INFO "%s: Overlaying existing connection; connection counter was: %u\n",__FUNCTION__, hilf->PTPConnCount);
++					BWU=0; //we allocate no bandwidth (is this necessary?)
++				} else {
++					hilf->ChNr=iso_channel;
++					hilf->DataRate=FIRESAT_SPEED;
++
++					hilf->OvhdID=0;      //FIXME: that is for worst case -> optimize
++					BWU=hilf->OvhdID?hilf->OvhdID*32:512;
++					BWU += (hilf->PayloadLo + (hilf->PayloadHi << 8) +3) * (2 << (3-hilf->DataRate));
++/*					if (allocate_1394_resources(iso_channel,BWU))
++					{
++						cout << "Allocation of resources failed\n";
++						return -2;
++					}*/
++				}
++
++				hilf->PTPConnCount++;
++				new_oPCR=test_oPCR;
++				printk(KERN_INFO "%s: trying compare_swap...\n",__FUNCTION__);
++				printk(KERN_INFO "%s: oPCR_old: %08x, oPCR_new: %08x\n",__FUNCTION__, old_oPCR, new_oPCR);
++				result=cmp_lock(firesat, &test_oPCR, oPCR_address, old_oPCR, 2);
++
++				if (result < 0) {
++					printk("%s: cannot compare_swap oPCR\n",__FUNCTION__);
++					return result;
++				}
++				if ((old_oPCR != test_oPCR) && (!((OPCR*) &old_oPCR)->PTPConnCount))
++				{
++					printk("%s: change of oPCR failed -> freeing resources\n",__FUNCTION__);
++//					hilf= (OPCR*) &new_oPCR;
++//					unsigned int BWU=hilf->OvhdID?hilf->OvhdID*32:512;
++//					BWU += (hilf->Payload+3) * (2 << (3-hilf->DataRate));
++/*					if (deallocate_1394_resources(iso_channel,BWU))
++					{
++
++						cout << "Deallocation of resources failed\n";
++						return -3;
++					}*/
++				}
++			}
++		}
++		while (old_oPCR != test_oPCR);
++	}
++	return 0;
++}
++
++//try breaking a point-to-point connection (may be interrupted by a busreset
++int try_CMPBreakPPconnection(struct firesat *firesat, int output_plug,int iso_channel) {
++	quadlet_t old_oPCR,test_oPCR;
++
++	u64 oPCR_address=0xfffff0000904ull+(output_plug << 2);
++	int result=cmp_read(firesat, &test_oPCR, oPCR_address, 4);
++
++	printk(KERN_INFO "%s\n",__FUNCTION__);
++
++	if (result < 0) {
++		printk("%s: cannot read oPCR\n", __FUNCTION__);
++		return result;
++	} else {
++		do {
++			OPCR *hilf= (OPCR*) &test_oPCR;
++
++			if (!hilf->OnLine || !hilf->PTPConnCount || hilf->ChNr != iso_channel) {
++				printk("%s: Output plug does not have PtP-connection on that channel; oPCR: %08x\n", __FUNCTION__, test_oPCR);
++				return -EINVAL;
++			} else {
++				quadlet_t new_oPCR;
++				old_oPCR=test_oPCR;
++				hilf->PTPConnCount--;
++				new_oPCR=test_oPCR;
++
++//				printk(KERN_INFO "%s: trying compare_swap...\n", __FUNCTION__);
++				result=cmp_lock(firesat, &test_oPCR, oPCR_address, old_oPCR, 2);
++				if (result < 0) {
++					printk("%s: cannot compare_swap oPCR\n",__FUNCTION__);
++					return result;
++				}
++			}
++
++		} while (old_oPCR != test_oPCR);
++
++/*		hilf = (OPCR*) &old_oPCR;
++		if (hilf->PTPConnCount == 1) { // if we were the last owner of this connection
++			cout << "deallocating 1394 resources\n";
++			unsigned int BWU=hilf->OvhdID?hilf->OvhdID*32:512;
++			BWU += (hilf->PayloadLo + (hilf->PayloadHi << 8) +3) * (2 << (3-hilf->DataRate));
++			if (deallocate_1394_resources(iso_channel,BWU))
++			{
++				cout << "Deallocation of resources failed\n";
++				return -3;
++			}
++		}*/
++    }
++	return 0;
++}
++
++static void complete_packet(void *data) {
++	complete((struct completion *) data);
++}
++
++int send_packet_and_wait(struct hpsb_packet *packet) {
++	struct completion done;
++	int retval;
++
++	init_completion(&done);
++	hpsb_set_packet_complete_task(packet, complete_packet, &done);
++	retval = hpsb_send_packet(packet);
++	if (retval == 0)
++		wait_for_completion(&done);
++
++	return retval;
++}
+--- /dev/null
++++ b/drivers/media/dvb/firesat/cmp.h
+@@ -0,0 +1,9 @@
++#ifndef __FIRESAT__CMP_H_
++#define __FIRESAT__CMP_H_
++
++#include "firesat.h"
++
++extern int try_CMPEstablishPPconnection(struct firesat *firesat, int output_plug, int iso_channel);
++extern int try_CMPBreakPPconnection(struct firesat *firesat, int output_plug,int iso_channel);
++
++#endif
+--- /dev/null
++++ b/drivers/media/dvb/firesat/firesat-ci.c
+@@ -0,0 +1,95 @@
++#include "firesat-ci.h"
++#include "firesat.h"
++#include "avc_api.h"
++
++#include <linux/dvb/ca.h>
++#include <dvbdev.h>
++/*
++static int firesat_ca_do_ioctl(struct inode *inode, struct file *file, unsigned int cmd, void *parg) {
++	//struct firesat *firesat = (struct firesat*)((struct dvb_device*)file->private_data)->priv;
++	int err;
++
++//	printk(KERN_INFO "%s: ioctl %d\n",__FUNCTION__,cmd);
++
++	switch(cmd) {
++	case CA_RESET:
++		// TODO: Needs to be implemented with new AVC Vendor commands
++		break;
++	case CA_GET_CAP: {
++		ca_caps_t *cap=(ca_caps_t*)parg;
++		cap->slot_num = 1;
++		cap->slot_type = CA_CI_LINK;
++		cap->descr_num = 1;
++		cap->descr_type = CA_DSS;
++
++		err = 0;
++		break;
++	}
++	case CA_GET_SLOT_INFO: {
++		ca_slot_info_t *slot=(ca_slot_info_t*)parg;
++		if(slot->num == 0) {
++			slot->type = CA_CI | CA_CI_LINK | CA_DESCR;
++			slot->flags = CA_CI_MODULE_PRESENT | CA_CI_MODULE_READY;
++		} else {
++			slot->type = 0;
++			slot->flags = 0;
++		}
++		err = 0;
++		break;
++	}
++	default:
++			err=-EINVAL;
++	}
++	return err;
++}
++*/
++
++static int firesat_ca_ioctl(struct inode *inode, struct file *file, unsigned int cmd, unsigned long arg) {
++	//return dvb_usercopy(inode, file, cmd, arg, firesat_ca_do_ioctl);
++	return dvb_generic_ioctl(inode, file, cmd, arg);
++}
++
++static int firesat_ca_io_open(struct inode *inode, struct file *file) {
++	printk(KERN_INFO "%s!\n",__FUNCTION__);
++	return dvb_generic_open(inode, file);
++}
++
++static int firesat_ca_io_release(struct inode *inode, struct file *file) {
++	printk(KERN_INFO "%s!\n",__FUNCTION__);
++	return dvb_generic_release(inode, file);
++}
++
++static unsigned int firesat_ca_io_poll(struct file *file, poll_table *wait) {
++//	printk(KERN_INFO "%s!\n",__FUNCTION__);
++	return POLLIN;
++}
++
++static struct file_operations firesat_ca_fops = {
++	.owner = THIS_MODULE,
++	.read = NULL, // There is no low level read anymore
++	.write = NULL, // There is no low level write anymore
++	.ioctl = firesat_ca_ioctl,
++	.open = firesat_ca_io_open,
++	.release = firesat_ca_io_release,
++	.poll = firesat_ca_io_poll,
++};
++
++static struct dvb_device firesat_ca = {
++	.priv = NULL,
++	.users = 1,
++	.readers = 1,
++	.writers = 1,
++	.fops = &firesat_ca_fops,
++};
++
++int firesat_ca_init(struct firesat *firesat) {
++	int ret = dvb_register_device(firesat->adapter, &firesat->cadev, &firesat_ca, firesat, DVB_DEVICE_CA);
++	if(ret) return ret;
++
++	// avoid unnecessary delays, we're not talking to the CI yet anyways
++	return 0;
++}
++
++void firesat_ca_release(struct firesat *firesat) {
++	dvb_unregister_device(firesat->cadev);
++}
+--- /dev/null
++++ b/drivers/media/dvb/firesat/firesat-ci.h
+@@ -0,0 +1,9 @@
++#ifndef __FIRESAT_CA_H
++#define __FIRESAT_CA_H
++
++#include "firesat.h"
++
++int firesat_ca_init(struct firesat *firesat);
++void firesat_ca_release(struct firesat *firesat);
++
++#endif
+--- /dev/null
++++ b/drivers/media/dvb/firesat/firesat-rc.c
+@@ -0,0 +1,82 @@
++#include "firesat.h"
++#include "firesat-rc.h"
++
++#include <linux/input.h>
++
++static u16 firesat_irtable[] = {
++	KEY_ESC,
++	KEY_F9,
++	KEY_1,
++	KEY_2,
++	KEY_3,
++	KEY_4,
++	KEY_5,
++	KEY_6,
++	KEY_7,
++	KEY_8,
++	KEY_9,
++	KEY_I,
++	KEY_0,
++	KEY_ENTER,
++	KEY_RED,
++	KEY_UP,
++	KEY_GREEN,
++	KEY_F10,
++	KEY_SPACE,
++	KEY_F11,
++	KEY_YELLOW,
++	KEY_DOWN,
++	KEY_BLUE,
++	KEY_Z,
++	KEY_P,
++	KEY_PAGEDOWN,
++	KEY_LEFT,
++	KEY_W,
++	KEY_RIGHT,
++	KEY_P,
++	KEY_M,
++	KEY_R,
++	KEY_V,
++	KEY_C,
++	0
++};
++
++static struct input_dev firesat_idev;
++
++int firesat_register_rc(void) {
++	int index;
++
++	memset(&firesat_idev, 0, sizeof(firesat_idev));
++
++	firesat_idev.evbit[0] = BIT(EV_KEY);
++
++	for(index=0;firesat_irtable[index] != 0; index++)
++		set_bit(firesat_irtable[index], firesat_idev.keybit);
++
++	input_register_device(&firesat_idev);
++
++	return 0;
++}
++
++int firesat_unregister_rc(void) {
++	input_unregister_device(&firesat_idev);
++	return 0;
++}
++
++int firesat_got_remotecontrolcode(u16 code) {
++	u16 keycode;
++
++	if(code > 0x4500 && code < 0x4520)
++		keycode = firesat_irtable[code - 0x4501];
++	else if(code > 0x453f && code < 0x4543)
++		keycode = firesat_irtable[code - 0x4521];
++	else {
++		printk("%s: invalid key code 0x%04x\n",__FUNCTION__,code);
++		return -EINVAL;
++	}
++
++	input_report_key(&firesat_idev, keycode, 1);
++	input_report_key(&firesat_idev, keycode, 0);
++
++	return 0;
++}
+--- /dev/null
++++ b/drivers/media/dvb/firesat/firesat-rc.h
+@@ -0,0 +1,9 @@
++#ifndef __FIRESAT_LIRC_H
++#define __FIRESAT_LIRC_H
++
++extern int firesat_register_rc(void);
++extern int firesat_unregister_rc(void);
++extern int firesat_got_remotecontrolcode(u16 code);
++
++#endif
++
+--- /dev/null
++++ b/drivers/media/dvb/firesat/firesat.c
+@@ -0,0 +1,967 @@
++/*
++ * FireSAT DVB driver
++ *
++ * Copyright (c) 2004-2008 Andreas Monitzer <andy@monitzer.com>
++ * Copyright (c) 2004-2008 Ben Backx <ben@bbackx.com>
++ *
++ *	This program is free software; you can redistribute it and/or
++ *	modify it under the terms of the GNU General Public License as
++ *	published by the Free Software Foundation; either version 2 of
++ *	the License, or (at your option) any later version.
++ */
++#include <linux/init.h>
++#include <linux/slab.h>
++#include <linux/wait.h>
++#include <linux/module.h>
++#include <linux/delay.h>
++#include <linux/time.h>
++#include <linux/errno.h>
++#include <linux/interrupt.h>
++#include <asm/semaphore.h>
++#include <ieee1394_hotplug.h>
++#include <nodemgr.h>
++#include <highlevel.h>
++#include <ohci1394.h>
++#include <hosts.h>
++#include <dvbdev.h>
++
++#include "firesat.h"
++#include "avc_api.h"
++#include "cmp.h"
++#include "firesat-rc.h"
++#include "firesat-ci.h"
++
++#define FIRESAT_Vendor_ID   0x001287
++
++/*** HOTPLUG STUFF **********************************************************/
++/*
++ * Export information about protocols/devices supported by this driver.
++ */
++static struct ieee1394_device_id firesat_id_table[] = {
++	/* FloppyDTV S/CI and FloppyDTV S2 */
++	{
++	.match_flags = IEEE1394_MATCH_MODEL_ID | IEEE1394_MATCH_SPECIFIER_ID,
++	.model_id = 0x000024,
++	.specifier_id = AVC_UNIT_SPEC_ID_ENTRY & 0xffffff,
++	},
++
++	/* FloppyDTV T/CI */
++	{
++	.match_flags = IEEE1394_MATCH_MODEL_ID | IEEE1394_MATCH_SPECIFIER_ID,
++	.model_id = 0x000025,
++	.specifier_id = AVC_UNIT_SPEC_ID_ENTRY & 0xffffff,
++	},
++
++	/* FloppyDTV C/CI */
++	{
++	.match_flags = IEEE1394_MATCH_MODEL_ID | IEEE1394_MATCH_SPECIFIER_ID,
++	.model_id = 0x000026,
++	.specifier_id = AVC_UNIT_SPEC_ID_ENTRY & 0xffffff,
++	},
++
++	/* FireDTV S/CI and FloppyDTV S2 */
++	{
++	.match_flags = IEEE1394_MATCH_MODEL_ID | IEEE1394_MATCH_SPECIFIER_ID,
++	.model_id = 0x000034,
++	.specifier_id = AVC_UNIT_SPEC_ID_ENTRY & 0xffffff,
++	},
++
++	/* ( FireDTV T/CI */
++	{
++	.match_flags = IEEE1394_MATCH_MODEL_ID | IEEE1394_MATCH_SPECIFIER_ID,
++	.model_id = 0x000035,
++	.specifier_id = AVC_UNIT_SPEC_ID_ENTRY & 0xffffff,
++	},
++
++	/* FireDTV C/CI */
++	{
++	.match_flags = IEEE1394_MATCH_MODEL_ID | IEEE1394_MATCH_SPECIFIER_ID,
++	.model_id = 0x000036,
++	.specifier_id = AVC_UNIT_SPEC_ID_ENTRY & 0xffffff,
++	},
++
++	{ }
++};
++
++MODULE_DEVICE_TABLE(ieee1394, firesat_id_table);
++
++/* list of all firesat devices */
++LIST_HEAD(firesat_list);
++spinlock_t firesat_list_lock = SPIN_LOCK_UNLOCKED;
++
++static void firesat_add_host(struct hpsb_host *host);
++static void firesat_remove_host(struct hpsb_host *host);
++static void firesat_host_reset(struct hpsb_host *host);
++static void iso_receive(struct hpsb_host *host, int channel, quadlet_t *data,
++			size_t length);
++static void fcp_request(struct hpsb_host *host, int nodeid, int direction,
++			int cts, u8 *data, size_t length);
++
++static struct hpsb_highlevel firesat_highlevel = {
++	.name =         "FireSAT",
++	.add_host =     firesat_add_host,
++	.remove_host =  firesat_remove_host,
++	.host_reset =   firesat_host_reset,
++// FIXME	.iso_receive =	iso_receive,
++	.fcp_request =	fcp_request,
++};
++
++/* Start of dvb_frontend_ops */
++/* The functions we need */
++
++static int firesat_dvb_init(struct dvb_frontend *fe);
++static int firesat_sleep(struct dvb_frontend *fe);
++static int firesat_diseqc_reset_overload(struct dvb_frontend *fe);
++static int firesat_diseqc_recv_slave_reply(struct dvb_frontend *fe,
++					struct dvb_diseqc_slave_reply *reply);
++static int firesat_diseqc_send_master_cmd(struct dvb_frontend *fe,
++					struct dvb_diseqc_master_cmd *cmd);
++static int firesat_diseqc_send_burst(struct dvb_frontend *fe,
++				     fe_sec_mini_cmd_t minicmd);
++static int firesat_set_tone(struct dvb_frontend *fe,
++			    fe_sec_tone_mode_t tone);
++static int firesat_set_voltage(struct dvb_frontend *fe,
++			       fe_sec_voltage_t voltage);
++static int firesat_enable_high_lnb_voltage(struct dvb_frontend *fe, long arg);
++static int firesat_read_status(struct dvb_frontend *fe, fe_status_t *status);
++static int firesat_read_ber(struct dvb_frontend *fe, u32 *ber);
++static int firesat_read_signal_strength(struct dvb_frontend *fe, u16 *strength);
++static int firesat_read_snr(struct dvb_frontend *fe, u16 *snr);
++static int firesat_read_uncorrected_blocks(struct dvb_frontend *fe,
++					   u32 *ucblocks);
++static int firesat_set_frontend(struct dvb_frontend *fe,
++				struct dvb_frontend_parameters *params);
++static int firesat_get_frontend(struct dvb_frontend *fe,
++				struct dvb_frontend_parameters *params);
++
++/* And the definition itself...*/
++
++static struct dvb_frontend_ops firesat_ops = {
++	.init =	firesat_dvb_init,
++	.sleep = firesat_sleep,
++
++	.set_frontend = firesat_set_frontend,
++	.get_frontend = firesat_get_frontend,
++
++	.read_status = firesat_read_status,
++	.read_ber = firesat_read_ber,
++	.read_signal_strength = firesat_read_signal_strength,
++	.read_snr = firesat_read_snr,
++	.read_ucblocks = firesat_read_uncorrected_blocks,
++
++	.diseqc_reset_overload = firesat_diseqc_reset_overload,
++	.diseqc_recv_slave_reply = firesat_diseqc_recv_slave_reply,
++	.diseqc_send_master_cmd = firesat_diseqc_send_master_cmd,
++	.diseqc_send_burst = firesat_diseqc_send_burst,
++	.set_tone = firesat_set_tone,
++	.set_voltage = firesat_set_voltage,
++	.enable_high_lnb_voltage = firesat_enable_high_lnb_voltage,
++};
++
++/* End of dvb_frontend_ops */
++
++static struct dvb_frontend_info firesat_S_frontend_info = {
++	.name			= "FireSAT DVB-S Frontend",
++	.type			= FE_QPSK,
++	.frequency_min		= 950000,
++	.frequency_max		= 2150000,
++	.frequency_stepsize	= 125,
++	.symbol_rate_min	= 1000000,
++	.symbol_rate_max	= 40000000,
++	.caps = FE_CAN_INVERSION_AUTO | FE_CAN_FEC_1_2 | FE_CAN_FEC_2_3 |
++		FE_CAN_FEC_3_4 | FE_CAN_FEC_5_6 | FE_CAN_FEC_7_8 |
++		FE_CAN_FEC_AUTO | FE_CAN_QPSK,
++};
++
++static struct dvb_frontend_info firesat_C_frontend_info = {
++	.name			= "FireSAT DVB-C Frontend",
++	.type			= FE_QAM,
++	.frequency_min		= 47000000,
++	.frequency_max		= 866000000,
++	.frequency_stepsize	= 62500,
++	.symbol_rate_min	= 870000,
++	.symbol_rate_max	= 6900000,
++	.caps = FE_CAN_INVERSION_AUTO | FE_CAN_QAM_16 | FE_CAN_QAM_32 |
++		FE_CAN_QAM_64 | FE_CAN_QAM_128 | FE_CAN_QAM_256 |
++		FE_CAN_QAM_AUTO,
++};
++
++static struct dvb_frontend_info firesat_T_frontend_info = {
++	.name			= "FireSAT DVB-T Frontend",
++	.type			= FE_OFDM,
++	.frequency_min		= 49000000,
++	.frequency_max		= 861000000,
++	.frequency_stepsize	= 62500,
++	.caps = FE_CAN_INVERSION_AUTO | FE_CAN_FEC_2_3 |
++		FE_CAN_TRANSMISSION_MODE_AUTO | FE_CAN_GUARD_INTERVAL_AUTO |
++		FE_CAN_HIERARCHY_AUTO,
++};
++
++static void firesat_add_host (struct hpsb_host *host) {
++	struct ti_ohci *ohci;
++//    printk(KERN_INFO "FireSAT add_host (nodeid = 0x%x)\n",host->node_id);
++
++	/* We only work with the OHCI-1394 driver */
++	if (strcmp(host->driver->name, OHCI1394_DRIVER_NAME))
++		return;
++
++	ohci = (struct ti_ohci *)host->hostdata;
++
++	if (!hpsb_create_hostinfo(&firesat_highlevel, host, 0)) {
++		printk(KERN_ERR "Cannot allocate hostinfo\n");
++		return;
++	}
++
++	hpsb_set_hostinfo(&firesat_highlevel, host, ohci);
++	hpsb_set_hostinfo_key(&firesat_highlevel, host, ohci->host->id);
++}
++
++static void firesat_remove_host (struct hpsb_host *host) {
++//    printk(KERN_INFO "FireSAT remove_host (nodeid = 0x%x)\n",host->node_id);
++}
++
++static void firesat_host_reset(struct hpsb_host *host) {
++    printk(KERN_INFO "FireSAT host_reset (nodeid = 0x%x, hosts active = %d)\n",host->node_id,host->nodes_active);
++}
++
++struct firewireheader {
++    union {
++	struct {
++	    unsigned char tcode:4;
++	    unsigned char sy:4;
++	    unsigned char tag:2;
++	    unsigned char channel:6;
++
++	    unsigned char length_l;
++	    unsigned char length_h;
++	} hdr;
++	unsigned long val;
++    };
++};
++
++struct CIPHeader {
++    union {
++	struct {
++	    unsigned char syncbits:2;
++	    unsigned char sid:6;
++	    unsigned char dbs;
++	    unsigned char fn:2;
++	    unsigned char qpc:3;
++	    unsigned char sph:1;
++	    unsigned char rsv:2;
++	    unsigned char dbc;
++	    unsigned char syncbits2:2;
++	    unsigned char fmt:6;
++	    unsigned long fdf:24;
++	} cip;
++	unsigned long long val;
++    };
++};
++
++struct MPEG2Header {
++    union {
++	struct {
++	    unsigned char sync; // must be 0x47
++	    unsigned char transport_error_indicator:1;
++	    unsigned char payload_unit_start_indicator:1;
++	    unsigned char transport_priority:1;
++	    unsigned short pid:13;
++	    unsigned char transport_scrambling_control:2;
++	    unsigned char adaption_field_control:2;
++	    unsigned char continuity_counter:4;
++	} hdr;
++	unsigned long val;
++    };
++};
++
++static void iso_receive(struct hpsb_host *host, int channel, quadlet_t *data,
++			size_t length) {
++//    printk(KERN_INFO "FireSAT iso_receive: channel %d, length = %d\n", channel, length);
++
++	if(length <= 12)
++		return; // ignore empty packets
++	else {
++		struct firesat *firesat=NULL;
++		struct firesat *firesat_entry;
++		unsigned long flags;
++
++		spin_lock_irqsave(&firesat_list_lock, flags);
++		list_for_each_entry(firesat_entry,&firesat_list,list) {
++			if(firesat_entry->host == host && firesat_entry->isochannel == channel) {
++				firesat=firesat_entry;
++				break;
++			}
++		}
++		spin_unlock_irqrestore(&firesat_list_lock, flags);
++
++		if(firesat) {
++			char *buf=((char*)data) + sizeof(struct firewireheader)+sizeof(struct CIPHeader);
++			int count = (length-sizeof(struct CIPHeader)) / 192;
++
++//			printk(KERN_INFO "%s: length = %u\n data[0] = %08x\n data[1] = %08x\n data[2] = %08x\n data[3] = %08x\n data[4] = %08x\n",__func__, length, data[0],data[1],data[2],data[3],data[4]);
++
++			while (count--) {
++
++				if(buf[sizeof(quadlet_t) /*timestamp*/] == 0x47)
++					dvb_dmx_swfilter_packets(&firesat->demux, &buf[sizeof(quadlet_t)], 1);
++				else
++					printk("%s: invalid packet, skipping\n", __func__);
++				buf += 188 + sizeof(quadlet_t) /* timestamp */;
++			}
++		}
++	}
++}
++
++static void fcp_request(struct hpsb_host *host, int nodeid, int direction,
++			int cts, u8 *data, size_t length)
++{
++//	printk(KERN_INFO "FireSAT fcp_request length=%d\n",length);
++	if (length > 0 && ((data[0] & 0xF0) >> 4) == 0) {
++		struct firesat *firesat=NULL;
++		struct firesat *firesat_entry;
++		unsigned long flags;
++
++		spin_lock_irqsave(&firesat_list_lock, flags);
++		list_for_each_entry(firesat_entry,&firesat_list,list) {
++			if (firesat_entry->host == host &&
++			    firesat_entry->nodeentry->nodeid == nodeid &&
++			    (firesat_entry->subunit == (data[1]&0x7) ||
++			     (firesat_entry->subunit == 0 &&
++			      (data[1]&0x7) == 0x7))) {
++				firesat=firesat_entry;
++				break;
++			}
++		}
++		spin_unlock_irqrestore(&firesat_list_lock, flags);
++
++		if (firesat)
++			AVCRecv(firesat,data,length);
++		else
++			printk("%s: received fcp request from unknown source, ignored\n", __func__);
++	} // else ignore
++}
++
++/********************************************
++ *  Beginning of dvb_frontend_ops functions *
++ ********************************************/
++
++static int firesat_dvb_init(struct dvb_frontend *fe)
++{
++	struct firesat *firesat=fe->sec_priv;
++	printk("fdi: 1\n");
++	firesat->isochannel = firesat->adapter->num; //<< 1 | (firesat->subunit & 0x1); // ### ask IRM
++	printk("fdi: 2\n");
++	try_CMPEstablishPPconnection(firesat, firesat->subunit, firesat->isochannel);
++	printk("fdi: 3\n");
++//FIXME	hpsb_listen_channel(&firesat_highlevel, firesat->host, firesat->isochannel);
++	printk("fdi: 4\n");
++	return 0;
++}
++
++static int firesat_sleep(struct dvb_frontend *fe)
++{
++	struct firesat *firesat=fe->sec_priv;
++
++//FIXME	hpsb_unlisten_channel(&firesat_highlevel, firesat->host, firesat->isochannel);
++	try_CMPBreakPPconnection(firesat, firesat->subunit, firesat->isochannel);
++	firesat->isochannel = -1;
++	return 0;
++}
++
++static int firesat_diseqc_reset_overload(struct dvb_frontend *fe)
++{
++	return -EOPNOTSUPP;
++}
++
++static int firesat_diseqc_recv_slave_reply(struct dvb_frontend *fe,
++					   struct dvb_diseqc_slave_reply *reply)
++{
++	return -EOPNOTSUPP;
++}
++
++static int firesat_diseqc_send_master_cmd(struct dvb_frontend *fe,
++					  struct dvb_diseqc_master_cmd *cmd)
++{
++	struct firesat *firesat=fe->sec_priv;
++
++	return AVCLNBControl(firesat, LNBCONTROL_DONTCARE, LNBCONTROL_DONTCARE,
++			     LNBCONTROL_DONTCARE, 1, cmd);
++}
++
++static int firesat_diseqc_send_burst(struct dvb_frontend *fe,
++				     fe_sec_mini_cmd_t minicmd)
++{
++	return 0;
++}
++
++static int firesat_set_tone(struct dvb_frontend *fe, fe_sec_tone_mode_t tone)
++{
++	struct firesat *firesat=fe->sec_priv;
++
++	firesat->tone = tone;
++	return 0;
++}
++
++static int firesat_set_voltage(struct dvb_frontend *fe,
++			       fe_sec_voltage_t voltage)
++{
++	struct firesat *firesat=fe->sec_priv;
++
++	firesat->voltage=voltage;
++	return 0;
++}
++
++static int firesat_enable_high_lnb_voltage (struct dvb_frontend* fe, long arg) {
++	return -EOPNOTSUPP;
++}
++
++static int firesat_read_status (struct dvb_frontend* fe, fe_status_t* status) {
++	struct firesat *firesat=fe->sec_priv;
++	ANTENNA_INPUT_INFO info;
++//			printk(KERN_INFO "%s: FE_READ_STATUS\n", __func__);
++
++	if(AVCTunerStatus(firesat,&info)) {
++		return -EINVAL;
++	}
++//			printk(KERN_INFO "%s: NoRF=%c\n",__func__,info.NoRF?'y':'n');
++	if(info.NoRF)
++		*status = 0;
++	else
++		*status = *status = FE_HAS_SIGNAL | FE_HAS_VITERBI | FE_HAS_SYNC | FE_HAS_CARRIER | FE_HAS_LOCK;
++	return 0;
++}
++
++static int firesat_read_ber (struct dvb_frontend* fe, u32* ber) {
++	struct firesat *firesat=fe->sec_priv;
++	ANTENNA_INPUT_INFO info;
++//			printk(KERN_INFO "%s: FE_READ_BER\n", __func__);
++
++	if(AVCTunerStatus(firesat,&info)) {
++		return -EINVAL;
++	}
++
++//			*ber = *(u32*)info.BER; /* might need some byte ordering correction */
++	*ber = ((info.BER[0] << 24) & 0xFF) | ((info.BER[1] << 16) & 0xFF) | ((info.BER[2] << 8) & 0xFF) | (info.BER[3] & 0xFF);
++	return 0;
++}
++
++static int firesat_read_signal_strength (struct dvb_frontend* fe, u16* strength) {
++	struct firesat *firesat=fe->sec_priv;
++	ANTENNA_INPUT_INFO info;
++	u16 *signal = strength;
++//	printk(KERN_INFO "%s: FE_READ_SIGNAL_STRENGTH\n", __func__);
++
++	if(AVCTunerStatus(firesat,&info)) {
++		return -EINVAL;
++	}
++
++	*signal = info.SignalStrength;
++	return 0;
++}
++
++static int firesat_read_snr(struct dvb_frontend* fe, u16* snr) {
++	return -EOPNOTSUPP;
++}
++
++static int firesat_read_uncorrected_blocks(struct dvb_frontend* fe, u32* ucblocks) {
++	return -EOPNOTSUPP;
++}
++
++static int firesat_set_frontend(struct dvb_frontend* fe, struct dvb_frontend_parameters* params) {
++	struct firesat *firesat=fe->sec_priv;
++
++//	printk(KERN_INFO "%s: FE_SET_FRONTEND\n", __func__);
++//	printk(KERN_INFO "            frequency->%d\n", params->frequency);
++//	printk(KERN_INFO "            symbol_rate->%d\n",params->u.qam.symbol_rate);
++//	printk(KERN_INFO "            inversion->%d\n", params->inversion);
++
++//	if(AVCTuner_DSIT(firesat, 0/*###*/, params, NULL))
++//		return -EINVAL;
++	if(AVCTuner_DSD(firesat, params, NULL) != ACCEPTED)
++		return -EINVAL;
++	else return 0; //not sure of this...
++}
++
++static int firesat_get_frontend(struct dvb_frontend* fe, struct dvb_frontend_parameters* params) {
++	return -EOPNOTSUPP;
++}
++
++/**************************************
++ *  End of dvb_frontend_ops functions *
++ * ************************************/
++
++static struct firesat_channel *firesat_channel_allocate(struct firesat *firesat) {
++	int k;
++
++	printk(KERN_INFO "%s\n", __func__);
++
++	if(down_interruptible(&firesat->demux_sem))
++		return NULL;
++
++	for(k=0;k<16;k++) {
++		printk(KERN_INFO "%s: channel %d: active = %d, pid = 0x%x\n",__func__,k,firesat->channel[k].active,firesat->channel[k].pid);
++		if(firesat->channel[k].active == 0) {
++			firesat->channel[k].active = 1;
++			up(&firesat->demux_sem);
++			return &firesat->channel[k];
++		}
++	}
++
++	up(&firesat->demux_sem);
++	return NULL; // no more channels available
++}
++
++static int firesat_channel_collect(struct firesat *firesat, int *pidc, u16 pid[]) {
++	int k, l=0;
++
++	if(down_interruptible(&firesat->demux_sem))
++		return -EINTR;
++
++	for(k=0;k<16;k++)
++		if(firesat->channel[k].active == 1)
++			pid[l++] = firesat->channel[k].pid;
++
++	up(&firesat->demux_sem);
++
++	*pidc = l;
++
++	return 0;
++}
++
++static int firesat_channel_release(struct firesat *firesat, struct firesat_channel *channel) {
++	if(down_interruptible(&firesat->demux_sem))
++		return -EINTR;
++
++	channel->active = 0;
++
++	up(&firesat->demux_sem);
++	return 0;
++}
++
++static int firesat_start_feed(struct dvb_demux_feed *dvbdmxfeed) {
++	struct firesat *firesat=(struct firesat*)dvbdmxfeed->demux->priv;
++	struct firesat_channel *channel;
++	int pidc,k;
++	u16 pids[16];
++
++	printk(KERN_INFO "%s (pid %u)\n",__func__,dvbdmxfeed->pid);
++
++	switch (dvbdmxfeed->type) {
++	case DMX_TYPE_TS:
++	case DMX_TYPE_SEC:
++		break;
++	default:
++		printk("%s: invalid type %u\n",__func__,dvbdmxfeed->type);
++		return -EINVAL;
++	}
++
++	if (dvbdmxfeed->type == DMX_TYPE_TS) {
++		switch (dvbdmxfeed->pes_type) {
++		case DMX_TS_PES_VIDEO:
++		case DMX_TS_PES_AUDIO:
++		case DMX_TS_PES_TELETEXT:
++		case DMX_TS_PES_PCR:
++		case DMX_TS_PES_OTHER:
++			channel = firesat_channel_allocate(firesat);
++			break;
++		default:
++			printk("%s: invalid pes type %u\n",__func__,dvbdmxfeed->pes_type);
++			return -EINVAL;
++		}
++	} else {
++		channel = firesat_channel_allocate(firesat);
++	}
++
++	if(!channel) {
++		printk("%s: busy!\n", __func__);
++		return -EBUSY;
++	}
++
++	dvbdmxfeed->priv = channel;
++
++	channel->dvbdmxfeed = dvbdmxfeed;
++	channel->pid = dvbdmxfeed->pid;
++	channel->type = dvbdmxfeed->type;
++	channel->firesat = firesat;
++
++	if(firesat_channel_collect(firesat, &pidc, pids)) {
++		firesat_channel_release(firesat, channel);
++		return -EINTR;
++	}
++
++	if((k=AVCTuner_SetPIDs(firesat, pidc, pids))) {
++		firesat_channel_release(firesat, channel);
++		printk("%s: AVCTuner failed with error %d\n", __func__, k);
++		return k;
++	}
++
++	return 0;
++}
++
++static int firesat_stop_feed(struct dvb_demux_feed *dvbdmxfeed) {
++	struct dvb_demux *demux = dvbdmxfeed->demux;
++	struct firesat *firesat=(struct firesat*)demux->priv;
++	int k, l=0;
++	u16 pids[16];
++
++	printk(KERN_INFO "%s (pid %u)\n", __func__, dvbdmxfeed->pid);
++
++	if (dvbdmxfeed->type == DMX_TYPE_TS && !((dvbdmxfeed->ts_type & TS_PACKET) &&
++				(demux->dmx.frontend->source != DMX_MEMORY_FE))) {
++	   if (dvbdmxfeed->ts_type & TS_DECODER) {
++		if (dvbdmxfeed->pes_type >= DMX_TS_PES_OTHER ||
++			!demux->pesfilter[dvbdmxfeed->pes_type])
++			return -EINVAL;
++		demux->pids[dvbdmxfeed->pes_type] |= 0x8000;
++		demux->pesfilter[dvbdmxfeed->pes_type] = 0;
++	   }
++	   if (!(dvbdmxfeed->ts_type & TS_DECODER &&
++		dvbdmxfeed->pes_type < DMX_TS_PES_OTHER)) {
++		return 0;
++	   }
++	}
++
++	if(down_interruptible(&firesat->demux_sem))
++		return -EINTR;
++
++	// list except channel to be removed
++	for(k=0;k<16;k++)
++		if(firesat->channel[k].active == 1 && &firesat->channel[k] != (struct firesat_channel*)dvbdmxfeed->priv)
++			pids[l++] = firesat->channel[k].pid;
++
++	if((k=AVCTuner_SetPIDs(firesat, l, pids))) {
++		up(&firesat->demux_sem);
++		return k;
++	}
++
++	((struct firesat_channel*)dvbdmxfeed->priv)->active = 0;
++
++	up(&firesat->demux_sem);
++
++	return 0;
++}
++
++static int firesat_probe(struct device *dev) {
++    struct unit_directory *ud=container_of(dev, struct unit_directory, device);
++    struct firesat *firesat;
++    struct dvb_frontend *fe;
++    unsigned long flags;
++    int result;
++	unsigned char subunitcount=0xff,subunit;
++	struct firesat **firesats=kmalloc(sizeof(void*)*2,GFP_KERNEL);
++
++	if (!firesats) {
++		printk("%s: couldn't allocate memory.\n", __func__);
++		return -ENOMEM;
++	}
++
++//    printk(KERN_INFO "FireSAT: Detected device with GUID %08lx%04lx%04lx\n",(unsigned long)((ud->ne->guid)>>32),(unsigned long)(ud->ne->guid & 0xFFFF),(unsigned long)ud->ne->guid_vendor_id);
++	printk(KERN_INFO "%s: loading device\n", __func__);
++
++	firesats[0]=NULL;
++	firesats[1]=NULL;
++
++	ud->device.driver_data = firesats;
++
++    for(subunit=0;subunit<subunitcount;subunit++) {
++		if (!(firesat = kmalloc(sizeof(struct firesat), GFP_KERNEL)) || !(fe = kmalloc(sizeof(struct dvb_frontend), GFP_KERNEL))) {
++			printk("%s: couldn't allocate memory.\n", __func__);
++			kfree(firesats);
++			return -ENOMEM;
++		}
++
++		memset(firesat, 0, sizeof(struct firesat));
++		firesat->host=ud->ne->host;
++		firesat->guid=ud->ne->guid;
++		firesat->guid_vendor_id=ud->ne->guid_vendor_id;
++		firesat->nodeentry=ud->ne;
++		firesat->isochannel=-1;
++		firesat->tone = 0xff;
++		firesat->voltage = 0xff;
++		if(!(firesat->respfrm = kmalloc(sizeof(AVCRspFrm), GFP_KERNEL))) {
++			printk("%s: couldn't allocate memory.\n", __func__);
++			kfree(firesat);
++			return -ENOMEM;
++		}
++
++		sema_init(&firesat->avc_sem, 1);
++		atomic_set(&firesat->avc_reply_received, 1);
++		sema_init(&firesat->demux_sem, 1);
++		atomic_set(&firesat->reschedule_remotecontrol, 0);
++
++		spin_lock_irqsave(&firesat_list_lock, flags);
++		INIT_LIST_HEAD(&firesat->list);
++		list_add_tail(&firesat->list, &firesat_list);
++		spin_unlock_irqrestore(&firesat_list_lock, flags);
++
++		if(subunit == 0) {
++			firesat->subunit = 0x7; // 0x7 = don't care
++			if(AVCSubUnitInfo(firesat, &subunitcount)) {
++				printk("%s: AVC subunit info command failed.\n",__func__);
++				spin_lock_irqsave(&firesat_list_lock, flags);
++				list_del(&firesat->list);
++				spin_unlock_irqrestore(&firesat_list_lock, flags);
++				kfree(firesat);
++				return -EIO;
++			}
++		}
++
++		printk(KERN_INFO "%s: subunit count = %d\n", __func__, subunitcount);
++
++		firesat->subunit=subunit;
++
++		if(AVCIdentifySubunit(firesat,NULL,(int*)&firesat->type,&firesat->has_ci)) {
++			printk("%s: cannot identify subunit %d\n", __func__, subunit);
++			spin_lock_irqsave(&firesat_list_lock, flags);
++			list_del(&firesat->list);
++			spin_unlock_irqrestore(&firesat_list_lock, flags);
++			kfree(firesat);
++			continue;
++		}
++
++		firesat->has_ci=1; // TEMP workaround
++
++		switch(firesat->type) {
++		case FireSAT_DVB_S:
++			firesat->model_name="FireSAT DVB-S";
++			firesat->frontend_info=&firesat_S_frontend_info;
++			break;
++		case FireSAT_DVB_C:
++			firesat->model_name="FireSAT DVB-C";
++			firesat->frontend_info=&firesat_C_frontend_info;
++			break;
++		case FireSAT_DVB_T:
++			firesat->model_name="FireSAT DVB-T";
++			firesat->frontend_info=&firesat_T_frontend_info;
++			break;
++		default:
++			printk("%s: unknown model type 0x%x on subunit %d!\n",
++				__func__, firesat->type,subunit);
++			firesat->model_name="Unknown";
++			firesat->frontend_info=NULL;
++		}
++
++		if(!firesat->frontend_info) {
++			spin_lock_irqsave(&firesat_list_lock, flags);
++			list_del(&firesat->list);
++			spin_unlock_irqrestore(&firesat_list_lock, flags);
++			kfree(firesat);
++			continue;
++		}
++
++		//initialising firesat->adapter before calling dvb_register_adapter
++		if(!(firesat->adapter = kmalloc(sizeof(struct dvb_adapter), GFP_KERNEL))) {
++			printk("%s: couldn't allocate memory.\n", __func__);
++			kfree(firesat->adapter);
++			kfree(firesat);
++			return -ENOMEM;
++		}
++
++		if ((result = dvb_register_adapter(firesat->adapter,
++										   firesat->model_name, THIS_MODULE, dev)) < 0) {
++			printk("%s: dvb_register_adapter failed: error %d\n", __func__, result);
++
++			/* ### cleanup */
++			spin_lock_irqsave(&firesat_list_lock, flags);
++			list_del(&firesat->list);
++			spin_unlock_irqrestore(&firesat_list_lock, flags);
++			kfree(firesat);
++
++			return result;
++		}
++
++		firesat->demux.dmx.capabilities = 0/*DMX_TS_FILTERING | DMX_SECTION_FILTERING*/;
++
++		firesat->demux.priv = (void *)firesat;
++		firesat->demux.filternum = 16;
++		firesat->demux.feednum = 16;
++		firesat->demux.start_feed = firesat_start_feed;
++		firesat->demux.stop_feed = firesat_stop_feed;
++
++		firesat->demux.write_to_decoder = NULL;
++
++		if ((result = dvb_dmx_init(&firesat->demux)) < 0) {
++			printk("%s: dvb_dmx_init failed: error %d\n", __func__,
++				   result);
++
++			dvb_unregister_adapter(firesat->adapter);
++
++			return result;
++		}
++
++		firesat->dmxdev.filternum = 16;
++		firesat->dmxdev.demux = &firesat->demux.dmx;
++		firesat->dmxdev.capabilities = 0;
++
++		if ((result = dvb_dmxdev_init(&firesat->dmxdev, firesat->adapter)) < 0) {
++			printk("%s: dvb_dmxdev_init failed: error %d\n",
++				   __func__, result);
++
++			dvb_dmx_release(&firesat->demux);
++			dvb_unregister_adapter(firesat->adapter);
++
++			return result;
++		}
++
++		firesat->frontend.source = DMX_FRONTEND_0;
++
++		if ((result = firesat->demux.dmx.add_frontend(&firesat->demux.dmx,
++							  &firesat->frontend)) < 0) {
++			printk("%s: dvb_dmx_init failed: error %d\n", __func__,
++				   result);
++
++			dvb_dmxdev_release(&firesat->dmxdev);
++			dvb_dmx_release(&firesat->demux);
++			dvb_unregister_adapter(firesat->adapter);
++
++			return result;
++		}
++
++		if ((result = firesat->demux.dmx.connect_frontend(&firesat->demux.dmx,
++								  &firesat->frontend)) < 0) {
++			printk("%s: dvb_dmx_init failed: error %d\n", __func__,
++				   result);
++
++			firesat->demux.dmx.remove_frontend(&firesat->demux.dmx, &firesat->frontend);
++			dvb_dmxdev_release(&firesat->dmxdev);
++			dvb_dmx_release(&firesat->demux);
++			dvb_unregister_adapter(firesat->adapter);
++
++			return result;
++		}
++
++		dvb_net_init(firesat->adapter, &firesat->dvbnet, &firesat->demux.dmx);
++
++		fe->ops = firesat_ops;
++		fe->dvb = firesat->adapter;
++		fe->sec_priv = firesat; //IMPORTANT, functions depend on this!!!
++		if((result= dvb_register_frontend(firesat->adapter, fe)) < 0) {
++			printk("%s: dvb_register_frontend_new failed: error %d\n", __func__, result);
++			/* ### cleanup */
++			return result;
++		}
++
++		if(firesat->has_ci)
++			firesat_ca_init(firesat);
++
++		firesats[subunit] = firesat;
++	} // loop for all tuners
++
++	//beta ;-) Disable remote control stuff to avoid crashing
++	//if(firesats[0])
++	//	AVCRegisterRemoteControl(firesats[0]);
++
++    return 0;
++}
++
++static int firesat_remove(struct device *dev) {
++    struct unit_directory *ud=container_of(dev, struct unit_directory, device);
++    struct dvb_frontend* fe;
++    struct firesat **firesats=ud->device.driver_data;
++
++    if(firesats) {
++		int k;
++		for(k=0;k<2;k++)
++			if(firesats[k]) {
++				unsigned long flags;
++				if(firesats[k]->has_ci)
++					firesat_ca_release(firesats[k]);
++				if(!(fe = kmalloc(sizeof(struct dvb_frontend), GFP_KERNEL))){
++					fe->ops = firesat_ops;
++					fe->dvb = firesats[k]->adapter;
++
++					dvb_unregister_frontend(fe);
++					kfree(fe);
++				}
++
++				dvb_net_release(&firesats[k]->dvbnet);
++				firesats[k]->demux.dmx.close(&firesats[k]->demux.dmx);
++				firesats[k]->demux.dmx.remove_frontend(&firesats[k]->demux.dmx, &firesats[k]->frontend);
++				dvb_dmxdev_release(&firesats[k]->dmxdev);
++				dvb_dmx_release(&firesats[k]->demux);
++				dvb_unregister_adapter(firesats[k]->adapter);
++
++				spin_lock_irqsave(&firesat_list_lock, flags);
++				list_del(&firesats[k]->list);
++				spin_unlock_irqrestore(&firesat_list_lock, flags);
++
++				kfree(firesats[k]->adapter);
++				kfree(firesats[k]->respfrm);
++				kfree(firesats[k]);
++			}
++		kfree(firesats);
++	} else
++		printk("%s: can't get firesat handle\n", __func__);
++
++    printk(KERN_INFO "FireSAT: Removing device with vendor id 0x%x, model id 0x%x.\n",ud->vendor_id,ud->model_id);
++    return 0;
++}
++
++static int firesat_update(struct unit_directory *ud) {
++//  printk(KERN_INFO "FireSAT: Found device with vendor id 0x%x, model id 0x%x\n", ud->vendor_id,ud->model_id);
++    struct firesat **firesats=ud->device.driver_data;
++    int k;
++    // loop over subunits
++
++	for(k=0;k<2;k++)
++		if(firesats[k]) {
++			firesats[k]->nodeentry=ud->ne;
++
++			if(firesats[k]->isochannel >= 0)
++				try_CMPEstablishPPconnection(firesats[k], firesats[k]->subunit, firesats[k]->isochannel);
++		}
++
++    return 0;
++}
++
++static struct hpsb_protocol_driver firesat_driver = {
++	.name		= "FireSAT",
++	.id_table	= firesat_id_table,
++    .update     = firesat_update,
++	.driver         = {
++		//.name and .bus are filled in for us in more recent linux versions
++		//.name	= "FireSAT",
++		//.bus	= &ieee1394_bus_type,
++		.probe  = firesat_probe,
++		.remove = firesat_remove,
++	},
++};
++
++static int __init firesat_init(void)
++{
++	int ret;
++
++	printk(KERN_INFO "FireSAT loaded\n");
++	hpsb_register_highlevel(&firesat_highlevel);
++	ret = hpsb_register_protocol(&firesat_driver);
++	if (ret) {
++		printk(KERN_ERR "FireSAT: failed to register protocol\n");
++		hpsb_unregister_highlevel(&firesat_highlevel);
++		return ret;
++	}
++
++	//Crash in this function, just disable RC for the time being...
++	//Don't forget to uncomment in firesat_exit and firesat_probe when you enable this.
++	/*if((ret=firesat_register_rc()))
++		printk("%s: firesat_register_rc return error code %d (ignored)\n", __func__, ret);*/
++
++	return 0;
++}
++
++static void __exit firesat_exit(void)
++{
++	/* firesat_unregister_rc(); */
++
++	hpsb_unregister_protocol(&firesat_driver);
++	hpsb_unregister_highlevel(&firesat_highlevel);
++	printk(KERN_INFO "FireSAT quit\n");
++}
++
++module_init(firesat_init);
++module_exit(firesat_exit);
++
++MODULE_AUTHOR("Andreas Monitzer <andy@monitzer.com>");
++MODULE_AUTHOR("Ben Backx <ben@bbackx.com>");
++MODULE_DESCRIPTION("FireSAT DVB Driver");
++MODULE_LICENSE("GPL");
++MODULE_SUPPORTED_DEVICE("FireSAT DVB");
+--- /dev/null
++++ b/drivers/media/dvb/firesat/firesat.h
+@@ -0,0 +1,73 @@
++#ifndef __FIRESAT_H
++#define __FIRESAT_H
++
++#include "dvb_frontend.h"
++#include "dmxdev.h"
++#include "dvb_demux.h"
++#include "dvb_net.h"
++
++#include <asm/semaphore.h>
++#include <linux/dvb/frontend.h>
++#include <linux/dvb/dmx.h>
++
++enum model_type {
++    FireSAT_DVB_S = 1,
++    FireSAT_DVB_C = 2,
++    FireSAT_DVB_T = 3
++};
++
++struct firesat {
++	struct dvb_demux dvb_demux;
++	char *model_name;
++
++	/* DVB bits */
++	struct dvb_adapter		*adapter;
++	struct dmxdev			dmxdev;
++	struct dvb_demux		demux;
++	struct dmx_frontend		frontend;
++	struct dvb_net			dvbnet;
++	struct dvb_frontend_info	*frontend_info;
++
++	struct dvb_device		*cadev;
++	int				has_ci;
++
++	struct semaphore		avc_sem;
++	atomic_t				avc_reply_received;
++
++	atomic_t				reschedule_remotecontrol;
++
++	struct firesat_channel {
++		struct firesat *firesat;
++		struct dvb_demux_feed *dvbdmxfeed;
++
++		int active;
++		int id;
++		int pid;
++		int type;	/* 1 - TS, 2 - Filter */
++	} channel[16];
++	struct semaphore		demux_sem;
++
++	/* needed by avc_api */
++	void *respfrm;
++	int resp_length;
++
++//    nodeid_t nodeid;
++    struct hpsb_host *host;
++	u64 guid;			/* GUID of this node */
++	u32 guid_vendor_id;		/* Top 24bits of guid */
++	struct node_entry *nodeentry;
++
++    enum model_type type;
++    char subunit;
++	fe_sec_voltage_t voltage;
++	fe_sec_tone_mode_t tone;
++
++	int isochannel;
++
++    struct list_head list;
++};
++
++extern struct list_head firesat_list;
++extern spinlock_t firesat_list_lock;
++
++#endif
