@@ -1,0 +1,447 @@
+From bhutchings@solarflare.com  Wed Mar 12 14:46:31 2008
+From: Ben Hutchings <bhutchings@solarflare.com>
+Date: Wed, 5 Mar 2008 16:52:39 +0000
+Subject: PCI: Expose PCI VPD through sysfs
+To: linux-pci@atrey.karlin.mff.cuni.cz
+Cc: Greg KH <greg@kroah.com>
+Message-ID: <20080305165238.GS2988@solarflare.com>
+Content-Disposition: inline
+
+From: Ben Hutchings <bhutchings@solarflare.com>
+
+Vital Product Data (VPD) may be exposed by PCI devices in several
+ways.  It is generally unsafe to read this information through the
+existing interfaces to user-land because of stateful interfaces.
+
+This adds:
+- abstract operations for VPD access (struct pci_vpd_ops)
+- VPD state information in struct pci_dev (struct pci_vpd)
+- an implementation of the VPD access method specified in PCI 2.2
+  (in access.c)
+- a 'vpd' binary file in sysfs directories for PCI devices with VPD
+  operations defined
+
+It adds a probe for PCI 2.2 VPD in pci_scan_device() and release of
+VPD state in pci_release_dev().
+
+Signed-off-by: Ben Hutchings <bhutchings@solarflare.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ Documentation/ABI/testing/sysfs-bus-pci |   11 ++
+ drivers/pci/access.c                    |  165 ++++++++++++++++++++++++++++++++
+ drivers/pci/pci-sysfs.c                 |  109 ++++++++++++++++++---
+ drivers/pci/pci.h                       |   19 +++
+ drivers/pci/probe.c                     |    3 
+ include/linux/pci.h                     |    3 
+ 6 files changed, 296 insertions(+), 14 deletions(-)
+
+--- /dev/null
++++ b/Documentation/ABI/testing/sysfs-bus-pci
+@@ -0,0 +1,11 @@
++What:		/sys/bus/pci/devices/.../vpd
++Date:		February 2008
++Contact:	Ben Hutchings <bhutchings@solarflare.com>
++Description:
++		A file named vpd in a device directory will be a
++		binary file containing the Vital Product Data for the
++		device.  It should follow the VPD format defined in
++		PCI Specification 2.1 or 2.2, but users should consider
++		that some devices may have malformatted data.  If the
++		underlying VPD has a writable section then the
++		corresponding section of this file will be writable.
+--- a/drivers/pci/access.c
++++ b/drivers/pci/access.c
+@@ -126,6 +126,171 @@ PCI_USER_WRITE_CONFIG(byte, u8)
+ PCI_USER_WRITE_CONFIG(word, u16)
+ PCI_USER_WRITE_CONFIG(dword, u32)
+ 
++/* VPD access through PCI 2.2+ VPD capability */
++
++#define PCI_VPD_PCI22_SIZE (PCI_VPD_ADDR_MASK + 1)
++
++struct pci_vpd_pci22 {
++	struct pci_vpd base;
++	spinlock_t lock; /* controls access to hardware and the flags */
++	u8	cap;
++	bool	busy;
++	bool	flag; /* value of F bit to wait for */
++};
++
++/* Wait for last operation to complete */
++static int pci_vpd_pci22_wait(struct pci_dev *dev)
++{
++	struct pci_vpd_pci22 *vpd =
++		container_of(dev->vpd, struct pci_vpd_pci22, base);
++	u16 flag, status;
++	int wait;
++	int ret;
++
++	if (!vpd->busy)
++		return 0;
++
++	flag = vpd->flag ? PCI_VPD_ADDR_F : 0;
++	wait = vpd->flag ? 10 : 1000; /* read: 100 us; write: 10 ms */
++	for (;;) {
++		ret = pci_user_read_config_word(dev,
++						vpd->cap + PCI_VPD_ADDR,
++						&status);
++		if (ret < 0)
++			return ret;
++		if ((status & PCI_VPD_ADDR_F) == flag) {
++			vpd->busy = false;
++			return 0;
++		}
++		if (wait-- == 0)
++			return -ETIMEDOUT;
++		udelay(10);
++	}
++}
++
++static int pci_vpd_pci22_read(struct pci_dev *dev, int pos, int size,
++			      char *buf)
++{
++	struct pci_vpd_pci22 *vpd =
++		container_of(dev->vpd, struct pci_vpd_pci22, base);
++	u32 val;
++	int ret;
++	int begin, end, i;
++
++	if (pos < 0 || pos > PCI_VPD_PCI22_SIZE ||
++	    size > PCI_VPD_PCI22_SIZE  - pos)
++		return -EINVAL;
++	if (size == 0)
++		return 0;
++
++	spin_lock_irq(&vpd->lock);
++	ret = pci_vpd_pci22_wait(dev);
++	if (ret < 0)
++		goto out;
++	ret = pci_user_write_config_word(dev, vpd->cap + PCI_VPD_ADDR,
++					 pos & ~3);
++	if (ret < 0)
++		goto out;
++	vpd->busy = true;
++	vpd->flag = 1;
++	ret = pci_vpd_pci22_wait(dev);
++	if (ret < 0)
++		goto out;
++	ret = pci_user_read_config_dword(dev, vpd->cap + PCI_VPD_DATA,
++					 &val);
++out:
++	spin_unlock_irq(&vpd->lock);
++	if (ret < 0)
++		return ret;
++
++	/* Convert to bytes */
++	begin = pos & 3;
++	end = min(4, begin + size);
++	for (i = 0; i < end; ++i) {
++		if (i >= begin)
++			*buf++ = val;
++		val >>= 8;
++	}
++	return end - begin;
++}
++
++static int pci_vpd_pci22_write(struct pci_dev *dev, int pos, int size,
++			       const char *buf)
++{
++	struct pci_vpd_pci22 *vpd =
++		container_of(dev->vpd, struct pci_vpd_pci22, base);
++	u32 val;
++	int ret;
++
++	if (pos < 0 || pos > PCI_VPD_PCI22_SIZE || pos & 3 ||
++	    size > PCI_VPD_PCI22_SIZE - pos || size < 4)
++		return -EINVAL;
++
++	val = (u8) *buf++;
++	val |= ((u8) *buf++) << 8;
++	val |= ((u8) *buf++) << 16;
++	val |= ((u32)(u8) *buf++) << 24;
++
++	spin_lock_irq(&vpd->lock);
++	ret = pci_vpd_pci22_wait(dev);
++	if (ret < 0)
++		goto out;
++	ret = pci_user_write_config_dword(dev, vpd->cap + PCI_VPD_DATA,
++					  val);
++	if (ret < 0)
++		goto out;
++	ret = pci_user_write_config_word(dev, vpd->cap + PCI_VPD_ADDR,
++					 pos | PCI_VPD_ADDR_F);
++	if (ret < 0)
++		goto out;
++	vpd->busy = true;
++	vpd->flag = 0;
++	ret = pci_vpd_pci22_wait(dev);
++out:
++	spin_unlock_irq(&vpd->lock);
++	if (ret < 0)
++		return ret;
++
++	return 4;
++}
++
++static int pci_vpd_pci22_get_size(struct pci_dev *dev)
++{
++	return PCI_VPD_PCI22_SIZE;
++}
++
++static void pci_vpd_pci22_release(struct pci_dev *dev)
++{
++	kfree(container_of(dev->vpd, struct pci_vpd_pci22, base));
++}
++
++static struct pci_vpd_ops pci_vpd_pci22_ops = {
++	.read = pci_vpd_pci22_read,
++	.write = pci_vpd_pci22_write,
++	.get_size = pci_vpd_pci22_get_size,
++	.release = pci_vpd_pci22_release,
++};
++
++int pci_vpd_pci22_init(struct pci_dev *dev)
++{
++	struct pci_vpd_pci22 *vpd;
++	u8 cap;
++
++	cap = pci_find_capability(dev, PCI_CAP_ID_VPD);
++	if (!cap)
++		return -ENODEV;
++	vpd = kzalloc(sizeof(*vpd), GFP_ATOMIC);
++	if (!vpd)
++		return -ENOMEM;
++
++	vpd->base.ops = &pci_vpd_pci22_ops;
++	spin_lock_init(&vpd->lock);
++	vpd->cap = cap;
++	vpd->busy = false;
++	dev->vpd = &vpd->base;
++	return 0;
++}
++
+ /**
+  * pci_block_user_cfg_access - Block userspace PCI config reads/writes
+  * @dev:	pci device struct
+--- a/drivers/pci/pci-sysfs.c
++++ b/drivers/pci/pci-sysfs.c
+@@ -343,6 +343,58 @@ pci_write_config(struct kobject *kobj, s
+ 	return count;
+ }
+ 
++static ssize_t
++pci_read_vpd(struct kobject *kobj, struct bin_attribute *bin_attr,
++	     char *buf, loff_t off, size_t count)
++{
++	struct pci_dev *dev =
++		to_pci_dev(container_of(kobj, struct device, kobj));
++	int end;
++	int ret;
++
++	if (off > bin_attr->size)
++		count = 0;
++	else if (count > bin_attr->size - off)
++		count = bin_attr->size - off;
++	end = off + count;
++
++	while (off < end) {
++		ret = dev->vpd->ops->read(dev, off, end - off, buf);
++		if (ret < 0)
++			return ret;
++		buf += ret;
++		off += ret;
++	}
++
++	return count;
++}
++
++static ssize_t
++pci_write_vpd(struct kobject *kobj, struct bin_attribute *bin_attr,
++	      char *buf, loff_t off, size_t count)
++{
++	struct pci_dev *dev =
++		to_pci_dev(container_of(kobj, struct device, kobj));
++	int end;
++	int ret;
++
++	if (off > bin_attr->size)
++		count = 0;
++	else if (count > bin_attr->size - off)
++		count = bin_attr->size - off;
++	end = off + count;
++
++	while (off < end) {
++		ret = dev->vpd->ops->write(dev, off, end - off, buf);
++		if (ret < 0)
++			return ret;
++		buf += ret;
++		off += ret;
++	}
++
++	return count;
++}
++
+ #ifdef HAVE_PCI_LEGACY
+ /**
+  * pci_read_legacy_io - read byte(s) from legacy I/O port space
+@@ -611,7 +663,7 @@ int __attribute__ ((weak)) pcibios_add_p
+ 
+ int __must_check pci_create_sysfs_dev_files (struct pci_dev *pdev)
+ {
+-	struct bin_attribute *rom_attr = NULL;
++	struct bin_attribute *attr = NULL;
+ 	int retval;
+ 
+ 	if (!sysfs_initialized)
+@@ -624,22 +676,41 @@ int __must_check pci_create_sysfs_dev_fi
+ 	if (retval)
+ 		goto err;
+ 
++	/* If the device has VPD, try to expose it in sysfs. */
++	if (pdev->vpd) {
++		attr = kzalloc(sizeof(*attr), GFP_ATOMIC);
++		if (attr) {
++			pdev->vpd->attr = attr;
++			attr->size = pdev->vpd->ops->get_size(pdev);
++			attr->attr.name = "vpd";
++			attr->attr.mode = S_IRUGO | S_IWUSR;
++			attr->read = pci_read_vpd;
++			attr->write = pci_write_vpd;
++			retval = sysfs_create_bin_file(&pdev->dev.kobj, attr);
++			if (retval)
++				goto err_vpd;
++		} else {
++			retval = -ENOMEM;
++			goto err_config_file;
++		}
++	}
++
+ 	retval = pci_create_resource_files(pdev);
+ 	if (retval)
+-		goto err_bin_file;
++		goto err_vpd_file;
+ 
+ 	/* If the device has a ROM, try to expose it in sysfs. */
+ 	if (pci_resource_len(pdev, PCI_ROM_RESOURCE) ||
+ 	    (pdev->resource[PCI_ROM_RESOURCE].flags & IORESOURCE_ROM_SHADOW)) {
+-		rom_attr = kzalloc(sizeof(*rom_attr), GFP_ATOMIC);
+-		if (rom_attr) {
+-			pdev->rom_attr = rom_attr;
+-			rom_attr->size = pci_resource_len(pdev, PCI_ROM_RESOURCE);
+-			rom_attr->attr.name = "rom";
+-			rom_attr->attr.mode = S_IRUSR;
+-			rom_attr->read = pci_read_rom;
+-			rom_attr->write = pci_write_rom;
+-			retval = sysfs_create_bin_file(&pdev->dev.kobj, rom_attr);
++		attr = kzalloc(sizeof(*attr), GFP_ATOMIC);
++		if (attr) {
++			pdev->rom_attr = attr;
++			attr->size = pci_resource_len(pdev, PCI_ROM_RESOURCE);
++			attr->attr.name = "rom";
++			attr->attr.mode = S_IRUSR;
++			attr->read = pci_read_rom;
++			attr->write = pci_write_rom;
++			retval = sysfs_create_bin_file(&pdev->dev.kobj, attr);
+ 			if (retval)
+ 				goto err_rom;
+ 		} else {
+@@ -657,12 +728,18 @@ int __must_check pci_create_sysfs_dev_fi
+ 
+ err_rom_file:
+ 	if (pci_resource_len(pdev, PCI_ROM_RESOURCE))
+-		sysfs_remove_bin_file(&pdev->dev.kobj, rom_attr);
++		sysfs_remove_bin_file(&pdev->dev.kobj, pdev->rom_attr);
+ err_rom:
+-	kfree(rom_attr);
++	kfree(pdev->rom_attr);
+ err_resource_files:
+ 	pci_remove_resource_files(pdev);
+-err_bin_file:
++err_vpd_file:
++	if (pdev->vpd) {
++		sysfs_remove_bin_file(&pdev->dev.kobj, pdev->vpd->attr);
++err_vpd:
++		kfree(pdev->vpd->attr);
++	}
++err_config_file:
+ 	if (pdev->cfg_size < 4096)
+ 		sysfs_remove_bin_file(&pdev->dev.kobj, &pci_config_attr);
+ 	else
+@@ -684,6 +761,10 @@ void pci_remove_sysfs_dev_files(struct p
+ 
+ 	pcie_aspm_remove_sysfs_dev_files(pdev);
+ 
++	if (pdev->vpd) {
++		sysfs_remove_bin_file(&pdev->dev.kobj, pdev->vpd->attr);
++		kfree(pdev->vpd->attr);
++	}
+ 	if (pdev->cfg_size < 4096)
+ 		sysfs_remove_bin_file(&pdev->dev.kobj, &pci_config_attr);
+ 	else
+--- a/drivers/pci/pci.h
++++ b/drivers/pci/pci.h
+@@ -18,6 +18,25 @@ extern int pci_user_write_config_byte(st
+ extern int pci_user_write_config_word(struct pci_dev *dev, int where, u16 val);
+ extern int pci_user_write_config_dword(struct pci_dev *dev, int where, u32 val);
+ 
++struct pci_vpd_ops {
++	int (*read)(struct pci_dev *dev, int pos, int size, char *buf);
++	int (*write)(struct pci_dev *dev, int pos, int size, const char *buf);
++	int (*get_size)(struct pci_dev *dev);
++	void (*release)(struct pci_dev *dev);
++};
++
++struct pci_vpd {
++	struct pci_vpd_ops *ops;
++	struct bin_attribute *attr; /* descriptor for sysfs VPD entry */
++};
++
++extern int pci_vpd_pci22_init(struct pci_dev *dev);
++static inline void pci_vpd_release(struct pci_dev *dev)
++{
++	if (dev->vpd)
++		dev->vpd->ops->release(dev);
++}
++
+ /* PCI /proc functions */
+ #ifdef CONFIG_PROC_FS
+ extern int pci_proc_attach_device(struct pci_dev *dev);
+--- a/drivers/pci/probe.c
++++ b/drivers/pci/probe.c
+@@ -794,6 +794,7 @@ static void pci_release_dev(struct devic
+ 	struct pci_dev *pci_dev;
+ 
+ 	pci_dev = to_pci_dev(dev);
++	pci_vpd_release(pci_dev);
+ 	kfree(pci_dev);
+ }
+ 
+@@ -933,6 +934,8 @@ pci_scan_device(struct pci_bus *bus, int
+ 		return NULL;
+ 	}
+ 
++	pci_vpd_pci22_init(dev);
++
+ 	return dev;
+ }
+ 
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@ -20,6 +20,8 @@
+ /* Include the pci register defines */
+ #include <linux/pci_regs.h>
+ 
++struct pci_vpd;
++
+ /*
+  * The PCI interface treats multi-function devices as independent
+  * devices.  The slot/function address of each device is encoded
+@@ -206,6 +208,7 @@ struct pci_dev {
+ #ifdef CONFIG_PCI_MSI
+ 	struct list_head msi_list;
+ #endif
++	struct pci_vpd *vpd;
+ };
+ 
+ extern struct pci_dev *alloc_pci_dev(void);
