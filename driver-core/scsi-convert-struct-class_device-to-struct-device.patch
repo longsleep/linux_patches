@@ -24,12 +24,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  drivers/infiniband/ulp/srp/ib_srp.h   |    2 
  drivers/message/fusion/mptscsih.c     |  120 ++++----
  drivers/message/fusion/mptscsih.h     |    2 
- drivers/misc/enclosure.c              |   76 ++---
+ drivers/misc/enclosure.c              |  118 ++++----
  drivers/scsi/3w-9xxx.c                |    9 
  drivers/scsi/3w-xxxx.c                |    9 
  drivers/scsi/aacraid/aachba.c         |    2 
  drivers/scsi/aacraid/aacraid.h        |    4 
- drivers/scsi/aacraid/linit.c          |   92 +++---
+ drivers/scsi/aacraid/linit.c          |   93 +++---
  drivers/scsi/arcmsr/arcmsr.h          |    4 
  drivers/scsi/arcmsr/arcmsr_attr.c     |  163 ++++++-----
  drivers/scsi/ch.c                     |   13 
@@ -37,7 +37,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  drivers/scsi/hptiop.c                 |   14 
  drivers/scsi/ibmvscsi/ibmvscsi.c      |   44 +--
  drivers/scsi/ibmvscsi/ibmvstgt.c      |   27 +
- drivers/scsi/ipr.c                    |  126 ++++----
+ drivers/scsi/ipr.c                    |  140 +++++----
  drivers/scsi/lpfc/lpfc_attr.c         |  482 ++++++++++++++++++----------------
  drivers/scsi/lpfc/lpfc_crtn.h         |    4 
  drivers/scsi/megaraid/megaraid_mbox.c |   13 
@@ -55,12 +55,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  drivers/scsi/scsi_transport_spi.c     |  185 ++++++-------
  drivers/scsi/scsi_transport_srp.c     |   26 -
  drivers/scsi/sd.c                     |   78 +++--
- drivers/scsi/ses.c                    |   12 
+ drivers/scsi/ses.c                    |   28 -
  drivers/scsi/sg.c                     |   36 +-
  drivers/scsi/st.c                     |   71 ++---
  include/linux/attribute_container.h   |   28 -
  include/linux/bsg.h                   |    2 
- include/linux/enclosure.h             |    8 
+ include/linux/enclosure.h             |   11 
  include/linux/libata.h                |    2 
  include/linux/raid_class.h            |   12 
  include/linux/transport_class.h       |    6 
@@ -70,7 +70,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  include/scsi/scsi_transport_fc.h      |   14 
  include/scsi/scsi_transport_sas.h     |   12 
  include/scsi/sd.h                     |    4 
- 55 files changed, 1714 insertions(+), 1468 deletions(-)
+ 55 files changed, 1754 insertions(+), 1504 deletions(-)
 
 --- a/block/bsg.c
 +++ b/block/bsg.c
@@ -1042,25 +1042,53 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +extern struct device_attribute *mptscsih_host_attrs[];
 --- a/drivers/misc/enclosure.c
 +++ b/drivers/misc/enclosure.c
-@@ -49,7 +49,7 @@ struct enclosure_device *enclosure_find(
+@@ -40,16 +40,16 @@ static struct class enclosure_component_
+  * Looks through the list of registered enclosures to see
+  * if it can find a match for a device.  Returns NULL if no
+  * enclosure is found. Obtains a reference to the enclosure class
+- * device which must be released with class_device_put().
++ * device which must be released with device_put().
+  */
+ struct enclosure_device *enclosure_find(struct device *dev)
+ {
+-	struct enclosure_device *edev = NULL;
++	struct enclosure_device *edev;
+ 
  	mutex_lock(&container_list_lock);
  	list_for_each_entry(edev, &container_list, node) {
- 		if (edev->cdev.dev == dev) {
+-		if (edev->cdev.dev == dev) {
 -			class_device_get(&edev->cdev);
-+			device_get(&edev->cdev);
++		if (edev->edev.parent == dev) {
++			get_device(&edev->edev);
  			mutex_unlock(&container_list_lock);
  			return edev;
  		}
-@@ -121,7 +121,7 @@ enclosure_register(struct device *dev, c
- 	edev->cdev.dev = get_device(dev);
+@@ -117,11 +117,11 @@ enclosure_register(struct device *dev, c
+ 
+ 	edev->components = components;
+ 
+-	edev->cdev.class = &enclosure_class;
+-	edev->cdev.dev = get_device(dev);
++	edev->edev.class = &enclosure_class;
++	edev->edev.parent = get_device(dev);
  	edev->cb = cb;
- 	snprintf(edev->cdev.class_id, BUS_ID_SIZE, "%s", name);
+-	snprintf(edev->cdev.class_id, BUS_ID_SIZE, "%s", name);
 -	err = class_device_register(&edev->cdev);
-+	err = device_register(&edev->cdev);
++	snprintf(edev->edev.bus_id, BUS_ID_SIZE, "%s", name);
++	err = device_register(&edev->edev);
  	if (err)
  		goto err;
  
-@@ -158,15 +158,15 @@ void enclosure_unregister(struct enclosu
+@@ -135,7 +135,7 @@ enclosure_register(struct device *dev, c
+ 	return edev;
+ 
+  err:
+-	put_device(edev->cdev.dev);
++	put_device(edev->edev.parent);
+ 	kfree(edev);
+ 	return ERR_PTR(err);
+ }
+@@ -158,27 +158,28 @@ void enclosure_unregister(struct enclosu
  
  	for (i = 0; i < edev->components; i++)
  		if (edev->component[i].number != -1)
@@ -1070,7 +1098,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	/* prevent any callbacks into service user */
  	edev->cb = &enclosure_null_callbacks;
 -	class_device_unregister(&edev->cdev);
-+	device_unregister(&edev->cdev);
++	device_unregister(&edev->edev);
  }
  EXPORT_SYMBOL_GPL(enclosure_unregister);
  
@@ -1079,21 +1107,25 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  {
  	struct enclosure_device *edev = to_enclosure_device(cdev);
  
-@@ -174,11 +174,11 @@ static void enclosure_release(struct cla
+-	put_device(cdev->dev);
++	put_device(cdev->parent);
  	kfree(edev);
  }
  
 -static void enclosure_component_release(struct class_device *cdev)
-+static void enclosure_component_release(struct device *cdev)
++static void enclosure_component_release(struct device *dev)
  {
- 	if (cdev->dev)
- 		put_device(cdev->dev);
+-	if (cdev->dev)
+-		put_device(cdev->dev);
 -	class_device_put(cdev->parent);
-+	device_put(cdev->parent);
++	struct enclosure_component *cdev = to_enclosure_component(dev);
++
++	put_device(cdev->dev);
++	put_device(dev->parent);
  }
  
  /**
-@@ -201,7 +201,7 @@ enclosure_component_register(struct encl
+@@ -201,7 +202,7 @@ enclosure_component_register(struct encl
  			     const char *name)
  {
  	struct enclosure_component *ecomp;
@@ -1102,74 +1134,81 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	int err;
  
  	if (number >= edev->components)
-@@ -215,14 +215,14 @@ enclosure_component_register(struct encl
+@@ -215,14 +216,14 @@ enclosure_component_register(struct encl
  	ecomp->type = type;
  	ecomp->number = number;
  	cdev = &ecomp->cdev;
 -	cdev->parent = class_device_get(&edev->cdev);
-+	cdev->parent = device_get(&edev->cdev);
++	cdev->parent = get_device(&edev->edev);
  	cdev->class = &enclosure_component_class;
  	if (name)
- 		snprintf(cdev->class_id, BUS_ID_SIZE, "%s", name);
+-		snprintf(cdev->class_id, BUS_ID_SIZE, "%s", name);
++		snprintf(cdev->bus_id, BUS_ID_SIZE, "%s", name);
  	else
- 		snprintf(cdev->class_id, BUS_ID_SIZE, "%u", number);
+-		snprintf(cdev->class_id, BUS_ID_SIZE, "%u", number);
++		snprintf(cdev->bus_id, BUS_ID_SIZE, "%u", number);
  
 -	err = class_device_register(cdev);
 +	err = device_register(cdev);
  	if (err)
  		ERR_PTR(err);
  
-@@ -247,18 +247,18 @@ EXPORT_SYMBOL_GPL(enclosure_component_re
+@@ -247,18 +248,17 @@ EXPORT_SYMBOL_GPL(enclosure_component_re
  int enclosure_add_device(struct enclosure_device *edev, int component,
  			 struct device *dev)
  {
 -	struct class_device *cdev;
-+	struct device *cdev;
++	struct enclosure_component *cdev;
  
  	if (!edev || component >= edev->components)
  		return -EINVAL;
  
- 	cdev = &edev->component[component].cdev;
+-	cdev = &edev->component[component].cdev;
++	cdev = &edev->component[component];
  
 -	class_device_del(cdev);
-+	device_del(cdev);
- 	if (cdev->dev)
- 		put_device(cdev->dev);
+-	if (cdev->dev)
+-		put_device(cdev->dev);
++	device_del(&cdev->cdev);
++	put_device(cdev->dev);
  	cdev->dev = get_device(dev);
 -	return class_device_add(cdev);
-+	return device_add(cdev);
++	return device_add(&cdev->cdev);
  }
  EXPORT_SYMBOL_GPL(enclosure_add_device);
  
-@@ -272,18 +272,18 @@ EXPORT_SYMBOL_GPL(enclosure_add_device);
+@@ -272,18 +272,17 @@ EXPORT_SYMBOL_GPL(enclosure_add_device);
   */
  int enclosure_remove_device(struct enclosure_device *edev, int component)
  {
 -	struct class_device *cdev;
-+	struct device *cdev;
++	struct enclosure_component *cdev;
  
  	if (!edev || component >= edev->components)
  		return -EINVAL;
  
- 	cdev = &edev->component[component].cdev;
+-	cdev = &edev->component[component].cdev;
++	cdev = &edev->component[component];
  
 -	class_device_del(cdev);
-+	device_del(cdev);
- 	if (cdev->dev)
- 		put_device(cdev->dev);
+-	if (cdev->dev)
+-		put_device(cdev->dev);
++	device_del(&cdev->cdev);
++	put_device(cdev->dev);
  	cdev->dev = NULL;
 -	return class_device_add(cdev);
-+	return device_add(cdev);
++	return device_add(&cdev->cdev);
  }
  EXPORT_SYMBOL_GPL(enclosure_remove_device);
  
-@@ -291,14 +291,15 @@ EXPORT_SYMBOL_GPL(enclosure_remove_devic
+@@ -291,14 +290,16 @@ EXPORT_SYMBOL_GPL(enclosure_remove_devic
   * sysfs pieces below
   */
  
 -static ssize_t enclosure_show_components(struct class_device *cdev, char *buf)
 +static ssize_t enclosure_show_components(struct device *cdev,
-+					 struct attribute *attr, char *buf)
++					 struct device_attribute *attr,
++					 char *buf)
  {
  	struct enclosure_device *edev = to_enclosure_device(cdev);
  
@@ -1181,11 +1220,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	__ATTR(components, S_IRUGO, enclosure_show_components, NULL),
  	__ATTR_NULL
  };
-@@ -307,7 +308,7 @@ static struct class enclosure_class = {
+@@ -306,8 +307,8 @@ static struct class_device_attribute enc
+ static struct class enclosure_class = {
  	.name			= "enclosure",
  	.owner			= THIS_MODULE,
- 	.release		= enclosure_release,
+-	.release		= enclosure_release,
 -	.class_dev_attrs	= enclosure_attrs,
++	.dev_release		= enclosure_release,
 +	.dev_attrs		= enclosure_attrs,
  };
  
@@ -1196,97 +1237,99 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
 -static ssize_t get_component_fault(struct class_device *cdev, char *buf)
 +static ssize_t get_component_fault(struct device *cdev,
-+				   struct attribute *attr, char *buf)
++				   struct device_attribute *attr, char *buf)
  {
  	struct enclosure_device *edev = to_enclosure_device(cdev->parent);
  	struct enclosure_component *ecomp = to_enclosure_component(cdev);
-@@ -336,8 +338,8 @@ static ssize_t get_component_fault(struc
+@@ -336,8 +338,9 @@ static ssize_t get_component_fault(struc
  	return snprintf(buf, 40, "%d\n", ecomp->fault);
  }
  
 -static ssize_t set_component_fault(struct class_device *cdev, const char *buf,
 -				   size_t count)
-+static ssize_t set_component_fault(struct device *cdev, struct attribute *attr,
++static ssize_t set_component_fault(struct device *cdev,
++				   struct device_attribute *attr,
 +				   const char *buf, size_t count)
  {
  	struct enclosure_device *edev = to_enclosure_device(cdev->parent);
  	struct enclosure_component *ecomp = to_enclosure_component(cdev);
-@@ -348,7 +350,8 @@ static ssize_t set_component_fault(struc
+@@ -348,7 +351,8 @@ static ssize_t set_component_fault(struc
  	return count;
  }
  
 -static ssize_t get_component_status(struct class_device *cdev, char *buf)
 +static ssize_t get_component_status(struct device *cdev,
-+				    struct attribute *attr,char *buf)
++				    struct device_attribute *attr,char *buf)
  {
  	struct enclosure_device *edev = to_enclosure_device(cdev->parent);
  	struct enclosure_component *ecomp = to_enclosure_component(cdev);
-@@ -358,8 +361,8 @@ static ssize_t get_component_status(stru
+@@ -358,8 +362,9 @@ static ssize_t get_component_status(stru
  	return snprintf(buf, 40, "%s\n", enclosure_status[ecomp->status]);
  }
  
 -static ssize_t set_component_status(struct class_device *cdev, const char *buf,
 -				   size_t count)
-+static ssize_t set_component_status(struct device *cdev, struct attribute *attr,
++static ssize_t set_component_status(struct device *cdev,
++				    struct device_attribute *attr,
 +				    const char *buf, size_t count)
  {
  	struct enclosure_device *edev = to_enclosure_device(cdev->parent);
  	struct enclosure_component *ecomp = to_enclosure_component(cdev);
-@@ -380,7 +383,8 @@ static ssize_t set_component_status(stru
+@@ -380,7 +385,8 @@ static ssize_t set_component_status(stru
  		return -EINVAL;
  }
  
 -static ssize_t get_component_active(struct class_device *cdev, char *buf)
 +static ssize_t get_component_active(struct device *cdev,
-+				    struct attribute *attr, char *buf)
++				    struct device_attribute *attr, char *buf)
  {
  	struct enclosure_device *edev = to_enclosure_device(cdev->parent);
  	struct enclosure_component *ecomp = to_enclosure_component(cdev);
-@@ -390,8 +394,9 @@ static ssize_t get_component_active(stru
+@@ -390,8 +396,9 @@ static ssize_t get_component_active(stru
  	return snprintf(buf, 40, "%d\n", ecomp->active);
  }
  
 -static ssize_t set_component_active(struct class_device *cdev, const char *buf,
 -				   size_t count)
 +static ssize_t set_component_active(struct device *cdev,
-+				    struct attribute *attr,
++				    struct device_attribute *attr,
 +				    const char *buf, size_t count)
  {
  	struct enclosure_device *edev = to_enclosure_device(cdev->parent);
  	struct enclosure_component *ecomp = to_enclosure_component(cdev);
-@@ -402,7 +407,8 @@ static ssize_t set_component_active(stru
+@@ -402,7 +409,8 @@ static ssize_t set_component_active(stru
  	return count;
  }
  
 -static ssize_t get_component_locate(struct class_device *cdev, char *buf)
 +static ssize_t get_component_locate(struct device *cdev,
-+				    struct attribute *attr, char *buf)
++				    struct device_attribute *attr, char *buf)
  {
  	struct enclosure_device *edev = to_enclosure_device(cdev->parent);
  	struct enclosure_component *ecomp = to_enclosure_component(cdev);
-@@ -412,8 +418,9 @@ static ssize_t get_component_locate(stru
+@@ -412,8 +420,9 @@ static ssize_t get_component_locate(stru
  	return snprintf(buf, 40, "%d\n", ecomp->locate);
  }
  
 -static ssize_t set_component_locate(struct class_device *cdev, const char *buf,
 -				   size_t count)
 +static ssize_t set_component_locate(struct device *cdev,
-+				    struct attribute *attr,
++				    struct device_attribute *attr,
 +				    const char *buf, size_t count)
  {
  	struct enclosure_device *edev = to_enclosure_device(cdev->parent);
  	struct enclosure_component *ecomp = to_enclosure_component(cdev);
-@@ -424,7 +431,8 @@ static ssize_t set_component_locate(stru
+@@ -424,7 +433,8 @@ static ssize_t set_component_locate(stru
  	return count;
  }
  
 -static ssize_t get_component_type(struct class_device *cdev, char *buf)
 +static ssize_t get_component_type(struct device *cdev,
-+				  struct attribute *attr, char *buf)
++				  struct device_attribute *attr, char *buf)
  {
  	struct enclosure_component *ecomp = to_enclosure_component(cdev);
  
-@@ -432,7 +440,7 @@ static ssize_t get_component_type(struct
+@@ -432,7 +442,7 @@ static ssize_t get_component_type(struct
  }
  
  
@@ -1295,15 +1338,17 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	__ATTR(fault, S_IRUGO | S_IWUSR, get_component_fault,
  	       set_component_fault),
  	__ATTR(status, S_IRUGO | S_IWUSR, get_component_status,
-@@ -448,7 +456,7 @@ static struct class_device_attribute enc
+@@ -448,8 +458,8 @@ static struct class_device_attribute enc
  static struct class enclosure_component_class =  {
  	.name			= "enclosure_component",
  	.owner			= THIS_MODULE,
 -	.class_dev_attrs	= enclosure_component_attrs,
+-	.release		= enclosure_component_release,
 +	.dev_attrs	= enclosure_component_attrs,
- 	.release		= enclosure_component_release,
++	.dev_release		= enclosure_component_release,
  };
  
+ static int __init enclosure_init(void)
 --- a/drivers/scsi/3w-9xxx.c
 +++ b/drivers/scsi/3w-9xxx.c
 @@ -140,9 +140,10 @@ static void twa_unmap_scsi_data(TW_Devic
@@ -1425,20 +1470,21 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	int len;
  
  	if (dev->supplement_adapter_info.AdapterTypeText[0]) {
-@@ -793,10 +793,10 @@ static ssize_t aac_show_vendor(struct cl
+@@ -793,10 +793,11 @@ static ssize_t aac_show_vendor(struct cl
  	return len;
  }
  
 -static ssize_t aac_show_flags(struct class_device *class_dev, char *buf)
-+static ssize_t aac_show_flags(struct device *dev, char *buf)
++static ssize_t aac_show_flags(struct device *cdev,
++			      struct device_attribute *attr, char *buf)
  {
  	int len = 0;
 -	struct aac_dev *dev = (struct aac_dev*)class_to_shost(class_dev)->hostdata;
-+	struct aac_dev *dev = (struct aac_dev*)class_to_shost(dev)->hostdata;
++	struct aac_dev *dev = (struct aac_dev*)class_to_shost(cdev)->hostdata;
  
  	if (nblank(dprintk(x)))
  		len = snprintf(buf, PAGE_SIZE, "dprintk\n");
-@@ -812,10 +812,11 @@ static ssize_t aac_show_flags(struct cla
+@@ -812,10 +813,11 @@ static ssize_t aac_show_flags(struct cla
  	return len;
  }
  
@@ -1453,7 +1499,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	int len, tmp;
  
  	tmp = le32_to_cpu(dev->adapter_info.kernelrev);
-@@ -825,10 +826,11 @@ static ssize_t aac_show_kernel_version(s
+@@ -825,10 +827,11 @@ static ssize_t aac_show_kernel_version(s
  	return len;
  }
  
@@ -1468,7 +1514,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	int len, tmp;
  
  	tmp = le32_to_cpu(dev->adapter_info.monitorrev);
-@@ -838,10 +840,11 @@ static ssize_t aac_show_monitor_version(
+@@ -838,10 +841,11 @@ static ssize_t aac_show_monitor_version(
  	return len;
  }
  
@@ -1483,7 +1529,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	int len, tmp;
  
  	tmp = le32_to_cpu(dev->adapter_info.biosrev);
-@@ -851,9 +854,10 @@ static ssize_t aac_show_bios_version(str
+@@ -851,9 +855,10 @@ static ssize_t aac_show_bios_version(str
  	return len;
  }
  
@@ -1496,7 +1542,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	int len = 0;
  
  	if (le32_to_cpu(dev->adapter_info.serial[0]) != 0xBAD0)
-@@ -869,35 +873,39 @@ ssize_t aac_show_serial_number(struct cl
+@@ -869,35 +874,39 @@ ssize_t aac_show_serial_number(struct cl
  	return len;
  }
  
@@ -1546,7 +1592,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	int len, tmp;
  
  	tmp = aac_adapter_check_health(dev);
-@@ -907,70 +915,70 @@ static ssize_t aac_show_reset_adapter(st
+@@ -907,70 +916,70 @@ static ssize_t aac_show_reset_adapter(st
  	return len;
  }
  
@@ -1627,7 +1673,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	.attr = {
  		.name = "reset_host",
  		.mode = S_IWUSR|S_IRUGO,
-@@ -979,7 +987,7 @@ static struct class_device_attribute aac
+@@ -979,7 +988,7 @@ static struct class_device_attribute aac
  	.show = aac_show_reset_adapter,
  };
  
@@ -1636,7 +1682,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	&aac_model,
  	&aac_vendor,
  	&aac_flags,
-@@ -993,6 +1001,10 @@ static struct class_device_attribute *aa
+@@ -993,6 +1002,10 @@ static struct class_device_attribute *aa
  	NULL
  };
  
@@ -2339,6 +2385,15 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
 --- a/drivers/scsi/ipr.c
 +++ b/drivers/scsi/ipr.c
+@@ -2431,7 +2431,7 @@ restart:
+ 	}
+ 
+ 	spin_unlock_irqrestore(ioa_cfg->host->host_lock, lock_flags);
+-	kobject_uevent(&ioa_cfg->host->shost_classdev.kobj, KOBJ_CHANGE);
++	kobject_uevent(&ioa_cfg->host->shost_dev.kobj, KOBJ_CHANGE);
+ 	LEAVE;
+ }
+ 
 @@ -2451,8 +2451,8 @@ static ssize_t ipr_read_trace(struct kob
  			      struct bin_attribute *bin_attr,
  			      char *buf, loff_t off, size_t count)
@@ -2390,7 +2445,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -static ssize_t ipr_store_write_caching(struct class_device *class_dev,
 -					const char *buf, size_t count)
 +static ssize_t ipr_store_write_caching(struct device *dev,
-+				       struct device_attribute *attr
++				       struct device_attribute *attr,
 +				       const char *buf, size_t count)
  {
 -	struct Scsi_Host *shost = class_to_shost(class_dev);
@@ -2420,8 +2475,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
   *	number of bytes printed to buffer
   **/
 -static ssize_t ipr_show_fw_version(struct class_device *class_dev, char *buf)
-+static ssize_t ipr_show_fw_version(struct device *class_dev,
-+				    struct device_attribute *attr, char *buf)
++static ssize_t ipr_show_fw_version(struct device *dev,
++				   struct device_attribute *attr, char *buf)
  {
 -	struct Scsi_Host *shost = class_to_shost(class_dev);
 +	struct Scsi_Host *shost = class_to_shost(dev);
@@ -2437,7 +2492,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	.attr = {
  		.name =		"fw_version",
  		.mode =		S_IRUGO,
-@@ -2613,13 +2616,14 @@ static struct class_device_attribute ipr
+@@ -2613,15 +2616,16 @@ static struct class_device_attribute ipr
  
  /**
   * ipr_show_log_level - Show the adapter's error logging level
@@ -2453,8 +2508,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static ssize_t ipr_show_log_level(struct device *dev,
 +				   struct device_attribute *attr, char *buf)
  {
- 	struct Scsi_Host *shost = class_to_shost(class_dev);
+-	struct Scsi_Host *shost = class_to_shost(class_dev);
++	struct Scsi_Host *shost = class_to_shost(dev);
  	struct ipr_ioa_cfg *ioa_cfg = (struct ipr_ioa_cfg *)shost->hostdata;
+ 	unsigned long lock_flags = 0;
+ 	int len;
 @@ -2634,16 +2638,17 @@ static ssize_t ipr_show_log_level(struct
  
  /**
@@ -2595,7 +2653,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
   * 	count on success / other on failure
   **/
 -static ssize_t ipr_store_reset_adapter(struct class_device *class_dev,
-+static ssize_t ipr_store_reset_adapter(struct device *class_dev,
++static ssize_t ipr_store_reset_adapter(struct device *dev,
 +				       struct device_attribute *attr,
  				       const char *buf, size_t count)
  {
@@ -2631,7 +2689,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
   **/
 -static ssize_t ipr_store_update_fw(struct class_device *class_dev,
 -				       const char *buf, size_t count)
-+static ssize_t ipr_store_update_fw(struct device *class_dev,
++static ssize_t ipr_store_update_fw(struct device *dev,
 +				   struct device_attribute *attr,
 +				   const char *buf, size_t count)
  {
@@ -2676,6 +2734,41 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	struct Scsi_Host *shost = class_to_shost(cdev);
  	struct ipr_ioa_cfg *ioa_cfg = (struct ipr_ioa_cfg *)shost->hostdata;
  	int rc;
+@@ -7697,9 +7707,9 @@ static void ipr_remove(struct pci_dev *p
+ 
+ 	ENTER;
+ 
+-	ipr_remove_trace_file(&ioa_cfg->host->shost_classdev.kobj,
++	ipr_remove_trace_file(&ioa_cfg->host->shost_dev.kobj,
+ 			      &ipr_trace_attr);
+-	ipr_remove_dump_file(&ioa_cfg->host->shost_classdev.kobj,
++	ipr_remove_dump_file(&ioa_cfg->host->shost_dev.kobj,
+ 			     &ipr_dump_attr);
+ 	scsi_remove_host(ioa_cfg->host);
+ 
+@@ -7740,7 +7750,7 @@ static int __devinit ipr_probe(struct pc
+ 		return rc;
+ 	}
+ 
+-	rc = ipr_create_trace_file(&ioa_cfg->host->shost_classdev.kobj,
++	rc = ipr_create_trace_file(&ioa_cfg->host->shost_dev.kobj,
+ 				   &ipr_trace_attr);
+ 
+ 	if (rc) {
+@@ -7749,11 +7759,11 @@ static int __devinit ipr_probe(struct pc
+ 		return rc;
+ 	}
+ 
+-	rc = ipr_create_dump_file(&ioa_cfg->host->shost_classdev.kobj,
++	rc = ipr_create_dump_file(&ioa_cfg->host->shost_dev.kobj,
+ 				   &ipr_dump_attr);
+ 
+ 	if (rc) {
+-		ipr_remove_trace_file(&ioa_cfg->host->shost_classdev.kobj,
++		ipr_remove_trace_file(&ioa_cfg->host->shost_dev.kobj,
+ 				      &ipr_trace_attr);
+ 		scsi_remove_host(ioa_cfg->host);
+ 		__ipr_remove(pdev);
 --- a/drivers/scsi/lpfc/lpfc_attr.c
 +++ b/drivers/scsi/lpfc/lpfc_attr.c
 @@ -66,23 +66,26 @@ lpfc_jedec_to_ascii(int incr, char hdw[]
@@ -7293,7 +7386,38 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	spin_lock(&sd_index_lock);
 --- a/drivers/scsi/ses.c
 +++ b/drivers/scsi/ses.c
-@@ -407,7 +407,7 @@ static void ses_match_to_enclosure(struc
+@@ -107,7 +107,7 @@ static int ses_set_page2_descriptor(stru
+ 				      unsigned char *desc)
+ {
+ 	int i, j, count = 0, descriptor = ecomp->number;
+-	struct scsi_device *sdev = to_scsi_device(edev->cdev.dev);
++	struct scsi_device *sdev = to_scsi_device(edev->edev.parent);
+ 	struct ses_device *ses_dev = edev->scratch;
+ 	unsigned char *type_ptr = ses_dev->page1 + 12 + ses_dev->page1[11];
+ 	unsigned char *desc_ptr = ses_dev->page2 + 8;
+@@ -137,7 +137,7 @@ static unsigned char *ses_get_page2_desc
+ 				      struct enclosure_component *ecomp)
+ {
+ 	int i, j, count = 0, descriptor = ecomp->number;
+-	struct scsi_device *sdev = to_scsi_device(edev->cdev.dev);
++	struct scsi_device *sdev = to_scsi_device(edev->edev.parent);
+ 	struct ses_device *ses_dev = edev->scratch;
+ 	unsigned char *type_ptr = ses_dev->page1 + 12 + ses_dev->page1[11];
+ 	unsigned char *desc_ptr = ses_dev->page2 + 8;
+@@ -269,10 +269,10 @@ int ses_match_host(struct enclosure_devi
+ 	struct ses_host_edev *sed = data;
+ 	struct scsi_device *sdev;
+ 
+-	if (!scsi_is_sdev_device(edev->cdev.dev))
++	if (!scsi_is_sdev_device(edev->edev.parent))
+ 		return 0;
+ 
+-	sdev = to_scsi_device(edev->cdev.dev);
++	sdev = to_scsi_device(edev->edev.parent);
+ 
+ 	if (sdev->host != sed->shost)
+ 		return 0;
+@@ -407,10 +407,10 @@ static void ses_match_to_enclosure(struc
  
  #define INIT_ALLOC_SIZE 32
  
@@ -7301,17 +7425,30 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static int ses_intf_add(struct device *cdev,
  			struct class_interface *intf)
  {
- 	struct scsi_device *sdev = to_scsi_device(cdev->dev);
+-	struct scsi_device *sdev = to_scsi_device(cdev->dev);
++	struct scsi_device *sdev = to_scsi_device(cdev->parent);
+ 	struct scsi_device *tmp_sdev;
+ 	unsigned char *buf = NULL, *hdr_buf, *type_ptr, *desc_ptr = NULL,
+ 		*addl_desc_ptr = NULL;
 @@ -426,7 +426,7 @@ static int ses_intf_add(struct class_dev
  		edev = enclosure_find(&sdev->host->shost_gendev);
  		if (edev) {
  			ses_match_to_enclosure(edev, sdev);
 -			class_device_put(&edev->cdev);
-+			device_put(&edev->cdev);
++			put_device(&edev->edev);
  		}
  		return -ENODEV;
  	}
-@@ -625,7 +625,7 @@ static int ses_remove(struct device *dev
+@@ -515,7 +515,7 @@ static int ses_intf_add(struct class_dev
+ 	if (!scomp)
+ 		goto err_free;
+ 
+-	edev = enclosure_register(cdev->dev, sdev->sdev_gendev.bus_id,
++	edev = enclosure_register(cdev->parent, sdev->sdev_gendev.bus_id,
+ 				  components, &ses_enclosure_callbacks);
+ 	if (IS_ERR(edev)) {
+ 		err = PTR_ERR(edev);
+@@ -625,17 +625,17 @@ static int ses_remove(struct device *dev
  	return 0;
  }
  
@@ -7319,13 +7456,25 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static void ses_intf_remove(struct device *cdev,
  			    struct class_interface *intf)
  {
- 	struct scsi_device *sdev = to_scsi_device(cdev->dev);
+-	struct scsi_device *sdev = to_scsi_device(cdev->dev);
++	struct scsi_device *sdev = to_scsi_device(cdev->parent);
+ 	struct enclosure_device *edev;
+ 	struct ses_device *ses_dev;
+ 
+ 	if (!scsi_device_enclosure(sdev))
+ 		return;
+ 
+-	edev = enclosure_find(cdev->dev);
++	edev = enclosure_find(cdev->parent);
+ 	if (!edev)
+ 		return;
+ 
 @@ -649,13 +649,13 @@ static void ses_intf_remove(struct class
  
  	kfree(edev->component[0].scratch);
  
 -	class_device_put(&edev->cdev);
-+	device_put(&edev->cdev);
++	put_device(&edev->edev);
  	enclosure_unregister(edev);
  }
  
@@ -7653,21 +7802,22 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	struct request_queue *queue;
 --- a/include/linux/enclosure.h
 +++ b/include/linux/enclosure.h
-@@ -82,7 +82,7 @@ struct enclosure_component_callbacks {
+@@ -82,7 +82,8 @@ struct enclosure_component_callbacks {
  
  struct enclosure_component {
  	void *scratch;
 -	struct class_device cdev;
 +	struct device cdev;
++	struct device *dev;
  	enum enclosure_component_type type;
  	int number;
  	int fault;
-@@ -94,20 +94,20 @@ struct enclosure_component {
+@@ -94,20 +95,20 @@ struct enclosure_component {
  struct enclosure_device {
  	void *scratch;
  	struct list_head node;
 -	struct class_device cdev;
-+	struct device cdev;
++	struct device edev;
  	struct enclosure_component_callbacks *cb;
  	int components;
  	struct enclosure_component component[0];
@@ -7677,7 +7827,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -to_enclosure_device(struct class_device *dev)
 +to_enclosure_device(struct device *dev)
  {
- 	return container_of(dev, struct enclosure_device, cdev);
+-	return container_of(dev, struct enclosure_device, cdev);
++	return container_of(dev, struct enclosure_device, edev);
  }
  
  static inline struct enclosure_component *
