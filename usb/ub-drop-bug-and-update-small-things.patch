@@ -1,0 +1,216 @@
+From zaitcev@redhat.com Wed Mar 19 17:00:20 2008
+From: Pete Zaitcev <zaitcev@redhat.com>
+Date: Wed, 19 Mar 2008 16:55:41 -0700
+Subject: ub: drop BUG() and update small things
+To: greg@kroah.com
+Cc: zaitcev@redhat.com, linux-usb@vger.kernel.org, <cw@f00f.org>, <fujita.tomonori@lab.ntt.co.jp>, jens.axboe@oracle.com
+Message-ID: <20080319165541.657cc7a9.zaitcev@redhat.com>
+
+- Remove the BUG() which trips, borrow the code from scsi_end_request().
+  This may break CD burning, because I am not sure residue gets returned
+  to cdrecord for successful commands. But everything that's good for SCSI
+  should be good for everyone else, right?
+- Ignore improper USB level residue. Too many devices have this bug.
+- Update cosmetics: spelling, formatting
+
+Signed-off-by: Pete Zaitcev <zaitcev@redhat.com>
+Cc: Chris Wedgwood <cw@f00f.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/block/ub.c |   76 +++++++++++++++++++++++++++++++----------------------
+ 1 file changed, 45 insertions(+), 31 deletions(-)
+
+--- a/drivers/block/ub.c
++++ b/drivers/block/ub.c
+@@ -317,6 +317,7 @@ struct ub_dev {
+ 	int openc;			/* protected by ub_lock! */
+ 					/* kref is too implicit for our taste */
+ 	int reset;			/* Reset is running */
++	int bad_resid;
+ 	unsigned int tagcnt;
+ 	char name[12];
+ 	struct usb_device *dev;
+@@ -359,7 +360,8 @@ static void ub_cmd_build_block(struct ub
+ static void ub_cmd_build_packet(struct ub_dev *sc, struct ub_lun *lun,
+     struct ub_scsi_cmd *cmd, struct ub_request *urq);
+ static void ub_rw_cmd_done(struct ub_dev *sc, struct ub_scsi_cmd *cmd);
+-static void ub_end_rq(struct request *rq, unsigned int status);
++static void ub_end_rq(struct request *rq, unsigned int status,
++    unsigned int act_len);
+ static int ub_rw_cmd_retry(struct ub_dev *sc, struct ub_lun *lun,
+     struct ub_request *urq, struct ub_scsi_cmd *cmd);
+ static int ub_submit_scsi(struct ub_dev *sc, struct ub_scsi_cmd *cmd);
+@@ -642,13 +644,13 @@ static int ub_request_fn_1(struct ub_lun
+ 
+ 	if (atomic_read(&sc->poison)) {
+ 		blkdev_dequeue_request(rq);
+-		ub_end_rq(rq, DID_NO_CONNECT << 16);
++		ub_end_rq(rq, DID_NO_CONNECT << 16, 0);
+ 		return 0;
+ 	}
+ 
+ 	if (lun->changed && !blk_pc_request(rq)) {
+ 		blkdev_dequeue_request(rq);
+-		ub_end_rq(rq, SAM_STAT_CHECK_CONDITION);
++		ub_end_rq(rq, SAM_STAT_CHECK_CONDITION, 0);
+ 		return 0;
+ 	}
+ 
+@@ -701,7 +703,7 @@ static int ub_request_fn_1(struct ub_lun
+ 
+ drop:
+ 	ub_put_cmd(lun, cmd);
+-	ub_end_rq(rq, DID_ERROR << 16);
++	ub_end_rq(rq, DID_ERROR << 16, 0);
+ 	return 0;
+ }
+ 
+@@ -770,16 +772,11 @@ static void ub_rw_cmd_done(struct ub_dev
+ 	struct ub_request *urq = cmd->back;
+ 	struct request *rq;
+ 	unsigned int scsi_status;
++	unsigned int act_len;
+ 
+ 	rq = urq->rq;
+ 
+ 	if (cmd->error == 0) {
+-		if (blk_pc_request(rq)) {
+-			if (cmd->act_len >= rq->data_len)
+-				rq->data_len = 0;
+-			else
+-				rq->data_len -= cmd->act_len;
+-		}
+ 		scsi_status = 0;
+ 	} else {
+ 		if (blk_pc_request(rq)) {
+@@ -799,16 +796,21 @@ static void ub_rw_cmd_done(struct ub_dev
+ 		}
+ 	}
+ 
++	if ((act_len = cmd->act_len) > cmd->len)
++		act_len = cmd->len;
++
+ 	urq->rq = NULL;
+ 
+ 	ub_put_cmd(lun, cmd);
+-	ub_end_rq(rq, scsi_status);
++	ub_end_rq(rq, scsi_status, act_len);
+ 	blk_start_queue(lun->disk->queue);
+ }
+ 
+-static void ub_end_rq(struct request *rq, unsigned int scsi_status)
++static void ub_end_rq(struct request *rq, unsigned int scsi_status,
++    unsigned int act_len)
+ {
+ 	int error;
++	long rqlen;
+ 
+ 	if (scsi_status == 0) {
+ 		error = 0;
+@@ -816,8 +818,18 @@ static void ub_end_rq(struct request *rq
+ 		error = -EIO;
+ 		rq->errors = scsi_status;
+ 	}
+-	if (__blk_end_request(rq, error, blk_rq_bytes(rq)))
+-		BUG();
++	rqlen = blk_rq_bytes(rq);
++	if (__blk_end_request(rq, error, act_len)) {
++		if (error) {
++			if (__blk_end_request(rq, error, blk_rq_bytes(rq))) {
++				printk(KERN_WARNING DRV_NAME
++				    ": __blk_end_request blew,"
++				    " %s-cmd rqlen %ld act %u\n",
++				    blk_pc_request(rq)? "pc": "fs",
++				    rqlen, act_len);
++			}
++		}
++	}
+ }
+ 
+ static int ub_rw_cmd_retry(struct ub_dev *sc, struct ub_lun *lun,
+@@ -1239,14 +1251,19 @@ static void ub_scsi_urb_compl(struct ub_
+ 			return;
+ 		}
+ 
+-		len = le32_to_cpu(bcs->Residue);
+-		if (len != cmd->len - cmd->act_len) {
+-			/*
+-			 * It is all right to transfer less, the caller has
+-			 * to check. But it's not all right if the device
+-			 * counts disagree with our counts.
+-			 */
+-			goto Bad_End;
++		if (!sc->bad_resid) {
++			len = le32_to_cpu(bcs->Residue);
++			if (len != cmd->len - cmd->act_len) {
++				/*
++				 * Only start ignoring if this cmd ended well.
++				 */
++				if (cmd->len == cmd->act_len) {
++					printk(KERN_NOTICE "%s: "
++					    "bad residual %d of %d, ignoring\n",
++					    sc->name, len, cmd->len);
++					sc->bad_resid = 1;
++				}
++			}
+ 		}
+ 
+ 		switch (bcs->Status) {
+@@ -1277,8 +1294,7 @@ static void ub_scsi_urb_compl(struct ub_
+ 		ub_state_done(sc, cmd, -EIO);
+ 
+ 	} else {
+-		printk(KERN_WARNING "%s: "
+-		    "wrong command state %d\n",
++		printk(KERN_WARNING "%s: wrong command state %d\n",
+ 		    sc->name, cmd->state);
+ 		ub_state_done(sc, cmd, -EINVAL);
+ 		return;
+@@ -1495,8 +1511,7 @@ static void ub_top_sense_done(struct ub_
+ 		return;
+ 	}
+ 	if (cmd->state != UB_CMDST_SENSE) {
+-		printk(KERN_WARNING "%s: "
+-		    "sense done with bad cmd state %d\n",
++		printk(KERN_WARNING "%s: sense done with bad cmd state %d\n",
+ 		    sc->name, cmd->state);
+ 		return;
+ 	}
+@@ -1700,7 +1715,7 @@ static int ub_bd_ioctl(struct inode *ino
+ }
+ 
+ /*
+- * This is called once a new disk was seen by the block layer or by ub_probe().
++ * This is called by check_disk_change if we reported a media change.
+  * The main onjective here is to discover the features of the media such as
+  * the capacity, read-only status, etc. USB storage generally does not
+  * need to be spun up, but if we needed it, this would be the place.
+@@ -2116,8 +2131,7 @@ static int ub_get_pipes(struct ub_dev *s
+ 	}
+ 
+ 	if (ep_in == NULL || ep_out == NULL) {
+-		printk(KERN_NOTICE "%s: failed endpoint check\n",
+-		    sc->name);
++		printk(KERN_NOTICE "%s: failed endpoint check\n", sc->name);
+ 		return -ENODEV;
+ 	}
+ 
+@@ -2334,7 +2348,7 @@ static void ub_disconnect(struct usb_int
+ 	spin_unlock_irqrestore(&ub_lock, flags);
+ 
+ 	/*
+-	 * Fence stall clearnings, operations triggered by unlinkings and so on.
++	 * Fence stall clearings, operations triggered by unlinkings and so on.
+ 	 * We do not attempt to unlink any URBs, because we do not trust the
+ 	 * unlink paths in HC drivers. Also, we get -84 upon disconnect anyway.
+ 	 */
+@@ -2397,7 +2411,7 @@ static void ub_disconnect(struct usb_int
+ 	spin_unlock_irqrestore(sc->lock, flags);
+ 
+ 	/*
+-	 * There is virtually no chance that other CPU runs times so long
++	 * There is virtually no chance that other CPU runs a timeout so long
+ 	 * after ub_urb_complete should have called del_timer, but only if HCD
+ 	 * didn't forget to deliver a callback on unlink.
+ 	 */
