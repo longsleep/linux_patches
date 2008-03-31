@@ -5,6 +5,22 @@ Subject: novfs: Add the Novell filesystem client kernel module
 
 This adds the Novell filesystem client kernel module.
 
+Things to do before it can be submitted:
+	- coding style cleanups
+		- remove typedefs
+		- function name lowercase
+		- 80 chars wide
+	- sparse cleanups
+		- __user markings
+		- endian markings
+	- remove functions that are never called and structures never used
+		- yeah, there are a lot of them...
+	- remove wrapper functions
+		- private kmalloc/free?
+	- userspace interface revisit
+		- uses /proc/novfs, not nice.
+		- might need userspace tools rework
+
 Cc: Lonnie Iverson <ldiverson@novell.com>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
@@ -12,18 +28,18 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  fs/Kconfig          |    9 
  fs/Makefile         |    1 
  fs/novfs/Makefile   |   19 
- fs/novfs/commands.h | 1089 +++++++++
- fs/novfs/daemon.c   | 2882 +++++++++++++++++++++++++
- fs/novfs/file.c     | 2420 +++++++++++++++++++++
- fs/novfs/inode.c    | 5863 ++++++++++++++++++++++++++++++++++++++++++++++++++++
- fs/novfs/nwcapi.c   | 2685 +++++++++++++++++++++++
- fs/novfs/nwcapi.h   | 2213 +++++++++++++++++++
- fs/novfs/nwerror.h  |  658 +++++
- fs/novfs/proc.c     |  236 ++
- fs/novfs/profile.c  | 1005 ++++++++
- fs/novfs/scope.c    |  905 ++++++++
- fs/novfs/vfs.h      |  288 ++
- 14 files changed, 20273 insertions(+)
+ fs/novfs/commands.h | 1089 ++++++++++
+ fs/novfs/daemon.c   | 2699 ++++++++++++++++++++++++
+ fs/novfs/file.c     | 2394 ++++++++++++++++++++++
+ fs/novfs/inode.c    | 5644 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ fs/novfs/nwcapi.c   | 2638 ++++++++++++++++++++++++
+ fs/novfs/nwcapi.h   | 2213 ++++++++++++++++++++
+ fs/novfs/nwerror.h  |  658 ++++++
+ fs/novfs/proc.c     |  152 +
+ fs/novfs/profile.c  |  880 ++++++++
+ fs/novfs/scope.c    |  749 ++++++
+ fs/novfs/vfs.h      |  468 ++++
+ 14 files changed, 19613 insertions(+)
 
 --- a/fs/Kconfig
 +++ b/fs/Kconfig
@@ -1166,7 +1182,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#endif	/* __NOVFS_COMMANDS_H */
 --- /dev/null
 +++ b/fs/novfs/daemon.c
-@@ -0,0 +1,2882 @@
+@@ -0,0 +1,2699 @@
 +/*
 + * Novell NCP Redirector for Linux
 + * Author: James Turner
@@ -1195,78 +1211,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#include <asm/atomic.h>
 +#include <linux/time.h>
 +
-+/*===[ Include files specific to this module ]============================*/
 +#include "vfs.h"
 +#include "nwcapi.h"
 +#include "commands.h"
 +#include "nwerror.h"
 +
-+/*===[ External data ]====================================================*/
-+extern char *Novfs_CurrentMount;
-+
-+/*===[ External prototypes ]==============================================*/
-+extern int DbgPrint(char *Fmt, ...);
-+extern void mydump(int size, void *dumpptr);
-+
-+extern char *Scope_Get_UserName(void *Scope);
-+extern void *Scope_Lookup(void);
-+extern session_t Scope_Get_SessionId(void *Scope);
-+extern void Scope_Cleanup(void);
-+
-+extern int Novfs_Read_Stream(HANDLE ConnHandle, u_char * Handle,
-+			     u_char * Buffer, size_t * Bytes, loff_t * Offset,
-+			     int User, session_t SessionId);
-+extern int Novfs_Write_Stream(HANDLE ConnHandle, u_char * Handle,
-+			      u_char * Buffer, size_t * Bytes, loff_t * Offset,
-+			      session_t SessionId);
-+extern int Novfs_Close_Stream(HANDLE ConnHandle, u_char * Handle,
-+			      session_t SessionId);
-+
-+extern int Novfs_Add_to_Root(char *);
-+
-+/*
-+ * profile.c functions
-+ */
-+extern uint64_t get_nanosecond_time(void);
-+
-+/*
-+ * nwcapi.c functions
-+ */
-+extern int NwAuthConnWithId(PXPLAT pdata, session_t Session);
-+extern int NwConnClose(PXPLAT pdata, HANDLE * Handle, session_t Session);
-+extern int NwGetConnInfo(PXPLAT pdata, session_t Session);
-+extern int NwSetConnInfo(PXPLAT pdata, session_t Session);
-+extern int NwGetDaemonVersion(PXPLAT pdata, session_t Session);
-+extern int NwGetIdentityInfo(PXPLAT pdata, session_t Session);
-+extern int NwLicenseConn(PXPLAT pdata, session_t Session);
-+extern int NwLoginIdentity(PXPLAT pdata, session_t Session);
-+extern int NwLogoutIdentity(PXPLAT pdata, session_t Session);
-+extern int NwOpenConnByAddr(PXPLAT pdata, HANDLE * Handle, session_t Session);
-+extern int NwOpenConnByName(PXPLAT pdata, HANDLE * Handle, session_t Session);
-+extern int NwOpenConnByRef(PXPLAT pdata, HANDLE * Handle, session_t Session);
-+extern int NwQueryFeature(PXPLAT pdata, session_t Session);
-+extern int NwRawSend(PXPLAT pdata, session_t Session);
-+extern int NwScanConnInfo(PXPLAT pdata, session_t Session);
-+extern int NwSysConnClose(PXPLAT pdata, HANDLE * Handle, session_t Session);
-+extern int NwUnAuthenticate(PXPLAT pdata, session_t Session);
-+extern int NwUnlicenseConn(PXPLAT pdata, session_t Session);
-+extern int NwcChangeAuthKey(PXPLAT pdata, session_t Session);
-+extern int NwcEnumIdentities(PXPLAT pdata, session_t Session);
-+extern int NwcGetDefaultNameCtx(PXPLAT pdata, session_t Session);
-+extern int NwcGetPreferredDSTree(PXPLAT pdata, session_t Session);
-+extern int NwcGetTreeMonitoredConn(PXPLAT pdata, session_t Session);
-+extern int NwcSetDefaultNameCtx(PXPLAT pdata, session_t Session);
-+extern int NwcSetPreferredDSTree(PXPLAT pdata, session_t Session);
-+extern int NwcSetPrimaryConn(PXPLAT pdata, session_t Session);
-+extern int NwcGetPrimaryConn(PXPLAT pdata, session_t Session);
-+extern int NwcSetMapDrive(PXPLAT pdata, session_t Session);
-+extern int NwcUnMapDrive(PXPLAT pdata, session_t Session);
-+extern int NwcEnumerateDrives(PXPLAT pdata, session_t Session);
-+extern int NwcGetBroadcastMessage(PXPLAT pdata, session_t Session);
-+extern int NwdSetKeyValue(PXPLAT pdata, session_t Session);
-+extern int NwdVerifyKeyValue(PXPLAT pdata, session_t Session);
-+
-+/*===[ Manifest constants ]===============================================*/
 +#define QUEUE_SENDING 0
 +#define QUEUE_WAITING 1
 +#define QUEUE_TIMEOUT 2
@@ -1331,25 +1280,19 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +int Daemon_Close_Control(struct inode *Inode, struct file *File);
 +int Daemon_CreateSessionId(SCHANDLE * SessionId);
 +int Daemon_DestroySessionId(SCHANDLE SessionId);
-+void Daemon_Dumpque(void);
 +int Daemon_Get_UserSpace(SCHANDLE SessionId, uint64_t * TotalSize,
 +			 uint64_t * TotalFree, uint64_t * TotalDirectoryEnties,
 +			 uint64_t * FreeDirectoryEnties);
 +int Daemon_Library_close(struct inode *inode, struct file *file);
-+int Daemon_Library_ioctl(struct inode *inode, struct file *file,
-+			 unsigned int cmd, u_long arg);
 +int Daemon_Library_open(struct inode *inode, struct file *file);
 +ssize_t Daemon_Library_read(struct file *file, char *buf, size_t len,
 +			    loff_t * off);
 +ssize_t Daemon_Library_write(struct file *file, const char *buf, size_t len,
 +			     loff_t * off);
 +loff_t Daemon_Library_llseek(struct file *file, loff_t offset, int origin);
-+int Daemon_Login(PLOGIN Login, session_t Session);
 +int Daemon_Logout(PLOGOUT Logout, session_t Session);
 +int Daemon_Open_Control(struct inode *Inode, struct file *File);
 +uint Daemon_Poll(struct file *file, struct poll_table_struct *poll_table);
-+ssize_t Daemon_Receive_Reply(struct file *file, char *buf, size_t nbytes,
-+			     loff_t * ppos);
 +int Daemon_Remove_Resource(daemon_handle_t * DHandle, int Type, HANDLE CHandle,
 +			   u_long FHandle);
 +
@@ -1358,17 +1301,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +int Daemon_SetMountPoint(char *Path);
 +void Daemon_Timer(u_long data);
 +int Daemon_getpwuid(uid_t uid, int unamelen, char *uname);
-+int Daemon_ioctl(struct inode *inode, struct file *file, unsigned int cmd,
-+		 u_long arg);
 +void Init_Daemon_Queue(void);
 +int Queue_Daemon_Command(void *request, u_long reqlen, void *data, int dlen,
 +			 void **reply, u_long * replen, int interruptible);
 +void Queue_get(daemon_command_t * que);
 +void Queue_put(daemon_command_t * que);
 +void Uninit_Daemon_Queue(void);
-+int do_login(NclString * Server, NclString * Username, NclString * Password,
-+	     HANDLE * lgnId, session_t Session);
-+int do_logout(struct qstr *Server, session_t Session);
 +daemon_command_t *find_queue(u_long sequence);
 +daemon_command_t *get_next_queue(int Set_Queue_Waiting);
 +int NwdConvertNetwareHandle(PXPLAT pdata, daemon_handle_t * DHandle);
@@ -1953,23 +1891,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return (retValue);
 +}
 +
-+/*++======================================================================*/
-+ssize_t
-+Daemon_Receive_Reply(struct file * file, char *buf, size_t nbytes,
-+		     loff_t * ppos)
-+/*
-+ *
-+ *  Arguments:
-+ *
-+ *  Returns:
-+ *
-+ *  Abstract:
-+ *
-+ *  Notes:
-+ *
-+ *  Environment:
-+ *
-+ *========================================================================*/
++ssize_t Daemon_Receive_Reply(struct file *file, const char *buf, size_t nbytes, loff_t * ppos)
 +{
 +	daemon_command_t *que;
 +	size_t retValue = 0;
@@ -2101,22 +2023,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return (retValue);
 +}
 +
-+/*++======================================================================*/
-+int do_login(NclString * Server, NclString * Username, NclString * Password,
-+	     HANDLE * lgnId, session_t Session)
-+/*
-+ *
-+ *  Arguments:
-+ *
-+ *  Returns:
-+ *
-+ *  Abstract:
-+ *
-+ *  Notes:
-+ *
-+ *  Environment:
-+ *
-+ *========================================================================*/
++int do_login(NclString *Server, NclString *Username, NclString *Password,
++	     HANDLE *lgnId, session_t Session)
 +{
 +	PLOGIN_USER_REQUEST cmd;
 +	PLOGIN_USER_REPLY reply;
@@ -2318,21 +2226,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +}
 +
-+/*++======================================================================*/
-+int Daemon_Login(PLOGIN Login, session_t Session)
-+/*
-+ *
-+ *  Arguments:
-+ *
-+ *  Returns:
-+ *
-+ *  Abstract:
-+ *
-+ *  Notes:
-+ *
-+ *  Environment:
-+ *
-+ *========================================================================*/
++static int daemon_login(PLOGIN Login, session_t Session)
 +{
 +	int retCode = -ENOMEM;
 +	LOGIN lLogin;
@@ -2364,28 +2258,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +							password.len = lLogin.Password.length;
 +							password.type =
 +							    NWC_STRING_TYPE_ASCII;
-+							if (!copy_from_user
-+							    ((void *)password.
-+							     buffer,
-+							     lLogin.Password.
-+							     data,
-+							     password.len)) {
-+								retCode =
-+								    do_login
-+								    (&server,
-+								     &username,
-+								     &password,
-+								     NULL,
-+								     Session);
++							if (!copy_from_user((void *)password.buffer, lLogin.Password.data, password.len)) {
++								retCode = do_login (&server, &username, &password, NULL, Session);
 +								if (!retCode) {
 +									char *username;
-+									username
-+									    =
-+									    Scope_Get_UserName
-+									    (NULL);
++									username = Scope_Get_UserName();
 +									if (username) {
-+										Novfs_Add_to_Root
-+										    (username);
++										Novfs_Add_to_Root(username);
 +									}
 +								}
 +							}
@@ -2712,7 +2591,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	switch (cmd) {
 +	case IOC_LOGIN:
-+		retCode = Daemon_Login((PLOGIN) arg, Scope_Get_SessionId(NULL));
++		retCode = daemon_login((PLOGIN) arg, Scope_Get_SessionId(NULL));
 +		break;
 +
 +	case IOC_LOGOUT:
@@ -3171,18 +3050,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +		switch (cmd) {
 +		case IOC_LOGIN:
-+			{
-+				retCode =
-+				    Daemon_Login((PLOGIN) arg, dh->session);
-+				break;
-+			}
++			retCode = daemon_login((PLOGIN) arg, dh->session);
++			break;
 +
 +		case IOC_LOGOUT:
-+			{
-+				retCode =
-+				    Daemon_Logout((PLOGOUT) arg, dh->session);
-+				break;
-+			}
++			retCode = Daemon_Logout((PLOGOUT) arg, dh->session);
++			break;
 +
 +		case IOC_DEBUGPRINT:
 +			{
@@ -3269,14 +3142,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +					break;
 +
 +				case NWC_SYS_CLOSE_CONN:
-+					DbgPrint
-+					    ("[VFS XPLAT] Call NwSysCloseConn\n");
-+					retCode =
-+					    NwSysConnClose(&data, &handle,
-+							   dh->session);
-+					Daemon_Remove_Resource(dh,
-+							       DH_TYPE_CONNECTION,
-+							       handle, 0);
++					DbgPrint("[VFS XPLAT] Call NwSysCloseConn\n");
++					retCode = NwSysConnClose(&data, (u_long *)&handle, dh->session);
++					Daemon_Remove_Resource(dh, DH_TYPE_CONNECTION, handle, 0);
 +					break;
 +
 +				case NWC_CLOSE_CONN:
@@ -3567,41 +3435,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	}
 +	return (mask);
-+}
-+
-+void Daemon_Dumpque(void)
-+{
-+#ifdef	CONFIG_KDB
-+	daemon_command_t *que;
-+
-+	que = (daemon_command_t *) Daemon_Queue.list.next;
-+
-+	while (que && (que != (daemon_command_t *) & Daemon_Queue.list.next)) {
-+		kdb_printf("DaemonQue:\n"
-+			   "   Que:       0x%p\n"
-+			   "   status:    0x%lx\n"
-+			   "   flags:     0x%lx\n"
-+			   "   semaphore: 0x%x\n"
-+			   "   sequence:  0x%lx\n"
-+			   "   timer:     0x%lx\n"
-+			   "   request:   0x%p\n"
-+			   "   reqlen:    %ld\n"
-+			   "   data:      0x%p\n"
-+			   "   datalen:   %d\n"
-+			   "   reply:     0x%p\n"
-+			   "   replen:    %ld\n",
-+			   que,
-+			   que->status,
-+			   que->flags,
-+			   atomic_read(&que->semaphore.count),
-+			   que->sequence,
-+			   que->timer.expires,
-+			   que->request,
-+			   que->reqlen,
-+			   que->data, que->datalen, que->reply, que->replen);
-+		que = (daemon_command_t *) que->list.next;
-+	}
-+#endif
 +}
 +
 +/*++======================================================================*/
@@ -4051,7 +3884,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#endif
 --- /dev/null
 +++ b/fs/novfs/file.c
-@@ -0,0 +1,2420 @@
+@@ -0,0 +1,2394 @@
 +/*
 + * Novell NCP Redirector for Linux
 + * Author: James Turner
@@ -4081,23 +3914,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#include "commands.h"
 +#include "nwerror.h"
 +
-+/*===[ External data ]====================================================*/
-+extern struct dentry_operations Novfs_dentry_operations;
-+extern int MaxIoSize;
-+
-+/*===[ External prototypes ]==============================================*/
-+extern int DbgPrint(char *Fmt, ...);
-+extern void mydump(int size, void *dumpptr);
-+extern int Queue_Daemon_Command(void *request, u_long reqlen, void *data,
-+				int dlen, void **reply, u_long * replen,
-+				int interruptible);
-+extern struct inode *Novfs_get_inode(struct super_block *sb, int mode, int dev,
-+				     uid_t uid);
-+
-+extern void *Scope_Lookup(void);
-+
 +/*===[ Function prototypes ]==============================================*/
-+
 +int Novfs_verify_file(struct qstr *Path, scope_t SessionId);
 +int Novfs_get_alltrees(struct dentry *parent);
 +ssize_t Novfs_tree_read(struct file *file, char *buf, size_t len, loff_t * off);
@@ -4217,9 +4034,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	DbgPrint("Novfs_get_alltrees:\n");
 +
-+	retCode =
-+	    Queue_Daemon_Command(&cmd, sizeof(cmd), NULL, 0, (void *)&reply,
-+				 &replylen, INTERRUPTIBLE);
++	retCode = Queue_Daemon_Command(&cmd, sizeof(cmd), NULL, 0, (void *)&reply, &replylen, INTERRUPTIBLE);
 +	DbgPrint("Novfs_get_alltrees: relpy=0x%p replylen=%d\n", reply,
 +		 replylen);
 +	if (reply) {
@@ -4234,21 +4049,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +				name.hash = full_name_hash(name.name, name.len);
 +				entry = d_lookup(parent, &name);
 +				if (NULL == entry) {
-+					DbgPrint
-+					    ("Novfs_get_alltrees: adding %s\n",
-+					     p);
++					DbgPrint("Novfs_get_alltrees: adding %s\n", p);
 +					entry = d_alloc(parent, &name);
 +					if (entry) {
-+						entry->d_op =
-+						    &Novfs_dentry_operations;
-+						inode =
-+						    Novfs_get_inode(parent->
-+								    d_sb,
-+								    S_IFREG |
-+								    0400, 0, 0);
++						entry->d_op = &Novfs_dentry_operations;
++						inode = Novfs_get_inode(parent->d_sb, S_IFREG | 0400, 0, 0, 0, &name);
 +						if (inode) {
-+							inode->i_fop =
-+							    &Novfs_tree_operations;
++							inode->i_fop = &Novfs_tree_operations;
 +							d_add(entry, inode);
 +						}
 +					}
@@ -6474,7 +6281,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +}
 --- /dev/null
 +++ b/fs/novfs/inode.c
-@@ -0,0 +1,5863 @@
+@@ -0,0 +1,5644 @@
 +/*
 + * Novell NCP Redirector for Linux
 + * Author: James Turner
@@ -6519,118 +6326,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#else
 +#define FSPRIVATE i_private
 +#endif
-+/*===[ External data ]====================================================*/
-+extern int MaxIoSize;
 +
-+/*===[ External prototypes ]==============================================*/
-+extern int DbgPrint(char *Fmt, ...);
 +
-+extern int Init_Procfs_Interface(void);
-+extern void Uninit_Procfs_Interface(void);
-+extern void mydump(int size, void *dumpptr);
-+
-+/*
-+ * Daemon.c functions
-+ */
-+extern void Init_Daemon_Queue(void);
-+extern void Uninit_Daemon_Queue(void);
-+extern int do_logout(struct qstr *Server);
-+extern int Daemon_SetMountPoint(char *Path);
-+
-+/*
-+ * file.c functions
-+ */
-+extern int Novfs_verify_file(struct qstr *Path, session_t SessionId);
-+extern int Novfs_get_alltrees(struct dentry *parent);
-+extern int Novfs_Get_Connected_Server_List(unsigned char **ServerList,
-+					   session_t SessionId);
-+extern int Novfs_Get_Server_Volume_List(struct qstr *Server,
-+					unsigned char **VolumeList,
-+					session_t SessionId);
-+extern int Novfs_Verify_Server_Name(struct qstr *Server, session_t SessionId);
-+extern int Novfs_Verify_Volume_Name(struct qstr *Server, struct qstr *Volume,
-+				    session_t SessionId);
-+extern int Novfs_Get_File_Info(unsigned char *Path, PENTRY_INFO Info,
-+			       session_t SessionId);
-+/* Novfs_GetX_File_Info - Extended attributes function */
-+extern int Novfs_GetX_File_Info(char *Path, const char *Name, char *buffer,
-+				ssize_t buffer_size, int *dataLen,
-+				session_t SessionId);
-+extern int Novfs_ListX_File_Info(char *Path, char *buffer, ssize_t buffer_size,
-+				 int *dataLen, session_t SessionId);
-+extern int Novfs_SetX_File_Info(char *Path, const char *Name, const void *Value,
-+				unsigned long valueLen,
-+				unsigned long *bytesWritten, int flags,
-+				session_t SessionId);
-+
-+extern int Novfs_Get_Directory_List(unsigned char *Path, HANDLE * EnumHandle,
-+				    PENTRY_INFO Info, session_t SessionId);
-+extern int Novfs_Get_Directory_ListEx(unsigned char *Path, HANDLE * EnumHandle,
-+				      int *Count, PENTRY_INFO * Info,
-+				      session_t SessionId);
-+extern int Novfs_Open_File(unsigned char *Path, int Flags, PENTRY_INFO Info,
-+			   HANDLE * Handle, session_t SessionId);
-+extern int Novfs_Create(unsigned char *Path, int DirectoryFlag,
-+			session_t SessionId);
-+extern int Novfs_Close_File(HANDLE Handle, session_t SessionId);
-+extern int Novfs_Read_File(HANDLE Handle, unsigned char *Buffer, size_t * Bytes,
-+			   loff_t * Offset, session_t SessionId);
-+extern int Novfs_Read_Pages(HANDLE Handle, PDATA_LIST DList, int DList_Cnt,
-+			    size_t * Bytes, loff_t * Offset,
-+			    session_t SessionId);
-+extern int Novfs_Write_File(HANDLE Handle, unsigned char *Buffer,
-+			    size_t * Bytes, loff_t * Offset,
-+			    session_t SessionId);
-+extern int Novfs_Write_Page(HANDLE Handle, struct page *Page,
-+			    session_t SessionId);
-+extern int Novfs_Write_Pages(HANDLE Handle, PDATA_LIST DList, int DList_Cnt,
-+			     size_t Bytes, loff_t Offset, session_t SessionId);
-+extern int Novfs_Delete(unsigned char *Path, int DirectoryFlag,
-+			session_t SessionId);
-+extern int Novfs_Truncate_File(unsigned char *Path, int PathLen,
-+			       session_t SessionId);
-+extern int Novfs_Truncate_File_Ex(HANDLE Handle, loff_t Offset,
-+				  session_t SessionId);
-+extern int Novfs_Rename_File(int DirectoryFlag, unsigned char *OldName,
-+			     int OldLen, unsigned char *NewName, int NewLen,
-+			     session_t SessionId);
-+extern int Novfs_Set_Attr(unsigned char *Path, struct iattr *Attr,
-+			  session_t SessionId);
-+extern int Novfs_Get_File_Cache_Flag(u_char * Path, session_t SessionId);
-+extern int Novfs_Set_File_Lock(session_t SessionId, HANDLE fhandle,
-+			       unsigned char fl_type, loff_t fl_start,
-+			       loff_t len);
-+
-+/*
-+ * scope.c functions
-+ */
-+extern void Scope_Init(void);
-+extern void Scope_Uninit(void);
-+extern void *Scope_Lookup(void);
-+extern unsigned int Scope_Get_Hash(void *);
-+extern uid_t Scope_Get_Uid(void *);
-+extern session_t Scope_Get_SessionId(void *Scope);
-+extern void *Scope_Get_ScopefromName(struct qstr *Name);
-+extern void *Scope_Get_ScopefromPath(struct dentry *Dentry);
-+extern char *Scope_Get_ScopeUsers(void);
-+extern int Scope_Set_UserSpace(uint64_t * TotalSize, uint64_t * Free,
-+			       uint64_t * TotalEnties, uint64_t * FreeEnties);
-+extern int Scope_Get_UserSpace(uint64_t * TotalSize, uint64_t * Free,
-+			       uint64_t * TotalEnties, uint64_t * FreeEnties);
-+extern char *Scope_dget_path(struct dentry *Dentry, char *Buf,
-+			     unsigned int Buflen, int Flags);
-+
-+/*
-+ * profile.c functions
-+ */
-+extern int init_profile(void);
-+extern void uninit_profile(void);
-+extern uint64_t get_nanosecond_time(void);
-+
-+/*===[ Manifest constants ]===============================================*/
 +#define FILE_UPDATE_TIMEOUT   2
 +
-+/*===[ Type definitions ]=================================================*/
++// FIXME these are wrong, but fake the compiler out for now until the proper people can be flogged...
++extern void *Scope_Get_ScopefromName(struct qstr *Name);
++extern void *Scope_Get_ScopefromPath(struct dentry *Dentry);
 +
 +/*===[ Function prototypes ]==============================================*/
 +int Novfs_Remove_from_Root(char *RemoveName);
@@ -6641,8 +6343,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +struct dentry *Novfs_d_lookup(struct dentry *Parent, struct qstr *Name);
 +int Novfs_d_add(struct dentry *p, struct dentry *d, struct inode *i, int add);
 +int Novfs_d_strcmp(struct qstr *s1, struct qstr *s2);
-+struct inode *Novfs_get_inode(struct super_block *sb, int mode, int dev,
-+			      uid_t uid, ino_t ino, struct qstr *name);
 +unsigned long Novfs_internal_hash(struct qstr *name);
 +
 +#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,18)
@@ -7103,8 +6803,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			 * done in Novfs_d_add now... entry->d_fsdata = (void *)Novfs_internal_hash( &name );
 +			 */
 +			inode =
-+			    Novfs_get_inode(Novfs_root->d_sb, S_IFDIR | 0700, 0,
-+					    Scope_Get_Uid(scope), 0, &name);
++			    Novfs_get_inode(Novfs_root->d_sb, S_IFDIR | 0700, 0, Scope_Get_Uid(scope), 0, &name);
 +			DbgPrint("Novfs_Add_to_Root: Inode=0x%p\n", inode);
 +			if (inode) {
 +				inode->i_atime =
@@ -7348,51 +7047,19 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +							}
 +						} else if (-EINTR != retVal) {
 +							retVal = 0;
-+							iLock =
-+							    Novfs_lock_inode_cache
-+							    (dir);
-+							Novfs_remove_inode_entry
-+							    (dir, &name, 0);
++							iLock = Novfs_lock_inode_cache(dir);
++							Novfs_remove_inode_entry(dir, &name, 0);
 +							if (dentry->d_inode
-+							    && !(dentry->
-+								 d_inode->
-+								 i_flags &
-+								 S_DEAD)) {
-+								dentry->
-+								    d_inode->
-+								    i_flags |=
-+								    S_DEAD;
-+								dentry->
-+								    d_inode->
-+								    i_size = 0;
-+								dentry->
-+								    d_inode->
-+								    i_atime.
-+								    tv_sec =
-+								    dentry->
-+								    d_inode->
-+								    i_atime.
-+								    tv_nsec =
-+								    dentry->
-+								    d_inode->
-+								    i_ctime.
-+								    tv_sec =
-+								    dentry->
-+								    d_inode->
-+								    i_ctime.
-+								    tv_nsec =
-+								    dentry->
-+								    d_inode->
-+								    i_mtime.
-+								    tv_sec =
-+								    dentry->
-+								    d_inode->
-+								    i_mtime.
-+								    tv_nsec = 0;
-+								dentry->
-+								    d_inode->
-+								    i_blocks =
-+								    0;
++							    && !(dentry->d_inode->i_flags & S_DEAD)) {
++								dentry->d_inode->i_flags |= S_DEAD;
++								dentry->d_inode-> i_size = 0;
++								dentry->d_inode->i_atime.tv_sec =
++									dentry->d_inode->i_atime.tv_nsec =
++									dentry->d_inode->i_ctime.tv_sec =
++									dentry->d_inode->i_ctime.tv_nsec =
++									dentry->d_inode->i_mtime.tv_sec =
++									dentry->d_inode->i_mtime.tv_nsec = 0;
++								dentry->d_inode->i_blocks = 0;
 +								d_delete(dentry);	/* Remove from cache */
 +							}
 +						}
@@ -9968,11 +9635,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +					if (!inode && ino) {
 +						uid = Scope_Get_Uid(id->Scope);
 +						if (Novfs_lock_inode_cache(dir)) {
-+							inode =
-+							    Novfs_get_inode
-+							    (dentry->d_sb,
-+							     info->mode, 0, uid,
-+							     ino, &name);
++							inode = Novfs_get_inode (dentry->d_sb, info->mode, 0, uid, ino, &name);
 +							if (inode) {
 +								if (!Novfs_get_entry(dir, &dentry->d_name, &ino, info)) {
 +									update_inode
@@ -10078,8 +9741,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +					    ("Novfs_i_unlink: path %s mode 0%o\n",
 +					     path, inode->i_mode);
 +					if (IS_ROOT(dentry->d_parent->d_parent)) {
-+						retCode =
-+						    do_logout(&dentry->d_name);
++						retCode = do_logout(&dentry->d_name, session);
 +					} else {
 +						retCode =
 +						    Novfs_Delete(path,
@@ -10260,8 +9922,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		uid = Scope_Get_Uid(((PINODE_DATA) dir->FSPRIVATE)->Scope);
 +		if (mode & (S_IFREG | S_IFDIR)) {
 +			inode =
-+			    Novfs_get_inode(dir->i_sb, mode, dev, uid, 0,
-+					    &dentry->d_name);
++			    Novfs_get_inode(dir->i_sb, mode, dev, uid, 0, &dentry->d_name);
 +		}
 +	}
 +	if (inode) {
@@ -10285,21 +9946,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return retCode;
 +}
 +
-+/*++======================================================================*/
 +int Novfs_i_rename(struct inode *odir, struct dentry *od, struct inode *ndir,
 +		   struct dentry *nd)
-+/*
-+ *  Arguments:
-+ *
-+ *  Returns:
-+ *
-+ *  Abstract:
-+ *
-+ *  Notes:
-+ *
-+ *  Environment:
-+ *
-+ *========================================================================*/
 +{
 +	int retCode = -ENOTEMPTY;
 +	char *newpath, *newbuf, *newcon;
@@ -10358,15 +10006,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +				(int)(oldcon - oldpath))) {
 +				newcon = strchr(newcon + 1, '\\');
 +				oldcon = strchr(oldcon + 1, '\\');
-+				DbgPrint
-+				    ("Novfs_i_rename2: newcon=0x%p newpath=0x%p\n",
-+				     newcon, newpath);
-+				DbgPrint
-+				    ("Novfs_i_rename2: oldcon=0x%p oldpath=0x%p\n",
-+				     oldcon, oldpath);
-+				if (newcon && oldcon
-+				    && ((int)(newcon - newpath) ==
-+					(int)(oldcon - oldpath))) {
++				DbgPrint("Novfs_i_rename2: newcon=0x%p newpath=0x%p\n", newcon, newpath);
++				DbgPrint("Novfs_i_rename2: oldcon=0x%p oldpath=0x%p\n", oldcon, oldpath);
++				if (newcon && oldcon &&
++				    ((int)(newcon - newpath) == (int)(oldcon - oldpath))) {
 +					newname.name = newpath;
 +					newname.len = (int)(newcon - newpath);
 +					newname.hash = 0;
@@ -12207,61 +11850,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	}
 +}
 +
-+int Novfs_dump_inode_cache(int argc, const char **argv, const char **envp,
-+		       struct pt_regs *regs)
-+{
-+#ifdef	CONFIG_KDB
-+	struct inode *inode = NULL;
-+	PINODE_DATA id;
-+	PDIR_CACHE dc;
-+	struct list_head *l;
-+	char atime_buf[32];
-+	char mtime_buf[32];
-+	char ctime_buf[32];
-+
-+	if (Novfs_root) {
-+		inode = Novfs_root->d_inode;
-+	}
-+
-+	if (argc > 0) {
-+		inode = (void *)simple_strtoul(argv[1], NULL, 0);
-+	}
-+
-+	kdb_printf("Inode: 0x%p\n", inode);
-+	if (inode) {
-+		id = inode->FSPRIVATE;
-+		kdb_printf("INODE_DATA: 0x%p\n", id);
-+
-+		if (id && id->DirCache.next) {
-+			list_for_each(l, &id->DirCache) {
-+				dc = list_entry(l, DIR_CACHE, list);
-+				ctime_r(&dc->atime.tv_sec, atime_buf);
-+				ctime_r(&dc->mtime.tv_sec, mtime_buf);
-+				ctime_r(&dc->ctime.tv_sec, ctime_buf);
-+
-+				DbgPrint("Cache Entry: 0x%p\n"
-+					 "   flags:   0x%x\n"
-+					 "   jiffies: %llu\n"
-+					 "   ino:     %u\n"
-+					 "   size:    %llu\n"
-+					 "   mode:    0%o\n"
-+					 "   atime:   %s\n"
-+					 "   mtime:   %s\n"
-+					 "   ctime:   %s\n"
-+					 "   hash:    0x%x\n"
-+					 "   len:     %d\n"
-+					 "   name:    %s\n",
-+					 dc, dc->flags, dc->jiffies,
-+					 dc->ino, dc->size, dc->mode,
-+					 atime_buf, mtime_buf, ctime_buf,
-+					 dc->hash, dc->nameLen, dc->name);
-+			}
-+		}
-+	}
-+#endif
-+	return (0);
-+}
-+
 +void Novfs_dump_inode(void *pf)
 +{
 +	struct inode *inode;
@@ -12340,7 +11928,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +MODULE_VERSION(NOVFS_VERSION_STRING);
 --- /dev/null
 +++ b/fs/novfs/nwcapi.c
-@@ -0,0 +1,2685 @@
+@@ -0,0 +1,2638 @@
 +/*
 + * Novell NCP Redirector for Linux
 + * Author: James Turner/Richard Williams
@@ -12374,37 +11962,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#define strlen_user(str) strnlen_user(str, ~0UL >> 1)
 +#endif
 +
-+/*===[ External data ]====================================================*/
-+
-+/*===[ External prototypes ]==============================================*/
-+
-+extern int DbgPrint(char *Fmt, ...);
-+extern void mydump(int size, void *dumpptr);
-+
-+extern session_t Scope_Get_SessionId(void *Scope);
-+extern int Queue_Daemon_Command(void *request, u_long reqlen, void *data,
-+				int dlen, void **reply, u_long * replen,
-+				int interruptible);
-+
-+extern int do_login(NclString * Server, NclString * Username,
-+		    NclString * Password, u_int * lgnId, session_t Session);
-+
-+void GetUserData(NwcScanConnInfo * connInfo, PXPLAT_CALL_REQUEST cmd,
-+		 PXPLAT_CALL_REPLY reply);
-+void GetConnData(NwcGetConnInfo * connInfo, PXPLAT_CALL_REQUEST cmd,
-+		 PXPLAT_CALL_REPLY reply);
-+
-+/*===[ Manifest constants ]===============================================*/
-+
-+/*===[ Type definitions ]=================================================*/
-+
-+/*===[ Function prototypes ]==============================================*/
-+
-+/*===[ Global variables ]=================================================*/
-+
-+/*===[ Code ]=============================================================*/
-+
-+/*++======================================================================*/
++static void GetUserData(NwcScanConnInfo * connInfo, PXPLAT_CALL_REQUEST cmd, PXPLAT_CALL_REPLY reply);
++static void GetConnData(NwcGetConnInfo * connInfo, PXPLAT_CALL_REQUEST cmd, PXPLAT_CALL_REPLY reply);
 +
 +/*++======================================================================*/
 +int NwOpenConnByName(PXPLAT pdata, HANDLE * Handle, session_t Session)
@@ -12431,9 +11990,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	char *data;
 +
 +	cpylen = copy_from_user(&ocbn, pdata->reqData, sizeof(ocbn));
-+	datalen =
-+	    sizeof(*openConn) + strlen_user(ocbn.pName->pString) +
-+	    strlen_user(ocbn.pServiceType);
++	datalen = sizeof(*openConn) + strlen_user(ocbn.pName->pString) + strlen_user(ocbn.pServiceType);
 +	cmdlen = datalen + sizeof(*cmd);
 +	cmd = Novfs_Malloc(cmdlen, GFP_KERNEL);
 +
@@ -12877,20 +12434,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +}
 +
-+/*++======================================================================*/
-+int NwSysConnClose(PXPLAT pdata, u_long * Handle, session_t Session)
-+/*
-+ *  Arguments:
-+ *
-+ *  Returns:
-+ *
-+ *  Abstract:
-+ *
-+ *  Notes:
-+ *
-+ *  Environment:
-+ *
-+ *========================================================================*/
++int NwSysConnClose(PXPLAT pdata, u_long *Handle, session_t Session)
 +{
 +	PXPLAT_CALL_REQUEST cmd;
 +	PXPLAT_CALL_REPLY reply;
@@ -13009,8 +12553,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +							    do_login(&server,
 +								     &username,
 +								     &password,
-+								     &lgn.
-+								     AuthenticationId,
++								     (HANDLE *)&lgn.AuthenticationId,
 +								     Session);
 +							if (retCode) {
 +								lgn.AuthenticationId = 0;
@@ -13657,8 +13200,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +}
 +
 +/*++======================================================================*/
-+void GetUserData(NwcScanConnInfo * connInfo, PXPLAT_CALL_REQUEST cmd,
-+		 PXPLAT_CALL_REPLY reply)
++static void GetUserData(NwcScanConnInfo * connInfo, PXPLAT_CALL_REQUEST cmd, PXPLAT_CALL_REPLY reply)
 +/*
 + *  Abstract:  Copies the user data out of the scan conn info call.
 + *
@@ -13758,8 +13300,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +}
 +
 +/*++======================================================================*/
-+void GetConnData(NwcGetConnInfo * connInfo, PXPLAT_CALL_REQUEST cmd,
-+		 PXPLAT_CALL_REPLY reply)
++static void GetConnData(NwcGetConnInfo * connInfo, PXPLAT_CALL_REQUEST cmd, PXPLAT_CALL_REPLY reply)
 +/*
 + *  Abstract:  Copies the user data out of the scan conn info call.
 + *
@@ -17905,7 +17446,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#endif	/* __NOVFS_ERROR_H */
 --- /dev/null
 +++ b/fs/novfs/proc.c
-@@ -0,0 +1,236 @@
+@@ -0,0 +1,152 @@
 +/*
 + * Novell NCP Redirector for Linux
 + * Author: James Turner
@@ -17928,63 +17469,17 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +#include "vfs.h"
 +
-+/*===[ External data ]====================================================*/
-+extern char *Novfs_CurrentMount;
++struct proc_dir_entry *Novfs_Procfs_dir;
++struct proc_dir_entry *Novfs_Control;
++struct proc_dir_entry *Novfs_Library;
++struct proc_dir_entry *Novfs_Version;
 +
-+/*===[ External prototypes ]==============================================*/
-+extern int DbgPrint(char *Fmt, ...);
-+
-+extern ssize_t
-+Daemon_Receive_Reply(struct file *file, const char *buf, size_t nbytes,
-+		     loff_t * ppos);
-+
-+extern ssize_t
-+Daemon_Send_Command(struct file *file, char *buf, size_t len, loff_t * off);
-+
-+extern int Daemon_ioctl(struct inode *inode, struct file *file,
-+			unsigned int cmd, unsigned long arg);
-+
-+extern int Daemon_Library_close(struct inode *inode, struct file *file);
-+extern int Daemon_Library_ioctl(struct inode *inode, struct file *file,
-+				unsigned int cmd, unsigned long arg);
-+extern int Daemon_Library_open(struct inode *inode, struct file *file);
-+extern ssize_t Daemon_Library_read(struct file *file, char *buf, size_t len,
-+				   loff_t * off);
-+extern ssize_t Daemon_Library_write(struct file *file, const char *buf,
-+				    size_t len, loff_t * off);
-+extern loff_t Daemon_Library_llseek(struct file *file, loff_t offset,
-+				    int origin);
-+
-+extern int Daemon_Open_Control(struct inode *Inode, struct file *File);
-+extern int Daemon_Close_Control(struct inode *Inode, struct file *File);
-+
-+extern int Daemon_getversion(char *Buf, int Length);
-+
-+/*===[ Function prototypes ]==============================================*/
-+ssize_t
-+Novfs_User_proc_read(struct file *file, char *buf, size_t nbytes,
-+		     loff_t * ppos);
-+
-+ssize_t
-+Novfs_User_proc_write(struct file *file, char *buf, size_t nbytes,
-+		      loff_t * ppos);
-+
-+int Novfs_User_proc_ioctl(struct inode *inode, struct file *file,
-+			  unsigned int cmd, unsigned long arg);
-+
-+int Init_Procfs_Interface(void);
-+void Uninit_Procfs_Interface(void);
-+
-+/*===[ Global variables ]=================================================*/
-+struct proc_dir_entry *Novfs_Procfs_dir, *Novfs_Control, *Novfs_Library,
-+    *Novfs_Version;
 +static struct file_operations Daemon_proc_fops;
 +static struct file_operations Library_proc_fops;
 +
 +/*===[ Code ]=============================================================*/
 +
-+int Novfs_Get_Version(char *page, char **start, off_t off, int count, int *eof,
-+		      void *data)
++static int Novfs_Get_Version(char *page, char **start, off_t off, int count, int *eof, void *data)
 +{
 +	char *buf, tbuf[48];
 +	int len = 0, i;
@@ -18012,42 +17507,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return (len);
 +}
 +
-+ssize_t
-+Novfs_User_proc_read(struct file * file, char *buf, size_t nbytes,
-+		     loff_t * ppos)
-+{
-+	ssize_t retval = 0;
-+
-+	DbgPrint("Novfs_User_proc_read: kernel_locked 0x%x\n", kernel_locked());
-+
-+	return retval;
-+}
-+
-+ssize_t
-+Novfs_User_proc_write(struct file * file, char *buf, size_t nbytes,
-+		      loff_t * ppos)
-+{
-+	ssize_t retval = 0;
-+
-+	DbgPrint("Novfs_User_proc_write: kernel_locked 0x%x\n",
-+		 kernel_locked());
-+	if (buf && nbytes) {
-+	}
-+
-+	return (retval);
-+}
-+
-+int Novfs_User_proc_ioctl(struct inode *inode, struct file *file,
-+			  unsigned int cmd, unsigned long arg)
-+{
-+	int retval = -ENOSYS;
-+
-+	DbgPrint("Novfs_User_proc_ioctl: kernel_locked 0x%x\n",
-+		 kernel_locked());
-+
-+	return (retval);
-+}
-+
 +int Init_Procfs_Interface(void)
 +{
 +	int retCode = 0;
@@ -18056,8 +17515,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	if (Novfs_Procfs_dir) {
 +		Novfs_Procfs_dir->owner = THIS_MODULE;
 +
-+		Novfs_Control =
-+		    create_proc_entry("Control", 0600, Novfs_Procfs_dir);
++		Novfs_Control = create_proc_entry("Control", 0600, Novfs_Procfs_dir);
 +
 +		if (Novfs_Control) {
 +			Novfs_Control->owner = THIS_MODULE;
@@ -18081,8 +17539,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			return (-ENOENT);
 +		}
 +
-+		Novfs_Library =
-+		    create_proc_entry("Library", 0666, Novfs_Procfs_dir);
++		Novfs_Library = create_proc_entry("Library", 0666, Novfs_Procfs_dir);
 +		if (Novfs_Library) {
 +			Novfs_Library->owner = THIS_MODULE;
 +			Novfs_Library->size = 0;
@@ -18144,7 +17601,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +}
 --- /dev/null
 +++ b/fs/novfs/profile.c
-@@ -0,0 +1,1005 @@
+@@ -0,0 +1,880 @@
 +/*
 + * Novell NCP Redirector for Linux
 + * Author: James Turner
@@ -18171,35 +17628,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#include <linux/profile.h>
 +#include <linux/notifier.h>
 +
-+/*===[ Include files specific to this module ]============================*/
 +#include "vfs.h"
-+
-+/*===[ External data ]====================================================*/
-+extern struct dentry *Novfs_root;
-+extern struct proc_dir_entry *Novfs_Procfs_dir;
-+extern unsigned long File_update_timeout;
-+extern int PageCache;
-+
-+/*===[ External prototypes ]==============================================*/
-+extern void Scope_Dump_Tasklist(void);
-+extern void Scope_Dump_Scopetable(void);
-+extern void Daemon_Dumpque(void);
-+extern char *Scope_dget_path(struct dentry *Dentry, char *Buf,
-+			     unsigned int Buflen, int Flags);
-+extern int Novfs_dump_inode_cache(int argc, const char **argv,
-+				  const char **envp, struct pt_regs *regs);
-+extern void Novfs_dump_inode(void *pf);
-+extern int Daemon_SendDebugCmd(char *Command);
 +
 +/*===[ Manifest constants ]===============================================*/
 +#define DBGBUFFERSIZE (1024*1024*32)
 +
 +/*===[ Type definitions ]=================================================*/
-+struct symbol_table {
-+	void *address;
-+	char *name;
-+};
-+
 +struct local_rtc_time {
 +	int tm_sec;
 +	int tm_min;
@@ -18229,18 +17663,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +    __attribute__ ((__no_instrument_function__));
 +char *ctime_r(time_t * clock, char *buf)
 +    __attribute__ ((__no_instrument_function__));
-+int profile_dump_tasklist(int argc, const char **argv, const char **envp,
-+			  struct pt_regs *regs);
-+int profile_dump_scopetable(int argc, const char **argv, const char **envp,
-+			    struct pt_regs *regs);
-+int profile_dump_daemonque(int argc, const char **argv, const char **envp,
-+			   struct pt_regs *regs);
-+int profile_dump_DbgBuffer(int argc, const char **argv, const char **envp,
-+			   struct pt_regs *regs);
-+int profile_dump_DentryTree(int argc, const char **argv, const char **envp,
-+			    struct pt_regs *regs);
-+int profile_dump_inode(int argc, const char **argv, const char **envp,
-+		       struct pt_regs *regs);
 +
 +void *Novfs_Malloc(size_t size, int flags)
 +    __attribute__ ((__no_instrument_function__));
@@ -18290,112 +17712,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +static DECLARE_MUTEX(LocalPrint_lock);
 +
-+int init_profile(void)
-+{
-+	int retCode = 0;
-+
-+	if (Novfs_Procfs_dir) {
-+		dbg_dir = Novfs_Procfs_dir;
-+	} else {
-+		dbg_dir = proc_mkdir(MODULE_NAME, NULL);
-+	}
-+
-+	if (dbg_dir) {
-+		dbg_dir->owner = THIS_MODULE;
-+		dbg_file = create_proc_read_entry("Debug",
-+						  0600,
-+						  dbg_dir,
-+						  proc_read_DbgBuffer, NULL);
-+		if (dbg_file) {
-+			dbg_file->owner = THIS_MODULE;
-+			dbg_file->size = DBGBUFFERSIZE;
-+			memcpy(&Dbg_proc_file_operations, dbg_file->proc_fops,
-+			       sizeof(struct file_operations));
-+			Dbg_proc_file_operations.read =
-+			    User_proc_read_DbgBuffer;
-+			Dbg_proc_file_operations.write =
-+			    User_proc_write_DbgBuffer;
-+			dbg_file->proc_fops = &Dbg_proc_file_operations;
-+		} else {
-+			remove_proc_entry(MODULE_NAME, NULL);
-+			vfree(DbgPrintBuffer);
-+			DbgPrintBuffer = NULL;
-+		}
-+	}
-+
-+	if (DbgPrintBuffer) {
-+		if (dbg_dir) {
-+			inode_file = create_proc_entry("inode", 0600, dbg_dir);
-+			if (inode_file) {
-+				inode_file->owner = THIS_MODULE;
-+				inode_file->size = 0;
-+				memcpy(&inode_proc_file_ops,
-+				       inode_file->proc_fops,
-+				       sizeof(struct file_operations));
-+				inode_proc_file_ops.owner = THIS_MODULE;
-+				inode_proc_file_ops.read = profile_inode_read;
-+				inode_file->proc_fops = &inode_proc_file_ops;
-+			}
-+
-+			dentry_file = create_proc_entry("dentry",
-+							0600, dbg_dir);
-+			if (dentry_file) {
-+				dentry_file->owner = THIS_MODULE;
-+				dentry_file->size = 0;
-+				memcpy(&dentry_proc_file_ops,
-+				       dentry_file->proc_fops,
-+				       sizeof(struct file_operations));
-+				dentry_proc_file_ops.owner = THIS_MODULE;
-+				dentry_proc_file_ops.read = profile_dentry_read;
-+				dentry_file->proc_fops = &dentry_proc_file_ops;
-+			}
-+
-+			memory_file = create_proc_entry("memory",
-+							0600, dbg_dir);
-+			if (memory_file) {
-+				memory_file->owner = THIS_MODULE;
-+				memory_file->size = 0;
-+				memcpy(&memory_proc_file_ops,
-+				       memory_file->proc_fops,
-+				       sizeof(struct file_operations));
-+				memory_proc_file_ops.owner = THIS_MODULE;
-+				memory_proc_file_ops.read = profile_memory_read;
-+				memory_file->proc_fops = &memory_proc_file_ops;
-+			}
-+
-+		} else {
-+			vfree(DbgPrintBuffer);
-+			DbgPrintBuffer = NULL;
-+		}
-+	}
-+	return (retCode);
-+}
-+
-+void uninit_profile(void)
-+{
-+	if (dbg_file)
-+		DbgPrint("Calling remove_proc_entry(Debug, NULL)\n"),
-+		    remove_proc_entry("Debug", dbg_dir);
-+	if (inode_file)
-+		DbgPrint("Calling remove_proc_entry(inode, NULL)\n"),
-+		    remove_proc_entry("inode", dbg_dir);
-+	if (dentry_file)
-+		DbgPrint("Calling remove_proc_entry(dentry, NULL)\n"),
-+		    remove_proc_entry("dentry", dbg_dir);
-+	if (memory_file)
-+		DbgPrint("Calling remove_proc_entry(memory, NULL)\n"),
-+		    remove_proc_entry("memory", dbg_dir);
-+
-+	if (dbg_dir && (dbg_dir != Novfs_Procfs_dir)) {
-+		DbgPrint("Calling remove_proc_entry(%s, NULL)\n", MODULE_NAME);
-+		remove_proc_entry(MODULE_NAME, NULL);
-+	}
-+}
-+
-+static
-+    ssize_t
-+User_proc_write_DbgBuffer(struct file *file, const char __user * buf,
-+			  size_t nbytes, loff_t * ppos)
++static ssize_t User_proc_write_DbgBuffer(struct file *file, const char __user *buf, size_t nbytes, loff_t *ppos)
 +{
 +	ssize_t retval = nbytes;
 +	u_char *lbuf, *p;
@@ -18737,91 +18054,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return (buf);
 +}
 +
-+#ifdef	CONFIG_KDB
-+
-+int
-+profile_dump_tasklist(int argc, const char **argv, const char **envp,
-+		      struct pt_regs *regs)
-+{
-+	Scope_Dump_Tasklist();
-+	return (0);
-+}
-+
-+int
-+profile_dump_scopetable(int argc, const char **argv, const char **envp,
-+			struct pt_regs *regs)
-+{
-+	Scope_Dump_Scopetable();
-+	return (0);
-+}
-+
-+int
-+profile_dump_daemonque(int argc, const char **argv, const char **envp,
-+		       struct pt_regs *regs)
-+{
-+	Daemon_Dumpque();
-+	return (0);
-+}
-+
-+int
-+profile_dump_DbgBuffer(int argc, const char **argv, const char **envp,
-+		       struct pt_regs *regs)
-+{
-+	unsigned long offset = DbgPrintBufferReadOffset;
-+	if (argc > 0) {
-+		if (!strcmp("-r", argv[1])) {
-+			DbgPrintBufferOffset = DbgPrintBufferReadOffset = 0;
-+		} else if (!strcmp("-e", argv[1]) && (argc > 1)) {
-+			offset = simple_strtoul(argv[2], NULL, 0);
-+			if (offset && offset < DbgPrintBufferOffset) {
-+				offset = DbgPrintBufferOffset - offset;
-+			} else {
-+				offset = DbgPrintBufferOffset;
-+			}
-+		} else if (!strcmp("-i", argv[1])) {
-+			kdb_printf("DbgPrintBuffer       =0x%p\n",
-+				   DbgPrintBuffer);
-+			kdb_printf("DbgPrintBufferOffset =0x%lx\n",
-+				   DbgPrintBufferOffset);
-+			kdb_printf("DbgPrintBufferSize   =0x%lx\n",
-+				   DbgPrintBufferSize);
-+			offset = DbgPrintBufferOffset;
-+
-+		}
-+	}
-+	while (DbgPrintBufferOffset > offset) {
-+		kdb_printf("%c", DbgPrintBuffer[offset++]);
-+	}
-+	return (0);
-+}
-+
-+int
-+profile_dump_DentryTree(int argc, const char **argv, const char **envp,
-+			struct pt_regs *regs)
-+{
-+	struct dentry *parent = Novfs_root;
-+
-+	if (argc > 0) {
-+		parent = (void *)simple_strtoul(argv[1], NULL, 0);
-+	}
-+
-+	if (parent) {
-+		profile_dump_dt(parent, kdb_printf);
-+	}
-+
-+	return (0);
-+}
-+
-+int
-+profile_dump_inode(int argc, const char **argv, const char **envp,
-+		   struct pt_regs *regs)
-+{
-+	Novfs_dump_inode(kdb_printf);
-+	return (0);
-+}
-+
-+#endif /* CONFIG_KDB */
-+
 +typedef struct memory_header {
 +	struct list_head list;
 +	void *caller;
@@ -18938,11 +18170,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +								n->dentry = d;
 +							}
 +						} else {
-+							path =
-+							    Scope_dget_path(d,
-+									    buf,
-+									    PATH_LENGTH_BUFFER,
-+									    1);
++							path = Scope_dget_path(d, buf, PATH_LENGTH_BUFFER, 1);
 +							if (path) {
 +								pfunc
 +								    ("1-0x%p %s\n"
@@ -19150,9 +18378,113 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	return (retVal);
 +}
++
++int init_profile(void)
++{
++	int retCode = 0;
++
++	if (Novfs_Procfs_dir) {
++		dbg_dir = Novfs_Procfs_dir;
++	} else {
++		dbg_dir = proc_mkdir(MODULE_NAME, NULL);
++	}
++
++	if (dbg_dir) {
++		dbg_dir->owner = THIS_MODULE;
++		dbg_file = create_proc_read_entry("Debug",
++						  0600,
++						  dbg_dir,
++						  proc_read_DbgBuffer, NULL);
++		if (dbg_file) {
++			dbg_file->owner = THIS_MODULE;
++			dbg_file->size = DBGBUFFERSIZE;
++			memcpy(&Dbg_proc_file_operations, dbg_file->proc_fops,
++			       sizeof(struct file_operations));
++			Dbg_proc_file_operations.read =
++			    User_proc_read_DbgBuffer;
++			Dbg_proc_file_operations.write =
++			    User_proc_write_DbgBuffer;
++			dbg_file->proc_fops = &Dbg_proc_file_operations;
++		} else {
++			remove_proc_entry(MODULE_NAME, NULL);
++			vfree(DbgPrintBuffer);
++			DbgPrintBuffer = NULL;
++		}
++	}
++
++	if (DbgPrintBuffer) {
++		if (dbg_dir) {
++			inode_file = create_proc_entry("inode", 0600, dbg_dir);
++			if (inode_file) {
++				inode_file->owner = THIS_MODULE;
++				inode_file->size = 0;
++				memcpy(&inode_proc_file_ops,
++				       inode_file->proc_fops,
++				       sizeof(struct file_operations));
++				inode_proc_file_ops.owner = THIS_MODULE;
++				inode_proc_file_ops.read = profile_inode_read;
++				inode_file->proc_fops = &inode_proc_file_ops;
++			}
++
++			dentry_file = create_proc_entry("dentry",
++							0600, dbg_dir);
++			if (dentry_file) {
++				dentry_file->owner = THIS_MODULE;
++				dentry_file->size = 0;
++				memcpy(&dentry_proc_file_ops,
++				       dentry_file->proc_fops,
++				       sizeof(struct file_operations));
++				dentry_proc_file_ops.owner = THIS_MODULE;
++				dentry_proc_file_ops.read = profile_dentry_read;
++				dentry_file->proc_fops = &dentry_proc_file_ops;
++			}
++
++			memory_file = create_proc_entry("memory",
++							0600, dbg_dir);
++			if (memory_file) {
++				memory_file->owner = THIS_MODULE;
++				memory_file->size = 0;
++				memcpy(&memory_proc_file_ops,
++				       memory_file->proc_fops,
++				       sizeof(struct file_operations));
++				memory_proc_file_ops.owner = THIS_MODULE;
++				memory_proc_file_ops.read = profile_memory_read;
++				memory_file->proc_fops = &memory_proc_file_ops;
++			}
++
++		} else {
++			vfree(DbgPrintBuffer);
++			DbgPrintBuffer = NULL;
++		}
++	}
++	return (retCode);
++}
++
++void uninit_profile(void)
++{
++	if (dbg_file)
++		DbgPrint("Calling remove_proc_entry(Debug, NULL)\n"),
++		    remove_proc_entry("Debug", dbg_dir);
++	if (inode_file)
++		DbgPrint("Calling remove_proc_entry(inode, NULL)\n"),
++		    remove_proc_entry("inode", dbg_dir);
++	if (dentry_file)
++		DbgPrint("Calling remove_proc_entry(dentry, NULL)\n"),
++		    remove_proc_entry("dentry", dbg_dir);
++	if (memory_file)
++		DbgPrint("Calling remove_proc_entry(memory, NULL)\n"),
++		    remove_proc_entry("memory", dbg_dir);
++
++	if (dbg_dir && (dbg_dir != Novfs_Procfs_dir)) {
++		DbgPrint("Calling remove_proc_entry(%s, NULL)\n", MODULE_NAME);
++		remove_proc_entry(MODULE_NAME, NULL);
++	}
++}
++
++
 --- /dev/null
 +++ b/fs/novfs/scope.c
-@@ -0,0 +1,905 @@
+@@ -0,0 +1,749 @@
 +/*
 + * Novell NCP Redirector for Linux
 + * Author:           James Turner
@@ -19188,18 +18520,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +typedef struct task_struct task_t;
 +#endif
 +
-+extern int DbgPrint(char *Fmt, ...);
-+extern int Daemon_CreateSessionId(SCHANDLE * SessionId);
-+extern int Daemon_DestroySessionId(SCHANDLE SessionId);
-+extern int Daemon_getpwuid(uid_t uid, int unamelen, char *uname);
-+extern int Daemon_Get_UserSpace(SCHANDLE SessionId, uint64_t * TotalSize,
-+				uint64_t * TotalFree,
-+				uint64_t * TotalDirectoryEnties,
-+				uint64_t * FreeDirectoryEnties);
-+
-+extern int Novfs_Remove_from_Root(char *);
-+extern int Novfs_Add_to_Root(char *);
-+
 +#define SHUTDOWN_INTERVAL     5
 +#define CLEANUP_INTERVAL      10
 +#define MAX_USERNAME_LENGTH   32
@@ -19220,71 +18540,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	unsigned char ScopeUserName[MAX_USERNAME_LENGTH];
 +} SCOPE_LIST, *PSCOPE_LIST;
 +
-+void Scope_Init(void);
-+void Scope_Uninit(void);
-+
-+unsigned int Scope_Get_Hash(PSCOPE_LIST Scope);
-+uid_t Scope_Get_Uid(PSCOPE_LIST Scope);
-+int Scope_Validate_Scope(PSCOPE_LIST Scope);
-+char *Scope_Get_UserName(PSCOPE_LIST Scope);
-+session_t Scope_Get_SessionId(PSCOPE_LIST Scope);
-+PSCOPE_LIST Scope_Get_ScopefromName(struct qstr *Name);
-+int Scope_Set_UserSpace(uint64_t * TotalSize, uint64_t * Free,
-+			uint64_t * TotalEnties, uint64_t * FreeEnties);
-+int Scope_Get_UserSpace(uint64_t * TotalSize, uint64_t * Free,
-+			uint64_t * TotalEnties, uint64_t * FreeEnties);
-+
-+char *Scope_Get_ScopeUsers(void);
-+void *Scope_Lookup(void);
-+
-+void Scope_Timer_Function(unsigned long Context);
-+int Scope_Cleanup_Thread(void *Args);
-+void Scope_Cleanup(void);
-+char *Scope_dget_path(struct dentry *Dentry, char *Buf, unsigned int Buflen,
-+		      int Flags);
-+void Scope_Dump_Tasklist(void);
-+void Scope_Dump_Scopetable(void);
-+
-+/*===[ Global variables ]=================================================*/
-+struct list_head Scope_List;
-+struct semaphore Scope_Lock;
-+struct semaphore Scope_Thread_Delay;
-+int Scope_Thread_Terminate = 0;
-+struct semaphore Scope_Delay_Event;
-+struct timer_list Scope_Timer;
-+unsigned int Scope_Hash_Val = 1;
-+
-+void Scope_Init(void)
-+{
-+	INIT_LIST_HEAD(&Scope_List);
-+	init_MUTEX(&Scope_Lock);
-+	init_MUTEX_LOCKED(&Scope_Thread_Delay);
-+
-+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,7)
-+	kernel_thread(Scope_Cleanup_Thread, NULL, 0);
-+#else
-+	kthread_run(Scope_Cleanup_Thread, NULL, "novfs_ST");
-+#endif
-+}
-+
-+void Scope_Uninit(void)
-+{
-+	unsigned long expires = jiffies + HZ * SHUTDOWN_INTERVAL;
-+
-+	printk(KERN_INFO "Scope_Uninit: Start\n");
-+
-+	Scope_Thread_Terminate = 1;
-+
-+	up(&Scope_Thread_Delay);
-+
-+	mb();
-+	while (Scope_Thread_Terminate && (jiffies < expires)) {
-+		yield();
-+	}
-+	//down(&Scope_Thread_Delay);
-+	printk(KERN_INFO "Scope_Uninit: Exit\n");
-+
-+}
++static struct list_head Scope_List;
++static struct semaphore Scope_Lock;
++static struct semaphore Scope_Thread_Delay;
++static int Scope_Thread_Terminate = 0;
++static struct timer_list Scope_Timer;
++static unsigned int Scope_Hash_Val = 1;
 +
 +static PSCOPE_LIST Scope_Search4Scope(session_t Id, BOOLEAN Session, BOOLEAN Locked)
 +{
@@ -19425,35 +18686,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return (scope);
 +}
 +
-+unsigned int Scope_Get_Hash(PSCOPE_LIST Scope)
-+{
-+	unsigned int hash = 0;
-+
-+	if (NULL == Scope) {
-+		Scope = Scope_Find_Scope(TRUE);
-+	}
-+
-+	if (Scope && Scope_Validate_Scope(Scope)) {
-+		hash = Scope->ScopeHash;
-+	}
-+	return (hash);
-+}
-+
-+uid_t Scope_Get_Uid(PSCOPE_LIST Scope)
-+{
-+	uid_t uid = 0;
-+
-+	if (NULL == Scope) {
-+		Scope = Scope_Find_Scope(TRUE);
-+	}
-+
-+	if (Scope && Scope_Validate_Scope(Scope)) {
-+		uid = Scope->ScopeUid;
-+	}
-+	return (uid);
-+}
-+
-+int Scope_Validate_Scope(PSCOPE_LIST Scope)
++static int Scope_Validate_Scope(PSCOPE_LIST Scope)
 +{
 +	PSCOPE_LIST s;
 +	struct list_head *sl;
@@ -19480,23 +18713,39 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return (retVal);
 +}
 +
-+char *Scope_Get_UserName(PSCOPE_LIST Scope)
++// FIXME void stuff
++uid_t Scope_Get_Uid(void *foo)
 +{
-+	char *name = NULL;
++	PSCOPE_LIST scope = foo;
++	uid_t uid = 0;
 +
-+	if (!Scope) {
-+		Scope = Scope_Find_Scope(TRUE);
-+	}
++	if (!scope)
++		scope = Scope_Find_Scope(TRUE);
 +
-+	if (Scope && Scope_Validate_Scope(Scope)) {
-+		name = Scope->ScopeUserName;
++	if (scope && Scope_Validate_Scope(scope)) {
++		uid = scope->ScopeUid;
 +	}
-+	return (name);
++	return uid;
 +}
 +
-+session_t Scope_Get_SessionId(PSCOPE_LIST Scope)
++char *Scope_Get_UserName(void)
++{
++	char *name = NULL;
++	PSCOPE_LIST Scope;
++
++	Scope = Scope_Find_Scope(TRUE);
++
++	if (Scope && Scope_Validate_Scope(Scope))
++		name = Scope->ScopeUserName;
++
++	return name;
++}
++
++// FIXME the void * needs to get fixed...
++session_t Scope_Get_SessionId(void * foo)
 +{
 +	session_t sessionId;
++	PSCOPE_LIST Scope = foo;
 +
 +	DbgPrint("Scope_Get_SessionId: 0x%p\n", Scope);
 +	SC_INITIALIZE(sessionId);
@@ -19641,7 +18890,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return (List);
 +}
 +
-+char *Scope_Get_ScopeUsers()
++char *Scope_Get_ScopeUsers(void)
 +{
 +	PSCOPE_LIST scope;
 +	struct list_head *sl;
@@ -19706,12 +18955,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return (scope);
 +}
 +
-+void Scope_Timer_Function(unsigned long Context)
++static void Scope_Timer_Function(unsigned long context)
 +{
 +	up(&Scope_Thread_Delay);
 +}
 +
-+int Scope_Cleanup_Thread(void *Args)
++static int Scope_Cleanup_Thread(void *Args)
 +{
 +	PSCOPE_LIST scope, rscope;
 +	struct list_head *sl, cleanup;
@@ -19952,115 +19201,42 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return (retval);
 +}
 +
-+void Scope_Dump_Tasklist(void)
++void Scope_Init(void)
 +{
-+#ifdef	OLD_DEBUG_KERNEL
-+	task_t *task;
-+	struct files_struct *fs;
-+	int i, open_files = 0;
-+	static char buf[1024];
-+	char *path;
++	INIT_LIST_HEAD(&Scope_List);
++	init_MUTEX(&Scope_Lock);
++	init_MUTEX_LOCKED(&Scope_Thread_Delay);
 +
-+	for_each_process(task) {
-+		kdb_printf("Task List:\n"
-+			   "   Task:           0x%p\n"
-+			   "   pid:            %d\n"
-+			   "   tgid:           %d\n"
-+			   "   uid:            %d %d %d %d\n"
-+			   "   gid:            %d\n"
-+			   "   parent:         0x%p\n"
-+			   "   comm:           %s\n"
-+			   "   user:           0x%p\n"
-+			   "   real_parent:    0x%p\n"
-+			   "   parent_exec_id: 0x%x\n"
-+			   "   self_exec_id:   0x%x\n"
-+			   "   did_exec:       0x%x\n"
-+			   "   signal:         0x%p\n"
-+			   "   thread_info:    0x%p\n"
-+			   "   security:       0x%p\n",
-+			   task,
-+			   task->pid,
-+			   task->tgid,
-+			   task->uid, task->euid, task->suid, task->fsuid,
-+			   task->gid,
-+			   task->parent,
-+			   task->comm,
-+			   task->user,
-+			   task->real_parent,
-+			   task->parent_exec_id,
-+			   task->self_exec_id,
-+			   task->did_exec,
-+			   task->signal, task->thread_info, task->security);
-+
-+		fs = task->files;
-+		kdb_printf("   File List:      0x%p\n", fs);
-+		if (fs) {
-+			open_files = fs->max_fds;
-+			kdb_printf("   Max fds:        %d\n", open_files);
-+			for (i = 0; i < open_files; i++) {
-+				struct file *f = fs->fd[i];
-+				if (f && (f->f_dentry)) {
-+					path =
-+					    Scope_dget_path(f->f_dentry, buf,
-+							    sizeof(buf), 1);
-+					if (!path) {
-+						path = buf;
-+						memcpy(path,
-+						       f->f_dentry->d_name.name,
-+						       f->f_dentry->d_name.len);
-+						path[f->f_dentry->d_name.len] =
-+						    '\0';
-+					}
-+					kdb_printf("      file(%d): 0x%p\n"
-+						   "         f_dentry: 0x%p\n"
-+						   "            d_name:  %s\n"
-+						   "            d_count: %d\n"
-+						   "            d_inode: 0x%p\n",
-+						   i, f, f->f_dentry, path,
-+						   atomic_read(&f->f_dentry->
-+							       d_count),
-+						   f->f_dentry->d_inode);
-+				}
-+			}
-+		}
-+	}
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,7)
++	kernel_thread(Scope_Cleanup_Thread, NULL, 0);
++#else
++	kthread_run(Scope_Cleanup_Thread, NULL, "novfs_ST");
 +#endif
 +}
 +
-+void Scope_Dump_Scopetable(void)
++void Scope_Uninit(void)
 +{
-+#ifdef	CONFIG_KDB
-+	PSCOPE_LIST scope;
-+	struct list_head *sl;
++	unsigned long expires = jiffies + HZ * SHUTDOWN_INTERVAL;
 +
-+	sl = Scope_List.next;
-+	while (sl != &Scope_List) {
-+		scope = list_entry(sl, SCOPE_LIST, ScopeList);
-+		sl = sl->next;
-+		kdb_printf("Scope List:\n"
-+			   "   Scope:         0x%p\n"
-+			   "   ScopeId:       0x%p:%p\n"
-+			   "   SessionId:     0x%p:%p\n"
-+			   "   ScopePid:      %d\n"
-+			   "   ScopeTask:     0x%p\n"
-+			   "   ScopeHash:     %u\n"
-+			   "   ScopeUid:      %u\n"
-+			   "   ScopeUserName: %s\n",
-+			   scope,
-+			   scope->ScopeId.hTypeId, scope->ScopeId.hId,
-+			   scope->SessionId.hTypeId, scope->SessionId.hId,
-+			   scope->ScopePid,
-+			   scope->ScopeTask,
-+			   scope->ScopeHash,
-+			   (long)scope->ScopeUid, scope->ScopeUserName);
++	printk(KERN_INFO "Scope_Uninit: Start\n");
 +
++	Scope_Thread_Terminate = 1;
++
++	up(&Scope_Thread_Delay);
++
++	mb();
++	while (Scope_Thread_Terminate && (jiffies < expires)) {
++		yield();
 +	}
++	//down(&Scope_Thread_Delay);
++	printk(KERN_INFO "Scope_Uninit: Exit\n");
 +
-+#endif
 +}
++
++
 --- /dev/null
 +++ b/fs/novfs/vfs.h
-@@ -0,0 +1,288 @@
+@@ -0,0 +1,468 @@
 +/*
 + * Novell NCP Redirector for Linux
 + * Author: James Turner
@@ -20080,12 +19256,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#ifndef __STDC_VERSION__
 +#define __STDC_VERSION__ 0L
 +#endif
-+
-+#ifdef	CONFIG_KDB
-+#include <linux/kdb.h>
-+#include <linux/kdbprivate.h>
-+
-+#endif /* CONFIG_KDB */
 +
 +#include <linux/version.h>
 +#include <linux/namei.h>
@@ -20108,6 +19278,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	HANDLE hId;
 +
 +} SCHANDLE, *PSCHANDLE;
++
++typedef SCHANDLE scope_t;
++typedef SCHANDLE session_t;
++
++#include "commands.h"
++
 +#ifndef TRUE
 +#define TRUE 1
 +#define FALSE 0
@@ -20126,13 +19302,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#define XTIER_SCHANDLE
 +#endif
 +
-+extern int Novfs_Version_Major;
-+extern int Novfs_Version_Minor;
-+extern int Novfs_Version_Sub;
-+extern int Novfs_Version_Release;
-+
-+extern void *Novfs_Malloc(size_t, int);
-+extern void Novfs_Free(const void *);
 +
 +/*===[ Manifest constants ]===============================================*/
 +#define NOVFS_MAGIC		0x4e574653
@@ -20266,9 +19435,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	struct novfs_string Server;
 +} LOGOUT, *PLOGOUT;
 +
-+typedef SCHANDLE scope_t;
-+typedef SCHANDLE session_t;
-+
 +typedef struct _DIR_CACHE_ {
 +	struct list_head list;
 +	int flags;
@@ -20305,9 +19471,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +} DATA_LIST, *PDATA_LIST;
 +
 +
-+/*===[ Function prototypes ]==============================================*/
-+
-+extern int DbgPrint(char *Fmt, ...);
 +extern char *ctime_r(time_t * clock, char *buf);
 +
 +static inline u32 HandletoUint32(HANDLE h)
@@ -20346,6 +19509,199 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +{
 +	return ((HANDLE) (u_long) ui32);
 +}
++
++/* Global variables */
++
++extern int Novfs_Version_Major;
++extern int Novfs_Version_Minor;
++extern int Novfs_Version_Sub;
++extern int Novfs_Version_Release;
++extern struct dentry *Novfs_root;
++extern struct proc_dir_entry *Novfs_Procfs_dir;
++extern unsigned long File_update_timeout;
++extern int PageCache;
++extern char *Novfs_CurrentMount;
++extern struct dentry_operations Novfs_dentry_operations;
++extern int MaxIoSize;
++
++
++/* Global functions */
++extern int Novfs_Remove_from_Root(char *);
++extern void Novfs_dump_inode(void *pf);
++
++extern void mydump(int size, void *dumpptr);
++
++extern int Queue_Daemon_Command(void *request, u_long reqlen, void *data,
++				int dlen, void **reply, u_long * replen,
++				int interruptible);
++extern int do_login(NclString * Server, NclString * Username, NclString * Password, HANDLE * lgnId, session_t Session);
++
++extern int Init_Procfs_Interface(void);
++extern void Uninit_Procfs_Interface(void);
++
++/*
++ * daemon.c functions
++ */
++extern void Init_Daemon_Queue(void);
++extern void Uninit_Daemon_Queue(void);
++extern int do_logout(struct qstr *Server, session_t Session);
++extern int Daemon_SetMountPoint(char *Path);
++extern int Daemon_CreateSessionId(SCHANDLE * SessionId);
++extern int Daemon_DestroySessionId(SCHANDLE SessionId);
++extern int Daemon_getpwuid(uid_t uid, int unamelen, char *uname);
++extern int Daemon_Get_UserSpace(SCHANDLE SessionId, uint64_t * TotalSize, uint64_t * TotalFree, uint64_t * TotalDirectoryEnties, uint64_t * FreeDirectoryEnties);
++extern int Daemon_SendDebugCmd(char *Command);
++extern ssize_t Daemon_Receive_Reply(struct file *file, const char *buf, size_t nbytes, loff_t * ppos);
++extern ssize_t Daemon_Send_Command(struct file *file, char *buf, size_t len, loff_t * off);
++extern int Daemon_ioctl(struct inode *inode, struct file *file, unsigned int cmd, unsigned long arg);
++extern int Daemon_Library_close(struct inode *inode, struct file *file);
++extern int Daemon_Library_ioctl(struct inode *inode, struct file *file, unsigned int cmd, unsigned long arg);
++extern int Daemon_Library_open(struct inode *inode, struct file *file);
++extern ssize_t Daemon_Library_read(struct file *file, char *buf, size_t len, loff_t * off);
++extern ssize_t Daemon_Library_write(struct file *file, const char *buf, size_t len, loff_t * off);
++extern loff_t Daemon_Library_llseek(struct file *file, loff_t offset, int origin);
++extern int Daemon_Open_Control(struct inode *Inode, struct file *File);
++extern int Daemon_Close_Control(struct inode *Inode, struct file *File);
++extern int Daemon_getversion(char *Buf, int Length);
++
++
++/*
++ * file.c functions
++ */
++extern int Novfs_verify_file(struct qstr *Path, session_t SessionId);
++extern int Novfs_get_alltrees(struct dentry *parent);
++extern int Novfs_Get_Connected_Server_List(unsigned char **ServerList, session_t SessionId);
++extern int Novfs_Get_Server_Volume_List(struct qstr *Server, unsigned char **VolumeList, session_t SessionId);
++extern int Novfs_Verify_Server_Name(struct qstr *Server, session_t SessionId);
++extern int Novfs_Verify_Volume_Name(struct qstr *Server, struct qstr *Volume, session_t SessionId);
++extern int Novfs_Get_File_Info(unsigned char *Path, PENTRY_INFO Info, session_t SessionId);
++extern int Novfs_GetX_File_Info(char *Path, const char *Name, char *buffer,
++				ssize_t buffer_size, int *dataLen,
++				session_t SessionId);
++extern int Novfs_ListX_File_Info(char *Path, char *buffer, ssize_t buffer_size,
++				 int *dataLen, session_t SessionId);
++extern int Novfs_SetX_File_Info(char *Path, const char *Name, const void *Value,
++				unsigned long valueLen,
++				unsigned long *bytesWritten, int flags,
++				session_t SessionId);
++
++extern int Novfs_Get_Directory_List(unsigned char *Path, HANDLE * EnumHandle,
++				    PENTRY_INFO Info, session_t SessionId);
++extern int Novfs_Get_Directory_ListEx(unsigned char *Path, HANDLE * EnumHandle,
++				      int *Count, PENTRY_INFO * Info,
++				      session_t SessionId);
++extern int Novfs_Open_File(unsigned char *Path, int Flags, PENTRY_INFO Info,
++			   HANDLE * Handle, session_t SessionId);
++extern int Novfs_Create(unsigned char *Path, int DirectoryFlag,
++			session_t SessionId);
++extern int Novfs_Close_File(HANDLE Handle, session_t SessionId);
++extern int Novfs_Read_File(HANDLE Handle, unsigned char *Buffer, size_t * Bytes,
++			   loff_t * Offset, session_t SessionId);
++extern int Novfs_Read_Pages(HANDLE Handle, PDATA_LIST DList, int DList_Cnt,
++			    size_t * Bytes, loff_t * Offset,
++			    session_t SessionId);
++extern int Novfs_Write_File(HANDLE Handle, unsigned char *Buffer,
++			    size_t * Bytes, loff_t * Offset,
++			    session_t SessionId);
++extern int Novfs_Write_Page(HANDLE Handle, struct page *Page,
++			    session_t SessionId);
++extern int Novfs_Write_Pages(HANDLE Handle, PDATA_LIST DList, int DList_Cnt,
++			     size_t Bytes, loff_t Offset, session_t SessionId);
++extern int Novfs_Delete(unsigned char *Path, int DirectoryFlag,
++			session_t SessionId);
++extern int Novfs_Truncate_File(unsigned char *Path, int PathLen,
++			       session_t SessionId);
++extern int Novfs_Truncate_File_Ex(HANDLE Handle, loff_t Offset,
++				  session_t SessionId);
++extern int Novfs_Rename_File(int DirectoryFlag, unsigned char *OldName,
++			     int OldLen, unsigned char *NewName, int NewLen,
++			     session_t SessionId);
++extern int Novfs_Set_Attr(unsigned char *Path, struct iattr *Attr,
++			  session_t SessionId);
++extern int Novfs_Get_File_Cache_Flag(u_char * Path, session_t SessionId);
++extern int Novfs_Set_File_Lock(session_t SessionId, HANDLE fhandle,
++			       unsigned char fl_type, loff_t fl_start,
++			       loff_t len);
++
++extern struct inode *Novfs_get_inode(struct super_block *sb, int mode, int dev, uid_t uid, ino_t ino, struct qstr *name);
++extern int Novfs_Read_Stream(HANDLE ConnHandle, u_char * Handle,
++			     u_char * Buffer, size_t * Bytes, loff_t * Offset,
++			     int User, session_t SessionId);
++extern int Novfs_Write_Stream(HANDLE ConnHandle, u_char * Handle,
++			      u_char * Buffer, size_t * Bytes, loff_t * Offset,
++			      session_t SessionId);
++extern int Novfs_Close_Stream(HANDLE ConnHandle, u_char * Handle,
++			      session_t SessionId);
++
++extern int Novfs_Add_to_Root(char *);
++
++
++/*
++ * scope.c functions
++ */
++extern void Scope_Init(void);
++extern void Scope_Uninit(void);
++extern void *Scope_Lookup(void);
++extern uid_t Scope_Get_Uid(void *);
++extern session_t Scope_Get_SessionId(void *Scope);
++//extern session_t Scope_Get_SessionId(PSCOPE_LIST Scope);
++extern char *Scope_Get_ScopeUsers(void);
++extern int Scope_Set_UserSpace(uint64_t * TotalSize, uint64_t * Free,
++			       uint64_t * TotalEnties, uint64_t * FreeEnties);
++extern int Scope_Get_UserSpace(uint64_t * TotalSize, uint64_t * Free,
++			       uint64_t * TotalEnties, uint64_t * FreeEnties);
++extern char *Scope_dget_path(struct dentry *Dentry, char *Buf,
++			     unsigned int Buflen, int Flags);
++extern char *Scope_Get_UserName(void);
++extern void Scope_Cleanup(void);
++
++/*
++ * profile.c functions
++ */
++extern uint64_t get_nanosecond_time(void);
++extern void *Novfs_Malloc(size_t, int);
++extern void Novfs_Free(const void *);
++extern int DbgPrint(char *Fmt, ...);
++extern int init_profile(void);
++extern void uninit_profile(void);
++
++/*
++ * nwcapi.c functions
++ */
++extern int NwAuthConnWithId(PXPLAT pdata, session_t Session);
++extern int NwConnClose(PXPLAT pdata, HANDLE * Handle, session_t Session);
++extern int NwGetConnInfo(PXPLAT pdata, session_t Session);
++extern int NwSetConnInfo(PXPLAT pdata, session_t Session);
++extern int NwGetDaemonVersion(PXPLAT pdata, session_t Session);
++extern int NwGetIdentityInfo(PXPLAT pdata, session_t Session);
++extern int NwLicenseConn(PXPLAT pdata, session_t Session);
++extern int NwLoginIdentity(PXPLAT pdata, session_t Session);
++extern int NwLogoutIdentity(PXPLAT pdata, session_t Session);
++extern int NwOpenConnByAddr(PXPLAT pdata, HANDLE * Handle, session_t Session);
++extern int NwOpenConnByName(PXPLAT pdata, HANDLE * Handle, session_t Session);
++extern int NwOpenConnByRef(PXPLAT pdata, HANDLE * Handle, session_t Session);
++extern int NwQueryFeature(PXPLAT pdata, session_t Session);
++extern int NwRawSend(PXPLAT pdata, session_t Session);
++extern int NwScanConnInfo(PXPLAT pdata, session_t Session);
++extern int NwSysConnClose(PXPLAT pdata, u_long * Handle, session_t Session);
++extern int NwUnAuthenticate(PXPLAT pdata, session_t Session);
++extern int NwUnlicenseConn(PXPLAT pdata, session_t Session);
++extern int NwcChangeAuthKey(PXPLAT pdata, session_t Session);
++extern int NwcEnumIdentities(PXPLAT pdata, session_t Session);
++extern int NwcGetDefaultNameCtx(PXPLAT pdata, session_t Session);
++extern int NwcGetPreferredDSTree(PXPLAT pdata, session_t Session);
++extern int NwcGetTreeMonitoredConn(PXPLAT pdata, session_t Session);
++extern int NwcSetDefaultNameCtx(PXPLAT pdata, session_t Session);
++extern int NwcSetPreferredDSTree(PXPLAT pdata, session_t Session);
++extern int NwcSetPrimaryConn(PXPLAT pdata, session_t Session);
++extern int NwcGetPrimaryConn(PXPLAT pdata, session_t Session);
++extern int NwcSetMapDrive(PXPLAT pdata, session_t Session);
++extern int NwcUnMapDrive(PXPLAT pdata, session_t Session);
++extern int NwcEnumerateDrives(PXPLAT pdata, session_t Session);
++extern int NwcGetBroadcastMessage(PXPLAT pdata, session_t Session);
++extern int NwdSetKeyValue(PXPLAT pdata, session_t Session);
++extern int NwdVerifyKeyValue(PXPLAT pdata, session_t Session);
++
 +
 +#endif	/* __NOVFS_H */
 +
