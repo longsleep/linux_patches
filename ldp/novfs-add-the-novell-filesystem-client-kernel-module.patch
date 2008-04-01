@@ -38,10 +38,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  fs/novfs/nwcapi.h   | 2213 ++++++++++++++++++++
  fs/novfs/nwerror.h  |  658 ++++++
  fs/novfs/proc.c     |  152 +
- fs/novfs/profile.c  |  880 ++++++++
+ fs/novfs/profile.c  |  758 ++++++
  fs/novfs/scope.c    |  749 ++++++
  fs/novfs/vfs.h      |  466 ++++
- 14 files changed, 19584 insertions(+)
+ 14 files changed, 19462 insertions(+)
 
 --- a/fs/Kconfig
 +++ b/fs/Kconfig
@@ -17576,7 +17576,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +}
 --- /dev/null
 +++ b/fs/novfs/profile.c
-@@ -0,0 +1,880 @@
+@@ -0,0 +1,758 @@
 +/*
 + * Novell NCP Redirector for Linux
 + * Author: James Turner
@@ -17639,11 +17639,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +char *ctime_r(time_t * clock, char *buf)
 +    __attribute__ ((__no_instrument_function__));
 +
-+void *Novfs_Malloc(size_t size, int flags)
-+    __attribute__ ((__no_instrument_function__));
 +void Novfs_Free(const void *p) __attribute__ ((__no_instrument_function__));
-+
-+static void profile_dump_memorylist(void *pf);
 +
 +static ssize_t User_proc_write_DbgBuffer(struct file *file,
 +					 const char __user * buf, size_t nbytes,
@@ -17661,8 +17657,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			   loff_t * off);
 +static ssize_t profile_dentry_read(struct file *file, char *buf, size_t len,
 +			    loff_t * off);
-+static ssize_t profile_memory_read(struct file *file, char *buf, size_t len,
-+			    loff_t * off);
 +uint64_t get_nanosecond_time(void);
 +
 +char *DbgPrintBuffer = NULL;
@@ -17677,13 +17671,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static struct file_operations Dbg_proc_file_operations;
 +static struct file_operations dentry_proc_file_ops;
 +static struct file_operations inode_proc_file_ops;
-+static struct file_operations memory_proc_file_ops;
 +
 +static struct proc_dir_entry *dbg_dir = NULL;
 +static struct proc_dir_entry *dbg_file = NULL;
 +static struct proc_dir_entry *dentry_file = NULL;
 +static struct proc_dir_entry *inode_file = NULL;
-+static struct proc_dir_entry *memory_file = NULL;
 +
 +static DECLARE_MUTEX(LocalPrint_lock);
 +
@@ -18015,11 +18007,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +char *ctime_r(time_t * clock, char *buf)
 +{
 +	struct local_rtc_time tm;
-+	static char *DAYOFWEEK[] =
-+	    { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
-+	static char *MONTHOFYEAR[] =
-+	    { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep",
-+"Oct", "Nov", "Dec" };
++	static char *DAYOFWEEK[] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
++	static char *MONTHOFYEAR[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
 +
 +	to_tm(*clock, &tm);
 +
@@ -18027,74 +18016,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		MONTHOFYEAR[tm.tm_mon - 1], tm.tm_mday, tm.tm_hour, tm.tm_min,
 +		tm.tm_sec, tm.tm_year);
 +	return (buf);
-+}
-+
-+typedef struct memory_header {
-+	struct list_head list;
-+	void *caller;
-+	size_t size;
-+} MEMORY_LIST, *PMEMORY_LIST;
-+
-+spinlock_t Malloc_Lock = SPIN_LOCK_UNLOCKED;
-+LIST_HEAD(Memory_List);
-+
-+void *Novfs_Malloc(size_t size, int flags)
-+{
-+	void *p = NULL;
-+	PMEMORY_LIST mh;
-+
-+	mh = kmalloc(size + sizeof(MEMORY_LIST), flags);
-+	if (mh) {
-+		mh->caller = __builtin_return_address(0);
-+		mh->size = size;
-+		spin_lock(&Malloc_Lock);
-+		list_add(&mh->list, &Memory_List);
-+		spin_unlock(&Malloc_Lock);
-+		p = (char *)mh + sizeof(MEMORY_LIST);
-+		/*DbgPrint("Novfs_Malloc: 0x%p 0x%p %d\n", p, mh->caller, size);
-+		 */
-+	}
-+	return (p);
-+}
-+
-+void Novfs_Free(const void *p)
-+{
-+	PMEMORY_LIST mh;
-+
-+	if (p) {
-+		/*DbgPrint("Novfs_Free: 0x%p 0x%p\n", p, __builtin_return_address(0));
-+		 */
-+		mh = (PMEMORY_LIST) ((char *)p - sizeof(MEMORY_LIST));
-+
-+		spin_lock(&Malloc_Lock);
-+		list_del(&mh->list);
-+		spin_unlock(&Malloc_Lock);
-+		kfree(mh);
-+	}
-+}
-+
-+static void profile_dump_memorylist(void *pf)
-+{
-+	void (*pfunc) (char *Fmt, ...) = pf;
-+
-+	PMEMORY_LIST mh;
-+	struct list_head *l;
-+
-+	size_t total = 0;
-+	int count = 0;
-+
-+	spin_lock(&Malloc_Lock);
-+
-+	list_for_each(l, &Memory_List) {
-+		mh = list_entry(l, MEMORY_LIST, list);
-+		pfunc("0x%p 0x%p 0x%p %d\n", mh,
-+		      (char *)mh + sizeof(MEMORY_LIST), mh->caller, mh->size);
-+		count++;
-+		total += mh->size;
-+	}
-+	spin_unlock(&Malloc_Lock);
-+
-+	pfunc("Blocks=%d Total=%d\n", count, total);
 +}
 +
 +static void profile_dump_dt(struct dentry *parent, void *pf)
@@ -18312,34 +18233,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +}
 +
-+static ssize_t profile_memory_read(struct file * file, char *buf, size_t len,
-+				     loff_t * off)
-+{
-+	ssize_t retval = 0;
-+	unsigned long offset = *off;
-+	static char save_DbgPrintOn;
-+
-+	if (offset == 0) {
-+		down(&LocalPrint_lock);
-+		save_DbgPrintOn = DbgPrintOn;
-+		DbgPrintOn = 0;
-+		DbgPrintBufferOffset = DbgPrintBufferReadOffset = 0;
-+		profile_dump_memorylist(LocalPrint);
-+	}
-+
-+	retval = profile_common_read(buf, len, off);
-+
-+	if (0 == retval) {
-+		DbgPrintBufferOffset = DbgPrintBufferReadOffset = 0;
-+		DbgPrintOn = save_DbgPrintOn;
-+
-+		up(&LocalPrint_lock);
-+	}
-+
-+	return retval;
-+
-+}
-+
 +uint64_t get_nanosecond_time()
 +{
 +	struct timespec ts;
@@ -18413,20 +18306,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +				dentry_proc_file_ops.read = profile_dentry_read;
 +				dentry_file->proc_fops = &dentry_proc_file_ops;
 +			}
-+
-+			memory_file = create_proc_entry("memory",
-+							0600, dbg_dir);
-+			if (memory_file) {
-+				memory_file->owner = THIS_MODULE;
-+				memory_file->size = 0;
-+				memcpy(&memory_proc_file_ops,
-+				       memory_file->proc_fops,
-+				       sizeof(struct file_operations));
-+				memory_proc_file_ops.owner = THIS_MODULE;
-+				memory_proc_file_ops.read = profile_memory_read;
-+				memory_file->proc_fops = &memory_proc_file_ops;
-+			}
-+
 +		} else {
 +			vfree(DbgPrintBuffer);
 +			DbgPrintBuffer = NULL;
@@ -18437,19 +18316,18 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +void uninit_profile(void)
 +{
-+	if (dbg_file)
-+		DbgPrint("Calling remove_proc_entry(Debug, NULL)\n"),
-+		    remove_proc_entry("Debug", dbg_dir);
-+	if (inode_file)
-+		DbgPrint("Calling remove_proc_entry(inode, NULL)\n"),
-+		    remove_proc_entry("inode", dbg_dir);
-+	if (dentry_file)
-+		DbgPrint("Calling remove_proc_entry(dentry, NULL)\n"),
-+		    remove_proc_entry("dentry", dbg_dir);
-+	if (memory_file)
-+		DbgPrint("Calling remove_proc_entry(memory, NULL)\n"),
-+		    remove_proc_entry("memory", dbg_dir);
-+
++	if (dbg_file) {
++		DbgPrint("Calling remove_proc_entry(Debug, NULL)\n");
++		remove_proc_entry("Debug", dbg_dir);
++	}
++	if (inode_file) {
++		DbgPrint("Calling remove_proc_entry(inode, NULL)\n");
++		remove_proc_entry("inode", dbg_dir);
++	}
++	if (dentry_file) {
++		DbgPrint("Calling remove_proc_entry(dentry, NULL)\n");
++		remove_proc_entry("dentry", dbg_dir);
++	}
 +	if (dbg_dir && (dbg_dir != Novfs_Procfs_dir)) {
 +		DbgPrint("Calling remove_proc_entry(%s, NULL)\n", MODULE_NAME);
 +		remove_proc_entry(MODULE_NAME, NULL);
@@ -19632,8 +19510,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + * profile.c functions
 + */
 +extern uint64_t get_nanosecond_time(void);
-+extern void *Novfs_Malloc(size_t, int);
-+extern void Novfs_Free(const void *);
++static inline void *Novfs_Malloc(size_t size, int flags) { return kmalloc(size, flags); }
++static inline void Novfs_Free(const void *p) { return kfree(p); }
 +extern int DbgPrint(char *Fmt, ...);
 +extern int init_profile(void);
 +extern void uninit_profile(void);
