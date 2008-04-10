@@ -19,7 +19,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  drivers/usb/Makefile                      |    1 
  drivers/usb/host/Kconfig                  |   14 
  drivers/usb/host/Makefile                 |    1 
- drivers/usb/host/hwa-hc.c                 | 1009 +++++++++++++++
+ drivers/usb/host/hwa-hc.c                 |  951 ++++++++++++++
  drivers/usb/wusbcore/Kconfig              |   17 
  drivers/usb/wusbcore/Makefile             |   21 
  drivers/usb/wusbcore/cbaf.c               |  783 ++++++++++++
@@ -32,12 +32,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  drivers/usb/wusbcore/rh.c                 |  493 +++++++
  drivers/usb/wusbcore/security.c           |  545 ++++++++
  drivers/usb/wusbcore/wa-hc.c              |   83 +
- drivers/usb/wusbcore/wa-hc.h              |  423 ++++++
+ drivers/usb/wusbcore/wa-hc.h              |  420 ++++++
  drivers/usb/wusbcore/wa-nep.c             |  331 +++++
  drivers/usb/wusbcore/wa-rpipe.c           |  567 ++++++++
  drivers/usb/wusbcore/wa-xfer.c            | 1762 +++++++++++++++++++++++++++
  drivers/usb/wusbcore/wusbhc.c             |  436 ++++++
- drivers/usb/wusbcore/wusbhc.h             |  535 ++++++++
+ drivers/usb/wusbcore/wusbhc.h             |  522 ++++++++
  drivers/uwb/Kconfig                       |   92 +
  drivers/uwb/Makefile                      |   31 
  drivers/uwb/address.c                     |  380 +++++
@@ -89,7 +89,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  drivers/uwb/wlp/wlp-internal.h            |  228 +++
  drivers/uwb/wlp/wlp-lc.c                  |  565 ++++++++
  drivers/uwb/wlp/wss-lc.c                  | 1056 ++++++++++++++++
- 76 files changed, 29388 insertions(+)
+ 76 files changed, 29314 insertions(+)
 
 --- a/drivers/Kconfig
 +++ b/drivers/Kconfig
@@ -164,7 +164,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
 --- /dev/null
 +++ b/drivers/usb/host/hwa-hc.c
-@@ -0,0 +1,1009 @@
+@@ -0,0 +1,951 @@
 +/*
 + * Host Wire Adapter:
 + * Driver glue, HWA-specific functions, bridges to WAHC and WUSBHC
@@ -239,10 +239,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	u8 buffer[16];		/* for misc usb transactions */
 +};
 +
-+
 +#if UWB_BUG_292 == 1
-+static
-+struct usb_wa_descriptor wa_descr_bugwa292 = {
++static struct usb_wa_descriptor wa_descr_bugwa292 = {
 +	.bLength = sizeof(wa_descr_bugwa292),
 +	.bDescriptorType = USB_DT_WIRE_ADAPTER,
 +	.bcdWAVersion = cpu_to_le16(0x0100),
@@ -257,29 +255,25 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +};
 +#endif
 +
-+
-+
 +/**
 + * FIXME should be wusbhc
 + *
 + * NOTE: we need to cache the Cluster ID because later...there is no
 + *       way to get it :)
 + */
-+static
-+int __hwahc_set_cluster_id(struct hwahc *hwahc, u8 cluster_id)
++static int __hwahc_set_cluster_id(struct hwahc *hwahc, u8 cluster_id)
 +{
 +	int result;
 +	struct wusbhc *wusbhc = &hwahc->wusbhc;
 +	struct wahc *wa = &hwahc->wa;
 +	struct device *dev = &wa->usb_iface->dev;
 +
-+	result = usb_control_msg(
-+		wa->usb_dev, usb_sndctrlpipe(wa->usb_dev, 0),
-+		WUSB_REQ_SET_CLUSTER_ID,
-+		USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-+		cluster_id,
-+		wa->usb_iface->cur_altsetting->desc.bInterfaceNumber,
-+		NULL, 0, 1000 /* FIXME: arbitrary */);
++	result = usb_control_msg(wa->usb_dev, usb_sndctrlpipe(wa->usb_dev, 0),
++			WUSB_REQ_SET_CLUSTER_ID,
++			USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
++			cluster_id,
++			wa->usb_iface->cur_altsetting->desc.bInterfaceNumber,
++			NULL, 0, 1000 /* FIXME: arbitrary */);
 +	if (result < 0)
 +		dev_err(dev, "Cannot set WUSB Cluster ID to 0x%02x: %d\n",
 +			cluster_id, result);
@@ -289,31 +283,26 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return result;
 +}
 +
-+
-+static
-+int __hwahc_op_set_num_dnts(struct wusbhc *wusbhc, u8 interval, u8 slots)
++static int __hwahc_op_set_num_dnts(struct wusbhc *wusbhc, u8 interval, u8 slots)
 +{
 +	struct hwahc *hwahc = container_of(wusbhc, struct hwahc, wusbhc);
 +	struct wahc *wa = &hwahc->wa;
 +
-+	return usb_control_msg(
-+		wa->usb_dev, usb_sndctrlpipe(wa->usb_dev, 0),
-+		WUSB_REQ_SET_NUM_DNTS,
-+		USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-+		interval << 8 | slots,
-+		wa->usb_iface->cur_altsetting->desc.bInterfaceNumber,
-+		NULL, 0, 1000 /* FIXME: arbitrary */);
++	return usb_control_msg(wa->usb_dev, usb_sndctrlpipe(wa->usb_dev, 0),
++			WUSB_REQ_SET_NUM_DNTS,
++			USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
++			interval << 8 | slots,
++			wa->usb_iface->cur_altsetting->desc.bInterfaceNumber,
++			NULL, 0, 1000 /* FIXME: arbitrary */);
 +}
 +
-+
-+/**
++/*
 + * Reset a WUSB host controller and wait for it to complete doing it.
 + *
 + * @usb_hcd:	Pointer to WUSB Host Controller instance.
 + *
 + */
-+static
-+int hwahc_op_reset(struct usb_hcd *usb_hcd)
++static int hwahc_op_reset(struct usb_hcd *usb_hcd)
 +{
 +	int result;
 +	struct wusbhc *wusbhc = usb_hcd_to_wusbhc(usb_hcd);
@@ -340,8 +329,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return result;
 +}
 +
-+
-+/**
++/*
 + * FIXME: break this function up
 + */
 +static int hwahc_op_start(struct usb_hcd *usb_hcd)
@@ -389,12 +377,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +}
 +
-+
-+/**
++/*
 + * FIXME: break this function up
 + */
-+static
-+int __hwahc_op_wusbhc_start(struct wusbhc *wusbhc)
++static int __hwahc_op_wusbhc_start(struct wusbhc *wusbhc)
 +{
 +	int result;
 +	struct hwahc *hwahc = container_of(wusbhc, struct hwahc, wusbhc);
@@ -424,31 +410,26 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	goto out;
 +}
 +
-+
-+static
-+int hwahc_op_suspend(struct usb_hcd *usb_hcd, pm_message_t msg)
++static int hwahc_op_suspend(struct usb_hcd *usb_hcd, pm_message_t msg)
 +{
 +	struct wusbhc *wusbhc = usb_hcd_to_wusbhc(usb_hcd);
 +	struct hwahc *hwahc = container_of(wusbhc, struct hwahc, wusbhc);
 +	dev_err(wusbhc->dev, "%s (%p [%p], 0x%lx) UNIMPLEMENTED\n", __func__,
-+	        usb_hcd, hwahc, *(unsigned long *) &msg);
++		usb_hcd, hwahc, *(unsigned long *) &msg);
 +	return -ENOSYS;
 +}
 +
-+
-+static
-+int hwahc_op_resume(struct usb_hcd *usb_hcd)
++static int hwahc_op_resume(struct usb_hcd *usb_hcd)
 +{
 +	struct wusbhc *wusbhc = usb_hcd_to_wusbhc(usb_hcd);
 +	struct hwahc *hwahc = container_of(wusbhc, struct hwahc, wusbhc);
++
 +	dev_err(wusbhc->dev, "%s (%p [%p]) UNIMPLEMENTED\n", __func__,
-+	        usb_hcd, hwahc);
++		usb_hcd, hwahc);
 +	return -ENOSYS;
 +}
 +
-+
-+static
-+void __hwahc_op_wusbhc_stop(struct wusbhc *wusbhc)
++static void __hwahc_op_wusbhc_stop(struct wusbhc *wusbhc)
 +{
 +	int result;
 +	struct hwahc *hwahc = container_of(wusbhc, struct hwahc, wusbhc);
@@ -460,15 +441,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return;
 +}
 +
-+
 +/*
 + * No need to abort pipes, as when this is called, all the children
 + * has been disconnected and that has done it [through
 + * usb_disable_interface() -> usb_disable_endpoint() ->
 + * hwahc_op_ep_disable() - >rpipe_ep_disable()].
 + */
-+static
-+void hwahc_op_stop(struct usb_hcd *usb_hcd)
++static void hwahc_op_stop(struct usb_hcd *usb_hcd)
 +{
 +	int result;
 +	struct wusbhc *wusbhc = usb_hcd_to_wusbhc(usb_hcd);
@@ -487,20 +466,18 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return;
 +}
 +
-+
-+static
-+int hwahc_op_get_frame_number(struct usb_hcd *usb_hcd)
++static int hwahc_op_get_frame_number(struct usb_hcd *usb_hcd)
 +{
 +	struct wusbhc *wusbhc = usb_hcd_to_wusbhc(usb_hcd);
 +	struct hwahc *hwahc = container_of(wusbhc, struct hwahc, wusbhc);
++
 +	dev_err(wusbhc->dev, "%s (%p [%p]) UNIMPLEMENTED\n", __func__,
-+	        usb_hcd, hwahc);
++		usb_hcd, hwahc);
 +	return -ENOSYS;
 +}
 +
-+
-+static
-+int hwahc_op_urb_enqueue(struct usb_hcd *usb_hcd, struct urb *urb, gfp_t gfp)
++static int hwahc_op_urb_enqueue(struct usb_hcd *usb_hcd, struct urb *urb,
++				gfp_t gfp)
 +{
 +	struct wusbhc *wusbhc = usb_hcd_to_wusbhc(usb_hcd);
 +	struct hwahc *hwahc = container_of(wusbhc, struct hwahc, wusbhc);
@@ -508,9 +485,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return wa_urb_enqueue(&hwahc->wa, urb->ep, urb, gfp);
 +}
 +
-+
-+static
-+int hwahc_op_urb_dequeue(struct usb_hcd *usb_hcd, struct urb *urb, int status)
++static int hwahc_op_urb_dequeue(struct usb_hcd *usb_hcd, struct urb *urb,
++				int status)
 +{
 +	struct wusbhc *wusbhc = usb_hcd_to_wusbhc(usb_hcd);
 +	struct hwahc *hwahc = container_of(wusbhc, struct hwahc, wusbhc);
@@ -518,15 +494,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return wa_urb_dequeue(&hwahc->wa, urb);
 +}
 +
-+
-+/**
++/*
 + * Release resources allocated for an endpoint
 + *
 + * If there is an associated rpipe to this endpoint, go ahead and put it.
 + */
-+static
-+void hwahc_op_endpoint_disable(struct usb_hcd *usb_hcd,
-+			       struct usb_host_endpoint *ep)
++static void hwahc_op_endpoint_disable(struct usb_hcd *usb_hcd,
++				      struct usb_host_endpoint *ep)
 +{
 +	struct wusbhc *wusbhc = usb_hcd_to_wusbhc(usb_hcd);
 +	struct hwahc *hwahc = container_of(wusbhc, struct hwahc, wusbhc);
@@ -534,16 +508,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	rpipe_ep_disable(&hwahc->wa, ep);
 +}
 +
-+
-+/**
++/*
 + * Set the UWB MAS allocation for the WUSB cluster
 + *
 + * @stream_index: stream to use (-1 for cancelling the allocation)
 + * @mas: mas bitmap to use
 + */
-+static
-+int __hwahc_op_bwa_set(struct wusbhc *wusbhc,
-+		       s8 stream_index, const struct uwb_mas_bm *mas)
++static int __hwahc_op_bwa_set(struct wusbhc *wusbhc, s8 stream_index,
++			      const struct uwb_mas_bm *mas)
 +{
 +	int result;
 +	struct hwahc *hwahc = container_of(wusbhc, struct hwahc, wusbhc);
@@ -551,33 +523,31 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	struct device *dev = &wa->usb_iface->dev;
 +	u8 mas_le[UWB_NUM_MAS/8];
 +
-+	result = usb_control_msg(	/* Set the stream index */
-+		wa->usb_dev, usb_sndctrlpipe(wa->usb_dev, 0),
-+		WUSB_REQ_SET_STREAM_IDX,
-+		USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-+		stream_index,
-+		wa->usb_iface->cur_altsetting->desc.bInterfaceNumber,
-+		NULL, 0, 1000 /* FIXME: arbitrary */);
++	/* Set the stream index */
++	result = usb_control_msg(wa->usb_dev, usb_sndctrlpipe(wa->usb_dev, 0),
++			WUSB_REQ_SET_STREAM_IDX,
++			USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
++			stream_index,
++			wa->usb_iface->cur_altsetting->desc.bInterfaceNumber,
++			NULL, 0, 1000 /* FIXME: arbitrary */);
 +	if (result < 0) {
 +		dev_err(dev, "Cannot set WUSB stream index: %d\n", result);
 +		goto out;
 +	}
 +	uwb_mas_bm_copy_le(mas_le, mas);
-+	result = usb_control_msg(	/* Set the MAS allocation */
-+		wa->usb_dev, usb_sndctrlpipe(wa->usb_dev, 0),
-+		WUSB_REQ_SET_WUSB_MAS,
-+		USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-+		0,
-+		wa->usb_iface->cur_altsetting->desc.bInterfaceNumber,
-+		mas_le, 32, 1000 /* FIXME: arbitrary */);
++	/* Set the MAS allocation */
++	result = usb_control_msg(wa->usb_dev, usb_sndctrlpipe(wa->usb_dev, 0),
++			WUSB_REQ_SET_WUSB_MAS,
++			USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
++			0, wa->usb_iface->cur_altsetting->desc.bInterfaceNumber,
++			mas_le, 32, 1000 /* FIXME: arbitrary */);
 +	if (result < 0)
 +		dev_err(dev, "Cannot set WUSB MAS allocation: %d\n", result);
 +out:
 +	return result;
 +}
 +
-+
-+/**
++/*
 + * Add an IE to the host's MMC
 + *
 + * @interval:    See WUSB1.0[8.5.3.1]
@@ -591,50 +561,47 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + *       normal MBOA MAC IEs (IE Id + Length in MBOA MAC vs. Length +
 + *       Id in WUSB IEs). Standards...you gotta love'em.
 + */
-+static
-+int __hwahc_op_mmcie_add(struct wusbhc *wusbhc, u8 interval, u8 repeat_cnt,
-+			 u8 handle, struct wuie_hdr *wuie)
++static int __hwahc_op_mmcie_add(struct wusbhc *wusbhc, u8 interval,
++				u8 repeat_cnt, u8 handle,
++				struct wuie_hdr *wuie)
 +{
 +	struct hwahc *hwahc = container_of(wusbhc, struct hwahc, wusbhc);
 +	struct wahc *wa = &hwahc->wa;
 +	u8 iface_no = wa->usb_iface->cur_altsetting->desc.bInterfaceNumber;
-+	return usb_control_msg(
-+		wa->usb_dev, usb_sndctrlpipe(wa->usb_dev, 0),
-+		WUSB_REQ_ADD_MMC_IE,
-+		USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-+		interval << 8 | repeat_cnt, handle << 8 | iface_no,
-+		wuie, wuie->bLength, 1000 /* FIXME: arbitrary */);
++
++	return usb_control_msg(wa->usb_dev, usb_sndctrlpipe(wa->usb_dev, 0),
++			WUSB_REQ_ADD_MMC_IE,
++			USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
++			interval << 8 | repeat_cnt,
++			handle << 8 | iface_no,
++			wuie, wuie->bLength, 1000 /* FIXME: arbitrary */);
 +}
 +
-+
-+/**
++/*
 + * Remove an IE to the host's MMC
 + *
 + * @handle:      See WUSB1.0[8.5.3.1]
 + */
-+static
-+int __hwahc_op_mmcie_rm(struct wusbhc *wusbhc, u8 handle)
++static int __hwahc_op_mmcie_rm(struct wusbhc *wusbhc, u8 handle)
 +{
 +	struct hwahc *hwahc = container_of(wusbhc, struct hwahc, wusbhc);
 +	struct wahc *wa = &hwahc->wa;
 +	u8 iface_no = wa->usb_iface->cur_altsetting->desc.bInterfaceNumber;
-+	return usb_control_msg(
-+		wa->usb_dev, usb_sndctrlpipe(wa->usb_dev, 0),
-+		WUSB_REQ_REMOVE_MMC_IE,
-+		USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-+		0, handle << 8 | iface_no,
-+		NULL, 0, 1000 /* FIXME: arbitrary */);
++	return usb_control_msg(wa->usb_dev, usb_sndctrlpipe(wa->usb_dev, 0),
++			WUSB_REQ_REMOVE_MMC_IE,
++			USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
++			0, handle << 8 | iface_no,
++			NULL, 0, 1000 /* FIXME: arbitrary */);
 +}
 +
-+
-+/**
++/*
 + * Update device information for a given fake port
 + *
 + * @port_idx: Fake port to which device is connected (wusbhc index, not
 + *            USB port number).
 + */
-+static
-+int __hwahc_op_dev_info_set(struct wusbhc *wusbhc, struct wusb_dev *wusb_dev)
++static int __hwahc_op_dev_info_set(struct wusbhc *wusbhc,
++				   struct wusb_dev *wusb_dev)
 +{
 +	struct hwahc *hwahc = container_of(wusbhc, struct hwahc, wusbhc);
 +	struct wahc *wa = &hwahc->wa;
@@ -652,16 +619,15 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	/* This is a little endian to little endian, so no need to convert */
 +	dev_info->wPHYRates = wusb_dev->wusb_cap_descr->wPHYRates;
 +
-+	ret = usb_control_msg(
-+		wa->usb_dev, usb_sndctrlpipe(wa->usb_dev, 0),
-+		WUSB_REQ_SET_DEV_INFO,
-+		USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-+		0, wusb_dev->port_idx << 8 | iface_no,
-+		dev_info, sizeof(struct hwa_dev_info), 1000 /* FIXME: arbitrary */);
++	ret = usb_control_msg(wa->usb_dev, usb_sndctrlpipe(wa->usb_dev, 0),
++			WUSB_REQ_SET_DEV_INFO,
++			USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
++			0, wusb_dev->port_idx << 8 | iface_no,
++			dev_info, sizeof(struct hwa_dev_info),
++			1000 /* FIXME: arbitrary */);
 +	kfree(dev_info);
 +	return ret;
 +}
-+
 +
 +/*
 + * Set host's idea of which encryption (and key) method to use when
@@ -670,10 +636,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + * If key is NULL, it means disable encryption for that "virtual port"
 + * (used when we disconnect).
 + */
-+static
-+int __hwahc_dev_set_key(struct wusbhc *wusbhc, u8 port_idx, u32 tkid,
-+			const void *key, size_t key_size,
-+			union wusb_key_index key_idx)
++static int __hwahc_dev_set_key(struct wusbhc *wusbhc, u8 port_idx, u32 tkid,
++			       const void *key, size_t key_size,
++			       union wusb_key_index key_idx)
 +{
 +	int result = -ENOMEM;
 +	struct hwahc *hwahc = container_of(wusbhc, struct hwahc, wusbhc);
@@ -694,18 +659,17 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	keyd->tTKID[2] = (tkid >> 16) & 0xff;
 +	memcpy(keyd->bKeyData, key, key_size);
 +
-+	result = usb_control_msg(
-+		wa->usb_dev, usb_sndctrlpipe(wa->usb_dev, 0),
-+		USB_REQ_SET_DESCRIPTOR,
-+		USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-+		USB_DT_KEY << 8 | key_idx.value, port_idx << 8 | iface_no,
-+		keyd, keyd_len, 1000 /* FIXME: arbitrary */);
++	result = usb_control_msg(wa->usb_dev, usb_sndctrlpipe(wa->usb_dev, 0),
++			USB_REQ_SET_DESCRIPTOR,
++			USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
++			USB_DT_KEY << 8 | key_idx.value,
++			port_idx << 8 | iface_no,
++			keyd, keyd_len, 1000 /* FIXME: arbitrary */);
 +
 +	memset(keyd, 0, sizeof(*keyd));	/* clear keys etc. */
 +	kfree(keyd);
 +	return result;
 +}
-+
 +
 +/*
 + * Set host's idea of which encryption (and key) method to use when
@@ -714,9 +678,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + * If key is NULL, it means disable encryption for that "virtual port"
 + * (used when we disconnect).
 + */
-+static
-+int __hwahc_op_set_ptk(struct wusbhc *wusbhc, u8 port_idx, u32 tkid,
-+		       const void *key, size_t key_size)
++static int __hwahc_op_set_ptk(struct wusbhc *wusbhc, u8 port_idx, u32 tkid,
++			      const void *key, size_t key_size)
 +{
 +	int result = -ENOMEM;
 +	struct hwahc *hwahc = container_of(wusbhc, struct hwahc, wusbhc);
@@ -737,18 +700,17 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		if (result < 0)
 +			goto error_set_key;
 +		encryption_value = wusbhc->ccm1_etd->bEncryptionValue;
-+	}
-+	else
-+#warning FIXME: this should come from wusbhc->etd[UNSECURE].value
++	} else {
++		/* FIXME: this should come from wusbhc->etd[UNSECURE].value */
 +		encryption_value = 0;
++	}
 +
 +	/* Set the encryption type for commmunicating with the device */
-+	result = usb_control_msg(
-+		wa->usb_dev, usb_sndctrlpipe(wa->usb_dev, 0),
-+		USB_REQ_SET_ENCRYPTION,
-+		USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-+		encryption_value, port_idx << 8 | iface_no,
-+		NULL, 0, 1000 /* FIXME: arbitrary */);
++	result = usb_control_msg(wa->usb_dev, usb_sndctrlpipe(wa->usb_dev, 0),
++			USB_REQ_SET_ENCRYPTION,
++			USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
++			encryption_value, port_idx << 8 | iface_no,
++			NULL, 0, 1000 /* FIXME: arbitrary */);
 +	if (result < 0)
 +		dev_err(wusbhc->dev, "Can't set host's WUSB encryption for "
 +			"port index %u to %s (value %d): %d\n", port_idx,
@@ -758,13 +720,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return result;
 +}
 +
-+
 +/*
 + * Set host's GTK key
 + */
-+static
-+int __hwahc_op_set_gtk(struct wusbhc *wusbhc, u32 tkid,
-+		       const void *key, size_t key_size)
++static int __hwahc_op_set_gtk(struct wusbhc *wusbhc, u32 tkid,
++			      const void *key, size_t key_size)
 +{
 +	union wusb_key_index key_idx = { .value = 0, };
 +	int result;
@@ -779,8 +739,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return result;
 +}
 +
-+
-+/**
++/*
 + * Get the Wire Adapter class-specific descriptor
 + *
 + * NOTE: this descriptor comes with the big bundled configuration
@@ -800,10 +759,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	size_t itr_size, actconfig_idx;
 +
 +	actconfig_idx = (usb_dev->actconfig - usb_dev->config) /
-+		sizeof(usb_dev->config[0]);
++			sizeof(usb_dev->config[0]);
 +	itr = usb_dev->rawdescriptors[actconfig_idx];
 +	itr_size = le16_to_cpu(usb_dev->actconfig->desc.wTotalLength);
-+	while(itr_size >= sizeof(*hdr)) {
++	while (itr_size >= sizeof(*hdr)) {
 +		hdr = (struct usb_descriptor_header *) itr;
 +		d_printf(3, dev, "Extra device descriptor: "
 +			 "type %02x/%u bytes @ %zu (%zu left)\n",
@@ -816,7 +775,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		itr_size -= hdr->bLength;
 +	}
 +#if UWB_BUG_292 == 1
-+	d_printf(3, dev, "BUGWA#292: no WA Class descriptor found, faking it\n");
++	d_printf(3, dev, "BUGWA#292: no WA Class descriptor found, "
++		 "faking it\n");
 +	hdr = (struct usb_descriptor_header *)&wa_descr_bugwa292;
 +	itr_size = sizeof(wa_descr_bugwa292);
 +	goto found;
@@ -850,7 +810,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return result;
 +}
 +
-+
 +static struct hc_driver hwahc_hc_driver = {
 +	.description = "hwa-hcd",
 +	.product_desc = "Wireless USB HWA host controller",
@@ -874,9 +833,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	.start_port_reset = wusbhc_rh_start_port_reset,
 +};
 +
-+
-+static
-+int hwahc_security_create(struct hwahc *hwahc)
++static int hwahc_security_create(struct hwahc *hwahc)
 +{
 +	int result;
 +	struct wusbhc *wusbhc = &hwahc->wusbhc;
@@ -895,23 +852,22 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	itr = usb_dev->rawdescriptors[index];
 +	itr_size = le16_to_cpu(usb_dev->actconfig->desc.wTotalLength);
 +	top = itr + itr_size;
-+	result = __usb_get_extra_descriptor(
-+		usb_dev->rawdescriptors[index],
-+		le16_to_cpu(usb_dev->actconfig->desc.wTotalLength),
-+		USB_DT_SECURITY, (void **) &secd);
++	result = __usb_get_extra_descriptor(usb_dev->rawdescriptors[index],
++			le16_to_cpu(usb_dev->actconfig->desc.wTotalLength),
++			USB_DT_SECURITY, (void **) &secd);
 +	if (result == -1) {
 +		dev_warn(dev, "BUG? WUSB host has no security descriptors\n");
 +		return 0;
 +	}
 +	needed = sizeof(*secd);
-+	if (top - (void*)secd < needed) {
++	if (top - (void *)secd < needed) {
 +		dev_err(dev, "BUG? Not enough data to process security "
 +			"descriptor header (%zu bytes left vs %zu needed)\n",
 +			top - (void *) secd, needed);
 +		return 0;
 +	}
 +	needed = le16_to_cpu(secd->wTotalLength);
-+	if (top - (void*)secd < needed) {
++	if (top - (void *)secd < needed) {
 +		dev_err(dev, "BUG? Not enough data to process security "
 +			"descriptors (%zu bytes left vs %zu needed)\n",
 +			top - (void *) secd, needed);
@@ -953,15 +909,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return 0;
 +}
 +
-+
 +static void hwahc_security_release(struct hwahc *hwahc)
 +{
 +	/* nothing to do here so far... */
 +}
 +
-+
-+static
-+int hwahc_create(struct hwahc *hwahc, struct usb_interface *iface)
++static int hwahc_create(struct hwahc *hwahc, struct usb_interface *iface)
 +{
 +	int result;
 +	struct device *dev = &iface->dev;
@@ -975,7 +928,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	wusbhc->uwb_rc = uwb_rc_get_by_grandpa(iface->dev.parent);
 +	if (wusbhc->uwb_rc == NULL) {
 +		result = -ENODEV;
-+		dev_err(dev, "WA-CDS: Cannot get associated UWB Host Controller\n");
++		dev_err(dev, "Cannot get associated UWB Host Controller\n");
 +		goto error_rc_get;
 +	}
 +	result = wa_fill_descr(wa);	/* Get the device descriptor */
@@ -988,9 +941,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			wusbhc->ports_max = USB_MAXCHILDREN - 1;
 +		else
 +			wusbhc->ports_max = USB_MAXCHILDREN;
-+	}
-+	else
++	} else {
 +		wusbhc->ports_max = wa->wa_descr->bNumPorts;
++	}
 +	wusbhc->mmcies_max = wa->wa_descr->bNumMMCIEs;
 +	wusbhc->start = __hwahc_op_wusbhc_start;
 +	wusbhc->stop = __hwahc_op_wusbhc_stop;
@@ -1030,9 +983,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return result;
 +}
 +
-+
-+static
-+void hwahc_destroy(struct hwahc *hwahc)
++static void hwahc_destroy(struct hwahc *hwahc)
 +{
 +	struct wusbhc *wusbhc = &hwahc->wusbhc;
 +
@@ -1049,17 +1000,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	d_fnend(1, NULL, "(hwahc %p) = void\n", hwahc);
 +}
 +
-+
-+static
-+void hwahc_init(struct hwahc *hwahc)
++static void hwahc_init(struct hwahc *hwahc)
 +{
 +	wa_init(&hwahc->wa);
 +}
 +
-+
-+static
-+int hwahc_probe(struct usb_interface *usb_iface,
-+		const struct usb_device_id *id)
++static int hwahc_probe(struct usb_interface *usb_iface,
++		       const struct usb_device_id *id)
 +{
 +	int result;
 +	struct usb_hcd *usb_hcd;
@@ -1108,9 +1055,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return result;
 +}
 +
-+
-+static
-+void hwahc_disconnect(struct usb_interface *usb_iface)
++static void hwahc_disconnect(struct usb_interface *usb_iface)
 +{
 +	struct usb_hcd *usb_hcd;
 +	struct wusbhc *wusbhc;
@@ -1125,9 +1070,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	usb_remove_hcd(usb_hcd);
 +	hwahc_destroy(hwahc);
 +	usb_put_hcd(usb_hcd);
-+	d_fnend(1, NULL, "(hwahc %p [usb_iface %p]) = void\n", hwahc, usb_iface);
++	d_fnend(1, NULL, "(hwahc %p [usb_iface %p]) = void\n", hwahc,
++		usb_iface);
 +}
-+
 +
 +/** USB device ID's that we handle */
 +static struct usb_device_id hwahc_id_table[] = {
@@ -1136,7 +1081,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	{},
 +};
 +MODULE_DEVICE_TABLE(usb, hwahc_id_table);
-+
 +
 +static struct usb_driver hwahc_driver = {
 +	.name =		"hwa-hc",
@@ -1162,9 +1106,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +}
 +module_init(hwahc_driver_init);
 +
-+
-+static
-+void __exit hwahc_driver_exit(void)
++static void __exit hwahc_driver_exit(void)
 +{
 +	usb_deregister(&hwahc_driver);
 +}
@@ -5748,7 +5690,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +MODULE_LICENSE("GPL");
 --- /dev/null
 +++ b/drivers/usb/wusbcore/wa-hc.h
-@@ -0,0 +1,423 @@
+@@ -0,0 +1,420 @@
 +/*
 + * HWA Host Controller Driver
 + * Wire Adapter Control/Data Streaming Iface (WUSB1.0[8])
@@ -5835,13 +5777,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#include <linux/usb.h>
 +#include <linux/mutex.h>
 +#include <linux/spinlock.h>
-+#include <linux/uwb.h>		// last so compat stuff doesn't mess up
++#include <linux/uwb.h>
 +#include <linux/usb/wusb.h>
 +#include <linux/usb/wusb-wa.h>
 +
 +struct wusbhc;
 +struct wahc;
-+static inline void wa_rpipe_init(struct wahc *);
 +extern void wa_urb_enqueue_run(struct work_struct *ws);
 +
 +/**
@@ -5914,7 +5855,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +struct wahc {
 +	struct usb_device *usb_dev;
 +	struct usb_interface *usb_iface;
-+	union {					// HC to deliver notifications
++
++	/* HC to deliver notifications */
++	union {
 +		struct wusbhc *wusb;
 +		struct dwahc *dwa;
 +	};
@@ -5922,25 +5865,25 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	const struct usb_endpoint_descriptor *dto_epd, *dti_epd;
 +	const struct usb_wa_descriptor *wa_descr;
 +
-+	struct urb *nep_urb;			// Notification EndPoint [lockless]
++	struct urb *nep_urb;		/* Notification EndPoint [lockless] */
 +	struct edc nep_edc;
 +	void *nep_buffer;
 +	size_t nep_buffer_size;
 +
 +	atomic_t notifs_queued;
 +
-+	struct mutex rpipe_lock;			// protects rpipe_bm
-+	unsigned long *rpipe_bm;		// rpipe usage bitmap
++	struct mutex rpipe_lock;	/* protects rpipe_bm */
++	unsigned long *rpipe_bm;	/* rpipe usage bitmap */
 +	u16 rpipes;
-+	struct semaphore rpipe_sem;		// for assigning resources to endpoints
++	struct semaphore rpipe_sem;	/* assigning resources to endpoints */
 +
-+	struct urb *dti_urb;			// URB for reading xfer results
-+	struct urb *buf_in_urb;			// URB for reading data in
-+	struct edc dti_edc;			// DTI error density counter
-+	struct wa_xfer_result *xfer_result;	// real size = dti_ep maxpktsize
++	struct urb *dti_urb;		/* URB for reading xfer results */
++	struct urb *buf_in_urb;		/* URB for reading data in */
++	struct edc dti_edc;		/* DTI error density counter */
++	struct wa_xfer_result *xfer_result; /* real size = dti_ep maxpktsize */
 +	size_t xfer_result_size;
 +
-+	s32 status;				// For reading status
++	s32 status;			/* For reading status */
 +
 +	struct list_head xfer_list;
 +	struct list_head xfer_delayed_list;
@@ -5950,26 +5893,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +};
 +
 +
-+static inline
-+void wa_init(struct wahc *wa)
-+{
-+	edc_init(&wa->nep_edc);
-+	atomic_set(&wa->notifs_queued, 0);
-+	wa_rpipe_init(wa);
-+	edc_init(&wa->dti_edc);
-+	INIT_LIST_HEAD(&wa->xfer_list);
-+	INIT_LIST_HEAD(&wa->xfer_delayed_list);
-+	spin_lock_init(&wa->xfer_list_lock);
-+	INIT_WORK(&wa->xfer_work, wa_urb_enqueue_run);
-+	atomic_set(&wa->xfer_id_count, 1);
-+}
-+
-+
 +extern int wa_create(struct wahc *wa, struct usb_interface *iface);
 +extern void __wa_destroy(struct wahc *wa);
 +
 +
-+// Miscellaneous constants
++/* Miscellaneous constants */
 +enum {
 +	/** Max number of EPROTO errors we tolerate on the NEP in a
 +	 * period of time */
@@ -5983,8 +5911,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +extern int wa_nep_create(struct wahc *, struct usb_interface *);
 +extern void wa_nep_destroy(struct wahc *);
 +
-+static inline
-+int wa_nep_arm(struct wahc *wa, gfp_t gfp_mask)
++static inline int wa_nep_arm(struct wahc *wa, gfp_t gfp_mask)
 +{
 +	struct urb *urb = wa->nep_urb;
 +	urb->transfer_buffer = wa->nep_buffer;
@@ -5992,17 +5919,30 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return usb_submit_urb(urb, gfp_mask);
 +}
 +
-+static inline
-+void wa_nep_disarm(struct wahc *wa) {
++static inline void wa_nep_disarm(struct wahc *wa)
++{
 +	usb_kill_urb(wa->nep_urb);
 +}
 +
 +
 +/* RPipes */
-+static inline
-+void wa_rpipe_init(struct wahc *wa) {
++static inline void wa_rpipe_init(struct wahc *wa)
++{
 +	mutex_init(&wa->rpipe_lock);
 +	sema_init(&wa->rpipe_sem, 1);
++}
++
++static inline void wa_init(struct wahc *wa)
++{
++	edc_init(&wa->nep_edc);
++	atomic_set(&wa->notifs_queued, 0);
++	wa_rpipe_init(wa);
++	edc_init(&wa->dti_edc);
++	INIT_LIST_HEAD(&wa->xfer_list);
++	INIT_LIST_HEAD(&wa->xfer_delayed_list);
++	spin_lock_init(&wa->xfer_list_lock);
++	INIT_WORK(&wa->xfer_work, wa_urb_enqueue_run);
++	atomic_set(&wa->xfer_id_count, 1);
 +}
 +
 +/**
@@ -6013,28 +5953,30 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +struct wa_xfer;
 +extern void rpipe_destroy(struct kref *_rpipe);
 +static inline
-+void __rpipe_get(struct wa_rpipe *rpipe) {
++void __rpipe_get(struct wa_rpipe *rpipe)
++{
 +	kref_get(&rpipe->refcnt);
 +}
 +extern int rpipe_get_by_ep(struct wahc *, struct usb_host_endpoint *,
 +			   struct urb *, gfp_t);
-+static inline
-+void rpipe_put(struct wa_rpipe *rpipe) {
++static inline void rpipe_put(struct wa_rpipe *rpipe)
++{
 +	kref_put(&rpipe->refcnt, rpipe_destroy);
 +
 +}
 +extern void rpipe_ep_disable(struct wahc *, struct usb_host_endpoint *);
 +extern int wa_rpipes_create(struct wahc *);
 +extern void wa_rpipes_destroy(struct wahc *);
-+static inline
-+void rpipe_avail_dec(struct wa_rpipe *rpipe) {
++static inline void rpipe_avail_dec(struct wa_rpipe *rpipe)
++{
 +	atomic_dec(&rpipe->segs_available);
 +}
++
 +/**
 + * Returns true if the rpipe is ready to submit more segments.
 + */
-+static inline
-+int rpipe_avail_inc(struct wa_rpipe *rpipe) {
++static inline int rpipe_avail_inc(struct wa_rpipe *rpipe)
++{
 +	return atomic_inc_return(&rpipe->segs_available) > 0
 +		&& !list_empty(&rpipe->seg_list);
 +}
@@ -6058,38 +6000,37 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + *
 + * FIXME: has to go away in favour of an 'struct' hcd based sollution
 + */
-+static inline
-+struct wahc * wa_get(struct wahc *wa) {
++static inline struct wahc *wa_get(struct wahc *wa)
++{
 +	usb_get_intf(wa->usb_iface);
 +	return wa;
 +}
 +
-+static inline
-+void wa_put(struct wahc *wa) {
++static inline void wa_put(struct wahc *wa)
++{
 +	usb_put_intf(wa->usb_iface);
 +}
 +
 +
-+static inline
-+int __wa_feature(struct wahc *wa, unsigned op, u16 feature) {
-+	return usb_control_msg(
-+		wa->usb_dev, usb_sndctrlpipe(wa->usb_dev, 0),
-+		op? USB_REQ_SET_FEATURE : USB_REQ_CLEAR_FEATURE,
-+		USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-+		feature,
-+		wa->usb_iface->cur_altsetting->desc.bInterfaceNumber,
-+		NULL, 0, 1000 /* FIXME: arbitrary */);
++static inline int __wa_feature(struct wahc *wa, unsigned op, u16 feature)
++{
++	return usb_control_msg(wa->usb_dev, usb_sndctrlpipe(wa->usb_dev, 0),
++			op ? USB_REQ_SET_FEATURE : USB_REQ_CLEAR_FEATURE,
++			USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
++			feature,
++			wa->usb_iface->cur_altsetting->desc.bInterfaceNumber,
++			NULL, 0, 1000 /* FIXME: arbitrary */);
 +}
 +
 +
-+static inline
-+int __wa_set_feature(struct wahc *wa, u16 feature) {
++static inline int __wa_set_feature(struct wahc *wa, u16 feature)
++{
 +	return  __wa_feature(wa, 1, feature);
 +}
 +
 +
-+static inline
-+int __wa_clear_feature(struct wahc *wa, u16 feature) {
++static inline int __wa_clear_feature(struct wahc *wa, u16 feature)
++{
 +	return __wa_feature(wa, 0, feature);
 +}
 +
@@ -6132,8 +6073,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + * FIXME: is there an official specification on how long status
 + *        changes can take?
 + */
-+static inline
-+s32 __wa_wait_status(struct wahc *wa, u32 mask, u32 value)
++static inline s32 __wa_wait_status(struct wahc *wa, u32 mask, u32 value)
 +{
 +	s32 result;
 +	unsigned loops = 10;
@@ -6146,14 +6086,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			result = -ETIMEDOUT;
 +			break;
 +		}
-+	} while(result >= 0);
++	} while (result >= 0);
 +	return result;
 +}
 +
 +
 +/** Command @hwahc to stop, @returns 0 if ok, < 0 errno code on error */
-+static inline
-+int __wa_stop(struct wahc *wa)
++static inline int __wa_stop(struct wahc *wa)
 +{
 +	int result;
 +	struct device *dev = &wa->usb_iface->dev;
@@ -9282,7 +9221,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +MODULE_LICENSE("GPL");
 --- /dev/null
 +++ b/drivers/usb/wusbcore/wusbhc.h
-@@ -0,0 +1,535 @@
+@@ -0,0 +1,522 @@
 +/*
 + * Wireless USB Host Controller
 + * Common infrastructure for WHCI and HWA WUSB-HC drivers
@@ -9374,7 +9313,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + */
 +struct wusb_dev {
 +	struct kref refcnt;
-+	struct list_head cack_node;	// Connect-Ack list
++	struct list_head cack_node;	/* Connect-Ack list */
 +	u8 port_idx;
 +	u8 addr;
 +	u8 beacon_type:4;
@@ -9389,30 +9328,24 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +#define WUSB_DEV_ADDR_UNAUTH 0x80
 +
-+static inline
-+void wusb_dev_init(struct wusb_dev *wusb_dev)
++static inline void wusb_dev_init(struct wusb_dev *wusb_dev)
 +{
 +	kref_init(&wusb_dev->refcnt);
-+	// no need to init the cack_node
++	/* no need to init the cack_node */
 +}
-+
 +
 +extern void wusb_dev_destroy(struct kref *_wusb_dev);
 +
-+
-+static inline
-+struct wusb_dev *wusb_dev_get(struct wusb_dev *wusb_dev)
++static inline struct wusb_dev *wusb_dev_get(struct wusb_dev *wusb_dev)
 +{
 +	kref_get(&wusb_dev->refcnt);
 +	return wusb_dev;
 +}
 +
-+
-+static inline
-+void wusb_dev_put(struct wusb_dev *wusb_dev) {
++static inline void wusb_dev_put(struct wusb_dev *wusb_dev)
++{
 +	kref_put(&wusb_dev->refcnt, wusb_dev_destroy);
 +}
-+
 +
 +/**
 + * Wireless USB Host Controlller root hub "fake" ports
@@ -9462,10 +9395,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			u16 reserved2:8
 +		) __attribute__((packed));
 +	};
-+	struct wusb_dev *wusb_dev;	// connected device's info
++	struct wusb_dev *wusb_dev;	/* connected device's info */
 +	unsigned reset_count;
 +};
-+
 +
 +/**
 + * WUSB Host Controller specifics
@@ -9564,26 +9496,26 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	struct uwb_rc *uwb_rc;
 +	struct uwb_pal pal;
 +
-+	unsigned trust_timeout;			// in jiffies
-+	struct wuie_host_info *wuie_host_info;	// Includes CHID
++	unsigned trust_timeout;			/* in jiffies */
++	struct wuie_host_info *wuie_host_info;	/* Includes CHID */
 +
-+	struct mutex mutex;			// locks everything else
-+	u16 cluster_id;				// Wireless USB Cluster ID
-+	struct wusb_port *port;			// Fake port status handling
-+	struct wusb_dev_info *dev_info;		// for Set Device Info mgmt
++	struct mutex mutex;			/* locks everything else */
++	u16 cluster_id;				/* Wireless USB Cluster ID */
++	struct wusb_port *port;			/* Fake port status handling */
++	struct wusb_dev_info *dev_info;		/* for Set Device Info mgmt */
 +	u8 ports_max;
-+	unsigned active:1;			// currently xmit'ing MMCs
-+	struct wuie_keep_alive keep_alive_ie;	// protected by mutex
++	unsigned active:1;			/* currently xmit'ing MMCs */
++	struct wuie_keep_alive keep_alive_ie;	/* protected by mutex */
 +	struct delayed_work keep_alive_timer;
-+	struct list_head cack_list;		// Connect acknowledging
-+	size_t cack_count;			// protected by 'mutex'
++	struct list_head cack_list;		/* Connect acknowledging */
++	size_t cack_count;			/* protected by 'mutex' */
 +	struct wuie_connect_ack cack_ie;
-+	struct uwb_rsv *rsv;                    /* cluster bandwidth reservation */
++	struct uwb_rsv *rsv;		/* cluster bandwidth reservation */
 +
-+	struct mutex mmcie_mutex;		// MMC WUIE handling
-+	struct wuie_hdr **mmcie;		// WUIE array
++	struct mutex mmcie_mutex;		/* MMC WUIE handling */
++	struct wuie_hdr **mmcie;		/* WUIE array */
 +	u8 mmcies_max;
-+	// FIXME: make wusbhc_ops?
++	/* FIXME: make wusbhc_ops? */
 +	int (*start)(struct wusbhc *wusbhc);
 +	void (*stop)(struct wusbhc *wusbhc);
 +	int (*mmcie_add)(struct wusbhc *wusbhc, u8 interval, u8 repeat_cnt,
@@ -9621,12 +9553,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +extern int wusbhc_sec_start(struct wusbhc *);
 +extern void wusbhc_sec_stop(struct wusbhc *);
 +extern void wusbhc_sec_destroy(struct wusbhc *);
-+extern void wusbhc_giveback_urb(struct wusbhc *wusbhc, struct urb *urb, int status);
++extern void wusbhc_giveback_urb(struct wusbhc *wusbhc, struct urb *urb,
++				int status);
 +
 +int wusbhc_pal_register(struct wusbhc *wusbhc);
 +void wusbhc_pal_unregister(struct wusbhc *wusbhc);
 +
-+/**
++/*
 + * Return @usb_dev's @usb_hcd (properly referenced) or NULL if gone
 + *
 + * @usb_dev: USB device, UNLOCKED and referenced (or otherwise, safe ptr)
@@ -9634,28 +9567,24 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + * This is a safe assumption as @usb_dev->bus is referenced all the
 + * time during the @usb_dev life cycle.
 + */
-+static inline
-+struct usb_hcd *usb_hcd_get_by_usb_dev(struct usb_device *usb_dev)
++static inline struct usb_hcd *usb_hcd_get_by_usb_dev(struct usb_device *usb_dev)
 +{
 +	struct usb_hcd *usb_hcd;
 +	usb_hcd = container_of(usb_dev->bus, struct usb_hcd, self);
 +	return usb_get_hcd(usb_hcd);
 +}
 +
-+
-+/**
++/*
 + * Increment the reference count on a wusbhc.
 + *
 + * @wusbhc's life cycle is identical to that of the underlying usb_hcd.
 + */
-+static inline
-+struct wusbhc *wusbhc_get(struct wusbhc *wusbhc)
++static inline struct wusbhc *wusbhc_get(struct wusbhc *wusbhc)
 +{
 +	return usb_get_hcd(&wusbhc->usb_hcd)? wusbhc : NULL;
 +}
 +
-+
-+/**
++/*
 + * Return the wusbhc associated to a @usb_dev
 + *
 + * @usb_dev: USB device, UNLOCKED and referenced (or otherwise, safe ptr)
@@ -9665,14 +9594,15 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + *
 + * FIXME: move offline
 + */
-+static inline
-+struct wusbhc *wusbhc_get_by_usb_dev(struct usb_device *usb_dev)
++static inline struct wusbhc *wusbhc_get_by_usb_dev(struct usb_device *usb_dev)
 +{
 +	struct wusbhc *wusbhc = NULL;
 +	struct usb_hcd *usb_hcd;
-+	if (usb_dev->devnum > 1 && !usb_dev->wusb) {	// but root hubs
-+		printk("devnum %d wusb %d\n", usb_dev->devnum, usb_dev->wusb);
-+		BUG_ON(usb_dev->devnum > 1 && !usb_dev->wusb);	// but root hubs
++	if (usb_dev->devnum > 1 && !usb_dev->wusb) {
++		/* but root hubs */
++		dev_err(&usb_dev->dev, "devnum %d wusb %d\n", usb_dev->devnum,
++			usb_dev->wusb);
++		BUG_ON(usb_dev->devnum > 1 && !usb_dev->wusb);
 +	}
 +	usb_hcd = usb_hcd_get_by_usb_dev(usb_dev);
 +	if (usb_hcd == NULL)
@@ -9682,8 +9612,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +}
 +
 +
-+static inline
-+void wusbhc_put(struct wusbhc *wusbhc)
++static inline void wusbhc_put(struct wusbhc *wusbhc)
 +{
 +	usb_put_hcd(&wusbhc->usb_hcd);
 +}
@@ -9695,11 +9624,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +/* Device connect handling */
 +extern int wusbhc_devconnect_create(struct wusbhc *);
 +extern void wusbhc_devconnect_destroy(struct wusbhc *);
-+int wusbhc_devconnect_start(struct wusbhc *wusbhc, const struct wusb_ckhdid *chid);
-+void wusbhc_devconnect_stop(struct wusbhc *wusbhc);
++extern int wusbhc_devconnect_start(struct wusbhc *wusbhc,
++				   const struct wusb_ckhdid *chid);
++extern void wusbhc_devconnect_stop(struct wusbhc *wusbhc);
 +extern void wusbhc_devconnect_ack(struct wusbhc *, struct wusb_dn_connect *,
 +				  const char *);
-+extern void wusbhc_devconnect_acked(struct wusbhc *wusbhc, struct wusb_dev *wusb_dev);
++extern void wusbhc_devconnect_acked(struct wusbhc *wusbhc,
++				    struct wusb_dev *wusb_dev);
 +extern int wusbhc_devconnect_auth(struct wusbhc *, u8);
 +extern void wusbhc_handle_dn(struct wusbhc *, u8 srcaddr,
 +			     struct wusb_dn_hdr *dn_hdr, size_t size);
@@ -9707,7 +9638,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +extern void __wusbhc_dev_disable(struct wusbhc *wusbhc, u8 port);
 +extern int wusb_usb_ncb(struct notifier_block *nb, unsigned long val,
 +			void *priv);
-+extern int wusb_set_dev_addr(struct wusbhc *wusbhc, struct wusb_dev *wusb_dev, u8 addr);
++extern int wusb_set_dev_addr(struct wusbhc *wusbhc, struct wusb_dev *wusb_dev,
++			     u8 addr);
 +
 +/* Wireless USB fake Root Hub methods */
 +extern int wusbhc_rh_create(struct wusbhc *);
@@ -9757,22 +9689,20 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +extern u8 wusb_cluster_id_get(void);
 +extern void wusb_cluster_id_put(u8);
 +
-+
-+/**
++/*
 + * wusb_port_by_idx - return the port associated to a zero-based port index
 + *
 + * NOTE: valid without locking as long as wusbhc is referenced (as the
 + *       number of ports doesn't change). The data pointed to has to
 + *       be verified though :)
 + */
-+static inline
-+struct wusb_port *wusb_port_by_idx(struct wusbhc *wusbhc, u8 port_idx)
++static inline struct wusb_port *wusb_port_by_idx(struct wusbhc *wusbhc,
++						 u8 port_idx)
 +{
 +	return &wusbhc->port[port_idx];
 +}
 +
-+
-+/**
++/*
 + * wusb_port_no_to_idx - Convert port number (per usb_dev->portnum) to
 + * a port_idx.
 + *
@@ -9780,18 +9710,15 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + *
 + * NOTE: only valid for WUSB devices!!!
 + */
-+static inline
-+u8 wusb_port_no_to_idx(u8 port_no)
++static inline u8 wusb_port_no_to_idx(u8 port_no)
 +{
 +	return port_no - 1;
 +}
 +
-+
 +extern struct wusb_dev *__wusb_dev_get_by_usb_dev(struct wusbhc *,
 +						  struct usb_device *);
 +
-+
-+/**
++/*
 + * Return a referenced wusb_dev given a @usb_dev
 + *
 + * Returns NULL if the usb_dev is being torn down.
@@ -9812,7 +9739,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	wusbhc_put(wusbhc);
 +	return wusb_dev;
 +}
-+
 +
 +/* Misc */
 +
