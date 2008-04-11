@@ -1,0 +1,91 @@
+From linux-usb-owner@vger.kernel.org Thu Apr  3 15:07:01 2008
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Thu, 3 Apr 2008 18:02:56 -0400 (EDT)
+Subject: USB: root hubs don't lie about their number of TTs
+To: Greg KH <greg@kroah.com>
+Cc: USB list <linux-usb@vger.kernel.org>
+Message-ID: <Pine.LNX.4.44L0.0804031752560.5410-100000@iolanthe.rowland.org>
+
+
+Currently EHCI root hubs enumerate with a bDeviceProtocol code
+indicating that they possess a Transaction Translator.  However the
+vast majority of controllers do not; they rely on a companion
+controller to handle full- and low-speed communications.  This patch
+(as1064) changes the root-hub device descriptor to match the actual
+situation.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/hcd.c      |   14 ++++++++++++--
+ drivers/usb/core/hcd.h      |    1 +
+ drivers/usb/host/ehci-pci.c |    1 +
+ 3 files changed, 14 insertions(+), 2 deletions(-)
+
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -129,7 +129,7 @@ static const u8 usb2_rh_dev_descriptor [
+ 
+ 	0x09,	    /*  __u8  bDeviceClass; HUB_CLASSCODE */
+ 	0x00,	    /*  __u8  bDeviceSubClass; */
+-	0x01,       /*  __u8  bDeviceProtocol; [ usb 2.0 single TT ]*/
++	0x00,       /*  __u8  bDeviceProtocol; [ usb 2.0 no TT ] */
+ 	0x40,       /*  __u8  bMaxPacketSize0; 64 Bytes */
+ 
+ 	0x6b, 0x1d, /*  __le16 idVendor; Linux Foundation */
+@@ -354,9 +354,10 @@ static int rh_call_control (struct usb_h
+ 		__attribute__((aligned(4)));
+ 	const u8	*bufp = tbuf;
+ 	int		len = 0;
+-	int		patch_wakeup = 0;
+ 	int		status;
+ 	int		n;
++	u8		patch_wakeup = 0;
++	u8		patch_protocol = 0;
+ 
+ 	might_sleep();
+ 
+@@ -433,6 +434,8 @@ static int rh_call_control (struct usb_h
+ 			else
+ 				goto error;
+ 			len = 18;
++			if (hcd->has_tt)
++				patch_protocol = 1;
+ 			break;
+ 		case USB_DT_CONFIG << 8:
+ 			if (hcd->driver->flags & HCD_USB2) {
+@@ -527,6 +530,13 @@ error:
+ 						bmAttributes))
+ 			((struct usb_config_descriptor *)ubuf)->bmAttributes
+ 				|= USB_CONFIG_ATT_WAKEUP;
++
++		/* report whether RH hardware has an integrated TT */
++		if (patch_protocol &&
++				len > offsetof(struct usb_device_descriptor,
++						bDeviceProtocol))
++			((struct usb_device_descriptor *) ubuf)->
++					bDeviceProtocol = 1;
+ 	}
+ 
+ 	/* any errors get returned through the urb completion */
+--- a/drivers/usb/core/hcd.h
++++ b/drivers/usb/core/hcd.h
+@@ -99,6 +99,7 @@ struct usb_hcd {
+ 	unsigned		poll_pending:1;	/* status has changed? */
+ 	unsigned		wireless:1;	/* Wireless USB HCD */
+ 	unsigned		authorized_default:1;
++	unsigned		has_tt:1;	/* Integrated TT in root hub */
+ 
+ 	int			irq;		/* irq allocated */
+ 	void __iomem		*regs;		/* device memory/io */
+--- a/drivers/usb/host/ehci-pci.c
++++ b/drivers/usb/host/ehci-pci.c
+@@ -130,6 +130,7 @@ static int ehci_pci_setup(struct usb_hcd
+ 	case PCI_VENDOR_ID_TDI:
+ 		if (pdev->device == PCI_DEVICE_ID_TDI_EHCI) {
+ 			ehci->is_tdi_rh_tt = 1;
++			hcd->has_tt = 1;
+ 			tdi_reset(ehci);
+ 		}
+ 		break;

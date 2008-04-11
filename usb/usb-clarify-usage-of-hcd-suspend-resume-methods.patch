@@ -1,0 +1,236 @@
+From linux-usb-owner@vger.kernel.org Thu Apr  3 15:07:01 2008
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Thu, 3 Apr 2008 18:03:06 -0400 (EDT)
+Subject: USB: clarify usage of hcd->suspend/resume methods
+To: Greg KH <greg@kroah.com>
+Cc: USB list <linux-usb@vger.kernel.org>
+Message-ID: <Pine.LNX.4.44L0.0804031754330.5410-100000@iolanthe.rowland.org>
+
+
+The .suspend and .resume method pointers in struct usb_hcd have not
+been fully understood by host-controller driver writers.  They are
+meant for use with PCI controllers; other platform-specific drivers
+generally should not refer to them.
+
+To try and clarify matters, this patch (as1065) renames those methods
+to .pci_suspend and .pci_resume.  It eliminates corresponding dead code
+and bogus references in the ohci-ssb and u132-hcd drivers.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/hcd-pci.c  |   10 +++++-----
+ drivers/usb/core/hcd.h      |    4 ++--
+ drivers/usb/host/ehci-pci.c |    4 ++--
+ drivers/usb/host/ohci-pci.c |    5 ++---
+ drivers/usb/host/ohci-ssb.c |   35 -----------------------------------
+ drivers/usb/host/u132-hcd.c |   32 --------------------------------
+ drivers/usb/host/uhci-hcd.c |    8 ++++----
+ 7 files changed, 15 insertions(+), 83 deletions(-)
+
+--- a/drivers/usb/core/hcd-pci.c
++++ b/drivers/usb/core/hcd-pci.c
+@@ -215,9 +215,9 @@ int usb_hcd_pci_suspend(struct pci_dev *
+ 			hcd->state == HC_STATE_HALT))
+ 		return -EBUSY;
+ 
+-	if (hcd->driver->suspend) {
+-		retval = hcd->driver->suspend(hcd, message);
+-		suspend_report_result(hcd->driver->suspend, retval);
++	if (hcd->driver->pci_suspend) {
++		retval = hcd->driver->pci_suspend(hcd, message);
++		suspend_report_result(hcd->driver->pci_suspend, retval);
+ 		if (retval)
+ 			goto done;
+ 	}
+@@ -405,8 +405,8 @@ int usb_hcd_pci_resume(struct pci_dev *d
+ 
+ 	clear_bit(HCD_FLAG_SAW_IRQ, &hcd->flags);
+ 
+-	if (hcd->driver->resume) {
+-		retval = hcd->driver->resume(hcd);
++	if (hcd->driver->pci_resume) {
++		retval = hcd->driver->pci_resume(hcd);
+ 		if (retval) {
+ 			dev_err(hcd->self.controller,
+ 				"PCI post-resume error %d!\n", retval);
+--- a/drivers/usb/core/hcd.h
++++ b/drivers/usb/core/hcd.h
+@@ -178,10 +178,10 @@ struct hc_driver {
+ 	 * a whole, not just the root hub; they're for PCI bus glue.
+ 	 */
+ 	/* called after suspending the hub, before entering D3 etc */
+-	int	(*suspend) (struct usb_hcd *hcd, pm_message_t message);
++	int	(*pci_suspend) (struct usb_hcd *hcd, pm_message_t message);
+ 
+ 	/* called after entering D0 (etc), before resuming the hub */
+-	int	(*resume) (struct usb_hcd *hcd);
++	int	(*pci_resume) (struct usb_hcd *hcd);
+ 
+ 	/* cleanly make HCD stop writing memory and doing I/O */
+ 	void	(*stop) (struct usb_hcd *hcd);
+--- a/drivers/usb/host/ehci-pci.c
++++ b/drivers/usb/host/ehci-pci.c
+@@ -353,8 +353,8 @@ static const struct hc_driver ehci_pci_h
+ 	.reset =		ehci_pci_setup,
+ 	.start =		ehci_run,
+ #ifdef	CONFIG_PM
+-	.suspend =		ehci_pci_suspend,
+-	.resume =		ehci_pci_resume,
++	.pci_suspend =		ehci_pci_suspend,
++	.pci_resume =		ehci_pci_resume,
+ #endif
+ 	.stop =			ehci_stop,
+ 	.shutdown =		ehci_shutdown,
+--- a/drivers/usb/host/ohci-pci.c
++++ b/drivers/usb/host/ohci-pci.c
+@@ -347,9 +347,8 @@ static const struct hc_driver ohci_pci_h
+ 	.shutdown =		ohci_shutdown,
+ 
+ #ifdef	CONFIG_PM
+-	/* these suspend/resume entries are for upstream PCI glue ONLY */
+-	.suspend =		ohci_pci_suspend,
+-	.resume =		ohci_pci_resume,
++	.pci_suspend =		ohci_pci_suspend,
++	.pci_resume =		ohci_pci_resume,
+ #endif
+ 
+ 	/*
+--- a/drivers/usb/host/ohci-ssb.c
++++ b/drivers/usb/host/ohci-ssb.c
+@@ -60,36 +60,6 @@ static int ssb_ohci_start(struct usb_hcd
+ 	return err;
+ }
+ 
+-#ifdef CONFIG_PM
+-static int ssb_ohci_hcd_suspend(struct usb_hcd *hcd, pm_message_t message)
+-{
+-	struct ssb_ohci_device *ohcidev = hcd_to_ssb_ohci(hcd);
+-	struct ohci_hcd *ohci = &ohcidev->ohci;
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&ohci->lock, flags);
+-
+-	ohci_writel(ohci, OHCI_INTR_MIE, &ohci->regs->intrdisable);
+-	ohci_readl(ohci, &ohci->regs->intrdisable); /* commit write */
+-
+-	/* make sure snapshot being resumed re-enumerates everything */
+-	if (message.event == PM_EVENT_PRETHAW)
+-		ohci_usb_reset(ohci);
+-
+-	clear_bit(HCD_FLAG_HW_ACCESSIBLE, &hcd->flags);
+-
+-	spin_unlock_irqrestore(&ohci->lock, flags);
+-	return 0;
+-}
+-
+-static int ssb_ohci_hcd_resume(struct usb_hcd *hcd)
+-{
+-	set_bit(HCD_FLAG_HW_ACCESSIBLE, &hcd->flags);
+-	usb_hcd_resume_root_hub(hcd);
+-	return 0;
+-}
+-#endif /* CONFIG_PM */
+-
+ static const struct hc_driver ssb_ohci_hc_driver = {
+ 	.description		= "ssb-usb-ohci",
+ 	.product_desc		= "SSB OHCI Controller",
+@@ -103,11 +73,6 @@ static const struct hc_driver ssb_ohci_h
+ 	.stop			= ohci_stop,
+ 	.shutdown		= ohci_shutdown,
+ 
+-#ifdef CONFIG_PM
+-	.suspend		= ssb_ohci_hcd_suspend,
+-	.resume			= ssb_ohci_hcd_resume,
+-#endif
+-
+ 	.urb_enqueue		= ohci_urb_enqueue,
+ 	.urb_dequeue		= ohci_urb_dequeue,
+ 	.endpoint_disable	= ohci_endpoint_disable,
+--- a/drivers/usb/host/u132-hcd.c
++++ b/drivers/usb/host/u132-hcd.c
+@@ -2946,34 +2946,6 @@ static void u132_hub_irq_enable(struct u
+ 
+ 
+ #ifdef CONFIG_PM
+-static int u132_hcd_suspend(struct usb_hcd *hcd, pm_message_t message)
+-{
+-	struct u132 *u132 = hcd_to_u132(hcd);
+-	if (u132->going > 1) {
+-		dev_err(&u132->platform_dev->dev, "device has been removed %d\n"
+-			, u132->going);
+-		return -ENODEV;
+-	} else if (u132->going > 0) {
+-		dev_err(&u132->platform_dev->dev, "device is being removed\n");
+-		return -ESHUTDOWN;
+-	} else
+-		return 0;
+-}
+-
+-static int u132_hcd_resume(struct usb_hcd *hcd)
+-{
+-	struct u132 *u132 = hcd_to_u132(hcd);
+-	if (u132->going > 1) {
+-		dev_err(&u132->platform_dev->dev, "device has been removed %d\n"
+-			, u132->going);
+-		return -ENODEV;
+-	} else if (u132->going > 0) {
+-		dev_err(&u132->platform_dev->dev, "device is being removed\n");
+-		return -ESHUTDOWN;
+-	} else
+-		return 0;
+-}
+-
+ static int u132_bus_suspend(struct usb_hcd *hcd)
+ {
+ 	struct u132 *u132 = hcd_to_u132(hcd);
+@@ -3003,8 +2975,6 @@ static int u132_bus_resume(struct usb_hc
+ }
+ 
+ #else
+-#define u132_hcd_suspend NULL
+-#define u132_hcd_resume NULL
+ #define u132_bus_suspend NULL
+ #define u132_bus_resume NULL
+ #endif
+@@ -3015,8 +2985,6 @@ static struct hc_driver u132_hc_driver =
+ 	.flags = HCD_USB11 | HCD_MEMORY,
+ 	.reset = u132_hcd_reset,
+ 	.start = u132_hcd_start,
+-	.suspend = u132_hcd_suspend,
+-	.resume = u132_hcd_resume,
+ 	.stop = u132_hcd_stop,
+ 	.urb_enqueue = u132_urb_enqueue,
+ 	.urb_dequeue = u132_urb_dequeue,
+--- a/drivers/usb/host/uhci-hcd.c
++++ b/drivers/usb/host/uhci-hcd.c
+@@ -737,7 +737,7 @@ static int uhci_rh_resume(struct usb_hcd
+ 	return rc;
+ }
+ 
+-static int uhci_suspend(struct usb_hcd *hcd, pm_message_t message)
++static int uhci_pci_suspend(struct usb_hcd *hcd, pm_message_t message)
+ {
+ 	struct uhci_hcd *uhci = hcd_to_uhci(hcd);
+ 	int rc = 0;
+@@ -774,7 +774,7 @@ done:
+ 	return rc;
+ }
+ 
+-static int uhci_resume(struct usb_hcd *hcd)
++static int uhci_pci_resume(struct usb_hcd *hcd)
+ {
+ 	struct uhci_hcd *uhci = hcd_to_uhci(hcd);
+ 
+@@ -872,8 +872,8 @@ static const struct hc_driver uhci_drive
+ 	.reset =		uhci_init,
+ 	.start =		uhci_start,
+ #ifdef CONFIG_PM
+-	.suspend =		uhci_suspend,
+-	.resume =		uhci_resume,
++	.pci_suspend =		uhci_pci_suspend,
++	.pci_resume =		uhci_pci_resume,
+ 	.bus_suspend =		uhci_rh_suspend,
+ 	.bus_resume =		uhci_rh_resume,
+ #endif
