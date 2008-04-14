@@ -6,7 +6,6 @@ Subject: USB: add option hso driver
 This driver is for a number of different Option devices.
 
 TODO:
-	- fix remaining scripts/checkpatch.pl errors/warnings
 	- review tty layer interface
 	- review USB interfaces
 	- remove proc files and move to debugfs
@@ -18,11 +17,12 @@ Cc: Alan Cox <alan@lxorguk.ukuu.org.uk>
 Cc: Filip Aben <f.aben@option.com>
 Cc: Paulius Zaleckas <paulius.zaleckas@teltonika.lt>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
 ---
  drivers/net/usb/Kconfig  |   10 
  drivers/net/usb/Makefile |    1 
- drivers/net/usb/hso.c    | 3352 +++++++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 3363 insertions(+)
+ drivers/net/usb/hso.c    | 3349 +++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 3360 insertions(+)
  create mode 100644 drivers/net/usb/hso.c
 
 --- a/drivers/net/usb/Kconfig
@@ -56,7 +56,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  obj-$(CONFIG_USB_NET_DM9601)	+= dm9601.o
 --- /dev/null
 +++ b/drivers/net/usb/hso.c
-@@ -0,0 +1,3352 @@
+@@ -0,0 +1,3349 @@
 +/******************************************************************************
 + *
 + * Driver for Option High Speed Mobile Devices.
@@ -199,18 +199,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#define D_(lvl, args...)				\
 +	do {						\
 +		if (lvl & debug)			\
-+			NFO(args);			\
++			D__(KERN_INFO, args);		\
 +	} while (0)
-+
-+#define QFO(fmt, args...)				\
-+	do {						\
-+		printk(KERN_INFO "hso: " fmt "\n",	\
-+			##args);			\
-+	} while (0)
-+
-+#define NFO(args...)	D__(KERN_INFO, ##args)
-+#define ERR(args...)	D__(KERN_ERR, ##args)
-+#define WARN(args...)	D__(KERN_WARNING, ##args)
 +
 +#define D1(args...)	D_(0x01, ##args)
 +#define D2(args...)	D_(0x02, ##args)
@@ -377,6 +367,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			unsigned int count, unsigned char is_eop);
 +static void write_bulk_callback(struct urb *urb);
 +/* Serial driver functions */
++static int hso_serial_tiocmset(struct tty_struct *tty, struct file *file,
++			       unsigned int set, unsigned int clear);
 +static void ctrl_callback(struct urb *urb);
 +static void put_rxbuf_data(struct urb *urb, struct hso_serial *serial);
 +static void hso_std_serial_read_bulk_callback(struct urb *urb);
@@ -706,7 +698,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	unsigned long flags = 0;
 +
 +	if (!odev) {
-+		printk("No net device !\n");
++		dev_err(&net->dev, "No net device !\n");
 +		return -ENODEV;
 +	}
 +	/* reset read counter. */
@@ -781,8 +773,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	odev->mux_bulk_tx_urb->transfer_flags |= URB_ZERO_PACKET;
 +
 +	/* Send the URB on its merry way. */
-+	if ((result = usb_submit_urb(odev->mux_bulk_tx_urb, GFP_ATOMIC))) {
-+		WARN("failed mux_bulk_tx_urb %d", result);
++	result = usb_submit_urb(odev->mux_bulk_tx_urb, GFP_ATOMIC);
++	if (result) {
++		dev_warn(&odev->parent->interface->dev,
++			"failed mux_bulk_tx_urb %d", result);
 +		odev->stats.tx_errors++;
 +		netif_start_queue(net);
 +	} else {
@@ -849,7 +843,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			return 0;
 +			}
 +		default:
-+			WARN("Got unsupported ioctl: %x", usercmd);
++			dev_warn(&net->dev, "Got unsupported ioctl: %x\n",
++				 usercmd);
 +			/* the ethtool user space tool relies on this */
 +			return -EOPNOTSUPP;
 +		}
@@ -872,7 +867,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		return;
 +
 +	/* Tell syslog we are hosed. */
-+	WARN("%s: Tx timed out.", net->name);
++	dev_warn(&net->dev, "Tx timed out.\n");
 +
 +	/* Tear the waiting frame off the list */
 +	if (odev->mux_bulk_tx_urb
@@ -898,33 +893,37 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	if (net->flags & IFF_PROMISC) {
 +		/* Unconditionally log net taps. */
 +		D1("%s: Promiscuous mode enabled", net->name);
-+		odev->mode_flags =
-+		    MODE_FLAG_ALL_MULTICAST | MODE_FLAG_DIRECTED |
-+		    MODE_FLAG_BROADCAST | MODE_FLAG_MULTICAST |
-+		    MODE_FLAG_PROMISCUOUS;
++		odev->mode_flags = MODE_FLAG_ALL_MULTICAST |
++				   MODE_FLAG_DIRECTED |
++				   MODE_FLAG_BROADCAST |
++				   MODE_FLAG_MULTICAST |
++				   MODE_FLAG_PROMISCUOUS;
 +	} else if (net->mc_count > odev->wNumberMCFilters) {
 +		/* Too many to filter perfectly -- accept all multicasts. */
 +		D1("%s: too many MC filters for hardware, using allmulti",
 +		   net->name);
-+		odev->mode_flags =
-+		    MODE_FLAG_ALL_MULTICAST | MODE_FLAG_DIRECTED |
-+		    MODE_FLAG_BROADCAST | MODE_FLAG_MULTICAST;
++		odev->mode_flags = MODE_FLAG_ALL_MULTICAST |
++				   MODE_FLAG_DIRECTED |
++				   MODE_FLAG_BROADCAST |
++				   MODE_FLAG_MULTICAST;
 +	} else if (net->flags & IFF_ALLMULTI) {
 +		/* Filter in software */
 +		D1("%s: using allmulti", net->name);
-+		odev->mode_flags =
-+		    MODE_FLAG_ALL_MULTICAST | MODE_FLAG_DIRECTED |
-+		    MODE_FLAG_BROADCAST | MODE_FLAG_MULTICAST;
++		odev->mode_flags = MODE_FLAG_ALL_MULTICAST |
++				   MODE_FLAG_DIRECTED |
++				   MODE_FLAG_BROADCAST |
++				   MODE_FLAG_MULTICAST;
 +	} else {
 +		/* do multicast filtering in hardware */
 +		struct dev_mc_list *mclist;
 +		D1("%s: set multicast filters", net->name);
-+		odev->mode_flags =
-+		    MODE_FLAG_ALL_MULTICAST | MODE_FLAG_DIRECTED |
-+		    MODE_FLAG_BROADCAST | MODE_FLAG_MULTICAST;
++		odev->mode_flags = MODE_FLAG_ALL_MULTICAST |
++				   MODE_FLAG_DIRECTED |
++				   MODE_FLAG_BROADCAST |
++				   MODE_FLAG_MULTICAST;
 +		buf = kmalloc(6 * net->mc_count, GFP_ATOMIC);
 +		if (!buf) {
-+			ERR("No memory to allocate?");
++			dev_err(&net->dev, "No memory to allocate?");
 +			goto exit;
 +		}
 +		for (i = 0, mclist = net->mc_list; mclist && i < net->mc_count;
@@ -981,7 +980,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	/* do we even have a packet? */
 +	if (urb->actual_length) {
-+		/* Handle the IP stream, add header and push it onto network stack if the packet is complete. */
++		/* Handle the IP stream, add header and push it onto network
++		 * stack if the packet is complete. */
 +		spin_lock_irqsave(&odev->net_lock, flags);
 +		packetizeRx(odev, urb->transfer_buffer, urb->actual_length,
 +			    (urb->transfer_buffer_length >
@@ -989,7 +989,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		spin_unlock_irqrestore(&odev->net_lock, flags);
 +	}
 +
-+	/* We are done with this URB, resubmit it. Prep the USB to wait for another frame. Reuse same as received. */
++	/* We are done with this URB, resubmit it. Prep the USB to wait for
++	 * another frame. Reuse same as received. */
 +	usb_fill_bulk_urb(urb,
 +			  odev->parent->usb,
 +			  usb_rcvbulkpipe(odev->parent->usb,
@@ -998,11 +999,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			  urb->transfer_buffer, MUX_BULK_RX_BUF_SIZE,
 +			  read_bulk_callback, odev);
 +
-+	/* Give this to the USB subsystem so it can tell us when more data arrives. */
-+	if ((result = usb_submit_urb(urb, GFP_ATOMIC))) {
-+		WARN("%s failed submit mux_bulk_rx_urb %d", __func__,
-+		     result);
-+	}
++	/* Give this to the USB subsystem so it can tell us when more data
++	 * arrives. */
++	result = usb_submit_urb(urb, GFP_ATOMIC);
++	if (result)
++		dev_warn(&odev->parent->interface->dev,
++			 "%s failed submit mux_bulk_rx_urb %d", __func__,
++			 result);
 +}
 +
 +/* make a real packet from the received USB buffer */
@@ -1052,11 +1055,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +					continue;
 +				}
 +				/* Allocate an sk_buff */
-+				if (!
-+				    (odev->skb_rx_buf =
-+				     dev_alloc_skb(frame_len + 2 +
-+						   odev->net->
-+						   hard_header_len))) {
++				odev->skb_rx_buf = dev_alloc_skb(
++					frame_len + 2 +
++					odev->net->hard_header_len);
++				if (!odev->skb_rx_buf) {
 +					/* We got no receive buffer. */
 +					D1("could not allocate memory");
 +					odev->rx_parse_state = WAIT_SYNC;
@@ -1065,11 +1067,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +				/* Here's where it came from */
 +				odev->skb_rx_buf->dev = odev->net;
 +
-+				/* Make some headroom: standard alignment + the ethernet header. */
++				/* Make some headroom: standard alignment + the
++				 * ethernet header. */
 +				skb_reserve(odev->skb_rx_buf,
 +					    2 + odev->net->hard_header_len);
 +
-+				/* Copy what we got so far. make room for iphdr after tail. */
++				/* Copy what we got so far. make room for iphdr
++				 * after tail. */
 +				tmp_rx_buf =
 +				    skb_put(odev->skb_rx_buf,
 +					    sizeof(struct iphdr));
@@ -1089,12 +1093,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			break;
 +
 +		case WAIT_DATA:
-+			temp_bytes =
-+			    (count <
-+			     odev->rx_buf_missing) ? count : odev->
-+			    rx_buf_missing;
++			temp_bytes = (count < odev->rx_buf_missing)
++					? count : odev->rx_buf_missing;
 +
-+			/* Copy the rest of the bytes that are left in the buffer into the waiting sk_buf. */
++			/* Copy the rest of the bytes that are left in the
++			 * buffer into the waiting sk_buf. */
 +			/* Make room for temp_bytes after tail. */
 +			tmp_rx_buf = skb_put(odev->skb_rx_buf, temp_bytes);
 +			memcpy(tmp_rx_buf, ip_pkt + buffer_offset, temp_bytes);
@@ -1103,35 +1106,36 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			count -= temp_bytes;
 +			buffer_offset += temp_bytes;
 +			odev->rx_buf_size += temp_bytes;
-+			if (!odev->rx_buf_missing) {	/* Packet is complete. Inject into stack. */
-+				{
-+					/* Add fake ethernet header. */
-+					eth_head =
-+					    (struct ethhdr *)skb_push(odev->
-+								      skb_rx_buf,
-+								      odev->
-+								      net->
-+								      hard_header_len);
-+					memcpy(eth_head, &odev->dummy_eth_head,
-+					       sizeof(struct ethhdr));
++			if (!odev->rx_buf_missing) {
++				/* Packet is complete. Inject into stack. */
++				/* Add fake ethernet header. */
++				eth_head = (struct ethhdr *)skb_push(odev->
++							      skb_rx_buf,
++							      odev->
++							      net->
++							      hard_header_len);
++				memcpy(eth_head, &odev->dummy_eth_head,
++				       sizeof(struct ethhdr));
 +
-+					/* Not sure here either */
-+					odev->skb_rx_buf->protocol =
-+					    eth_type_trans(odev->skb_rx_buf,
-+							   odev->net);
-+					odev->skb_rx_buf->ip_summed = CHECKSUM_UNNECESSARY;	/* don't check it */
-+					/* Ship it off to the kernel */
-+					netif_rx(odev->skb_rx_buf);
-+					/* No longer our buffer. */
-+					odev->skb_rx_buf = NULL;
++				/* Not sure here either */
++				odev->skb_rx_buf->protocol = eth_type_trans(
++							odev->skb_rx_buf,
++							odev->net);
++				/* don't check it */
++				odev->skb_rx_buf->ip_summed =
++					CHECKSUM_UNNECESSARY;
++				/* Ship it off to the kernel */
++				netif_rx(odev->skb_rx_buf);
++				/* No longer our buffer. */
++				odev->skb_rx_buf = NULL;
 +
-+					/* update out statistics */
-+					odev->stats.rx_packets++;
++				/* update out statistics */
++				odev->stats.rx_packets++;
 +
-+					/* Hmmm, wonder if we have received the IP len or the ETH len. */
-+					odev->stats.rx_bytes +=
-+					    odev->rx_buf_size;
-+				}
++				/* Hmmm, wonder if we have received the IP len
++				 * or the ETH len. */
++				odev->stats.rx_bytes += odev->rx_buf_size;
++
 +				odev->rx_buf_size = 0;
 +				odev->rx_buf_missing = sizeof(struct iphdr);
 +				odev->rx_parse_state = WAIT_IP;
@@ -1167,13 +1171,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	/* Sanity check */
 +	if (!odev || !test_bit(HSO_NET_RUNNING, &odev->flags)) {
-+		ERR("write_bulk_callback: device not running");
++		dev_err(&urb->dev->dev, "%s: device not running\n", __func__);
 +		return;
 +	}
 +
 +	/* Do we still have a valid kernel network device? */
 +	if (!netif_device_present(odev->net)) {
-+		ERR("write_bulk_callback: net device not present");
++		dev_err(&urb->dev->dev, "%s: net device not present\n",
++			__func__);
 +		return;
 +	}
 +
@@ -1196,7 +1201,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	struct hso_serial *serial = get_serial_by_tty(tty);
 +
 +	if ((!tty) || (!tty->termios) || (!serial)) {
-+		ERR("no tty structures");
++		printk(KERN_ERR "%s: no tty structures", __func__);
 +		return;
 +	}
 +
@@ -1352,8 +1357,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	/* sanity check */
 +	if (serial == NULL) {
-+		ERR("%s(%d) tty or tty->driver_data is NULL", __func__,
-+		    __LINE__);
++		printk(KERN_ERR "%s: tty or tty->driver_data is NULL\n",
++			__func__);
 +		return -ENODEV;
 +	}
 +
@@ -1384,9 +1389,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	unsigned long flags;
 +
 +	/* sanity check */
-+	if (serial == NULL) {
++	if (serial == NULL)
 +		return 0;
-+	}
 +
 +	spin_lock_irqsave(&serial->serial_lock, flags);
 +	room = serial->tx_data_length - serial->tx_buffer_count;
@@ -1414,9 +1418,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	/* the actual setup */
 +	spin_lock_irqsave(&serial->serial_lock, flags);
-+	if (serial->open_count) {
++	if (serial->open_count)
 +		_hso_serial_set_termios(tty, old);
-+	}
 +	spin_unlock_irqrestore(&serial->serial_lock, flags);
 +
 +	/* done */
@@ -1431,9 +1434,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	unsigned long flags;
 +
 +	/* sanity check */
-+	if (serial == NULL) {
++	if (serial == NULL)
 +		return 0;
-+	}
 +
 +	spin_lock_irqsave(&serial->serial_lock, flags);
 +	chars = serial->tx_buffer_count;
@@ -1598,13 +1600,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	unsigned long flags;
 +
 +	spin_lock_irqsave(&serial->serial_lock, flags);
-+	if (!serial->tx_buffer_count) {
++	if (!serial->tx_buffer_count)
 +		goto out;
-+	}
 +
-+	if (serial->tx_urb->status == -EINPROGRESS) {
++	if (serial->tx_urb->status == -EINPROGRESS)
 +		goto out;
-+	}
 +
 +	/* Wakeup USB interface if necessary */
 +	if (hso_get_activity(serial->parent) == -EAGAIN)
@@ -1619,9 +1619,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +out:
 +	/* If temp is set, it means we switched buffers */
-+	if (temp && serial->write_data) {
++	if (temp && serial->write_data)
 +		serial->write_data(serial);
-+	}
 +	spin_unlock_irqrestore(&serial->serial_lock, flags);
 +}
 +
@@ -1683,14 +1682,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static int mux_device_request(struct hso_serial *serial, u8 type, u16 port,
 +			      struct urb *ctrl_urb,
 +			      struct usb_ctrlrequest *ctrl_req,
-+			      u8 * ctrl_urb_data, u32 size)
++			      u8 *ctrl_urb_data, u32 size)
 +{
 +	int result = 0;
 +	int pipe = -1;
 +
 +	/* Sanity check */
 +	if (!serial || !ctrl_urb || !ctrl_req) {
-+		ERR("Wrong arguments ");
++		printk(KERN_ERR "%s: Wrong arguments\n", __func__);
 +		return -EINVAL;
 +	}
 +
@@ -1701,14 +1700,16 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	if (type == GET_ENCAPSULATED_RESPONSE) {
 +		/* Reading command */
-+		ctrl_req->bRequestType =
-+		    USB_DIR_IN | USB_TYPE_OPTION_VENDOR | USB_RECIP_INTERFACE;
++		ctrl_req->bRequestType = USB_DIR_IN |
++					 USB_TYPE_OPTION_VENDOR |
++					 USB_RECIP_INTERFACE;
 +		ctrl_req->bRequest = GET_ENCAPSULATED_RESPONSE;
 +		pipe = usb_rcvctrlpipe(serial->parent->usb, 0);
 +	} else {
 +		/* Writing command */
-+		ctrl_req->bRequestType =
-+		    USB_DIR_OUT | USB_TYPE_OPTION_VENDOR | USB_RECIP_INTERFACE;
++		ctrl_req->bRequestType = USB_DIR_OUT |
++					 USB_TYPE_OPTION_VENDOR |
++					 USB_RECIP_INTERFACE;
 +		ctrl_req->bRequest = SEND_ENCAPSULATED_COMMAND;
 +		pipe = usb_sndctrlpipe(serial->parent->usb, 0);
 +	}
@@ -1725,9 +1726,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			     (u8 *) ctrl_req,
 +			     ctrl_urb_data, size, ctrl_callback, serial);
 +	/* Send it on merry way */
-+	if ((result = usb_submit_urb(ctrl_urb, GFP_ATOMIC))) {
-+		ERR("%s failed submit ctrl_urb %d type %d", __func__,
-+		    result, type);
++	result = usb_submit_urb(ctrl_urb, GFP_ATOMIC);
++	if (result) {
++		dev_err(&ctrl_urb->dev->dev,
++			"%s failed submit ctrl_urb %d type %d", __func__,
++			result, type);
 +		return result;
 +	}
 +
@@ -1738,15 +1741,17 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +/* called by intr_callback when read occurs */
 +static int hso_mux_serial_read(struct hso_serial *serial)
 +{
-+	if (NULL == serial)
++	if (!serial)
 +		return -EINVAL;
++
 +	/* clean data */
 +	memset(serial->rx_data[0], 0, CTRL_URB_RX_SIZE);
 +	/* make the request */
 +
 +	if (serial->num_rx_urbs != 1) {
-+		printk
-+		    ("ERROR: mux'd reads with multiple buffers not possible\n");
++		dev_err(&serial->parent->interface->dev,
++			"ERROR: mux'd reads with multiple buffers "
++			"not possible\n");
 +		return 0;
 +	}
 +	return mux_device_request(serial,
@@ -1783,19 +1788,21 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	port_req = urb->transfer_buffer;
 +	D4(" port_req = 0x%.2X\n", *port_req);
 +	/* loop over all muxed ports to find the one sending this */
-+	for (i = 0; i < 8; i++) {	/* max 8 channels on MUX */
++	for (i = 0; i < 8; i++) {
++		/* max 8 channels on MUX */
 +		if (*port_req & (1 << i)) {
-+			serial =
-+			    get_serial_by_shared_int_and_type(shared_int,
-+							      (1 << i));
++			serial = get_serial_by_shared_int_and_type(shared_int,
++								   (1 << i));
 +			if (serial != NULL) {
 +				D1("Pending read interrupt on port %d\n", i);
-+				if (!test_and_set_bit
-+				    (HSO_SERIAL_FLAG_RX_SENT, &serial->flags)) {
-+					/* Setup and send a ctrl req read on port i */
++				if (!test_and_set_bit(HSO_SERIAL_FLAG_RX_SENT,
++						      &serial->flags)) {
++					/* Setup and send a ctrl req read on
++					 * port i */
 +					hso_mux_serial_read(serial);
 +				} else {
-+					D1("Already pending a read on port %d\n", i);
++					D1("Already pending a read on "
++					   "port %d\n", i);
 +				}
 +			}
 +		}
@@ -1832,8 +1839,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			  serial->tx_data, serial->tx_data_count,
 +			  hso_std_serial_write_bulk_callback, serial);
 +
-+	if ((result = usb_submit_urb(serial->tx_urb, GFP_KERNEL))) {
-+		D1("Failed to submit urb - res %d ", result);
++	result = usb_submit_urb(serial->tx_urb, GFP_KERNEL);
++	if (result) {
++		dev_warn(&serial->parent->usb->dev,
++			 "Failed to submit urb - res %d\n", result);
 +		return result;
 +	}
 +
@@ -1848,9 +1857,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	int status = urb->status;
 +
 +	/* sanity check */
-+	if (!serial) {
++	if (!serial)
 +		return;
-+	}
 +
 +	if (status) {
 +		log_usb_status(status, __func__);
@@ -1872,11 +1880,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		}
 +
 +		/* Re issue a read as long as we receive data. */
-+		if (urb->actual_length != 0) {
++		if (urb->actual_length != 0)
 +			hso_mux_serial_read(serial);
-+		} else {
++		else
 +			clear_bit(HSO_SERIAL_FLAG_RX_SENT, &serial->flags);
-+		}
 +	} else {
 +		hso_put_activity(serial->parent);
 +		tty_wakeup(serial->tty);
@@ -1955,16 +1962,20 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	usb_mark_last_busy(urb->dev);
 +
-+	/* We are done with this URB, resubmit it. Prep the USB to wait for another frame */
++	/* We are done with this URB, resubmit it. Prep the USB to wait for
++	 * another frame */
 +	usb_fill_bulk_urb(urb, serial->parent->usb,
 +			  usb_rcvbulkpipe(serial->parent->usb,
 +					  serial->in_endp->
 +					  bEndpointAddress & 0x7F),
 +			  urb->transfer_buffer, serial->rx_data_length,
 +			  hso_std_serial_read_bulk_callback, serial);
-+	/* Give this to the USB subsystem so it can tell us when more data arrives. */
-+	if ((result = usb_submit_urb(urb, GFP_ATOMIC))) {
-+		ERR("%s failed submit serial rx_urb %d", __func__, result);
++	/* Give this to the USB subsystem so it can tell us when more data
++	 * arrives. */
++	result = usb_submit_urb(urb, GFP_ATOMIC);
++	if (result) {
++		dev_err(&urb->dev->dev, "%s failed submit serial rx_urb %d",
++			__func__, result);
 +	}
 +}
 +
@@ -2018,11 +2029,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	int result = 0;
 +
 +	/* put it in the log */
-+	QFO("%s", version);
++	printk(KERN_INFO "hso: %s\n", version);
 +
 +	/* if procfs is enabled, initialize devices */
 +	if (procfs) {
-+		QFO("Registering procfs");
 +		hso_proc_dir = proc_mkdir(driver_name, NULL);
 +		if (hso_proc_dir) {
 +			hso_proc_dir_devices =
@@ -2034,9 +2044,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	/* Initialise the serial table semaphore and table */
 +	spin_lock_init(&serial_table_lock);
-+	for (i = 0; i < HSO_SERIAL_TTY_MINORS; i++) {
++	for (i = 0; i < HSO_SERIAL_TTY_MINORS; i++)
 +		serial_table[i] = NULL;
-+	}
 +
 +	/* allocate our driver using the proper amount of supported minors */
 +	tty_drv = alloc_tty_driver(HSO_SERIAL_TTY_MINORS);
@@ -2050,9 +2059,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	tty_drv->name = tty_filename;
 +
 +	/* if major number is provided as parameter, use that one */
-+	if (tty_major) {
++	if (tty_major)
 +		tty_drv->major = tty_major;
-+	}
 +
 +	tty_drv->minor_start = 0;
 +	tty_drv->num = HSO_SERIAL_TTY_MINORS;
@@ -2068,14 +2076,16 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	/* register the tty driver */
 +	result = tty_register_driver(tty_drv);
 +	if (result) {
-+		err("%s - tty_register_driver failed(%d)", __func__,
-+		    result);
++		printk(KERN_ERR "%s - tty_register_driver failed(%d)\n",
++			__func__, result);
 +		return result;
 +	}
 +
 +	/* register this module as an usb driver */
-+	if ((result = usb_register(&hso_driver))) {
-+		ERR("Could not register hso driver? error: %d", result);
++	result = usb_register(&hso_driver);
++	if (result) {
++		printk(KERN_ERR "Could not register hso driver? error: %d\n",
++			result);
 +		/* cleanup serial interface */
 +		tty_unregister_driver(tty_drv);
 +		return result;
@@ -2087,7 +2097,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +static void __exit hso_exit(void)
 +{
-+	QFO("Exiting hso");
++	printk(KERN_INFO "hso: unloaded\n");
 +
 +	tty_unregister_driver(tty_drv);
 +	/* deregister the usb driver */
@@ -2148,7 +2158,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		sprintf(port_dev, "/dev/%s%d", tty_filename,
 +			dev2ser(hso_dev)->minor);
 +
-+	printk("HSO: Found %s port %s\n", port_type, port_dev);
++	dev_dbg(&hso_dev->interface->dev, "HSO: Found %s port %s\n",
++		port_type, port_dev);
 +}
 +
 +static int hso_start_net_device(struct hso_device *hso_dev)
@@ -2173,12 +2184,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +				  hso_net);
 +
 +		/* Put it out there so the device can send us stuff */
-+		if ((result =
-+		     usb_submit_urb(hso_net->mux_bulk_rx_urb_pool[i],
-+				    GFP_KERNEL))) {
-+			WARN("%s failed mux_bulk_rx_urb[%d] %d", __func__,
-+			     i, result);
-+		}
++		result = usb_submit_urb(hso_net->mux_bulk_rx_urb_pool[i],
++					GFP_KERNEL);
++		if (result)
++			dev_warn(&hso_dev->usb->dev,
++				"%s failed mux_bulk_rx_urb[%d] %d\n", __func__,
++				i, result);
 +	}
 +
 +	return result;
@@ -2228,9 +2239,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +					  serial->rx_data_length,
 +					  hso_std_serial_read_bulk_callback,
 +					  serial);
-+			if ((result =
-+			     usb_submit_urb(serial->rx_urb[i], GFP_KERNEL))) {
-+				D1("Failed to submit urb - res %d", result);
++			result = usb_submit_urb(serial->rx_urb[i], GFP_KERNEL);
++			if (result) {
++				dev_warn(&serial->parent->usb->dev,
++					 "Failed to submit urb - res %d\n",
++					 result);
 +				break;
 +			}
 +		}
@@ -2266,11 +2279,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		}
 +	}
 +
-+	if (serial->tx_urb && (serial->tx_urb->status == -EINPROGRESS))
++	if (serial->tx_urb && (serial->tx_urb->status == -EINPROGRESS)) {
 +		if (in_interrupt())
 +			usb_unlink_urb(serial->tx_urb);
 +		else
 +			usb_kill_urb(serial->rx_urb[i]);
++	}
 +	if (serial->shared_int) {
 +		spin_lock_bh(&serial->shared_int->shared_int_lock);
 +		if (serial->shared_int->use_count &&
@@ -2291,7 +2305,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return 0;
 +}
 +
-+static int hso_serial_common_free(struct hso_serial *serial)
++static void hso_serial_common_free(struct hso_serial *serial)
 +{
 +	int i;
 +
@@ -2302,25 +2316,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	for (i = 0; i < serial->num_rx_urbs; i++) {
 +		/* unlink and free RX URB */
-+		if (serial->rx_urb[i] != NULL) {
-+			usb_free_urb(serial->rx_urb[i]);
-+		}
++		usb_free_urb(serial->rx_urb[i]);
 +		/* free the RX buffer */
-+		if (serial->rx_data[i] != NULL) {
-+			kfree(serial->rx_data[i]);
-+		}
++		kfree(serial->rx_data[i]);
 +	}
 +
 +	/* unlink and free TX URB */
-+	if (serial->tx_urb != NULL) {
-+		usb_free_urb(serial->tx_urb);
-+	}
-+	/* free the TX buffer */
-+	if (serial->tx_data != NULL) {
-+		kfree(serial->tx_data);
-+	}
-+
-+	return 0;
++	usb_free_urb(serial->tx_urb);
++	kfree(serial->tx_data);
 +}
 +
 +static int hso_serial_common_create(struct hso_serial *serial, int num_urbs,
@@ -2330,7 +2333,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	int minor;
 +	int i;
 +
-+	if ((minor = get_free_serial_index()) < 0)
++	minor = get_free_serial_index();
++	if (minor < 0)
 +		goto exit;
 +
 +	/* register our minor number */
@@ -2353,22 +2357,23 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	for (i = 0; i < serial->num_rx_urbs; i++) {
 +		serial->rx_urb[i] = usb_alloc_urb(0, GFP_KERNEL);
 +		if (!serial->rx_urb[i]) {
-+			dev_err(dev, "Could not allocate urb?");
++			dev_err(dev, "Could not allocate urb?\n");
 +			goto exit;
 +		}
 +		serial->rx_urb[i]->transfer_buffer = NULL;
 +		serial->rx_urb[i]->transfer_buffer_length = 0;
-+		if (!
-+		    (serial->rx_data[i] =
-+		     kzalloc(serial->rx_data_length, GFP_KERNEL))) {
-+			ERR("%s - Out of memory", __func__);
++		serial->rx_data[i] = kzalloc(serial->rx_data_length,
++					     GFP_KERNEL);
++		if (!serial->rx_data[i]) {
++			dev_err(dev, "%s - Out of memory\n", __func__);
 +			goto exit;
 +		}
 +	}
 +
 +	/* TX , allocate urb and initialize */
-+	if (!(serial->tx_urb = usb_alloc_urb(0, GFP_KERNEL))) {
-+		ERR("Could not allocate urb?");
++	serial->tx_urb = usb_alloc_urb(0, GFP_KERNEL);
++	if (!serial->tx_urb) {
++		dev_err(dev, "Could not allocate urb?\n");
 +		goto exit;
 +	}
 +	serial->tx_urb->transfer_buffer = NULL;
@@ -2379,12 +2384,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	serial->tx_data_length = tx_size;
 +	serial->tx_data = kzalloc(serial->tx_data_length, GFP_KERNEL);
 +	if (!serial->tx_data) {
-+		ERR("%s - Out of memory", __func__);
++		dev_err(dev, "%s - Out of memory", __func__);
 +		goto exit;
 +	}
 +	serial->tx_buffer = kzalloc(serial->tx_data_length, GFP_KERNEL);
 +	if (!serial->tx_buffer) {
-+		ERR("%s - Out of memory", __func__);
++		dev_err(dev, "%s - Out of memory", __func__);
 +		goto exit;
 +	}
 +
@@ -2436,19 +2441,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	/* start freeing */
 +	for (i = 0; i < MUX_BULK_RX_BUF_COUNT; i++) {
-+		if (hso_net->mux_bulk_rx_urb_pool[i]) {
-+			usb_free_urb(hso_net->mux_bulk_rx_urb_pool[i]);
-+		}
-+		if (hso_net->mux_bulk_rx_buf_pool[i]) {
-+			kfree(hso_net->mux_bulk_rx_buf_pool[i]);
-+		}
++		usb_free_urb(hso_net->mux_bulk_rx_urb_pool[i]);
++		kfree(hso_net->mux_bulk_rx_buf_pool[i]);
 +	}
-+	if (hso_net->mux_bulk_tx_urb) {
-+		usb_free_urb(hso_net->mux_bulk_tx_urb);
-+	}
-+	if (hso_net->mux_bulk_tx_buf) {
-+		kfree(hso_net->mux_bulk_tx_buf);
-+	}
++	usb_free_urb(hso_net->mux_bulk_tx_urb);
++	kfree(hso_net->mux_bulk_tx_buf);
 +
 +	remove_net_device(hso_net->parent);
 +
@@ -2476,7 +2473,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	/* call hso_net_init to do the basic initialization */
 +	net = alloc_netdev(sizeof(struct hso_net), "hso%d", hso_net_init);
 +	if (!net) {
-+		printk("Unable to create ethernet device");
++		dev_err(&interface->dev, "Unable to create ethernet device\n");
 +		goto exit;
 +	}
 +
@@ -2486,52 +2483,49 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	hso_net->net = net;
 +	hso_net->parent = hso_dev;
 +
-+	if (!
-+	    (hso_net->in_endp =
-+	     hso_get_ep(interface, USB_ENDPOINT_XFER_BULK, USB_DIR_IN))) {
-+		printk("Can't find BULK IN endpoint\n");
++	hso_net->in_endp = hso_get_ep(interface, USB_ENDPOINT_XFER_BULK,
++				      USB_DIR_IN);
++	if (!hso_net->in_endp) {
++		dev_err(&interface->dev, "Can't find BULK IN endpoint\n");
 +		goto exit;
 +	}
-+	if (!
-+	    (hso_net->out_endp =
-+	     hso_get_ep(interface, USB_ENDPOINT_XFER_BULK, USB_DIR_OUT))) {
-+		printk("Can't find BULK OUT endpoint\n");
++	hso_net->out_endp = hso_get_ep(interface, USB_ENDPOINT_XFER_BULK,
++				       USB_DIR_OUT);
++	if (!hso_net->out_endp) {
++		dev_err(&interface->dev, "Can't find BULK OUT endpoint\n");
 +		goto exit;
 +	}
-+#ifdef SYSFS_NET
 +	SET_NETDEV_DEV(net, &interface->dev);
-+#endif
 +
 +	/* registering our net device */
 +	result = register_netdev(net);
 +	if (result) {
-+		printk("Failed to register device\n");
++		dev_err(&interface->dev, "Failed to register device\n");
 +		goto exit;
 +	}
 +
 +	/* start allocating */
 +	for (i = 0; i < MUX_BULK_RX_BUF_COUNT; i++) {
-+		if (!
-+		    (hso_net->mux_bulk_rx_urb_pool[i] =
-+		     usb_alloc_urb(0, GFP_KERNEL))) {
-+			printk("Could not allocate rx urb?");
++		hso_net->mux_bulk_rx_urb_pool[i] = usb_alloc_urb(0, GFP_KERNEL);
++		if (!hso_net->mux_bulk_rx_urb_pool[i]) {
++			dev_err(&interface->dev, "Could not allocate rx urb\n");
 +			goto exit;
 +		}
-+		if (!
-+		    (hso_net->mux_bulk_rx_buf_pool[i] =
-+		     kzalloc(MUX_BULK_RX_BUF_SIZE, GFP_KERNEL))) {
-+			printk("Could not allocate rx buf?");
++		hso_net->mux_bulk_rx_buf_pool[i] = kzalloc(MUX_BULK_RX_BUF_SIZE,
++							   GFP_KERNEL);
++		if (!hso_net->mux_bulk_rx_buf_pool[i]) {
++			dev_err(&interface->dev, "Could not allocate rx buf\n");
 +			goto exit;
 +		}
 +	}
-+	if (!(hso_net->mux_bulk_tx_urb = usb_alloc_urb(0, GFP_KERNEL))) {
-+		printk("Could not allocate tx urb?");
++	hso_net->mux_bulk_tx_urb = usb_alloc_urb(0, GFP_KERNEL);
++	if (!hso_net->mux_bulk_tx_urb) {
++		dev_err(&interface->dev, "Could not allocate tx urb\n");
 +		goto exit;
 +	}
-+	if (!
-+	    (hso_net->mux_bulk_tx_buf =
-+	     kzalloc(MUX_BULK_TX_BUF_SIZE, GFP_KERNEL))) {
-+		printk("Could not allocate tx buf?");
++	hso_net->mux_bulk_tx_buf = kzalloc(MUX_BULK_TX_BUF_SIZE, GFP_KERNEL);
++	if (!hso_net->mux_bulk_tx_buf) {
++		dev_err(&interface->dev, "Could not allocate tx buf\n");
 +		goto exit;
 +	}
 +
@@ -2543,7 +2537,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	/* setup the proc dirs and files if needed */
 +	if (procfs) {
 +		if (!hso_proc_dir_devices)
-+			QFO("Warning, creating port info under root");
++			printk(KERN_WARNING "hso: Warning, creating port info "
++				"under root\n");
 +		create_proc_read_entry(hso_net->net->name, 0,
 +				       hso_proc_dir_devices, hso_proc_port_info,
 +				       hso_dev);
@@ -2576,9 +2571,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	if (serial->shared_int) {
 +		spin_lock_bh(&serial->shared_int->shared_int_lock);
-+		if (--serial->shared_int->ref_count == 0) {
++		if (--serial->shared_int->ref_count == 0)
 +			hso_free_shared_int(serial->shared_int);
-+		}
 +		spin_unlock_bh(&serial->shared_int->shared_int_lock);
 +	}
 +	kfree(serial);
@@ -2617,14 +2611,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	serial->in_endp = hso_get_ep(interface, USB_ENDPOINT_XFER_BULK,
 +				     USB_DIR_IN);
 +	if (!serial->in_endp) {
-+		printk("Failed to find BULK IN ep\n");
++		dev_err(&interface->dev, "Failed to find BULK IN ep\n");
 +		goto exit;
 +	}
 +
 +	if (!
 +	    (serial->out_endp =
 +	     hso_get_ep(interface, USB_ENDPOINT_XFER_BULK, USB_DIR_OUT))) {
-+		printk("Failed to find BULK IN ep\n");
++		dev_err(&interface->dev, "Failed to find BULK IN ep\n");
 +		goto exit;
 +	}
 +
@@ -2636,7 +2630,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	/* setup the proc dirs and files if needed */
 +	if (procfs) {
 +		if (!hso_proc_dir_devices)
-+			QFO("Warning, creating port info under root");
++			printk(KERN_WARNING "hso: Warning, creating port "
++				"info under root\n");
 +		sprintf(device_name, "%s%d", tty_filename, serial->minor);
 +		create_proc_read_entry(device_name, 0, hso_proc_dir_devices,
 +				       hso_proc_port_info, hso_dev);
@@ -2649,10 +2644,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +exit:
 +	if (hso_dev && serial)
 +		hso_serial_common_free(serial);
-+	if (serial)
-+		kfree(serial);
-+	if (hso_dev)
-+		hso_free_device(hso_dev);
++	kfree(serial);
++	hso_free_device(hso_dev);
 +	return NULL;
 +}
 +
@@ -2678,10 +2671,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	if (!hso_dev)
 +		return NULL;
 +
-+	serial = (struct hso_serial *)kmalloc(sizeof(*serial), GFP_KERNEL);
++	serial = kzalloc(sizeof(*serial), GFP_KERNEL);
 +	if (!serial)
 +		goto exit;
-+	memset(serial, 0, sizeof(*serial));
 +
 +	hso_dev->port_data.dev_serial = serial;
 +	serial->parent = hso_dev;
@@ -2704,7 +2696,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	/* setup the proc dirs and files if needed */
 +	if (procfs) {
 +		if (!hso_proc_dir_devices)
-+			QFO("Warning, creating port info under root");
++			printk(KERN_WARNING "hso: Warning, creating port info "
++				"under root\n");
 +		sprintf(device_name, "%s%d", tty_filename, serial->minor);
 +		create_proc_read_entry(device_name, 0, hso_proc_dir_devices,
 +				       hso_proc_port_info, hso_dev);
@@ -2728,36 +2721,35 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +static void hso_free_shared_int(struct hso_shared_int *mux)
 +{
-+	if (mux->shared_intr_urb)
-+		usb_free_urb(mux->shared_intr_urb);
-+	if (mux->shared_intr_buf)
-+		kfree(mux->shared_intr_buf);
-+
++	usb_free_urb(mux->shared_intr_urb);
++	kfree(mux->shared_intr_buf);
 +	kfree(mux);
 +}
 +
-+static struct hso_shared_int *hso_create_shared_int(struct usb_interface *interface)
++static
++struct hso_shared_int *hso_create_shared_int(struct usb_interface *interface)
 +{
 +	struct hso_shared_int *mux = kzalloc(sizeof(*mux), GFP_KERNEL);
 +
 +	if (!mux)
 +		return NULL;
 +
-+	if (!
-+	    (mux->intr_endp =
-+	     hso_get_ep(interface, USB_ENDPOINT_XFER_INT, USB_DIR_IN))) {
-+		printk("Can't find INT IN endpoint\n");
++	mux->intr_endp = hso_get_ep(interface, USB_ENDPOINT_XFER_INT,
++				    USB_DIR_IN);
++	if (!mux->intr_endp) {
++		dev_err(&interface->dev, "Can't find INT IN endpoint\n");
 +		goto exit;
 +	}
 +
-+	if (!(mux->shared_intr_urb = usb_alloc_urb(0, GFP_KERNEL))) {
-+		printk("Could not allocate intr urb?");
++	mux->shared_intr_urb = usb_alloc_urb(0, GFP_KERNEL);
++	if (!mux->shared_intr_urb) {
++		dev_err(&interface->dev, "Could not allocate intr urb?");
 +		goto exit;
 +	}
-+	if (!
-+	    (mux->shared_intr_buf =
-+	     kzalloc(mux->intr_endp->wMaxPacketSize, GFP_KERNEL))) {
-+		printk("Could not allocate intr buf?");
++	mux->shared_intr_buf = kzalloc(mux->intr_endp->wMaxPacketSize,
++				       GFP_KERNEL);
++	if (!mux->shared_intr_buf) {
++		dev_err(&interface->dev, "Could not allocate intr buf?");
 +		goto exit;
 +	}
 +
@@ -2856,7 +2848,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		port_spec = hso_get_config_data(interface);
 +
 +	if (interface->cur_altsetting->desc.bInterfaceClass != 0xFF) {
-+		printk("Not our interface\n");
++		dev_err(&interface->dev, "Not our interface\n");
 +		return -ENODEV;
 +	}
 +	/* Check if we need to switch to alt interfaces prior to port
@@ -2888,7 +2880,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +		for (i = 1, mux = 0; i < 0x100; i = i << 1, mux++) {
 +			if (port_mask & i) {
-+				hso_dev = hso_create_mux_serial_device(interface, i, shared_int);
++				hso_dev = hso_create_mux_serial_device(
++						interface, i, shared_int);
 +				if (!hso_dev)
 +					goto exit;
 +			}
@@ -3041,7 +3034,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			/* First transmit any lingering data, then restart the
 +			 * device. */
 +			if (hso_net->skb_tx_buf) {
-+				printk("Transmitting lingering data\n");
++				dev_dbg(&iface->dev,
++					"Transmitting lingering data\n");
 +				hso_net_start_xmit(hso_net->skb_tx_buf,
 +						   hso_net->net);
 +			}
@@ -3146,7 +3140,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	result = usb_submit_urb(shared_int->shared_intr_urb, gfp);
 +	if (result)
-+		WARN("%s failed mux_intr_urb %d", __func__, result);
++		dev_warn(&usb->dev, "%s failed mux_intr_urb %d", __func__,
++			result);
 +
 +	return result;
 +}
@@ -3223,8 +3218,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +				for (i = 2; i < 6; i++) {
 +					if ((16 == buffer[2 * i]) ||
 +					    (16 == buffer[2 * i + 1])) {
-+						ERR("Bad value in MAC "
-+						    "address i:%d", i);
++						dev_err(&odev->parent->usb->dev,
++							"Bad value in MAC "
++							"address i:%d\n", i);
 +					} else {
 +						mac_addr[i] =
 +						    (hex2dec(buffer[2 * i]) <<
@@ -3236,7 +3232,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			}
 +		}
 +	} else {
-+		ERR("Attempting to get MAC address failed: using default");
++		dev_err(&odev->parent->usb->dev, "Attempting to get MAC "
++			"address failed: using default\n");
 +	}
 +
 +	/* Now copy it over to our network device structure */
@@ -3328,7 +3325,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	}
 +	spin_unlock_irqrestore(&serial_table_lock, flags);
 +
-+	ERR("no free serial devices in table");
++	printk(KERN_ERR "%s: no free serial devices in table\n", __func__);
 +	return -1;
 +}
 +
