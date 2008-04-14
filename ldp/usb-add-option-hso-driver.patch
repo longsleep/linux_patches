@@ -21,8 +21,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 ---
  drivers/net/usb/Kconfig  |   10 
  drivers/net/usb/Makefile |    1 
- drivers/net/usb/hso.c    | 3333 +++++++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 3344 insertions(+)
+ drivers/net/usb/hso.c    | 3352 +++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 3363 insertions(+)
  create mode 100644 drivers/net/usb/hso.c
 
 --- a/drivers/net/usb/Kconfig
@@ -56,7 +56,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  obj-$(CONFIG_USB_NET_DM9601)	+= dm9601.o
 --- /dev/null
 +++ b/drivers/net/usb/hso.c
-@@ -0,0 +1,3333 @@
+@@ -0,0 +1,3352 @@
 +/******************************************************************************
 + *
 + * Driver for Option High Speed Mobile Devices.
@@ -123,7 +123,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#include <asm/byteorder.h>
 +
 +
-+#define DRIVER_VERSION			"1.1"
++#define DRIVER_VERSION			"1.2"
 +#define MOD_AUTHOR			"Option Wireless"
 +#define MOD_DESCRIPTION			"USB High Speed Option driver"
 +#define MOD_LICENSE			"GPL"
@@ -1043,9 +1043,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +				 * continue to WAIT_DATA */
 +				frame_len = ntohs(odev->rx_ip_hdr.tot_len);
 +
-+				if (frame_len > DEFAULT_MRU) {
-+					D1("Frame (%d) length larger then MRU"
-+					   "(%d)", frame_len, DEFAULT_MRU);
++				if ((frame_len > DEFAULT_MRU) ||
++				    (frame_len < sizeof(struct iphdr))) {
++					dev_err(&odev->net->dev,
++						"Invalid frame (%d) length\n",
++						frame_len);
 +					odev->rx_parse_state = WAIT_SYNC;
 +					continue;
 +				}
@@ -1280,6 +1282,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		/* Force default termio settings */
 +		_hso_serial_set_termios(tty, NULL);
 +		result = hso_start_serial_device(serial->parent);
++		if (result) {
++			hso_stop_serial_device(serial->parent);
++			serial->open_count--;
++			kref_put(&serial->parent->ref, hso_serial_ref_free);
++		}
 +	} else {
 +		D1("Port was already open");
 +	}
@@ -1290,7 +1297,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	/* done */
 +	if (result)
-+		kref_put(&serial->parent->ref, hso_serial_ref_free);
++		hso_serial_tiocmset(tty, NULL, TIOCM_RTS | TIOCM_DTR, 0);
 +	return result;
 +}
 +
@@ -1299,6 +1306,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +{
 +	struct hso_serial *serial = tty->driver_data;
 +	unsigned long flags;
++	u8 usb_gone;
++
 +	D1("Closing serial port");
 +
 +	/* sanity check */
@@ -1307,31 +1316,30 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		return;
 +	}
 +
-+	if (test_bit(HSO_SERIAL_USB_GONE, &serial->flags))
-+		goto out;
++	usb_gone = test_bit(HSO_SERIAL_USB_GONE, &serial->flags);
 +
-+	usb_autopm_get_interface(serial->parent->interface);
++	if (!usb_gone)
++		usb_autopm_get_interface(serial->parent->interface);
 +
 +	/* reset the rts and dtr */
 +	/* do the actual close */
 +	spin_lock_irqsave(&serial->serial_lock, flags);
 +	serial->open_count--;
 +	if (serial->open_count <= 0) {
++		kref_put(&serial->parent->ref, hso_serial_ref_free);
 +		serial->open_count = 0;
 +		if (serial->tty) {
 +			serial->tty->driver_data = NULL;
 +			serial->tty = NULL;
 +		}
++		if (!usb_gone)
++			hso_stop_serial_device(serial->parent);
 +	}
++	if (serial->open_count < 0)
++		serial->open_count = 0;
 +	spin_unlock_irqrestore(&serial->serial_lock, flags);
-+	usb_autopm_put_interface(serial->parent->interface);
-+
-+out:
-+	if (!serial->open_count)
-+		hso_stop_serial_device(serial->parent);
-+
-+	/* usb_autopm_put_interface( serial->parent->interface ); */
-+	kref_put(&serial->parent->ref, hso_serial_ref_free);
++	if (!usb_gone)
++		usb_autopm_put_interface(serial->parent->interface);
 +}
 +
 +/* close the requested serial port */
@@ -1458,16 +1466,18 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			       unsigned int set, unsigned int clear)
 +{
 +	int val = 0;
++	unsigned long flags;
++	int if_num;
 +	struct hso_serial *serial = get_serial_by_tty(tty);
-+	int if_num =
-+	    serial->parent->interface->altsetting->desc.bInterfaceNumber;
 +
 +	/* sanity check */
 +	if (!serial) {
 +		D1("no tty structures");
 +		return -EINVAL;
 +	}
-+	/* spin_lock_irqsave(&serial->serial_lock, flags); */
++	if_num = serial->parent->interface->altsetting->desc.bInterfaceNumber;
++
++	spin_lock_irqsave(&serial->serial_lock, flags);
 +	if (set & TIOCM_RTS)
 +		serial->rts_state = 1;
 +	if (set & TIOCM_DTR)
@@ -1483,7 +1493,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	if (serial->rts_state)
 +		val |= 0x02;
 +
-+	/* spin_unlock_irqrestore(&serial->serial_lock, flags); */
++	spin_unlock_irqrestore(&serial->serial_lock, flags);
 +
 +	return usb_control_msg(serial->parent->usb,
 +			       usb_rcvctrlpipe(serial->parent->usb, 0), 0x22,
@@ -2249,21 +2259,30 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	for (i = 0; i < serial->num_rx_urbs; i++) {
 +		if (serial->rx_urb[i]
 +		    && (serial->rx_urb[i]->status == -EINPROGRESS)) {
-+			usb_unlink_urb(serial->rx_urb[i]);
++			if (in_interrupt())
++				usb_unlink_urb(serial->rx_urb[i]);
++			else
++				usb_kill_urb(serial->rx_urb[i]);
 +		}
 +	}
 +
 +	if (serial->tx_urb && (serial->tx_urb->status == -EINPROGRESS))
-+		usb_unlink_urb(serial->tx_urb);
++		if (in_interrupt())
++			usb_unlink_urb(serial->tx_urb);
++		else
++			usb_kill_urb(serial->rx_urb[i]);
 +	if (serial->shared_int) {
 +		spin_lock_bh(&serial->shared_int->shared_int_lock);
-+		if (serial->shared_int->use_count
-+		    && (--serial->shared_int->use_count == 0)) {
-+			if ((serial->shared_int->shared_intr_urb)
-+			    && (serial->shared_int->shared_intr_urb->status ==
-+				-EINPROGRESS)) {
-+				usb_unlink_urb(serial->shared_int->
-+					       shared_intr_urb);
++		if (serial->shared_int->use_count &&
++		    (--serial->shared_int->use_count == 0)) {
++			struct urb *urb;
++
++			urb = serial->shared_int->shared_intr_urb;
++			if ((urb) && (urb->status == -EINPROGRESS)) {
++				if (in_interrupt())
++					usb_unlink_urb(urb);
++				else
++					usb_kill_urb(urb);
 +			}
 +		}
 +		spin_unlock_bh(&serial->shared_int->shared_int_lock);
