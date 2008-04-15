@@ -3,7 +3,9 @@ From: Greg Kroah-Hartman <gregkh@suse.de>
 Date: Mon, 14 Apr 2008 11:41:16 -0700
 Subject: USB: add option hso driver
 
-This driver is for a number of different Option devices.
+This driver is for a number of different Option devices.  Originally
+written by Option and Andrew Bird, but cleaned up massivly for
+acceptance into mainline by me (Greg).
 
 TODO:
 	- review tty layer interface
@@ -12,17 +14,24 @@ TODO:
 	- review network interfaces
 	- add better changelog information
 
+Many thanks to the following for their help in cleaning up the driver by
+providing feedback and patches to it:
+	- Paulius Zaleckas <paulius.zaleckas@teltonika.lt>
+	- Oliver Neukum <oliver@neukum.org>
+
+
 Cc: Andrew Bird <ajb@spheresystems.co.uk>
 Cc: Alan Cox <alan@lxorguk.ukuu.org.uk>
 Cc: Filip Aben <f.aben@option.com>
 Cc: Paulius Zaleckas <paulius.zaleckas@teltonika.lt>
+Cc: Oliver Neukum <oliver@neukum.org>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
  drivers/net/usb/Kconfig  |   10 
  drivers/net/usb/Makefile |    1 
- drivers/net/usb/hso.c    | 3349 +++++++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 3360 insertions(+)
+ drivers/net/usb/hso.c    | 3315 +++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 3326 insertions(+)
  create mode 100644 drivers/net/usb/hso.c
 
 --- a/drivers/net/usb/Kconfig
@@ -36,8 +45,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	depends on USB
 +	default n
 +	help
-+	  Choose this option if you have an Option High Speed Mobile
-+	  device.
++	  Choose this option if you have an Option HSDPA/HSUPA card.
++	  These cards support downlink speeds of 7.2Mbps or greater.
 +
 +	  To compile this driver as a module, choose M here: the
 +	  module will be called hso.
@@ -56,7 +65,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  obj-$(CONFIG_USB_NET_DM9601)	+= dm9601.o
 --- /dev/null
 +++ b/drivers/net/usb/hso.c
-@@ -0,0 +1,3349 @@
+@@ -0,0 +1,3315 @@
 +/******************************************************************************
 + *
 + * Driver for Option High Speed Mobile Devices.
@@ -429,7 +438,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return 16;
 +}
 +
-+#define SIOCSETSUSPEND (SIOCDEVPRIVATE+3)
 +#define SIOCSETRADIO   (SIOCDEVPRIVATE+4)
 +
 +/* #define DEBUG */
@@ -1503,27 +1511,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			       USB_CTRL_SET_TIMEOUT);
 +}
 +
-+/* Toggles suspend on or off ( used by ioctl ) */
-+static int hso_set_suspend(struct hso_device *hso_dev, int enabled)
-+{
-+	if (!hso_dev)
-+		return -ENODEV;
-+
-+	if (enabled) {
-+		if (hso_dev->suspend_disabled) {
-+			usb_autopm_put_interface(hso_dev->interface);
-+			hso_dev->suspend_disabled = 0;
-+		}
-+	} else {
-+		if (!hso_dev->suspend_disabled) {
-+			usb_autopm_get_interface(hso_dev->interface);
-+			hso_dev->suspend_disabled = 1;
-+		}
-+	}
-+	return 0;
-+}
-+
-+/* Toggles radioon or off ( used by ioctl ) */
++/* Toggles radio on or off ( used by ioctl ) */
 +static int hso_set_radio(struct hso_device *hso_dev, int enabled)
 +{
 +	if (!hso_dev)
@@ -1546,13 +1534,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		return -ENODEV;
 +
 +	switch (cmd) {
-+	case SIOCSETSUSPEND:
-+		if (arg)
-+			hso_set_suspend(serial->parent, 1);
-+		else
-+			hso_set_suspend(serial->parent, 0);
-+		ret = 0;
-+		break;
 +	case SIOCSETRADIO:
 +		if (arg)
 +			hso_set_radio(serial->parent, 1);
@@ -2350,7 +2331,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	spin_lock_init(&serial->serial_lock);
 +	serial->num_rx_urbs = num_urbs;
 +
-+	/* RX , allocate urb and initialize */
++	/* RX, allocate urb and initialize */
 +
 +	/* prepare our RX buffer */
 +	serial->rx_data_length = rx_size;
@@ -2370,7 +2351,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		}
 +	}
 +
-+	/* TX , allocate urb and initialize */
++	/* TX, allocate urb and initialize */
 +	serial->tx_urb = usb_alloc_urb(0, GFP_KERNEL);
 +	if (!serial->tx_urb) {
 +		dev_err(dev, "Could not allocate urb?\n");
@@ -3190,14 +3171,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	unsigned char buffer[13];
 +	unsigned char checkserial[7] = "Serial";
 +
-+	/* we can't fail, therefor we use a default macaddress (constructed
-+	 * from the pointer of our struct) */
-+	mac_addr[0] = 0x00;
-+	mac_addr[1] = 0x03;
-+	mac_addr[2] = (unsigned char)(((unsigned long)odev) & 0xFF);
-+	mac_addr[3] = (unsigned char)((((unsigned long)odev) >> 8) & 0xFF);
-+	mac_addr[4] = (unsigned char)((((unsigned long)odev) >> 16) & 0xFF);
-+	mac_addr[5] = (unsigned char)((((unsigned long)odev) >> 24) & 0xFF);
++	/* we can't fail, therefor we use a random macaddress */
++	random_ether_addr(mac_addr);
 +	dummy_mac[0] = 0xFA;
 +	dummy_mac[1] = mac_addr[1];
 +	dummy_mac[2] = mac_addr[2];
@@ -3233,7 +3208,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		}
 +	} else {
 +		dev_err(&odev->parent->usb->dev, "Attempting to get MAC "
-+			"address failed: using default\n");
++			"address failed: using random\n");
 +	}
 +
 +	/* Now copy it over to our network device structure */
