@@ -50,14 +50,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
  arch/x86/kernel/apm_32.c   |    8 
- drivers/base/power/main.c  |  688 ++++++++++++++++++++++++++++++++++-----------
+ drivers/base/power/main.c  |  683 ++++++++++++++++++++++++++++++++++-----------
  drivers/base/power/power.h |    2 
  drivers/base/power/trace.c |    4 
  include/linux/device.h     |    9 
  include/linux/pm.h         |  314 ++++++++++++++++++--
- kernel/power/disk.c        |   20 -
+ kernel/power/disk.c        |   22 -
  kernel/power/main.c        |    6 
- 8 files changed, 851 insertions(+), 200 deletions(-)
+ 8 files changed, 849 insertions(+), 199 deletions(-)
 
 --- a/arch/x86/kernel/apm_32.c
 +++ b/arch/x86/kernel/apm_32.c
@@ -163,7 +163,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  /**
   *	device_pm_add - add a device to the list of active devices
-@@ -68,19 +75,32 @@ int device_pm_add(struct device *dev)
+@@ -68,17 +75,25 @@ int device_pm_add(struct device *dev)
  		 dev->bus ? dev->bus->name : "No Bus",
  		 kobject_name(&dev->kobj));
  	mutex_lock(&dpm_list_mtx);
@@ -176,8 +176,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  				dev->parent->bus_id);
 -		else
 -			dev_warn(dev, "all devices are sleeping\n");
--		WARN_ON(true);
-+			goto Refuse;
++			WARN_ON(true);
 +		}
 +	} else if (transition_started) {
 +		/*
@@ -185,7 +184,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		 * transition is in progress in order to avoid leaving them
 +		 * unhandled down the road
 +		 */
-+		goto Refuse;
+ 		WARN_ON(true);
  	}
  	error = dpm_sysfs_add(dev);
 -	if (!error)
@@ -193,18 +192,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	if (!error) {
 +		dev->power.status = DPM_ON;
 +		list_add_tail(&dev->power.entry, &dpm_list);
-+  	}
-+End:
++	}
  	mutex_unlock(&dpm_list_mtx);
  	return error;
-+Refuse:
-+	WARN_ON(true);
-+	error = -EBUSY;
-+	goto End;
  }
- 
- /**
-@@ -100,73 +120,241 @@ void device_pm_remove(struct device *dev
+@@ -100,73 +115,243 @@ void device_pm_remove(struct device *dev
  	mutex_unlock(&dpm_list_mtx);
  }
  
@@ -347,6 +339,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		return "thaw";
 +	case PM_EVENT_RESTORE:
 +		return "restore";
++	case PM_EVENT_RECOVER:
++		return "recover";
 +	default:
 +		return "(unknown PM event)";
 +	}
@@ -467,7 +461,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  {
  	int error = 0;
  
-@@ -175,21 +363,40 @@ static int resume_device(struct device *
+@@ -175,21 +360,40 @@ static int resume_device(struct device *
  
  	down(&dev->sem);
  
@@ -518,7 +512,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	up(&dev->sem);
  
  	TRACE_RESUME(error);
-@@ -198,78 +405,161 @@ static int resume_device(struct device *
+@@ -198,78 +402,161 @@ static int resume_device(struct device *
  
  /**
   *	dpm_resume - Resume every device.
@@ -716,7 +710,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		error = dev->bus->suspend_late(dev, state);
  		suspend_report_result(dev->bus->suspend_late, error);
  	}
-@@ -278,37 +568,30 @@ static int suspend_device_late(struct de
+@@ -278,37 +565,30 @@ static int suspend_device_late(struct de
  
  /**
   *	device_power_down - Shut down special devices.
@@ -762,7 +756,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	return error;
  }
  EXPORT_SYMBOL_GPL(device_power_down);
-@@ -316,7 +599,7 @@ EXPORT_SYMBOL_GPL(device_power_down);
+@@ -316,7 +596,7 @@ EXPORT_SYMBOL_GPL(device_power_down);
  /**
   *	suspend_device - Save state of one device.
   *	@dev:	Device.
@@ -771,7 +765,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
   */
  static int suspend_device(struct device *dev, pm_message_t state)
  {
-@@ -324,24 +607,43 @@ static int suspend_device(struct device 
+@@ -324,24 +604,43 @@ static int suspend_device(struct device 
  
  	down(&dev->sem);
  
@@ -831,7 +825,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	up(&dev->sem);
  
  	return error;
-@@ -349,67 +651,141 @@ static int suspend_device(struct device 
+@@ -349,67 +648,141 @@ static int suspend_device(struct device 
  
  /**
   *	dpm_suspend - Suspend every device.
@@ -1418,28 +1412,30 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	local_irq_disable();
  	/* At this point, device_suspend() has been called, but *not*
  	 * device_power_down(). We *must* call device_power_down() now.
-@@ -224,9 +225,10 @@ static int create_image(int platform_mod
+@@ -224,9 +225,11 @@ static int create_image(int platform_mod
  	/* NOTE:  device_power_up() is just a resume() for devices
  	 * that suspended with irqs off ... no overall powerup.
  	 */
 -	device_power_up();
-+	device_power_up(in_suspend ? PMSG_RECOVER : PMSG_RESTORE);
++	device_power_up(in_suspend ?
++		(error ? PMSG_RECOVER : PMSG_THAW) : PMSG_RESTORE);
   Enable_irqs:
  	local_irq_enable();
 +	device_pm_unlock();
  	return error;
  }
  
-@@ -280,7 +282,7 @@ int hibernation_snapshot(int platform_mo
+@@ -280,7 +283,8 @@ int hibernation_snapshot(int platform_mo
   Finish:
  	platform_finish(platform_mode);
   Resume_devices:
 -	device_resume();
-+	device_resume(in_suspend ? PMSG_RECOVER : PMSG_RESTORE);
++	device_resume(in_suspend ?
++		(error ? PMSG_RECOVER : PMSG_THAW) : PMSG_RESTORE);
   Resume_console:
  	resume_console();
   Close:
-@@ -300,8 +302,9 @@ static int resume_target_kernel(void)
+@@ -300,8 +304,9 @@ static int resume_target_kernel(void)
  {
  	int error;
  
@@ -1450,19 +1446,19 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	if (error) {
  		printk(KERN_ERR "PM: Some devices failed to power down, "
  			"aborting resume\n");
-@@ -329,9 +332,10 @@ static int resume_target_kernel(void)
+@@ -329,9 +334,10 @@ static int resume_target_kernel(void)
  	swsusp_free();
  	restore_processor_state();
  	touch_softlockup_watchdog();
 -	device_power_up();
-+	device_power_up(PMSG_THAW);
++	device_power_up(PMSG_RECOVER);
   Enable_irqs:
  	local_irq_enable();
 +	device_pm_unlock();
  	return error;
  }
  
-@@ -350,7 +354,7 @@ int hibernation_restore(int platform_mod
+@@ -350,7 +356,7 @@ int hibernation_restore(int platform_mod
  
  	pm_prepare_console();
  	suspend_console();
@@ -1471,7 +1467,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	if (error)
  		goto Finish;
  
-@@ -362,7 +366,7 @@ int hibernation_restore(int platform_mod
+@@ -362,7 +368,7 @@ int hibernation_restore(int platform_mod
  		enable_nonboot_cpus();
  	}
  	platform_restore_cleanup(platform_mode);
@@ -1480,7 +1476,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
   Finish:
  	resume_console();
  	pm_restore_console();
-@@ -403,6 +407,7 @@ int hibernation_platform_enter(void)
+@@ -403,6 +409,7 @@ int hibernation_platform_enter(void)
  	if (error)
  		goto Finish;
  
@@ -1488,7 +1484,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	local_irq_disable();
  	error = device_power_down(PMSG_HIBERNATE);
  	if (!error) {
-@@ -411,6 +416,7 @@ int hibernation_platform_enter(void)
+@@ -411,6 +418,7 @@ int hibernation_platform_enter(void)
  		while (1);
  	}
  	local_irq_enable();
@@ -1496,7 +1492,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  	/*
  	 * We don't need to reenable the nonboot CPUs or resume consoles, since
-@@ -419,7 +425,7 @@ int hibernation_platform_enter(void)
+@@ -419,7 +427,7 @@ int hibernation_platform_enter(void)
   Finish:
  	hibernation_ops->finish();
   Resume_devices:
