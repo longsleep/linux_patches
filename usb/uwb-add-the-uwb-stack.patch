@@ -30,7 +30,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  drivers/uwb/est.c          |  414 ++++++++++++++++++++++++++
  drivers/uwb/ie.c           |  591 +++++++++++++++++++++++++++++++++++++
  drivers/uwb/lc-dev.c       |  703 ++++++++++++++++++++++++++++++++++++++++++++
- drivers/uwb/lc-rc.c        |  560 +++++++++++++++++++++++++++++++++++
+ drivers/uwb/lc-rc.c        |  499 +++++++++++++++++++++++++++++++
  drivers/uwb/neh.c          |  616 ++++++++++++++++++++++++++++++++++++++
  drivers/uwb/pal.c          |   71 ++++
  drivers/uwb/reset.c        |  328 ++++++++++++++++++++
@@ -40,10 +40,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  drivers/uwb/umc-dev.c      |  104 ++++++
  drivers/uwb/umc-drv.c      |   31 +
  drivers/uwb/uwb-debug.c    |  306 +++++++++++++++++++
- drivers/uwb/uwb-internal.h |  298 ++++++++++++++++++
+ drivers/uwb/uwb-internal.h |  288 ++++++++++++++++++
  drivers/uwb/uwbd.c         |  428 +++++++++++++++++++++++++++
  drivers/uwb/whci.c         |  285 +++++++++++++++++
- 26 files changed, 8071 insertions(+)
+ 26 files changed, 8000 insertions(+)
 
 --- a/drivers/Kconfig
 +++ b/drivers/Kconfig
@@ -4189,7 +4189,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +EXPORT_SYMBOL_GPL(uwb_dev_get_count);
 --- /dev/null
 +++ b/drivers/uwb/lc-rc.c
-@@ -0,0 +1,560 @@
+@@ -0,0 +1,499 @@
 +/*
 + * Ultra Wide Band
 + * Life cycle of radio controllers
@@ -4526,6 +4526,24 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +}
 +EXPORT_SYMBOL_GPL(uwb_rc_rm);
 +
++static int find_rc_try_get(struct device *dev, void *data)
++{
++	struct uwb_rc *target_rc = data;
++	struct uwb_rc *rc = dev_get_drvdata(dev);
++
++	if (rc == NULL) {
++		WARN_ON(1);
++		return 0;
++	}
++	if (rc == target_rc) {
++		if (rc->ready == 0)
++			return 0;
++		else
++			return 1;
++	}
++	return 0;
++}
++
 +/**
 + * Given a radio controller descriptor, validate and refcount it
 + *
@@ -4534,30 +4552,15 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + */
 +struct uwb_rc *__uwb_rc_try_get(struct uwb_rc *target_rc)
 +{
-+	struct class_device *class_dev;
++	struct device *dev;
 +	struct uwb_rc *rc = NULL;
-+	struct list_head *children;
-+	if (uwb_rc_class_lock())
-+		return NULL;
-+	children = &uwb_rc_class->children;
-+	list_for_each_entry(class_dev, children, node) {
-+		rc = class_get_devdata(class_dev);
-+		if (rc == NULL) {
-+			WARN_ON(1);
-+			continue;
-+		}
-+		if (rc == target_rc) {
-+			if (rc->ready == 0)
-+				break;
-+			__uwb_rc_get(rc);
-+			goto out;
-+		}
++
++	dev = class_find_device(uwb_rc_class, target_rc, find_rc_try_get);
++	if (dev) {
++		rc = dev_get_drvdata(dev);
++		__uwb_rc_get(rc);
 +	}
-+	rc = NULL;
-+out:
-+	target_rc = rc;
-+	uwb_rc_class_unlock();
-+	return target_rc;
++	return rc;
 +}
 +EXPORT_SYMBOL_GPL(__uwb_rc_try_get);
 +
@@ -4574,42 +4577,17 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return rc;
 +}
 +
-+
-+/**
-+ * Locate and refcount a radio controller given a father device
-+ *
-+ * @father_dev   Pointer to the 'father' device structure.
-+ * @returns NULL If the rc does not exist or is quiescing; the ptr to
-+ *               it otherwise, properly referenced.
-+ *
-+ * There is no need to lock around as the "father" would be
-+ * refcounted by the target, and to remove the referemes, the
-+ * uwb_rc_class->sem would have to be taken--we hold it, ergo we
-+ * should be safe.
-+ */
-+struct uwb_rc *uwb_rc_get_by_father(const struct device *father_dev)
++static int find_rc_grandpa(struct device *dev, void *data)
 +{
-+	struct class_device *class_dev;
-+	struct uwb_rc *rc;
-+	struct list_head *children;
++	struct device *grandpa_dev = data;
++	struct uwb_rc *rc = dev_get_drvdata(dev);
 +
-+	if (uwb_rc_class_lock())
-+		return NULL;
-+	children = &uwb_rc_class->children;
-+	list_for_each_entry(class_dev, children, node) {
-+		rc = class_get_devdata(class_dev);
-+		if (rc->uwb_dev.dev.parent == father_dev) {
-+			rc = uwb_rc_get(rc);
-+			goto out;
-+		}
++	if (rc->uwb_dev.dev.parent->parent == grandpa_dev) {
++		rc = uwb_rc_get(rc);
++		return 1;
 +	}
-+	rc = NULL;
-+out:
-+	uwb_rc_class_unlock();
-+	return rc;
++	return 0;
 +}
-+EXPORT_SYMBOL_GPL(uwb_rc_get_by_father);
-+
 +
 +/**
 + * Locate and refcount a radio controller given a common grand-parent
@@ -4629,23 +4607,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + */
 +struct uwb_rc *uwb_rc_get_by_grandpa(const struct device *grandpa_dev)
 +{
-+	struct class_device *class_dev;
-+	struct uwb_rc *rc;
-+	struct list_head *children;
++	struct device *dev;
++	struct uwb_rc *rc = NULL;
 +
-+	if (uwb_rc_class_lock())
-+		return NULL;
-+	children = &uwb_rc_class->children;
-+	list_for_each_entry(class_dev, children, node) {
-+		rc = class_get_devdata(class_dev);
-+		if (rc->uwb_dev.dev.parent->parent == grandpa_dev) {
-+			rc = uwb_rc_get(rc);
-+			goto out;
-+		}
-+	}
-+	rc = NULL;
-+out:
-+	uwb_rc_class_unlock();
++	dev = class_find_device(uwb_rc_class, (void *)grandpa_dev,
++				find_rc_grandpa);
++	if (dev)
++		rc = dev_get_drvdata(dev);
 +	return rc;
 +}
 +EXPORT_SYMBOL_GPL(uwb_rc_get_by_grandpa);
@@ -4655,64 +4623,35 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + *
 + * @returns the pointer to the radio controller, properly referenced
 + */
++static int find_rc_dev(struct device *dev, void *data)
++{
++	struct uwb_dev_addr *addr = data;
++	struct uwb_rc *rc = dev_get_drvdata(dev);
++
++	if (rc == NULL) {
++		WARN_ON(1);
++		return 0;
++	}
++	if (!uwb_dev_addr_cmp(&rc->uwb_dev.dev_addr, addr)) {
++		rc = uwb_rc_get(rc);
++		return 1;
++	}
++	return 0;
++}
++
 +struct uwb_rc *uwb_rc_get_by_dev(const struct uwb_dev_addr *addr)
 +{
-+	struct class_device *class_dev;
++	struct device *dev;
 +	struct uwb_rc *rc = NULL;
-+	struct list_head *children;
 +
-+	if (uwb_rc_class_lock())
-+		return NULL;
-+	children = &uwb_rc_class->children;
-+	list_for_each_entry(class_dev, children, node) {
-+		rc = class_get_devdata(class_dev);
-+		if (rc == NULL) {
-+			WARN_ON(1);
-+			continue;
-+		}
-+		if (!uwb_dev_addr_cmp(&rc->uwb_dev.dev_addr, addr)) {
-+			rc = uwb_rc_get(rc);
-+			goto out;
-+		}
-+	}
-+	rc = NULL;
-+out:
-+	uwb_rc_class_unlock();
++	dev = class_find_device(uwb_rc_class, (void *)addr,
++				find_rc_dev);
++	if (dev)
++		rc = dev_get_drvdata(dev);
++
 +	return rc;
 +}
 +EXPORT_SYMBOL_GPL(uwb_rc_get_by_dev);
-+
-+/**
-+ * Find a radio controller by name
-+ *
-+ * @returns the pointer to the radio controller, properly referenced
-+ */
-+struct uwb_rc * uwb_rc_get_by_name(const char *name)
-+{
-+	struct class_device *class_dev;
-+	struct uwb_rc *rc = NULL;
-+	struct list_head *children;
-+
-+	if (uwb_rc_class_lock())
-+		return NULL;
-+	children = &uwb_rc_class->children;
-+	list_for_each_entry(class_dev, children, node) {
-+		rc = class_get_devdata(class_dev);
-+		if (rc == NULL) {
-+			WARN_ON(1);
-+			continue;
-+		}
-+		if (!strcmp(class_dev->class_id, name)) {
-+			rc = uwb_rc_get(rc);
-+			goto out;
-+		}
-+	}
-+	rc = NULL;
-+out:
-+	uwb_rc_class_unlock();
-+	return rc;
-+}
-+EXPORT_SYMBOL_GPL(uwb_rc_get_by_name);
 +
 +/**
 + * Drop a reference on a radio controller
@@ -7188,7 +7127,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +}
 --- /dev/null
 +++ b/drivers/uwb/uwb-internal.h
-@@ -0,0 +1,298 @@
+@@ -0,0 +1,288 @@
 +/*
 + * Ultra Wide Band
 + * UWB internal API
@@ -7465,16 +7404,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +void uwb_dbg_del_rc(struct uwb_rc *rc);
 +
 +/* Workarounds for version specific stuff */
-+
-+static inline int uwb_rc_class_lock(void)
-+{
-+	return down_interruptible(&uwb_rc_class->sem);
-+}
-+
-+static inline void uwb_rc_class_unlock(void)
-+{
-+	up(&uwb_rc_class->sem);
-+}
 +
 +static inline void uwb_dev_lock(struct uwb_dev *uwb_dev)
 +{

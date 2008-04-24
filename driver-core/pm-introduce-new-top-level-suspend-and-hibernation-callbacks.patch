@@ -50,14 +50,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
  arch/x86/kernel/apm_32.c   |    8 
- drivers/base/power/main.c  |  693 ++++++++++++++++++++++++++++++++++-----------
+ drivers/base/power/main.c  |  688 ++++++++++++++++++++++++++++++++++-----------
  drivers/base/power/power.h |    2 
  drivers/base/power/trace.c |    4 
  include/linux/device.h     |    9 
  include/linux/pm.h         |  314 ++++++++++++++++++--
  kernel/power/disk.c        |   20 -
  kernel/power/main.c        |    6 
- 8 files changed, 852 insertions(+), 204 deletions(-)
+ 8 files changed, 851 insertions(+), 200 deletions(-)
 
 --- a/arch/x86/kernel/apm_32.c
 +++ b/arch/x86/kernel/apm_32.c
@@ -163,26 +163,20 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  /**
   *	device_pm_add - add a device to the list of active devices
-@@ -68,22 +75,32 @@ int device_pm_add(struct device *dev)
+@@ -68,19 +75,32 @@ int device_pm_add(struct device *dev)
  		 dev->bus ? dev->bus->name : "No Bus",
  		 kobject_name(&dev->kobj));
  	mutex_lock(&dpm_list_mtx);
 -	if ((dev->parent && dev->parent->power.sleeping) || all_sleeping) {
 -		if (dev->parent->power.sleeping)
--			dev_warn(dev,
--				"parent %s is sleeping, will not add\n",
+-			dev_warn(dev, "parent %s is sleeping\n",
 +	if (dev->parent) {
 +		if (dev->parent->power.status >= DPM_SUSPENDING) {
 +			dev_warn(dev, "parent %s is sleeping, will not add\n",
  				dev->parent->bus_id);
 -		else
--			dev_warn(dev, "devices are sleeping, will not add\n");
+-			dev_warn(dev, "all devices are sleeping\n");
 -		WARN_ON(true);
--		error = -EBUSY;
--	} else {
--		error = dpm_sysfs_add(dev);
--		if (!error)
--			list_add_tail(&dev->power.entry, &dpm_active);
 +			goto Refuse;
 +		}
 +	} else if (transition_started) {
@@ -192,23 +186,25 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		 * unhandled down the road
 +		 */
 +		goto Refuse;
-+	}
-+	error = dpm_sysfs_add(dev);
+ 	}
+ 	error = dpm_sysfs_add(dev);
+-	if (!error)
+-		list_add_tail(&dev->power.entry, &dpm_active);
 +	if (!error) {
 +		dev->power.status = DPM_ON;
 +		list_add_tail(&dev->power.entry, &dpm_list);
- 	}
-+ End:
++  	}
++End:
  	mutex_unlock(&dpm_list_mtx);
  	return error;
-+ Refuse:
++Refuse:
 +	WARN_ON(true);
 +	error = -EBUSY;
 +	goto End;
  }
  
  /**
-@@ -103,73 +120,241 @@ void device_pm_remove(struct device *dev
+@@ -100,73 +120,241 @@ void device_pm_remove(struct device *dev
  	mutex_unlock(&dpm_list_mtx);
  }
  
@@ -471,7 +467,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  {
  	int error = 0;
  
-@@ -178,21 +363,40 @@ static int resume_device(struct device *
+@@ -175,21 +363,40 @@ static int resume_device(struct device *
  
  	down(&dev->sem);
  
@@ -522,7 +518,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	up(&dev->sem);
  
  	TRACE_RESUME(error);
-@@ -201,78 +405,161 @@ static int resume_device(struct device *
+@@ -198,78 +405,161 @@ static int resume_device(struct device *
  
  /**
   *	dpm_resume - Resume every device.
@@ -720,7 +716,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		error = dev->bus->suspend_late(dev, state);
  		suspend_report_result(dev->bus->suspend_late, error);
  	}
-@@ -281,37 +568,30 @@ static int suspend_device_late(struct de
+@@ -278,37 +568,30 @@ static int suspend_device_late(struct de
  
  /**
   *	device_power_down - Shut down special devices.
@@ -766,7 +762,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	return error;
  }
  EXPORT_SYMBOL_GPL(device_power_down);
-@@ -319,7 +599,7 @@ EXPORT_SYMBOL_GPL(device_power_down);
+@@ -316,7 +599,7 @@ EXPORT_SYMBOL_GPL(device_power_down);
  /**
   *	suspend_device - Save state of one device.
   *	@dev:	Device.
@@ -775,7 +771,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
   */
  static int suspend_device(struct device *dev, pm_message_t state)
  {
-@@ -327,24 +607,43 @@ static int suspend_device(struct device 
+@@ -324,24 +607,43 @@ static int suspend_device(struct device 
  
  	down(&dev->sem);
  
@@ -835,7 +831,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	up(&dev->sem);
  
  	return error;
-@@ -352,67 +651,141 @@ static int suspend_device(struct device 
+@@ -349,67 +651,141 @@ static int suspend_device(struct device 
  
  /**
   *	dpm_suspend - Suspend every device.
