@@ -1,0 +1,329 @@
+From linux-usb-owner@vger.kernel.org Mon Apr 28 07:22:16 2008
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Mon, 28 Apr 2008 10:21:05 -0400 (EDT)
+Subject: USB: create attributes before sending uevent
+To: Greg KH <greg@kroah.com>
+Cc: Kay Sievers <kay.sievers@vrfy.org>, USB list <linux-usb@vger.kernel.org>
+Message-ID: <Pine.LNX.4.44L0.0804281018220.5827-100000@iolanthe.rowland.org>
+
+
+This patch (as1087b) fixes a long-standing problem in usbcore: Device,
+interface, and endpoint attributes aren't added until _after_ the
+creation uevent has already been broadcast.
+
+Unfortunately there are a few attributes which cannot be created that
+early.  The "descriptors" attribute is binary and so must be created
+separately.  The power-management attributes can't be created until
+the dev/power/ group exists.  And the interface string can vary from
+one altsetting to another, so it has to be created dynamically.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Cc: Kay Sievers <kay.sievers@vrfy.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ drivers/usb/core/endpoint.c |   11 +--
+ drivers/usb/core/message.c  |    1 
+ drivers/usb/core/sysfs.c    |  136 +++++++++++++++++++++++++++-----------------
+ drivers/usb/core/usb.c      |    1 
+ drivers/usb/core/usb.h      |    4 +
+ 5 files changed, 95 insertions(+), 58 deletions(-)
+
+--- a/drivers/usb/core/endpoint.c
++++ b/drivers/usb/core/endpoint.c
+@@ -156,6 +156,10 @@ static struct attribute *ep_dev_attrs[] 
+ static struct attribute_group ep_dev_attr_grp = {
+ 	.attrs = ep_dev_attrs,
+ };
++static struct attribute_group *ep_dev_groups[] = {
++	&ep_dev_attr_grp,
++	NULL
++};
+ 
+ static int usb_endpoint_major_init(void)
+ {
+@@ -298,6 +302,7 @@ int usb_create_ep_files(struct device *p
+ 
+ 	ep_dev->desc = &endpoint->desc;
+ 	ep_dev->udev = udev;
++	ep_dev->dev.groups = ep_dev_groups;
+ 	ep_dev->dev.devt = MKDEV(usb_endpoint_major, ep_dev->minor);
+ 	ep_dev->dev.class = ep_class->class;
+ 	ep_dev->dev.parent = parent;
+@@ -309,9 +314,6 @@ int usb_create_ep_files(struct device *p
+ 	retval = device_register(&ep_dev->dev);
+ 	if (retval)
+ 		goto error_chrdev;
+-	retval = sysfs_create_group(&ep_dev->dev.kobj, &ep_dev_attr_grp);
+-	if (retval)
+-		goto error_group;
+ 
+ 	/* create the symlink to the old-style "ep_XX" directory */
+ 	sprintf(name, "ep_%02x", endpoint->desc.bEndpointAddress);
+@@ -322,8 +324,6 @@ int usb_create_ep_files(struct device *p
+ 	return retval;
+ 
+ error_link:
+-	sysfs_remove_group(&ep_dev->dev.kobj, &ep_dev_attr_grp);
+-error_group:
+ 	device_unregister(&ep_dev->dev);
+ 	destroy_endpoint_class();
+ 	return retval;
+@@ -348,7 +348,6 @@ void usb_remove_ep_files(struct usb_host
+ 
+ 		sprintf(name, "ep_%02x", endpoint->desc.bEndpointAddress);
+ 		sysfs_remove_link(&ep_dev->dev.parent->kobj, name);
+-		sysfs_remove_group(&ep_dev->dev.kobj, &ep_dev_attr_grp);
+ 		device_unregister(&ep_dev->dev);
+ 		endpoint->ep_dev = NULL;
+ 		destroy_endpoint_class();
+--- a/drivers/usb/core/message.c
++++ b/drivers/usb/core/message.c
+@@ -1605,6 +1605,7 @@ free_interfaces:
+ 		intf->dev.driver = NULL;
+ 		intf->dev.bus = &usb_bus_type;
+ 		intf->dev.type = &usb_if_device_type;
++		intf->dev.groups = usb_interface_groups;
+ 		intf->dev.dma_mask = dev->dev.dma_mask;
+ 		device_initialize(&intf->dev);
+ 		mark_quiesced(intf);
+--- a/drivers/usb/core/sysfs.c
++++ b/drivers/usb/core/sysfs.c
+@@ -538,6 +538,47 @@ static struct attribute_group dev_attr_g
+ 	.attrs = dev_attrs,
+ };
+ 
++/* The index numbers defined here are used for selecting attributes
++ * in dev_string_attrs_are_visible() below.
++ */
++static struct attribute *dev_string_attrs[] = {
++#define MANUFACTURER_ATTR_INDEX		0
++	&dev_attr_manufacturer.attr,
++#define PRODUCT_ATTR_INDEX		1
++	&dev_attr_product.attr,
++#define SERIAL_ATTR_INDEX		2
++	&dev_attr_serial.attr,
++	NULL
++};
++
++static int dev_string_attrs_are_visible(struct kobject *kobj,
++		struct attribute *a, int n)
++{
++	struct usb_device *udev = to_usb_device(
++			container_of(kobj, struct device, kobj));
++
++	switch (n) {
++	case MANUFACTURER_ATTR_INDEX:
++		return (udev->manufacturer != NULL);
++	case PRODUCT_ATTR_INDEX:
++		return (udev->product != NULL);
++	case SERIAL_ATTR_INDEX:
++		return (udev->serial != NULL);
++	}
++	return 0;
++}
++
++static struct attribute_group dev_string_attr_grp = {
++	.attrs =	dev_string_attrs,
++	.is_visible =	dev_string_attrs_are_visible,
++};
++
++struct attribute_group *usb_device_groups[] = {
++	&dev_attr_grp,
++	&dev_string_attr_grp,
++	NULL
++};
++
+ /* Binary descriptors */
+ 
+ static ssize_t
+@@ -591,10 +632,9 @@ int usb_create_sysfs_dev_files(struct us
+ 	struct device *dev = &udev->dev;
+ 	int retval;
+ 
+-	retval = sysfs_create_group(&dev->kobj, &dev_attr_grp);
+-	if (retval)
+-		return retval;
+-
++	/* Unforunately these attributes cannot be created before
++	 * the uevent is broadcast.
++	 */
+ 	retval = device_create_bin_file(dev, &dev_bin_attr_descriptors);
+ 	if (retval)
+ 		goto error;
+@@ -607,21 +647,6 @@ int usb_create_sysfs_dev_files(struct us
+ 	if (retval)
+ 		goto error;
+ 
+-	if (udev->manufacturer) {
+-		retval = device_create_file(dev, &dev_attr_manufacturer);
+-		if (retval)
+-			goto error;
+-	}
+-	if (udev->product) {
+-		retval = device_create_file(dev, &dev_attr_product);
+-		if (retval)
+-			goto error;
+-	}
+-	if (udev->serial) {
+-		retval = device_create_file(dev, &dev_attr_serial);
+-		if (retval)
+-			goto error;
+-	}
+ 	retval = usb_create_ep_files(dev, &udev->ep0, udev);
+ 	if (retval)
+ 		goto error;
+@@ -636,13 +661,9 @@ void usb_remove_sysfs_dev_files(struct u
+ 	struct device *dev = &udev->dev;
+ 
+ 	usb_remove_ep_files(&udev->ep0);
+-	device_remove_file(dev, &dev_attr_manufacturer);
+-	device_remove_file(dev, &dev_attr_product);
+-	device_remove_file(dev, &dev_attr_serial);
+ 	remove_power_attributes(dev);
+ 	remove_persist_attributes(dev);
+ 	device_remove_bin_file(dev, &dev_bin_attr_descriptors);
+-	sysfs_remove_group(&dev->kobj, &dev_attr_grp);
+ }
+ 
+ /* Interface Accociation Descriptor fields */
+@@ -688,17 +709,15 @@ static ssize_t show_interface_string(str
+ 		struct device_attribute *attr, char *buf)
+ {
+ 	struct usb_interface *intf;
+-	struct usb_device *udev;
+-	int len;
++	char *string;
+ 
+ 	intf = to_usb_interface(dev);
+-	udev = interface_to_usbdev(intf);
+-	len = snprintf(buf, 256, "%s", intf->cur_altsetting->string);
+-	if (len < 0)
++	string = intf->cur_altsetting->string;
++	barrier();		/* The altsetting might change! */
++
++	if (!string)
+ 		return 0;
+-	buf[len] = '\n';
+-	buf[len+1] = 0;
+-	return len+1;
++	return sprintf(buf, "%s\n", string);
+ }
+ static DEVICE_ATTR(interface, S_IRUGO, show_interface_string, NULL);
+ 
+@@ -727,18 +746,6 @@ static ssize_t show_modalias(struct devi
+ }
+ static DEVICE_ATTR(modalias, S_IRUGO, show_modalias, NULL);
+ 
+-static struct attribute *intf_assoc_attrs[] = {
+-	&dev_attr_iad_bFirstInterface.attr,
+-	&dev_attr_iad_bInterfaceCount.attr,
+-	&dev_attr_iad_bFunctionClass.attr,
+-	&dev_attr_iad_bFunctionSubClass.attr,
+-	&dev_attr_iad_bFunctionProtocol.attr,
+-	NULL,
+-};
+-static struct attribute_group intf_assoc_attr_grp = {
+-	.attrs = intf_assoc_attrs,
+-};
+-
+ static struct attribute *intf_attrs[] = {
+ 	&dev_attr_bInterfaceNumber.attr,
+ 	&dev_attr_bAlternateSetting.attr,
+@@ -753,6 +760,35 @@ static struct attribute_group intf_attr_
+ 	.attrs = intf_attrs,
+ };
+ 
++static struct attribute *intf_assoc_attrs[] = {
++	&dev_attr_iad_bFirstInterface.attr,
++	&dev_attr_iad_bInterfaceCount.attr,
++	&dev_attr_iad_bFunctionClass.attr,
++	&dev_attr_iad_bFunctionSubClass.attr,
++	&dev_attr_iad_bFunctionProtocol.attr,
++	NULL,
++};
++
++static int intf_assoc_attrs_are_visible(struct kobject *kobj,
++		struct attribute *a, int n)
++{
++	struct usb_interface *intf = to_usb_interface(
++			container_of(kobj, struct device, kobj));
++
++	return (intf->intf_assoc != NULL);
++}
++
++static struct attribute_group intf_assoc_attr_grp = {
++	.attrs =	intf_assoc_attrs,
++	.is_visible =	intf_assoc_attrs_are_visible,
++};
++
++struct attribute_group *usb_interface_groups[] = {
++	&intf_attr_grp,
++	&intf_assoc_attr_grp,
++	NULL
++};
++
+ static inline void usb_create_intf_ep_files(struct usb_interface *intf,
+ 		struct usb_device *udev)
+ {
+@@ -777,23 +813,21 @@ static inline void usb_remove_intf_ep_fi
+ 
+ int usb_create_sysfs_intf_files(struct usb_interface *intf)
+ {
+-	struct device *dev = &intf->dev;
+ 	struct usb_device *udev = interface_to_usbdev(intf);
+ 	struct usb_host_interface *alt = intf->cur_altsetting;
+ 	int retval;
+ 
+ 	if (intf->sysfs_files_created)
+ 		return 0;
+-	retval = sysfs_create_group(&dev->kobj, &intf_attr_grp);
+-	if (retval)
+-		return retval;
+ 
++	/* The interface string may be present in some altsettings
++	 * and missing in others.  Hence its attribute cannot be created
++	 * before the uevent is broadcast.
++	 */
+ 	if (alt->string == NULL)
+ 		alt->string = usb_cache_string(udev, alt->desc.iInterface);
+ 	if (alt->string)
+-		retval = device_create_file(dev, &dev_attr_interface);
+-	if (intf->intf_assoc)
+-		retval = sysfs_create_group(&dev->kobj, &intf_assoc_attr_grp);
++		retval = device_create_file(&intf->dev, &dev_attr_interface);
+ 	usb_create_intf_ep_files(intf, udev);
+ 	intf->sysfs_files_created = 1;
+ 	return 0;
+@@ -807,7 +841,5 @@ void usb_remove_sysfs_intf_files(struct 
+ 		return;
+ 	usb_remove_intf_ep_files(intf);
+ 	device_remove_file(dev, &dev_attr_interface);
+-	sysfs_remove_group(&dev->kobj, &intf_attr_grp);
+-	sysfs_remove_group(&intf->dev.kobj, &intf_assoc_attr_grp);
+ 	intf->sysfs_files_created = 0;
+ }
+--- a/drivers/usb/core/usb.c
++++ b/drivers/usb/core/usb.c
+@@ -291,6 +291,7 @@ struct usb_device *usb_alloc_dev(struct 
+ 	device_initialize(&dev->dev);
+ 	dev->dev.bus = &usb_bus_type;
+ 	dev->dev.type = &usb_device_type;
++	dev->dev.groups = usb_device_groups;
+ 	dev->dev.dma_mask = bus->controller->dma_mask;
+ 	set_dev_node(&dev->dev, dev_to_node(bus->controller));
+ 	dev->state = USB_STATE_ATTACHED;
+--- a/drivers/usb/core/usb.h
++++ b/drivers/usb/core/usb.h
+@@ -130,6 +130,10 @@ static inline int is_active(const struct
+ /* for labeling diagnostics */
+ extern const char *usbcore_name;
+ 
++/* sysfs stuff */
++extern struct attribute_group *usb_device_groups[];
++extern struct attribute_group *usb_interface_groups[];
++
+ /* usbfs stuff */
+ extern struct mutex usbfs_mutex;
+ extern struct usb_driver usbfs_driver;
