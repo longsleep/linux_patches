@@ -39,9 +39,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  fs/novfs/nwerror.h  |  658 ++++++
  fs/novfs/proc.c     |  152 +
  fs/novfs/profile.c  |  687 ++++++
- fs/novfs/scope.c    |  738 ++++++
- fs/novfs/vfs.h      |  447 ++++
- 14 files changed, 18853 insertions(+)
+ fs/novfs/scope.c    |  675 ++++++
+ fs/novfs/vfs.h      |  449 ++++
+ 14 files changed, 18792 insertions(+)
 
 --- a/fs/Kconfig
 +++ b/fs/Kconfig
@@ -17758,7 +17758,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 --- /dev/null
 +++ b/fs/novfs/scope.c
-@@ -0,0 +1,738 @@
+@@ -0,0 +1,675 @@
 +/*
 + * Novell NCP Redirector for Linux
 + * Author:           James Turner
@@ -17790,40 +17790,38 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +#include "vfs.h"
 +
-+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,18)
-+typedef struct task_struct task_t;
-+#endif
-+
 +#define SHUTDOWN_INTERVAL     5
 +#define CLEANUP_INTERVAL      10
 +#define MAX_USERNAME_LENGTH   32
 +
-+typedef struct _SCOPE_LIST_ {
-+	struct list_head ScopeList;
++struct scope_list {
++	struct list_head entry;
 +	scope_t ScopeId;
 +	session_t SessionId;
 +	pid_t ScopePid;
-+	task_t *ScopeTask;
++	struct task_struct *ScopeTask;
 +	unsigned int ScopeHash;
 +	uid_t ScopeUid;
-+	uint64_t ScopeUSize;
-+	uint64_t ScopeUFree;
-+	uint64_t ScopeUTEnties;
-+	uint64_t ScopeUAEnties;
++	u64 ScopeUSize;
++	u64 ScopeUFree;
++	u64 ScopeUTEnties;
++	u64 ScopeUAEnties;
 +	int ScopeUserNameLength;
 +	unsigned char ScopeUserName[MAX_USERNAME_LENGTH];
-+} SCOPE_LIST, *PSCOPE_LIST;
++};
 +
 +static struct list_head Scope_List;
 +static struct semaphore Scope_Lock;
 +static struct semaphore Scope_Thread_Delay;
-+static int Scope_Thread_Terminate = 0;
++static int Scope_Thread_Terminate;
 +static struct timer_list Scope_Timer;
 +static unsigned int Scope_Hash_Val = 1;
 +
-+static PSCOPE_LIST Scope_Search4Scope(session_t Id, BOOLEAN Session, BOOLEAN Locked)
++static struct scope_list *Scope_Search4Scope(session_t Id, bool Session,
++					     bool Locked)
 +{
-+	PSCOPE_LIST scope, rscope = NULL;
++	struct scope_list *scope;
++	struct scope_list *rscope = NULL;
 +	session_t cur_scope;
 +	struct list_head *sl;
 +	int offset;
@@ -17832,18 +17830,17 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		 Session, Locked);
 +
 +	if (Session)
-+		offset = offsetof(SCOPE_LIST, SessionId);
++		offset = offsetof(struct scope_list, SessionId);
 +	else
-+		offset = offsetof(SCOPE_LIST, ScopeId);
++		offset = offsetof(struct scope_list, ScopeId);
 +
-+	if (!Locked) {
++	if (!Locked)
 +		down(&Scope_Lock);
-+	}
 +
 +	sl = Scope_List.next;
 +	DbgPrint("Scope_Search4Scope: 0x%p\n", sl);
 +	while (sl != &Scope_List) {
-+		scope = list_entry(sl, SCOPE_LIST, ScopeList);
++		scope = list_entry(sl, struct scope_list, entry);
 +
 +		cur_scope = *(session_t *) ((char *)scope + offset);
 +		if (SC_EQUAL(Id, cur_scope)) {
@@ -17854,18 +17851,18 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		sl = sl->next;
 +	}
 +
-+	if (!Locked) {
++	if (!Locked)
 +		up(&Scope_Lock);
-+	}
 +
 +	DbgPrint("Scope_Search4Scope: return 0x%p\n", rscope);
-+	return (rscope);
++	return rscope;
 +}
 +
-+static PSCOPE_LIST Scope_Find_Scope(BOOLEAN Create)
++static struct scope_list *Scope_Find_Scope(bool Create)
 +{
-+	PSCOPE_LIST scope = NULL, pscope = NULL;
-+	task_t *task;
++	struct scope_list *scope = NULL;
++	struct scope_list *pscope = NULL;
++	struct task_struct *task;
 +	scope_t scopeId;
 +	int addscope = 0;
 +
@@ -17874,7 +17871,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	DbgPrint("Scope_Find_Scope: %d %d %d %d\n", task->uid, task->euid,
 +		 task->suid, task->fsuid);
 +
-+	//scopeId = task->euid;
++	/* scopeId = task->euid; */
 +	UID_TO_SCHANDLE(scopeId, task->euid);
 +
 +	scope = Scope_Search4Scope(scopeId, 0, 0);
@@ -17893,8 +17890,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	scope->ScopeUserName[0] = '\0';
 +
 +	if (!Daemon_CreateSessionId(&scope->SessionId)) {
-+		DbgPrint("Scope_Find_Scope2: %d %d %d %d\n", task->uid, task->euid,
-+			 task->suid, task->fsuid);
++		DbgPrint("Scope_Find_Scope2: %d %d %d %d\n", task->uid,
++			 task->euid, task->suid, task->fsuid);
 +		memset(scope->ScopeUserName, 0, sizeof(scope->ScopeUserName));
 +		scope->ScopeUserNameLength = 0;
 +		Daemon_getpwuid(task->euid, sizeof(scope->ScopeUserName),
@@ -17927,7 +17924,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		down(&Scope_Lock);
 +		pscope = Scope_Search4Scope(scopeId, 0, 1);
 +		if (!pscope)
-+			list_add(&scope->ScopeList, &Scope_List);
++			list_add(&scope->entry, &Scope_List);
 +		up(&Scope_Lock);
 +
 +		if (pscope) {
@@ -17943,16 +17940,15 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		scope = NULL;
 +	}
 +
-+	if (addscope) {
++	if (addscope)
 +		Novfs_Add_to_Root(scope->ScopeUserName);
-+	}
 +
-+	return (scope);
++	return scope;
 +}
 +
-+static int Scope_Validate_Scope(PSCOPE_LIST Scope)
++static int Scope_Validate_Scope(struct scope_list *Scope)
 +{
-+	PSCOPE_LIST s;
++	struct scope_list *s;
 +	struct list_head *sl;
 +	int retVal = 0;
 +
@@ -17962,7 +17958,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	sl = Scope_List.next;
 +	while (sl != &Scope_List) {
-+		s = list_entry(sl, SCOPE_LIST, ScopeList);
++		s = list_entry(sl, struct scope_list, entry);
 +
 +		if (s == Scope) {
 +			retVal = 1;
@@ -17974,28 +17970,28 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	up(&Scope_Lock);
 +
-+	return (retVal);
++	return retVal;
 +}
 +
-+// FIXME void stuff
++/* FIXME void stuff */
 +uid_t Scope_Get_Uid(void *foo)
 +{
-+	PSCOPE_LIST scope = foo;
++	struct scope_list *scope = foo;
 +	uid_t uid = 0;
 +
 +	if (!scope)
 +		scope = Scope_Find_Scope(1);
 +
-+	if (scope && Scope_Validate_Scope(scope)) {
++	if (scope && Scope_Validate_Scope(scope))
 +		uid = scope->ScopeUid;
-+	}
++
 +	return uid;
 +}
 +
 +char *Scope_Get_UserName(void)
 +{
 +	char *name = NULL;
-+	PSCOPE_LIST Scope;
++	struct scope_list *Scope;
 +
 +	Scope = Scope_Find_Scope(1);
 +
@@ -18005,58 +18001,56 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return name;
 +}
 +
-+// FIXME the void * needs to get fixed...
-+session_t Scope_Get_SessionId(void * foo)
++/* FIXME the void * needs to get fixed... */
++session_t Scope_Get_SessionId(void *foo)
 +{
 +	session_t sessionId;
-+	PSCOPE_LIST Scope = foo;
++	struct scope_list *Scope = foo;
 +
 +	DbgPrint("Scope_Get_SessionId: 0x%p\n", Scope);
 +	SC_INITIALIZE(sessionId);
-+	if (!Scope) {
++	if (!Scope)
 +		Scope = Scope_Find_Scope(1);
-+	}
 +
-+	if (Scope && Scope_Validate_Scope(Scope)) {
++	if (Scope && Scope_Validate_Scope(Scope))
 +		sessionId = Scope->SessionId;
-+	}
++
 +	DbgPrint("Scope_Get_SessionId: return 0x%p:%p\n", sessionId.hTypeId,
 +		 sessionId.hId);
-+	return (sessionId);
++	return sessionId;
 +}
 +
-+PSCOPE_LIST Scope_Get_ScopefromName(struct qstr * Name)
++struct scope_list *Scope_Get_ScopefromName(struct qstr *name)
 +{
-+	PSCOPE_LIST scope, rscope = NULL;
++	struct scope_list *scope;
++	struct scope_list *rscope = NULL;
 +	struct list_head *sl;
 +
-+	DbgPrint("Scope_Get_ScopefromName: %.*s\n", Name->len, Name->name);
++	DbgPrint("Scope_Get_ScopefromName: %.*s\n", name->len, name->name);
 +
 +	down(&Scope_Lock);
 +
 +	sl = Scope_List.next;
 +	while (sl != &Scope_List) {
-+		scope = list_entry(sl, SCOPE_LIST, ScopeList);
++		scope = list_entry(sl, struct scope_list, entry);
 +
-+		if ((Name->len == scope->ScopeUserNameLength) &&
-+		    (0 == strncmp(scope->ScopeUserName, Name->name, Name->len)))
-+		{
++		if ((name->len == scope->ScopeUserNameLength) &&
++		    (strncmp(scope->ScopeUserName, name->name, name->len) == 0)) {
 +			rscope = scope;
 +			break;
 +		}
-+
 +		sl = sl->next;
 +	}
 +
 +	up(&Scope_Lock);
 +
-+	return (rscope);
++	return rscope;
 +}
 +
-+int Scope_Set_UserSpace(uint64_t * TotalSize, uint64_t * Free,
-+			uint64_t * TotalEnties, uint64_t * FreeEnties)
++int Scope_Set_UserSpace(u64 *TotalSize, u64 *Free,
++			u64 *TotalEnties, u64 *FreeEnties)
 +{
-+	PSCOPE_LIST scope;
++	struct scope_list *scope;
 +	int retVal = 0;
 +
 +	scope = Scope_Find_Scope(1);
@@ -18072,16 +18066,16 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			scope->ScopeUAEnties = *FreeEnties;
 +	}
 +
-+	return (retVal);
++	return retVal;
 +}
 +
-+int Scope_Get_UserSpace(uint64_t * TotalSize, uint64_t * Free,
-+			uint64_t * TotalEnties, uint64_t * FreeEnties)
++int Scope_Get_UserSpace(u64 *TotalSize, u64 *Free,
++			u64 *TotalEnties, u64 *FreeEnties)
 +{
-+	PSCOPE_LIST scope;
++	struct scope_list *scope;
 +	int retVal = 0;
 +
-+	uint64_t td, fd, te, fe;
++	u64 td, fd, te, fe;
 +
 +	scope = Scope_Find_Scope(1);
 +
@@ -18106,18 +18100,18 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	if (FreeEnties)
 +		*FreeEnties = fe;
 +
-+	return (retVal);
++	return retVal;
 +}
 +
-+PSCOPE_LIST Scope_Get_ScopefromPath(struct dentry * Dentry)
++struct scope_list *Scope_Get_ScopefromPath(struct dentry *dentry)
 +{
-+	PSCOPE_LIST scope = NULL;
++	struct scope_list *scope = NULL;
 +	char *buf, *path, *cp;
 +	struct qstr name;
 +
 +	buf = kmalloc(PATH_LENGTH_BUFFER, GFP_KERNEL);
 +	if (buf) {
-+		path = Scope_dget_path(Dentry, buf, PATH_LENGTH_BUFFER, 0);
++		path = Scope_dget_path(dentry, buf, PATH_LENGTH_BUFFER, 0);
 +		if (path) {
 +			DbgPrint("Scope_Get_ScopefromPath: %s\n", path);
 +
@@ -18139,24 +18133,23 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		kfree(buf);
 +	}
 +
-+	return (scope);
++	return scope;
 +}
 +
-+static char *add_to_list(char *Name, char *List, char *EndOfList)
++static char *add_to_list(char *name, char *list, char *endoflist)
 +{
-+	while (*Name && (List < EndOfList)) {
-+		*List++ = *Name++;
-+	}
++	while (*name && (list < endoflist))
++		*list++ = *name++;
 +
-+	if (List < EndOfList) {
-+		*List++ = '\0';
-+	}
-+	return (List);
++	if (list < endoflist)
++		*list++ = '\0';
++
++	return list;
 +}
 +
 +char *Scope_Get_ScopeUsers(void)
 +{
-+	PSCOPE_LIST scope;
++	struct scope_list *scope;
 +	struct list_head *sl;
 +	int asize = 8 * MAX_USERNAME_LENGTH;
 +	char *list, *cp, *ep;
@@ -18181,7 +18174,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +			sl = Scope_List.next;
 +			while ((sl != &Scope_List) && (cp < ep)) {
-+				scope = list_entry(sl, SCOPE_LIST, ScopeList);
++				scope = list_entry(sl, struct scope_list, entry);
 +
 +				DbgPrint("Scope_Get_ScopeUsers found 0x%p %s\n",
 +					 scope, scope->ScopeUserName);
@@ -18205,17 +18198,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +			break;
 +		}
-+	} while (!list);	/* List was to small try again */
++	} while (!list);	/* list was to small try again */
 +
-+	return (list);
++	return list;
 +}
 +
 +void *Scope_Lookup(void)
 +{
-+	PSCOPE_LIST scope;
-+
-+	scope = Scope_Find_Scope(1);
-+	return (scope);
++	return Scope_Find_Scope(1);
 +}
 +
 +static void Scope_Timer_Function(unsigned long context)
@@ -18225,20 +18215,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +static int Scope_Cleanup_Thread(void *Args)
 +{
-+	PSCOPE_LIST scope, rscope;
++	struct scope_list *scope;
++	struct scope_list *rscope;
 +	struct list_head *sl, cleanup;
-+	task_t *task;
++	struct task_struct *task;
 +
 +	DbgPrint("Scope_Cleanup_Thread: %d\n", current->pid);
-+
-+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,7)
-+	lock_kernel();
-+	snprintf(current->comm, 16, "novfs_ST");
-+	unlock_kernel();
-+	sys_close(0);
-+	sys_close(1);
-+	sys_close(2);
-+#endif
 +
 +	/*
 +	 * Setup and start que timer
@@ -18247,9 +18229,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	while (0 == Scope_Thread_Terminate) {
 +		DbgPrint("Scope_Cleanup_Thread: looping\n");
-+		if (Scope_Thread_Terminate) {
++		if (Scope_Thread_Terminate)
 +			break;
-+		}
 +
 +		/*
 +		 * Check scope list for any terminated processes
@@ -18260,7 +18241,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		INIT_LIST_HEAD(&cleanup);
 +
 +		while (sl != &Scope_List) {
-+			scope = list_entry(sl, SCOPE_LIST, ScopeList);
++			scope = list_entry(sl, struct scope_list, entry);
 +			sl = sl->next;
 +
 +			rscope = NULL;
@@ -18275,7 +18256,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			rcu_read_unlock();
 +
 +			if (!rscope) {
-+				list_move(&scope->ScopeList, &cleanup);
++				list_move(&scope->entry, &cleanup);
 +				DbgPrint("Scope_Cleanup_Thread: Scope=0x%p\n",
 +					 rscope);
 +			}
@@ -18285,7 +18266,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +		sl = cleanup.next;
 +		while (sl != &cleanup) {
-+			scope = list_entry(sl, SCOPE_LIST, ScopeList);
++			scope = list_entry(sl, struct scope_list, entry);
 +			sl = sl->next;
 +
 +			DbgPrint("Scope_Cleanup_Thread: Removing 0x%p\n"
@@ -18316,21 +18297,21 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		add_timer(&Scope_Timer);
 +		DbgPrint("Scope_Cleanup_Thread: sleeping\n");
 +
-+		if (down_interruptible(&Scope_Thread_Delay)) {
++		if (down_interruptible(&Scope_Thread_Delay))
 +			break;
-+		}
++
 +		del_timer(&Scope_Timer);
 +	}
 +	Scope_Thread_Terminate = 0;
 +
 +	printk(KERN_INFO "Scope_Cleanup_Thread: Exit\n");
 +	DbgPrint("Scope_Cleanup_Thread: Exit\n");
-+	return (0);
++	return 0;
 +}
 +
 +void Scope_Cleanup(void)
 +{
-+	PSCOPE_LIST scope;
++	struct scope_list *scope;
 +	struct list_head *sl;
 +
 +	DbgPrint("Scope_Cleanup:\n");
@@ -18343,10 +18324,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	sl = Scope_List.next;
 +
 +	while (sl != &Scope_List) {
-+		scope = list_entry(sl, SCOPE_LIST, ScopeList);
++		scope = list_entry(sl, struct scope_list, entry);
 +		sl = sl->next;
 +
-+		list_del(&scope->ScopeList);
++		list_del(&scope->entry);
 +
 +		DbgPrint("Scope_Cleanup: Removing 0x%p\n"
 +			 "   ScopeId:       0x%p:%p\n"
@@ -18375,7 +18356,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +}
 +
 +/*
-+ *  Arguments:   struct dentry *Dentry - starting entry
++ *  Arguments:   struct dentry *dentry - starting entry
 + *               char *Buf - pointer to memory buffer
 + *               unsigned int Buflen - size of memory buffer
 + *
@@ -18383,55 +18364,16 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + *
 + *  Abstract:    Walks the dentry chain building a path.
 + */
-+char *Scope_dget_path(struct dentry *Dentry, char *Buf, unsigned int Buflen,
++char *Scope_dget_path(struct dentry *dentry, char *Buf, unsigned int Buflen,
 +		int Flags)
 +{
 +	char *retval = &Buf[Buflen];
-+	struct dentry *p = Dentry;
++	struct dentry *p = dentry;
 +	int len;
 +
 +	*(--retval) = '\0';
 +	Buflen--;
 +
-+/*
-+   if (!IS_ROOT(p))
-+   {
-+      while (Buflen && !IS_ROOT(p))
-+      {
-+         if (Buflen > p->d_name.len)
-+         {
-+            retval -= p->d_name.len;
-+            Buflen -= p->d_name.len;
-+            memcpy(retval, p->d_name.name, p->d_name.len);
-+            *(--retval) = '/';
-+            Buflen--;
-+            p = p->d_parent;
-+         }
-+         else
-+         {
-+            retval = NULL;
-+            break;
-+         }
-+      }
-+   }
-+   if (Flags)
-+   {
-+      len = strlen(p->d_sb->s_type->name);
-+      if (Buflen-len > 0)
-+      {
-+         retval -= len;
-+         Buflen -= len;
-+         memcpy(retval, p->d_sb->s_type->name, len);
-+         *(--retval) = '/';
-+         Buflen--;
-+      }
-+   }
-+   else
-+   {
-+      *(--retval) = '/';
-+      Buflen--;
-+   }
-+*/
 +	do {
 +		if (Buflen > p->d_name.len) {
 +			retval -= p->d_name.len;
@@ -18446,9 +18388,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		}
 +	} while (!IS_ROOT(p));
 +
-+	if (IS_ROOT(Dentry)) {
++	if (IS_ROOT(dentry))
 +		retval++;
-+	}
 +
 +	if (Flags) {
 +		len = strlen(p->d_sb->s_type->name);
@@ -18461,7 +18402,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		}
 +	}
 +
-+	return (retval);
++	return retval;
 +}
 +
 +void Scope_Init(void)
@@ -18470,11 +18411,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	init_MUTEX(&Scope_Lock);
 +	init_MUTEX_LOCKED(&Scope_Thread_Delay);
 +
-+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,7)
-+	kernel_thread(Scope_Cleanup_Thread, NULL, 0);
-+#else
 +	kthread_run(Scope_Cleanup_Thread, NULL, "novfs_ST");
-+#endif
 +}
 +
 +void Scope_Uninit(void)
@@ -18488,10 +18425,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	up(&Scope_Thread_Delay);
 +
 +	mb();
-+	while (Scope_Thread_Terminate && (jiffies < expires)) {
++	while (Scope_Thread_Terminate && (jiffies < expires))
 +		yield();
-+	}
-+	//down(&Scope_Thread_Delay);
++
++	/* down(&Scope_Thread_Delay); */
 +	printk(KERN_INFO "Scope_Uninit: Exit\n");
 +
 +}
@@ -18499,7 +18436,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 --- /dev/null
 +++ b/fs/novfs/vfs.h
-@@ -0,0 +1,447 @@
+@@ -0,0 +1,449 @@
 +/*
 + * Novell NCP Redirector for Linux
 + * Author: James Turner
@@ -18796,7 +18733,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +extern int Daemon_CreateSessionId(SCHANDLE * SessionId);
 +extern int Daemon_DestroySessionId(SCHANDLE SessionId);
 +extern int Daemon_getpwuid(uid_t uid, int unamelen, char *uname);
-+extern int Daemon_Get_UserSpace(SCHANDLE SessionId, uint64_t * TotalSize, uint64_t * TotalFree, uint64_t * TotalDirectoryEnties, uint64_t * FreeDirectoryEnties);
++extern int Daemon_Get_UserSpace(SCHANDLE SessionId, u64 *TotalSize,
++				u64 *TotalFree, u64 *TotalDirectoryEnties,
++				u64 *FreeDirectoryEnties);
 +extern int Daemon_SendDebugCmd(char *Command);
 +extern ssize_t Daemon_Receive_Reply(struct file *file, const char __user *buf, size_t nbytes, loff_t *ppos);
 +extern ssize_t Daemon_Send_Command(struct file *file, char __user *buf, size_t len, loff_t *off);
@@ -18889,10 +18828,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +extern session_t Scope_Get_SessionId(void *Scope);
 +//extern session_t Scope_Get_SessionId(PSCOPE_LIST Scope);
 +extern char *Scope_Get_ScopeUsers(void);
-+extern int Scope_Set_UserSpace(uint64_t * TotalSize, uint64_t * Free,
-+			       uint64_t * TotalEnties, uint64_t * FreeEnties);
-+extern int Scope_Get_UserSpace(uint64_t * TotalSize, uint64_t * Free,
-+			       uint64_t * TotalEnties, uint64_t * FreeEnties);
++extern int Scope_Set_UserSpace(u64 *TotalSize, u64 *Free,
++			       u64 *TotalEnties, u64 *FreeEnties);
++extern int Scope_Get_UserSpace(u64 *TotalSize, u64 *Free,
++			       u64 *TotalEnties, u64 *FreeEnties);
 +extern char *Scope_dget_path(struct dentry *Dentry, char *Buf,
 +			     unsigned int Buflen, int Flags);
 +extern char *Scope_Get_UserName(void);
@@ -18901,7 +18840,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +/*
 + * profile.c functions
 + */
-+extern uint64_t get_nanosecond_time(void);
++extern u64 get_nanosecond_time(void);
 +static inline void *Novfs_Malloc(size_t size, int flags) { return kmalloc(size, flags); }
 +extern int DbgPrint(char *Fmt, ...);
 +extern int init_profile(void);
