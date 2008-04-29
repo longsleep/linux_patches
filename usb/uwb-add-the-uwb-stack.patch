@@ -67,67 +67,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  obj-$(CONFIG_USB_GADGET)	+= usb/gadget/
  obj-$(CONFIG_SERIO)		+= input/serio/
 --- /dev/null
-+++ b/drivers/uwb/Kconfig
-@@ -0,0 +1,29 @@
-+#
-+# UWB device configuration
-+#
-+
-+menuconfig UWB
-+	tristate "Ultra Wide Band devices"
-+	depends on PCI
-+	default n
-+	help
-+	  UWB is a high-bandwidth, low-power, point-to-point radio
-+	  technology using a wide spectrum (3.1-10.6GHz). It is
-+	  optimized for in-room use (480Mbps at 2 meters, 110Mbps at
-+	  10m). It serves as the transport layer for other protocols,
-+	  such as Wireless USB (WUSB), IP (WLP) and upcoming
-+	  Bluetooth and 1394
-+
-+	  The topology is peer to peer; however, higher level
-+	  protocols (such as WUSB) might impose a master/slave
-+	  relationship.
-+
-+	  Say Y here if your computer has UWB radio controllers (USB or PCI)
-+	  based. You will need to enable the radio controllers
-+	  below.  It is ok to select all of them, no harm done.
-+
-+	  For more help check the UWB and WUSB related files in
-+	  <file:Documentation/usb/>.
-+
-+	  To compile the UWB stack as a module, choose M here.
-+
---- /dev/null
-+++ b/drivers/uwb/Makefile
-@@ -0,0 +1,26 @@
-+obj-$(CONFIG_UWB)		+= uwb.o umc.o whci.o
-+
-+uwb-objs :=		\
-+	address.o	\
-+	beacon.o	\
-+	driver.o	\
-+	drp.o		\
-+	drp-avail.o	\
-+	drp-ie.o	\
-+	est.o		\
-+	ie.o		\
-+	lc-dev.o	\
-+	lc-rc.o		\
-+	neh.o		\
-+	pal.o		\
-+	reset.o		\
-+	rsv.o		\
-+	scan.o		\
-+	uwb-debug.o	\
-+	uwbd.o
-+
-+umc-objs :=		\
-+	umc-bus.o	\
-+	umc-dev.o	\
-+	umc-drv.o
-+
---- /dev/null
 +++ b/drivers/uwb/address.c
 @@ -0,0 +1,380 @@
 +/*
@@ -1829,239 +1768,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return 0;
 +}
 --- /dev/null
-+++ b/drivers/uwb/drp-ie.c
-@@ -0,0 +1,230 @@
-+/*
-+ * UWB DRP IE management.
-+ *
-+ * Copyright (C) 2005-2006 Intel Corporation
-+ * Copyright (C) 2008 Cambridge Silicon Radio Ltd.
-+ *
-+ * This program is free software; you can redistribute it and/or
-+ * modify it under the terms of the GNU General Public License version
-+ * 2 as published by the Free Software Foundation.
-+ *
-+ * This program is distributed in the hope that it will be useful,
-+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
-+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-+ * GNU General Public License for more details.
-+ *
-+ * You should have received a copy of the GNU General Public License
-+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
-+ */
-+#include <linux/version.h>
-+#include <linux/kernel.h>
-+#include <linux/random.h>
-+#include <linux/uwb.h>
-+
-+#include "uwb-internal.h"
-+
-+/*
-+ * Allocate a DRP IE.
-+ *
-+ * To save having to free/allocate a DRP IE when its MAS changes,
-+ * enough memory is allocated for the maxiumum number of DRP
-+ * allocation fields.  This gives an overhead per reservation of up to
-+ * (UWB_NUM_ZONES - 1) * 4 = 60 octets.
-+ */
-+static struct uwb_ie_drp *uwb_drp_ie_alloc(void)
-+{
-+	struct uwb_ie_drp *drp_ie;
-+	unsigned tiebreaker;
-+
-+	drp_ie = kzalloc(sizeof(struct uwb_ie_drp) +
-+			UWB_NUM_ZONES * sizeof(struct uwb_drp_alloc),
-+			GFP_KERNEL);
-+	if (drp_ie) {
-+		drp_ie->hdr.element_id = UWB_IE_DRP;
-+
-+		get_random_bytes(&tiebreaker, sizeof(unsigned));
-+		drp_ie->tiebreaker = tiebreaker & 1;
-+	}
-+	return drp_ie;
-+}
-+
-+
-+/*
-+ * Fill a DRP IE's allocation fields from a MAS bitmap.
-+ */
-+static void uwb_drp_ie_from_bm(struct uwb_ie_drp *drp_ie,
-+			       struct uwb_mas_bm *mas)
-+{
-+	int z, i, num_fields = 0, next = 0;
-+	struct uwb_drp_alloc *zones;
-+	__le16 current_bmp;
-+	DECLARE_BITMAP(tmp_bmp, UWB_NUM_MAS);
-+	DECLARE_BITMAP(tmp_mas_bm, UWB_MAS_PER_ZONE);
-+
-+	zones = drp_ie->allocs;
-+
-+	bitmap_copy(tmp_bmp, mas->bm, UWB_NUM_MAS);
-+
-+	/* Determine unique MAS bitmaps in zones from bitmap. */
-+	for (z = 0; z < UWB_NUM_ZONES; z++) {
-+		bitmap_copy(tmp_mas_bm, tmp_bmp, UWB_MAS_PER_ZONE);
-+		if (bitmap_weight(tmp_mas_bm, UWB_MAS_PER_ZONE) > 0) {
-+			bool found = false;
-+			current_bmp = (__le16) *tmp_mas_bm;
-+			for (i = 0; i < next; i++) {
-+				if (current_bmp == zones[i].mas_bm) {
-+					zones[i].zone_bm |= 1 << z;
-+					found = true;
-+					break;
-+				}
-+			}
-+			if (!found)  {
-+				num_fields++;
-+				zones[next].zone_bm = 1 << z;
-+				zones[next].mas_bm = current_bmp;
-+				next++;
-+			}
-+		}
-+		bitmap_shift_right(tmp_bmp, tmp_bmp, UWB_MAS_PER_ZONE, UWB_NUM_MAS);
-+	}
-+
-+	/* Store in format ready for transmission (le16). */
-+	for (i = 0; i < num_fields; i++) {
-+		drp_ie->allocs[i].zone_bm = cpu_to_le16(zones[i].zone_bm);
-+		drp_ie->allocs[i].mas_bm = cpu_to_le16(zones[i].mas_bm);
-+	}
-+
-+	drp_ie->hdr.length = sizeof(struct uwb_ie_drp) - sizeof(struct uwb_ie_hdr)
-+		+ num_fields * sizeof(struct uwb_drp_alloc);
-+}
-+
-+/**
-+ * uwb_drp_ie_update - update a reservation's DRP IE
-+ * @rsv: the reservation
-+ */
-+int uwb_drp_ie_update(struct uwb_rsv *rsv)
-+{
-+	struct device *dev = &rsv->rc->uwb_dev.dev;
-+	struct uwb_ie_drp *drp_ie;
-+	int reason_code, status;
-+
-+	if (!rsv->drp_ie) {
-+		rsv->drp_ie = uwb_drp_ie_alloc();
-+		if (!rsv->drp_ie)
-+			return -ENOMEM;
-+	}
-+
-+	switch(rsv->state) {
-+	case UWB_RSV_STATE_NONE:
-+		dev_dbg(dev, "rsv with state NONE in list\n");
-+		return -EINVAL;
-+	case UWB_RSV_STATE_O_INITIATED:
-+		reason_code = UWB_DRP_REASON_ACCEPTED;
-+		status = 0;
-+		break;
-+	case UWB_RSV_STATE_O_PENDING:
-+		reason_code = UWB_DRP_REASON_ACCEPTED;
-+		status = 0;
-+		break;
-+	case UWB_RSV_STATE_O_MODIFIED:
-+		reason_code = UWB_DRP_REASON_MODIFIED;
-+		status = 1;
-+		break;
-+	case UWB_RSV_STATE_O_ESTABLISHED:
-+		reason_code = UWB_DRP_REASON_ACCEPTED;
-+		status = 1;
-+		break;
-+	case UWB_RSV_STATE_T_ACCEPTED:
-+		reason_code = UWB_DRP_REASON_ACCEPTED;
-+		status = 1;
-+		break;
-+	case UWB_RSV_STATE_T_DENIED:
-+		reason_code = UWB_DRP_REASON_DENIED;
-+		status = 0;
-+		break;
-+	default:
-+		dev_dbg(dev, "rsv with unhandled state (%d)\n", rsv->state);
-+		return -EINVAL;
-+	}
-+
-+	drp_ie = rsv->drp_ie;
-+
-+	drp_ie->owner        = rsv->owner == &rsv->rc->uwb_dev;
-+	drp_ie->status       = status;
-+	drp_ie->reason_code  = reason_code;
-+	drp_ie->stream_index = rsv->stream;
-+	drp_ie->type         = rsv->type;
-+	drp_ie->DRP_Control = cpu_to_le16(drp_ie->DRP_Control);
-+
-+	switch (rsv->target.type) {
-+	case UWB_RSV_TARGET_DEV:
-+		drp_ie->dev_addr = rsv->target.dev->dev_addr;
-+		break;
-+	case UWB_RSV_TARGET_DEVADDR:
-+		drp_ie->dev_addr = rsv->target.devaddr;
-+		break;
-+	}
-+
-+	uwb_drp_ie_from_bm(drp_ie, &rsv->mas);
-+
-+	rsv->ie_valid = true;
-+	return 0;
-+}
-+
-+/*
-+ * Set MAS bits from given MAS bitmap in a single zone of large bitmap.
-+ *
-+ * We are given a zone id and the MAS bitmap of bits that need to be set in
-+ * this zone. Note that this zone may already have bits set and this only
-+ * adds settings - we cannot simply assign the MAS bitmap contents to the
-+ * zone contents. We iterate over the the bits (MAS) in the zone and set the
-+ * bits that are set in the given MAS bitmap.
-+ */
-+static
-+void uwb_drp_ie_single_zone_to_bm(struct uwb_mas_bm *bm, u8 zone, u16 mas_bm)
-+{
-+	int mas;
-+	u16 mas_mask;
-+
-+	for (mas = 0; mas < UWB_MAS_PER_ZONE; mas++) {
-+		mas_mask = 1 << mas;
-+		if (mas_bm & mas_mask)
-+			set_bit(zone * UWB_NUM_ZONES + mas, bm->bm);
-+	}
-+}
-+
-+/**
-+ * uwb_drp_ie_zones_to_bm - convert DRP allocation fields to a bitmap
-+ * @mas:    MAS bitmap that will be populated to correspond to the
-+ *          allocation fields in the DRP IE
-+ * @drp_ie: the DRP IE that contains the allocation fields.
-+ *
-+ * The input format is an array of MAS allocation fields (16 bit Zone
-+ * bitmap, 16 bit MAS bitmap) as described in [ECMA-368] section
-+ * 16.8.6. The output is a full 256 bit MAS bitmap.
-+ *
-+ * We go over all the allocation fields, for each allocation field we
-+ * know which zones are impacted. We iterate over all the zones
-+ * impacted and call a function that will set the correct MAS bits in
-+ * each zone.
-+ */
-+void uwb_drp_ie_to_bm(struct uwb_mas_bm *bm, const struct uwb_ie_drp *drp_ie)
-+{
-+	int numallocs = (drp_ie->hdr.length - 4) / 4;
-+	const struct uwb_drp_alloc *alloc;
-+	int cnt;
-+	u16 zone_bm, mas_bm;
-+	u8 zone;
-+	u16 zone_mask;
-+
-+	for (cnt = 0; cnt < numallocs; cnt++) {
-+		alloc = &drp_ie->allocs[cnt];
-+		zone_bm = le16_to_cpu(alloc->zone_bm);
-+		mas_bm = le16_to_cpu(alloc->mas_bm);
-+		for (zone = 0; zone < UWB_NUM_ZONES; zone++)   {
-+			zone_mask = 1 << zone;
-+			if (zone_bm & zone_mask)
-+				uwb_drp_ie_single_zone_to_bm(bm, zone, mas_bm);
-+		}
-+	}
-+}
---- /dev/null
 +++ b/drivers/uwb/drp.c
 @@ -0,0 +1,406 @@
 +/*
@@ -2469,6 +2175,239 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	uwb_dev_put(src_dev);
 +	return 0;
++}
+--- /dev/null
++++ b/drivers/uwb/drp-ie.c
+@@ -0,0 +1,230 @@
++/*
++ * UWB DRP IE management.
++ *
++ * Copyright (C) 2005-2006 Intel Corporation
++ * Copyright (C) 2008 Cambridge Silicon Radio Ltd.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++#include <linux/version.h>
++#include <linux/kernel.h>
++#include <linux/random.h>
++#include <linux/uwb.h>
++
++#include "uwb-internal.h"
++
++/*
++ * Allocate a DRP IE.
++ *
++ * To save having to free/allocate a DRP IE when its MAS changes,
++ * enough memory is allocated for the maxiumum number of DRP
++ * allocation fields.  This gives an overhead per reservation of up to
++ * (UWB_NUM_ZONES - 1) * 4 = 60 octets.
++ */
++static struct uwb_ie_drp *uwb_drp_ie_alloc(void)
++{
++	struct uwb_ie_drp *drp_ie;
++	unsigned tiebreaker;
++
++	drp_ie = kzalloc(sizeof(struct uwb_ie_drp) +
++			UWB_NUM_ZONES * sizeof(struct uwb_drp_alloc),
++			GFP_KERNEL);
++	if (drp_ie) {
++		drp_ie->hdr.element_id = UWB_IE_DRP;
++
++		get_random_bytes(&tiebreaker, sizeof(unsigned));
++		drp_ie->tiebreaker = tiebreaker & 1;
++	}
++	return drp_ie;
++}
++
++
++/*
++ * Fill a DRP IE's allocation fields from a MAS bitmap.
++ */
++static void uwb_drp_ie_from_bm(struct uwb_ie_drp *drp_ie,
++			       struct uwb_mas_bm *mas)
++{
++	int z, i, num_fields = 0, next = 0;
++	struct uwb_drp_alloc *zones;
++	__le16 current_bmp;
++	DECLARE_BITMAP(tmp_bmp, UWB_NUM_MAS);
++	DECLARE_BITMAP(tmp_mas_bm, UWB_MAS_PER_ZONE);
++
++	zones = drp_ie->allocs;
++
++	bitmap_copy(tmp_bmp, mas->bm, UWB_NUM_MAS);
++
++	/* Determine unique MAS bitmaps in zones from bitmap. */
++	for (z = 0; z < UWB_NUM_ZONES; z++) {
++		bitmap_copy(tmp_mas_bm, tmp_bmp, UWB_MAS_PER_ZONE);
++		if (bitmap_weight(tmp_mas_bm, UWB_MAS_PER_ZONE) > 0) {
++			bool found = false;
++			current_bmp = (__le16) *tmp_mas_bm;
++			for (i = 0; i < next; i++) {
++				if (current_bmp == zones[i].mas_bm) {
++					zones[i].zone_bm |= 1 << z;
++					found = true;
++					break;
++				}
++			}
++			if (!found)  {
++				num_fields++;
++				zones[next].zone_bm = 1 << z;
++				zones[next].mas_bm = current_bmp;
++				next++;
++			}
++		}
++		bitmap_shift_right(tmp_bmp, tmp_bmp, UWB_MAS_PER_ZONE, UWB_NUM_MAS);
++	}
++
++	/* Store in format ready for transmission (le16). */
++	for (i = 0; i < num_fields; i++) {
++		drp_ie->allocs[i].zone_bm = cpu_to_le16(zones[i].zone_bm);
++		drp_ie->allocs[i].mas_bm = cpu_to_le16(zones[i].mas_bm);
++	}
++
++	drp_ie->hdr.length = sizeof(struct uwb_ie_drp) - sizeof(struct uwb_ie_hdr)
++		+ num_fields * sizeof(struct uwb_drp_alloc);
++}
++
++/**
++ * uwb_drp_ie_update - update a reservation's DRP IE
++ * @rsv: the reservation
++ */
++int uwb_drp_ie_update(struct uwb_rsv *rsv)
++{
++	struct device *dev = &rsv->rc->uwb_dev.dev;
++	struct uwb_ie_drp *drp_ie;
++	int reason_code, status;
++
++	if (!rsv->drp_ie) {
++		rsv->drp_ie = uwb_drp_ie_alloc();
++		if (!rsv->drp_ie)
++			return -ENOMEM;
++	}
++
++	switch(rsv->state) {
++	case UWB_RSV_STATE_NONE:
++		dev_dbg(dev, "rsv with state NONE in list\n");
++		return -EINVAL;
++	case UWB_RSV_STATE_O_INITIATED:
++		reason_code = UWB_DRP_REASON_ACCEPTED;
++		status = 0;
++		break;
++	case UWB_RSV_STATE_O_PENDING:
++		reason_code = UWB_DRP_REASON_ACCEPTED;
++		status = 0;
++		break;
++	case UWB_RSV_STATE_O_MODIFIED:
++		reason_code = UWB_DRP_REASON_MODIFIED;
++		status = 1;
++		break;
++	case UWB_RSV_STATE_O_ESTABLISHED:
++		reason_code = UWB_DRP_REASON_ACCEPTED;
++		status = 1;
++		break;
++	case UWB_RSV_STATE_T_ACCEPTED:
++		reason_code = UWB_DRP_REASON_ACCEPTED;
++		status = 1;
++		break;
++	case UWB_RSV_STATE_T_DENIED:
++		reason_code = UWB_DRP_REASON_DENIED;
++		status = 0;
++		break;
++	default:
++		dev_dbg(dev, "rsv with unhandled state (%d)\n", rsv->state);
++		return -EINVAL;
++	}
++
++	drp_ie = rsv->drp_ie;
++
++	drp_ie->owner        = rsv->owner == &rsv->rc->uwb_dev;
++	drp_ie->status       = status;
++	drp_ie->reason_code  = reason_code;
++	drp_ie->stream_index = rsv->stream;
++	drp_ie->type         = rsv->type;
++	drp_ie->DRP_Control = cpu_to_le16(drp_ie->DRP_Control);
++
++	switch (rsv->target.type) {
++	case UWB_RSV_TARGET_DEV:
++		drp_ie->dev_addr = rsv->target.dev->dev_addr;
++		break;
++	case UWB_RSV_TARGET_DEVADDR:
++		drp_ie->dev_addr = rsv->target.devaddr;
++		break;
++	}
++
++	uwb_drp_ie_from_bm(drp_ie, &rsv->mas);
++
++	rsv->ie_valid = true;
++	return 0;
++}
++
++/*
++ * Set MAS bits from given MAS bitmap in a single zone of large bitmap.
++ *
++ * We are given a zone id and the MAS bitmap of bits that need to be set in
++ * this zone. Note that this zone may already have bits set and this only
++ * adds settings - we cannot simply assign the MAS bitmap contents to the
++ * zone contents. We iterate over the the bits (MAS) in the zone and set the
++ * bits that are set in the given MAS bitmap.
++ */
++static
++void uwb_drp_ie_single_zone_to_bm(struct uwb_mas_bm *bm, u8 zone, u16 mas_bm)
++{
++	int mas;
++	u16 mas_mask;
++
++	for (mas = 0; mas < UWB_MAS_PER_ZONE; mas++) {
++		mas_mask = 1 << mas;
++		if (mas_bm & mas_mask)
++			set_bit(zone * UWB_NUM_ZONES + mas, bm->bm);
++	}
++}
++
++/**
++ * uwb_drp_ie_zones_to_bm - convert DRP allocation fields to a bitmap
++ * @mas:    MAS bitmap that will be populated to correspond to the
++ *          allocation fields in the DRP IE
++ * @drp_ie: the DRP IE that contains the allocation fields.
++ *
++ * The input format is an array of MAS allocation fields (16 bit Zone
++ * bitmap, 16 bit MAS bitmap) as described in [ECMA-368] section
++ * 16.8.6. The output is a full 256 bit MAS bitmap.
++ *
++ * We go over all the allocation fields, for each allocation field we
++ * know which zones are impacted. We iterate over all the zones
++ * impacted and call a function that will set the correct MAS bits in
++ * each zone.
++ */
++void uwb_drp_ie_to_bm(struct uwb_mas_bm *bm, const struct uwb_ie_drp *drp_ie)
++{
++	int numallocs = (drp_ie->hdr.length - 4) / 4;
++	const struct uwb_drp_alloc *alloc;
++	int cnt;
++	u16 zone_bm, mas_bm;
++	u8 zone;
++	u16 zone_mask;
++
++	for (cnt = 0; cnt < numallocs; cnt++) {
++		alloc = &drp_ie->allocs[cnt];
++		zone_bm = le16_to_cpu(alloc->zone_bm);
++		mas_bm = le16_to_cpu(alloc->mas_bm);
++		for (zone = 0; zone < UWB_NUM_ZONES; zone++)   {
++			zone_mask = 1 << zone;
++			if (zone_bm & zone_mask)
++				uwb_drp_ie_single_zone_to_bm(bm, zone, mas_bm);
++		}
++	}
 +}
 --- /dev/null
 +++ b/drivers/uwb/est.c
@@ -3481,6 +3420,38 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	return uwb_rc_ie_add(uwb_rc, &ie_data.id_ie.hdr, sizeof(ie_data));
 +}
+--- /dev/null
++++ b/drivers/uwb/Kconfig
+@@ -0,0 +1,29 @@
++#
++# UWB device configuration
++#
++
++menuconfig UWB
++	tristate "Ultra Wide Band devices"
++	depends on PCI
++	default n
++	help
++	  UWB is a high-bandwidth, low-power, point-to-point radio
++	  technology using a wide spectrum (3.1-10.6GHz). It is
++	  optimized for in-room use (480Mbps at 2 meters, 110Mbps at
++	  10m). It serves as the transport layer for other protocols,
++	  such as Wireless USB (WUSB), IP (WLP) and upcoming
++	  Bluetooth and 1394
++
++	  The topology is peer to peer; however, higher level
++	  protocols (such as WUSB) might impose a master/slave
++	  relationship.
++
++	  Say Y here if your computer has UWB radio controllers (USB or PCI)
++	  based. You will need to enable the radio controllers
++	  below.  It is ok to select all of them, no harm done.
++
++	  For more help check the UWB and WUSB related files in
++	  <file:Documentation/usb/>.
++
++	  To compile the UWB stack as a module, choose M here.
++
 --- /dev/null
 +++ b/drivers/uwb/lc-dev.c
 @@ -0,0 +1,703 @@
@@ -4688,6 +4659,35 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +error_get_ie:
 +	return result;
 +}
++
+--- /dev/null
++++ b/drivers/uwb/Makefile
+@@ -0,0 +1,26 @@
++obj-$(CONFIG_UWB)		+= uwb.o umc.o whci.o
++
++uwb-objs :=		\
++	address.o	\
++	beacon.o	\
++	driver.o	\
++	drp.o		\
++	drp-avail.o	\
++	drp-ie.o	\
++	est.o		\
++	ie.o		\
++	lc-dev.o	\
++	lc-rc.o		\
++	neh.o		\
++	pal.o		\
++	reset.o		\
++	rsv.o		\
++	scan.o		\
++	uwb-debug.o	\
++	uwbd.o
++
++umc-objs :=		\
++	umc-bus.o	\
++	umc-dev.o	\
++	umc-drv.o
 +
 --- /dev/null
 +++ b/drivers/uwb/neh.c
@@ -6817,606 +6817,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +}
 +EXPORT_SYMBOL_GPL(umc_driver_unregister);
 --- /dev/null
-+++ b/drivers/uwb/uwb-debug.c
-@@ -0,0 +1,306 @@
-+/*
-+ * Ultra Wide Band
-+ * Debug support
-+ *
-+ * Copyright (C) 2005-2006 Intel Corporation
-+ * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
-+ *
-+ * This program is free software; you can redistribute it and/or
-+ * modify it under the terms of the GNU General Public License version
-+ * 2 as published by the Free Software Foundation.
-+ *
-+ * This program is distributed in the hope that it will be useful,
-+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
-+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-+ * GNU General Public License for more details.
-+ *
-+ * You should have received a copy of the GNU General Public License
-+ * along with this program; if not, write to the Free Software
-+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
-+ * 02110-1301, USA.
-+ *
-+ *
-+ * FIXME: doc
-+ */
-+
-+#include <linux/spinlock.h>
-+#include <linux/module.h>
-+#include <linux/slab.h>
-+#include <linux/notifier.h>
-+#include <linux/device.h>
-+#include <linux/debugfs.h>
-+#include <linux/uaccess.h>
-+#include <linux/seq_file.h>
-+
-+#include <linux/uwb/debug-cmd.h>
-+#define D_LOCAL 0
-+#include <linux/uwb/debug.h>
-+
-+#include "uwb-internal.h"
-+
-+void dump_bytes(struct device *dev, const void *_buf, size_t rsize)
-+{
-+	const char *buf = _buf;
-+	char line[32];
-+	size_t offset = 0;
-+	int cnt, cnt2;
-+	for (cnt = 0; cnt < rsize; cnt += 8) {
-+		size_t rtop = rsize - cnt < 8? rsize - cnt : 8;
-+		for (offset = cnt2 = 0; cnt2 < rtop; cnt2++) {
-+			offset += scnprintf(line + offset, sizeof(line) - offset,
-+					    "%02x ", buf[cnt + cnt2] & 0xff);
-+		}
-+		if (dev)
-+			dev_info(dev, "%s\n", line);
-+		else
-+			printk(KERN_INFO "%s\n", line);
-+	}
-+}
-+EXPORT_SYMBOL_GPL(dump_bytes);
-+
-+/*
-+ * Debug interface
-+ *
-+ * Per radio controller debugfs files (in uwb/uwbN/):
-+ *
-+ * command: Flexible command interface (see <linux/uwb/debug-cmd.h>).
-+ *
-+ * accept: Set to true (Y or 1) to accept reservation requests from
-+ * peers.
-+ *
-+ * drp_avail: DRP availability information.
-+ */
-+
-+struct uwb_dbg {
-+	struct uwb_pal pal;
-+
-+	u32 accept;
-+	struct list_head rsvs;
-+
-+	struct dentry *root_d;
-+	struct dentry *command_f;
-+	struct dentry *accept_f;
-+	struct dentry *drp_avail_f;
-+};
-+
-+static struct dentry *root_dir;
-+
-+static void uwb_dbg_rsv_cb(struct uwb_rsv *rsv)
-+{
-+	struct device *dev = &rsv->rc->uwb_dev.dev;
-+	struct uwb_dev_addr devaddr;
-+	char owner[UWB_ADDR_STRSIZE], target[UWB_ADDR_STRSIZE];
-+
-+	uwb_dev_addr_print(owner, sizeof(owner), &rsv->owner->dev_addr);
-+	if (rsv->target.type == UWB_RSV_TARGET_DEV)
-+		devaddr = rsv->target.dev->dev_addr;
-+	else
-+		devaddr = rsv->target.devaddr;
-+	uwb_dev_addr_print(target, sizeof(target), &devaddr);
-+
-+	dev_dbg(dev, "debug: rsv %s -> %s: %s\n",
-+		owner, target, uwb_rsv_state_str(rsv->state));
-+}
-+
-+static int cmd_rsv_establish(struct uwb_rc *rc,
-+			     struct uwb_dbg_cmd_rsv_establish *cmd)
-+{
-+	struct uwb_mac_addr macaddr;
-+	struct uwb_rsv *rsv;
-+	struct uwb_dev *target;
-+	int ret;
-+
-+	memcpy(&macaddr, cmd->target, sizeof(macaddr));
-+	target = uwb_dev_get_by_macaddr(rc, &macaddr);
-+	if (target == NULL)
-+		return -ENODEV;
-+
-+	rsv = uwb_rsv_create(rc, uwb_dbg_rsv_cb, NULL);
-+	if (rsv == NULL) {
-+		uwb_dev_put(target);
-+		return -ENOMEM;
-+	}
-+
-+	rsv->owner       = &rc->uwb_dev;
-+	rsv->target.type = UWB_RSV_TARGET_DEV;
-+	rsv->target.dev  = target;
-+	rsv->type        = cmd->type;
-+	rsv->max_mas     = cmd->max_mas;
-+	rsv->min_mas     = cmd->min_mas;
-+	rsv->sparsity    = cmd->sparsity;
-+
-+	ret = uwb_rsv_establish(rsv);
-+	if (ret) {
-+		uwb_dev_put(target);
-+		uwb_rsv_destroy(rsv);
-+	} else
-+		list_add_tail(&rc->dbg->rsvs, &rsv->pal_node);
-+
-+	return ret;
-+}
-+
-+static int cmd_rsv_terminate(struct uwb_rc *rc,
-+			     struct uwb_dbg_cmd_rsv_terminate *cmd)
-+{
-+	struct uwb_rsv *rsv, *found = NULL;
-+	int i = 0;
-+
-+	list_for_each_entry(rsv, &rc->dbg->rsvs, pal_node) {
-+		if (i == cmd->index) {
-+			found = rsv;
-+			break;
-+		}
-+	}
-+	if (!found)
-+		return -EINVAL;
-+
-+	list_del(&found->pal_node);
-+	uwb_rsv_terminate(found);
-+	uwb_rsv_destroy(found);
-+
-+	return 0;
-+}
-+
-+static int command_open(struct inode *inode, struct file *file)
-+{
-+	file->private_data = inode->i_private;
-+
-+	return 0;
-+}
-+
-+static ssize_t command_write(struct file *file, const char __user *buf,
-+			 size_t len, loff_t *off)
-+{
-+	struct uwb_rc *rc = file->private_data;
-+	struct uwb_dbg_cmd cmd;
-+	int ret;
-+
-+	if (len != sizeof(struct uwb_dbg_cmd))
-+		return -EINVAL;
-+
-+	if (copy_from_user(&cmd, buf, len) != 0)
-+		return -EFAULT;
-+
-+	switch (cmd.type) {
-+	case UWB_DBG_CMD_RSV_ESTABLISH:
-+		ret = cmd_rsv_establish(rc, &cmd.rsv_establish);
-+		break;
-+	case UWB_DBG_CMD_RSV_TERMINATE:
-+		ret = cmd_rsv_terminate(rc, &cmd.rsv_terminate);
-+		break;
-+	default:
-+		return -EINVAL;
-+	}
-+
-+	return ret < 0 ? ret : len;
-+}
-+
-+static struct file_operations command_fops = {
-+	.open   = command_open,
-+	.write  = command_write,
-+	.read   = NULL,
-+	.llseek = no_llseek,
-+	.owner  = THIS_MODULE,
-+};
-+
-+static int drp_avail_print(struct seq_file *s, void *p)
-+{
-+	struct uwb_rc *rc = s->private;
-+	char buf[72];
-+
-+	bitmap_scnprintf(buf, sizeof(buf), rc->drp_avail.global, UWB_NUM_MAS);
-+	seq_printf(s, "global:  %s\n", buf);
-+	bitmap_scnprintf(buf, sizeof(buf), rc->drp_avail.local, UWB_NUM_MAS);
-+	seq_printf(s, "local:   %s\n", buf);
-+	bitmap_scnprintf(buf, sizeof(buf), rc->drp_avail.pending, UWB_NUM_MAS);
-+	seq_printf(s, "pending: %s\n", buf);
-+
-+	return 0;
-+}
-+
-+static int drp_avail_open(struct inode *inode, struct file *file)
-+{
-+	return single_open(file, drp_avail_print, inode->i_private);
-+}
-+
-+static struct file_operations drp_avail_fops = {
-+	.open    = drp_avail_open,
-+	.read    = seq_read,
-+	.llseek  = seq_lseek,
-+	.release = single_release,
-+	.owner   = THIS_MODULE,
-+};
-+
-+static void uwb_dbg_new_rsv(struct uwb_rsv *rsv)
-+{
-+	struct uwb_rc *rc = rsv->rc;
-+
-+	if (rc->dbg->accept)
-+		uwb_rsv_accept(rsv, uwb_dbg_rsv_cb, NULL);
-+}
-+
-+/**
-+ * uwb_dbg_add_rc - add a debug interface for a radio controller
-+ * @rc: the radio controller
-+ */
-+void uwb_dbg_add_rc(struct uwb_rc *rc)
-+{
-+	rc->dbg = kzalloc(sizeof(struct uwb_dbg), GFP_KERNEL);
-+	if (rc->dbg == NULL)
-+		return;
-+
-+	INIT_LIST_HEAD(&rc->dbg->rsvs);
-+
-+	uwb_pal_init(&rc->dbg->pal);
-+	rc->dbg->pal.new_rsv = uwb_dbg_new_rsv;
-+	uwb_pal_register(rc, &rc->dbg->pal);
-+
-+	if (root_dir) {
-+		rc->dbg->root_d = debugfs_create_dir(rc->uwb_dev.dev.bus_id,
-+						     root_dir);
-+		rc->dbg->command_f = debugfs_create_file("command", 0200,
-+							 rc->dbg->root_d, rc,
-+							 &command_fops);
-+		rc->dbg->accept_f = debugfs_create_bool("accept", 0600,
-+							rc->dbg->root_d,
-+							&rc->dbg->accept);
-+		rc->dbg->drp_avail_f = debugfs_create_file("drp_avail", 0200,
-+							   rc->dbg->root_d, rc,
-+							   &drp_avail_fops);
-+	}
-+}
-+
-+/**
-+ * uwb_dbg_add_rc - remove a radio controller's debug interface
-+ * @rc: the radio controller
-+ */
-+void uwb_dbg_del_rc(struct uwb_rc *rc)
-+{
-+	if (rc->dbg == NULL)
-+		return;
-+
-+	uwb_pal_unregister(rc, &rc->dbg->pal);
-+
-+	if (root_dir) {
-+		debugfs_remove(rc->dbg->drp_avail_f);
-+		debugfs_remove(rc->dbg->accept_f);
-+		debugfs_remove(rc->dbg->command_f);
-+		debugfs_remove(rc->dbg->root_d);
-+	}
-+}
-+
-+/**
-+ * uwb_dbg_exit - initialize the debug interface sub-module
-+ */
-+void uwb_dbg_init(void)
-+{
-+	root_dir = debugfs_create_dir("uwb", NULL);
-+}
-+
-+/**
-+ * uwb_dbg_exit - clean-up the debug interface sub-module
-+ */
-+void uwb_dbg_exit(void)
-+{
-+	debugfs_remove(root_dir);
-+}
---- /dev/null
-+++ b/drivers/uwb/uwb-internal.h
-@@ -0,0 +1,288 @@
-+/*
-+ * Ultra Wide Band
-+ * UWB internal API
-+ *
-+ * Copyright (C) 2005-2006 Intel Corporation
-+ * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
-+ *
-+ * This program is free software; you can redistribute it and/or
-+ * modify it under the terms of the GNU General Public License version
-+ * 2 as published by the Free Software Foundation.
-+ *
-+ * This program is distributed in the hope that it will be useful,
-+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
-+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-+ * GNU General Public License for more details.
-+ *
-+ * You should have received a copy of the GNU General Public License
-+ * along with this program; if not, write to the Free Software
-+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
-+ * 02110-1301, USA.
-+ *
-+ * This contains most of the internal API for UWB. This is stuff used
-+ * across the stack that of course, is of no interest to the rest.
-+ *
-+ * Some parts might end up going public (like uwb_rc_*())...
-+ */
-+
-+#ifndef __UWB_INTERNAL_H__
-+#define __UWB_INTERNAL_H__
-+
-+#include <linux/version.h>
-+#include <linux/kernel.h>
-+#include <linux/device.h>
-+#include <linux/uwb.h>
-+#include <asm/semaphore.h>
-+
-+struct uwb_beca_e;
-+
-+/* Two declarations only needed if UWB_BUG_514 == 1. */
-+extern int hwarc_filter_cmd(struct uwb_rc *, struct uwb_rccb **, size_t *);
-+
-+extern int hwarc_filter_event(struct uwb_rc *, struct uwb_rceb **,
-+				const size_t, size_t *, size_t *);
-+
-+/* General device API */
-+extern void uwb_dev_init(struct uwb_dev *uwb_dev);
-+extern int __uwb_dev_offair(struct uwb_dev *, struct uwb_rc *);
-+extern int uwb_dev_add(struct uwb_dev *uwb_dev, struct device *parent_dev,
-+		       struct uwb_rc *parent_rc);
-+extern void uwb_dev_rm(struct uwb_dev *uwb_dev);
-+extern void uwbd_dev_onair(struct uwb_rc *, struct uwb_beca_e *);
-+extern void uwbd_dev_offair(struct uwb_beca_e *);
-+
-+/* General UWB Radio Controller Internal API */
-+extern struct uwb_rc *__uwb_rc_try_get(struct uwb_rc *);
-+static inline struct uwb_rc *__uwb_rc_get(struct uwb_rc *rc)
-+{
-+	uwb_dev_get(&rc->uwb_dev);
-+	return rc;
-+}
-+
-+static inline void __uwb_rc_put(struct uwb_rc *rc)
-+{
-+	uwb_dev_put(&rc->uwb_dev);
-+}
-+
-+extern int uwb_rc_reset(struct uwb_rc *rc);
-+extern int uwb_rc_beacon(struct uwb_rc *rc,
-+			 int channel, unsigned bpst_offset);
-+extern int uwb_rc_scan(struct uwb_rc *rc,
-+		       unsigned channel, enum uwb_scan_type type,
-+		       unsigned bpst_offset);
-+extern int uwb_rc_send_all_drp_ie(struct uwb_rc *rc);
-+extern ssize_t uwb_rc_print_IEs(struct uwb_rc *rc, char *, size_t);
-+extern void uwb_rc_ie_init(struct uwb_rc *);
-+extern void uwb_rc_ie_init(struct uwb_rc *);
-+extern ssize_t uwb_rc_ie_setup(struct uwb_rc *);
-+extern void uwb_rc_ie_release(struct uwb_rc *);
-+extern int uwb_rc_ie_add(struct uwb_rc *,
-+			 const struct uwb_ie_hdr *, size_t);
-+extern int uwb_rc_ie_rm(struct uwb_rc *, enum uwb_ie);
-+extern int uwb_rc_set_identification_ie(struct uwb_rc *);
-+
-+extern const char *uwb_rc_strerror(unsigned code);
-+
-+/*
-+ * Time to wait for a response to an RC command.
-+ *
-+ * Some commands can take a long time to response. e.g., START_BEACON
-+ * may scan for several superframes before joining an existing beacon
-+ * group and this can take around 600 ms.
-+ */
-+#define UWB_RC_CMD_TIMEOUT_MS 1000 /* ms */
-+
-+/*
-+ * Notification/Event Handlers
-+ */
-+
-+struct uwb_rc_neh;
-+
-+typedef void (*uwb_rc_neh_cb_f)(struct uwb_rc *rc, void *arg,
-+				struct uwb_rceb *reply, ssize_t reply_size);
-+
-+void uwb_rc_neh_create(struct uwb_rc *rc);
-+void uwb_rc_neh_destroy(struct uwb_rc *rc);
-+
-+struct uwb_rc_neh *uwb_rc_neh_add(struct uwb_rc *rc, struct uwb_rccb *cmd,
-+				  u8 expected_type, u16 expected_event,
-+				  uwb_rc_neh_cb_f cb, void *arg);
-+void uwb_rc_neh_rm(struct uwb_rc *rc, struct uwb_rc_neh *neh);
-+void uwb_rc_neh_arm(struct uwb_rc *rc, struct uwb_rc_neh *neh);
-+void uwb_rc_neh_put(struct uwb_rc_neh *neh);
-+
-+/* Event size tables */
-+extern int uwb_est_create(void);
-+extern void uwb_est_destroy(void);
-+
-+
-+/*
-+ * UWB Events & management daemon
-+ *
-+ * The UWBD daemon receives events following the RCI interface for
-+ * notifications (with an RCEB header)...basically it acts on the
-+ * notifications from that the radio controllers pipe to him.
-+ *
-+ * FIXME: rename events to notifications (as that's what they
-+ *        are)...however, that'll mess with uwb_notifs.
-+ */
-+
-+/**
-+ * UWB Event
-+ *
-+ * @rc:         Radio controller that emitted the event (referenced)
-+ * @size:       Size of the buffer (ie: Guaranteed to contain at least
-+ *              a full 'struct uwb_rceb')
-+ * @ts_jiffies: Timestamp, when was it received
-+ * @rceb:       Pointer to a kmalloced() event payload
-+ */
-+/* FIXME: rename to uwb_evt for consistency */
-+struct uwb_event {
-+	struct list_head list_node;
-+	struct uwb_rc *rc;
-+	size_t size;
-+	unsigned long ts_jiffies;
-+	struct uwb_rceb *rceb;
-+};
-+extern void uwbd_start(void);
-+extern void uwbd_stop(void);
-+extern struct uwb_event *uwb_event_alloc(size_t, gfp_t gfp_mask);
-+extern void uwbd_event_queue(struct uwb_event *);
-+
-+/* UWB event handlers */
-+extern int uwbd_evt_handle_rc_beacon(struct uwb_event *);
-+extern int uwbd_evt_handle_rc_beacon_size(struct uwb_event *);
-+extern int uwbd_evt_handle_rc_bpoie_change(struct uwb_event *);
-+extern int uwbd_evt_handle_rc_bp_slot_change(struct uwb_event *);
-+extern int uwbd_evt_handle_rc_drp(struct uwb_event *);
-+extern int uwbd_evt_handle_rc_drp_avail(struct uwb_event *);
-+
-+
-+/*
-+ * Address management
-+ */
-+int uwb_rc_dev_addr_assign(struct uwb_rc *rc);
-+int uwbd_evt_handle_rc_dev_addr_conflict(struct uwb_event *evt);
-+
-+/*
-+ * UWB Beacon Cache
-+ *
-+ * Each beacon we received is kept in a cache--when we receive that
-+ * beacon consistently, that means there is a new device that we have
-+ * to add to the system.
-+ */
-+
-+extern unsigned long beacon_timeout_ms;
-+
-+/** Beacon cache list */
-+struct uwb_beca {
-+	struct list_head list;
-+	size_t entries;
-+	struct semaphore mutex;
-+};
-+
-+extern struct uwb_beca uwb_beca;
-+
-+/**
-+ * Beacon cache entry
-+ *
-+ * @jiffies_refresh: last time a beacon was  received that refreshed
-+ *                   this cache entry.
-+ * @uwb_dev: device connected to this beacon. This pointer is not
-+ *           safe, you need to get it with uwb_dev_try_get()
-+ *
-+ * @hits: how many time we have seen this beacon since last time we
-+ *        cleared it
-+ */
-+struct uwb_beca_e {
-+	struct mutex mutex;
-+	struct kref refcnt;
-+	struct list_head node;
-+	struct uwb_mac_addr *mac_addr;
-+	struct uwb_dev_addr dev_addr;
-+	u8 hits;
-+	unsigned long ts_jiffies;
-+	struct uwb_dev *uwb_dev;
-+	struct uwb_rc_evt_beacon *be;
-+	struct stats lqe_stats, rssi_stats;	/* radio statistics */
-+};
-+struct uwb_beacon_frame;
-+extern ssize_t uwb_bce_print_IEs(struct uwb_dev *, struct uwb_beca_e *,
-+				 char *, size_t);
-+extern struct uwb_beca_e *__uwb_beca_add(struct uwb_rc_evt_beacon *,
-+					 struct uwb_beacon_frame *,
-+					 unsigned long);
-+
-+extern void uwb_bce_kfree(struct kref *_bce);
-+static inline void uwb_bce_get(struct uwb_beca_e *bce)
-+{
-+	kref_get(&bce->refcnt);
-+}
-+static inline void uwb_bce_put(struct uwb_beca_e *bce)
-+{
-+	kref_put(&bce->refcnt, uwb_bce_kfree);
-+}
-+extern void uwb_beca_purge(void);
-+extern void uwb_beca_release(void);
-+
-+struct uwb_dev *uwb_dev_get_by_devaddr(struct uwb_rc *rc,
-+				       const struct uwb_dev_addr *devaddr);
-+struct uwb_dev *uwb_dev_get_by_macaddr(struct uwb_rc *rc,
-+				       const struct uwb_mac_addr *macaddr);
-+
-+/* -- UWB Sysfs representation */
-+extern struct bus_type uwb_bus;
-+extern struct class *uwb_rc_class;
-+extern struct device_attribute dev_attr_mac_address;
-+extern struct device_attribute dev_attr_dev_address;
-+extern struct device_attribute dev_attr_beacon;
-+extern struct device_attribute dev_attr_scan;
-+extern struct device_attribute dev_attr_event_stats;
-+
-+/* -- DRP Bandwidth allocator: bandwidth allocations, reservations, DRP */
-+void uwb_rsv_init(struct uwb_rc *rc);
-+int uwb_rsv_setup(struct uwb_rc *rc);
-+void uwb_rsv_cleanup(struct uwb_rc *rc);
-+
-+void uwb_rsv_set_state(struct uwb_rsv *rsv, enum uwb_rsv_state new_state);
-+struct uwb_rsv *uwb_rsv_find(struct uwb_rc *rc, struct uwb_dev *src,
-+			     struct uwb_ie_drp *drp_ie);
-+void uwb_rsv_sched_update(struct uwb_rc *rc);
-+
-+void uwb_drp_handle_timeout(struct uwb_rsv *rsv);
-+int uwb_drp_ie_update(struct uwb_rsv *rsv);
-+void uwb_drp_ie_to_bm(struct uwb_mas_bm *bm, const struct uwb_ie_drp *drp_ie);
-+
-+void uwb_drp_avail_init(struct uwb_rc *rc);
-+int  uwb_drp_avail_reserve_pending(struct uwb_rc *rc, struct uwb_mas_bm *mas);
-+void uwb_drp_avail_reserve(struct uwb_rc *rc, struct uwb_mas_bm *mas);
-+void uwb_drp_avail_release(struct uwb_rc *rc, struct uwb_mas_bm *mas);
-+void uwb_drp_avail_ie_update(struct uwb_rc *rc);
-+
-+/* -- PAL support */
-+void uwb_rc_pal_init(struct uwb_rc *rc);
-+
-+/* -- Misc */
-+
-+extern ssize_t uwb_mac_frame_hdr_print(char *, size_t,
-+				       const struct uwb_mac_frame_hdr *);
-+
-+/* -- Debug interface */
-+void uwb_dbg_init(void);
-+void uwb_dbg_exit(void);
-+void uwb_dbg_add_rc(struct uwb_rc *rc);
-+void uwb_dbg_del_rc(struct uwb_rc *rc);
-+
-+/* Workarounds for version specific stuff */
-+
-+static inline void uwb_dev_lock(struct uwb_dev *uwb_dev)
-+{
-+	down(&uwb_dev->dev.sem);
-+}
-+
-+static inline void uwb_dev_unlock(struct uwb_dev *uwb_dev)
-+{
-+	up(&uwb_dev->dev.sem);
-+}
-+
-+#endif /* #ifndef __UWB_INTERNAL_H__ */
---- /dev/null
 +++ b/drivers/uwb/uwbd.c
 @@ -0,0 +1,428 @@
 +/*
@@ -7847,6 +7247,606 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return consumed;
 +}
 +DEVICE_ATTR(event_stats, S_IRUGO, uwbd_evt_stats_show, NULL);
+--- /dev/null
++++ b/drivers/uwb/uwb-debug.c
+@@ -0,0 +1,306 @@
++/*
++ * Ultra Wide Band
++ * Debug support
++ *
++ * Copyright (C) 2005-2006 Intel Corporation
++ * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ *
++ *
++ * FIXME: doc
++ */
++
++#include <linux/spinlock.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/notifier.h>
++#include <linux/device.h>
++#include <linux/debugfs.h>
++#include <linux/uaccess.h>
++#include <linux/seq_file.h>
++
++#include <linux/uwb/debug-cmd.h>
++#define D_LOCAL 0
++#include <linux/uwb/debug.h>
++
++#include "uwb-internal.h"
++
++void dump_bytes(struct device *dev, const void *_buf, size_t rsize)
++{
++	const char *buf = _buf;
++	char line[32];
++	size_t offset = 0;
++	int cnt, cnt2;
++	for (cnt = 0; cnt < rsize; cnt += 8) {
++		size_t rtop = rsize - cnt < 8? rsize - cnt : 8;
++		for (offset = cnt2 = 0; cnt2 < rtop; cnt2++) {
++			offset += scnprintf(line + offset, sizeof(line) - offset,
++					    "%02x ", buf[cnt + cnt2] & 0xff);
++		}
++		if (dev)
++			dev_info(dev, "%s\n", line);
++		else
++			printk(KERN_INFO "%s\n", line);
++	}
++}
++EXPORT_SYMBOL_GPL(dump_bytes);
++
++/*
++ * Debug interface
++ *
++ * Per radio controller debugfs files (in uwb/uwbN/):
++ *
++ * command: Flexible command interface (see <linux/uwb/debug-cmd.h>).
++ *
++ * accept: Set to true (Y or 1) to accept reservation requests from
++ * peers.
++ *
++ * drp_avail: DRP availability information.
++ */
++
++struct uwb_dbg {
++	struct uwb_pal pal;
++
++	u32 accept;
++	struct list_head rsvs;
++
++	struct dentry *root_d;
++	struct dentry *command_f;
++	struct dentry *accept_f;
++	struct dentry *drp_avail_f;
++};
++
++static struct dentry *root_dir;
++
++static void uwb_dbg_rsv_cb(struct uwb_rsv *rsv)
++{
++	struct device *dev = &rsv->rc->uwb_dev.dev;
++	struct uwb_dev_addr devaddr;
++	char owner[UWB_ADDR_STRSIZE], target[UWB_ADDR_STRSIZE];
++
++	uwb_dev_addr_print(owner, sizeof(owner), &rsv->owner->dev_addr);
++	if (rsv->target.type == UWB_RSV_TARGET_DEV)
++		devaddr = rsv->target.dev->dev_addr;
++	else
++		devaddr = rsv->target.devaddr;
++	uwb_dev_addr_print(target, sizeof(target), &devaddr);
++
++	dev_dbg(dev, "debug: rsv %s -> %s: %s\n",
++		owner, target, uwb_rsv_state_str(rsv->state));
++}
++
++static int cmd_rsv_establish(struct uwb_rc *rc,
++			     struct uwb_dbg_cmd_rsv_establish *cmd)
++{
++	struct uwb_mac_addr macaddr;
++	struct uwb_rsv *rsv;
++	struct uwb_dev *target;
++	int ret;
++
++	memcpy(&macaddr, cmd->target, sizeof(macaddr));
++	target = uwb_dev_get_by_macaddr(rc, &macaddr);
++	if (target == NULL)
++		return -ENODEV;
++
++	rsv = uwb_rsv_create(rc, uwb_dbg_rsv_cb, NULL);
++	if (rsv == NULL) {
++		uwb_dev_put(target);
++		return -ENOMEM;
++	}
++
++	rsv->owner       = &rc->uwb_dev;
++	rsv->target.type = UWB_RSV_TARGET_DEV;
++	rsv->target.dev  = target;
++	rsv->type        = cmd->type;
++	rsv->max_mas     = cmd->max_mas;
++	rsv->min_mas     = cmd->min_mas;
++	rsv->sparsity    = cmd->sparsity;
++
++	ret = uwb_rsv_establish(rsv);
++	if (ret) {
++		uwb_dev_put(target);
++		uwb_rsv_destroy(rsv);
++	} else
++		list_add_tail(&rc->dbg->rsvs, &rsv->pal_node);
++
++	return ret;
++}
++
++static int cmd_rsv_terminate(struct uwb_rc *rc,
++			     struct uwb_dbg_cmd_rsv_terminate *cmd)
++{
++	struct uwb_rsv *rsv, *found = NULL;
++	int i = 0;
++
++	list_for_each_entry(rsv, &rc->dbg->rsvs, pal_node) {
++		if (i == cmd->index) {
++			found = rsv;
++			break;
++		}
++	}
++	if (!found)
++		return -EINVAL;
++
++	list_del(&found->pal_node);
++	uwb_rsv_terminate(found);
++	uwb_rsv_destroy(found);
++
++	return 0;
++}
++
++static int command_open(struct inode *inode, struct file *file)
++{
++	file->private_data = inode->i_private;
++
++	return 0;
++}
++
++static ssize_t command_write(struct file *file, const char __user *buf,
++			 size_t len, loff_t *off)
++{
++	struct uwb_rc *rc = file->private_data;
++	struct uwb_dbg_cmd cmd;
++	int ret;
++
++	if (len != sizeof(struct uwb_dbg_cmd))
++		return -EINVAL;
++
++	if (copy_from_user(&cmd, buf, len) != 0)
++		return -EFAULT;
++
++	switch (cmd.type) {
++	case UWB_DBG_CMD_RSV_ESTABLISH:
++		ret = cmd_rsv_establish(rc, &cmd.rsv_establish);
++		break;
++	case UWB_DBG_CMD_RSV_TERMINATE:
++		ret = cmd_rsv_terminate(rc, &cmd.rsv_terminate);
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return ret < 0 ? ret : len;
++}
++
++static struct file_operations command_fops = {
++	.open   = command_open,
++	.write  = command_write,
++	.read   = NULL,
++	.llseek = no_llseek,
++	.owner  = THIS_MODULE,
++};
++
++static int drp_avail_print(struct seq_file *s, void *p)
++{
++	struct uwb_rc *rc = s->private;
++	char buf[72];
++
++	bitmap_scnprintf(buf, sizeof(buf), rc->drp_avail.global, UWB_NUM_MAS);
++	seq_printf(s, "global:  %s\n", buf);
++	bitmap_scnprintf(buf, sizeof(buf), rc->drp_avail.local, UWB_NUM_MAS);
++	seq_printf(s, "local:   %s\n", buf);
++	bitmap_scnprintf(buf, sizeof(buf), rc->drp_avail.pending, UWB_NUM_MAS);
++	seq_printf(s, "pending: %s\n", buf);
++
++	return 0;
++}
++
++static int drp_avail_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, drp_avail_print, inode->i_private);
++}
++
++static struct file_operations drp_avail_fops = {
++	.open    = drp_avail_open,
++	.read    = seq_read,
++	.llseek  = seq_lseek,
++	.release = single_release,
++	.owner   = THIS_MODULE,
++};
++
++static void uwb_dbg_new_rsv(struct uwb_rsv *rsv)
++{
++	struct uwb_rc *rc = rsv->rc;
++
++	if (rc->dbg->accept)
++		uwb_rsv_accept(rsv, uwb_dbg_rsv_cb, NULL);
++}
++
++/**
++ * uwb_dbg_add_rc - add a debug interface for a radio controller
++ * @rc: the radio controller
++ */
++void uwb_dbg_add_rc(struct uwb_rc *rc)
++{
++	rc->dbg = kzalloc(sizeof(struct uwb_dbg), GFP_KERNEL);
++	if (rc->dbg == NULL)
++		return;
++
++	INIT_LIST_HEAD(&rc->dbg->rsvs);
++
++	uwb_pal_init(&rc->dbg->pal);
++	rc->dbg->pal.new_rsv = uwb_dbg_new_rsv;
++	uwb_pal_register(rc, &rc->dbg->pal);
++
++	if (root_dir) {
++		rc->dbg->root_d = debugfs_create_dir(rc->uwb_dev.dev.bus_id,
++						     root_dir);
++		rc->dbg->command_f = debugfs_create_file("command", 0200,
++							 rc->dbg->root_d, rc,
++							 &command_fops);
++		rc->dbg->accept_f = debugfs_create_bool("accept", 0600,
++							rc->dbg->root_d,
++							&rc->dbg->accept);
++		rc->dbg->drp_avail_f = debugfs_create_file("drp_avail", 0200,
++							   rc->dbg->root_d, rc,
++							   &drp_avail_fops);
++	}
++}
++
++/**
++ * uwb_dbg_add_rc - remove a radio controller's debug interface
++ * @rc: the radio controller
++ */
++void uwb_dbg_del_rc(struct uwb_rc *rc)
++{
++	if (rc->dbg == NULL)
++		return;
++
++	uwb_pal_unregister(rc, &rc->dbg->pal);
++
++	if (root_dir) {
++		debugfs_remove(rc->dbg->drp_avail_f);
++		debugfs_remove(rc->dbg->accept_f);
++		debugfs_remove(rc->dbg->command_f);
++		debugfs_remove(rc->dbg->root_d);
++	}
++}
++
++/**
++ * uwb_dbg_exit - initialize the debug interface sub-module
++ */
++void uwb_dbg_init(void)
++{
++	root_dir = debugfs_create_dir("uwb", NULL);
++}
++
++/**
++ * uwb_dbg_exit - clean-up the debug interface sub-module
++ */
++void uwb_dbg_exit(void)
++{
++	debugfs_remove(root_dir);
++}
+--- /dev/null
++++ b/drivers/uwb/uwb-internal.h
+@@ -0,0 +1,288 @@
++/*
++ * Ultra Wide Band
++ * UWB internal API
++ *
++ * Copyright (C) 2005-2006 Intel Corporation
++ * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ *
++ * This contains most of the internal API for UWB. This is stuff used
++ * across the stack that of course, is of no interest to the rest.
++ *
++ * Some parts might end up going public (like uwb_rc_*())...
++ */
++
++#ifndef __UWB_INTERNAL_H__
++#define __UWB_INTERNAL_H__
++
++#include <linux/version.h>
++#include <linux/kernel.h>
++#include <linux/device.h>
++#include <linux/semaphore.h>
++#include <linux/uwb.h>
++
++struct uwb_beca_e;
++
++/* Two declarations only needed if UWB_BUG_514 == 1. */
++extern int hwarc_filter_cmd(struct uwb_rc *, struct uwb_rccb **, size_t *);
++
++extern int hwarc_filter_event(struct uwb_rc *, struct uwb_rceb **,
++				const size_t, size_t *, size_t *);
++
++/* General device API */
++extern void uwb_dev_init(struct uwb_dev *uwb_dev);
++extern int __uwb_dev_offair(struct uwb_dev *, struct uwb_rc *);
++extern int uwb_dev_add(struct uwb_dev *uwb_dev, struct device *parent_dev,
++		       struct uwb_rc *parent_rc);
++extern void uwb_dev_rm(struct uwb_dev *uwb_dev);
++extern void uwbd_dev_onair(struct uwb_rc *, struct uwb_beca_e *);
++extern void uwbd_dev_offair(struct uwb_beca_e *);
++
++/* General UWB Radio Controller Internal API */
++extern struct uwb_rc *__uwb_rc_try_get(struct uwb_rc *);
++static inline struct uwb_rc *__uwb_rc_get(struct uwb_rc *rc)
++{
++	uwb_dev_get(&rc->uwb_dev);
++	return rc;
++}
++
++static inline void __uwb_rc_put(struct uwb_rc *rc)
++{
++	uwb_dev_put(&rc->uwb_dev);
++}
++
++extern int uwb_rc_reset(struct uwb_rc *rc);
++extern int uwb_rc_beacon(struct uwb_rc *rc,
++			 int channel, unsigned bpst_offset);
++extern int uwb_rc_scan(struct uwb_rc *rc,
++		       unsigned channel, enum uwb_scan_type type,
++		       unsigned bpst_offset);
++extern int uwb_rc_send_all_drp_ie(struct uwb_rc *rc);
++extern ssize_t uwb_rc_print_IEs(struct uwb_rc *rc, char *, size_t);
++extern void uwb_rc_ie_init(struct uwb_rc *);
++extern void uwb_rc_ie_init(struct uwb_rc *);
++extern ssize_t uwb_rc_ie_setup(struct uwb_rc *);
++extern void uwb_rc_ie_release(struct uwb_rc *);
++extern int uwb_rc_ie_add(struct uwb_rc *,
++			 const struct uwb_ie_hdr *, size_t);
++extern int uwb_rc_ie_rm(struct uwb_rc *, enum uwb_ie);
++extern int uwb_rc_set_identification_ie(struct uwb_rc *);
++
++extern const char *uwb_rc_strerror(unsigned code);
++
++/*
++ * Time to wait for a response to an RC command.
++ *
++ * Some commands can take a long time to response. e.g., START_BEACON
++ * may scan for several superframes before joining an existing beacon
++ * group and this can take around 600 ms.
++ */
++#define UWB_RC_CMD_TIMEOUT_MS 1000 /* ms */
++
++/*
++ * Notification/Event Handlers
++ */
++
++struct uwb_rc_neh;
++
++typedef void (*uwb_rc_neh_cb_f)(struct uwb_rc *rc, void *arg,
++				struct uwb_rceb *reply, ssize_t reply_size);
++
++void uwb_rc_neh_create(struct uwb_rc *rc);
++void uwb_rc_neh_destroy(struct uwb_rc *rc);
++
++struct uwb_rc_neh *uwb_rc_neh_add(struct uwb_rc *rc, struct uwb_rccb *cmd,
++				  u8 expected_type, u16 expected_event,
++				  uwb_rc_neh_cb_f cb, void *arg);
++void uwb_rc_neh_rm(struct uwb_rc *rc, struct uwb_rc_neh *neh);
++void uwb_rc_neh_arm(struct uwb_rc *rc, struct uwb_rc_neh *neh);
++void uwb_rc_neh_put(struct uwb_rc_neh *neh);
++
++/* Event size tables */
++extern int uwb_est_create(void);
++extern void uwb_est_destroy(void);
++
++
++/*
++ * UWB Events & management daemon
++ *
++ * The UWBD daemon receives events following the RCI interface for
++ * notifications (with an RCEB header)...basically it acts on the
++ * notifications from that the radio controllers pipe to him.
++ *
++ * FIXME: rename events to notifications (as that's what they
++ *        are)...however, that'll mess with uwb_notifs.
++ */
++
++/**
++ * UWB Event
++ *
++ * @rc:         Radio controller that emitted the event (referenced)
++ * @size:       Size of the buffer (ie: Guaranteed to contain at least
++ *              a full 'struct uwb_rceb')
++ * @ts_jiffies: Timestamp, when was it received
++ * @rceb:       Pointer to a kmalloced() event payload
++ */
++/* FIXME: rename to uwb_evt for consistency */
++struct uwb_event {
++	struct list_head list_node;
++	struct uwb_rc *rc;
++	size_t size;
++	unsigned long ts_jiffies;
++	struct uwb_rceb *rceb;
++};
++extern void uwbd_start(void);
++extern void uwbd_stop(void);
++extern struct uwb_event *uwb_event_alloc(size_t, gfp_t gfp_mask);
++extern void uwbd_event_queue(struct uwb_event *);
++
++/* UWB event handlers */
++extern int uwbd_evt_handle_rc_beacon(struct uwb_event *);
++extern int uwbd_evt_handle_rc_beacon_size(struct uwb_event *);
++extern int uwbd_evt_handle_rc_bpoie_change(struct uwb_event *);
++extern int uwbd_evt_handle_rc_bp_slot_change(struct uwb_event *);
++extern int uwbd_evt_handle_rc_drp(struct uwb_event *);
++extern int uwbd_evt_handle_rc_drp_avail(struct uwb_event *);
++
++
++/*
++ * Address management
++ */
++int uwb_rc_dev_addr_assign(struct uwb_rc *rc);
++int uwbd_evt_handle_rc_dev_addr_conflict(struct uwb_event *evt);
++
++/*
++ * UWB Beacon Cache
++ *
++ * Each beacon we received is kept in a cache--when we receive that
++ * beacon consistently, that means there is a new device that we have
++ * to add to the system.
++ */
++
++extern unsigned long beacon_timeout_ms;
++
++/** Beacon cache list */
++struct uwb_beca {
++	struct list_head list;
++	size_t entries;
++	struct semaphore mutex;
++};
++
++extern struct uwb_beca uwb_beca;
++
++/**
++ * Beacon cache entry
++ *
++ * @jiffies_refresh: last time a beacon was  received that refreshed
++ *                   this cache entry.
++ * @uwb_dev: device connected to this beacon. This pointer is not
++ *           safe, you need to get it with uwb_dev_try_get()
++ *
++ * @hits: how many time we have seen this beacon since last time we
++ *        cleared it
++ */
++struct uwb_beca_e {
++	struct mutex mutex;
++	struct kref refcnt;
++	struct list_head node;
++	struct uwb_mac_addr *mac_addr;
++	struct uwb_dev_addr dev_addr;
++	u8 hits;
++	unsigned long ts_jiffies;
++	struct uwb_dev *uwb_dev;
++	struct uwb_rc_evt_beacon *be;
++	struct stats lqe_stats, rssi_stats;	/* radio statistics */
++};
++struct uwb_beacon_frame;
++extern ssize_t uwb_bce_print_IEs(struct uwb_dev *, struct uwb_beca_e *,
++				 char *, size_t);
++extern struct uwb_beca_e *__uwb_beca_add(struct uwb_rc_evt_beacon *,
++					 struct uwb_beacon_frame *,
++					 unsigned long);
++
++extern void uwb_bce_kfree(struct kref *_bce);
++static inline void uwb_bce_get(struct uwb_beca_e *bce)
++{
++	kref_get(&bce->refcnt);
++}
++static inline void uwb_bce_put(struct uwb_beca_e *bce)
++{
++	kref_put(&bce->refcnt, uwb_bce_kfree);
++}
++extern void uwb_beca_purge(void);
++extern void uwb_beca_release(void);
++
++struct uwb_dev *uwb_dev_get_by_devaddr(struct uwb_rc *rc,
++				       const struct uwb_dev_addr *devaddr);
++struct uwb_dev *uwb_dev_get_by_macaddr(struct uwb_rc *rc,
++				       const struct uwb_mac_addr *macaddr);
++
++/* -- UWB Sysfs representation */
++extern struct bus_type uwb_bus;
++extern struct class *uwb_rc_class;
++extern struct device_attribute dev_attr_mac_address;
++extern struct device_attribute dev_attr_dev_address;
++extern struct device_attribute dev_attr_beacon;
++extern struct device_attribute dev_attr_scan;
++extern struct device_attribute dev_attr_event_stats;
++
++/* -- DRP Bandwidth allocator: bandwidth allocations, reservations, DRP */
++void uwb_rsv_init(struct uwb_rc *rc);
++int uwb_rsv_setup(struct uwb_rc *rc);
++void uwb_rsv_cleanup(struct uwb_rc *rc);
++
++void uwb_rsv_set_state(struct uwb_rsv *rsv, enum uwb_rsv_state new_state);
++struct uwb_rsv *uwb_rsv_find(struct uwb_rc *rc, struct uwb_dev *src,
++			     struct uwb_ie_drp *drp_ie);
++void uwb_rsv_sched_update(struct uwb_rc *rc);
++
++void uwb_drp_handle_timeout(struct uwb_rsv *rsv);
++int uwb_drp_ie_update(struct uwb_rsv *rsv);
++void uwb_drp_ie_to_bm(struct uwb_mas_bm *bm, const struct uwb_ie_drp *drp_ie);
++
++void uwb_drp_avail_init(struct uwb_rc *rc);
++int  uwb_drp_avail_reserve_pending(struct uwb_rc *rc, struct uwb_mas_bm *mas);
++void uwb_drp_avail_reserve(struct uwb_rc *rc, struct uwb_mas_bm *mas);
++void uwb_drp_avail_release(struct uwb_rc *rc, struct uwb_mas_bm *mas);
++void uwb_drp_avail_ie_update(struct uwb_rc *rc);
++
++/* -- PAL support */
++void uwb_rc_pal_init(struct uwb_rc *rc);
++
++/* -- Misc */
++
++extern ssize_t uwb_mac_frame_hdr_print(char *, size_t,
++				       const struct uwb_mac_frame_hdr *);
++
++/* -- Debug interface */
++void uwb_dbg_init(void);
++void uwb_dbg_exit(void);
++void uwb_dbg_add_rc(struct uwb_rc *rc);
++void uwb_dbg_del_rc(struct uwb_rc *rc);
++
++/* Workarounds for version specific stuff */
++
++static inline void uwb_dev_lock(struct uwb_dev *uwb_dev)
++{
++	down(&uwb_dev->dev.sem);
++}
++
++static inline void uwb_dev_unlock(struct uwb_dev *uwb_dev)
++{
++	up(&uwb_dev->dev.sem);
++}
++
++#endif /* #ifndef __UWB_INTERNAL_H__ */
 --- /dev/null
 +++ b/drivers/uwb/whci.c
 @@ -0,0 +1,285 @@
