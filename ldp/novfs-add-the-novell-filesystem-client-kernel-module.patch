@@ -32,7 +32,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  fs/novfs/Makefile   |   19 
  fs/novfs/commands.h | 1087 ++++++++++
  fs/novfs/daemon.c   | 2400 ++++++++++++++++++++++
- fs/novfs/file.c     | 2187 ++++++++++++++++++++
+ fs/novfs/file.c     | 2032 ++++++++++++++++++
  fs/novfs/inode.c    | 5580 ++++++++++++++++++++++++++++++++++++++++++++++++++++
  fs/novfs/nwcapi.c   | 2537 +++++++++++++++++++++++
  fs/novfs/nwcapi.h   | 2213 ++++++++++++++++++++
@@ -40,8 +40,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  fs/novfs/proc.c     |  152 +
  fs/novfs/profile.c  |  687 ++++++
  fs/novfs/scope.c    |  675 ++++++
- fs/novfs/vfs.h      |  432 ++++
- 14 files changed, 18637 insertions(+)
+ fs/novfs/vfs.h      |  429 +++
+ 14 files changed, 18479 insertions(+)
 
 --- a/fs/Kconfig
 +++ b/fs/Kconfig
@@ -3585,7 +3585,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#endif
 --- /dev/null
 +++ b/fs/novfs/file.c
-@@ -0,0 +1,2187 @@
+@@ -0,0 +1,2032 @@
 +/*
 + * Novell NCP Redirector for Linux
 + * Author: James Turner
@@ -3619,11 +3619,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +int Novfs_get_alltrees(struct dentry *parent);
 +ssize_t Novfs_tree_read(struct file *file, char *buf, size_t len, loff_t * off);
 +
-+int Novfs_Get_Connected_Server_List(unsigned char ** ServerList, session_t SessionId);
-+int Novfs_Get_Server_Volume_List(struct qstr *Server, unsigned char ** VolumeList,
-+				 scope_t SessionId);
 +int Novfs_Find_Name_In_List(struct qstr *Name, unsigned char * List);
-+int Novfs_Verify_Server_Name(struct qstr *Server, session_t SessionId);
 +/* Novfs_*X_File_Info - Extended attributes functions */
 +int Novfs_SetX_File_Info(char *Path, const char *Name, const void *Value,
 +			 unsigned long valueLen, unsigned long *bytesWritten,
@@ -3661,7 +3657,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + */
 +static int StripTrailingDots = 1;
 +
-+int Novfs_verify_file(struct qstr *Path, scope_t SessionId)
++static int Novfs_verify_file(struct qstr *Path, struct schandle *SessionId)
 +{
 +	PVERIFY_FILE_REPLY reply = NULL;
 +	unsigned long replylen = 0;
@@ -3676,7 +3672,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	cmd->Command.CommandType = VFS_COMMAND_VERIFY_FILE;
 +	cmd->Command.SequenceNumber = 0;
-+	cmd->Command.SessionId = SessionId;
++	memcpy(&cmd->Command.SessionId, SessionId, sizeof(*SessionId));
 +	cmd->pathLen = Path->len;
 +	memcpy(cmd->path, Path->name, Path->len);
 +
@@ -3758,7 +3754,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return (5);
 +}
 +
-+int Novfs_Get_Connected_Server_List(unsigned char ** ServerList, session_t SessionId)
++int Novfs_Get_Connected_Server_List(unsigned char ** ServerList, struct schandle *SessionId)
 +{
 +	GET_CONNECTED_SERVER_LIST_REQUEST req;
 +	PGET_CONNECTED_SERVER_LIST_REPLY reply = NULL;
@@ -3768,7 +3764,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	*ServerList = NULL;
 +
 +	req.Command.CommandType = VFS_COMMAND_GET_CONNECTED_SERVER_LIST;
-+	req.Command.SessionId = SessionId;
++	memcpy(&req.Command.SessionId, SessionId, sizeof(*SessionId));
 +
 +	retCode =
 +	    Queue_Daemon_Command(&req, sizeof(req), NULL, 0, (void *)&reply,
@@ -3789,7 +3785,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +}
 +
 +int Novfs_Get_Server_Volume_List(struct qstr *Server, unsigned char ** VolumeList,
-+				 scope_t SessionId)
++				 struct schandle *SessionId)
 +{
 +	PGET_SERVER_VOLUME_LIST_REQUEST req;
 +	PGET_SERVER_VOLUME_LIST_REPLY reply = NULL;
@@ -3804,7 +3800,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	req->Command.CommandType = VFS_COMMAND_GET_SERVER_VOLUME_LIST;
 +	req->Length = Server->len;
 +	memcpy(req->Name, Server->name, Server->len);
-+	req->Command.SessionId = SessionId;
++	memcpy(&req->Command.SessionId, SessionId, sizeof(*SessionId));
 +
 +	retCode = Queue_Daemon_Command(req, reqlen, NULL, 0, (void *)&reply,
 +					 &replylen, INTERRUPTIBLE);
@@ -3840,53 +3836,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		List += (len + 1);
 +	}
 +	return (retCode);
-+}
-+
-+int Novfs_Verify_Server_Name(struct qstr *Server, session_t SessionId)
-+{
-+	unsigned char *list;
-+	int retCode = 0;
-+
-+	DbgPrint("Novfs_Verify_Server_Name: %.*s\n", Server->len, Server->name);
-+
-+	list = NULL;
-+	Novfs_Get_Connected_Server_List(&list, SessionId);
-+
-+	if (list) {
-+		retCode = Novfs_Find_Name_In_List(Server, list);
-+		kfree(list);
-+	}
-+	DbgPrint("Novfs_Verify_Server_Name: %d\n", retCode);
-+	return (retCode);
-+}
-+
-+static int Novfs_Verify_Volume_Name(struct qstr *Server, struct qstr *Volume, session_t SessionId)
-+{
-+	unsigned char *list;
-+	int retCode = 0;
-+	unsigned char *name;
-+	int namelen;
-+	struct qstr path;
-+
-+	list = NULL;
-+	namelen = Server->len + Volume->len + 2;
-+	name = kmalloc(namelen, GFP_KERNEL);
-+	if (!name)
-+		return -ENOMEM;
-+	name[0] = '\\';
-+	memcpy(&name[1], Server->name, Server->len);
-+	name[1 + Server->len] = '\\';
-+	memcpy(&name[2 + Server->len], Volume->name, Volume->len);
-+	path.len = namelen;
-+	path.name = name;
-+	if (Novfs_verify_file(&path, SessionId)) {
-+		retCode = 0;
-+	} else {
-+		retCode = 1;
-+	}
-+
-+	kfree(name);
-+	return retCode;
 +}
 +
 +int Novfs_Get_File_Info(unsigned char * Path, struct entry_info *Info, session_t SessionId)
@@ -3979,110 +3928,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		}
 +	}
 +
-+	DbgPrint("Novfs_Get_File_Info: return 0x%x\n", retCode);
-+	return (retCode);
-+}
-+
-+int Novfs_Get_File_Info2(unsigned char * Path, struct entry_info *Info, session_t SessionId)
-+{
-+	PVERIFY_FILE_REPLY reply = NULL;
-+	unsigned long replylen = 0;
-+	PVERIFY_FILE_REQUEST cmd;
-+	int cmdlen;
-+	struct qstr server = { 0 }, volume = {
-+	0};
-+	unsigned char *p;
-+	int i;
-+	int retCode = -ENOENT;
-+	p = Path;
-+
-+	DbgPrint("Novfs_Get_File_Info: Path = %s\n", Path);
-+
-+	Info->mode = S_IFDIR | 0700;
-+	Info->uid = current->uid;
-+	Info->gid = current->gid;
-+	Info->size = 0;
-+	Info->atime = Info->mtime = Info->ctime = CURRENT_TIME;
-+
-+	if ('\\' == *p) {
-+		p++;
-+	}
-+	server.name = p;
-+
-+	for (i = 0; *p && ('\\' != *p); i++, p++) ;
-+	server.len = i;
-+	if (*p) {
-+		if ('\\' == *p) {
-+			p++;
-+		}
-+		volume.name = p;
-+		for (i = 0; *p && ('\\' != *p); i++, p++) ;
-+		if (i) {
-+			volume.len = i;
-+			if (*p) {
-+				if ('\\' == *p) {
-+					p++;
-+				}
-+				if (*p) {
-+					cmdlen = offsetof(VERIFY_FILE_REQUEST, path) + strlen(Path);
-+					cmd = (PVERIFY_FILE_REQUEST)Novfs_Malloc(cmdlen, GFP_KERNEL);
-+					if (cmd) {
-+						cmd->Command.CommandType = VFS_COMMAND_VERIFY_FILE;
-+						cmd->Command.SequenceNumber = 0;
-+						cmd->Command.SessionId = SessionId;
-+						cmd->pathLen = strlen(Path);
-+						memcpy(cmd->path, Path, cmd->pathLen);
-+
-+						retCode = Queue_Daemon_Command(cmd, cmdlen, NULL, 0, (void *)&reply, &replylen, INTERRUPTIBLE);
-+						if (reply) {
-+							if (reply->Reply.ErrorCode) {
-+								retCode = -ENOENT;
-+							} else {
-+								Info->type = 3;
-+								Info->mode = S_IRWXU;
-+
-+								if (reply->fileMode & NW_ATTRIBUTE_DIRECTORY) {
-+									Info->mode |= S_IFDIR;
-+								} else {
-+									Info->mode |= S_IFREG;
-+								}
-+
-+								if (reply-> fileMode & NW_ATTRIBUTE_READ_ONLY) {
-+									Info->mode &= ~(S_IWUSR);
-+								}
-+
-+								Info->uid = current->euid;
-+								Info->gid = current->egid;
-+								Info->size = reply->fileSize;
-+								Info->atime.tv_sec = reply->lastAccessTime;
-+								Info->atime.tv_nsec = 0;
-+								Info->mtime.tv_sec = reply->modifyTime;
-+								Info->mtime.tv_nsec = 0;
-+								Info->ctime.tv_sec = reply->createTime;
-+								Info->ctime.tv_nsec = 0;
-+								retCode = 0;
-+							}
-+
-+							kfree(reply);
-+						}
-+						kfree(cmd);
-+					}
-+				}
-+			}
-+		}
-+		if (('\0' == *p) && volume.len) {
-+			if (Novfs_Verify_Volume_Name(&server, &volume, SessionId)) {
-+				retCode = 0;
-+				Info->type = 2;
-+			}
-+		}
-+	}
-+	if (server.len && !volume.len) {
-+		if (Novfs_Verify_Server_Name(&server, SessionId)) {
-+			retCode = 0;
-+			Info->type = 1;
-+		}
-+	}
 +	DbgPrint("Novfs_Get_File_Info: return 0x%x\n", retCode);
 +	return (retCode);
 +}
@@ -7327,13 +7172,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		} else if (IS_ROOT(file->f_dentry->d_parent)) {
 +			DbgPrint
 +			    ("Novfs_dir_readdir: Parent is Root directory\n");
-+			Novfs_Get_Connected_Server_List(&list, sessionId);
++			Novfs_Get_Connected_Server_List(&list, &sessionId);
 +			type = SERVER_LIST;
 +		} else {
 +			DbgPrint
 +			    ("Novfs_dir_readdir: Parent-Parent is Root directory\n");
 +			Novfs_Get_Server_Volume_List(&file->f_dentry->d_name,
-+						     &list, sessionId);
++						     &list, &sessionId);
 +			type = VOLUME_LIST;
 +		}
 +
@@ -17658,8 +17503,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +struct scope_list {
 +	struct list_head entry;
-+	scope_t ScopeId;
-+	session_t SessionId;
++	struct schandle ScopeId;
++	struct schandle SessionId;
 +	pid_t ScopePid;
 +	struct task_struct *ScopeTask;
 +	unsigned int ScopeHash;
@@ -17725,7 +17570,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	struct scope_list *scope = NULL;
 +	struct scope_list *pscope = NULL;
 +	struct task_struct *task;
-+	scope_t scopeId;
++	struct schandle scopeId;
 +	int addscope = 0;
 +
 +	task = current;
@@ -18298,7 +18143,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 --- /dev/null
 +++ b/fs/novfs/vfs.h
-@@ -0,0 +1,432 @@
+@@ -0,0 +1,429 @@
 +/*
 + * Novell NCP Redirector for Linux
 + * Author: James Turner
@@ -18327,11 +18172,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +typedef void *HANDLE;
 +
 +struct schandle {
-+	HANDLE hTypeId;
-+	HANDLE hId;
++	void *hTypeId;
++	void *hId;
 +};
 +
-+typedef struct schandle scope_t;
 +typedef struct schandle session_t;
 +
 +#include "commands.h"
@@ -18601,11 +18445,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +/*
 + * file.c functions
 + */
-+extern int Novfs_verify_file(struct qstr *Path, session_t SessionId);
 +extern int Novfs_get_alltrees(struct dentry *parent);
-+extern int Novfs_Get_Connected_Server_List(unsigned char **ServerList, session_t SessionId);
-+extern int Novfs_Get_Server_Volume_List(struct qstr *Server, unsigned char **VolumeList, session_t SessionId);
-+extern int Novfs_Verify_Server_Name(struct qstr *Server, session_t SessionId);
++extern int Novfs_Get_Connected_Server_List(unsigned char **ServerList, struct schandle *SessionId);
++extern int Novfs_Get_Server_Volume_List(struct qstr *Server, unsigned char **VolumeList, struct schandle *SessionId);
 +extern int Novfs_Get_File_Info(unsigned char *Path, struct entry_info *Info, session_t SessionId);
 +extern int Novfs_GetX_File_Info(char *Path, const char *Name, char *buffer, ssize_t buffer_size, ssize_t *dataLen, session_t SessionId);
 +extern int Novfs_ListX_File_Info(char *Path, char *buffer, ssize_t buffer_size, ssize_t * dataLen, session_t SessionId);
