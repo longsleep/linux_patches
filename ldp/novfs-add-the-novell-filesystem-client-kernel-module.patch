@@ -30,18 +30,18 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  fs/Kconfig          |    9 
  fs/Makefile         |    1 
  fs/novfs/Makefile   |   19 
- fs/novfs/commands.h | 1029 +++++++++
- fs/novfs/daemon.c   | 2376 ++++++++++++++++++++++
- fs/novfs/file.c     | 1711 +++++++++++++++
- fs/novfs/inode.c    | 5568 ++++++++++++++++++++++++++++++++++++++++++++++++++++
- fs/novfs/nwcapi.c   | 2537 +++++++++++++++++++++++
- fs/novfs/nwcapi.h   | 2213 ++++++++++++++++++++
+ fs/novfs/commands.h | 1029 ++++++++++
+ fs/novfs/daemon.c   | 2229 +++++++++++++++++++++
+ fs/novfs/file.c     | 1711 ++++++++++++++++
+ fs/novfs/inode.c    | 5307 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ fs/novfs/nwcapi.c   | 2517 ++++++++++++++++++++++++
+ fs/novfs/nwcapi.h   | 2208 +++++++++++++++++++++
  fs/novfs/nwerror.h  |  658 ++++++
- fs/novfs/proc.c     |  152 +
+ fs/novfs/proc.c     |  140 +
  fs/novfs/profile.c  |  687 ++++++
  fs/novfs/scope.c    |  675 ++++++
- fs/novfs/vfs.h      |  433 ++++
- 14 files changed, 18068 insertions(+)
+ fs/novfs/vfs.h      |  438 ++++
+ 14 files changed, 17628 insertions(+)
 
 --- a/fs/Kconfig
 +++ b/fs/Kconfig
@@ -1102,7 +1102,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#endif	/* __NOVFS_COMMANDS_H */
 --- /dev/null
 +++ b/fs/novfs/daemon.c
-@@ -0,0 +1,2376 @@
+@@ -0,0 +1,2229 @@
 +/*
 + * Novell NCP Redirector for Linux
 + * Author: James Turner
@@ -1220,8 +1220,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +int NwdGetMountPath(PXPLAT pdata);
 +static int NwdSetMapDrive(PXPLAT pdata, session_t Session);
 +static int NwdUnMapDrive(PXPLAT pdata, session_t Session);
-+void RemoveDriveMaps(void);
-+int local_unlink(const char *pathname);
 +
 +/*===[ Global variables ]=================================================*/
 +static daemon_queue_t Daemon_Queue;
@@ -1233,10 +1231,78 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +static unsigned long Daemon_Command_Timeout = TIMEOUT_VALUE;
 +
-+static DECLARE_MUTEX(DriveMapLock);
-+static LIST_HEAD(DriveMapList);
++static DECLARE_MUTEX(drive_map_lock);
++static LIST_HEAD(drive_map_list);
 +
 +int MaxIoSize = PAGE_SIZE;
++
++static int local_unlink(const char *pathname)
++{
++	int error;
++	struct dentry *dentry;
++	struct nameidata nd;
++	struct inode *inode = NULL;
++
++	DbgPrint("%s: %s\n", __func__, pathname);
++	error = path_lookup(pathname, LOOKUP_PARENT, &nd);
++	DbgPrint("%s: path_lookup %d\n", __func__, error);
++	if (!error) {
++		error = -EISDIR;
++		if (nd.last_type == LAST_NORM) {
++			dentry = lookup_create(&nd, 1);
++			DbgPrint("%s: lookup_hash 0x%p\n", __func__, dentry);
++
++			error = PTR_ERR(dentry);
++			if (!IS_ERR(dentry)) {
++				if (nd.last.name[nd.last.len]) {
++					error =
++					    !dentry->
++					    d_inode ? -ENOENT : S_ISDIR(dentry->
++									d_inode->
++									i_mode)
++					    ? -EISDIR : -ENOTDIR;
++				} else {
++					inode = dentry->d_inode;
++					if (inode) {
++						atomic_inc(&inode->i_count);
++					}
++					error = vfs_unlink(nd.path.dentry->d_inode, dentry);
++					DbgPrint("%s: vfs_unlink %d\n", __func__, error);
++				}
++				dput(dentry);
++			}
++			mutex_unlock(&nd.path.dentry->d_inode->i_mutex);
++
++		}
++		path_put(&nd.path);
++	}
++
++	if (inode) {
++		iput(inode);	/* truncate the inode here */
++	}
++
++	DbgPrint("%s: error=%d\n", __func__, error);
++	return error;
++}
++
++static void remove_drive_maps(void)
++{
++	drive_map_t *dm;
++	struct list_head *list;
++
++	down(&drive_map_lock);
++	list_for_each(list, &drive_map_list) {
++		dm = list_entry(list, drive_map_t, list);
++
++		DbgPrint("%s: dm=0x%p hash: 0x%lx namelen: %d name: %s\n",
++			 __func__, dm, dm->hash, dm->namelen, dm->name);
++		local_unlink(dm->name);
++		list = list->prev;
++		list_del(&dm->list);
++		kfree(dm);
++	}
++	up(&drive_map_lock);
++}
 +
 +void Init_Daemon_Queue(void)
 +{
@@ -1301,7 +1367,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	ts1 = get_nanosecond_time();
 +
-+	DbgPrint("Queue_Daemon_Command: 0x%p %d\n", request, reqlen);
++	DbgPrint("Queue_Daemon_Command: %p %ld\n", request, reqlen);
 +
 +	if (atomic_read(&Daemon_Open_Count)) {
 +
@@ -1540,7 +1606,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +{
 +	daemon_command_t *que;
 +
-+	DbgPrint("find_queue: 0x%x\n", sequence);
++	DbgPrint("find_queue: 0x%lx\n", sequence);
 +
 +	spin_lock(&Daemon_Queue.lock);
 +	que = (daemon_command_t *) Daemon_Queue.list.next;
@@ -1628,7 +1694,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		}
 +		spin_unlock(&Daemon_Queue.lock);
 +
-+		RemoveDriveMaps();
++		remove_drive_maps();
 +
 +		Scope_Cleanup();
 +	}
@@ -1775,7 +1841,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	 */
 +	que = find_queue(sequence);
 +
-+	DbgPrint("Daemon_Receive_Reply: 0x%x 0x%p %d\n", sequence, que, nbytes);
++	DbgPrint("Daemon_Receive_Reply: 0x%lx %p %d\n", sequence, que, nbytes);
 +	if (que) {
 +		do {
 +			retValue = nbytes;
@@ -2058,7 +2124,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +}
 +
-+static int daemon_login(struct login *Login, struct schandle *Session)
++static int daemon_login(struct login __user *Login, struct schandle *Session)
 +{
 +	int retCode = -ENOMEM;
 +	struct login lLogin;
@@ -2105,7 +2171,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return (retCode);
 +}
 +
-+static int daemon_logout(struct logout *Logout, struct schandle *Session)
++static int daemon_logout(struct logout __user *Logout, struct schandle *Session)
 +{
 +	struct logout lLogout;
 +	struct qstr server;
@@ -2134,7 +2200,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	unsigned long replylen = 0;
 +	int retCode = 0;
 +
-+	DbgPrint("Daemon_Createsession_id: %d\n", current->pid);
++	DbgPrint("%s: %d\n", __func__, current->pid);
 +
 +	cmd.command.command_type = VFS_COMMAND_CREATE_CONTEXT;
 +	cmd.command.sequence_number = 0;
@@ -2149,13 +2215,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			*session_id = reply->session_id;
 +			retCode = 0;
 +		} else {
-+			session_id->hTypeId = 0;
-+			session_id->hId = 0;
++			session_id->hTypeId = NULL;
++			session_id->hId = NULL;
 +			retCode = -EIO;
 +		}
 +		kfree(reply);
 +	}
-+	DbgPrint("Daemon_Createsession_id: session_id=0x%llx\n", *session_id);
++	DbgPrint("%s: session_id=%p\n", __func__, session_id);
 +	return (retCode);
 +}
 +
@@ -2166,8 +2232,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	unsigned long replylen = 0;
 +	int retCode = 0;
 +
-+	DbgPrint("Daemon_Destroysession_id: 0x%p:%p\n",
-+		 session_id->hTypeId, session_id->hId);
++	DbgPrint("%s: %p:%p\n", __func__, session_id->hTypeId, session_id->hId);
 +
 +	cmd.command.command_type = VFS_COMMAND_DESTROY_CONTEXT;
 +	cmd.command.sequence_number = 0;
@@ -2187,8 +2252,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			 * When destroying the session check to see if there are any
 +			 * mapped drives.  If there are then remove them.
 +			 */
-+			down(&DriveMapLock);
-+			list_for_each(list, &DriveMapList) {
++			down(&drive_map_lock);
++			list_for_each(list, &drive_map_list) {
 +				struct schandle *temp;
 +
 +				dm = list_entry(list, drive_map_t, list);
@@ -2201,7 +2266,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +				}
 +
 +			}
-+			up(&DriveMapLock);
++			up(&drive_map_lock);
 +
 +		} else {
 +			retCode = -EIO;
@@ -2220,8 +2285,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	unsigned long replylen = 0;
 +	int retCode = 0;
 +
-+	DbgPrint("Daemon_Get_UserSpace: 0x%p:%p\n",
-+		 session_id->hTypeId, session_id->hId);
++	DbgPrint("%s: %p:%p\n", __func__, session_id->hTypeId, session_id->hId);
 +
 +	cmd.command.command_type = VFS_COMMAND_GET_USER_SPACE;
 +	cmd.command.sequence_number = 0;
@@ -2232,7 +2296,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +				 &replylen, INTERRUPTIBLE);
 +	if (reply) {
 +		if (!reply->Reply.error_code) {
-+
 +			DbgPrint("TotalSpace:  %llu\n", reply->TotalSpace);
 +			DbgPrint("FreeSpace:   %llu\n", reply->FreeSpace);
 +			DbgPrint("TotalEnties: %llu\n", reply->TotalEnties);
@@ -2276,7 +2339,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	unsigned long replylen, cmdlen;
 +	int retCode = -ENOMEM;
 +
-+	DbgPrint("Daemon_SetMountPoint: %s\n", Path);
++	DbgPrint("%s: %s\n", __func__, Path);
 +
 +	replylen = strlen(Path);
 +	cmdlen = sizeof(SET_MOUNT_PATH_REQUEST) + replylen;
@@ -2317,7 +2380,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	int retCode = -ENOMEM;
 +
-+	DbgPrint("Daemon_SendDebugCmd: %s\n", command);
++	DbgPrint("%s: %s\n", __func__, command);
 +
 +	dlist[0].page = NULL;
 +	dlist[0].offset = (char *)command;
@@ -2352,32 +2415,31 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	unsigned long cpylen;
 +	struct schandle session_id;
 +
-+	session_id = Scope_Get_session_id(NULL);
-+
 +	switch (cmd) {
 +	case IOC_LOGIN:
-+		retCode = daemon_login((struct login *)arg, &session_id);
++		session_id = Scope_Get_session_id(NULL);
++		retCode = daemon_login((struct login __user *)arg, &session_id);
 +		break;
 +
 +	case IOC_LOGOUT:
-+		retCode = daemon_logout((struct logout *) arg, &session_id);
++		session_id = Scope_Get_session_id(NULL);
++		retCode = daemon_logout((struct logout __user *) arg, &session_id);
 +		break;
++
 +	case IOC_DEBUGPRINT:
 +		{
 +			struct Ioctl_Debug {
 +				int length;
-+				char *data;
++				char __user *data;
 +			} io;
 +			char *buf;
 +			io.length = 0;
-+			cpylen = copy_from_user(&io, (char *)arg, sizeof(io));
++			cpylen = copy_from_user(&io, (char __user *)arg, sizeof(io));
 +			if (io.length) {
 +				buf = kmalloc(io.length + 1, GFP_KERNEL);
 +				if (buf) {
 +					buf[0] = 0;
-+					cpylen =
-+					    copy_from_user(buf, io.data,
-+							   io.length);
++					cpylen = copy_from_user(buf, io.data, io.length);
 +					buf[io.length] = '\0';
 +					DbgPrint("%s", buf);
 +					kfree(buf);
@@ -2391,14 +2453,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		{
 +			XPLAT data;
 +
-+			cpylen =
-+			    copy_from_user(&data, (void *)arg, sizeof(data));
++			cpylen = copy_from_user(&data, (void __user *)arg, sizeof(data));
 +			retCode = ((data.xfunction & 0x0000FFFF) | 0xCC000000);
 +
 +			switch (data.xfunction) {
 +			case NWC_GET_MOUNT_PATH:
-+				DbgPrint
-+				    ("[Daemon_ioctl] Call NwdGetMountPath\n");
++				DbgPrint("%s: Call NwdGetMountPath\n", __func__);
 +				retCode = NwdGetMountPath(&data);
 +				break;
 +			}
@@ -2411,14 +2471,15 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return (retCode);
 +}
 +
-+int Daemon_Added_Resource(daemon_handle_t *DHandle, int Type, HANDLE CHandle, unsigned char *FHandle, unsigned long Mode, unsigned long Size)
++static int Daemon_Added_Resource(daemon_handle_t *DHandle, int Type, HANDLE CHandle, unsigned char *FHandle, unsigned long Mode, unsigned long Size)
 +{
 +	daemon_resource_t *resource;
 +
 +	if (FHandle)
-+		DbgPrint("Daemon_Added_Resource: DHandle=0x%p Type=%d CHandle=0x%p FHandle=0x%x Mode=0x%x Size=%d\n", DHandle, Type, CHandle, *(u32 *) & FHandle[2], Mode, Size);
++		DbgPrint("%s: DHandle=0x%p Type=%d CHandle=0x%p FHandle=0x%x Mode=0x%lx Size=%ld\n",
++			 __func__, DHandle, Type, CHandle, *(u32 *) & FHandle[2], Mode, Size);
 +	else
-+		DbgPrint("Daemon_Added_Resource: DHandle=0x%p Type=%d CHandle=0x%p\n", DHandle, Type, CHandle);
++		DbgPrint("%s: DHandle=0x%p Type=%d CHandle=0x%p\n", __func__, DHandle, Type, CHandle);
 +
 +	resource = kmalloc(sizeof(daemon_resource_t), GFP_KERNEL);
 +	if (!resource)
@@ -2435,35 +2496,20 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	write_lock(&DHandle->lock);
 +	list_add(&resource->list, &DHandle->list);
 +	write_unlock(&DHandle->lock);
-+	DbgPrint("Daemon_Added_Resource: Adding resource=0x%p\n", resource);
++	DbgPrint("%s: Adding resource=0x%p\n", __func__, resource);
 +
 +	return 0;
 +}
 +
-+/*++======================================================================*/
-+int Daemon_Remove_Resource(daemon_handle_t * DHandle, int Type, HANDLE CHandle,
++int Daemon_Remove_Resource(daemon_handle_t *DHandle, int Type, HANDLE CHandle,
 +			   unsigned long FHandle)
-+/*
-+ *
-+ *  Arguments:
-+ *
-+ *  Returns:
-+ *
-+ *  Abstract:
-+ *
-+ *  Notes:
-+ *
-+ *  Environment:
-+ *
-+ *========================================================================*/
 +{
 +	daemon_resource_t *resource;
 +	struct list_head *l;
 +	int retVal = -ENOMEM;
 +
-+	DbgPrint
-+	    ("Daemon_Remove_Resource: DHandle=0x%p Type=%d CHandle=0x%p FHandle=0x%x\n",
-+	     DHandle, Type, CHandle, FHandle);
++	DbgPrint("%s: DHandle=%p Type=%d CHandle=%p FHandle=0x%lx\n",
++		 __func__, DHandle, Type, CHandle, FHandle);
 +
 +	write_lock(&DHandle->lock);
 +
@@ -2491,7 +2537,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +{
 +	daemon_handle_t *dh;
 +
-+	DbgPrint("Daemon_Library_open: inode=0x%p file=0x%p\n", inode, file);
++	DbgPrint("%s: inode=0x%p file=0x%p\n", __func__, inode, file);
 +
 +	dh = kmalloc(sizeof(daemon_handle_t), GFP_KERNEL);
 +	if (!dh)
@@ -2505,21 +2551,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return 0;
 +}
 +
-+/*++======================================================================*/
 +int Daemon_Library_close(struct inode *inode, struct file *file)
-+/*
-+ *
-+ *  Arguments:
-+ *
-+ *  Returns:
-+ *
-+ *  Abstract:
-+ *
-+ *  Notes:
-+ *
-+ *  Environment:
-+ *
-+ *========================================================================*/
 +{
 +	daemon_handle_t *dh;
 +	daemon_resource_t *resource;
@@ -2531,7 +2563,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	PNwdCCloseConn nwdClose;
 +	unsigned long cmdlen, replylen;
 +
-+	DbgPrint("Daemon_Library_close: inode=0x%p file=0x%p\n", inode, file);
++	DbgPrint("%s: inode=0x%p file=0x%p\n", __func__, inode, file);
 +	if (file->private_data) {
 +		dh = (daemon_handle_t *) file->private_data;
 +
@@ -2581,8 +2613,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	size_t thisread, totalread = 0;
 +	loff_t offset = *off;
 +
-+	DbgPrint("Daemon_Library_read: file=0x%p len=%d off=%lld\n", file, len,
-+		 *off);
++	DbgPrint("%s: file=0x%p len=%d off=%lld\n", __func__, file, len, *off);
 +
 +	if (file->private_data) {
 +		dh = file->private_data;
@@ -2607,7 +2638,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		read_unlock(&dh->lock);
 +	}
 +	*off = offset;
-+	DbgPrint("Daemon_Library_read return = 0x%x\n", totalread);
++	DbgPrint("%s: return = 0x%x\n", __func__, totalread);
 +	return (totalread);
 +}
 +
@@ -2620,8 +2651,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	loff_t offset = *off;
 +	int status;
 +
-+	DbgPrint("Daemon_Library_write: file=0x%p len=%d off=%lld\n", file, len,
-+		 *off);
++	DbgPrint("%s: file=0x%p len=%d off=%lld\n", __func__, file, len, *off);
 +
 +	if (file->private_data) {
 +		dh = file->private_data;
@@ -2638,7 +2668,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +					    Novfs_Write_Stream(resource->
 +							       connection,
 +							       resource->handle,
-+							       (void *)buf,
++							       buf,
 +							       &thiswrite,
 +							       &offset,
 +							       dh->session);
@@ -2666,33 +2696,19 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		write_unlock(&dh->lock);
 +	}
 +	*off = offset;
-+	DbgPrint("Daemon_Library_write return = 0x%x\n", totalwrite);
++	DbgPrint("%s: return = 0x%x\n", __func__, totalwrite);
 +
 +	return (totalwrite);
 +}
 +
-+/*++======================================================================*/
-+loff_t Daemon_Library_llseek(struct file * file, loff_t offset, int origin)
-+/*
-+ *
-+ *  Arguments:
-+ *
-+ *  Returns:
-+ *
-+ *  Abstract:
-+ *
-+ *  Notes:
-+ *
-+ *  Environment:
-+ *
-+ *========================================================================*/
++loff_t Daemon_Library_llseek(struct file *file, loff_t offset, int origin)
 +{
 +	daemon_handle_t *dh;
 +	daemon_resource_t *resource;
 +
 +	loff_t retVal = -EINVAL;
 +
-+	DbgPrint("Daemon_Library_llseek: file=0x%p offset=%lld origin=%d\n",
++	DbgPrint("%s: file=0x%p offset=%lld origin=%d\n", __func__,
 +		 file, offset, origin);
 +
 +	if (file->private_data) {
@@ -2722,7 +2738,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		read_unlock(&dh->lock);
 +	}
 +
-+	DbgPrint("Daemon_Library_llseek: ret %lld\n", retVal);
++	DbgPrint("%s: ret %lld\n", __func__, retVal);
 +
 +	return retVal;
 +}
@@ -2736,31 +2752,28 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	dh = file->private_data;
 +
-+	DbgPrint("Daemon_Library_ioctl: file=0x%p 0x%x 0x%p dh=0x%p\n", file,
-+		 cmd, arg, dh);
++	DbgPrint("%s: file=0x%p 0x%x 0x%lx dh=0x%p\n", __func__, file, cmd, arg, dh);
 +
 +	if (dh) {
 +
 +		switch (cmd) {
 +		case IOC_LOGIN:
-+			retCode = daemon_login((struct login *)arg, &dh->session);
++			retCode = daemon_login((struct login __user*)arg, &dh->session);
 +			break;
 +
 +		case IOC_LOGOUT:
-+			retCode = daemon_logout((struct logout *)arg, &dh->session);
++			retCode = daemon_logout((struct logout __user*)arg, &dh->session);
 +			break;
 +
 +		case IOC_DEBUGPRINT:
 +			{
 +				struct Ioctl_Debug {
 +					int length;
-+					char *data;
++					char __user *data;
 +				} io;
 +				char *buf;
 +				io.length = 0;
-+				cpylen =
-+				    copy_from_user(&io, (void *)arg,
-+						   sizeof(io));
++				cpylen = copy_from_user(&io, (void __user *)arg, sizeof(io));
 +				if (io.length) {
 +					buf = kmalloc(io.length + 1, GFP_KERNEL);
 +					if (buf) {
@@ -2779,12 +2792,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			{
 +				XPLAT data;
 +
-+				cpylen =
-+				    copy_from_user(&data, (void *)arg,
-+						   sizeof(data));
-+				retCode =
-+				    ((data.
-+				      xfunction & 0x0000FFFF) | 0xCC000000);
++				cpylen = copy_from_user(&data, (void __user *)arg, sizeof(data));
++				retCode = ((data.xfunction & 0x0000FFFF) | 0xCC000000);
 +
 +				switch (data.xfunction) {
 +				case NWC_OPEN_CONN_BY_NAME:
@@ -3137,9 +3146,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +//sgled         memcpy(lh.NwWareHandle, resource->handle, sizeof(resource->handle));
 +			memcpy(lh.NetWareHandle, resource->handle, sizeof(resource->handle));	//sgled
 +			if (pdata->repLen >= sizeof(NwcConvertLocalHandle)) {
-+				cpylen =
-+				    copy_to_user(pdata->repData, &lh,
-+						 sizeof(NwcConvertLocalHandle));
++				cpylen = copy_to_user(pdata->repData, &lh, sizeof(NwcConvertLocalHandle));
 +				retVal = 0;
 +			} else {
 +				retVal = NWE_BUFFER_OVERFLOW;
@@ -3183,9 +3190,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			retVal = NWE_BUFFER_OVERFLOW;
 +		} else {
 +			if (mp.pMountPath) {
-+				cpylen =
-+				    copy_to_user(mp.pMountPath,
-+						 Novfs_CurrentMount, len);
++				cpylen = copy_to_user(mp.pMountPath, Novfs_CurrentMount, len);
 +			}
 +			retVal = 0;
 +		}
@@ -3204,7 +3209,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +{
 +	int retVal;
 +	NwcMapDriveEx symInfo;
-+	char *path;
++	char __user *path;
 +	drive_map_t *drivemap, *dm;
 +	struct list_head *list;
 +
@@ -3219,7 +3224,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	if (!drivemap)
 +		return -ENOMEM;
 +
-+	path = (char *)pdata->reqData;
++	path = pdata->reqData;
 +	path += symInfo.linkOffset;
 +	if (copy_from_user(drivemap->name, path, symInfo.linkOffsetLength)) {
 +		kfree(drivemap);
@@ -3229,19 +3234,16 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	drivemap->session = Session;
 +	drivemap->hash = full_name_hash(drivemap->name, symInfo.linkOffsetLength - 1);
 +	drivemap->namelen = symInfo.linkOffsetLength - 1;
-+	DbgPrint("NwdSetMapDrive: hash=0x%x path=%s\n", drivemap->hash, drivemap->name);
++	DbgPrint("%s: hash=0x%lx path=%s\n", __func__, drivemap->hash, drivemap->name);
 +
-+	dm = (drive_map_t *) & DriveMapList.next;
++	dm = (drive_map_t *) & drive_map_list.next;
 +
-+	down(&DriveMapLock);
++	down(&drive_map_lock);
 +
-+	list_for_each(list, &DriveMapList) {
++	list_for_each(list, &drive_map_list) {
 +		dm = list_entry(list, drive_map_t, list);
-+		DbgPrint("NwdSetMapDrive: dm=0x%p\n"
-+			 "   hash:    0x%x\n"
-+			 "   namelen: %d\n"
-+			 "   name:    %s\n",
-+			 dm, dm->hash, dm->namelen, dm->name);
++		DbgPrint("%s: dm=0x%p hash: 0x%lx namelen: %d name: %s\n",
++			 __func__, dm, dm->hash, dm->namelen, dm->name);
 +
 +		if (drivemap->hash == dm->hash) {
 +			if (0 ==
@@ -3255,7 +3257,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	}
 +
 +	if (dm) {
-+		if ((dm == (drive_map_t *) & DriveMapList) ||
++		if ((dm == (drive_map_t *) & drive_map_list) ||
 +		    (dm->hash < drivemap->hash)) {
 +			list_add(&drivemap->list, &dm->list);
 +		} else {
@@ -3265,7 +3267,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	} else {
 +		kfree(drivemap);
 +	}
-+	up(&DriveMapLock);
++	up(&drive_map_lock);
 +
 +	return (retVal);
 +}
@@ -3290,23 +3292,21 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	if (!path)
 +		return -ENOMEM;
 +
-+	if (copy_from_user(path, ((NwcUnmapDriveEx *)pdata->reqData)->linkData, symInfo.linkLen)) {
++	if (copy_from_user(path, ((NwcUnmapDriveEx __user *)pdata->reqData)->linkData, symInfo.linkLen)) {
 +		kfree(path);
 +		return -EFAULT;
 +	}
 +
 +	hash = full_name_hash(path, symInfo.linkLen - 1);
-+	DbgPrint("NwdUnMapDrive: hash=0x%x path=%s\n", hash, path);
++	DbgPrint("%s: hash=0x%lx path=%s\n", __func__, hash, path);
 +
 +	dm = NULL;
 +
-+	down(&DriveMapLock);
++	down(&drive_map_lock);
 +
-+	list_for_each(list, &DriveMapList) {
++	list_for_each(list, &drive_map_list) {
 +		dm = list_entry(list, drive_map_t, list);
-+		DbgPrint("NwdUnMapDrive: dm=0x%p %s\n"
-+			 "   hash:    0x%x\n"
-+			 "   namelen: %d\n",
++		DbgPrint("%s: dm=0x%p %s hash: 0x%lx namelen: %d\n", __func__,
 +			 dm, dm->name, dm->hash, dm->namelen);
 +
 +		if (hash == dm->hash) {
@@ -3320,165 +3320,18 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	}
 +
 +	if (dm) {
-+		DbgPrint("NwdUnMapDrive: Remove dm=0x%p %s\n"
-+			 "   hash:    0x%x\n"
-+			 "   namelen: %d\n",
-+			 dm, dm->name, dm->hash, dm->namelen);
++		DbgPrint("%s: Remove dm=0x%p %s hash: 0x%lx namelen: %d\n",
++			 __func__, dm, dm->name, dm->hash, dm->namelen);
 +		list_del(&dm->list);
 +		kfree(dm);
 +	}
 +
-+	up(&DriveMapLock);
++	up(&drive_map_lock);
 +
 +	return retVal;
 +}
 +
-+/*++======================================================================*/
-+void RemoveDriveMaps(void)
-+/*
-+ *
-+ *  Arguments:
-+ *
-+ *  Returns:
-+ *
-+ *  Abstract:
-+ *
-+ *  Notes:
-+ *
-+ *  Environment:
-+ *
-+ *========================================================================*/
-+{
-+	drive_map_t *dm;
-+	struct list_head *list;
 +
-+	down(&DriveMapLock);
-+	list_for_each(list, &DriveMapList) {
-+		dm = list_entry(list, drive_map_t, list);
-+
-+		DbgPrint("RemoveDriveMap: dm=0x%p\n"
-+			 "   hash:    0x%x\n"
-+			 "   namelen: %d\n"
-+			 "   name:    %s\n",
-+			 dm, dm->hash, dm->namelen, dm->name);
-+		local_unlink(dm->name);
-+		list = list->prev;
-+		list_del(&dm->list);
-+		kfree(dm);
-+	}
-+	up(&DriveMapLock);
-+}
-+
-+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,15)
-+/*++======================================================================*/
-+int local_unlink(const char *pathname)
-+{
-+	int error;
-+	struct dentry *dentry;
-+	struct nameidata nd;
-+	struct inode *inode = NULL;
-+
-+	DbgPrint("local_unlink: %s\n", pathname);
-+	error = path_lookup(pathname, LOOKUP_PARENT, &nd);
-+	DbgPrint("local_unlink: path_lookup %d\n", error);
-+	if (!error) {
-+		error = -EISDIR;
-+		if (nd.last_type == LAST_NORM) {
-+			dentry = lookup_create(&nd, 1);
-+			DbgPrint("local_unlink: lookup_hash 0x%p\n", dentry);
-+
-+			error = PTR_ERR(dentry);
-+			if (!IS_ERR(dentry)) {
-+				if (nd.last.name[nd.last.len]) {
-+					error =
-+					    !dentry->
-+					    d_inode ? -ENOENT : S_ISDIR(dentry->
-+									d_inode->
-+									i_mode)
-+					    ? -EISDIR : -ENOTDIR;
-+				} else {
-+					inode = dentry->d_inode;
-+					if (inode) {
-+						atomic_inc(&inode->i_count);
-+					}
-+					error = vfs_unlink(nd.path.dentry->d_inode, dentry);
-+					DbgPrint
-+					    ("local_unlink: vfs_unlink %d\n",
-+					     error);
-+				}
-+				dput(dentry);
-+			}
-+			mutex_unlock(&nd.path.dentry->d_inode->i_mutex);
-+
-+		}
-+		path_put(&nd.path);
-+	}
-+
-+	if (inode) {
-+		iput(inode);	/* truncate the inode here */
-+	}
-+
-+	DbgPrint("local_unlink: error=%d\n", error);
-+	return error;
-+}
-+
-+#else
-+/*++======================================================================*/
-+int local_unlink(const char *pathname)
-+{
-+	int error;
-+	struct dentry *dentry;
-+	struct nameidata nd;
-+	struct inode *inode = NULL;
-+
-+	DbgPrint("local_unlink: %s\n", pathname);
-+	error = path_lookup(pathname, LOOKUP_PARENT, &nd);
-+	DbgPrint("local_unlink: path_lookup %d\n", error);
-+	if (!error) {
-+		error = -EISDIR;
-+		if (nd.last_type == LAST_NORM) {
-+			down(&nd.dentry->d_inode->i_sem);
-+			dentry =
-+			    lookup_one_len(&nd.last, nd.dentry,
-+					   sizeof(nd.last));
-+			DbgPrint("local_unlink: lookup_hash 0x%p\n", dentry);
-+
-+			error = PTR_ERR(dentry);
-+			if (!IS_ERR(dentry)) {
-+				if (nd.last.name[nd.last.len]) {
-+					error =
-+					    !dentry->
-+					    d_inode ? -ENOENT : S_ISDIR(dentry->
-+									d_inode->
-+									i_mode)
-+					    ? -EISDIR : -ENOTDIR;
-+				} else {
-+					inode = dentry->d_inode;
-+					if (inode) {
-+						atomic_inc(&inode->i_count);
-+					}
-+					error =
-+					    vfs_unlink(nd.dentry->d_inode,
-+						       dentry);
-+					DbgPrint
-+					    ("local_unlink: vfs_unlink %d\n",
-+					     error);
-+				}
-+				dput(dentry);
-+			}
-+			up(&nd.dentry->d_inode->i_sem);
-+		}
-+		path_release(&nd);
-+	}
-+
-+	if (inode) {
-+		iput(inode);	/* truncate the inode here */
-+	}
-+
-+	DbgPrint("local_unlink: error=%d\n", error);
-+	return error;
-+}
-+#endif
 --- /dev/null
 +++ b/fs/novfs/file.c
 @@ -0,0 +1,1711 @@
@@ -4389,7 +4242,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return (retCode);
 +}
 +
-+int Novfs_Write_File(HANDLE handle, unsigned char __user *buffer,
++int Novfs_Write_File(HANDLE handle, const char __user *buffer,
 +		     size_t *bytes, loff_t *offset, session_t session_id)
 +{
 +	WRITE_FILE_REQUEST cmd;
@@ -4765,7 +4618,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return (retCode);
 +}
 +
-+int Novfs_Write_Stream(HANDLE ConnHandle, unsigned char * handle, unsigned char __user *buffer,
++int Novfs_Write_Stream(HANDLE ConnHandle, unsigned char * handle, const char __user *buffer,
 +		       size_t * bytes, loff_t * offset, session_t session_id)
 +{
 +	PWRITE_STREAM_REQUEST cmd;
@@ -5195,7 +5048,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +}
 --- /dev/null
 +++ b/fs/novfs/inode.c
-@@ -0,0 +1,5568 @@
+@@ -0,0 +1,5307 @@
 +/*
 + * Novell NCP Redirector for Linux
 + * Author: James Turner
@@ -5298,18 +5151,18 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +int Novfs_dir_open(struct inode *inode, struct file *file);
 +int Novfs_dir_release(struct inode *inode, struct file *file);
 +loff_t Novfs_dir_lseek(struct file *file, loff_t offset, int origin);
-+ssize_t Novfs_dir_read(struct file *file, char *buf, size_t len, loff_t * off);
++static ssize_t Novfs_dir_read(struct file *file, char __user *buf, size_t len, loff_t * off);
 +void addtodentry(struct dentry *Parent, unsigned char *List, int Level);
 +int Novfs_filldir(void *data, const char *name, int namelen, loff_t off,
 +		  ino_t ino, unsigned ftype);
 +int Novfs_dir_readdir(struct file *filp, void *dirent, filldir_t filldir);
-+int Novfs_dir_fsync(struct file *file, struct dentry *dentry, int datasync);
++static int Novfs_dir_fsync(struct file *file, struct dentry *dentry, int datasync);
 +
 +/*
 + * Declared address space operations
 + */
 +int Novfs_a_writepage(struct page *page, struct writeback_control *wbc);
-+int Novfs_a_writepages(struct address_space *mapping,
++static int Novfs_a_writepages(struct address_space *mapping,
 +		       struct writeback_control *wbc);
 +int Novfs_a_prepare_write(struct file *file, struct page *page, unsigned from,
 +			  unsigned to);
@@ -5324,8 +5177,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +/*
 + * Declared file_operations
 + */
-+ssize_t Novfs_f_read(struct file *, char *, size_t, loff_t *);
-+ssize_t Novfs_f_write(struct file *, const char *, size_t, loff_t *);
++static ssize_t Novfs_f_read(struct file *, char __user *, size_t, loff_t *);
++static ssize_t Novfs_f_write(struct file *, const char __user *, size_t, loff_t *);
 +int Novfs_f_readdir(struct file *, void *, filldir_t);
 +int Novfs_f_ioctl(struct inode *, struct file *, unsigned int, unsigned long);
 +int Novfs_f_mmap(struct file *file, struct vm_area_struct *vma);
@@ -5421,8 +5274,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +void Novfs_free_invalid_entries(struct inode *i);
 +void Novfs_free_inode_cache(struct inode *i);
 +
-+/*===[ Global variables ]=================================================*/
-+struct dentry_operations Novfs_dentry_operations = {
++static struct dentry_operations Novfs_dentry_operations = {
 +	.d_revalidate = Novfs_d_revalidate,
 +	.d_hash = Novfs_d_hash,
 +	.d_compare = Novfs_d_compare,
@@ -5431,7 +5283,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	.d_iput = Novfs_d_iput,
 +};
 +
-+struct file_operations Novfs_dir_operations = {
++static struct file_operations Novfs_dir_operations = {
 +	.owner = THIS_MODULE,
 +	.open = Novfs_dir_open,
 +	.release = Novfs_dir_release,
@@ -5460,7 +5312,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	.readpage = Novfs_a_readpage,
 +};
 +
-+struct backing_dev_info Novfs_backing_dev_info = {
++static struct backing_dev_info Novfs_backing_dev_info = {
 +	.ra_pages = (VM_MAX_READAHEAD * 1024) / PAGE_CACHE_SIZE,
 +	.state = 0,
 +	.capabilities = BDI_CAP_NO_WRITEBACK | BDI_CAP_MAP_COPY,
@@ -5532,82 +5384,24 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +char *Novfs_CurrentMount = NULL;
 +
-+DECLARE_MUTEX(InodeList_lock);
++static DECLARE_MUTEX(InodeList_lock);
++static LIST_HEAD(InodeList);
++static DECLARE_MUTEX(TimeDir_Lock);
++static uint64_t inHAXTime;
++static int inHAX;
 +
-+LIST_HEAD(InodeList);
++static unsigned long InodeCount = 0;
++static unsigned long DCCount = 0;
 +
-+DECLARE_MUTEX(TimeDir_Lock);
-+uint64_t lastTime;
-+char lastDir[PATH_MAX];
-+
-+uint64_t inHAXTime;
-+int inHAX;
-+
-+unsigned long InodeCount = 0, DCCount = 0;
 +unsigned long File_update_timeout = FILE_UPDATE_TIMEOUT;
 +int PageCache = 0;
-+
-+typedef struct _Novfs_List2 {
-+	struct list_head list;
-+	void *data;
-+} Novfs_List2;
 +
 +typedef struct _File_Private2 {
 +	int listedall;
 +	HANDLE enumHandle;
 +} FilePrivate2;
 +
-+static void PRINT_DENTRY(const char *s, struct dentry *d)
-+{
-+	DbgPrint("%s: 0x%p\n", s, d);
-+	DbgPrint("   d_count:      0x%x\n", d->d_count);
-+	DbgPrint("   d_lock:       0x%x\n", d->d_lock);
-+	DbgPrint("   d_inode:      0x%x\n", d->d_inode);
-+	DbgPrint("   d_lru:        0x%p\n"
-+		 "      next:      0x%p\n"
-+		 "      prev:      0x%p\n", &d->d_lru, d->d_lru.next,
-+		 d->d_lru.prev);
-+	DbgPrint("   d_child:      0x%p\n" "      next:      0x%p\n"
-+		 "      prev:      0x%p\n", &d->D_CHILD, d->D_CHILD.next,
-+		 d->D_CHILD.prev);
-+	DbgPrint("   d_subdirs:    0x%p\n" "      next:      0x%p\n"
-+		 "      prev:      0x%p\n", &d->d_subdirs, d->d_subdirs.next,
-+		 d->d_subdirs.prev);
-+	DbgPrint("   d_alias:      0x%p\n" "      next:      0x%p\n"
-+		 "      prev:      0x%p\n", &d->d_alias, d->d_alias.next,
-+		 d->d_alias.prev);
-+	DbgPrint("   d_time:       0x%x\n", d->d_time);
-+	DbgPrint("   d_op:         0x%p\n", d->d_op);
-+	DbgPrint("   d_sb:         0x%p\n", d->d_sb);
-+	DbgPrint("   d_flags:      0x%x\n", d->d_flags);
-+	DbgPrint("   d_mounted:    0x%x\n", d->d_mounted);
-+	DbgPrint("   d_fsdata:     0x%p\n", d->d_fsdata);
-+/*   DbgPrint("   d_cookie:     0x%x\n", d->d_cookie); */
-+	DbgPrint("   d_parent:     0x%p\n", d->d_parent);
-+	DbgPrint("   d_name:       0x%p %.*s\n", &d->d_name, d->d_name.len,
-+		 d->d_name.name);
-+	DbgPrint("      name:      0x%p\n" "      len:       %d\n"
-+		 "      hash:      0x%x\n", d->d_name.name, d->d_name.len,
-+		 d->d_name.hash);
-+	DbgPrint("   d_hash:       0x%x\n" "      next:      0x%x\n"
-+		 "      pprev:     0x%x\n", d->d_hash, d->d_hash.next,
-+		 d->d_hash.pprev);
-+}
-+
-+/*++======================================================================*/
 +int Novfs_Remove_from_Root(char *RemoveName)
-+/*
-+ *  Arguments:
-+ *
-+ *  Returns:
-+ *
-+ *  Abstract:
-+ *
-+ *  Notes:
-+ *
-+ *  Environment:
-+ *
-+ *========================================================================*/
 +{
 +	struct qstr name;
 +	struct dentry *dentry;
@@ -5678,72 +5472,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	Novfs_unlock_inode_cache(dir);
 +
-+	return (0);
-+}
-+
-+/*++======================================================================*/
-+int Novfs_Add_to_Root2(char *AddName)
-+/*
-+ *  Arguments:
-+ *
-+ *  Returns:
-+ *
-+ *  Abstract:
-+ *
-+ *  Notes:
-+ *
-+ *  Environment:
-+ *
-+ *========================================================================*/
-+{
-+	struct dentry *entry;
-+	struct qstr name;
-+	struct inode *inode;
-+	void *scope;
-+
-+	DbgPrint("Novfs_Add_to_Root: %s\n", AddName);
-+	name.len = strlen(AddName);
-+	name.name = AddName;
-+
-+	Novfs_d_hash(Novfs_root, &name);
-+
-+	entry = Novfs_d_lookup(Novfs_root, &name);
-+	DbgPrint("Novfs_Add_to_Root: Novfs_d_lookup 0x%p\n", entry);
-+	if (NULL == entry) {
-+		scope = Scope_Lookup();
-+
-+		entry = d_alloc(Novfs_root, &name);
-+		DbgPrint("Novfs_Add_to_Root: d_alloc 0x%p\n", entry);
-+		if (entry) {
-+			entry->d_op = &Novfs_dentry_operations;
-+			entry->d_time = jiffies + (File_update_timeout * HZ);
-+			/*
-+			 * done in Novfs_d_add now... entry->d_fsdata = (void *)Novfs_internal_hash( &name );
-+			 */
-+			inode =
-+			    Novfs_get_inode(Novfs_root->d_sb, S_IFDIR | 0700, 0, Scope_Get_Uid(scope), 0, &name);
-+			DbgPrint("Novfs_Add_to_Root: Inode=0x%p\n", inode);
-+			if (inode) {
-+				inode->i_atime =
-+				    inode->i_ctime =
-+				    inode->i_mtime = CURRENT_TIME;
-+				if (!Novfs_d_add(Novfs_root, entry, inode, 1)) {
-+					if (inode->FSPRIVATE) {
-+						((struct inode_data *) inode->
-+						 FSPRIVATE)->Flags = USER_INODE;
-+					}
-+					PRINT_DENTRY("After Novfs_d_add",
-+						     entry);
-+				} else {
-+					dput(entry);
-+					iput(inode);
-+				}
-+			}
-+		}
-+	} else {
-+		dput(entry);
-+		PRINT_DENTRY("Novfs_Add_to_Root: After dput Dentry", entry);
-+	}
 +	return (0);
 +}
 +
@@ -6446,35 +6174,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	//return(default_llseek(file, offset, origin));
 +}
 +
-+/*++======================================================================*/
-+ssize_t Novfs_dir_read(struct file * file, char *buf, size_t len, loff_t * off)
-+/*
-+ *  Arguments:
-+ *
-+ *  Returns:
-+ *
-+ *  Abstract:
-+ *
-+ *  Notes:
-+ *
-+ *  Environment:
-+ *
-+ *========================================================================*/
++static ssize_t Novfs_dir_read(struct file *file, char __user *buf,
++			      size_t len, loff_t * off)
 +{
-+/*
-+   int rlen = 0;
-+
-+   DbgPrint("Novfs_dir_readdir: dentry path %.*s buf=0x%p len=%d off=%lld\n", file->f_dentry->d_name.len, file->f_dentry->d_name.name, buf, len, *off);
-+
-+   if (0 == *off)
-+   {
-+      rlen = 8;
-+      rlen -= copy_to_user(buf, "Testing\n", 8);
-+      *off += rlen;
-+   }
-+   return(rlen);
-+*/
-+	DbgPrint("Novfs_dir_read: %lld %d Name %.*s\n", *off, len,
++	DbgPrint("%s: %lld %d Name %.*s\n", __func__, *off, len,
 +		 file->f_dentry->d_name.len, file->f_dentry->d_name.name);
 +	return (generic_read_dir(file, buf, len, off));
 +}
@@ -6502,33 +6205,21 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	ctime_r(&info->atime.tv_sec, atime_buf);
 +	ctime_r(&info->mtime.tv_sec, mtime_buf);
 +	ctime_r(&info->ctime.tv_sec, ctime_buf);
-+	DbgPrint("Novfs_dir_readdir : type = %i\n", info->type);
-+	DbgPrint("Novfs_dir_readdir : mode = %x\n", info->mode);
-+	DbgPrint("Novfs_dir_readdir : uid = %d\n", info->uid);
-+	DbgPrint("Novfs_dir_readdir : gid = %d\n", info->gid);
-+	DbgPrint("Novfs_dir_readdir : size = %i\n", info->size);
-+	DbgPrint("Novfs_dir_readdir : atime = %s\n", atime_buf);
-+	DbgPrint("Novfs_dir_readdir : mtime = %s\n", mtime_buf);
-+	DbgPrint("Novfs_dir_readdir : ctime = %s\n", ctime_buf);
-+	DbgPrint("Novfs_dir_readdir : namelength = %i\n", info->namelength);
-+	DbgPrint("Novfs_dir_readdir : name = %s\n", namebuf);
++	DbgPrint("%s: type = %i\n", __func__, info->type);
++	DbgPrint("%s: mode = %x\n", __func__, info->mode);
++	DbgPrint("%s: uid = %d\n", __func__, info->uid);
++	DbgPrint("%s: gid = %d\n", __func__, info->gid);
++	DbgPrint("%s: size = %i\n", __func__, info->size);
++	DbgPrint("%s: atime = %s\n", __func__, atime_buf);
++	DbgPrint("%s: mtime = %s\n", __func__, mtime_buf);
++	DbgPrint("%s: ctime = %s\n", __func__, ctime_buf);
++	DbgPrint("%s: namelength = %i\n", __func__, info->namelength);
++	DbgPrint("%s: name = %s\n", __func__, namebuf);
 +}
 +
 +/*++======================================================================*/
-+void processList(struct file *file, void *dirent, filldir_t filldir, char *list,
-+		 int type, session_t session_id)
-+/*
-+ *  Arguments:
-+ *
-+ *  Returns:
-+ *
-+ *  Abstract:
-+ *
-+ *  Notes:
-+ *
-+ *  Environment:
-+ *
-+ *========================================================================*/
++static void processList(struct file *file, void *dirent, filldir_t filldir,
++			char *list, int type, session_t session_id)
 +{
 +	unsigned char *path, *buf = NULL, *cp;
 +	struct qstr name;
@@ -6549,7 +6240,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		cp = list;
 +		while (*cp) {
 +			name.name = cp;
-+			DbgPrint("Novfs_dir_readdir : name.name = %s\n",
++			DbgPrint("%s: name.name = %s\n", __func__,
 +				 name.name);
 +			name.len = strlen(cp);
 +			name.hash = Novfs_internal_hash(&name);
@@ -6580,8 +6271,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	}
 +}
 +
-+int processEntries(struct file *file, void *dirent, filldir_t filldir,
-+		   HANDLE * enumHandle, session_t sessionId)
++static int processEntries(struct file *file, void *dirent, filldir_t filldir,
++			  HANDLE * enumHandle, session_t sessionId)
 +{
 +	unsigned char *path = NULL, *buf = NULL;
 +	int count = 0, status = 0;
@@ -6778,40 +6469,15 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return 1;
 +}
 +
-+/*++======================================================================*/
-+int Novfs_dir_fsync(struct file *file, struct dentry *dentry, int datasync)
-+/*
-+ *  Arguments:
-+ *
-+ *  Returns:
-+ *
-+ *  Abstract:
-+ *
-+ *  Notes:
-+ *
-+ *  Environment:
-+ *
-+ *========================================================================*/
++static int Novfs_dir_fsync(struct file *file, struct dentry *dentry, int datasync)
 +{
-+	DbgPrint("Novfs_dir_fsync: Name %.*s\n", file->f_dentry->d_name.len,
++	DbgPrint("%s: Name %.*s\n", __func__, file->f_dentry->d_name.len,
 +		 file->f_dentry->d_name.name);
-+	return (simple_sync_file(file, dentry, datasync));
++	return simple_sync_file(file, dentry, datasync);
 +}
 +
-+/*++======================================================================*/
-+ssize_t Novfs_f_read(struct file * file, char *buf, size_t len, loff_t * off)
-+/*
-+ *  Arguments:
-+ *
-+ *  Returns:
-+ *
-+ *  Abstract:
-+ *
-+ *  Notes:
-+ *
-+ *  Environment:
-+ *
-+ *========================================================================*/
++static ssize_t Novfs_f_read(struct file * file, char __user *buf,
++			    size_t len, loff_t *off)
 +{
 +	size_t thisread, totalread = 0;
 +	loff_t offset = *off;
@@ -6823,7 +6489,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	    (inode = file->f_dentry->d_inode) &&
 +	    (id = (struct inode_data *)inode->FSPRIVATE)) {
 +
-+		DbgPrint("Novfs_f_read(0x%p 0x%p %d %lld %.*s)\n",
++		DbgPrint("%s: (0x%p 0x%p %d %lld %.*s)\n", __func__,
 +			 file->private_data,
 +			 buf, len, offset,
 +			 file->f_dentry->d_name.len,
@@ -6856,7 +6522,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +					}
 +					break;
 +				}
-+				DbgPrint("Novfs_f_read thisread = 0x%x\n",
++				DbgPrint("%s: thisread = 0x%x\n", __func__,
 +					 thisread);
 +				len -= thisread;
 +				buf += thisread;
@@ -6866,28 +6532,16 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			*off = offset;
 +		}
 +	}
-+	DbgPrint("Novfs_f_read return = %d\n", totalread);
++	DbgPrint("%s: return = %d\n", __func__, totalread);
 +
 +	return (totalread);
 +}
 +
-+/*++======================================================================*/
-+ssize_t Novfs_f_write(struct file * file, const char *buf, size_t len,
-+		      loff_t * off)
-+/*
-+ *  Arguments:
-+ *
-+ *  Returns:
-+ *
-+ *  Abstract:
-+ *
-+ *  Notes:
-+ *
-+ *  Environment:
-+ *
-+ *========================================================================*/
++static ssize_t Novfs_f_write(struct file *file, const char __user *buf,
++			     size_t len, loff_t *off)
 +{
-+	ssize_t thiswrite, totalwrite = 0;
++	size_t thiswrite;
++	ssize_t totalwrite = 0;
 +	loff_t offset = *off;
 +	session_t session;
 +	struct inode *inode;
@@ -6897,7 +6551,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	if (file->f_dentry &&
 +	    (inode = file->f_dentry->d_inode) &&
 +	    (id = file->f_dentry->d_inode->FSPRIVATE)) {
-+		DbgPrint("Novfs_f_write(0x%p 0x%p 0x%p %d %lld %.*s)\n",
++		DbgPrint("%s: (0x%p 0x%p 0x%p %d %lld %.*s)\n", __func__,
 +			 file->private_data, inode, id->FileHandle, len, offset,
 +			 file->f_dentry->d_name.len,
 +			 file->f_dentry->d_name.name);
@@ -6913,8 +6567,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		} else {
 +			if (file->f_flags & O_APPEND) {
 +				offset = i_size_read(inode);
-+				DbgPrint
-+				    ("Novfs_f_write appending to end %lld %.*s\n",
++				DbgPrint("%s: appending to end %lld %.*s\n", __func__,
 +				     offset, file->f_dentry->d_name.len,
 +				     file->f_dentry->d_name.name);
 +			}
@@ -6930,13 +6583,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +				thiswrite = len;
 +				if ((status =
 +				     Novfs_Write_File(file->private_data,
-+						      (unsigned char *)buf,
++						      buf,
 +						      &thiswrite, &offset,
 +						      session)) || !thiswrite) {
 +					totalwrite = status;
 +					break;
 +				}
-+				DbgPrint("Novfs_f_write thiswrite = 0x%x\n",
++				DbgPrint("%s: thiswrite = 0x%x\n", __func__,
 +					 thiswrite);
 +				len -= thiswrite;
 +				buf += thiswrite;
@@ -6955,7 +6608,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			*off = offset;
 +		}
 +	}
-+	DbgPrint("Novfs_f_write return = 0x%x\n", totalwrite);
++	DbgPrint("%s: return = 0x%x\n", __func__, totalwrite);
 +
 +	return (totalwrite);
 +}
@@ -7108,21 +6761,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return (retCode);
 +}
 +
-+/*++======================================================================*/
-+int Novfs_flush_mapping(HANDLE Handle, struct address_space *mapping,
-+			session_t Session)
-+/*
-+ *  Arguments:
-+ *
-+ *  Returns:
-+ *
-+ *  Abstract:
-+ *
-+ *  Notes:
-+ *
-+ *  Environment:
-+ *
-+ *========================================================================*/
++static int Novfs_flush_mapping(HANDLE Handle, struct address_space *mapping,
++			       session_t Session)
 +{
 +	struct pagevec pagevec;
 +	unsigned nrpages;
@@ -7330,27 +6970,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +int Novfs_f_fsync(struct file *file, struct dentry *dentry, int datasync)
 +{
 +	return 0;
-+}
-+
-+/*++======================================================================*/
-+int Novfs_f_llseek(struct file *file, loff_t offset, int origin)
-+/*
-+ *  Arguments:
-+ *
-+ *  Returns:
-+ *
-+ *  Abstract:
-+ *
-+ *  Notes:
-+ *
-+ *  Environment:
-+ *
-+ *========================================================================*/
-+{
-+	DbgPrint("Novfs_f_llseek: File=0x%p Name=%.*s offset=%lld origin=%d\n",
-+		 file, file->f_dentry->d_name.len, file->f_dentry->d_name.name,
-+		 offset, origin);
-+	return (generic_file_llseek(file, offset, origin));
 +}
 +
 +/*++======================================================================*/
@@ -7593,26 +7212,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return (retCode);
 +}
 +
-+/*++======================================================================*/
-+int Novfs_a_writepages(struct address_space *mapping,
-+		       struct writeback_control *wbc)
-+/*
-+ *  Arguments:
-+ *
-+ *  Returns:
-+ *
-+ *  Abstract:
-+ *
-+ *  Notes:
-+ *
-+ *  Environment:
-+ *
-+ *========================================================================*/
++static int Novfs_a_writepages(struct address_space *mapping,
++			      struct writeback_control *wbc)
 +{
 +	int retCode = 0;
 +	struct inode *inode = mapping->host;
 +	session_t session;
-+	HANDLE fh = 0;
++	HANDLE fh = NULL;
 +	struct inode_data *id = NULL;
 +
 +	int max_page_lookup = MaxIoSize / PAGE_CACHE_SIZE;
@@ -7627,9 +7233,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	size_t tsize;
 +
 +	SC_INITIALIZE(session);
-+	DbgPrint
-+	    ("Novfs_a_writepages: inode=0x%p mapping=0x%p wbc=0x%p nr_to_write=%d\n",
-+	     inode, mapping, wbc, wbc->nr_to_write);
++	DbgPrint("%s: inode=0x%p mapping=0x%p wbc=0x%p nr_to_write=%d\n",
++		  __func__, inode, mapping, wbc, wbc->nr_to_write);
 +
 +	if (inode) {
 +		DbgPrint(" Inode=0x%p Ino=%d Id=0x%p\n", inode, inode->i_ino,
@@ -7647,13 +7252,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	    Novfs_Malloc(sizeof(struct page *) * max_page_lookup, GFP_KERNEL);
 +
 +	if (id)
-+		DbgPrint
-+		    ("Novfs_a_writepages: inode=0x%p fh=0x%p dlist=0x%p pages=0x%p %s\n",
-+		     inode, fh, dlist, pages, id->Name);
++		DbgPrint("%s: inode=0x%p fh=0x%p dlist=0x%p pages=0x%p %s\n",
++			 __func__, inode, fh, dlist, pages, id->Name);
 +	else
-+		DbgPrint
-+		    ("Novfs_a_writepages: inode=0x%p fh=0x%p dlist=0x%p pages=0x%p\n",
-+		     inode, fh, dlist, pages);
++		DbgPrint("%s: inode=0x%p fh=0x%p dlist=0x%p pages=0x%p\n",
++			 __func__, inode, fh, dlist, pages);
 +
 +	if (dlist && pages) {
 +		struct backing_dev_info *bdi = mapping->backing_dev_info;
@@ -7679,8 +7282,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			dlist_idx = 0;
 +			dlptr = &dlist[1];
 +
-+			DbgPrint("Novfs_a_writepages1: nr_pages=%d\n",
-+				 nr_pages);
++			DbgPrint("%s: nr_pages=%d\n", __func__, nr_pages);
 +			if (!nr_pages) {
 +				memset(pages, 0,
 +				       sizeof(struct page *) * max_page_lookup);
@@ -7701,7 +7303,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +							       1,
 +							       PAGECACHE_TAG_DIRTY);
 +
-+				DbgPrint("Novfs_a_writepages2: nr_pages=%d\n",
++				DbgPrint("%s: nr_pages=%d\n", __func__,
 +					 nr_pages);
 +				/*
 +				 * Check to see if there are dirty pages and there is a valid
@@ -7758,9 +7360,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +				 * mapping
 +				 */
 +
-+				DbgPrint
-+				    ("Novfs_a_writepages: pos=0x%llx index=%d page->index=%d next_index=%d\n",
-+				     pos, index, page->index, next_index);
++				DbgPrint("%s: pos=0x%llx index=%d page->index=%d next_index=%d\n",
++					 __func__, pos, index, page->index, next_index);
 +
 +				if (page->index != next_index) {
 +					next_index = page->index;
@@ -7785,13 +7386,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +				dlptr[dlist_idx].len = PAGE_CACHE_SIZE;
 +				dlptr[dlist_idx].rwflag = DLREAD;
 +				dlist_idx++;
-+				DbgPrint
-+				    ("Novfs_a_writepages: Add page=0x%p index=0x%lx\n",
-+				     page, page->index);
++				DbgPrint("%s: Add page=0x%p index=0x%lx\n", __func__, page, page->index);
 +			}
 +
-+			DbgPrint("Novfs_a_writepages: dlist_idx=%d\n",
-+				 dlist_idx);
++			DbgPrint("%s: dlist_idx=%d\n", __func__, dlist_idx);
 +			if (dlist_idx) {
 +				tsize = dlist_idx * PAGE_CACHE_SIZE;
 +				/*
@@ -7827,12 +7425,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +					page_cache_release((struct page *)
 +							   dlptr[dlist_idx -
 +								 1].page);
-+					DbgPrint
-+					    ("Novfs_a_writepages: release page=0x%p index=0x%lx\n",
-+					     dlptr[dlist_idx - 1].page,
-+					     ((struct page *)
-+					      dlptr[dlist_idx -
-+						    1].page)->index);
++					DbgPrint("%s: release page=0x%p index=0x%lx\n",
++						 __func__, dlptr[dlist_idx - 1].page,
++						 ((struct page *)dlptr[dlist_idx - 1].page)->index);
 +					if (!retCode) {
 +						wbc->nr_to_write--;
 +					}
@@ -8156,7 +7751,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +				 */
 +
 +				dllst[1].page = page;
-+				dllst[1].offset = 0;
++				dllst[1].offset = NULL;
 +				dllst[1].len = len;
 +				dllst[1].rwflag = DLWRITE;
 +
@@ -8487,12 +8082,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	}
 +
 +	if (dir && (id = dir->FSPRIVATE)) {
-+		retVal = 0;
++		retVal = NULL;
 +		if (IS_ROOT(dentry)) {
 +			DbgPrint("Novfs_i_lookup: Root entry=0x%p\n",
 +				 Novfs_root);
 +			inode = Novfs_root->d_inode;
-+			return (0);
++			return NULL;
 +		} else {
 +			info =
 +			    Novfs_Malloc(sizeof(struct entry_info) +
@@ -9684,7 +9279,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			INIT_LIST_HEAD(&id->DirCache);
 +			init_MUTEX(&id->DirCacheLock);
 +
-+			id->FileHandle = 0;
++			id->FileHandle = NULL;
 +			id->CacheFlag = 0;
 +
 +			down(&InodeList_lock);
@@ -9914,9 +9509,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +int __init init_novfs(void)
 +{
 +	int retCode;
-+
-+	lastDir[0] = 0;
-+	lastTime = get_nanosecond_time();
 +
 +	inHAX = 0;
 +	inHAXTime = get_nanosecond_time();
@@ -10788,7 +10380,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 --- /dev/null
 +++ b/fs/novfs/nwcapi.c
-@@ -0,0 +1,2537 @@
+@@ -0,0 +1,2517 @@
 +/*
 + * Novell NCP Redirector for Linux
 + * Author: James Turner/Richard Williams
@@ -12638,23 +12230,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +					 sizeof(pEnum->Iterator));
 +			DbgPrint("[XPLAT NWCAPI] Found AuthId 0x%X\n",
 +				 pEnum->AuthenticationId);
-+			cpylen =
-+			    copy_to_user(&eId->AuthenticationId,
-+					 &pEnum->AuthenticationId,
-+					 sizeof(pEnum->AuthenticationId));
-+			cpylen =
-+			    copy_to_user(&eId->AuthType, &pEnum->AuthType,
-+					 sizeof(pEnum->AuthType));
-+			cpylen =
-+			    copy_to_user(&eId->IdentityFlags,
-+					 &pEnum->IdentityFlags,
-+					 sizeof(pEnum->IdentityFlags));
-+			cpylen =
-+			    copy_to_user(&eId->NameType, &pEnum->NameType,
-+					 sizeof(pEnum->NameType));
-+			cpylen =
-+			    copy_to_user(&eId->ObjectType, &pEnum->ObjectType,
-+					 sizeof(pEnum->ObjectType));
++			cpylen = copy_to_user(&eId->AuthenticationId, &pEnum->AuthenticationId, sizeof(pEnum->AuthenticationId));
++			cpylen = copy_to_user(&eId->AuthType, &pEnum->AuthType, sizeof(pEnum->AuthType));
++			cpylen = copy_to_user(&eId->IdentityFlags, &pEnum->IdentityFlags, sizeof(pEnum->IdentityFlags));
++			cpylen = copy_to_user(&eId->NameType, &pEnum->NameType, sizeof(pEnum->NameType));
++			cpylen = copy_to_user(&eId->ObjectType, &pEnum->ObjectType, sizeof(pEnum->ObjectType));
 +
 +			if (!status) {
 +				cpylen =
@@ -13061,21 +12641,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			status = reply->Reply.error_code;
 +			DbgPrint("Status Code = 0x%X\n", status);
 +			if (!status) {
-+				offset =
-+				    sizeof(((PNwcGetMappedDrives) pdata->
-+					    repData)->MapBuffLen);
++				offset = sizeof(((PNwcGetMappedDrives)pdata->repData)->MapBuffLen);
 +				cp = reply->data;
-+				replylen =
-+				    ((PNwcGetMappedDrives) pdata->repData)->
-+				    MapBuffLen;
-+				cpylen =
-+				    copy_to_user(pdata->repData, cp, offset);
++				replylen = ((PNwcGetMappedDrives)pdata->repData)->MapBuffLen;
++				cpylen = copy_to_user(pdata->repData, cp, offset);
 +				cp += offset;
-+				cpylen =
-+				    copy_to_user(((PNwcGetMappedDrives) pdata->
-+						  repData)->MapBuffer, cp,
-+						 min(replylen - offset,
-+						     reply->dataLen - offset));
++				cpylen = copy_to_user(((PNwcGetMappedDrives)pdata->repData)->MapBuffer,
++						      cp, min(replylen - offset, reply->dataLen - offset));
 +			}
 +
 +			kfree(reply);
@@ -13328,7 +12900,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +}
 --- /dev/null
 +++ b/fs/novfs/nwcapi.h
-@@ -0,0 +1,2213 @@
+@@ -0,0 +1,2208 @@
 +/*
 + * NetWare Redirector for Linux
 + * Author: Sheffer Clark
@@ -13443,10 +13015,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +typedef struct _XPLAT_ {
 +	int xfunction;
 +	unsigned long reqLen;
-+	void *reqData;
++	void __user *reqData;
 +	unsigned long repLen;
-+	void *repData;
-+
++	void __user *repData;
 +} XPLAT, *PXPLAT;
 +
 +#if 0
@@ -13713,19 +13284,15 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +} NwcConnString, *PNwcConnString;
 +
-+//#if defined(NTYPES_H)
-+//typedef NWCString    NwcString, *PNwcString;
-+//#else
 +typedef struct tagNwcString {
 +	u32 DataType;
 +	u32 BuffSize;
 +	u32 DataLen;
-+	void *pBuffer;
++	void __user *pBuffer;
 +	u32 CodePage;
 +	u32 CountryCode;
 +
 +} NwcString, *PNwcString;
-+//#endif
 +
 +//
 +// Structure used in NDS Resolve name
@@ -14511,7 +14078,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +typedef struct tagNwcGetMountPath {
 +	u32 MountPathLen;
-+	unsigned char *pMountPath;
++	unsigned char __user *pMountPath;
 +
 +} NwcGetMountPath, *PNwcGetMountPath;
 +
@@ -16205,7 +15772,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#endif	/* __NOVFS_ERROR_H */
 --- /dev/null
 +++ b/fs/novfs/proc.c
-@@ -0,0 +1,152 @@
+@@ -0,0 +1,140 @@
 +/*
 + * Novell NCP Redirector for Linux
 + * Author: James Turner
@@ -16232,36 +15799,35 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static struct proc_dir_entry *Novfs_Control;
 +static struct proc_dir_entry *Novfs_Library;
 +static struct proc_dir_entry *Novfs_Version;
-+
 +static struct file_operations Daemon_proc_fops;
 +static struct file_operations Library_proc_fops;
 +
-+/*===[ Code ]=============================================================*/
-+
-+static int Novfs_Get_Version(char *page, char **start, off_t off, int count, int *eof, void *data)
++static int get_version(char *page, char **start, off_t off, int count,
++		       int *eof, void *data)
 +{
 +	char *buf, tbuf[48];
 +	int len = 0, i;
 +
-+	if (!off) {
-+		buf = page + off;
-+		*start = buf;
-+		len = sprintf(buf, "Novfs Version=%s\n", NOVFS_VERSION_STRING);
-+		i = Daemon_getversion(tbuf, sizeof(tbuf));
-+		if ((i > 0) && i < (count - len)) {
-+			len += sprintf(buf + len, "Novfsd Version=%s\n", tbuf);
-+		}
++	if (off)
++		goto exit;
 +
-+		if (Novfs_CurrentMount) {
-+			i = strlen(Novfs_CurrentMount);
-+			if ((i > 0) && i < (count - len)) {
-+				len +=
-+				    sprintf(buf + len, "Novfs mount=%s\n",
-+					    Novfs_CurrentMount);
-+			}
++	buf = page + off;
++	*start = buf;
++	len = sprintf(buf, "Novfs Version=%s\n", NOVFS_VERSION_STRING);
++	i = Daemon_getversion(tbuf, sizeof(tbuf));
++	if ((i > 0) && i < (count - len))
++		len += sprintf(buf + len, "Novfsd Version=%s\n", tbuf);
++
++	if (Novfs_CurrentMount) {
++		i = strlen(Novfs_CurrentMount);
++		if ((i > 0) && i < (count - len)) {
++			len +=
++			    sprintf(buf + len, "Novfs mount=%s\n",
++				    Novfs_CurrentMount);
 +		}
-+		DbgPrint("Novfs_Get_Version:\n%s\n", buf);
 +	}
++	DbgPrint("%s:\n%s\n", __func__, buf);
++exit:
 +	*eof = 1;
 +	return (len);
 +}
@@ -16271,92 +15837,81 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	int retCode = 0;
 +
 +	Novfs_Procfs_dir = proc_mkdir(MODULE_NAME, NULL);
-+	if (Novfs_Procfs_dir) {
-+		Novfs_Procfs_dir->owner = THIS_MODULE;
++	if (!Novfs_Procfs_dir)
++		return -ENOENT;
 +
-+		Novfs_Control = create_proc_entry("Control", 0600, Novfs_Procfs_dir);
++	Novfs_Procfs_dir->owner = THIS_MODULE;
 +
-+		if (Novfs_Control) {
-+			Novfs_Control->owner = THIS_MODULE;
-+			Novfs_Control->size = 0;
-+			memcpy(&Daemon_proc_fops, Novfs_Control->proc_fops,
-+			       sizeof(struct file_operations));
++	Novfs_Control = create_proc_entry("Control", 0600, Novfs_Procfs_dir);
 +
-+			/*
-+			 * Setup our functions
-+			 */
-+			Daemon_proc_fops.owner = THIS_MODULE;
-+			Daemon_proc_fops.open = Daemon_Open_Control;
-+			Daemon_proc_fops.release = Daemon_Close_Control;
-+			Daemon_proc_fops.read = Daemon_Send_Command;
-+			Daemon_proc_fops.write = Daemon_Receive_Reply;
-+			Daemon_proc_fops.ioctl = Daemon_ioctl;
++	if (Novfs_Control) {
++		Novfs_Control->owner = THIS_MODULE;
++		Novfs_Control->size = 0;
++		memcpy(&Daemon_proc_fops, Novfs_Control->proc_fops,
++		       sizeof(struct file_operations));
 +
-+			Novfs_Control->proc_fops = &Daemon_proc_fops;
-+		} else {
-+			remove_proc_entry(MODULE_NAME, NULL);
-+			return (-ENOENT);
-+		}
++		/*
++		 * Setup our functions
++		 */
++		Daemon_proc_fops.owner = THIS_MODULE;
++		Daemon_proc_fops.open = Daemon_Open_Control;
++		Daemon_proc_fops.release = Daemon_Close_Control;
++		Daemon_proc_fops.read = Daemon_Send_Command;
++		Daemon_proc_fops.write = Daemon_Receive_Reply;
++		Daemon_proc_fops.ioctl = Daemon_ioctl;
 +
-+		Novfs_Library = create_proc_entry("Library", 0666, Novfs_Procfs_dir);
-+		if (Novfs_Library) {
-+			Novfs_Library->owner = THIS_MODULE;
-+			Novfs_Library->size = 0;
-+
-+			/*
-+			 * Setup our file functions
-+			 */
-+			memcpy(&Library_proc_fops, Novfs_Library->proc_fops,
-+			       sizeof(struct file_operations));
-+			Library_proc_fops.owner = THIS_MODULE;
-+			Library_proc_fops.open = Daemon_Library_open;
-+			Library_proc_fops.release = Daemon_Library_close;
-+			Library_proc_fops.read = Daemon_Library_read;
-+			Library_proc_fops.write = Daemon_Library_write;
-+			Library_proc_fops.llseek = Daemon_Library_llseek;
-+			Library_proc_fops.ioctl = Daemon_Library_ioctl;
-+			Novfs_Library->proc_fops = &Library_proc_fops;
-+		} else {
-+			remove_proc_entry("Control", Novfs_Procfs_dir);
-+			remove_proc_entry(MODULE_NAME, NULL);
-+			return (-ENOENT);
-+		}
-+
-+		Novfs_Version =
-+		    create_proc_read_entry("Version", 0444, Novfs_Procfs_dir,
-+					   Novfs_Get_Version, NULL);
-+		if (Novfs_Version) {
-+			Novfs_Version->owner = THIS_MODULE;
-+			Novfs_Version->size = 0;
-+		} else {
-+			remove_proc_entry("Library", Novfs_Procfs_dir);
-+			remove_proc_entry("Control", Novfs_Procfs_dir);
-+			remove_proc_entry(MODULE_NAME, NULL);
-+			retCode = -ENOENT;
-+		}
++		Novfs_Control->proc_fops = &Daemon_proc_fops;
 +	} else {
++		remove_proc_entry(MODULE_NAME, NULL);
++		return (-ENOENT);
++	}
++
++	Novfs_Library = create_proc_entry("Library", 0666, Novfs_Procfs_dir);
++	if (Novfs_Library) {
++		Novfs_Library->owner = THIS_MODULE;
++		Novfs_Library->size = 0;
++
++		/*
++		 * Setup our file functions
++		 */
++		memcpy(&Library_proc_fops, Novfs_Library->proc_fops,
++		       sizeof(struct file_operations));
++		Library_proc_fops.owner = THIS_MODULE;
++		Library_proc_fops.open = Daemon_Library_open;
++		Library_proc_fops.release = Daemon_Library_close;
++		Library_proc_fops.read = Daemon_Library_read;
++		Library_proc_fops.write = Daemon_Library_write;
++		Library_proc_fops.llseek = Daemon_Library_llseek;
++		Library_proc_fops.ioctl = Daemon_Library_ioctl;
++		Novfs_Library->proc_fops = &Library_proc_fops;
++	} else {
++		remove_proc_entry("Control", Novfs_Procfs_dir);
++		remove_proc_entry(MODULE_NAME, NULL);
++		return (-ENOENT);
++	}
++
++	Novfs_Version = create_proc_read_entry("Version", 0444,
++					       Novfs_Procfs_dir,
++					       get_version, NULL);
++	if (Novfs_Version) {
++		Novfs_Version->owner = THIS_MODULE;
++		Novfs_Version->size = 0;
++	} else {
++		remove_proc_entry("Library", Novfs_Procfs_dir);
++		remove_proc_entry("Control", Novfs_Procfs_dir);
++		remove_proc_entry(MODULE_NAME, NULL);
 +		retCode = -ENOENT;
 +	}
-+	return (retCode);
++	return retCode;
 +}
 +
 +void Uninit_Procfs_Interface(void)
 +{
-+
-+	DbgPrint("Uninit_Procfs_Interface remove_proc_entry(Version, NULL)\n");
 +	remove_proc_entry("Version", Novfs_Procfs_dir);
-+
-+	DbgPrint("Uninit_Procfs_Interface remove_proc_entry(Control, NULL)\n");
 +	remove_proc_entry("Control", Novfs_Procfs_dir);
-+
-+	DbgPrint("Uninit_Procfs_Interface remove_proc_entry(Library, NULL)\n");
 +	remove_proc_entry("Library", Novfs_Procfs_dir);
-+
-+	DbgPrint("Uninit_Procfs_Interface remove_proc_entry(%s, NULL)\n",
-+		 MODULE_NAME);
 +	remove_proc_entry(MODULE_NAME, NULL);
-+
-+	DbgPrint("Uninit_Procfs_Interface done\n");
++	DbgPrint("%s done\n", __func__);
 +}
 --- /dev/null
 +++ b/fs/novfs/profile.c
@@ -17728,7 +17283,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 --- /dev/null
 +++ b/fs/novfs/vfs.h
-@@ -0,0 +1,433 @@
+@@ -0,0 +1,438 @@
 +/*
 + * Novell NCP Redirector for Linux
 + * Author: James Turner
@@ -17902,7 +17457,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +struct novfs_string {
 +	int length;
-+	unsigned char *data;
++	unsigned char __user *data;
 +};
 +
 +struct login {
@@ -17988,7 +17543,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +extern unsigned long File_update_timeout;
 +extern int PageCache;
 +extern char *Novfs_CurrentMount;
-+extern struct dentry_operations Novfs_dentry_operations;
 +extern int MaxIoSize;
 +
 +
@@ -18060,7 +17614,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +extern int Novfs_Read_Pages(HANDLE Handle, struct data_list *dlist, int DList_Cnt,
 +			    size_t * Bytes, loff_t * Offset,
 +			    session_t session_id);
-+extern int Novfs_Write_File(HANDLE handle, unsigned char __user *buffer,
++extern int Novfs_Write_File(HANDLE handle, const char __user *buffer,
 +			    size_t *bytes, loff_t *offset,
 +			    session_t session_id);
 +extern int Novfs_Write_Page(HANDLE Handle, struct page *Page,
@@ -18086,7 +17640,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			     unsigned char __user *buffer, size_t *bytes,
 +			     loff_t *offset, session_t session_id);
 +extern int Novfs_Write_Stream(HANDLE ConnHandle, unsigned char *handle,
-+			      unsigned char __user *buffer, size_t *bytes,
++			      const char __user *buffer, size_t *bytes,
 +			      loff_t *offset, session_t session_id);
 +extern int Novfs_Close_Stream(HANDLE ConnHandle, unsigned char * Handle,
 +			      session_t session_id);
@@ -18118,7 +17672,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + */
 +extern u64 get_nanosecond_time(void);
 +static inline void *Novfs_Malloc(size_t size, gfp_t flags) { return kmalloc(size, flags); }
++
++/* It's as if people just wanted their code to be wrong... */
++/* switch declarations so that we can fix them up, it's so crappy... */
++//extern int DbgPrint(char *Fmt, ...) __attribute__ ((format (printf, 1, 2)));
 +extern int DbgPrint(char *Fmt, ...);
++
++
 +extern int init_profile(void);
 +extern void uninit_profile(void);
 +
