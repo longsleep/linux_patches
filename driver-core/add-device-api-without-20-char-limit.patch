@@ -1,0 +1,186 @@
+From kay.sievers@vrfy.org Fri May  2 09:28:44 2008
+From: Kay Sievers <kay.sievers@vrfy.org>
+Date: Fri, 02 May 2008 06:02:41 +0200
+Subject: driver core: add new device API to allow names longer than 20 chars
+Message-ID: <1209700961.3100.7.camel@linux.site>
+
+
+After all drivers are converted, the 20 char bus_id array
+can be removed.
+
+Signed-off-by: Kay Sievers <kay.sievers@vrfy.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/base/core.c    |   76 ++++++++++++++++++++++++++++++++++++++++++-------
+ include/linux/device.h |   13 ++++++--
+ 2 files changed, 76 insertions(+), 13 deletions(-)
+
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@ -809,6 +809,47 @@ static void device_remove_sys_dev_entry(
+ 	}
+ }
+ 
++static int dev_set_name_vargs(struct device *dev,
++			      const char *fmt, va_list vargs)
++{
++	if (dev->init_name_is_set) {
++		kfree(dev->init_name);
++		dev->init_name_is_set = 0;
++	}
++
++	dev->init_name = NULL;
++
++	if (!fmt)
++		return 0;
++
++	dev->init_name = kvasprintf(GFP_KERNEL, fmt, vargs);
++	if (!dev->init_name)
++		return -ENOMEM;
++
++	dev->init_name_is_set = 1;
++	return 0;
++}
++
++/**
++ * dev_set_name - allocate temporary name for device
++ * @dev: device
++ *
++ * A temporary name is assigned to a device. The memory will be
++ * released with any call to device_add(), after successful
++ * registration the name available from the kobject with dev_name().
++ */
++int dev_set_name(struct device *dev, const char *fmt, ...)
++{
++	va_list vargs;
++	int err;
++
++	va_start(vargs, fmt);
++	err = dev_set_name_vargs(dev, fmt, vargs);
++	va_end(vargs);
++	return err;
++}
++EXPORT_SYMBOL_GPL(dev_set_name);
++
+ /**
+  * device_add - add device to device hierarchy.
+  * @dev: device.
+@@ -827,12 +868,22 @@ int device_add(struct device *dev)
+ 	int error;
+ 
+ 	dev = get_device(dev);
+-	if (!dev || !strlen(dev->bus_id)) {
++	if (!dev) {
+ 		error = -EINVAL;
+ 		goto Done;
+ 	}
+ 
+-	pr_debug("device: '%s': %s\n", dev->bus_id, __func__);
++	/* support bus_id until everything is converted, and it is removed */
++	if (!dev->init_name)
++		dev->init_name = dev->bus_id;
++
++	if (strlen(dev->init_name) == 0) {
++		printk(KERN_ERR "device (%p) does not have a name\n", dev);
++		error = -EINVAL;
++		goto Done;
++	}
++
++	pr_debug("device: '%s': %s\n", dev->init_name, __func__);
+ 
+ 	parent = get_device(dev->parent);
+ 	setup_parent(dev, parent);
+@@ -841,16 +892,16 @@ int device_add(struct device *dev)
+ 	if (parent)
+ 		set_dev_node(dev, dev_to_node(parent));
+ 
+-	/* first, register with generic layer. */
+-	error = kobject_add(&dev->kobj, dev->kobj.parent, "%s", dev->bus_id);
++	error = kobject_add(&dev->kobj, dev->kobj.parent, "%s", dev->init_name);
++	/* possibly free and clear any init_name, so nobody can misuse it */
++	dev_set_name(dev, NULL);
+ 	if (error)
+ 		goto Error;
+ 
+-	/* notify platform of device entry */
+ 	if (platform_notify)
+ 		platform_notify(dev);
+ 
+-	/* notify clients of device entry (new way) */
++	/* notify clients of device entry */
+ 	if (dev->bus)
+ 		blocking_notifier_call_chain(&dev->bus->p->bus_notifier,
+ 					     BUS_NOTIFY_ADD_DEVICE, dev);
+@@ -900,6 +951,7 @@ int device_add(struct device *dev)
+  Done:
+ 	put_device(dev);
+ 	return error;
++
+  PMError:
+ 	bus_remove_device(dev);
+  BusError:
+@@ -1184,7 +1236,7 @@ static void device_create_release(struct
+ struct device *device_create(struct class *class, struct device *parent,
+ 			     dev_t devt, const char *fmt, ...)
+ {
+-	va_list args;
++	va_list vargs;
+ 	struct device *dev = NULL;
+ 	int retval = -ENODEV;
+ 
+@@ -1202,9 +1254,12 @@ struct device *device_create(struct clas
+ 	dev->parent = parent;
+ 	dev->release = device_create_release;
+ 
+-	va_start(args, fmt);
+-	vsnprintf(dev->bus_id, BUS_ID_SIZE, fmt, args);
+-	va_end(args);
++	va_start(vargs, fmt);
++	retval = dev_set_name_vargs(dev, fmt, vargs);
++	va_end(vargs);
++	if (retval)
++		goto error;
++
+ 	retval = device_register(dev);
+ 	if (retval)
+ 		goto error;
+@@ -1212,6 +1267,7 @@ struct device *device_create(struct clas
+ 	return dev;
+ 
+ error:
++	kfree(dev->init_name);
+ 	kfree(dev);
+ 	return ERR_PTR(retval);
+ }
+--- a/include/linux/device.h
++++ b/include/linux/device.h
+@@ -340,7 +340,9 @@ struct device {
+ 	struct kobject kobj;
+ 	char	bus_id[20];	/* will be removed */
+ 	struct device_type	*type;
+-	unsigned		uevent_suppress:1;
++	const char		*init_name;
++	unsigned int		init_name_is_set:1;
++	unsigned int		uevent_suppress:1;
+ 
+ 	struct semaphore	sem;	/* semaphore to synchronize calls to
+ 					 * its driver.
+@@ -389,10 +391,15 @@ struct device {
+ 
+ static inline const char *dev_name(struct device *dev)
+ {
+-	/* will be changed into kobject_name(&dev->kobj) in the near future */
+-	return dev->bus_id;
++	/* support bus_id until everything is converted, and it is removed */
++	if (kobject_name(&dev->kobj))
++		return kobject_name(&dev->kobj);
++  	return dev->bus_id;
+ }
+ 
++extern int dev_set_name(struct device *dev, const char *name, ...)
++			    __attribute__((format(printf, 2, 3)));
++
+ #ifdef CONFIG_NUMA
+ static inline int dev_to_node(struct device *dev)
+ {
