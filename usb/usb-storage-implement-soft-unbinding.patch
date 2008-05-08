@@ -1,0 +1,260 @@
+From stern+483d8e12@rowland.harvard.edu Thu May  8 08:56:01 2008
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Thu, 8 May 2008 11:55:59 -0400 (EDT)
+Subject: usb-storage: implement "soft" unbinding
+To: Greg KH <greg@kroah.com>, Matthew Dharm <mdharm-usb@one-eyed-alien.net>
+Cc: USB list <linux-usb@vger.kernel.org>,  USB Storage list <usb-storage@lists.one-eyed-alien.net>
+Message-ID: <Pine.LNX.4.44L0.0805081154370.2188-100000@iolanthe.rowland.org>
+
+
+This patch (as1092) implements "soft" unbinding for usb-storage.  When
+the disconnect routine is called, all commands and reset delays are
+allowed to complete normally until after scsi_remove_host() returns.
+This means that the commands needed for an orderly shutdown will be
+sent through to the device.
+
+Unlike before, the driver will now execute every command that it
+accepts.  Hence there's no need for special code to catch unexecuted
+commands and fail them.
+
+The new sequence of events when disconnect runs goes as follows:
+
+	If the device is truly unplugged, set the DISCONNECTING
+	flag so we won't try to access it any more.
+
+	If the SCSI-scanning thread hasn't started up yet, prevent
+	it from doing anything by setting the new DONT_SCAN flag.
+	Then wake it up and wait for it to terminate.
+
+	Remove the SCSI host.  This unbinds the upper-level drivers,
+	doing an orderly shutdown.  Commands sent to quiesce the
+	device will be transmitted normally, unless the device is
+	unplugged.
+
+	Set the DISCONNECTING flag so that we won't accept any new
+	commands that might get submitted (there aren't supposed to be
+	any) and we won't try to access the device for resets.
+
+	Tell the control thread to exit by waking it up with no
+	pending command, and wait for it to terminate.
+
+	Go on to do all the other normal stuff: releasing resources,
+	freeing memory, and so on.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/storage/transport.c |   16 ++++----
+ drivers/usb/storage/usb.c       |   77 ++++++++++++++++++----------------------
+ drivers/usb/storage/usb.h       |    4 --
+ 3 files changed, 45 insertions(+), 52 deletions(-)
+
+--- a/drivers/usb/storage/transport.c
++++ b/drivers/usb/storage/transport.c
+@@ -127,8 +127,8 @@ static int usb_stor_msg_common(struct us
+ 	long timeleft;
+ 	int status;
+ 
+-	/* don't submit URBs during abort/disconnect processing */
+-	if (us->dflags & ABORTING_OR_DISCONNECTING)
++	/* don't submit URBs during abort processing */
++	if (test_bit(US_FLIDX_ABORTING, &us->dflags))
+ 		return -EIO;
+ 
+ 	/* set up data structures for the wakeup system */
+@@ -161,8 +161,8 @@ static int usb_stor_msg_common(struct us
+ 	 * to cancel it */
+ 	set_bit(US_FLIDX_URB_ACTIVE, &us->dflags);
+ 
+-	/* did an abort/disconnect occur during the submission? */
+-	if (us->dflags & ABORTING_OR_DISCONNECTING) {
++	/* did an abort occur during the submission? */
++	if (test_bit(US_FLIDX_ABORTING, &us->dflags)) {
+ 
+ 		/* cancel the URB, if it hasn't been cancelled already */
+ 		if (test_and_clear_bit(US_FLIDX_URB_ACTIVE, &us->dflags)) {
+@@ -419,8 +419,8 @@ static int usb_stor_bulk_transfer_sglist
+ {
+ 	int result;
+ 
+-	/* don't submit s-g requests during abort/disconnect processing */
+-	if (us->dflags & ABORTING_OR_DISCONNECTING)
++	/* don't submit s-g requests during abort processing */
++	if (test_bit(US_FLIDX_ABORTING, &us->dflags))
+ 		return USB_STOR_XFER_ERROR;
+ 
+ 	/* initialize the scatter-gather request block */
+@@ -437,8 +437,8 @@ static int usb_stor_bulk_transfer_sglist
+ 	 * okay to cancel it */
+ 	set_bit(US_FLIDX_SG_ACTIVE, &us->dflags);
+ 
+-	/* did an abort/disconnect occur during the submission? */
+-	if (us->dflags & ABORTING_OR_DISCONNECTING) {
++	/* did an abort occur during the submission? */
++	if (test_bit(US_FLIDX_ABORTING, &us->dflags)) {
+ 
+ 		/* cancel the request, if it hasn't been cancelled already */
+ 		if (test_and_clear_bit(US_FLIDX_SG_ACTIVE, &us->dflags)) {
+--- a/drivers/usb/storage/usb.c
++++ b/drivers/usb/storage/usb.c
+@@ -320,16 +320,17 @@ static int usb_stor_control_thread(void 
+ 		/* lock the device pointers */
+ 		mutex_lock(&(us->dev_mutex));
+ 
+-		/* if the device has disconnected, we are free to exit */
+-		if (test_bit(US_FLIDX_DISCONNECTING, &us->dflags)) {
+-			US_DEBUGP("-- exiting\n");
++		/* lock access to the state */
++		scsi_lock(host);
++
++		/* When we are called with no command pending, we're done */
++		if (us->srb == NULL) {
++			scsi_unlock(host);
+ 			mutex_unlock(&us->dev_mutex);
++			US_DEBUGP("-- exiting\n");
+ 			break;
+ 		}
+ 
+-		/* lock access to the state */
+-		scsi_lock(host);
+-
+ 		/* has the command timed out *already* ? */
+ 		if (test_bit(US_FLIDX_TIMED_OUT, &us->dflags)) {
+ 			us->srb->result = DID_ABORT << 16;
+@@ -384,12 +385,8 @@ static int usb_stor_control_thread(void 
+ 		/* lock access to the state */
+ 		scsi_lock(host);
+ 
+-		/* did the command already complete because of a disconnect? */
+-		if (!us->srb)
+-			;		/* nothing to do */
+-
+ 		/* indicate that the command is done */
+-		else if (us->srb->result != DID_ABORT << 16) {
++		if (us->srb->result != DID_ABORT << 16) {
+ 			US_DEBUGP("scsi cmd done, result=0x%x\n", 
+ 				   us->srb->result);
+ 			us->srb->scsi_done(us->srb);
+@@ -820,11 +817,10 @@ static void usb_stor_release_resources(s
+ 	US_DEBUGP("-- %s\n", __func__);
+ 
+ 	/* Tell the control thread to exit.  The SCSI host must
+-	 * already have been removed so it won't try to queue
+-	 * any more commands.
++	 * already have been removed and the DISCONNECTING flag set
++	 * so that we won't accept any more commands.
+ 	 */
+ 	US_DEBUGP("-- sending exit command to thread\n");
+-	set_bit(US_FLIDX_DISCONNECTING, &us->dflags);
+ 	complete(&us->cmnd_ready);
+ 	if (us->ctl_thread)
+ 		kthread_stop(us->ctl_thread);
+@@ -859,39 +855,36 @@ static void dissociate_dev(struct us_dat
+ 	usb_set_intfdata(us->pusb_intf, NULL);
+ }
+ 
+-/* First stage of disconnect processing: stop all commands and remove
+- * the host */
++/* First stage of disconnect processing: stop SCSI scanning,
++ * remove the host, and stop accepting new commands
++ */
+ static void quiesce_and_remove_host(struct us_data *us)
+ {
+ 	struct Scsi_Host *host = us_to_host(us);
+ 
+-	/* Prevent new USB transfers, stop the current command, and
+-	 * interrupt a SCSI-scan or device-reset delay */
+-	scsi_lock(host);
+-	set_bit(US_FLIDX_DISCONNECTING, &us->dflags);
+-	scsi_unlock(host);
+-	usb_stor_stop_transport(us);
+-	wake_up(&us->delay_wait);
++	/* If the device is really gone, cut short reset delays */
++	if (us->pusb_dev->state == USB_STATE_NOTATTACHED)
++		set_bit(US_FLIDX_DISCONNECTING, &us->dflags);
+ 
+-	/* queuecommand won't accept any new commands and the control
+-	 * thread won't execute a previously-queued command.  If there
+-	 * is such a command pending, complete it with an error. */
+-	mutex_lock(&us->dev_mutex);
+-	if (us->srb) {
+-		us->srb->result = DID_NO_CONNECT << 16;
+-		scsi_lock(host);
+-		us->srb->scsi_done(us->srb);
+-		us->srb = NULL;
+-		complete(&us->notify);		/* in case of an abort */
+-		scsi_unlock(host);
+-	}
+-	mutex_unlock(&us->dev_mutex);
++	/* Prevent SCSI-scanning (if it hasn't started yet)
++	 * and wait for the SCSI-scanning thread to stop.
++	 */
++	set_bit(US_FLIDX_DONT_SCAN, &us->dflags);
++	wake_up(&us->delay_wait);
++	wait_for_completion(&us->scanning_done);
+ 
+-	/* Now we own no commands so it's safe to remove the SCSI host */
++	/* Removing the host will perform an orderly shutdown: caches
++	 * synchronized, disks spun down, etc.
++	 */
+ 	scsi_remove_host(host);
+ 
+-	/* Wait for the SCSI-scanning thread to stop */
+-	wait_for_completion(&us->scanning_done);
++	/* Prevent any new commands from being accepted and cut short
++	 * reset delays.
++	 */
++	scsi_lock(host);
++	set_bit(US_FLIDX_DISCONNECTING, &us->dflags);
++	scsi_unlock(host);
++	wake_up(&us->delay_wait);
+ }
+ 
+ /* Second stage of disconnect processing: deallocate all resources */
+@@ -919,12 +912,12 @@ static int usb_stor_scan_thread(void * _
+ 		printk(KERN_DEBUG "usb-storage: waiting for device "
+ 				"to settle before scanning\n");
+ 		wait_event_freezable_timeout(us->delay_wait,
+-				test_bit(US_FLIDX_DISCONNECTING, &us->dflags),
++				test_bit(US_FLIDX_DONT_SCAN, &us->dflags),
+ 				delay_use * HZ);
+ 	}
+ 
+ 	/* If the device is still connected, perform the scanning */
+-	if (!test_bit(US_FLIDX_DISCONNECTING, &us->dflags)) {
++	if (!test_bit(US_FLIDX_DONT_SCAN, &us->dflags)) {
+ 
+ 		/* For bulk-only devices, determine the max LUN value */
+ 		if (us->protocol == US_PR_BULK &&
+@@ -1023,6 +1016,7 @@ static int storage_probe(struct usb_inte
+ 	if (IS_ERR(th)) {
+ 		printk(KERN_WARNING USB_STORAGE 
+ 		       "Unable to start the device-scanning thread\n");
++		complete(&us->scanning_done);
+ 		quiesce_and_remove_host(us);
+ 		result = PTR_ERR(th);
+ 		goto BadDevice;
+@@ -1065,6 +1059,7 @@ static struct usb_driver usb_storage_dri
+ 	.pre_reset =	storage_pre_reset,
+ 	.post_reset =	storage_post_reset,
+ 	.id_table =	storage_usb_ids,
++	.soft_unbind =	1,
+ };
+ 
+ static int __init usb_stor_init(void)
+--- a/drivers/usb/storage/usb.h
++++ b/drivers/usb/storage/usb.h
+@@ -72,11 +72,9 @@ struct us_unusual_dev {
+ #define US_FLIDX_SG_ACTIVE	1	/* current_sg is in use     */
+ #define US_FLIDX_ABORTING	2	/* abort is in progress     */
+ #define US_FLIDX_DISCONNECTING	3	/* disconnect in progress   */
+-#define ABORTING_OR_DISCONNECTING	((1UL << US_FLIDX_ABORTING) | \
+-					 (1UL << US_FLIDX_DISCONNECTING))
+ #define US_FLIDX_RESETTING	4	/* device reset in progress */
+ #define US_FLIDX_TIMED_OUT	5	/* SCSI midlayer timed out  */
+-
++#define US_FLIDX_DONT_SCAN	6	/* don't scan (disconnect)  */
+ 
+ #define USB_STOR_STRING_LEN 32
+ 

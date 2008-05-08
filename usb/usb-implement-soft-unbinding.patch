@@ -1,0 +1,83 @@
+From stern+483d8e12@rowland.harvard.edu Thu May  8 08:54:42 2008
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Thu, 8 May 2008 11:54:37 -0400 (EDT)
+Subject: USB: implement "soft" unbinding
+To: Greg KH <greg@kroah.com>
+Cc: USB list <linux-usb@vger.kernel.org>
+Message-ID: <Pine.LNX.4.44L0.0805081152300.2188-100000@iolanthe.rowland.org>
+
+
+This patch (as1091) changes the way usbcore handles interface
+unbinding.  If the interface's driver supports "soft" unbinding (a new
+flag in the driver structure) then in-flight URBs are not cancelled
+and endpoints are not disabled.  Instead the driver is allowed to
+continue communicating with the device (although of course it should
+stop before its disconnect routine returns).
+
+The purpose of this change is to allow drivers to do a clean shutdown
+when they get unbound from a device that is still plugged in.  Killing
+all the URBs and disabling the endpoints before calling the driver's
+disconnect method doesn't give the driver any control over what
+happens, and it can leave devices in indeterminate states.  For
+example, when usb-storage unbinds it doesn't want to stop while in the
+middle of transmitting a SCSI command.
+
+The soft_unbind flag is added because in the past, a number of drivers
+have experienced problems related to ongoing I/O after their disconnect
+routine returned.  Hence "soft" unbinding is made available only to
+drivers that claim to support it.
+
+The patch also replaces "interface_to_usbdev(intf)" with "udev" in a
+couple of places, a minor simplification.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/driver.c |   11 ++++++-----
+ include/linux/usb.h       |    3 +++
+ 2 files changed, 9 insertions(+), 5 deletions(-)
+
+--- a/drivers/usb/core/driver.c
++++ b/drivers/usb/core/driver.c
+@@ -257,15 +257,16 @@ static int usb_unbind_interface(struct d
+ 	udev = interface_to_usbdev(intf);
+ 	error = usb_autoresume_device(udev);
+ 
+-	/* release all urbs for this interface */
+-	usb_disable_interface(interface_to_usbdev(intf), intf);
++	/* Terminate all URBs for this interface unless the driver
++	 * supports "soft" unbinding.
++	 */
++	if (!driver->soft_unbind)
++		usb_disable_interface(udev, intf);
+ 
+ 	driver->disconnect(intf);
+ 
+ 	/* reset other interface state */
+-	usb_set_interface(interface_to_usbdev(intf),
+-			intf->altsetting[0].desc.bInterfaceNumber,
+-			0);
++	usb_set_interface(udev, intf->altsetting[0].desc.bInterfaceNumber, 0);
+ 	usb_set_intfdata(intf, NULL);
+ 
+ 	intf->condition = USB_INTERFACE_UNBOUND;
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -972,6 +972,8 @@ struct usbdrv_wrap {
+  *	added to this driver by preventing the sysfs file from being created.
+  * @supports_autosuspend: if set to 0, the USB core will not allow autosuspend
+  *	for interfaces bound to this driver.
++ * @soft_unbind: if set to 1, the USB core will not kill URBs and disable
++ *	endpoints before calling the driver's disconnect method.
+  *
+  * USB interface drivers must provide a name, probe() and disconnect()
+  * methods, and an id_table.  Other driver fields are optional.
+@@ -1012,6 +1014,7 @@ struct usb_driver {
+ 	struct usbdrv_wrap drvwrap;
+ 	unsigned int no_dynamic_id:1;
+ 	unsigned int supports_autosuspend:1;
++	unsigned int soft_unbind:1;
+ };
+ #define	to_usb_driver(d) container_of(d, struct usb_driver, drvwrap.driver)
+ 
