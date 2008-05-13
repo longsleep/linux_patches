@@ -5,39 +5,45 @@ Subject: USB: add option hso driver
 
 This driver is for a number of different Option devices.  Originally
 written by Option and Andrew Bird, but cleaned up massivly for
-acceptance into mainline by me (Greg).
-
-TODO:
-	- remove proc files and move to debugfs
-	- review network interfaces
-	- add better changelog information
-	- Use netif_msg_ for the message level rather than module parameter
-	- net_device_stats are now available in dev->stats
+acceptance into mainline by me and others.
 
 Many thanks to the following for their help in cleaning up the driver by
 providing feedback and patches to it:
 	- Paulius Zaleckas <paulius.zaleckas@teltonika.lt>
 	- Oliver Neukum <oliver@neukum.org>
 	- Alan Cox <alan@lxorguk.ukuu.org.uk>
+	- Javier Marcet <javier@krausbeck.org>
 
 
 Cc: Andrew Bird <ajb@spheresystems.co.uk>
+Cc: Javier Marcet <javier@krausbeck.org>
 Cc: Alan Cox <alan@lxorguk.ukuu.org.uk>
 Cc: Filip Aben <f.aben@option.com>
 Cc: Paulius Zaleckas <paulius.zaleckas@teltonika.lt>
 Cc: Oliver Neukum <oliver@neukum.org>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
+
 ---
+ drivers/net/Makefile     |    1 
  drivers/net/usb/Kconfig  |   10 
  drivers/net/usb/Makefile |    1 
- drivers/net/usb/hso.c    | 3153 +++++++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 3164 insertions(+)
- create mode 100644 drivers/net/usb/hso.c
+ drivers/net/usb/hso.c    | 2841 +++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 2853 insertions(+)
 
+--- a/drivers/net/Makefile
++++ b/drivers/net/Makefile
+@@ -236,6 +236,7 @@ obj-$(CONFIG_USB_CATC)          += usb/
+ obj-$(CONFIG_USB_KAWETH)        += usb/
+ obj-$(CONFIG_USB_PEGASUS)       += usb/
+ obj-$(CONFIG_USB_RTL8150)       += usb/
++obj-$(CONFIG_USB_HSO)		+= usb/
+ obj-$(CONFIG_USB_USBNET)        += usb/
+ obj-$(CONFIG_USB_ZD1201)        += usb/
+ 
 --- /dev/null
 +++ b/drivers/net/usb/hso.c
-@@ -0,0 +1,3153 @@
+@@ -0,0 +1,2841 @@
 +/******************************************************************************
 + *
 + * Driver for Option High Speed Mobile Devices.
@@ -45,6 +51,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + *  Copyright (C) 2008 Option International
 + *  Copyright (C) 2007 Andrew Bird (Sphere Systems Ltd)
 + *  			<ajb@spheresystems.co.uk>
++ *  Copyright (C) 2008 Greg Kroah-Hartman <gregkh@suse.de>
++ *  Copyright (C) 2008 Novell, Inc.
 + *
 + *  This program is free software; you can redistribute it and/or modify
 + *  it under the terms of the GNU General Public License version 2 as
@@ -87,8 +95,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#include <linux/init.h>
 +#include <linux/delay.h>
 +#include <linux/netdevice.h>
-+#include <linux/inetdevice.h>
-+#include <linux/etherdevice.h>
 +#include <linux/module.h>
 +#include <linux/ethtool.h>
 +#include <linux/usb.h>
@@ -99,7 +105,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#include <linux/kmod.h>
 +#include <linux/rfkill.h>
 +#include <linux/ip.h>
-+#include <linux/proc_fs.h>
 +#include <linux/uaccess.h>
 +#include <linux/usb/cdc.h>
 +#include <net/arp.h>
@@ -122,7 +127,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#define BULK_URB_RX_SIZE		4096
 +#define BULK_URB_TX_SIZE		8192
 +
-+#define MUX_INTR_BUF_SIZE		16
 +#define MUX_BULK_RX_BUF_SIZE		HSO__MAX_MTU
 +#define MUX_BULK_TX_BUF_SIZE		HSO__MAX_MTU
 +#define MUX_BULK_RX_BUF_COUNT		4
@@ -131,18 +135,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +/* These definitions are used with the struct hso_net flags element */
 +/* - use *_bit operations on it. (bit indices not values.) */
 +#define HSO_NET_RUNNING			0
-+#define HSO_NET_TX_BUSY			1
-+#define HSO_TERMINATE			2
 +
 +#define	HSO_NET_TX_TIMEOUT		(HZ*10)
 +
 +/* Serial port defines and structs. */
-+#define HSO_THRESHOLD_THROTTLE		(7*1024)
-+#define HSO_THRESHOLD_UNTHROTTLE	(2*1024)
-+
-+#define HSO_SERIAL_FLAG_THROTTLED	0
-+#define HSO_SERIAL_FLAG_TX_SENT		1
-+#define HSO_SERIAL_FLAG_RX_SENT		2
++#define HSO_SERIAL_FLAG_RX_SENT		0
 +
 +#define HSO_SERIAL_MAGIC		0x48534f31
 +
@@ -200,8 +197,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +struct hso_net {
 +	struct hso_device *parent;
-+	struct net_device_stats stats;
 +	struct net_device *net;
++	struct rfkill *rfkill;
 +
 +	struct usb_endpoint_descriptor *in_endp;
 +	struct usb_endpoint_descriptor *out_endp;
@@ -220,14 +217,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	unsigned short rx_buf_size;
 +	unsigned short rx_buf_missing;
 +	struct iphdr rx_ip_hdr;
-+	struct ethhdr dummy_eth_head;
 +
-+	__u16 bcdCDC;
-+	__u16 wMaxSegmentSize;
-+	__u16 wNumberMCFilters;
-+	__u16 mode_flags;
 +	unsigned long flags;
-+
 +};
 +
 +struct hso_serial {
@@ -250,7 +241,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	u16 tx_data_length;	/* should contain allocated length */
 +	u16 tx_data_count;
 +	u16 tx_buffer_count;
-+	spinlock_t buffer_lock;
 +	struct usb_ctrlrequest ctrl_req_tx;
 +	struct usb_ctrlrequest ctrl_req_rx;
 +
@@ -266,7 +256,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	struct tty_struct *tty;
 +	int open_count;
 +	spinlock_t serial_lock;
-+	void *private;
 +
 +	int (*write_data) (struct hso_serial *serial);
 +};
@@ -280,21 +269,16 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	u32 port_spec;
 +
 +	u8 is_active;
-+	u8 suspend_disabled;
 +	u8 usb_gone;
 +	struct work_struct async_get_intf;
 +	struct work_struct async_put_intf;
 +
 +	struct usb_device *usb;
 +	struct usb_interface *interface;
-+	struct rfkill *rfkill;
 +
 +	struct device *dev;
 +	struct kref ref;
 +	struct mutex mutex;
-+
-+	/* TODO: Not sure about the ones below */
-+	struct proc_dir_entry *ourproc;
 +};
 +
 +/* Type of interface */
@@ -354,21 +338,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +/* Helping functions                                                         */
 +/*****************************************************************************/
 +
-+/* convert a character representing a hex value to a number */
-+static unsigned char hex2dec(unsigned char digit)
-+{
-+	if ((digit >= '0') && (digit <= '9'))
-+		return (digit - '0');
-+	/* Map all characters to 0-15 */
-+	if ((digit >= 'a') && (digit <= 'z'))
-+		return (digit - 'a' + 10) % 16;
-+	if ((digit >= 'A') && (digit <= 'Z'))
-+		return (digit - 'A' + 10) % 16;
-+	return 0;
-+}
-+
-+#define SIOCSETRADIO   (SIOCDEVPRIVATE+4)
-+
 +/* #define DEBUG */
 +
 +#define dev2net(x) (x->port_data.dev_net)
@@ -406,7 +375,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +/* module parameters */
 +static int debug;
-+static int procfs = 1;
 +static int tty_major;
 +static int disable_net;
 +
@@ -416,9 +384,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static const char *version = __FILE__ ": " DRIVER_VERSION " " MOD_AUTHOR;
 +/* the usb driver itself (registered in hso_init) */
 +static struct usb_driver hso_driver;
-+/* the procfs vars (if procfs enabled as parameter) */
-+static struct proc_dir_entry *hso_proc_dir;
-+static struct proc_dir_entry *hso_proc_dir_devices;
 +/* serial structures */
 +static struct tty_driver *tty_drv;
 +static struct hso_device *serial_table[HSO_SERIAL_TTY_MINORS];
@@ -451,7 +416,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		.driver_info = (kernel_ulong_t)icon321_port_spec
 +
 +/* list of devices we support */
-+static struct usb_device_id hso_ids[] = {
++static const struct usb_device_id hso_ids[] = {
 +	{default_port_device(0x0af0, 0x6711)},
 +	{default_port_device(0x0af0, 0x6731)},
 +	{default_port_device(0x0af0, 0x6751)},
@@ -609,7 +574,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +static struct hso_serial *get_serial_by_index(unsigned index)
 +{
-+	struct hso_serial *serial = NULL;
++	struct hso_serial *serial;
 +	unsigned long flags;
 +
 +	if (!serial_table[index])
@@ -623,7 +588,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +static int get_free_serial_index(void)
 +{
-+	int index = 0;
++	int index;
 +	unsigned long flags;
 +
 +	spin_lock_irqsave(&serial_table_lock, flags);
@@ -650,10 +615,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	spin_unlock_irqrestore(&serial_table_lock, flags);
 +}
 +
-+/* log a meaningfull explanation of an USB status to syslog */
++/* log a meaningfull explanation of an USB status */
 +static void log_usb_status(int status, const char *function)
 +{
-+	char *explanation = NULL;
++	char *explanation;
 +
 +	switch (status) {
 +	case -ENODEV:
@@ -687,79 +652,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	D1("%s: received USB status - %s (%d)", function, explanation, status);
 +}
 +
-+/* Procfs functions */
-+
-+static int hso_proc_options(char *buf, char **start, off_t offset, int count,
-+			    int *eof, void *data)
-+{
-+	int len = 0;
-+	/* get the module parameters */
-+	len +=
-+	    snprintf(buf + len, count - len, "Version: %s\n", DRIVER_VERSION);
-+	len += snprintf(buf + len, count - len, "debug: 0x%02x\n", debug);
-+	len += snprintf(buf + len, count - len, "procfs: 0x%02x\n", procfs);
-+	len +=
-+	    snprintf(buf + len, count - len, "tty_major: 0x%02x\n", tty_major);
-+	len +=
-+	    snprintf(buf + len, count - len, "disable_net: 0x%02x\n",
-+		     disable_net);
-+	return len;
-+}
-+
-+static int hso_proc_port_info(char *buf, char **start, off_t offset, int count,
-+			      int *eof, void *data)
-+{
-+	int len = 0;
-+	struct hso_device *hso_dev = (struct hso_device *)data;
-+	char *port_name = NULL;
-+
-+	D1("count: %d", count);
-+
-+	switch (hso_dev->port_spec & HSO_PORT_MASK) {
-+	case HSO_PORT_CONTROL:
-+		port_name = "Control";
-+		break;
-+	case HSO_PORT_APP:
-+		port_name = "Application";
-+		break;
-+	case HSO_PORT_GPS:
-+		port_name = "GPS";
-+		break;
-+	case HSO_PORT_GPS_CONTROL:
-+		port_name = "GPS Control";
-+		break;
-+	case HSO_PORT_APP2:
-+		port_name = "Application2";
-+		break;
-+	case HSO_PORT_PCSC:
-+		port_name = "PCSC";
-+		break;
-+	case HSO_PORT_DIAG:
-+		port_name = "Diagnostic";
-+		break;
-+	case HSO_PORT_DIAG2:
-+		port_name = "Diagnostic2";
-+		break;
-+	case HSO_PORT_MODEM:
-+		port_name = "Modem";
-+		break;
-+	case HSO_PORT_NETWORK:
-+		port_name = "Network";
-+		break;
-+	default:
-+		port_name = "Unknown";
-+		break;
-+	}
-+
-+	len += snprintf(buf + len, count - len, "%s\n", port_name);
-+
-+	/* return the device id to the user, for use in scripts for autopm */
-+	len +=
-+	    snprintf(buf + len, count - len, "USB bus ID:\t%s\n",
-+		     hso_dev->usb->dev.bus_id);
-+	return len;
-+}
-+
 +/* Network interface functions */
 +
 +/* called when net interface is brought up by ifconfig */
@@ -772,8 +664,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		dev_err(&net->dev, "No net device !\n");
 +		return -ENODEV;
 +	}
-+	/* reset read counter. */
-+	odev->stats.rx_packets = 0;
++
 +	odev->skb_tx_buf = NULL;
 +
 +	/* setup environment */
@@ -844,7 +735,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static int hso_net_start_xmit(struct sk_buff *skb, struct net_device *net)
 +{
 +	struct hso_net *odev = netdev_priv(net);
-+	int result = 0;
++	int result;
 +
 +	/* Tell the kernel, "No more frames 'til we are done with this one." */
 +	netif_stop_queue(net);
@@ -853,8 +744,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		return 0;
 +	}
 +
-+	/* fetch the packet */
-+	skb_pull(skb, ETH_HLEN);
 +	/* log if asked */
 +	DUMP1(skb->data, skb->len);
 +	/* Copy it from kernel memory to OUR memory */
@@ -878,11 +767,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	if (result) {
 +		dev_warn(&odev->parent->interface->dev,
 +			"failed mux_bulk_tx_urb %d", result);
-+		odev->stats.tx_errors++;
++		net->stats.tx_errors++;
 +		netif_start_queue(net);
 +	} else {
-+		odev->stats.tx_packets++;
-+		odev->stats.tx_bytes += skb->len;
++		net->stats.tx_packets++;
++		net->stats.tx_bytes += skb->len;
 +		/* And tell the kernel when the last transmit started. */
 +		net->trans_start = jiffies;
 +	}
@@ -898,19 +787,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	strncpy(info->driver, driver_name, ETHTOOL_BUSINFO_LEN);
 +	strncpy(info->version, DRIVER_VERSION, ETHTOOL_BUSINFO_LEN);
 +	usb_make_path(odev->parent->usb, info->bus_info, sizeof info->bus_info);
-+	snprintf(info->fw_version, ETHTOOL_BUSINFO_LEN, "%s %x.%x", driver_name,
-+		 ((odev->bcdCDC & 0xff00) >> 8), (odev->bcdCDC & 0x00ff));
 +}
 +
 +static struct ethtool_ops ops = {
 +	.get_drvinfo = hso_get_drvinfo,
 +	.get_link = ethtool_op_get_link
 +};
-+
-+static struct net_device_stats *hso_net_get_stats(struct net_device *net)
-+{
-+	return &((struct hso_net *)netdev_priv(net))->stats;
-+}
 +
 +/* called when a packet did not ack after watchdogtimeout */
 +static void hso_net_tx_timeout(struct net_device *net)
@@ -929,78 +811,17 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		usb_unlink_urb(odev->mux_bulk_tx_urb);
 +
 +	/* Update statistics */
-+	odev->stats.tx_errors++;
-+}
-+
-+/* setup the multicast filters */
-+static void hso_net_set_multicast(struct net_device *net)
-+{
-+	struct hso_net *odev = netdev_priv(net);
-+	int i = 0;
-+	__u8 *buf = NULL;
-+
-+	/* Tell the kernel to stop sending us frames while we get this all set
-+	 * up. */
-+	netif_stop_queue(net);
-+
-+	/* Note: do not reorder, GCC is clever about common statements. */
-+	if (net->flags & IFF_PROMISC) {
-+		/* Unconditionally log net taps. */
-+		D1("%s: Promiscuous mode enabled", net->name);
-+		odev->mode_flags = USB_CDC_PACKET_TYPE_ALL_MULTICAST |
-+				   USB_CDC_PACKET_TYPE_DIRECTED |
-+				   USB_CDC_PACKET_TYPE_BROADCAST |
-+				   USB_CDC_PACKET_TYPE_MULTICAST |
-+				   USB_CDC_PACKET_TYPE_PROMISCUOUS;
-+	} else if (net->mc_count > odev->wNumberMCFilters) {
-+		/* Too many to filter perfectly -- accept all multicasts. */
-+		D1("%s: too many MC filters for hardware, using allmulti",
-+		   net->name);
-+		odev->mode_flags = USB_CDC_PACKET_TYPE_ALL_MULTICAST |
-+				   USB_CDC_PACKET_TYPE_DIRECTED |
-+				   USB_CDC_PACKET_TYPE_BROADCAST |
-+				   USB_CDC_PACKET_TYPE_MULTICAST;
-+	} else if (net->flags & IFF_ALLMULTI) {
-+		/* Filter in software */
-+		D1("%s: using allmulti", net->name);
-+		odev->mode_flags = USB_CDC_PACKET_TYPE_ALL_MULTICAST |
-+				   USB_CDC_PACKET_TYPE_DIRECTED |
-+				   USB_CDC_PACKET_TYPE_BROADCAST |
-+				   USB_CDC_PACKET_TYPE_MULTICAST;
-+	} else {
-+		/* do multicast filtering in hardware */
-+		struct dev_mc_list *mclist;
-+		D1("%s: set multicast filters", net->name);
-+		odev->mode_flags = USB_CDC_PACKET_TYPE_ALL_MULTICAST |
-+				   USB_CDC_PACKET_TYPE_DIRECTED |
-+				   USB_CDC_PACKET_TYPE_BROADCAST |
-+				   USB_CDC_PACKET_TYPE_MULTICAST;
-+		buf = kmalloc(6 * net->mc_count, GFP_ATOMIC);
-+		if (!buf) {
-+			dev_err(&net->dev, "No memory to allocate?");
-+			goto exit;
-+		}
-+		for (i = 0, mclist = net->mc_list; mclist && i < net->mc_count;
-+		     i++, mclist = mclist->next) {
-+			memcpy(&mclist->dmi_addr, &buf[i * 6], 6);
-+		}
-+		kfree(buf);
-+	}
-+
-+exit:
-+	/* Tell the kernel to start giving frames to us again. */
-+	netif_wake_queue(net);
++	net->stats.tx_errors++;
 +}
 +
 +/* make a real packet from the received USB buffer */
 +static void packetizeRx(struct hso_net *odev, unsigned char *ip_pkt,
 +			unsigned int count, unsigned char is_eop)
 +{
-+	unsigned short temp_bytes = 0;
++	unsigned short temp_bytes;
 +	unsigned short buffer_offset = 0;
-+	unsigned short frame_len = 0;
-+	unsigned char *tmp_rx_buf = NULL;
-+	struct ethhdr *eth_head = NULL;
++	unsigned short frame_len;
++	unsigned char *tmp_rx_buf;
 +
 +	/* log if needed */
 +	D1("Rx %d bytes", count);
@@ -1039,9 +860,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +					continue;
 +				}
 +				/* Allocate an sk_buff */
-+				odev->skb_rx_buf = dev_alloc_skb(
-+					frame_len + 2 +
-+					odev->net->hard_header_len);
++				odev->skb_rx_buf = dev_alloc_skb(frame_len);
 +				if (!odev->skb_rx_buf) {
 +					/* We got no receive buffer. */
 +					D1("could not allocate memory");
@@ -1050,11 +869,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +				}
 +				/* Here's where it came from */
 +				odev->skb_rx_buf->dev = odev->net;
-+
-+				/* Make some headroom: standard alignment + the
-+				 * ethernet header. */
-+				skb_reserve(odev->skb_rx_buf,
-+					    2 + odev->net->hard_header_len);
 +
 +				/* Copy what we got so far. make room for iphdr
 +				 * after tail. */
@@ -1065,9 +879,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +				       sizeof(struct iphdr));
 +
 +				/* ETH_HLEN */
-+				odev->rx_buf_size =
-+				    odev->net->hard_header_len +
-+				    sizeof(struct iphdr);
++				odev->rx_buf_size = sizeof(struct iphdr);
 +
 +				/* Filip actually use .tot_len */
 +				odev->rx_buf_missing =
@@ -1092,33 +904,24 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			odev->rx_buf_size += temp_bytes;
 +			if (!odev->rx_buf_missing) {
 +				/* Packet is complete. Inject into stack. */
-+				/* Add fake ethernet header. */
-+				eth_head = (struct ethhdr *)skb_push(odev->
-+							      skb_rx_buf,
-+							      odev->
-+							      net->
-+							      hard_header_len);
-+				memcpy(eth_head, &odev->dummy_eth_head,
-+				       sizeof(struct ethhdr));
-+
-+				/* Not sure here either */
-+				odev->skb_rx_buf->protocol = eth_type_trans(
-+							odev->skb_rx_buf,
-+							odev->net);
++				/* We have IP packet here */
++				odev->skb_rx_buf->protocol =
++						__constant_htons(ETH_P_IP);
 +				/* don't check it */
 +				odev->skb_rx_buf->ip_summed =
 +					CHECKSUM_UNNECESSARY;
++
++				skb_reset_mac_header(odev->skb_rx_buf);
++
 +				/* Ship it off to the kernel */
 +				netif_rx(odev->skb_rx_buf);
 +				/* No longer our buffer. */
 +				odev->skb_rx_buf = NULL;
 +
 +				/* update out statistics */
-+				odev->stats.rx_packets++;
++				odev->net->stats.rx_packets++;
 +
-+				/* Hmmm, wonder if we have received the IP len
-+				 * or the ETH len. */
-+				odev->stats.rx_bytes += odev->rx_buf_size;
++				odev->net->stats.rx_bytes += odev->rx_buf_size;
 +
 +				odev->rx_buf_size = 0;
 +				odev->rx_buf_missing = sizeof(struct iphdr);
@@ -1151,8 +954,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static void read_bulk_callback(struct urb *urb)
 +{
 +	struct hso_net *odev = urb->context;
-+	struct net_device *net = NULL;
-+	int result = 0;
++	struct net_device *net;
++	int result;
 +	int status = urb->status;
 +
 +	/* is al ok?  (Filip: Who's Al ?) */
@@ -1372,7 +1175,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			    int count)
 +{
 +	struct hso_serial *serial = get_serial_by_tty(tty);
-+	int space = 0, tx_bytes = 0;
++	int space, tx_bytes;
 +	unsigned long flags;
 +
 +	/* sanity check */
@@ -1405,7 +1208,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static int hso_serial_write_room(struct tty_struct *tty)
 +{
 +	struct hso_serial *serial = get_serial_by_tty(tty);
-+	int room = 0;
++	int room;
 +	unsigned long flags;
 +
 +	spin_lock_irqsave(&serial->serial_lock, flags);
@@ -1440,7 +1243,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static int hso_serial_chars_in_buffer(struct tty_struct *tty)
 +{
 +	struct hso_serial *serial = get_serial_by_tty(tty);
-+	int chars = 0;
++	int chars;
 +	unsigned long flags;
 +
 +	/* sanity check */
@@ -1456,7 +1259,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +static int hso_serial_tiocmget(struct tty_struct *tty, struct file *file)
 +{
-+	unsigned int value = 0;
++	unsigned int value;
 +	struct hso_serial *serial = get_serial_by_tty(tty);
 +	unsigned long flags;
 +
@@ -1516,7 +1319,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +/* starts a transmit */
 +static void hso_kick_transmit(struct hso_serial *serial)
 +{
-+	u8 *temp = NULL;
++	u8 *temp;
 +	unsigned long flags;
 +	int res;
 +
@@ -1554,8 +1357,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			      struct usb_ctrlrequest *ctrl_req,
 +			      u8 *ctrl_urb_data, u32 size)
 +{
-+	int result = 0;
-+	int pipe = -1;
++	int result;
++	int pipe;
 +
 +	/* Sanity check */
 +	if (!serial || !ctrl_urb || !ctrl_req) {
@@ -1636,10 +1439,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static void intr_callback(struct urb *urb)
 +{
 +	struct hso_shared_int *shared_int = urb->context;
-+	struct hso_serial *serial = NULL;
-+	unsigned char *port_req = NULL;
++	struct hso_serial *serial;
++	unsigned char *port_req;
 +	int status = urb->status;
-+	int i = 0;
++	int i;
 +
 +	usb_mark_last_busy(urb->dev);
 +
@@ -1726,7 +1529,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static int hso_std_serial_write_data(struct hso_serial *serial)
 +{
 +	int count = serial->tx_data_count;
-+	int result = 0;
++	int result;
 +
 +	usb_fill_bulk_urb(serial->tx_urb,
 +			  serial->parent->usb,
@@ -1750,7 +1553,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static void ctrl_callback(struct urb *urb)
 +{
 +	struct hso_serial *serial = urb->context;
-+	struct usb_ctrlrequest *req = NULL;
++	struct usb_ctrlrequest *req;
 +	int status = urb->status;
 +
 +	/* sanity check */
@@ -1816,7 +1619,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static void hso_std_serial_read_bulk_callback(struct urb *urb)
 +{
 +	struct hso_serial *serial = urb->context;
-+	int result = 0;
++	int result;
 +	int status = urb->status;
 +
 +	/* sanity check */
@@ -1882,7 +1685,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +static void hso_log_port(struct hso_device *hso_dev)
 +{
-+	char *port_type = NULL;
++	char *port_type;
 +	char port_dev[20];
 +
 +	switch (hso_dev->port_spec & HSO_PORT_MASK) {
@@ -2082,7 +1885,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static int hso_serial_common_create(struct hso_serial *serial, int num_urbs,
 +				    int rx_size, int tx_size)
 +{
-+	struct device *dev = NULL;
++	struct device *dev;
 +	int minor;
 +	int i;
 +
@@ -2150,7 +1953,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +exit:
 +	hso_serial_common_free(serial);
 +	return -1;
-+
 +}
 +
 +/* Frees a general hso device */
@@ -2206,9 +2008,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	if (!hso_net)
 +		return;
 +
-+	if (procfs)
-+		remove_proc_entry(hso_net->net->name, hso_proc_dir_devices);
-+
 +	/* start freeing */
 +	for (i = 0; i < MUX_BULK_RX_BUF_COUNT; i++) {
 +		usb_free_urb(hso_net->mux_bulk_rx_urb_pool[i]);
@@ -2232,78 +2031,22 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +{
 +	struct hso_net *hso_net = netdev_priv(net);
 +
-+	/* initialize to zero */
-+	memset(hso_net, 0, sizeof(*hso_net));
 +	D1("sizeof hso_net is %d", (int)sizeof(*hso_net));
-+
-+	/* most of the setup is done by standard function */
-+	ether_setup(net);
 +
 +	/* fill in the other fields */
 +	net->open = hso_net_open;
 +	net->stop = hso_net_close;
 +	net->hard_start_xmit = hso_net_start_xmit;
-+	net->get_stats = hso_net_get_stats;
 +	net->tx_timeout = hso_net_tx_timeout;
 +	net->watchdog_timeo = HSO_NET_TX_TIMEOUT;
-+	net->set_multicast_list = hso_net_set_multicast;
-+	net->flags |= IFF_NOARP;
++	net->flags = IFF_POINTOPOINT | IFF_NOARP | IFF_MULTICAST;
++	net->type = ARPHRD_NONE;
 +	net->mtu = DEFAULT_MTU - 14;
 +	net->tx_queue_len = 10;
 +	SET_ETHTOOL_OPS(net, &ops);
-+	hso_net->skb_rx_buf = NULL;
-+	hso_net->rx_parse_state = WAIT_IP;
-+	hso_net->wMaxSegmentSize = DEFAULT_MTU;
-+	/* always use all multi, no lists of multicasts */
-+	hso_net->wNumberMCFilters = 0;
 +
 +	/* and initialize the semaphore */
 +	spin_lock_init(&hso_net->net_lock);
-+}
-+
-+/* setting the mac-address of the newly created iface */
-+static void set_ethernet_addr(struct hso_net *odev)
-+{
-+	unsigned char mac_addr[6];
-+	unsigned char dummy_mac[6];
-+	int i = 0;
-+	int len = 0;
-+	unsigned char buffer[13];
-+
-+	/* we can't fail, therefor we use a random macaddress */
-+	random_ether_addr(mac_addr);
-+	dummy_mac[0] = 0xFA;
-+	dummy_mac[1] = mac_addr[1];
-+	dummy_mac[2] = mac_addr[2];
-+	dummy_mac[3] = mac_addr[3];
-+	dummy_mac[4] = mac_addr[4];
-+	dummy_mac[5] = mac_addr[5];
-+
-+	/* but we like consistency, that's why we try to use the serial number
-+	 * as a macaddress if available */
-+	len = usb_string(odev->parent->usb,
-+			 odev->parent->usb->descriptor.iSerialNumber,
-+			 buffer, 13);
-+	if (len != 12 && strcmp("Serial", buffer)) {
-+		/* Fill in the mac_addr */
-+		for (i = 0; i < 6; i++) {
-+			mac_addr[i] = (hex2dec(buffer[2 * i]) << 4) +
-+				       hex2dec(buffer[2 * i + 1]);
-+		}
-+		mac_addr[0] &= 0xfe;	/* clear multicast bit */
-+		mac_addr[0] |= 0x02;	/* set local assignment bit (IEEE802) */
-+	} else {
-+		dev_err(&odev->parent->usb->dev, "Attempting to get MAC "
-+			"address failed: using random\n");
-+	}
-+
-+	/* Now copy it over to our network device structure */
-+	memcpy(odev->net->dev_addr, mac_addr, sizeof(mac_addr));
-+
-+	/* Create the default fake ethernet header. */
-+	memcpy(odev->dummy_eth_head.h_dest, mac_addr, ETH_ALEN);
-+	memcpy(odev->dummy_eth_head.h_source, dummy_mac, ETH_ALEN);
-+	odev->dummy_eth_head.h_proto = htons(ETH_P_IP);
 +}
 +
 +/* Adds a network device in the network device table */
@@ -2322,13 +2065,65 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return 0;
 +}
 +
++static int hso_radio_toggle(void *data, enum rfkill_state state)
++{
++	struct hso_device *hso_dev = data;
++	int enabled = (state == RFKILL_STATE_ON);
++	int rv;
++
++	mutex_lock(&hso_dev->mutex);
++	if (hso_dev->usb_gone)
++		rv = 0;
++	else
++		rv = usb_control_msg(hso_dev->usb, usb_rcvctrlpipe(hso_dev->usb, 0),
++				       enabled ? 0x82 : 0x81, 0x40, 0, 0, NULL, 0,
++				       USB_CTRL_SET_TIMEOUT);
++	mutex_unlock(&hso_dev->mutex);
++	return rv;
++}
++
++/* Creates and sets up everything for rfkill */
++static void hso_create_rfkill(struct hso_device *hso_dev,
++			     struct usb_interface *interface)
++{
++	struct hso_net *hso_net = dev2net(hso_dev);
++	struct device *dev = hso_dev->dev;
++	char *rfkn;
++
++	hso_net->rfkill = rfkill_allocate(&interface_to_usbdev(interface)->dev,
++				 RFKILL_TYPE_WLAN);
++	if (!hso_net->rfkill) {
++		dev_err(dev, "%s - Out of memory", __func__);
++		return;
++	}
++	rfkn = kzalloc(20, GFP_KERNEL);
++	if (!rfkn) {
++		rfkill_free(hso_net->rfkill);
++		dev_err(dev, "%s - Out of memory", __func__);
++		return;
++	}
++	snprintf(rfkn, 20, "hso-%d",
++		 interface->altsetting->desc.bInterfaceNumber);
++	hso_net->rfkill->name = rfkn;
++	hso_net->rfkill->state = RFKILL_STATE_ON;
++	hso_net->rfkill->data = hso_dev;
++	hso_net->rfkill->toggle_radio = hso_radio_toggle;
++	if (rfkill_register(hso_net->rfkill) < 0) {
++		kfree(rfkn);
++		hso_net->rfkill->name = NULL;
++		rfkill_free(hso_net->rfkill);
++		dev_err(dev, "%s - Failed to register rfkill", __func__);
++		return;
++	}
++}
++
 +/* Creates our network device */
 +static struct hso_device *hso_create_net_device(struct usb_interface *interface)
 +{
 +	int result, i;
-+	struct net_device *net = NULL;
-+	struct hso_net *hso_net = NULL;
-+	struct hso_device *hso_dev = NULL;
++	struct net_device *net;
++	struct hso_net *hso_net;
++	struct hso_device *hso_dev;
 +
 +	hso_dev = hso_create_device(interface, HSO_INTF_MUX | HSO_PORT_NETWORK);
 +	if (!hso_dev)
@@ -2394,22 +2189,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		goto exit;
 +	}
 +
-+	/* and don't forget the MAC address. */
-+	set_ethernet_addr(hso_net);
-+
 +	add_net_device(hso_dev);
 +
-+	/* setup the proc dirs and files if needed */
-+	if (procfs) {
-+		if (!hso_proc_dir_devices)
-+			printk(KERN_WARNING "hso: Warning, creating port info "
-+				"under root\n");
-+		create_proc_read_entry(hso_net->net->name, 0,
-+				       hso_proc_dir_devices, hso_proc_port_info,
-+				       hso_dev);
-+	}
-+
 +	hso_log_port(hso_dev);
++
++	hso_create_rfkill(hso_dev, interface);
 +
 +	return hso_dev;
 +exit:
@@ -2421,16 +2205,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static void hso_free_serial_device(struct hso_device *hso_dev)
 +{
 +	struct hso_serial *serial = dev2ser(hso_dev);
-+	char device_name[20];
 +
 +	if (!serial)
 +		return;
 +	set_serial_by_index(serial->minor, NULL);
-+
-+	if (procfs) {
-+		sprintf(device_name, "%s%d", tty_filename, serial->minor);
-+		remove_proc_entry(device_name, hso_proc_dir_devices);
-+	}
 +
 +	hso_serial_common_free(serial);
 +
@@ -2438,7 +2216,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		mutex_lock(&serial->shared_int->shared_int_lock);
 +		if (--serial->shared_int->ref_count == 0)
 +			hso_free_shared_int(serial->shared_int);
-+		mutex_unlock(&serial->shared_int->shared_int_lock);
++		else
++			mutex_unlock(&serial->shared_int->shared_int_lock);
 +	}
 +	kfree(serial);
 +	hso_free_device(hso_dev);
@@ -2448,9 +2227,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static struct hso_device *hso_create_bulk_serial_device(
 +			struct usb_interface *interface, int port)
 +{
-+	struct hso_device *hso_dev = NULL;
-+	struct hso_serial *serial = NULL;
-+	char device_name[20];
++	struct hso_device *hso_dev;
++	struct hso_serial *serial;
 +	int num_urbs;
 +
 +	hso_dev = hso_create_device(interface, port);
@@ -2493,15 +2271,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	set_serial_by_index(serial->minor, serial);
 +
 +	/* setup the proc dirs and files if needed */
-+	if (procfs) {
-+		if (!hso_proc_dir_devices)
-+			printk(KERN_WARNING "hso: Warning, creating port "
-+				"info under root\n");
-+		sprintf(device_name, "%s%d", tty_filename, serial->minor);
-+		create_proc_read_entry(device_name, 0, hso_proc_dir_devices,
-+				       hso_proc_port_info, hso_dev);
-+	}
-+
 +	hso_log_port(hso_dev);
 +
 +	/* done, return it */
@@ -2520,12 +2289,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +						int port,
 +						struct hso_shared_int *mux)
 +{
-+	struct hso_device *hso_dev = NULL;
-+	struct hso_serial *serial = NULL;
-+	char device_name[20];
-+	int port_spec = 0;
++	struct hso_device *hso_dev;
++	struct hso_serial *serial;
++	int port_spec;
 +
-+	port_spec |= HSO_INTF_MUX;
++	port_spec = HSO_INTF_MUX;
 +	port_spec &= ~HSO_PORT_MASK;
 +
 +	port_spec |= hso_mux_to_port(port);
@@ -2559,15 +2327,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	set_serial_by_index(serial->minor, serial);
 +
 +	/* setup the proc dirs and files if needed */
-+	if (procfs) {
-+		if (!hso_proc_dir_devices)
-+			printk(KERN_WARNING "hso: Warning, creating port info "
-+				"under root\n");
-+		sprintf(device_name, "%s%d", tty_filename, serial->minor);
-+		create_proc_read_entry(device_name, 0, hso_proc_dir_devices,
-+				       hso_proc_port_info, hso_dev);
-+	}
-+
 +	hso_log_port(hso_dev);
 +
 +	/* done, return it */
@@ -2588,6 +2347,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +{
 +	usb_free_urb(mux->shared_intr_urb);
 +	kfree(mux->shared_intr_buf);
++	mutex_unlock(&mux->shared_int_lock);
 +	kfree(mux);
 +}
 +
@@ -2635,7 +2395,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	struct usb_device *usbdev = interface_to_usbdev(interface);
 +	u8 config_data[17];
 +	u32 if_num = interface->altsetting->desc.bInterfaceNumber;
-+	s32 result = 0;
++	s32 result;
 +
 +	if (usb_control_msg(usbdev, usb_rcvctrlpipe(usbdev, 0),
 +			    0x86, 0xC0, 0, 0, config_data, 17,
@@ -2693,32 +2453,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	return result;
 +}
 +
-+static int hso_radio_toggle(void *data, enum rfkill_state state)
-+{
-+	struct hso_device *hso_dev = data;
-+	int enabled = (state == RFKILL_STATE_ON);
-+	int rv;
-+
-+	mutex_lock(&hso_dev->mutex);
-+	if (hso_dev->usb_gone)
-+		rv = 0;
-+	else
-+		rv = usb_control_msg(hso_dev->usb, usb_rcvctrlpipe(hso_dev->usb, 0),
-+				       enabled ? 0x82 : 0x81, 0x40, 0, 0, NULL, 0,
-+				       USB_CTRL_SET_TIMEOUT);
-+	mutex_unlock(&hso_dev->mutex);
-+	return rv;
-+}
-+
 +/* called once for each interface upon device insertion */
 +static int hso_probe(struct usb_interface *interface,
 +		     const struct usb_device_id *id)
 +{
 +	int mux, i, if_num, port_spec;
 +	unsigned char port_mask;
-+	char *rfkn;
 +	struct hso_device *hso_dev = NULL;
-+	struct hso_shared_int *shared_int = NULL;
++	struct hso_shared_int *shared_int;
 +	struct hso_device *tmp_dev = NULL;
 +
 +	if_num = interface->altsetting->desc.bInterfaceNumber;
@@ -2789,27 +2531,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		goto exit;
 +	}
 +
-+	hso_dev->rfkill = rfkill_allocate(&interface_to_usbdev(interface)->dev,
-+					  RFKILL_TYPE_WLAN);
-+	if (!hso_dev->rfkill)
-+		goto exit;
-+	rfkn = kzalloc(20, GFP_KERNEL);
-+	if (!rfkn) {
-+		rfkill_free(hso_dev->rfkill);
-+		goto exit;
-+	}
-+	snprintf(rfkn, 20, "hso-%d", if_num);
-+	hso_dev->rfkill->name = rfkn;
-+	hso_dev->rfkill->state = RFKILL_STATE_ON;
-+	hso_dev->rfkill->data = hso_dev;
-+	hso_dev->rfkill->toggle_radio = hso_radio_toggle;
-+	if (rfkill_register(hso_dev->rfkill) < 0) {
-+		kfree(rfkn);
-+		hso_dev->rfkill->name = NULL;
-+		rfkill_free(hso_dev->rfkill);
-+		goto exit;
-+	}
-+
 +	usb_driver_claim_interface(&hso_driver, interface, hso_dev);
 +
 +	/* save our data pointer in this device */
@@ -2817,7 +2538,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	/* done */
 +	return 0;
-+
 +exit:
 +	hso_free_interface(interface);
 +	return -ENODEV;
@@ -2826,15 +2546,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +/* device removed, cleaning up */
 +static void hso_disconnect(struct usb_interface *interface)
 +{
-+	struct hso_device *hso_dev = usb_get_intfdata(interface);
-+
 +	hso_free_interface(interface);
-+
-+	if (hso_dev) {
-+		cancel_work_sync(&hso_dev->async_put_intf);
-+		cancel_work_sync(&hso_dev->async_get_intf);
-+		rfkill_unregister(hso_dev->rfkill);
-+	}
 +
 +	/* remove reference of our private data */
 +	usb_set_intfdata(interface, NULL);
@@ -2889,7 +2601,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +/* called by kernel when we need to suspend device */
 +static int hso_suspend(struct usb_interface *iface, pm_message_t message)
 +{
-+	int i, result = 0;
++	int i, result;
 +
 +	/* Stop all serial ports */
 +	for (i = 0; i < HSO_SERIAL_TTY_MINORS; i++) {
@@ -2984,10 +2696,15 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	for (i = 0; i < HSO_MAX_NET_DEVICES; i++) {
 +		if (network_table[i]
 +		    && (network_table[i]->interface == interface)) {
++			struct rfkill *rfk = dev2net(network_table[i])->rfkill;
 +			/* hso_stop_net_device doesn't stop the net queue since
 +			 * traffic needs to start it again when suspended */
 +			netif_stop_queue(dev2net(network_table[i])->net);
 +			hso_stop_net_device(network_table[i]);
++			cancel_work_sync(&network_table[i]->async_put_intf);
++			cancel_work_sync(&network_table[i]->async_get_intf);
++			if(rfk)
++				rfkill_unregister(rfk);
 +			hso_free_net_device(network_table[i]);
 +		}
 +	}
@@ -3001,7 +2718,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +{
 +	int i;
 +	struct usb_host_interface *iface = intf->cur_altsetting;
-+	struct usb_endpoint_descriptor *endp = NULL;
++	struct usb_endpoint_descriptor *endp;
 +
 +	for (i = 0; i < iface->desc.bNumEndpoints; i++) {
 +		endp = &iface->endpoint[i].desc;
@@ -3080,22 +2797,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +static int __init hso_init(void)
 +{
-+	int i = 0;
-+	int result = 0;
++	int i;
++	int result;
 +
 +	/* put it in the log */
 +	printk(KERN_INFO "hso: %s\n", version);
-+
-+	/* if procfs is enabled, initialize devices */
-+	if (procfs) {
-+		hso_proc_dir = proc_mkdir(driver_name, NULL);
-+		if (hso_proc_dir) {
-+			hso_proc_dir_devices =
-+			    proc_mkdir("devices", hso_proc_dir);
-+			create_proc_read_entry("options", 0, hso_proc_dir,
-+					       hso_proc_options, NULL);
-+		}
-+	}
 +
 +	/* Initialise the serial table semaphore and table */
 +	spin_lock_init(&serial_table_lock);
@@ -3157,14 +2863,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	tty_unregister_driver(tty_drv);
 +	/* deregister the usb driver */
 +	usb_deregister(&hso_driver);
-+	/* if procfs is enabled, remove the entries */
-+
-+	if (procfs) {
-+		remove_proc_entry("options", hso_proc_dir);
-+		remove_proc_entry("devices", hso_proc_dir);
-+		remove_proc_entry(driver_name, NULL);
-+	}
-+
 +}
 +
 +/* Module definitions */
@@ -3175,10 +2873,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +MODULE_DESCRIPTION(MOD_DESCRIPTION);
 +MODULE_LICENSE(MOD_LICENSE);
 +MODULE_INFO(Version, DRIVER_VERSION);
-+
-+/* Module parameter to allow procfs (eg: insmod hso.ko procfs=1) */
-+MODULE_PARM_DESC(procfs, "Allow procfs [0 | 1]");
-+module_param(procfs, int, S_IRUGO | S_IWUSR);
 +
 +/* change the debug level (eg: insmod hso.ko debug=0x04) */
 +MODULE_PARM_DESC(debug, "Level of debug [0x01 | 0x02 | 0x04 | 0x08 | 0x10]");
@@ -3199,7 +2893,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
 +config USB_HSO
 +	tristate "Option USB High Speed Mobile Devices"
-+	depends on USB
++	depends on USB && RFKILL
 +	default n
 +	help
 +	  Choose this option if you have an Option HSDPA/HSUPA card.
