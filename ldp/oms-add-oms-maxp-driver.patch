@@ -1,0 +1,4467 @@
+From ebbb6697fbcc795359f580ec65f9f6e85b8cebd9 Mon Sep 17 00:00:00 2001
+From: Greg Kroah-Hartman <gregkh@suse.de>
+Date: Tue, 13 May 2008 15:49:45 -0700
+Subject: [PATCH] OMS: add OMS MAXp driver
+
+Cc: Michael Williamson <michael.h.williamson@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/misc/Kconfig           |   11 
+ drivers/misc/Makefile          |    1 
+ drivers/misc/oms/Makefile      |    2 
+ drivers/misc/oms/oms-core.c    | 1327 +++++++++++++++++++++++++++++++++++++++++
+ drivers/misc/oms/oms-core.h    |  165 +++++
+ drivers/misc/oms/oms-maxp.h    |   85 ++
+ drivers/misc/oms/oms-maxpdrv.c | 1314 ++++++++++++++++++++++++++++++++++++++++
+ drivers/misc/oms/oms-maxpdrv.h |  142 ++++
+ drivers/misc/oms/oms-pcix.h    |   67 ++
+ drivers/misc/oms/oms-pcixdrv.c | 1141 +++++++++++++++++++++++++++++++++++
+ drivers/misc/oms/oms-pcixdrv.h |   61 +
+ drivers/misc/oms/oms.h         |   85 ++
+ 12 files changed, 4401 insertions(+)
+
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -391,4 +391,15 @@ config SGI_XP
+ 	  this feature will allow for direct communication between SSIs
+ 	  based on a network adapter and DMA messaging.
+ 
++config OMS
++	tristate "Oregon Micro Systems motion controller drivers"
++	depends on PCI
++	default n
++	help
++	  These drivers provide support for the Oregon Micro Systems
++	  series of motion control devices.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called oms.
++
+ endif # MISC_DEVICES
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -26,3 +26,4 @@ obj-$(CONFIG_INTEL_MENLOW)	+= intel_menl
+ obj-$(CONFIG_ENCLOSURE_SERVICES) += enclosure.o
+ obj-$(CONFIG_KGDB_TESTS)	+= kgdbts.o
+ obj-$(CONFIG_SGI_XP)		+= sgi-xp/
++obj-$(CONFIG_OMS)		+= oms/
+--- /dev/null
++++ b/drivers/misc/oms/Makefile
+@@ -0,0 +1,2 @@
++obj-$(CONFIG_OMS) := oms-core.o oms-pcixdrv.o oms-maxpdrv.o
++
+--- /dev/null
++++ b/drivers/misc/oms/oms-core.c
+@@ -0,0 +1,1327 @@
++/*
++ *  oms-core.c --- Linux device driver for Oregon Micro Systems
++ *    motion controllers, 1 of at least 2. This file contains the
++ *		generic IOCTL and read/write/poll code. Hardware-specific code
++ *		will be located elsewhere.
++ *
++ *  Copyright(c) 2003 Oregon Micro Systems, Inc.  All rights reserved.
++ *
++ *  Theory of queued ioctl operation
++ *     This driver is built around the most common operation:
++ *         -->> putting a string into the controller command buffer, and,
++ *         -->>  optionally waiting for a response
++ *
++ *     Because the driver must support multiple simultaneous opens,
++ *     each of which may conduct controller operations, the operations
++ *     are serialized by placing them into a simple queue, which is
++ *     consumed one at a time.  (There are some exceptions, e.g.,
++ *     an operation that reads the current number of bytes available
++ *     in the controller's command buffer.)
++ *
++ *     Virtually all controller commands use a single ioctl data
++ *     structure, described in oms-ioctl.h:
++ *
++ *           struct oms_ioctl {   // user/kernel ioctl API definition
++ *                   unsigned char *command;       // IN
++ *                   unsigned int   command_len;   // IN
++ *                   unsigned char *response;      // OUT
++ *                   unsigned int   response_len;  // IN and OUT
++ *           };
++ *
++ *     This user-space structure is copied into a newly allocated
++ *     instance of struct omsdrv_ioctl, which contains other structure
++ *     elements (pointers, flags, etc.).  If a user-space command string
++ *     is present, space for it is allocated and the command string is
++ *     copied into kernel space.  If a response string is expected, then
++ *     kernel space is pre-allocated.  The structure is put at the tail
++ *     of the queue.
++ *
++ *     Once queued, the user-thread executing the ioctl function sleeps
++ *     until awakened, or until a timer expires.  (Note:  due to the
++ *     essential non-restartability of most controller operations, the
++ *     sleep is UNINTERRUPTIBLE --- we rely on the timer to prevent
++ *     indefinite hangs.)
++ *
++ *     When awakened, the user-thread code executing the ioctl system
++ *     call completes the operation, which is frequently just copying
++ *     out the oms_ioctl structure, along with any response data,
++ *     back to the user program.
++ *
++ *  INTERACTIVE_MODE --- the driver enforces a single-open policy
++ *     for interactive mode:  you can't put the driver into this mode
++ *     if there is another active open, and you can't open the driver
++ *     if it's in interactive mode.
++ *
++ *     For interactive mode, three new entry points are supported:
++ *       read() --- read text responses from the controller
++ *       write() --- write to the command buffer of the controller
++ *       poll() --- supports the select(2) syscall so that the
++ *                  application can determine when data is available
++ *                  for reading.
++ *
++ *       The read and write routines are non-blocking.  Read will
++ *       return immediately if there are no waiting text responses.
++ *       Write will return immediately if there is insufficient room
++ *       in the controller's command buffer for the entire command string.
++ *
++ *       Text response data is delivered to the driver via the normal
++ *       interrupt mechanism.  The IRQ handler notices that the driver
++ *       is in interactive mode and allocates a simple data structure
++ *       to hold the response data, which is then retrieved from the
++ *       controller and held pending a subsequent read.
++ *       (This contrasts to the normal-mode operation, where text is
++ *       retrieved from the controller only if there is an IOCTL
++ *       struct waiting for it .... if there is none, the controller's
++ *       response is discarded.)
++ */
++
++#include <linux/kernel.h>
++#include <linux/string.h>
++#include <linux/errno.h>
++#include <linux/slab.h>
++#include <linux/list.h>
++#include <linux/interrupt.h>
++#include <linux/timer.h>
++#include <linux/spinlock.h>
++#include <linux/init.h>
++#include <linux/fs.h>
++#include <linux/poll.h>
++#include <linux/ioctl.h>
++//#include <linux/kmod.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include <asm/io.h>
++#include <asm/atomic.h>
++#include <asm/uaccess.h>
++#include <asm/byteorder.h>
++#include <linux/byteorder/generic.h>
++
++#include "oms-core.h"		// shared with user-space programs:  defines IOCTLs
++
++MODULE_AUTHOR("Oregon Micro Systems, Inc.");
++//MODULE_DESCRIPTION found in hardware-specific source
++MODULE_LICENSE("GPL");
++
++//  ********** module parameters **********
++int DEBUGLEVEL = 0;
++module_param(DEBUGLEVEL, int, 0000);
++MODULE_PARM_DESC(DEBUGLEVEL, "Debug output level");
++
++int MAJORNUMBER = OMS_MAJOR_NUMBER;
++module_param(MAJORNUMBER, int, 0000);
++MODULE_PARM_DESC(MAJORNUMBER, "Major number");
++
++int ONE_CPU = TRUE;
++module_param(ONE_CPU, int, 0000);
++MODULE_PARM_DESC(ONE_CPU, "Single CPU environment");
++
++int MAX_CARDS = 16;
++module_param(MAX_CARDS, int, 0000);
++MODULE_PARM_DESC(MAX_CARDS, "Max supported cards (default=16)");
++
++// This driver is accompanied by a script that will create the proper
++//  char-special files (aka "nodes") under /dev.  This helper program
++//  is useful, as we're using dynamic major number allocation.  (For now.)
++char *NODE_CREATION_SCRIPT = "/opt/oms/bin/create_nodes";
++//module_param(NODE_CREATION_SCRIPT, char *, 0000);
++//MODULE_PARM_DESC(NODE_CREATION_SCRIPT, "Path to node creation script");
++
++module_init(oms_install_module);	// hook for insmod
++module_exit(oms_remove_module);	// hook for insmod
++
++// ********* data declarations *****************
++struct kmem_cache *oms_slab;
++LIST_HEAD(oms_cardlist);
++unsigned long flags;		//for locking, driver global
++
++extern char *me;		//from card-specific source
++extern char version_string[];	//from card-specific source
++// the OMS device ID will be some value + a small integer set by DIP switches
++extern int PCI_DEVICE_ID_OMS_BASE;
++
++#if OMS_DEBUG_SPINLOCKS
++atomic_t oms_islocked;
++#endif
++
++// pci_device_id --- specify to PCI driver the set of vendor/device IDs
++//     that we know about.  The PCI driver will call our "probe" routine
++//     for each device matching one of our descriptions.
++//extern struct pci_device_id oms_pci_tbl[] __devinitdata;
++//MODULE_DEVICE_TABLE(pci, oms_pci_tbl);
++
++// pci_driver structure --- register with the PCI driver.  It will call
++//   our "probe" routine for each PCI device matching our table.
++extern struct pci_driver oms_driver;
++
++// file_operations table for registering as a char driver
++struct file_operations oms_fileops = {
++	.owner = THIS_MODULE,	// automatic handing of module refcounts
++	.open = oms_fop_open,
++	.release = oms_fop_close,
++	.ioctl = oms_fop_ioctl,
++	.read = oms_fop_read,	// supported only in INTERACTIVE_MODE
++	.write = oms_fop_write,	// supported only in INTERACTIVE_MODE
++	.poll = oms_fop_poll	// supported only in INTERACTIVE_MODE
++};
++
++DECLARE_TASKLET(oms_tasklet, oms_tasklet_ioctl, 0);
++
++extern char *node_device;
++
++//***************************************************************
++//   beginning of code
++
++//****************************************************************************
++// oms_install_module() -- called when the module is loaded, but before
++//   it is available for user programs.  Here, we register as a PCI
++//   driver, which will indirectly call our "probe" routine for each
++//   PCI device matching the specs in oms_pci_tbl[].  Our probe routine
++//   is oms_install_one().  If no cards were found, the module fails
++//   to load.  (Fix later if hot-swap CompactPCI is required.)  Otherwise,
++//   we register as a character driver.  During this registration, we
++//   first attempt to use our default major number.  Should this fail,
++//   we fall back on using a dynamically assigned major number.  In either
++//   case, we try to run a user-mode shell script that ensures creation
++//   of the char-special files (aka "nodes") in /dev.
++//
++//   We also create a "slab allocator" that we will use for the many
++//   allocations of 'struct omsdrv_ioctl' necessary for queued ioctl
++//   operations.  (This is a very fast and efficient means of allocating
++//   specific objects.)
++int __init oms_install_module(void)
++{
++	int retval;
++
++	// register as a PCI driver.  The upper layer will call our "probe"
++	//  routine for each card that should match our specifications.
++	retval = pci_register_driver(&oms_driver);
++	if (!retval)
++		printk(KERN_INFO "%s:  module PCI init successful\n", me);
++	else {
++		printk(KERN_ERR "%s:  module failed to load:  no cards found\n",
++		       me);
++		return retval;
++	}
++
++	// create a slab allocator for the frequently needed ioctl ops
++	oms_slab = kmem_cache_create(me, sizeof(struct omsdrv_ioctl), 0,
++				     SLAB_HWCACHE_ALIGN, NULL);
++	if (oms_slab == NULL) {
++		printk(KERN_ERR "%s:  kmem_cache_create failed\n", me);
++		pci_unregister_driver(&oms_driver);
++		_LOCK_(flags);
++		oms_release_resources(NULL);
++		UN_LOCK_(flags);
++		return -ENODEV;
++	}
++	// we found and initialized some cards.  Register as a chrdev.
++	if (register_chrdev(MAJORNUMBER, me, &oms_fileops) < 0) {
++		printk(KERN_ERR "%s:  failed to register as char-major %d\n",
++		       me, MAJORNUMBER);
++		pci_unregister_driver(&oms_driver);
++		_LOCK_(flags);
++		oms_release_resources(NULL);
++		UN_LOCK_(flags);
++		return -ENODEV;
++	}
++
++	oms_create_nodes();
++
++	printk(KERN_INFO "%s:  module loaded successfully\n", me);
++	return retval;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// oms_remove_module() ---  called when our module is unloaded.  As
++//   with module initialization, most of the work is done indirectly.
++//   Here, we call pci_unregister_driver(), which will call our
++//   'remove' function (oms_remove_one()) for each card we've claimed.
++//   We double check that all of the cards have indeed been removed.
++//   (Early testing showed no actual need for this.)  We also
++//   unregister as a character driver and release our slab allocator.
++void __exit oms_remove_module(void)
++{
++	tasklet_kill(&oms_tasklet);
++
++	if (MAJORNUMBER > 0) {
++		(void)unregister_chrdev(MAJORNUMBER, me);
++	}
++
++	pci_unregister_driver(&oms_driver);
++	_LOCK_(flags);
++	oms_release_resources(NULL);	// double check resource release
++	UN_LOCK_(flags);
++	printk(KERN_INFO "%s:  module cleanup\n", me);
++
++	if (!list_empty(&oms_cardlist))
++		printk(KERN_ERR "%s:  non-empty card list\n", me);
++
++	// delete our slab allocator
++	kmem_cache_destroy(oms_slab);
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// oms_install_one ---- called by the driver "probe" routine for each
++//    PCI device found matching our pci_device_id table.
++int __devinit oms_install_one(struct pci_dev *pdev,
++			      const struct pci_device_id *ent)
++{
++	int minor;
++	struct oms_card *card;
++	struct oms_card *temp;
++	struct list_head *ptr;
++
++	ASSERT_UNLOCKED();
++
++	// First, derive the minor number from the DIP switch settings
++	//  that contributes to the subsystem_device value
++	if (pdev->subsystem_device < PCI_DEVICE_ID_OMS_BASE) {
++		minor = 16;	// fake an error --- see below
++	} else {
++		// the card firmware translates DIP switch value 0 to 1
++		//    Subtract 1 to get to minor range 0 to (MAX_CARDS -1)
++		minor = pdev->subsystem_device - PCI_DEVICE_ID_OMS_BASE - 1;
++	}
++	if (minor >= 16)	//never support more than 16 cards at a time
++	{
++		printk(KERN_ERR "%s:  invalid subsystem_device ID %04x\n", me,
++		       pdev->subsystem_device);
++		return -ENODEV;
++	}
++	// from here on, we're under the 'big' spinlock
++	_LOCK_(flags);
++
++	// verify that we don't already have a card with this subsystem_device ID
++	for (ptr = oms_cardlist.next; ptr != &oms_cardlist; ptr = ptr->next) {
++		temp = list_entry(ptr, struct oms_card, listhead);
++		if (temp->minor == minor) {
++			UN_LOCK_(flags);
++			printk(KERN_ERR
++			       "%s:  duplicate subsystem_device ID %04x\n", me,
++			       pdev->subsystem_device);
++			printk(KERN_ERR
++			       "%s:  (minor %d).  Adjust DIP switches so all cards are unique.\n",
++			       me, minor);
++			return -EBUSY;
++		}
++	}
++
++	if (pci_enable_device(pdev) != 0) {
++		UN_LOCK_(flags);
++		return -ENODEV;
++	}
++
++	card = kmalloc(sizeof(struct oms_card), GFP_ATOMIC);	//cannot allow sleep here
++	memset(card, 0, sizeof(struct oms_card));
++	card->pdev = pdev;
++	card->minor = minor;
++	card->irq = -1;
++	card->blocking = 0;
++	card->response_ready = 0;
++	INIT_LIST_HEAD(&card->listhead);
++	INIT_LIST_HEAD(&card->ioctl_list);
++	init_waitqueue_head(&card->poll_waitq);
++	list_add(&card->listhead, &oms_cardlist);
++
++	if (_oms_init_memory(pdev, card) != 0 ||
++	    _oms_attach_irq(pdev, card) != 0) {
++		oms_release_resources(card);
++		UN_LOCK_(flags);
++		return -ENODEV;
++	}
++
++	tasklet_schedule(&oms_tasklet);	// get things moving
++
++	UN_LOCK_(flags);
++	printk(KERN_INFO "%s:  device initialized (minor %d)\n", me, minor);
++	return 0;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// oms_remove_one() --- normally called from pci_unregister_driver().
++//   Release all resources associated with an oms card we've previously
++//   claimed.
++void oms_remove_one(struct pci_dev *pdev)
++{
++	struct oms_card *card;
++	struct list_head *ptr;
++
++	ASSERT_UNLOCKED();
++
++	_LOCK_(flags);
++
++	// search for the card matching the pdev by bus/slot number
++	for (ptr = oms_cardlist.next; ptr != &oms_cardlist; ptr = ptr->next) {
++		card = list_entry(ptr, struct oms_card, listhead);
++		if (card->pdev->bus->number == pdev->bus->number
++		    && card->pdev->devfn == pdev->devfn) {
++			oms_release_resources(card);
++			UN_LOCK_(flags);
++			return;
++		}
++	}
++	printk(KERN_WARNING "%s:  remove_one failed to find bus %d, slot %d\n",
++	       me, pdev->bus->number, PCI_SLOT(pdev->devfn));
++	UN_LOCK_(flags);
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// oms_release_resources() --- release all resources used by one, or
++//   all, cards.  If arg 'card' is NULL release for all
++//   else only the specified card.
++//
++//  Note:  spinlock oms_biglock is LOCKED on entry.
++void oms_release_resources(struct oms_card *card)
++{
++	struct list_head *ptr;
++
++	ASSERT_LOCKED();
++
++	if (card == NULL) {
++		for (ptr = oms_cardlist.next; ptr != &oms_cardlist;
++		     ptr = ptr->next) {
++			struct oms_card *card =
++			    list_entry(ptr, struct oms_card, listhead);
++			oms_release_resources(card);
++		}
++		return;
++	}
++
++	_oms_release_resources(card);
++	list_del(&card->listhead);
++	for (ptr = card->ioctl_list.next; ptr != &(card->ioctl_list);
++	     ptr = ptr->next) {
++		struct omsdrv_ioctl *sioctl =
++		    list_entry(ptr, struct omsdrv_ioctl, listhead);
++		oms_release_ioctl(sioctl);
++	}
++	kfree(card);
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// run a user-mode program to ensure that the correct nodes in /dev are
++//    present.  The program is a shell script that is part of the package.
++void oms_create_nodes(void)
++{
++	char *av[5];
++	char major_buf[8];
++	char max_buf[8];
++	char *env[] = { NULL };
++
++	sprintf(major_buf, "%d", MAJORNUMBER);
++	sprintf(max_buf, "%d", MAX_CARDS);
++	av[0] = NODE_CREATION_SCRIPT;
++	av[1] = node_device;
++	av[2] = major_buf;
++	av[3] = max_buf;
++	av[4] = NULL;
++
++	(void)call_usermodehelper(NODE_CREATION_SCRIPT, av, env, 1);
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// oms_new_ioctl() --- allocate an instance of struct omsdrv_ioctl from
++//   our private slab allocator, zero it, and return it.
++struct omsdrv_ioctl *oms_new_ioctl(struct oms_card *card)
++{
++	struct omsdrv_ioctl *sioctl;
++
++	if (card == NULL) {
++		printk(KERN_ERR "%s:  oms_new_ioctl:  NULL card\n", me);
++	}
++
++	sioctl = kmem_cache_alloc(oms_slab, GFP_KERNEL);
++	memset(sioctl, 0, sizeof(struct omsdrv_ioctl));
++	sioctl->card = card;
++
++	return sioctl;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// oms_release_ioctl() --- free the resources associated with one or
++//   more instances of 'struct omsdrv_ioctl'.  Dequeue it if it is
++//   still enqueued
++void oms_release_ioctl(struct omsdrv_ioctl *sioctl)
++{
++	if (sioctl) {
++		// not all ioctls get added to a list
++		if (sioctl->listhead.next) {
++			list_del(&(sioctl->listhead));
++		}
++
++		if (sioctl->buffers.command) {
++			kfree(sioctl->buffers.command);
++		}
++		if (sioctl->buffers.response) {
++			kfree(sioctl->buffers.response);
++		}
++		if (sioctl->task_asleep) {
++			printk(KERN_WARNING "%s:  task asleep on freed ioctl\n",
++			       me);
++		}
++
++		kmem_cache_free(oms_slab, sioctl);	// return struct to slab
++	}
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// oms_fetch_user_ioctl_struct() --- called from the oms_fop_ioctl() function
++//    (a file_operations routine running the user thread).   Fetch the
++//    user data into kernel space according to parameter args.  Also,
++//    if indicated by parameter args, pre-allocate space for a response
++//
++//    If there is an error, the ios structure is released and an error
++//    code is returned suitable for return to the user.
++//
++//   (we must NOT be locked, as one should never access user space under
++//    a spinlock --- there might be a page fault during transfer)
++int oms_fetch_user_ioctl_struct(struct omsdrv_ioctl *pioctl,
++				int command_parm,
++				int response_parm, void *user_arg)
++{
++	void *ptmp;
++
++	ASSERT_UNLOCKED();
++
++	if (pioctl == NULL || user_arg == NULL) {
++		return -EINVAL;
++	}
++
++	if (copy_from_user
++	    (&pioctl->buffers, user_arg, sizeof(struct oms_ioctl))) {
++		oms_release_ioctl(pioctl);
++		return -EFAULT;
++	}
++
++	if (command_parm) {
++		// we must try to copy the command string into kernel
++		//  space.  If command_parm is greater than 1, then
++		//  we validate by checking to see if the command_len
++		//  is a multiple of command_parm.
++		if (pioctl->buffers.command_len > 4096) {
++			oms_release_ioctl(pioctl);
++			return -EINVAL;
++		}
++		if (command_parm > 1
++		    && (pioctl->buffers.command_len % command_parm) != 0) {
++			oms_release_ioctl(pioctl);
++			return -EINVAL;
++		}
++		ptmp = pioctl->buffers.command;
++		pioctl->buffers.command =
++		    kmalloc(pioctl->buffers.command_len, GFP_KERNEL);
++		if (copy_from_user
++		    (pioctl->buffers.command, ptmp,
++		     pioctl->buffers.command_len)) {
++			oms_release_ioctl(pioctl);
++			return -EFAULT;
++		}
++	}
++
++	if (response_parm) {
++		// pre-allocate space for a response, with length constraint checking
++		if (pioctl->buffers.response_len == 0
++		    || pioctl->buffers.response_len > 4096) {
++			oms_release_ioctl(pioctl);
++			return -EINVAL;
++		}
++
++		if (response_parm > 1
++		    && (pioctl->buffers.response_len % response_parm) != 0) {
++			oms_release_ioctl(pioctl);
++			return -EINVAL;
++		}
++		// make sure user allocated space for the response
++		if (pioctl->buffers.response == NULL) {
++			oms_release_ioctl(pioctl);
++			return -EINVAL;
++		}
++
++		pioctl->buffers.response =
++		    kmalloc(pioctl->buffers.response_len + 1, GFP_KERNEL);
++		pioctl->p_response = 0;	// will increment as data arrives
++	}
++
++	return 0;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// oms_sleep() --- delay for a specified number of jiffies.
++//    We simply sleep on a wait queue that no one ever awakens.
++void oms_sleep(int jifs)
++{
++	wait_queue_head_t wq;
++	init_waitqueue_head(&wq);
++	sleep_on_timeout(&wq, jifs);
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// oms_fop_open() --- file_operations function.  Verify that a card
++//   exists corresponding to the minor number, and bump the count
++//   of current opens.
++//   Addition:  suport for INTERACTIVE_MODE --- refuse to allow open
++//      if card is already in INTERACTIVE mode.  (We enforce exclusive
++//      open for interactive mode here, and in the ioctl that turns on
++//      that mode.)
++int oms_fop_open(struct inode *pinode, struct file *pfile)
++{
++	int minor;
++	struct oms_card *card;
++	struct list_head *ptr;
++	int rv = 0;
++
++	ASSERT_UNLOCKED();
++
++	minor = MINOR(pinode->i_rdev);
++	if (minor < 0 || minor >= MAX_CARDS)
++		return -ENODEV;
++
++	_LOCK_(flags);
++	for (ptr = oms_cardlist.next; ptr != &oms_cardlist; ptr = ptr->next) {
++		card = list_entry(ptr, struct oms_card, listhead);
++		if (card->minor == minor)
++			break;
++	}
++	if (ptr == &oms_cardlist) {
++		rv = -ENODEV;
++	} else if (card->comm_mode == INTERACTIVE_MODE) {
++		printk(KERN_INFO
++		       "%s:  open of card in INTERACTIVE_MODE.  EBUSY\n", me);
++		rv = -EBUSY;
++	} else {
++		printk(KERN_INFO "%s:  opened %s%d\n", me, me, minor);
++		++(card->open_count);
++	}
++	UN_LOCK_(flags);
++
++	return rv;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// oms_fop_close() --- file_operations function.  Decrement count of opens.
++//   If open_count falls to zero, take card out of INTERACTIVE_MODE so
++//   that other programs may open and use the device.
++int oms_fop_close(struct inode *pinode, struct file *pfile)
++{
++	int minor;
++	struct oms_card *card;
++	struct list_head *ptr;
++	int rv = 0;
++
++	ASSERT_UNLOCKED();
++
++	minor = MINOR(pinode->i_rdev);
++	if (minor < 0 || minor >= MAX_CARDS)
++		return -ENODEV;	// should never happen
++
++	_LOCK_(flags);
++	for (ptr = oms_cardlist.next; ptr != &oms_cardlist; ptr = ptr->next) {
++		card = list_entry(ptr, struct oms_card, listhead);
++		if (card->minor == minor)
++			break;
++	}
++	if (ptr == &oms_cardlist) {
++		rv = -ENODEV;	// should never happen
++	} else {
++		card->blocking = 0;
++		--(card->open_count);
++		if (card->open_count == 0) {
++			// no remaining opens.  take out of interactive mode
++			//   (if applicable)
++			card->comm_mode = STRING_MODE;
++		}
++	}
++
++	printk(KERN_INFO "%s:  closed %s%d\n", me, me, minor);
++
++	UN_LOCK_(flags);
++
++	return rv;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// oms_fop_read() --- valid ONLY if card->comm_mode is INTERACTIVE_MODE.
++//
++// NON-blocking read.  If there's nothing to read, returns 0 immediately.
++//     Use select(2) or poll(2) to avoid busy looping.  Each time we're
++//     called we grab ALL data from the card into a temporary buffer, and
++//     copy out what will fit in the user's buffer.  Any residue in
++//     temporary buffer is silently discarded.  This is semi-okay, as
++//     INTERACTIVE_MODE is intended only for use by OMS user programs,
++//     which can be developed to allocate a large enough buffer.
++int oms_fop_read(struct file *pfile,
++		 char *userbuf, size_t usersiz, loff_t * ppos)
++{
++	struct oms_card *card;
++	int minor;
++	int rv = 0;
++	char *tempbuf;
++	struct list_head *ptr;
++
++	ASSERT_UNLOCKED();
++
++	// find oms card by minor
++	minor = MINOR(pfile->f_dentry->d_inode->i_rdev);
++	if (minor < 0 || minor >= MAX_CARDS)
++		return -ENODEV;
++
++	for (ptr = oms_cardlist.next; ptr != &oms_cardlist; ptr = ptr->next) {
++		card = list_entry(ptr, struct oms_card, listhead);
++		if (card->minor == minor)
++			break;
++	}
++	if (ptr == &oms_cardlist) {
++		return -ENODEV;
++	}
++	// ensure card is in interactive mode
++	if (card->comm_mode != INTERACTIVE_MODE)
++		return -ENODEV;
++
++	// grab temporary buffer and copy data in before locking
++	if (usersiz > INTERACTIVE_BUFFER_LEN)
++		usersiz = INTERACTIVE_BUFFER_LEN;
++	tempbuf = kmalloc(usersiz, GFP_KERNEL);
++
++	_LOCK_(flags);
++	// perform card-specific read work
++	rv = _oms_fop_read(card, tempbuf, usersiz);
++	UN_LOCK_(flags);
++
++	if (copy_to_user(userbuf, tempbuf, rv))
++		rv = -EFAULT;
++
++	kfree(tempbuf);
++
++	return rv;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// oms_fop_write --- valid only in INTERACTIVE_MODE (returns -ENODEV if not).
++//  NON-blocking write.  If there's room in the command buffer, the
++//  user data is put there.  If not, we immediately return 0.  Note that
++//  one can NEVER successfully write data whose length is greater than
++//  the size of the card's command buffer!  (We return -EINVAL to so indicate.)
++//
++//  In order to avoid a user-program consuming CPU cycles by busily
++//  re-issuing a write(2) syscall that return 0, we delay 2 jiffies
++//  before we return 0.
++int oms_fop_write(struct file *pfile,
++		  const char *userbuf, size_t usersiz, loff_t * ppos)
++{
++	int minor;
++	struct oms_card *card;
++	struct list_head *ptr;
++	int rv;
++	char *tmp;
++
++	ASSERT_UNLOCKED();
++
++	// find oms card by minor
++	minor = MINOR(pfile->f_dentry->d_inode->i_rdev);
++	if (minor < 0 || minor >= MAX_CARDS)
++		return -ENODEV;
++
++	for (ptr = oms_cardlist.next; ptr != &oms_cardlist; ptr = ptr->next) {
++		card = list_entry(ptr, struct oms_card, listhead);
++		if (card->minor == minor)
++			break;
++	}
++	if (ptr == &oms_cardlist) {
++		return -ENODEV;
++	}
++	// ensure card is in interactive mode
++	if (card->comm_mode != INTERACTIVE_MODE)
++		return -ENODEV;
++
++	// make sure we have room for the command and the command exists...
++	if (usersiz >= INTERACTIVE_BUFFER_LEN ||
++	    usersiz < 1 || usersiz > _oms_xmit_space_avail(card))
++		return -EINVAL;
++
++	// grab temporary buffer and copy data in before locking
++	tmp = kmalloc(INTERACTIVE_BUFFER_LEN, GFP_KERNEL);
++	if (copy_from_user(tmp, userbuf, usersiz))
++		return -EFAULT;
++
++	// perform card-specific write operation
++	_LOCK_(flags);
++	rv = _oms_fop_write(card, tmp, usersiz);
++	UN_LOCK_(flags);
++
++	kfree(tmp);
++
++	return rv;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// oms_fop_poll() --- support select(2)/poll(2) syscalls for read(2) ONLY.
++//   (We don't support polling for write(2).  Instead, a write(2) will
++//   fail, i.e., return 0, if there is insufficient room in card command
++//   buffer.
++unsigned int oms_fop_poll(struct file *pfile,
++			  struct poll_table_struct *polltable)
++{
++	int minor;
++	struct oms_card *card;
++	struct list_head *ptr;
++	unsigned int rv = 0;
++
++	ASSERT_UNLOCKED();
++
++	// find oms card by minor
++	minor = MINOR(pfile->f_dentry->d_inode->i_rdev);
++	if (minor < 0 || minor >= MAX_CARDS)
++		return -ENODEV;
++	for (ptr = oms_cardlist.next; ptr != &oms_cardlist; ptr = ptr->next) {
++		card = list_entry(ptr, struct oms_card, listhead);
++		if (card->minor == minor)
++			break;
++	}
++	if (ptr == &oms_cardlist) {
++		return -ENODEV;
++	}
++	// ensure card is in interactive mode
++	if (card->comm_mode != INTERACTIVE_MODE) {
++		// hmmmm ... say device is readable, since read(2)
++		//   can return -ENODEV and we can't
++		return POLLIN | POLLRDNORM;
++	}
++	// tell the upper-layers of select(2) what waitq will be
++	//   awakened when text data is available in the device.
++	//   Our IRQ handler will issue a wake_up() on
++	//   this waitq if card->comm_mode == INTERACTIVE_MODE.
++	if (card->response_ready == FALSE) {
++		poll_wait(pfile, &card->poll_waitq, polltable);
++	}
++
++	_LOCK_(flags);
++	// if there is data in the response buffer then
++	//   return value indicating that device is now readable
++	if (_oms_recv_space_used(card))
++		rv |= POLLIN | POLLRDNORM;
++	UN_LOCK_(flags);
++
++	return rv;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int oms_fop_ioctl(struct inode *pinode,
++		  struct file *pfile, unsigned int cmd, unsigned long userarg)
++{
++	int minor;
++	struct oms_card *card;
++	struct list_head *ptr;
++	struct omsdrv_ioctl *pioctl;
++	int rv;
++	void *arg = (void *)userarg;
++
++	ASSERT_UNLOCKED();
++
++	// find oms card by minor
++	minor = MINOR(pfile->f_dentry->d_inode->i_rdev);
++	if (minor < 0 || minor >= MAX_CARDS)
++		return -ENODEV;
++
++	for (ptr = oms_cardlist.next; ptr != &oms_cardlist; ptr = ptr->next) {
++		card = list_entry(ptr, struct oms_card, listhead);
++		if (card->minor == minor)
++			break;
++	}
++	if (ptr == &oms_cardlist) {
++		return -ENODEV;
++	}
++	// execute requested ioctl function
++	switch (cmd) {
++	case IOCTL_OMS_GET_VERSION:
++		{
++			struct oms_ioctl sioctl;
++			int len = strlen(version_string) + 1;
++
++			if (copy_from_user
++			    (&sioctl, (void *)arg, sizeof(sioctl)))
++				return -EFAULT;
++			if (sioctl.response_len < len)
++				return -EINVAL;
++			if (copy_to_user(sioctl.response, version_string, len))
++				return -EFAULT;
++			return 0;	// no tasklet start
++		}
++
++	case IOCTL_OMS_COMMAND:
++		{
++			// Send a command to the oms card. Invalid in interactive mode.
++			if (card->comm_mode == INTERACTIVE_MODE)
++				return -ENODEV;
++
++			pioctl = oms_new_ioctl(card);
++			if ((rv =
++			     oms_fetch_user_ioctl_struct(pioctl, 1, 0,
++							 arg)) != 0) {
++				return rv;	// ioctl already released
++			}
++
++			pioctl->cmd = cmd;
++			pioctl->response_expected = FALSE;
++			pioctl->comm_mode = STRING_MODE;
++
++			if (DEBUGLEVEL > 1)
++				printk(KERN_INFO "%s:  enqueueing COMMAND\n",
++				       me);
++
++			_LOCK_(flags);
++			tasklet_schedule(&oms_tasklet);
++			rv = oms_enqueue_ioctl_and_sleep(pioctl, &flags);
++			UN_LOCK_(flags);
++
++			if (DEBUGLEVEL > 1)
++				printk(KERN_INFO "%s:  dequeueing COMMAND\n",
++				       me);
++
++			oms_release_ioctl(pioctl);
++			return (rv);
++		}
++
++	case IOCTL_OMS_COMMAND_NONALPHA:
++		{
++			// Send a binary string to the oms card. Invalid in interactive mode
++			if (card->comm_mode == INTERACTIVE_MODE)
++				return -ENODEV;
++
++			pioctl = oms_new_ioctl(card);
++			if ((rv =
++			     oms_fetch_user_ioctl_struct(pioctl, 1, 0,
++							 arg)) != 0) {
++				return rv;	// ios already released
++			}
++
++			pioctl->cmd = cmd;
++			pioctl->response_expected = FALSE;
++			pioctl->comm_mode = BINARY_MODE;
++
++			if (DEBUGLEVEL > 1)
++				printk(KERN_INFO
++				       "%s:  enqueueing COMMAND_NONALPHA\n",
++				       me);
++
++			_LOCK_(flags);
++			tasklet_schedule(&oms_tasklet);
++			rv = oms_enqueue_ioctl_and_sleep(pioctl, &flags);
++			UN_LOCK_(flags);
++
++			if (DEBUGLEVEL > 1)
++				printk(KERN_INFO
++				       "%s:  dequeueing COMMAND_NONALPHA\n",
++				       me);
++
++			oms_release_ioctl(pioctl);
++			return (rv);
++		}
++
++	case IOCTL_OMS_QUERY:
++		{
++			// Send a command to the oms card and await a response
++			// Invalid in interactive mode
++			if (card->comm_mode == INTERACTIVE_MODE)
++				return -ENODEV;
++
++			pioctl = oms_new_ioctl(card);
++			if ((rv =
++			     oms_fetch_user_ioctl_struct(pioctl, 1, 1,
++							 arg)) != 0) {
++				return rv;	// ios already released
++			}
++			// incorporate operation-specific info into ioctl
++			pioctl->cmd = cmd;
++			pioctl->response_expected = TRUE;
++			pioctl->comm_mode = STRING_MODE;
++
++			if (DEBUGLEVEL > 1)
++				printk(KERN_INFO "%s:  enqueueing QUERY\n", me);
++
++			_LOCK_(flags);
++			tasklet_schedule(&oms_tasklet);
++			rv = oms_enqueue_ioctl_and_sleep(pioctl, &flags);
++			UN_LOCK_(flags);
++
++			if (DEBUGLEVEL > 1)
++				printk(KERN_INFO "%s:  dequeueing QUERY\n", me);
++
++			if (!rv) {
++				if (DEBUGLEVEL > 2)
++					printk(KERN_INFO
++					       "%s:  QUERY response \"%s\"\n",
++					       me, pioctl->buffers.response);
++
++				rv = oms_copy_out_ioctl_response(pioctl, arg);
++			}
++
++			oms_release_ioctl(pioctl);
++			return (rv);
++		}
++
++	case IOCTL_OMS_QUERY_NONALPHA:
++		{
++			// Send a binary string to the oms card and await a response.
++			// Invalid in interactive mode
++			if (card->comm_mode == INTERACTIVE_MODE)
++				return -ENODEV;
++
++			pioctl = oms_new_ioctl(card);
++			if ((rv =
++			     oms_fetch_user_ioctl_struct(pioctl, 1, 1,
++							 arg)) != 0) {
++				return rv;	// ios already released
++			}
++			// incorporate operation-specific info into ios
++			pioctl->cmd = cmd;
++			pioctl->response_expected = TRUE;
++			pioctl->comm_mode = BINARY_MODE;
++
++			if (DEBUGLEVEL > 1)
++				printk(KERN_INFO
++				       "%s:  enqueueing QUERY_NONALPHA\n", me);
++
++			_LOCK_(flags);
++			tasklet_schedule(&oms_tasklet);
++			rv = oms_enqueue_ioctl_and_sleep(pioctl, &flags);
++			UN_LOCK_(flags);
++
++			if (DEBUGLEVEL > 1)
++				printk(KERN_INFO
++				       "%s:  dequeueing QUERY_NONALPHA\n", me);
++
++			if (!rv) {
++				if (DEBUGLEVEL > 2)
++					printk(KERN_INFO
++					       "%s:  QUERY_NONALPHA response \"%s\"\n",
++					       me, pioctl->buffers.response);
++
++				rv = oms_copy_out_ioctl_response(pioctl, arg);
++			}
++
++			oms_release_ioctl(pioctl);
++			return (rv);
++		}
++
++	case IOCTL_OMS_READ_SHARED_MEM:
++		return _oms_ioctl_read_shared_mem(card, (void *)arg);
++
++	case IOCTL_OMS_WRITE_SHARED_MEM:
++		return _oms_ioctl_write_shared_mem(card, (void *)arg);
++
++	case IOCTL_OMS_READ_STATUS_FLAGS:
++		return _oms_ioctl_read_status_flags(card, arg);
++
++	case IOCTL_OMS_CLEAR_STATUS_FLAGS:
++		return _oms_ioctl_clear_status_flags(card, arg);
++
++	case IOCTL_OMS_READ_DONE_FLAGS:
++		return _oms_ioctl_read_done_flags(card, arg);
++
++	case IOCTL_OMS_CLEAR_DONE_FLAGS:
++		return _oms_ioctl_clear_done_flags(card, arg);
++
++	case IOCTL_OMS_READ_PLIMIT_FLAGS:
++		return _oms_ioctl_read_pos_limit_flags(card, arg);
++
++	case IOCTL_OMS_CLEAR_PLIMIT_FLAGS:
++		return _oms_ioctl_clear_pos_limit_flags(card, arg);
++
++	case IOCTL_OMS_READ_NLIMIT_FLAGS:
++		return _oms_ioctl_read_neg_limit_flags(card, arg);
++
++	case IOCTL_OMS_CLEAR_NLIMIT_FLAGS:
++		return _oms_ioctl_clear_neg_limit_flags(card, arg);
++
++	case IOCTL_OMS_READ_SLIP_FLAGS:
++		return _oms_ioctl_read_slip_flags(card, arg);
++
++	case IOCTL_OMS_CLEAR_SLIP_FLAGS:
++		return _oms_ioctl_clear_slip_flags(card, arg);
++
++	case IOCTL_OMS_READ_AXIS_POSITIONS:
++		return _oms_ioctl_read_axis_positions(card, (void *)arg);
++
++	case IOCTL_OMS_CMD_BUFF_FREE:
++		{
++			// perform the arithmetic immediately, without queueing
++			//  an ios through the system.
++			pioctl = oms_new_ioctl(card);
++			if ((rv =
++			     oms_fetch_user_ioctl_struct(pioctl, 0, 4,
++							 arg)) != 0)
++				return rv;	// ios already released
++			// the response area must be exactly 4 bytes long
++			if (pioctl->buffers.response_len != sizeof(u32)) {
++				oms_release_ioctl(pioctl);
++				return -EINVAL;
++			}
++
++			_LOCK_(flags);
++			*((u32 *) (pioctl->buffers.response)) =
++			    (u32) (_oms_xmit_space_avail(card));
++			UN_LOCK_(flags);
++
++			pioctl->p_response = sizeof(u32);
++			pioctl->response_expected = 1;	// fake out our copy_out func
++			rv = oms_copy_out_ioctl_response(pioctl, arg);
++			oms_release_ioctl(pioctl);
++			return rv;
++		}
++
++	case IOCTL_OMS_ENTER_INTERACTIVE_MODE:
++		{
++			rv = 0;
++			_LOCK_(flags);
++			if (card->open_count != 1) {
++				rv = -EBUSY;
++			} else {
++				card->comm_mode = INTERACTIVE_MODE;
++			}
++			UN_LOCK_(flags);
++			printk(KERN_INFO
++			       "%s:  Entered interactive mode (single open only)\n",
++			       me);
++			return rv;
++		}
++
++	case IOCTL_OMS_EXIT_INTERACTIVE_MODE:
++		{
++			rv = 0;
++			_LOCK_(flags);
++			if (card->open_count != 1) {
++				rv = -EBUSY;
++			} else {
++				card->comm_mode = STRING_MODE;
++			}
++			UN_LOCK_(flags);
++			printk(KERN_INFO "%s:  Exited interactive mode\n", me);
++			return rv;
++		}
++
++	case IOCTL_OMS_REINIT:
++		{
++			// should only be called after a firmware upgrade
++			return _oms_ioctl_reinit(card, arg);
++		}
++
++	default:
++		return _oms_fop_ioctl(pinode, pfile, cmd, userarg);
++	}
++	return 0;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// oms_tasklet_ioctl() --- function run in a TASKLET (aka DPC).
++//   For all cards in the list, call oms_start_ioctl().
++void oms_tasklet_ioctl(unsigned long ignored)
++{
++	struct list_head *pos;
++	struct oms_card *card;
++
++	ASSERT_UNLOCKED();
++
++	_LOCK_(flags);
++	list_for_each(pos, &oms_cardlist) {
++		card = list_entry(pos, struct oms_card, listhead);
++		oms_start_ioctl(card);
++	}
++	UN_LOCK_(flags);
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// oms_start_ioctl() -- examine the top ioctl structure in a card's
++//     queue, and test whether the card has enough space to accept
++//     the command.  If so, dequeue the ioctl structure and transfer
++//     the command data to the card.  If the struct is marked as "done
++//     at xfer", then complete the operation:  (1) if the structure is
++//     marked having a task asleep, wake him up, else (2) simply
++//     free the resources associated with this ioctl.
++//
++//     If there is insufficient room in the card for the command string,
++//     set ios->userstruct.command_len to zero and arrange for the
++//     sleeping task to transfer this negative result to the user program.
++//
++//  biglock is LOCKED
++void oms_start_ioctl(struct oms_card *card)
++{
++	struct omsdrv_ioctl *pioctl;
++	struct list_head *pos;
++
++	ASSERT_LOCKED();
++
++	// if the card is flagged 'blocking', just return
++	if (card->blocking == TRUE) {
++		if (DEBUGLEVEL > 0)
++			printk(KERN_INFO "%s:  card blocking\n", me);
++		return;
++	}
++
++	if (!list_empty(&card->ioctl_list)) {
++		pos = card->ioctl_list.next;
++		pioctl = list_entry(pos, struct omsdrv_ioctl, listhead);
++		if (pioctl->comm_mode != INTERACTIVE_MODE) {
++			// processing a string/binary, block any others that come along
++			card->blocking = TRUE;
++
++			if (DEBUGLEVEL > 0)
++				printk(KERN_INFO "%s:  card set to blocking\n",
++				       me);
++
++			// Do any card-specific operations required
++			_oms_start_ioctl(card);
++		}
++	}
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// oms_ioctl_complete
++// Returns TRUE iff command has been completely transmitted and any expected
++// reply has been received
++inline BOOL oms_ioctl_complete(struct omsdrv_ioctl *pioctl)
++{
++	if (pioctl->buffers.command_len &&
++	    (pioctl->p_command < pioctl->buffers.command_len))
++		return FALSE;
++
++	if (pioctl->response_expected)
++		return pioctl->card->response_ready;
++
++	return TRUE;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// oms_enqueue_ioctl_and_sleep() --- called from the oms_fop_ioctl() function
++//    (a file_operations routine running the user thread).  Enqueue an
++//    ioctl op and sleep, with timeout, until awakened.  Return a
++//    negative errno on error, or 0.
++//
++//  Called with spinlock 'biglock' LOCKED, with flags in reference var pflags.
++//    (because we can block, we need to release and re-acquire the lock)
++int oms_enqueue_ioctl_and_sleep(struct omsdrv_ioctl *pioctl,
++				unsigned long *pflags)
++{
++	struct oms_card *card = pioctl->card;
++	int rv;
++
++	ASSERT_LOCKED();
++
++	if (card == NULL) {
++		printk(KERN_ERR "%s:  NULL card pointer in ios\n", me);
++		return -EIO;	// general purpose error code
++	}
++	// enqueue the ioctl
++	INIT_LIST_HEAD(&pioctl->listhead);
++	init_waitqueue_head(&pioctl->waitq);
++	pioctl->task_asleep = 1;
++	pioctl->card->response_ready = 0;
++	list_add_tail(&pioctl->listhead, &card->ioctl_list);
++	UN_LOCK_(*pflags);
++
++	// sleep until awakened or timed out
++	tasklet_schedule(&oms_tasklet);
++	rv = sleep_on_timeout(&pioctl->waitq, IO_TIMEOUT * HZ);
++
++	// awake, clean up
++	_LOCK_(*pflags);
++	if (DEBUGLEVEL > 0)
++		printk(KERN_INFO "%s:  card set to non-blocking\n", me);
++	card->blocking = 0;
++	pioctl->task_asleep = 0;
++
++	if (oms_ioctl_complete(pioctl))
++		return 0;
++
++	if (rv == 0)
++		return -ETIME;
++
++	return -EIO;		// catchall.
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// oms_copy_out_ioctl_response() -- copy the user's 'struct oms_ioctl'
++//   structure, and if there's a response, copy that out too.
++//   Return 0 on success or -EFAULT.
++//
++//   (we must NOT be locked, as one should never access user space under
++//    a spinlock --- there might be a page fault during transfer)
++int oms_copy_out_ioctl_response(struct omsdrv_ioctl *pioctl, void *usr_arg)
++{
++	struct oms_ioctl tmp_ioctl;
++	int extra = 0;
++
++	ASSERT_UNLOCKED();
++
++	// only do the work if the ioctl asked for a response
++	if (pioctl->response_expected && pioctl->p_response) {
++		// get the user struct first
++		copy_from_user(&tmp_ioctl, usr_arg, sizeof(struct oms_ioctl));
++
++		// if not interactive and a response exists, make sure it's nul terminated
++		if (pioctl->comm_mode != INTERACTIVE_MODE &&
++		    pioctl->p_response < pioctl->buffers.response_len) {
++			pioctl->buffers.response[pioctl->p_response] = 0;	// nul byte
++			extra = 1;
++		}
++		// copy out the response itself (tmp_ioctl.response is a pointer to user space)
++		if (copy_to_user(tmp_ioctl.response,
++				 pioctl->buffers.response,
++				 pioctl->buffers.response_len + extra)) {
++			return -EFAULT;
++		}
++		// on input, the user's response_len is the max size of his buffer.
++		// on output, response_len is the actual byte count copied out (less the
++		//  nul byte if in STRING_MODE).
++		tmp_ioctl.response_len = pioctl->buffers.response_len;
++
++		// now copy the whole struct just to get the size copied...
++		if (copy_to_user((void *)usr_arg,
++				 &tmp_ioctl, sizeof(struct oms_ioctl))) {
++			return -EFAULT;
++		}
++	}
++
++	return 0;
++}
++
++//****************************************************************************
+--- /dev/null
++++ b/drivers/misc/oms/oms-core.h
+@@ -0,0 +1,165 @@
++/* oms-core.h --- non-user-space header file
++ *
++ *  Copyright(c) 2003 Oregon Micro Systems, Inc.  All rights reserved.
++ */
++
++#ifndef __OMS_CORE_H_
++#define __OMS_CORE_H_
++
++#include <linux/ioctl.h>
++#include "oms.h"		// user-space header
++
++// structure used for queueing ioctl operations for sequential service
++struct omsdrv_ioctl {
++	unsigned long cmd;	// copy of ioctl arg 2
++	struct oms_card *card;	// pointer to card this is for
++
++	struct oms_ioctl buffers;	// copied in from user-space
++	int p_command;		// index in buffers.command of next char to xmit
++	unsigned char response_expected;	// NO_RESPONSE or TEXT_RESPONSE
++	int p_response;		// index in buffers.response of next char to recv
++
++	struct list_head listhead;	// list per card
++	wait_queue_head_t waitq;	// process sleeps here
++
++	unsigned char comm_mode;	// STRING... or INTERACTIVE.. or BIN..
++	unsigned char task_asleep;	// boolean:  TRUE if task sleeping
++	int lf_count;		// number of LFs received thus far
++};
++
++#define IOCTL_NOT_SUPPORTED			-EINVAL
++
++#define	INTERACTIVE_BUFFER_LEN	1024
++#define IO_TIMEOUT     					10	// number of seconds
++
++// per-device instance of a card
++//
++//  Minor number and uniqueness conventions:
++//       1.  each card must have a unique DIP switch setting.
++//       2.  the minor number of the device is the DIP switch setting.
++//     (explanatory note:  the number generated by the DIP switches
++//      is added to PCI_DEVICE_ID_OMS_BASE and appears in the
++//      PCI config header field "subsystem device id".)
++struct oms_card {
++	struct list_head listhead;	// for driver-wide list of cards
++	struct list_head ioctl_list;	// list of IOCTLs for this card
++
++	struct pci_dev *pdev;	// system PCI device structure
++	int minor;		// minor number for this card
++	int irq;
++
++	int blocking;		// whether handling a blocking IOCTL
++	int open_count;		// number of open handles to this card
++
++#define STRING_MODE				0
++#define INTERACTIVE_MODE	1
++#define BINARY_MODE				2
++	short comm_mode;	// current communication mode
++
++	// INTERACTIVE_MODE buffers
++	char xmit_buffer[INTERACTIVE_BUFFER_LEN];
++	int xmit_ins_ptr;
++	int xmit_rem_ptr;
++	char recv_buffer[INTERACTIVE_BUFFER_LEN];
++	int recv_ins_ptr;
++	int recv_rem_ptr;
++	int lf_count;
++	BOOL response_ready;
++
++	// we need a wait queue to support select(2)/poll(2) syscall
++	wait_queue_head_t poll_waitq;
++
++	void *hardware;		// pointer to card-specific data
++};
++
++//***************************************************************
++//  A single spinlock, and conditional code for spinlock debugging
++static spinlock_t oms_biglock;
++
++// on a uniprocessor, we can make an ASSERT_UNLOCKED() test.  Since
++//   RedHat kernels are configured with CONFIG_SMP defined, we can't use
++//   <linux/config.h> to tell if we're running on a uniprocessor.  We
++//   therefore make the assertion a MODULE_PARM
++#define OMS_DEBUG_SPINLOCKS 1
++#if OMS_DEBUG_SPINLOCKS
++#define _LOCK_(f) \
++  	({spin_lock_irqsave(&oms_biglock, (f)); \
++    if (atomic_read(&oms_islocked) != 0) \
++    	printk(KERN_ERR "%s:  LOCK() bad %s:%d\n", me, __FILE__, __LINE__); \
++		atomic_set(&oms_islocked, 1);})
++#define UN_LOCK_(f) \
++  	({if (atomic_read(&oms_islocked) != 1) \
++    	printk(KERN_ERR "%s:  UNLOCK() bad %s:%d\n", me,__FILE__,__LINE__); \
++      atomic_set(&oms_islocked, 0); \
++      spin_unlock_irqrestore(&oms_biglock, (f));})
++#define ASSERT_LOCKED() \
++  	({if (atomic_read(&oms_islocked) != 1) \
++    		printk(KERN_ERR "%s:  ASSERT_LOCKED bad %s:%d\n", me,__FILE__, __LINE__);})
++#define ASSERT_UNLOCKED() \
++  	({if (ONE_CPU && atomic_read(&oms_islocked) != 0) \
++			printk(KERN_ERR "%s:  ASSERT_UNLOCKED bad %s:%d\n", me,__FILE__, __LINE__);})
++#else // if NOT OMS_DEBUG_SPINLOCKS --- vanilla lock/unlock without tests
++#define _LOCK_(f)     spin_lock_irqsave(&oms_biglock, (f))
++#define UN_LOCK_(f)   spin_unlock_irqrestore(&oms_biglock, (f))
++#define ASSERT_LOCKED()		/* empty */
++#define ASSERT_UNLOCKED()	/* empty */
++#endif // OMS_DEBUG_SPINLOCKS
++
++//  ********* function prototypes **************
++int oms_install_module(void);
++int oms_install_one(struct pci_dev *pdev, const struct pci_device_id *ent);
++int oms_attach_irq(int irq);
++void oms_remove_module(void);
++void oms_remove_one(struct pci_dev *pdev);
++void oms_release_resources(struct oms_card *card);
++void oms_create_nodes(void);
++void oms_tasklet_ioctl(unsigned long ignored);
++void oms_start_ioctl(struct oms_card *card);
++struct omsdrv_ioctl *oms_new_ioctl(struct oms_card *card);
++void oms_release_ioctl(struct omsdrv_ioctl *);
++int oms_fetch_user_ioctl_struct(struct omsdrv_ioctl *pioctl,
++				int command_parm,
++				int response_parm, void *user_arg);
++int oms_enqueue_ioctl_and_sleep(struct omsdrv_ioctl *pioctl,
++				unsigned long *pflags);
++int oms_copy_out_ioctl_response(struct omsdrv_ioctl *pioctl, void *user_arg);
++
++// char device file operations
++int oms_fop_open(struct inode *, struct file *);
++int oms_fop_close(struct inode *, struct file *);
++int oms_fop_ioctl(struct inode *, struct file *, unsigned int, unsigned long);
++int oms_fop_read(struct file *, char *, size_t, loff_t *);
++int oms_fop_write(struct file *, const char *, size_t, loff_t *);
++unsigned int oms_fop_poll(struct file *, struct poll_table_struct *);
++
++void oms_sleep(int jifs);
++
++//  **** function prototypes which MUST be supported by card-specific code ****
++irqreturn_t _oms_irq_handler(int irq, void *dev, struct pt_regs *regs);
++int _oms_init_memory(struct pci_dev *pdev, struct oms_card *card);
++int _oms_attach_irq(struct pci_dev *pdev, struct oms_card *card);
++void _oms_detach_irq(struct oms_card *card);
++void _oms_release_resources(struct oms_card *card);
++int _oms_fop_read(struct oms_card *card, char buffer[], int maxsize);
++int _oms_fop_write(struct oms_card *card, char buffer[], int maxsize);
++int _oms_fop_ioctl(struct inode *, struct file *, unsigned int, unsigned long);
++
++int _oms_xmit_space_avail(struct oms_card *card);
++int _oms_recv_space_used(struct oms_card *card);
++void _oms_start_ioctl(struct oms_card *card);
++int _oms_ioctl_read_status_flags(struct oms_card *card, void *arg);
++int _oms_ioctl_clear_status_flags(struct oms_card *card, void *arg);
++int _oms_ioctl_read_done_flags(struct oms_card *card, void *arg);
++int _oms_ioctl_clear_done_flags(struct oms_card *card, void *arg);
++int _oms_ioctl_read_pos_limit_flags(struct oms_card *card, void *arg);
++int _oms_ioctl_clear_pos_limit_flags(struct oms_card *card, void *arg);
++int _oms_ioctl_read_neg_limit_flags(struct oms_card *card, void *arg);
++int _oms_ioctl_clear_neg_limit_flags(struct oms_card *card, void *arg);
++int _oms_ioctl_read_slip_flags(struct oms_card *card, void *arg);
++int _oms_ioctl_clear_slip_flags(struct oms_card *card, void *arg);
++int _oms_ioctl_read_shared_mem(struct oms_card *card, void *arg);
++int _oms_ioctl_write_shared_mem(struct oms_card *card, void *arg);
++int _oms_ioctl_read_axis_positions(struct oms_card *card, void *arg);
++int _oms_ioctl_reinit(struct oms_card *card, void *arg);
++
++#endif // __OMS_CORE_H_
+--- /dev/null
++++ b/drivers/misc/oms/oms-maxp.h
+@@ -0,0 +1,85 @@
++/* oms-maxp.h --- header file shared between driver and user-space
++ *    programs.  Defines the physical MAXp hardware I/O.
++ *
++ *
++ *  Copyright(c) 2003 Oregon Micro Systems, Inc.  All rights reserved.
++ */
++
++#ifndef __OMSMAXP_H_
++#define __OMSMAXP_H_
++
++#include "oms.h"		// core IOCTL calls, et. al.
++
++//****************************************************************************
++// HARDWARE SPECIFIC REGISTER AND BIT DEFINITIONS
++
++// control and status bits
++#define CMDERR_BIT              0x01	//Command error
++#define INIT_BIT                0x02	//Controller is initializing
++#define SLIP_BIT                0x04	//Axis encoder slip
++#define OVRT_BIT                0x08	//Axis overtravel
++#define DONE_BIT                0x10	//Done condition
++#define IBF_BIT                 0x20	//Character received from controller
++#define TBE_BIT                 0x40	//Controller ready to receive a character
++#define IRQ_BIT                 0x80	//Controller interrupt master enable
++// done register bits
++#define AXIS_X                  0x01
++#define AXIS_Y                  0x02
++#define AXIS_Z                  0x04
++#define AXIS_T                  0x08
++#define AXIS_U                  0x10
++#define AXIS_V                  0x20
++#define AXIS_R                  0x40
++#define AXIS_S                  0x80
++
++// interesting shared memory offsets (from shared_mem base)
++#define OMS_MEM_CARDNUM         0x00000000
++
++// 64k Shared Memory Offsets
++#define MEM_RT_MOTOR				0x00000000	//Real Time Motor Position
++#define MEM_X_OFFSET				0x00	// Offset to X axis data
++#define MEM_Y_OFFSET				0x04	// Offset to Y axis data
++#define MEM_Z_OFFSET				0x08	// Offset to Z axis data
++#define MEM_T_OFFSET				0x0C	// Offset to T axis data
++#define MEM_U_OFFSET				0x10	// Offset to U axis data
++#define MEM_V_OFFSET				0x14	// Offset to V axis data
++#define MEM_R_OFFSET				0x18	// Offset to R axis data
++#define MEM_S_OFFSET				0x1C	// Offset to S axis data
++#define MEM_RT_ENCODER			0x00000020	//Real Time Encoder Position
++	// Same offsets as OMS_MEM_RT_MOTOR
++#define MEM_CAP_RQ_MBOX			0x00000050	//Position Capture Request Mailbox
++#define MEM_CAP_REQUEST			0x00000001	// Request position capture
++#define MEM_CAP_COMPLETE		0x00000000	// Capture complete
++#define MEM_CAP_MOTOR				0x00000054	//Motor Capture Data
++	// Same offsets as OMS_MEM_RT_MOTOR
++#define MEM_CAP_ENCODER			0x00000074	//Encoder Capture Data
++	// Same offsets as OMS_MEM_RT_MOTOR
++#define MEM_OUT_BINARY			0x00000900	//Outbound Binary Transfer Buffer
++#define MEM_IN_BINARY				0x00000D00	//Inbound Binary Transfer Buffer
++#define MEM_CAPTURE_TBL			0x00001540	//Position Capture Tables
++#define MEM_CAP_1						0x0000	// Table 1 Offset
++#define MEM_CAP_2						0x0150	// Table 2 Offset
++#define MEM_CAP_3						0x0328	// Table 3 Offset
++#define MEM_CAP_4						0x0978	// Table 4 Offset
++#define MEM_CAP_5						0x0CA0	// Table 5 Offset
++#define MEM_CAP_6						0x0FC8	// Table 6 Offset
++#define MEM_CAP_7						0x12F0	// Table 7 Offset
++#define MEM_CAP_8						0x1618	// Table 8 Offset
++
++#define MEM_CAP_INSERT			0x0000	// Insert Index Offset
++#define MEM_CAP_PROCESS			0x0004	// Process Index Offset
++#define MEM_CAP_BUFFER			0x0008	// Ring Buffer Offset
++#define MEM_PROFILE_1				0x00004000	//Motion Profile Transfer Buffer 1
++#define MEM_PROF						0x0000	// Profile Buffer
++#define MEM_PROF_STATUS			0x0004	// Profile Buffer Status
++#define MEM_PROF_SEQNUM			0x0008	// Profile Buffer Sequence Number
++#define MEM_PROF_DATA				0x000C	// Profile Buffer Data
++#define MEM_PROFILE_2				0x0000A000	//Motion Profile Transfer Buffer 2
++	//same offsets as OMS_MEM_PROFILE_1 above
++
++// 512k Shared Memory Offsets
++#define MEM_VECTOR_INSERT		0x00000000	//Vector Mode Ring Buffer Insert Index
++#define MEM_VECTOR_PROCESS	0x00000004	//Vector Mode Ring Buffer Process Index
++#define MEM_VECTOR_BUFFER		0x00000008	//Vector Mode Ring Buffer (327,720 bytes)
++
++#endif // __OMSMAXP_H_
+--- /dev/null
++++ b/drivers/misc/oms/oms-maxpdrv.c
+@@ -0,0 +1,1314 @@
++/*
++ *  oms-maxpdrv.c --- Linux device driver for Oregon Micro Systems
++ *    MAXp motion controller, hardware-specific code.
++ *
++ *  Copyright(c) 2003 Oregon Micro Systems, Inc.  All rights reserved.
++ */
++
++char version_string[] = "Oregon Micro Systems MAXp Linux Driver v2.0";
++char *me = "MAXp";
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/string.h>
++#include <linux/errno.h>
++#include <linux/slab.h>
++#include <linux/list.h>
++#include <linux/interrupt.h>
++#include <linux/timer.h>
++#include <linux/pci.h>
++#include <linux/spinlock.h>
++#include <linux/init.h>
++#include <linux/fs.h>
++#include <linux/poll.h>
++#include <asm/io.h>
++#include <linux/ioctl.h>
++#include <linux/kmod.h>
++#include <asm/atomic.h>
++#include <asm/uaccess.h>
++#include <asm/byteorder.h>
++#include <linux/byteorder/generic.h>
++
++#include "oms-core.h"		// driver-private header
++#include "oms-maxpdrv.h"	// driver-private card-specific header
++
++MODULE_DESCRIPTION("Driver for OMS MAXp motion control");
++MODULE_LICENSE("GPL");
++char *node_device = "maxp";
++
++//****************************************************************************
++// PCI BUS VENDOR AND DEVICE IDS FOR BUS INTERFACE AND OMS DEVICES
++
++// The bus interface vendor/device IDs will be in system vendor ID
++//  registers of PCI configuration space
++#define PCI_VENDOR_ID_BUS	    	0x1057
++#define PCI_DEVICE_ID_BUS				0x0006
++// The OMS vendor/device IDs will be in the subsystem vendor ID
++//   registers of PCI configuration space
++#define PCI_VENDOR_ID_OMS				0x160c
++#define PCI_DEVICE_NAME					"maxp"
++
++int PCI_DEVICE_ID_OMS_BASE = 0x0010;
++
++// pci_device_id --- specify to PCI driver the set of vendor/device IDs
++//     that we know about.  The PCI driver will call our "probe" routine
++//     for each device matching one of our descriptions.
++struct pci_device_id oms_pci_tbl[] __devinitdata = {
++	{.vendor = PCI_VENDOR_ID_BUS,
++	 .device = PCI_DEVICE_ID_BUS,
++	 .subvendor = PCI_VENDOR_ID_OMS,
++	 .subdevice = PCI_ANY_ID		// we will accept anything >= PCI_OMS_DEVICE_ID_BASE
++	 },
++	{0}
++};
++MODULE_DEVICE_TABLE(pci, oms_pci_tbl);
++
++// pci_driver structure --- register with the PCI driver.  It will call
++//   our "probe" routine for each PCI device matching our table.
++struct pci_driver oms_driver = {
++	.name = PCI_DEVICE_NAME,
++	.id_table = oms_pci_tbl,
++	.probe = oms_install_one,
++	.remove = __devexit_p(oms_remove_one),
++};
++
++//****************************************************************************
++// externs from oms-core.c
++extern struct list_head oms_cardlist;
++extern unsigned long flags;
++// Module parameters
++extern int DEBUGLEVEL;
++extern int MAJORNUMBER;
++extern int ONE_CPU;
++extern int MAX_CARDS;
++extern char *NODE_CREATION_SCRIPT;
++#if OMS_DEBUG_SPINLOCKS
++extern atomic_t oms_islocked;
++#endif
++
++//****************************************************************************
++// Private functions
++void _oms_irq_handle_ibf(struct oms_card *card);
++void _oms_irq_handle_pos_data(struct oms_card *card);
++
++//****************************************************************************
++// _oms_init_memory ---- called by oms_install_one to probe for
++//   card-specific memory regions and allocate them
++//
++//  We don't know the index numbers of the 3 BARs we need.  One
++//    is 4K, one is 64K and one is 512 bytes.  Search for these.
++int _oms_init_memory(struct pci_dev *pdev, struct oms_card *card)
++{
++	int i;
++	int bars_found = 0;
++	unsigned long start, len, siz;
++
++	card->hardware = (void *)kmalloc(sizeof(struct hw_struct), GFP_ATOMIC);
++	memset(card->hardware, 0, sizeof(struct hw_struct));
++
++	// scan the BARs looking for MMIO regions of 4k, 64k and 512k
++	for (i = DEVICE_COUNT_RESOURCE; bars_found < 3 && i >= 0; i--) {
++		start = pci_resource_start(pdev, i);
++		len = pci_resource_len(pdev, i);
++
++		if (start == 0 || len == 0)
++			continue;
++		if ((pci_resource_flags(pdev, i) & IORESOURCE_MEM) == 0)
++			continue;
++
++		siz = 4 * 1024;	// look for 4k register space
++		if (len == siz) {
++			if (!request_mem_region(start, siz, me)) {
++				printk(KERN_ERR
++				       "%s:  mem region collision at %p\n", me,
++				       (void *)start);
++				return 1;
++			}
++			// we store the base of the mapped registers
++			//  as an unsigned long, as we never dereference
++			//  it, but need the value for address arithmetic
++			//  to derive the pointers we actually use.
++			card_hw->regbase_addr =
++			    (unsigned long)ioremap(start, siz);
++
++			if (!card_hw->regbase_addr) {
++				printk(KERN_ERR "%s:  ioremap failed\n", me);
++				return 1;
++			}
++			card_hw->regbase_physaddr = start;
++
++			// set pointers to registers
++			card_hw->obisr =
++			    (u32 *) (card_hw->regbase_addr + REG_OBISR);
++			card_hw->obimr =
++			    (u32 *) (card_hw->regbase_addr + REG_OBIMR);
++			card_hw->obmr0 =
++			    (u32 *) (card_hw->regbase_addr + REG_OBMR0);
++			card_hw->obmr1 =
++			    (u32 *) (card_hw->regbase_addr + REG_OBMR1);
++			card_hw->obdr =
++			    (u32 *) (card_hw->regbase_addr + REG_OBDR);
++
++			bars_found++;
++			// continue 'for' loop
++			continue;
++		}
++
++		siz = 64 * 1024;	// look for shared memory
++		if (len == siz) {
++			if (!request_mem_region(start, siz, me)) {
++				printk(KERN_ERR
++				       "%s:  mem region collision at %p\n", me,
++				       (void *)start);
++				return 1;
++			}
++			card_hw->shared64k = ioremap(start, siz);
++			if (!card_hw->shared64k) {
++				printk(KERN_ERR "%s:  ioremap failed\n", me);
++				return 1;
++			}
++			card_hw->shared64k_physaddr = start;
++
++			// set pointers
++			card_hw->firmware =
++			    (u32 *) & card_hw->shared64k[MEM_FIRMWARE];
++			card_hw->limit =
++			    (u32 *) & card_hw->shared64k[MEM_RT_LIMIT];
++			card_hw->home =
++			    (u32 *) & card_hw->shared64k[MEM_RT_HOME];
++			card_hw->semaphore =
++			    (u32 *) & card_hw->shared64k[MEM_OM_SEMAPHORE];
++			card_hw->mailbox =
++			    (u32 *) & card_hw->shared64k[MEM_CAP_RQ_MBOX];
++
++			// Set up pointers to command and response buffers
++			card_hw->command_buf =
++			    (char *)(&card_hw->shared64k[MEM_CMD_BUFFER]);
++			card_hw->command_ip =
++			    (u32 *) & card_hw->shared64k[MEM_CMD_INSERT];
++			card_hw->command_pp =
++			    (u32 *) & card_hw->shared64k[MEM_CMD_PROCESS];
++			card_hw->response_buf =
++			    (char *)(&card_hw->shared64k[MEM_RESP_BUFFER]);
++			card_hw->response_ip =
++			    (u32 *) & card_hw->shared64k[MEM_RESP_INSERT];
++			card_hw->response_pp =
++			    (u32 *) & card_hw->shared64k[MEM_RESP_PROCESS];
++
++			bars_found++;
++			// continue 'for' loop
++			continue;
++		}
++
++		siz = 512 * 1024;	// look for large shared memory
++		if (len == siz) {
++			if (!request_mem_region(start, siz, me)) {
++				printk(KERN_ERR
++				       "%s:  mem region collision at %p\n", me,
++				       (void *)start);
++				return 1;
++			}
++			card_hw->shared512k = ioremap(start, siz);
++			if (!card_hw->shared512k) {
++				printk(KERN_ERR "%s:  ioremap failed\n", me);
++				return 1;
++			}
++			card_hw->shared512k_physaddr = start;
++
++			bars_found++;
++			// continue 'for' loop
++			continue;
++		}
++	}
++	if (bars_found < 3) {
++		printk(KERN_ERR "%s:  failed to find all needed BARs\n", me);
++		return 1;
++	}
++
++	return 0;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// _oms_attach_irq()
++//
++//   Note:  spinlock oms_biglock is LOCKED on entry.
++int _oms_attach_irq(struct pci_dev *pdev, struct oms_card *card)
++{
++	int rv;
++	struct list_head *ptr;
++
++	ASSERT_LOCKED();
++
++	// see if we've already requested this IRQ
++	for (ptr = oms_cardlist.next; ptr != &oms_cardlist; ptr = ptr->next) {
++		struct oms_card *a_card =
++		    list_entry(ptr, struct oms_card, listhead);
++		if (a_card->irq == pdev->irq) {
++			return 0;
++		}
++	}
++
++	if ((rv =
++	     request_irq(pdev->irq, &_oms_irq_handler, IRQF_SHARED, me,
++			 card)) != 0) {
++		printk(KERN_ERR "%s:  request_irq failed on irq %d:  %d\n", me,
++		       pdev->irq, rv);
++		return -1;
++	}
++	// now we can set the irq number in the card struct
++	card->irq = pdev->irq;
++
++	// initialize card's interrupt enable register
++	writel(cpu_to_le32(INTERRUPT_MASK), card_hw->obimr);
++
++	// clear the message semaphore and reset the response buffer
++	writel(0, card_hw->semaphore);
++	writel(readl(card_hw->response_ip), card_hw->response_pp);
++
++	return 0;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// _oms_detach_irq()
++//
++//   Note:  spinlock oms_biglock is LOCKED on entry.
++void _oms_detach_irq(struct oms_card *card)
++{
++	ASSERT_LOCKED();
++
++	// free the irq
++	(void)free_irq(card->irq, card);
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// _oms_release_resources() --- release all resources used by one card
++//
++//  Note:  spinlock oms_biglock is LOCKED on entry.
++void _oms_release_resources(struct oms_card *card)
++{
++	ASSERT_LOCKED();
++
++	if (card->hardware) {
++		if (card_hw->shared512k) {
++			iounmap(card_hw->shared512k);
++		}
++		if (card_hw->shared64k) {
++			iounmap(card_hw->shared64k);
++		}
++		if (card_hw->regbase_addr) {
++			iounmap((void *)card_hw->regbase_addr);
++		}
++		if (card_hw->shared512k_physaddr) {
++			release_mem_region(card_hw->shared512k_physaddr,
++					   (512 * 1024));
++		}
++		if (card_hw->shared64k_physaddr) {
++			release_mem_region(card_hw->shared64k_physaddr,
++					   (64 * 1024));
++		}
++		if (card_hw->regbase_physaddr) {
++			release_mem_region(card_hw->regbase_physaddr,
++					   (4 * 1024));
++		}
++		kfree(card->hardware);
++	}
++	if (card->irq >= 0)
++		_oms_detach_irq(card);
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// _oms_fop_read() --- valid ONLY if card->comm_mode is INTERACTIVE_MODE.
++//
++// NON-blocking read.  If there's nothing to read, returns 0 immediately.
++//     Use select(2) or poll(2) to avoid busy looping.  Each time we're
++//     called we grab ALL data from the card into a temporary buffer, and
++//     copy out what will fit in the user's buffer.  Any residue in
++//     temporary buffer is silently discarded.  This is semi-okay, as
++//     INTERACTIVE_MODE is intended only for use by OMS user programs,
++//     which can be developed to allocate a large enough buffer.
++int _oms_fop_read(struct oms_card *card, char buffer[], int maxsize)
++{
++	int rv = 0;
++
++	ASSERT_LOCKED();
++
++	if (card->response_ready) {
++		while ((rv < maxsize) && (_oms_recv_space_used(card) > 0)) {
++			buffer[rv++] = card->recv_buffer[card->recv_rem_ptr];
++			card->recv_buffer[card->recv_rem_ptr] = 0;
++			if (++card->recv_rem_ptr >= INTERACTIVE_BUFFER_LEN)
++				card->recv_rem_ptr = 0;
++		}
++		card->response_ready = FALSE;
++	}
++	return rv;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// _oms_fop_write --- valid only in INTERACTIVE_MODE (returns -ENODEV if not).
++//  NON-blocking write.  If there's room in the command buffer, the
++//  user data is put there.  If not, we immediately return 0.  Note that
++//  one can NEVER successfully write data whose length is greater than
++//  the size of the card's command buffer!  (We return -EINVAL to so indicate.)
++//
++//  In order to avoid a user-program consuming CPU cycles by busily
++//  re-issuing a write(2) syscall that return 0, we delay 2 jiffies
++//  before we return 0.
++int _oms_fop_write(struct oms_card *card, char buffer[], int maxsize)
++{
++	int rv = 0;
++	int size = maxsize;
++
++	ASSERT_LOCKED();
++
++	if (maxsize <= _oms_xmit_space_avail(card)) {
++		// put data into card command buffer
++		u32 buf_idx = be32_to_cpu(readl(card_hw->command_ip));
++		unsigned char *src = buffer;
++		volatile unsigned char *dest = card_hw->command_buf;
++
++		while (size-- > 0) {
++			dest[buf_idx++] = *src++;
++			if (buf_idx >= CARD_COMMAND_BUFFER_LEN)
++				buf_idx = 0;
++		}
++		writel(cpu_to_be32(buf_idx), card_hw->command_ip);
++		rv = maxsize;
++	}
++
++	return rv;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// We don't buffer outgoing data.  This data is written directly to the card.
++//
++int _oms_xmit_space_avail(struct oms_card *card)
++{
++	u32 get_idx, put_idx;
++
++	get_idx = be32_to_cpu(readl(card_hw->command_pp));
++	put_idx = be32_to_cpu(readl(card_hw->command_ip));
++
++	if (get_idx == put_idx)
++		return CARD_COMMAND_BUFFER_LEN - 1;
++	else if (put_idx > get_idx)
++		return CARD_COMMAND_BUFFER_LEN - (put_idx - get_idx) - 1;
++	else
++		return (get_idx - put_idx) - 1;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// Incoming data is buffered in the card object's buffer space. An interrupt
++// is generated by the card when a complete response is ready and the ISR
++// moves the new data into the local receive buffer.
++//
++int _oms_recv_space_used(struct oms_card *card)
++{
++	if (card->recv_ins_ptr >= card->recv_rem_ptr)
++		return (card->recv_ins_ptr - card->recv_rem_ptr);
++	return INTERACTIVE_BUFFER_LEN - (card->recv_rem_ptr -
++					 card->recv_ins_ptr - 1);
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// _oms_irq_handler()
++irqreturn_t _oms_irq_handler(int irq, void *dev, struct pt_regs * regs)
++{
++	irqreturn_t retval;
++	struct list_head *pos;
++	struct oms_card *card;
++	u32 interrupt_mask;
++	u32 curr_status;
++
++	ASSERT_UNLOCKED();
++	_LOCK_(flags);
++
++	retval = IRQ_NONE;
++
++	for (pos = oms_cardlist.next; pos != &oms_cardlist; pos = pos->next) {
++		card = list_entry(pos, struct oms_card, listhead);
++
++		// disable interrupts, retain present config to reenable later
++		interrupt_mask = le32_to_cpu(readl(card_hw->obimr));
++		writel(0, card_hw->obimr);
++
++		// read the interrupt status register.  This is LITTLE_ENDIAN
++		curr_status = le32_to_cpu(readl(card_hw->obisr));
++
++//              if ( curr_status & REG_OBISR_DR )
++		{
++			u32 data, data2;
++			u8 new_status = 0;
++
++			// read the status data reg (it's LITTLE_ENDIAN)
++			data = le32_to_cpu(readl(card_hw->obdr));
++			// construct an old-style status word
++			if ((data & OBDR_CMDERR) > 0) {
++				new_status |= CMDERR_BIT;
++			}
++			if ((data & OBDR_SLIP_MASK) > 0) {
++				new_status |= SLIP_BIT;
++				// Save the slip bits
++				card_hw->slip_flags |=
++				    (u8) ((data & OBDR_SLIP_MASK) >>
++					  OBDR_SLIP_SHIFT);
++			}
++			if ((data & OBDR_LIMIT_MASK) > 0) {
++				new_status |= OVRT_BIT;
++				// Save the limit bits
++				data2 = le32_to_cpu(readl(card_hw->limit));
++				card_hw->pos_limit_flags |=
++				    (u8) ((data2 & MEM_LIMIT_POS_MASK) >>
++					  MEM_LIMIT_POS_SHIFT);
++				card_hw->neg_limit_flags |=
++				    (u8) ((data2 & MEM_LIMIT_NEG_MASK) >>
++					  MEM_LIMIT_NEG_SHIFT);
++			}
++			if ((data & OBDR_DONE_MASK) > 0) {
++				new_status |= DONE_BIT;
++				// Save the done bits
++				card_hw->done_flags |=
++				    (u8) ((data & OBDR_DONE_MASK) >>
++					  OBDR_DONE_SHIFT);
++			}
++			// clear the status data register
++			writel(cpu_to_le32(data), card_hw->obdr);
++
++			// One more bit... Check for init condition
++			data = le32_to_cpu(readl(card_hw->firmware));
++			if ((data & MEM_FW_POWERUP) == MEM_FW_POWERUP
++			    || (data & MEM_FW_INITING) == MEM_FW_INITING)
++				new_status |= INIT_BIT;
++
++			// preserve status bits in our card struct
++			card_hw->status_flags |= new_status;
++			// dismiss the interrupt condition
++			writel(cpu_to_le32(REG_OBISR_DR), card_hw->obisr);
++			retval = IRQ_HANDLED;
++		}
++
++		if (curr_status & REG_OBISR_MR0) {
++			if ((be32_to_cpu(readl(card_hw->obmr0)) &
++			     OBMR0_RESPONSE) == OBMR0_RESPONSE) {
++				_oms_irq_handle_ibf(card);
++				// clear card's text semaphore
++				writel(0, card_hw->semaphore);
++			}
++			// dismiss the interrupt condition
++			writel(cpu_to_le32(REG_OBISR_MR0), card_hw->obisr);
++			retval = IRQ_HANDLED;
++		}
++
++		if (curr_status & REG_OBISR_MR1) {
++			if (be32_to_cpu(readl(card_hw->obmr1)) == OBMR1_POSDATA) {
++				_oms_irq_handle_pos_data(card);
++			} else {
++				printk(KERN_INFO "%s:  bad MSG_REG_1 irq\n",
++				       me);
++			}
++			// dismiss the interrupt condition
++			writel(cpu_to_le32(REG_OBISR_MR1), card_hw->obisr);
++			retval = IRQ_HANDLED;
++		}
++		// reenable previously enabled interrupts
++		writel(interrupt_mask, card_hw->obimr);
++	}
++
++	UN_LOCK_(flags);
++
++	return retval;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// _oms_irq_handle_ibf() --- called from _oms_irq_handler() when
++//   the card indicates that there is a TEXT_RESPONSE.  Determine from
++//   the state of the card and the ioctl op queue what to do with the
++//   data.
++//
++//  Note:  the 'biglock' spinlock is locked.
++void _oms_irq_handle_ibf(struct oms_card *card)
++{
++	struct list_head *pos;
++	struct omsdrv_ioctl *pioctl = NULL;
++	u32 obmr0;
++	u32 index;
++	u32 len;
++	char tempbuf[CARD_RESPONSE_BUFFER_LEN + 1];
++	char resp_char;
++	int i = 0;
++
++	ASSERT_LOCKED();
++
++	// Collect the response from the card
++	obmr0 = be32_to_cpu(readl(card_hw->obmr0));
++	index = ((obmr0 & OBMR0_START_MASK) >> OBMR0_START_SHIFT);
++	len = ((obmr0 & OBMR0_LEN_MASK) >> OBMR0_LEN_SHIFT);
++	for (; len > 0; len--) {
++		resp_char = readb(card_hw->response_buf + index);
++		if (resp_char != LF && resp_char != CR) {
++			tempbuf[i++] = resp_char;
++		}
++		if (++index >= CARD_RESPONSE_BUFFER_LEN)
++			index -= CARD_RESPONSE_BUFFER_LEN;
++	}
++	tempbuf[i] = 0;
++
++	// Decide what to do with the collected response
++	if (card->comm_mode == INTERACTIVE_MODE) {
++		i = 0;
++		while (tempbuf[i] != 0) {
++			card->recv_buffer[card->recv_ins_ptr] = tempbuf[i++];
++			if (++card->recv_ins_ptr >= INTERACTIVE_BUFFER_LEN)
++				card->recv_ins_ptr = 0;
++		}
++		card->lf_count = 0;
++		card->response_ready = TRUE;
++		wake_up(&card->poll_waitq);
++	} else {
++		// find the ioctl associated with the last command sent
++		if (list_empty(&card->ioctl_list)) {
++			// no ioctls waiting
++			return;
++		}
++		pos = card->ioctl_list.next;
++		pioctl = list_entry(pos, struct omsdrv_ioctl, listhead);
++		if (pioctl->response_expected == FALSE) {
++			if (pioctl->buffers.command &&
++			    pioctl->p_command < pioctl->buffers.command_len) {
++				if (DEBUGLEVEL > 2)
++					printk(KERN_INFO
++					       "%s: IBF IRQ received but still transmitting\n",
++					       me);
++				// still transmitting, just exit
++				return;
++			}
++
++			printk(KERN_ERR
++			       "%s: irq:  unexpected response from card\n", me);
++			if (pioctl->task_asleep) {
++				wake_up(&pioctl->waitq);
++			} else {
++				oms_release_ioctl(pioctl);
++			}
++			return;
++		}
++		// ioctl found.  store the response and wake up the ioctl
++		i = 0;
++		while (tempbuf[i] != 0) {
++			pioctl->buffers.response[pioctl->p_response++] =
++			    tempbuf[i++];
++		}
++
++		pioctl->lf_count = 0;
++		pioctl->card->response_ready = 1;
++
++		// let the task complete the ioctl operation
++		if (pioctl->task_asleep) {
++			wake_up(&pioctl->waitq);
++		} else {
++			printk(KERN_ERR
++			       "%s:  irq:  task not asleep for response\n", me);
++			oms_release_ioctl(pioctl);
++		}
++	}
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// _oms_irq_handle_pos_data() --- called from _oms_irq_handler()
++//
++//  Note:  the 'biglock' spinlock is locked.
++void _oms_irq_handle_pos_data(struct oms_card *card)
++{
++	struct list_head *pos;
++	struct omsdrv_ioctl *pioctl = NULL;
++	u32 *pbuffer;
++	u32 *pmemory;
++	int i;
++
++	ASSERT_LOCKED();
++
++	if (list_empty(&card->ioctl_list)) {
++		// no ioctls waiting
++		return;
++	}
++	pos = card->ioctl_list.next;
++	pioctl = list_entry(pos, struct omsdrv_ioctl, listhead);
++	if (pioctl == NULL || pioctl->response_expected == FALSE ||
++	    pioctl->cmd != IOCTL_OMS_READ_AXIS_POSITIONS) {
++		// not expecting position data
++		return;
++	}
++
++	pbuffer = (u32 *) (pioctl->buffers.response);
++	pmemory = (u32 *) (card_hw->shared64k + MEM_CAP_MOTOR);
++	for (i = 0; i < 8; i++) {
++		pbuffer[i] = be32_to_cpu(readl(&pmemory[i]));
++	}
++
++	pmemory = (u32 *) (card_hw->shared64k + MEM_CAP_ENCODER);
++	for (i = 0; i < 8; i++) {
++		pbuffer[i + 8] = be32_to_cpu(readl(&pmemory[i]));
++	}
++
++	pioctl->buffers.response_len = 16 * sizeof(u32);
++	// let the task complete the ioctl operation
++	if (pioctl->task_asleep) {
++		wake_up(&pioctl->waitq);
++	} else {
++		printk(KERN_ERR "%s:  irq:  task not asleep for response\n",
++		       me);
++		oms_release_ioctl(pioctl);
++	}
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// Support card-specific IOCTL operations
++//
++int _oms_fop_ioctl(struct inode *pinode,
++		   struct file *pfile, unsigned int cmd, unsigned long userarg)
++{
++/*
++	int                   minor;
++	struct oms_card*      card;
++	struct list_head*     ptr;
++	struct omsdrv_ioctl*  pioctl;
++	int                   rv;
++	void*                 arg = (void*)userarg;
++
++	ASSERT_UNLOCKED();
++
++	// find oms card by minor
++	minor = MINOR( pfile->f_dentry->d_inode->i_rdev );
++	if ( minor < 0 || minor >= MAX_CARDS )
++		return -ENODEV;
++	for ( ptr = oms_cardlist.next; ptr != &oms_cardlist; ptr = ptr->next )
++	{
++		card = list_entry( ptr, struct oms_card, listhead );
++		if ( card->minor == minor )
++			break;
++	}
++	if ( ptr == &oms_cardlist )
++	{
++		return -ENODEV;
++	}
++*/
++
++	// execute requested ioctl function
++	switch (cmd) {
++	default:
++		return -EINVAL;
++	}
++	return 0;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int _oms_ioctl_read_status_flags(struct oms_card *card, void *arg)
++{
++	struct omsdrv_ioctl *pioctl;
++	int rv;
++
++	// read the status_flags.
++	pioctl = oms_new_ioctl(card);
++	if ((rv = oms_fetch_user_ioctl_struct(pioctl, 0, 1, arg)) != 0)
++		return rv;	// ios already released
++	if (pioctl->buffers.response_len != sizeof(card_hw->status_flags)) {
++		oms_release_ioctl(pioctl);
++		return -EINVAL;
++	}
++	//pioctl->cmd = cmd;
++	memset(pioctl->buffers.response, 0, sizeof(card_hw->status_flags));	// pre-zero
++
++	_LOCK_(flags);
++	memcpy(pioctl->buffers.response, &card_hw->status_flags,
++	       sizeof(card_hw->status_flags));
++	UN_LOCK_(flags);
++
++	if (pioctl->buffers.response[0] != 0) {
++		pioctl->p_response = sizeof(card_hw->status_flags);
++		pioctl->response_expected = TRUE;	// fake out our copy_out func
++		rv = oms_copy_out_ioctl_response(pioctl, arg);
++	}
++	oms_release_ioctl(pioctl);
++	return (rv);
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int _oms_ioctl_clear_status_flags(struct oms_card *card, void *arg)
++{
++	struct omsdrv_ioctl *pioctl;
++	int rv;
++
++	// clear status flag bits selected by 1's in the command
++	pioctl = oms_new_ioctl(card);
++	if ((rv = oms_fetch_user_ioctl_struct(pioctl, 1, 0, arg)) != 0)
++		return rv;	// ios already released
++	if (pioctl->buffers.command_len != sizeof(card_hw->status_flags)) {
++		oms_release_ioctl(pioctl);
++		return -EINVAL;
++	}
++	//pioctl->cmd = cmd;
++
++	_LOCK_(flags);
++	switch (sizeof(card_hw->status_flags)) {
++	case 1:
++		{
++			u8 mask = *((u8 *) (pioctl->buffers.command));
++			card_hw->status_flags &= ~mask;
++			break;
++		}
++	case 2:
++		{
++			u16 mask = *((u16 *) (pioctl->buffers.command));
++			card_hw->status_flags &= ~mask;
++			break;
++		}
++	case 4:
++		{
++			u32 mask = *((u32 *) (pioctl->buffers.command));
++			card_hw->status_flags &= ~mask;
++			break;
++		}
++	}
++	UN_LOCK_(flags);
++
++	oms_release_ioctl(pioctl);
++	return (0);
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int _oms_ioctl_read_done_flags(struct oms_card *card, void *arg)
++{
++	struct omsdrv_ioctl *pioctl;
++	int rv;
++
++	// read the done_flags.
++	pioctl = oms_new_ioctl(card);
++	if ((rv = oms_fetch_user_ioctl_struct(pioctl, 0, 1, arg)) != 0)
++		return rv;	// ios already released
++	if (pioctl->buffers.response_len != sizeof(card_hw->done_flags)) {
++		oms_release_ioctl(pioctl);
++		return -EINVAL;
++	}
++	//pioctl->cmd = cmd;
++	memset(pioctl->buffers.response, 0, sizeof(card_hw->done_flags));
++
++	_LOCK_(flags);
++	memcpy(pioctl->buffers.response, &card_hw->done_flags,
++	       sizeof(card_hw->done_flags));
++	UN_LOCK_(flags);
++
++	if (pioctl->buffers.response[0] != 0) {
++		pioctl->p_response = sizeof(card_hw->done_flags);
++		pioctl->response_expected = TRUE;	// fake out our copy_out func
++		rv = oms_copy_out_ioctl_response(pioctl, arg);
++	}
++	oms_release_ioctl(pioctl);
++	return (rv);
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int _oms_ioctl_clear_done_flags(struct oms_card *card, void *arg)
++{
++	struct omsdrv_ioctl *pioctl;
++	int rv;
++
++	// clear flag bits selected by 1's in the command
++	pioctl = oms_new_ioctl(card);
++	if ((rv = oms_fetch_user_ioctl_struct(pioctl, 1, 0, arg)) != 0)
++		return rv;	// ios already released
++	if (pioctl->buffers.command_len != sizeof(card_hw->done_flags)) {
++		oms_release_ioctl(pioctl);
++		return -EINVAL;
++	}
++	//pioctl->cmd = cmd;
++
++	_LOCK_(flags);
++	switch (sizeof(card_hw->done_flags)) {
++	case 1:
++		{
++			u8 mask = *((u8 *) (pioctl->buffers.command));
++			card_hw->done_flags &= ~mask;
++			break;
++		}
++	case 2:
++		{
++			u16 mask = *((u16 *) (pioctl->buffers.command));
++			card_hw->done_flags &= ~mask;
++			break;
++		}
++	case 4:
++		{
++			u32 mask = *((u32 *) (pioctl->buffers.command));
++			card_hw->done_flags &= ~mask;
++			break;
++		}
++	}
++	UN_LOCK_(flags);
++
++	oms_release_ioctl(pioctl);
++	return (0);
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int _oms_ioctl_read_pos_limit_flags(struct oms_card *card, void *arg)
++{
++	struct omsdrv_ioctl *pioctl;
++	int rv;
++
++	// read the flags.
++	pioctl = oms_new_ioctl(card);
++	if ((rv = oms_fetch_user_ioctl_struct(pioctl, 0, 1, arg)) != 0)
++		return rv;	// ios already released
++	if (pioctl->buffers.response_len != sizeof(card_hw->pos_limit_flags)) {
++		oms_release_ioctl(pioctl);
++		return -EINVAL;
++	}
++	//pioctl->cmd = cmd;
++	memset(pioctl->buffers.response, 0, sizeof(card_hw->pos_limit_flags));
++
++	_LOCK_(flags);
++	memcpy(pioctl->buffers.response, &card_hw->pos_limit_flags,
++	       sizeof(card_hw->pos_limit_flags));
++	UN_LOCK_(flags);
++
++	if (pioctl->buffers.response[0] != 0) {
++		pioctl->p_response = sizeof(card_hw->pos_limit_flags);
++		pioctl->response_expected = TRUE;	// fake out our copy_out func
++		rv = oms_copy_out_ioctl_response(pioctl, arg);
++	}
++	oms_release_ioctl(pioctl);
++	return (rv);
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int _oms_ioctl_clear_pos_limit_flags(struct oms_card *card, void *arg)
++{
++	struct omsdrv_ioctl *pioctl;
++	int rv;
++
++	// clear flag bits selected by 1's in the command
++	pioctl = oms_new_ioctl(card);
++	if ((rv = oms_fetch_user_ioctl_struct(pioctl, 1, 0, arg)) != 0)
++		return rv;	// ios already released
++	if (pioctl->buffers.command_len != sizeof(card_hw->pos_limit_flags)) {
++		oms_release_ioctl(pioctl);
++		return -EINVAL;
++	}
++	//pioctl->cmd = cmd;
++
++	_LOCK_(flags);
++	switch (sizeof(card_hw->pos_limit_flags)) {
++	case 1:
++		{
++			u8 mask = *((u8 *) (pioctl->buffers.command));
++			card_hw->pos_limit_flags &= ~mask;
++			break;
++		}
++	case 2:
++		{
++			u16 mask = *((u16 *) (pioctl->buffers.command));
++			card_hw->pos_limit_flags &= ~mask;
++			break;
++		}
++	case 4:
++		{
++			u32 mask = *((u32 *) (pioctl->buffers.command));
++			card_hw->pos_limit_flags &= ~mask;
++			break;
++		}
++	}
++	UN_LOCK_(flags);
++
++	oms_release_ioctl(pioctl);
++	return (0);
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int _oms_ioctl_read_neg_limit_flags(struct oms_card *card, void *arg)
++{
++	struct omsdrv_ioctl *pioctl;
++	int rv;
++
++	// read the flags.
++	pioctl = oms_new_ioctl(card);
++	if ((rv = oms_fetch_user_ioctl_struct(pioctl, 0, 1, arg)) != 0)
++		return rv;	// ios already released
++	if (pioctl->buffers.response_len != sizeof(card_hw->neg_limit_flags)) {
++		oms_release_ioctl(pioctl);
++		return -EINVAL;
++	}
++	//pioctl->cmd = cmd;
++	memset(pioctl->buffers.response, 0, sizeof(card_hw->neg_limit_flags));
++
++	_LOCK_(flags);
++	memcpy(pioctl->buffers.response, &card_hw->neg_limit_flags,
++	       sizeof(card_hw->neg_limit_flags));
++	UN_LOCK_(flags);
++
++	if (pioctl->buffers.response[0] != 0) {
++		pioctl->p_response = sizeof(card_hw->neg_limit_flags);
++		pioctl->response_expected = TRUE;	// fake out our copy_out func
++		rv = oms_copy_out_ioctl_response(pioctl, arg);
++	}
++	oms_release_ioctl(pioctl);
++	return (rv);
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int _oms_ioctl_clear_neg_limit_flags(struct oms_card *card, void *arg)
++{
++	struct omsdrv_ioctl *pioctl;
++	int rv;
++
++	// clear flag bits selected by 1's in the command
++	pioctl = oms_new_ioctl(card);
++	if ((rv = oms_fetch_user_ioctl_struct(pioctl, 1, 0, arg)) != 0)
++		return rv;	// ios already released
++	if (pioctl->buffers.command_len != sizeof(card_hw->neg_limit_flags)) {
++		oms_release_ioctl(pioctl);
++		return -EINVAL;
++	}
++	//pioctl->cmd = cmd;
++
++	_LOCK_(flags);
++	switch (sizeof(card_hw->neg_limit_flags)) {
++	case 1:
++		{
++			u8 mask = *((u8 *) (pioctl->buffers.command));
++			card_hw->neg_limit_flags &= ~mask;
++			break;
++		}
++	case 2:
++		{
++			u16 mask = *((u16 *) (pioctl->buffers.command));
++			card_hw->neg_limit_flags &= ~mask;
++			break;
++		}
++	case 4:
++		{
++			u32 mask = *((u32 *) (pioctl->buffers.command));
++			card_hw->neg_limit_flags &= ~mask;
++			break;
++		}
++	}
++	UN_LOCK_(flags);
++
++	oms_release_ioctl(pioctl);
++	return (0);
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int _oms_ioctl_read_slip_flags(struct oms_card *card, void *arg)
++{
++	struct omsdrv_ioctl *pioctl;
++	int rv;
++
++	// read the flags.
++	pioctl = oms_new_ioctl(card);
++	if ((rv = oms_fetch_user_ioctl_struct(pioctl, 0, 1, arg)) != 0)
++		return rv;	// ios already released
++	if (pioctl->buffers.response_len != sizeof(card_hw->slip_flags)) {
++		oms_release_ioctl(pioctl);
++		return -EINVAL;
++	}
++	//pioctl->cmd = cmd;
++	memset(pioctl->buffers.response, 0, sizeof(card_hw->slip_flags));
++
++	_LOCK_(flags);
++	memcpy(pioctl->buffers.response, &card_hw->slip_flags,
++	       sizeof(card_hw->slip_flags));
++	UN_LOCK_(flags);
++
++	if (pioctl->buffers.response[0] != 0) {
++		pioctl->p_response = sizeof(card_hw->slip_flags);
++		pioctl->response_expected = TRUE;	// fake out our copy_out func
++		rv = oms_copy_out_ioctl_response(pioctl, arg);
++	}
++	oms_release_ioctl(pioctl);
++	return (rv);
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int _oms_ioctl_clear_slip_flags(struct oms_card *card, void *arg)
++{
++	struct omsdrv_ioctl *pioctl;
++	int rv;
++
++	// clear flag bits selected by 1's in the command
++	pioctl = oms_new_ioctl(card);
++	if ((rv = oms_fetch_user_ioctl_struct(pioctl, 1, 0, arg)) != 0)
++		return rv;	// ios already released
++	if (pioctl->buffers.command_len != sizeof(card_hw->slip_flags)) {
++		oms_release_ioctl(pioctl);
++		return -EINVAL;
++	}
++	//pioctl->cmd = cmd;
++
++	_LOCK_(flags);
++	switch (sizeof(card_hw->slip_flags)) {
++	case 1:
++		{
++			u8 mask = *((u8 *) (pioctl->buffers.command));
++			card_hw->slip_flags &= ~mask;
++			break;
++		}
++	case 2:
++		{
++			u16 mask = *((u16 *) (pioctl->buffers.command));
++			card_hw->slip_flags &= ~mask;
++			break;
++		}
++	case 4:
++		{
++			u32 mask = *((u32 *) (pioctl->buffers.command));
++			card_hw->slip_flags &= ~mask;
++			break;
++		}
++	}
++	UN_LOCK_(flags);
++
++	oms_release_ioctl(pioctl);
++	return (0);
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int _oms_ioctl_read_shared_mem(struct oms_card *card, void *arg)
++{
++	u32 *src;
++	u32 *dest;
++	u32 count, word, i, offst;
++	struct omsdrv_ioctl *pioctl;
++	int rv;
++
++	if (card->comm_mode == INTERACTIVE_MODE)
++		return -ENODEV;
++
++	// read shared memory.  The starting offset is the
++	//   single u32 of the command string, the number
++	//   of u32's to read is given by the response_len.
++	pioctl = oms_new_ioctl(card);
++	if ((rv = oms_fetch_user_ioctl_struct(pioctl, 2, 2, arg)) != 0)
++		return rv;	// pioctl already released
++
++	// verify that command_len == sizeof(u32), i.e., one word
++	//   also verify a non-zero response length
++	if (pioctl->buffers.command_len != sizeof(u32) ||
++	    pioctl->buffers.response_len == 0) {
++		oms_release_ioctl(pioctl);
++		return -EINVAL;
++	}
++
++	_LOCK_(flags);
++	// copy data from the shared memory address to pioctl
++	offst = *((u32 *) pioctl->buffers.command);
++	src = (u32 *) (card_hw->shared64k + offst);
++	dest = (u32 *) (pioctl->buffers.response);
++	count = pioctl->buffers.response_len / sizeof(u32);
++	// make sure src addr is 32-bit word aligned
++	if ((unsigned long)src & 0x03) {
++		UN_LOCK_(flags);
++		oms_release_ioctl(pioctl);
++		return (-EINVAL);
++	}
++	for (i = 0; i < count; i++, src++) {
++		// range check
++		if ((unsigned long)src >=
++		    (((unsigned long)(card_hw->shared64k)) + (64 * 1024))) {
++			UN_LOCK_(flags);
++			oms_release_ioctl(pioctl);
++			return (-EINVAL);
++		}
++		word = be32_to_cpu(readl(src));
++		*dest++ = word;
++	}
++	UN_LOCK_(flags);
++
++	pioctl->p_response = pioctl->buffers.response_len;
++	pioctl->response_expected = TRUE;	// fake out copy_out function
++	rv = oms_copy_out_ioctl_response(pioctl, arg);
++	oms_release_ioctl(pioctl);
++	return (rv);
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int _oms_ioctl_write_shared_mem(struct oms_card *card, void *arg)
++{
++	u32 *src;
++	u32 *dest;
++	u32 count, word, i;
++	struct omsdrv_ioctl *pioctl;
++	int rv;
++
++	// write words (u32's) to shared memory.  The first
++	//  word of the command string is the offset into
++	//  shared memory.  The second word is the word count,
++	//  and the third (and successive) words are the data
++	//  to write in big-endian format.
++	//
++	//  This one is easy to get wrong in your user program.
++	//  Make sure that command_len is:
++	//             (2 * sizeof(__u32)) + sizeof(data)
++	//  And that the 2 words of info (offset and WORD count)
++	//  are contiguous with the data.
++	//
++	//  As an aid, we return -ENXIO if the command_len
++	//  doesn't jibe with the word-count.
++	if (card->comm_mode == INTERACTIVE_MODE)
++		return -ENODEV;
++	pioctl = oms_new_ioctl(card);
++	if ((rv = oms_fetch_user_ioctl_struct(pioctl, 2, 0, arg)) != 0)
++		return rv;	// pioctl already released
++	if (pioctl->buffers.command_len < (3 * sizeof(u16)) ||
++	    pioctl->buffers.response_len != 0) {
++		oms_release_ioctl(pioctl);
++		return -EINVAL;
++	}
++
++	_LOCK_(flags);
++	// copy the data into the shared memory
++	src = (u32 *) pioctl->buffers.command;
++	dest = (u32 *) (card_hw->shared64k + *src++);
++	count = *src++;		// must be a WORD count!!
++
++	// make sure command_len jibes with the count
++	if (pioctl->buffers.command_len != (count + 2) * sizeof(u32)) {
++		UN_LOCK_(flags);
++		oms_release_ioctl(pioctl);
++		return (-ENXIO);
++	}
++	// make sure that dest addr is word-aligned
++	if ((unsigned long)dest & 0x03) {
++		UN_LOCK_(flags);
++		oms_release_ioctl(pioctl);
++		return (-EINVAL);
++	}
++
++	for (i = 0; i < count; i++, dest++) {
++		word = *src++;
++		// range check
++		if ((unsigned long)dest >=
++		    (((unsigned long)(card_hw->shared64k)) + (64 * 1024))) {
++			UN_LOCK_(flags);
++			oms_release_ioctl(pioctl);
++			return (-EINVAL);
++		}
++		writel(cpu_to_be32(word), dest);
++	}
++	UN_LOCK_(flags);
++	oms_release_ioctl(pioctl);
++	return (0);
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int _oms_ioctl_read_axis_positions(struct oms_card *card, void *arg)
++{
++	struct omsdrv_ioctl *pioctl;
++	int rv;
++
++//      if ( card->comm_mode == INTERACTIVE_MODE )
++//              return -ENODEV;
++
++	pioctl = oms_new_ioctl(card);
++	if ((rv = oms_fetch_user_ioctl_struct(pioctl, 0, 4, arg)) != 0)
++		return rv;	// ios already released
++	if (pioctl->buffers.response_len != (16 * sizeof(u32))) {
++		oms_release_ioctl(pioctl);
++		return -EINVAL;
++	}
++	// tickle the mailbox to get updated position info
++	writel(cpu_to_be32(MEM_CAP_REQUEST), card_hw->mailbox);
++
++	pioctl->response_expected = TRUE;
++	pioctl->cmd = IOCTL_OMS_READ_AXIS_POSITIONS;
++
++	_LOCK_(flags);
++	tasklet_schedule(&oms_tasklet);
++	rv = oms_enqueue_ioctl_and_sleep(pioctl, &flags);
++	UN_LOCK_(flags);
++
++	pioctl->p_response = pioctl->buffers.response_len;
++	rv = oms_copy_out_ioctl_response(pioctl, arg);
++
++	if (rv == 0)
++		rv = oms_copy_out_ioctl_response(pioctl, arg);
++	oms_release_ioctl(pioctl);
++	return rv;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int _oms_ioctl_reinit(struct oms_card *card, void *arg)
++{
++/*
++	// Rewrite the interrupt control register
++	_LOCK_(flags);
++	*card_hw->eg_control = INTERRUPT_MASK;
++	UN_LOCK_(flags);
++*/
++	return 0;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++void _oms_start_ioctl(struct oms_card *card)
++{
++/*
++	ASSERT_LOCKED();
++
++	// enable TBE interrupts
++	*card_hw->reg_control = (*card_hw->reg_control & ~TBE_BIT);
++	*card_hw->reg_control = (*card_hw->reg_control | TBE_BIT);
++*/
++}
++
++//****************************************************************************
+--- /dev/null
++++ b/drivers/misc/oms/oms-maxpdrv.h
+@@ -0,0 +1,142 @@
++/*
++ *  header file for driver 'oms-pcixdrv.c'.  Does not present a user-space API.
++ *
++ *  Copyright(c) 2003 Oregon Micro Systems, Inc.  All rights reserved.
++ */
++#ifndef __PCIXDRV_H_
++#define __PCIXDRV_H_
++
++#include "oms-maxp.h"
++
++#ifdef __KERNEL__
++
++#define	INTERACTIVE_BUFFER_LEN	1024
++
++// card specific data included in struct oms_card
++struct hw_struct {
++	// ******************************************************
++	// physical addresses and mapped pointers into the card
++
++	// physaddr (from pci config header BAR) of registers
++	unsigned long regbase_physaddr;
++	// mapped address of register base
++	unsigned long regbase_addr;	// note that this is not a pointer
++
++	volatile u32 *obisr;
++	volatile u32 *obimr;
++	volatile u32 *obmr0;
++	volatile u32 *obmr1;
++	volatile u32 *obdr;
++
++	// physaddr (from pci config header BAR) of 64k shared memory
++	unsigned long shared64k_physaddr;
++	// mapped address of shared memory
++	u8 *shared64k;		// note that this IS a pointer
++
++	volatile u32 *firmware;
++	volatile u32 *limit;
++	volatile u32 *home;
++	volatile u32 *semaphore;
++	volatile u32 *mailbox;
++
++	//volatile u16*         cardnum;                                // physical card ID
++	//volatile u16*         vec_opcode;                     // vector mode type
++	//volatile u16*         vec_insert;                     // vector queue insertion pointer
++	//volatile u16*         vec_process;            // vector queue process pointer
++
++	volatile char *command_buf;
++	volatile u32 *command_ip;
++	volatile u32 *command_pp;
++	volatile char *response_buf;
++	volatile u32 *response_ip;
++	volatile u32 *response_pp;
++
++	// physaddr (from pci config header BAR) of 512k shared memory
++	unsigned long shared512k_physaddr;
++	// mapped address of shared memory
++	u32 *shared512k;	// note that this IS a pointer
++
++	// ******************************************************
++	u8 status_flags;	// driver copy of status flags
++	u8 done_flags;		// driver copy of done flags
++	u8 pos_limit_flags;	// driver copy of positive limit flags
++	u8 neg_limit_flags;	// driver copy of negative limit flags
++	u8 slip_flags;		// driver copy of slip flags
++};
++
++// simplify access and expressions
++#define	card_hw	((struct hw_struct*)(card->hardware))
++
++// Hardware specific register definitions
++#define REG_OBISR						0x00000030	//Outbound Interrupt Status Register
++#define REG_OBISR_MR0				0x0001	// Message Register 0
++#define REG_OBISR_MR1				0x0002	// Message Register 1
++#define REG_OBISR_DR				0x0008	// Data Register
++#define REG_OBIMR						0x00000034	//Outbound Interrupt Mask Register
++#define REG_OBMR0						0x00000058	//Outbound Message Register 0
++#define OBMR0_RESPONSE			0x00000001	// Response string available
++#define OBMR0_START_MASK		0x000FFF00	// Response Starting Index Mask
++#define OBMR0_START_SHIFT		8	// Response Starting Index Shift to 0
++#define OBMR0_LEN_MASK			0xFFF00000	// Response Length Mask
++#define OBMR0_LEN_SHIFT			20	// Response Length Shift to 0
++#define REG_OBMR1						0x0000005C	//Outbound Message Register 1
++#define OBMR1_POSDATA				0x00000001	// Position data available
++#define REG_OBDR						0x00000060	//Outbound Data Register
++#define OBDR_DONE_MASK			0x000000FF
++#define OBDR_DONE_SHIFT			0
++#define OBDR_LIMIT_MASK			0x0000FF00
++#define OBDR_LIMIT_SHIFT		8
++#define OBDR_SLIP_MASK			0x00FF0000
++#define OBDR_SLIP_SHIFT			16
++#define OBDR_CMDERR					0x01000000
++#define OBDR_CMDERR_SHIFT		24
++
++// 64k Shared Memory Addresses the user doesn't really need to know about
++#define MEM_RT_LIMIT				0x00000040	//Real Time Limit Switch Status
++#define MEM_LIMIT_POS_MASK		0x000000FF
++#define MEM_LIMIT_POS_SHIFT		0
++#define MEM_LIMIT_NEG_MASK		0x0000FF00
++#define MEM_LIMIT_NEG_SHIFT		8
++#define MEM_RT_HOME					0x00000044	//Real Time Home Switch Status
++#define MEM_FIRMWARE				0x00000048	//Firmware State
++#define MEM_FW_POWERUP			0xFFFFFFFF	// Power-up state, pre-init
++#define MEM_FW_DOWNLOAD			0x00000001	// Downloading
++#define MEM_FW_INITING			0x00000002	// Initializing
++#define MEM_FW_RUNNING			0x00000004	// Running
++#define MEM_FW_CKSUMERR			0x00000100	// Checksum Error
++#define MEM_FW_PGMERR				0x00000200	// Programming Error
++#define MEM_FW_CSERR1				0x00001000	// Checksum Error @ Parm Archive 1
++#define MEM_FW_PGERR1				0x00002000	// Programming Error @ Parm Archive 1
++#define MEM_FW_CSERR2				0x00004000	// Checksum Error @ Parm Archive 2
++#define MEM_FW_PGERR2				0x00008000	// Programming Error @ Parm Archive 2
++#define MEM_FW_DEFAULT			0x00010000	// Defaults Loaded
++#define MEM_FW_ALTERNATE		0x00020000	// Alternates Loaded
++#define MEM_FW_FACTORY			0x00040000	// Factory Defaults Loaded
++#define MEM_DIRECT_MBOX			0x0000004C	//Direct Command Mailbox
++#define MEM_DMB_CMD_MASK		0x0000FFFF	// Host Command Mask
++#define MEM_DMB_STAT_MASK		0xFFFF0000	// Controller Status Mask
++#define MEM_OM_SEMAPHORE		0x00000094	//Outbound Message Semaphore Register
++#define MEM_OMSEM_RESPONSE	0x00000001	// Response available in MEM_RESP_BUFFER
++																							// write to block, clear to acknowledge
++#define MEM_FLUSH_MBOX			0x00000098	//Command Buffer Flush Mailbox
++#define MEM_FLASH_ADDRESS		0x000000EC	//Flash Program Address Pointer
++#define MEM_CMD_INSERT			0x000000F0	//Command Buffer Insert Index
++#define MEM_CMD_PROCESS			0x000000F4	//Command Buffer Process Index
++#define MEM_RESP_INSERT			0x000000F8	//Response Buffer Insert Index
++#define MEM_RESP_PROCESS		0x000000FC	//Response Buffer Process Index
++#define MEM_CMD_BUFFER			0x00000100	//Command Ring Buffer
++#define MEM_RESP_BUFFER			0x00000500	//Response Ring Buffer
++#define MEM_EXCEPTION_LOG		0x00001100	//Exception Log
++
++// initial interrupt mask
++//#define INTERRUPT_MASK (REG_OBISR_MR0|REG_OBISR_MR1|REG_OBISR_DR)
++#define INTERRUPT_MASK 0	//0xffffffff
++
++// other defines
++#define CARD_COMMAND_BUFFER_LEN		1024
++#define CARD_RESPONSE_BUFFER_LEN	1024
++
++extern struct tasklet_struct oms_tasklet;
++
++#endif // __KERNEL__
++#endif // __PCIXDRV_H_
+--- /dev/null
++++ b/drivers/misc/oms/oms-pcix.h
+@@ -0,0 +1,67 @@
++/* oms-pcix.h --- header file shared between driver and user-space
++ *    programs.  Defines the physical PCIX hardware I/O.
++ *
++ *
++ *  Copyright(c) 2003 Oregon Micro Systems, Inc.  All rights reserved.
++ */
++
++#ifndef __OMSPCIX_H_
++#define __OMSPCIX_H_
++
++#include "oms.h"		// core IOCTL calls, et. al.
++
++//****************************************************************************
++// HARDWARE SPECIFIC REGISTER AND BIT DEFINITIONS
++
++// control and status bits
++#define CMDERR_BIT              0x01	//Command error
++#define INIT_BIT                0x02	//Controller is initializing
++#define SLIP_BIT                0x04	//Axis encoder slip
++#define OVRT_BIT                0x08	//Axis overtravel
++#define DONE_BIT                0x10	//Done condition
++#define IBF_BIT                 0x20	//Character received from controller
++#define TBE_BIT                 0x40	//Controller ready to receive a character
++#define IRQ_BIT                 0x80	//Controller interrupt master enable
++// done register bits
++#define AXIS_X                  0x01
++#define AXIS_Y                  0x02
++#define AXIS_Z                  0x04
++#define AXIS_T                  0x08
++#define AXIS_U                  0x10
++#define AXIS_V                  0x20
++#define AXIS_R                  0x40
++#define AXIS_S                  0x80
++
++// interesting shared memory offsets (from shared_mem base)
++#define OMS_MEM_CARDNUM         0x00000000
++
++#define OMS_MEM_MAILBOX         0x00000010
++// <mailbox codes>
++#define MAILBOX_MOTOR           0x0001
++#define MAILBOX_ENCODER         0x0002
++#define MAILBOX_BOTH            0x0003
++// </mailbox codes>
++
++#define OMS_MEM_MOTOR_X         0x00000020
++#define OMS_MEM_MOTOR_Y         0x00000024
++#define OMS_MEM_MOTOR_Z         0x00000028
++#define OMS_MEM_MOTOR_T         0x0000002C
++#define OMS_MEM_MOTOR_U         0x00000030
++#define OMS_MEM_MOTOR_V         0x00000034
++#define OMS_MEM_MOTOR_R         0x00000038
++#define OMS_MEM_MOTOR_S         0x0000003C
++
++#define OMS_MEM_ENCODER_X       0x00000040
++#define OMS_MEM_ENCODER_Y       0x00000044
++#define OMS_MEM_ENCODER_Z       0x00000048
++#define OMS_MEM_ENCODER_T       0x0000004C
++#define OMS_MEM_ENCODER_U       0x00000050
++#define OMS_MEM_ENCODER_V       0x00000054
++#define OMS_MEM_ENCODER_R       0x00000058
++#define OMS_MEM_ENCODER_S       0x0000005C
++
++#define OMS_MEM_VEC_OPCODE      0x000000E8
++#define OMS_MEM_VEC_INSERT      0x000000F0
++#define OMS_MEM_VEC_PROCESS     0x000000F8
++
++#endif // __OMSPCIX_H_
+--- /dev/null
++++ b/drivers/misc/oms/oms-pcixdrv.c
+@@ -0,0 +1,1141 @@
++/*
++ *  oms-pcixdrv.c --- Linux device driver for Oregon Micro Systems
++ *    PCIx motion controller, hardware-specific code.
++ *
++ *  Copyright(c) 2003 Oregon Micro Systems, Inc.  All rights reserved.
++ */
++
++char version_string[] = "Oregon Micro Systems PCIx Linux Driver v2.0";
++char *me = "PCIx";
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/string.h>
++#include <linux/errno.h>
++#include <linux/slab.h>
++#include <linux/list.h>
++#include <linux/interrupt.h>
++#include <linux/timer.h>
++#include <linux/pci.h>
++#include <linux/spinlock.h>
++#include <linux/init.h>
++#include <linux/fs.h>
++#include <linux/poll.h>
++#include <asm/io.h>
++#include <linux/ioctl.h>
++#include <linux/kmod.h>
++#include <asm/atomic.h>
++#include <asm/uaccess.h>
++#include <asm/byteorder.h>
++#include <linux/byteorder/generic.h>
++
++#include "oms-core.h"		// driver-private header
++#include "oms-pcixdrv.h"	// driver-private card-specific header
++
++MODULE_DESCRIPTION("Driver for OMS PCIx motion control");
++MODULE_LICENSE("GPL");
++char *node_device = "pcix";
++
++//****************************************************************************
++// PCI BUS VENDOR AND DEVICE IDS FOR BUS INTERFACE AND OMS DEVICES
++
++// The bus interface vendor/device IDs will be in system vendor ID
++//  registers of PCI configuration space
++#define PCI_VENDOR_ID_BUS	    	0x10B5
++#define PCI_DEVICE_ID_BUS				0x9050
++// The OMS vendor/device IDs will be in the subsystem vendor ID
++//   registers of PCI configuration space
++#define PCI_VENDOR_ID_OMS				0x160c
++#define PCI_DEVICE_NAME					"pcix"
++
++int PCI_DEVICE_ID_OMS_BASE = 0x0010;
++
++// pci_device_id --- specify to PCI driver the set of vendor/device IDs
++//     that we know about.  The PCI driver will call our "probe" routine
++//     for each device matching one of our descriptions.
++struct pci_device_id oms_pci_tbl[] __devinitdata = {
++	{PCI_VENDOR_ID_BUS,
++	 PCI_DEVICE_ID_BUS,
++	 PCI_VENDOR_ID_OMS,
++	 PCI_ANY_ID		// we will accept anything >= PCI_OMS_DEVICE_ID_BASE
++	 },
++	{0}
++};
++
++// pci_driver structure --- register with the PCI driver.  It will call
++//   our "probe" routine for each PCI device matching our table.
++struct pci_driver oms_driver = {
++	.name = PCI_DEVICE_NAME,
++	.id_table = oms_pci_tbl,
++	.probe = oms_install_one,
++	.remove = __devexit_p(oms_remove_one),
++};
++
++//****************************************************************************
++// externs from oms-core.c
++extern struct list_head oms_cardlist;
++extern unsigned long flags;
++// Module parameters
++extern int DEBUGLEVEL;
++extern int MAJORNUMBER;
++extern int ONE_CPU;
++extern int MAX_CARDS;
++extern char *NODE_CREATION_SCRIPT;
++#if OMS_DEBUG_SPINLOCKS
++extern atomic_t oms_islocked;
++#endif
++
++//****************************************************************************
++// Private functions
++BOOL _oms_irq_handle_tbe(struct oms_card *card);
++void _oms_irq_handle_ibf(struct oms_card *card);
++
++//****************************************************************************
++// _oms_init_memory ---- called by oms_install_one to probe for
++//   card-specific memory regions and allocate them
++//
++//  We don't know the index numbers of the 8 byte and 8k BARs we need.
++int _oms_init_memory(struct pci_dev *pdev, struct oms_card *card)
++{
++	int i;
++	int bars_found = 0;
++	unsigned long start, len, siz;
++	int bars_128 = 0;
++	char char1, char2;
++	int char_matches = 0;
++
++	card->hardware = (void *)kmalloc(sizeof(struct hw_struct), GFP_ATOMIC);
++	memset(card->hardware, 0, sizeof(struct hw_struct));
++
++	// scan the BARs looking for MMIO regions of 128 bytes and 8k
++	for (i = 0; bars_found < 2 && i < DEVICE_COUNT_RESOURCE; i++) {
++		start = pci_resource_start(pdev, i);
++		len = pci_resource_len(pdev, i);
++
++		if (start == 0 || len == 0)
++			continue;
++		if ((pci_resource_flags(pdev, i) & IORESOURCE_MEM) == 0)
++			continue;
++
++		siz = 128;	// look for 128 bytes of register space
++		// There are 2 128 byte BARs for the PCIx. The first is the PCI
++		// configuration space, the second is the remapped register region.
++		if (len == siz) {
++			if (++bars_128 < 2)
++				continue;
++
++			if (!request_mem_region(start, siz, me)) {
++				printk(KERN_ERR
++				       "%s:  mem region collision at %p\n", me,
++				       (void *)start);
++				return 1;
++			}
++			// we store the base of the mapped registers
++			//  as an unsigned long, as we never dereference
++			//  it, but need the value for address arithmetic
++			//  to derive the pointers we actually use.
++			card_hw->regbase_addr =
++			    (unsigned long)ioremap(start, siz);
++
++			if (!card_hw->regbase_addr) {
++				printk(KERN_ERR "%s:  ioremap failed\n", me);
++				return 1;
++			}
++			card_hw->regbase_physaddr = start;
++			// set pointers to registers within the 128 byte space
++			card_hw->reg_control =
++			    (u8 *) (card_hw->regbase_addr + OMS_REG_CONTROL);
++			card_hw->reg_status =
++			    (u8 *) (card_hw->regbase_addr + OMS_REG_STATUS);
++			card_hw->reg_done =
++			    (u8 *) (card_hw->regbase_addr + OMS_REG_DONE);
++			card_hw->reg_data =
++			    (u8 *) (card_hw->regbase_addr + OMS_REG_DATA);
++			bars_found++;
++			// continue 'for' loop
++			continue;
++		}
++
++		siz = 8 * 1024;	// look for shared memory
++		if (len == siz) {
++			if (!request_mem_region(start, siz, me)) {
++				printk(KERN_ERR
++				       "%s:  mem region collision at %p\n", me,
++				       (void *)start);
++				return 1;
++			}
++			card_hw->sharedmem = ioremap(start, siz);
++			if (!card_hw->sharedmem) {
++				printk(KERN_ERR "%s:  ioremap failed\n", me);
++				return 1;
++			}
++			card_hw->sharedmem_physaddr = start;
++			bars_found++;
++			// continue 'for' loop
++			continue;
++		}
++	}
++	if (bars_found < 2) {
++		printk(KERN_ERR "%s:  failed to find all needed BARs\n", me);
++		return 1;
++	}
++	// Set up pointers to commonly used shared memory structures
++	card_hw->cardnum = (u16 *) & card_hw->sharedmem[OMS_MEM_CARDNUM];
++	card_hw->mailbox = (u16 *) & card_hw->sharedmem[OMS_MEM_MAILBOX];
++	card_hw->vec_opcode = (u16 *) & card_hw->sharedmem[OMS_MEM_VEC_OPCODE];
++	card_hw->vec_insert = (u16 *) & card_hw->sharedmem[OMS_MEM_VEC_INSERT];
++	card_hw->vec_process =
++	    (u16 *) & card_hw->sharedmem[OMS_MEM_VEC_PROCESS];
++
++	// make sure the card's data buffer is empty
++	char1 = *card_hw->reg_data;
++	char_matches = 0;
++	while (char_matches < 10) {
++		char2 = *card_hw->reg_data;
++		if (char1 == char2)
++			char_matches++;
++		else
++			char_matches = 0;
++		char1 = char2;
++	}
++
++	return 0;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// _oms_attach_irq()
++//
++//   Note:  spinlock oms_biglock is LOCKED on entry.
++int _oms_attach_irq(struct pci_dev *pdev, struct oms_card *card)
++{
++	int rv;
++	struct list_head *ptr;
++
++	ASSERT_LOCKED();
++
++	// see if we've already requested this IRQ
++	for (ptr = oms_cardlist.next; ptr != &oms_cardlist; ptr = ptr->next) {
++		struct oms_card *a_card =
++		    list_entry(ptr, struct oms_card, listhead);
++		if (a_card->irq == pdev->irq) {
++			return 0;
++		}
++	}
++
++	if ((rv =
++	     request_irq(pdev->irq, &_oms_irq_handler, IRQF_SHARED, me,
++			 card)) != 0) {
++		printk(KERN_ERR "%s:  request_irq failed on irq %d:  %d\n", me,
++		       pdev->irq, rv);
++		return -1;
++	}
++	// now we can set the irq number in the card struct
++	card->irq = pdev->irq;
++
++	// initialize card's interrupt enable register
++	*card_hw->reg_control = INTERRUPT_MASK;
++
++	return 0;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// _oms_detach_irq()
++//
++//   Note:  spinlock oms_biglock is LOCKED on entry.
++void _oms_detach_irq(struct oms_card *card)
++{
++	ASSERT_LOCKED();
++
++	// free the irq
++	(void)free_irq(card->irq, card);
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// _oms_release_resources() --- release all resources used by one card
++//
++//  Note:  spinlock oms_biglock is LOCKED on entry.
++void _oms_release_resources(struct oms_card *card)
++{
++	ASSERT_LOCKED();
++
++	if (card->hardware) {
++		if (card_hw->sharedmem) {
++			iounmap(card_hw->sharedmem);
++		}
++		if (card_hw->regbase_addr) {
++			iounmap((void *)card_hw->regbase_addr);
++		}
++		if (card_hw->sharedmem_physaddr) {
++			release_mem_region(card_hw->sharedmem_physaddr,
++					   (8 * 1024));
++		}
++		if (card_hw->regbase_physaddr) {
++			release_mem_region(card_hw->regbase_physaddr, 128);
++		}
++		kfree(card->hardware);
++	}
++	if (card->irq >= 0)
++		_oms_detach_irq(card);
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// _oms_fop_read() --- valid ONLY if card->comm_mode is INTERACTIVE_MODE.
++//
++// NON-blocking read.  If there's nothing to read, returns 0 immediately.
++//     Use select(2) or poll(2) to avoid busy looping.  Each time we're
++//     called we grab ALL data from the card into a temporary buffer, and
++//     copy out what will fit in the user's buffer.  Any residue in
++//     temporary buffer is silently discarded.  This is semi-okay, as
++//     INTERACTIVE_MODE is intended only for use by OMS user programs,
++//     which can be developed to allocate a large enough buffer.
++int _oms_fop_read(struct oms_card *card, char buffer[], int maxsize)
++{
++	int rv = 0;
++
++	ASSERT_LOCKED();
++
++	if (card->response_ready) {
++		while (rv <= maxsize
++		       && _oms_recv_space_used(card) < INTERACTIVE_BUFFER_LEN) {
++			buffer[rv++] = card->recv_buffer[card->recv_rem_ptr];
++			card->recv_buffer[card->recv_rem_ptr] = 0;
++			if (++card->recv_rem_ptr > INTERACTIVE_BUFFER_LEN)
++				card->recv_rem_ptr = 0;
++		}
++		card->response_ready = FALSE;
++	}
++	return rv;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// _oms_fop_write --- valid only in INTERACTIVE_MODE (returns -ENODEV if not).
++//  NON-blocking write.  If there's room in the command buffer, the
++//  user data is put there.  If not, we immediately return 0.  Note that
++//  one can NEVER successfully write data whose length is greater than
++//  the size of the card's command buffer!  (We return -EINVAL to so indicate.)
++//
++//  In order to avoid a user-program consuming CPU cycles by busily
++//  re-issuing a write(2) syscall that return 0, we delay 2 jiffies
++//  before we return 0.
++int _oms_fop_write(struct oms_card *card, char buffer[], int maxsize)
++{
++	int rv = 0;
++
++	ASSERT_LOCKED();
++
++	// Stuff the command in the outgoing buffer
++	while (rv < maxsize && buffer[rv] != 0
++	       && (_oms_xmit_space_avail(card) >= (maxsize - rv))) {
++		if (buffer[rv] >= 0x20 || buffer[rv] == CR)
++			card->xmit_buffer[card->xmit_ins_ptr] = buffer[rv];
++		rv++;
++		if (++card->xmit_ins_ptr >= INTERACTIVE_BUFFER_LEN)
++			card->xmit_ins_ptr = 0;
++	}
++
++	if (rv > 0) {
++		// enable TBE interrupts
++		*card_hw->reg_control = (*card_hw->reg_control & ~TBE_BIT);
++		*card_hw->reg_control = (*card_hw->reg_control | TBE_BIT);
++	} else {
++		// delay here so user doesn't have to
++		oms_sleep(2);
++	}
++	return rv;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int _oms_xmit_space_avail(struct oms_card *card)
++{
++	if (card->xmit_ins_ptr >= card->xmit_rem_ptr)
++		return INTERACTIVE_BUFFER_LEN - (card->xmit_ins_ptr -
++						 card->xmit_rem_ptr);
++	return card->xmit_rem_ptr - card->xmit_ins_ptr - 1;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int _oms_recv_space_used(struct oms_card *card)
++{
++	if (card->recv_ins_ptr >= card->recv_rem_ptr)
++		return INTERACTIVE_BUFFER_LEN - (card->recv_ins_ptr -
++						 card->recv_rem_ptr);
++	return card->recv_rem_ptr - card->recv_ins_ptr - 1;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// _oms_irq_handler()
++irqreturn_t _oms_irq_handler(int irq, void *dev, struct pt_regs * regs)
++{
++	irqreturn_t retval;
++	struct list_head *pos;
++	struct oms_card *card;
++	u8 enabled_interrupts;
++	u8 interrupt_mask;
++	u8 curr_status;
++
++	ASSERT_UNLOCKED();
++	_LOCK_(flags);
++
++	retval = IRQ_NONE;
++
++	for (pos = oms_cardlist.next; pos != &oms_cardlist; pos = pos->next) {
++		card = list_entry(pos, struct oms_card, listhead);
++
++		// Get the status of the enabled interrupts
++		enabled_interrupts = *card_hw->reg_control;
++		// Hold off any additional controller interrupt requests
++		interrupt_mask = enabled_interrupts & 0x7f;
++		*card_hw->reg_control = interrupt_mask;
++
++		// Get the status of the enabled interrupts & the error flags
++		curr_status = (*card_hw->reg_status) & interrupt_mask;
++		if (curr_status == 0) {
++			// nothing to do on this card.  carry on
++			continue;
++		}
++		//If any error status flags are set
++		if (curr_status & 0x0f) {
++			//Preserve the error flags that were set
++			//Note it's up to the application to explicitly clear the stored error
++			// flags, via the IOCTL_OMS_CLR_STATUS IO control function, once they
++			// have been processed.
++			card_hw->status_flags |= (curr_status & 0x0f);
++			retval = IRQ_HANDLED;
++		}
++		// If the DONE interrupt flag is set
++		if ((curr_status & DONE_BIT) == DONE_BIT) {
++			//OR the done flags in to the controller's done flag byte.
++			//Note it's up to the application to explicitly clear the stored done
++			// flags, via the IOCTL_OMS_CLR_DONE IO control function, once they have
++			// been processed.
++			card_hw->done_flags |= *card_hw->reg_done;
++			retval = IRQ_HANDLED;
++		}
++		// If the CONTROLLER has a response character waiting to be read
++		if ((curr_status & IBF_BIT) == IBF_BIT) {
++			_oms_irq_handle_ibf(card);
++			retval = IRQ_HANDLED;
++		}
++		//If the controller is ready to accept another command string character
++		if ((curr_status & TBE_BIT) == TBE_BIT) {
++			if (_oms_irq_handle_tbe(card) == FALSE) {
++				// no more chars to send, disable TBE interrupts
++				enabled_interrupts &= ~TBE_BIT;
++			}
++			retval = IRQ_HANDLED;
++		}
++		//Re-enable controller interrupts
++		*card_hw->reg_control = enabled_interrupts;
++	}
++
++	UN_LOCK_(flags);
++
++	return retval;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// _oms_irq_handle_tbe() --- called from _oms_irq_handler() when
++//   the card indicates that it has space available.  Determine from
++//   the state of the card and the ioctl op queue what to do.
++//
++//  returns true iff there are more characters to send
++//
++//  Note:  the 'biglock' spinlock is locked.
++BOOL _oms_irq_handle_tbe(struct oms_card * card)
++{
++	struct list_head *pos;
++	struct omsdrv_ioctl *pioctl = NULL;
++	char c_send = 0;
++	BOOL b_more_to_send = FALSE;
++
++	ASSERT_LOCKED();
++
++	// if we're in interactive mode, send chars from the card's buffer
++	if (card->comm_mode == INTERACTIVE_MODE) {
++		c_send = card->xmit_buffer[card->xmit_rem_ptr];
++		card->xmit_buffer[card->xmit_rem_ptr] = 0;
++		if (++card->xmit_rem_ptr >= INTERACTIVE_BUFFER_LEN)
++			card->xmit_rem_ptr = 0;
++		if (_oms_xmit_space_avail(card) != INTERACTIVE_BUFFER_LEN)
++			b_more_to_send = TRUE;
++	} else {
++		// Non-interactive mode uses the buffers in the current ioctl
++		// find the ios associated with the waiting command
++		if (list_empty(&card->ioctl_list)) {
++			// no ioctls waiting, why were we flagged to send a command?
++			printk(KERN_ERR
++			       "%s:  irq:  no ios for expected command\n", me);
++			return FALSE;
++		}
++		pos = card->ioctl_list.next;
++		pioctl = list_entry(pos, struct omsdrv_ioctl, listhead);
++
++		if (!pioctl->buffers.command
++		    || pioctl->p_command >= pioctl->buffers.command_len) {
++			if (DEBUGLEVEL > 2)
++				printk(KERN_INFO
++				       "%s:  TBE - no command (%x) or command already sent (%d,%d)\n",
++				       me,
++				       (unsigned int)pioctl->buffers.command,
++				       pioctl->p_command,
++				       pioctl->buffers.command_len);
++			// an ioctl is present but command has been sent
++			if (pioctl->response_expected == FALSE) {
++				if (DEBUGLEVEL > 2)
++					printk(KERN_INFO
++					       "%s:  TBE - no response expected, waking task\n",
++					       me);
++				// done, kill off the ios
++				if (pioctl->task_asleep)
++					wake_up(&pioctl->waitq);
++				else {
++					oms_release_ioctl(pioctl);
++				}
++			}
++			return FALSE;
++		}
++		c_send = pioctl->buffers.command[pioctl->p_command++];
++		// always claim there is more to send. Allow the logic above to
++		// complete the transaction
++		b_more_to_send = TRUE;
++	}
++
++	if (DEBUGLEVEL > 0) {
++		if (card->comm_mode != INTERACTIVE_MODE) {
++			if (pioctl->p_command < 3 ||
++			    pioctl->p_command >= pioctl->buffers.command_len ||
++			    pioctl->buffers.command_len < 20)
++				printk(KERN_INFO "%s:  TBE [%02X] (%d of %d)\n",
++				       me,
++				       c_send,
++				       pioctl->p_command,
++				       pioctl->buffers.command_len);
++			else if (DEBUGLEVEL > 1)
++				printk(KERN_INFO "%s:  TBE [%02X]\n", me,
++				       c_send);
++		} else {
++			printk(KERN_INFO "%s:  TBE [%02X]\n", me, c_send);
++		}
++	}
++	// send the next character
++	*card_hw->reg_data = c_send;
++	return (b_more_to_send);
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// _oms_irq_handle_ibf() --- called from _oms_irq_handler() when
++//   the card indicates that there is a TEXT_RESPONSE.  Determine from
++//   the state of the card and the ioctl op queue what to do with the
++//   data.
++//
++//  Note:  the 'biglock' spinlock is locked.
++void _oms_irq_handle_ibf(struct oms_card *card)
++{
++	struct list_head *pos;
++	struct omsdrv_ioctl *pioctl = NULL;
++	u8 resp_char;
++
++	ASSERT_LOCKED();
++
++	// read the input buffer regardless of what we are expected to do with it
++	resp_char = *card_hw->reg_data;
++
++	if (DEBUGLEVEL > 0)
++		printk(KERN_INFO "%s:  IBF [%02X]\n", me, resp_char);
++
++	if (card->comm_mode == INTERACTIVE_MODE) {
++		if (resp_char == LF) {
++			if (++card->lf_count > 1) {
++				card->lf_count = 0;
++				card->response_ready = TRUE;
++				wake_up(&card->poll_waitq);
++			}
++		} else if (resp_char != CR) {
++			card->recv_buffer[card->recv_ins_ptr] = resp_char;
++			if (++card->recv_ins_ptr >= INTERACTIVE_BUFFER_LEN)
++				card->recv_ins_ptr = 0;
++		}
++	} else {
++		// find the ioctl associated with the last command sent
++		if (list_empty(&card->ioctl_list)) {
++			// no ioctls waiting
++			return;
++		}
++		pos = card->ioctl_list.next;
++		pioctl = list_entry(pos, struct omsdrv_ioctl, listhead);
++		if (pioctl->response_expected == FALSE) {
++			// an ios is present but doesn't want the response
++			if (pioctl->buffers.command &&
++			    pioctl->p_command < pioctl->buffers.command_len) {
++				if (DEBUGLEVEL > 2)
++					printk(KERN_INFO
++					       "%s: IBF char received [%x] but still transmitting, discard\n",
++					       me, resp_char);
++				// still transmitting, just exit
++				return;
++			}
++
++			printk(KERN_ERR
++			       "%s: irq:  unexpected response from card\n", me);
++			if (pioctl->task_asleep) {
++				wake_up(&pioctl->waitq);
++			} else {
++				oms_release_ioctl(pioctl);
++			}
++			return;
++		}
++		// ioctl found.  store the received character and wake up the ioctl if
++		// the response is complete.
++		if (pioctl->comm_mode == STRING_MODE) {
++			switch (resp_char) {
++			case CR:
++				// ignore carriage returns
++				break;
++
++			case LF:
++				// 2 LFs == end of transmission
++				if (pioctl->lf_count > 0) {
++					pioctl->lf_count = 0;
++					pioctl->card->response_ready = 1;
++
++					// let the task complete the ioctl operation
++					if (pioctl->task_asleep) {
++						wake_up(&pioctl->waitq);
++					} else {
++						printk(KERN_ERR
++						       "%s:  irq:  task not asleep for response\n",
++						       me);
++						oms_release_ioctl(pioctl);
++					}
++
++					// done.
++				} else
++					pioctl->lf_count++;
++				break;
++
++			default:
++				pioctl->buffers.response[pioctl->p_response++] =
++				    resp_char;
++				break;
++			}
++		} else		//BINARY_MODE
++		{
++			if (DEBUGLEVEL > 1)
++				printk(KERN_INFO
++				       "%s:  IBF response status (%d of %d)\n",
++				       me, pioctl->p_response,
++				       pioctl->buffers.response_len);
++			pioctl->buffers.response[pioctl->p_response++] =
++			    resp_char;
++			if (pioctl->p_response >= pioctl->buffers.response_len) {
++				if (DEBUGLEVEL > 1)
++					printk(KERN_INFO
++					       "%s:  IBF response complete (%d of %d)\n",
++					       me, pioctl->p_response,
++					       pioctl->buffers.response_len);
++				pioctl->card->response_ready = 1;
++
++				// let the task complete the ioctl operation
++				if (pioctl->task_asleep) {
++					wake_up(&pioctl->waitq);
++				} else {
++					printk(KERN_ERR
++					       "%s:  irq:  task not asleep for response\n",
++					       me);
++					oms_release_ioctl(pioctl);
++				}
++
++				// done.
++			}
++		}
++	}
++}
++
++//****************************************************************************
++
++//****************************************************************************
++// Support card-specific IOCTL operations
++//
++int _oms_fop_ioctl(struct inode *pinode,
++		   struct file *pfile, unsigned int cmd, unsigned long userarg)
++{
++/*
++	int                   minor;
++	struct oms_card*      card;
++	struct list_head*     ptr;
++	struct omsdrv_ioctl*  pioctl;
++	int                   rv;
++	void*                 arg = (void*)userarg;
++
++	ASSERT_UNLOCKED();
++
++	// find oms card by minor
++	minor = MINOR( pfile->f_dentry->d_inode->i_rdev );
++	if ( minor < 0 || minor >= MAX_CARDS )
++		return -ENODEV;
++	for ( ptr = oms_cardlist.next; ptr != &oms_cardlist; ptr = ptr->next )
++	{
++		card = list_entry( ptr, struct oms_card, listhead );
++		if ( card->minor == minor )
++			break;
++	}
++	if ( ptr == &oms_cardlist )
++	{
++		return -ENODEV;
++	}
++*/
++
++	// execute requested ioctl function
++	switch (cmd) {
++	default:
++		return -EINVAL;
++	}
++	return 0;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int _oms_ioctl_read_status_flags(struct oms_card *card, void *arg)
++{
++	struct omsdrv_ioctl *pioctl;
++	int rv;
++
++	// read the status_flags.
++	pioctl = oms_new_ioctl(card);
++	if ((rv = oms_fetch_user_ioctl_struct(pioctl, 0, 1, arg)) != 0)
++		return rv;	// ios already released
++	if (pioctl->buffers.response_len != sizeof(card_hw->status_flags)) {
++		oms_release_ioctl(pioctl);
++		return -EINVAL;
++	}
++	//pioctl->cmd = cmd;
++	memset(pioctl->buffers.response, 0, sizeof(card_hw->status_flags));	// pre-zero
++
++	_LOCK_(flags);
++	memcpy(pioctl->buffers.response, &card_hw->status_flags,
++	       sizeof(card_hw->status_flags));
++	UN_LOCK_(flags);
++
++	if (pioctl->buffers.response[0] != 0) {
++		pioctl->p_response = sizeof(card_hw->status_flags);
++		pioctl->response_expected = TRUE;	// fake out our copy_out func
++		rv = oms_copy_out_ioctl_response(pioctl, arg);
++	}
++	oms_release_ioctl(pioctl);
++	return (rv);
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int _oms_ioctl_clear_status_flags(struct oms_card *card, void *arg)
++{
++	struct omsdrv_ioctl *pioctl;
++	int rv;
++
++	// clear status flag bits selected by 1's in the command
++	pioctl = oms_new_ioctl(card);
++	if ((rv = oms_fetch_user_ioctl_struct(pioctl, 1, 0, arg)) != 0)
++		return rv;	// ios already released
++	if (pioctl->buffers.command_len != sizeof(card_hw->status_flags)) {
++		oms_release_ioctl(pioctl);
++		return -EINVAL;
++	}
++	//pioctl->cmd = cmd;
++
++	_LOCK_(flags);
++	switch (sizeof(card_hw->status_flags)) {
++	case 1:
++		{
++			u8 mask = *((u8 *) (pioctl->buffers.command));
++			card_hw->status_flags &= ~mask;
++			break;
++		}
++	case 2:
++		{
++			u16 mask = *((u16 *) (pioctl->buffers.command));
++			card_hw->status_flags &= ~mask;
++			break;
++		}
++	case 4:
++		{
++			u32 mask = *((u32 *) (pioctl->buffers.command));
++			card_hw->status_flags &= ~mask;
++			break;
++		}
++	}
++	UN_LOCK_(flags);
++
++	oms_release_ioctl(pioctl);
++	return (0);
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int _oms_ioctl_read_done_flags(struct oms_card *card, void *arg)
++{
++	struct omsdrv_ioctl *pioctl;
++	int rv;
++
++	// read the done_flags.
++	pioctl = oms_new_ioctl(card);
++	if ((rv = oms_fetch_user_ioctl_struct(pioctl, 0, 1, arg)) != 0)
++		return rv;	// ios already released
++	if (pioctl->buffers.response_len != sizeof(card_hw->done_flags)) {
++		oms_release_ioctl(pioctl);
++		return -EINVAL;
++	}
++	//pioctl->cmd = cmd;
++	memset(pioctl->buffers.response, 0, sizeof(card_hw->done_flags));
++
++	_LOCK_(flags);
++	memcpy(pioctl->buffers.response, &card_hw->done_flags,
++	       sizeof(card_hw->done_flags));
++	UN_LOCK_(flags);
++
++	if (pioctl->buffers.response[0] != 0) {
++		pioctl->p_response = sizeof(card_hw->done_flags);
++		pioctl->response_expected = TRUE;	// fake out our copy_out func
++		rv = oms_copy_out_ioctl_response(pioctl, arg);
++	}
++	oms_release_ioctl(pioctl);
++	return (rv);
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int _oms_ioctl_clear_done_flags(struct oms_card *card, void *arg)
++{
++	struct omsdrv_ioctl *pioctl;
++	int rv;
++
++	// clear done flag bits selected by 1's in the command
++	pioctl = oms_new_ioctl(card);
++	if ((rv = oms_fetch_user_ioctl_struct(pioctl, 1, 0, arg)) != 0)
++		return rv;	// ios already released
++	if (pioctl->buffers.command_len != sizeof(card_hw->done_flags)) {
++		oms_release_ioctl(pioctl);
++		return -EINVAL;
++	}
++	//pioctl->cmd = cmd;
++
++	_LOCK_(flags);
++	switch (sizeof(card_hw->done_flags)) {
++	case 1:
++		{
++			u8 mask = *((u8 *) (pioctl->buffers.command));
++			card_hw->done_flags &= ~mask;
++			break;
++		}
++	case 2:
++		{
++			u16 mask = *((u16 *) (pioctl->buffers.command));
++			card_hw->done_flags &= ~mask;
++			break;
++		}
++	case 4:
++		{
++			u32 mask = *((u32 *) (pioctl->buffers.command));
++			card_hw->done_flags &= ~mask;
++			break;
++		}
++	}
++	UN_LOCK_(flags);
++
++	oms_release_ioctl(pioctl);
++	return (0);
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int _oms_ioctl_read_pos_limit_flags(struct oms_card *card, void *arg)
++{
++	return IOCTL_NOT_SUPPORTED;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int _oms_ioctl_clear_pos_limit_flags(struct oms_card *card, void *arg)
++{
++	return IOCTL_NOT_SUPPORTED;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int _oms_ioctl_read_neg_limit_flags(struct oms_card *card, void *arg)
++{
++	return IOCTL_NOT_SUPPORTED;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int _oms_ioctl_clear_neg_limit_flags(struct oms_card *card, void *arg)
++{
++	return IOCTL_NOT_SUPPORTED;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int _oms_ioctl_read_slip_flags(struct oms_card *card, void *arg)
++{
++	return IOCTL_NOT_SUPPORTED;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int _oms_ioctl_clear_slip_flags(struct oms_card *card, void *arg)
++{
++	return IOCTL_NOT_SUPPORTED;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int _oms_ioctl_read_shared_mem(struct oms_card *card, void *arg)
++{
++	u16 *src;
++	u16 *dest;
++	u16 count, word, i, offst;
++	struct omsdrv_ioctl *pioctl;
++	int rv;
++
++	if (card->comm_mode == INTERACTIVE_MODE)
++		return -ENODEV;
++
++	// read shared memory.  The starting offset is the
++	//   single u16 of the command string, the number
++	//   of u16's to read is given by the response_len.
++	pioctl = oms_new_ioctl(card);
++	if ((rv = oms_fetch_user_ioctl_struct(pioctl, 2, 2, arg)) != 0)
++		return rv;	// pioctl already released
++
++	// verify that command_len == sizeof(u16), i.e., one word
++	//   also verify a non-zero response length
++	if (pioctl->buffers.command_len != sizeof(u16) ||
++	    pioctl->buffers.response_len == 0) {
++		oms_release_ioctl(pioctl);
++		return -EINVAL;
++	}
++	//pioctl->cmd = cmd;
++
++	_LOCK_(flags);
++	rv = oms_enqueue_ioctl_and_sleep(pioctl, &flags);
++	if (rv) {
++		UN_LOCK_(flags);
++		oms_release_ioctl(pioctl);
++		return (rv);
++	}
++	// copy data from the shared memory address to ios->kresponse
++	offst = *((u16 *) pioctl->buffers.command);
++	src = (u16 *) (card_hw->sharedmem + offst);
++	dest = (u16 *) (pioctl->buffers.response);
++	count = pioctl->buffers.response_len / sizeof(u16);
++	// make sure src addr is word-aligned
++	if ((unsigned long)src & 0x01) {
++		UN_LOCK_(flags);
++		oms_release_ioctl(pioctl);
++		return (-EINVAL);
++	}
++	for (i = 0; i < count; i++, src++) {
++		// range check
++		if ((unsigned long)src >=
++		    (((unsigned long)(card_hw->sharedmem)) + (8 * 1024))) {
++			UN_LOCK_(flags);
++			oms_release_ioctl(pioctl);
++			return (-EINVAL);
++		}
++		word = be16_to_cpu(readl(src));
++		*dest++ = word;
++	}
++	UN_LOCK_(flags);
++
++	pioctl->p_response = pioctl->buffers.response_len;
++	pioctl->response_expected = TRUE;	// fake out copy_out function
++	rv = oms_copy_out_ioctl_response(pioctl, arg);
++	oms_release_ioctl(pioctl);
++	return (rv);
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int _oms_ioctl_write_shared_mem(struct oms_card *card, void *arg)
++{
++	u16 *src;
++	u16 *dest;
++	u16 count, word, i;
++	struct omsdrv_ioctl *pioctl;
++	int rv;
++
++	// write words (u16's) to shared memory.  The first
++	//  word of the command string is the offset into
++	//  shared memory.  The second word is the word count,
++	//  and the third (and successive) words are the data
++	//  to write in big-endian format.
++	//
++	//  This one is easy to get wrong in your user program.
++	//  Make sure that command_len is:
++	//             (2 * sizeof(__u16)) + sizeof(data)
++	//  And that the 2 words of info (offset and WORD count)
++	//  are contiguous with the data.
++	//
++	//  As an aid, we return -ENXIO if the command_len
++	//  doesn't jibe with the word-count.
++	if (card->comm_mode == INTERACTIVE_MODE)
++		return -ENODEV;
++	pioctl = oms_new_ioctl(card);
++	if ((rv = oms_fetch_user_ioctl_struct(pioctl, 2, 0, arg)) != 0)
++		return rv;	// pioctl already released
++	if (pioctl->buffers.command_len < (3 * sizeof(u16)) ||
++	    pioctl->buffers.response_len != 0) {
++		oms_release_ioctl(pioctl);
++		return -EINVAL;
++	}
++	//pioctl->cmd = cmd;
++
++	_LOCK_(flags);
++	rv = oms_enqueue_ioctl_and_sleep(pioctl, &flags);
++
++	// see if there was a timeout error or we must handle a sig
++	if (rv) {
++		UN_LOCK_(flags);
++		oms_release_ioctl(pioctl);
++		return rv;
++	}
++	// copy the data into the shared memory
++	src = (u16 *) pioctl->buffers.command;
++	dest = (u16 *) (card_hw->sharedmem + *src++);
++	count = *src++;		// must be a WORD count!!
++
++	// make sure command_len jibes with the count
++	if (pioctl->buffers.command_len != (count + 2) * sizeof(u16)) {
++		UN_LOCK_(flags);
++		oms_release_ioctl(pioctl);
++		return (-ENXIO);
++	}
++	// make sure that dest addr is word-aligned
++	if ((unsigned long)dest & 0x01) {
++		UN_LOCK_(flags);
++		oms_release_ioctl(pioctl);
++		return (-EINVAL);
++	}
++
++	for (i = 0; i < count; i++, dest++) {
++		word = *src++;
++		// range check
++		if ((unsigned long)dest >=
++		    (((unsigned long)(card_hw->sharedmem)) + (8 * 1024))) {
++			UN_LOCK_(flags);
++			oms_release_ioctl(pioctl);
++			return (-EINVAL);
++		}
++		writel(cpu_to_be16(word), dest);
++	}
++	UN_LOCK_(flags);
++	oms_release_ioctl(pioctl);
++	return (0);
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int _oms_ioctl_read_axis_positions(struct oms_card *card, void *arg)
++{
++	struct omsdrv_ioctl *pioctl;
++	int rv;
++	__u32 *kdata;
++	unsigned long timeout;
++
++	if (card->comm_mode == INTERACTIVE_MODE)
++		return -ENODEV;
++
++	pioctl = oms_new_ioctl(card);
++	if ((rv = oms_fetch_user_ioctl_struct(pioctl, 0, 4, arg)) != 0)
++		return rv;	// ios already released
++	if (pioctl->buffers.response_len != (8 * sizeof(u32))) {
++		oms_release_ioctl(pioctl);
++		return -EINVAL;
++	}
++	// tickle the mailbox to get updated position info
++	*((unsigned short *)(card_hw->sharedmem + OMS_MEM_MAILBOX)) =
++	    MAILBOX_BOTH;
++	timeout = jiffies + 3 * HZ;
++	while (*((unsigned short *)(card_hw->sharedmem + OMS_MEM_MAILBOX)) ==
++	       MAILBOX_BOTH && jiffies < timeout) {
++	};
++
++	kdata = (__u32 *) pioctl->buffers.response;
++	kdata[0] = *((__u32 *) (card_hw->sharedmem + OMS_MEM_MOTOR_X));
++	kdata[1] = *((__u32 *) (card_hw->sharedmem + OMS_MEM_MOTOR_Y));
++	kdata[2] = *((__u32 *) (card_hw->sharedmem + OMS_MEM_MOTOR_Z));
++	kdata[3] = *((__u32 *) (card_hw->sharedmem + OMS_MEM_MOTOR_T));
++	kdata[4] = *((__u32 *) (card_hw->sharedmem + OMS_MEM_ENCODER_X));
++	kdata[5] = *((__u32 *) (card_hw->sharedmem + OMS_MEM_ENCODER_Y));
++	kdata[6] = *((__u32 *) (card_hw->sharedmem + OMS_MEM_ENCODER_Z));
++	kdata[7] = *((__u32 *) (card_hw->sharedmem + OMS_MEM_ENCODER_T));
++	pioctl->p_response = 8 * sizeof(__u16);
++
++	pioctl->response_expected = TRUE;	// fake out our copy_out func
++	rv = oms_copy_out_ioctl_response(pioctl, arg);
++
++	if (rv == 0)
++		rv = oms_copy_out_ioctl_response(pioctl, arg);
++	oms_release_ioctl(pioctl);
++	return rv;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++int _oms_ioctl_reinit(struct oms_card *card, void *arg)
++{
++	// Rewrite the interrupt control register
++	_LOCK_(flags);
++	*card_hw->reg_control = INTERRUPT_MASK;
++	UN_LOCK_(flags);
++
++	return 0;
++}
++
++//****************************************************************************
++
++//****************************************************************************
++void _oms_start_ioctl(struct oms_card *card)
++{
++	ASSERT_LOCKED();
++
++	// enable TBE interrupts
++	*card_hw->reg_control = (*card_hw->reg_control & ~TBE_BIT);
++	*card_hw->reg_control = (*card_hw->reg_control | TBE_BIT);
++}
++
++//****************************************************************************
+--- /dev/null
++++ b/drivers/misc/oms/oms-pcixdrv.h
+@@ -0,0 +1,61 @@
++/*
++ *  header file for driver 'oms-pcixdrv.c'.  Does not present a user-space API.
++ *
++ *  Copyright(c) 2003 Oregon Micro Systems, Inc.  All rights reserved.
++ */
++#ifndef __PCIXDRV_H_
++#define __PCIXDRV_H_
++
++#include "oms-pcix.h"
++
++#ifdef __KERNEL__
++
++#define	INTERACTIVE_BUFFER_LEN	1024
++
++// card specific data included in struct oms_card
++struct hw_struct {
++	// ******************************************************
++	// physical addresses and mapped pointers into the card
++
++	// physaddr (from pci config header BAR) of 8 byte registers
++	unsigned long regbase_physaddr;
++	// mapped address of 8 byte registers
++	unsigned long regbase_addr;	// note that this is not a pointer
++
++	// pointers to relevant registers within 8 byte space
++	volatile u8 *reg_control;	// Control register
++	volatile u8 *reg_status;	// Status register
++	volatile u8 *reg_done;	// Done register
++	volatile u8 *reg_data;	// Data register
++
++	// physaddr (from pci config header BAR) of 8K shared memory
++	unsigned long sharedmem_physaddr;
++	// mapped address of shared memory
++	u8 *sharedmem;		// note that this IS a pointer
++	volatile u16 *cardnum;	// physical card ID
++	volatile u16 *mailbox;	// position data sampling
++	volatile u16 *vec_opcode;	// vector mode type
++	volatile u16 *vec_insert;	// vector queue insertion pointer
++	volatile u16 *vec_process;	// vector queue process pointer
++
++	// ******************************************************
++	u8 status_flags;	// driver copy of status flags
++	u8 done_flags;		// driver copy of done flags
++};
++
++// simplify access and expressions
++#define	card_hw	((struct hw_struct*)(card->hardware))
++
++// initial interrupt mask. do not enable TBE until the xmit buffer is non-empty
++#define INTERRUPT_MASK (IRQ_BIT|IBF_BIT|DONE_BIT|OVRT_BIT|SLIP_BIT|CMDERR_BIT)
++
++// Hardware specific register offsets
++#define OMS_REG_CONTROL         0x00000000
++#define OMS_REG_STATUS          0x00000002
++#define OMS_REG_DONE            0x00000004
++#define OMS_REG_DATA            0x00000006
++
++extern struct tasklet_struct oms_tasklet;
++
++#endif // __KERNEL__
++#endif // __PCIXDRV_H_
+--- /dev/null
++++ b/drivers/misc/oms/oms.h
+@@ -0,0 +1,85 @@
++/* oms.h --- header file shared between driver and user-space
++ *    programs.  Define the ioctl(2) API supported by the driver.
++ *
++ *  Copyright(c) 2003 Oregon Micro Systems, Inc.  All rights reserved.
++ */
++
++#ifndef __OMS_H_
++#define __OMS_H_
++
++#ifndef __OMS_CORE_H_
++#include <sys/ioctl.h>
++#endif
++
++#define OMS_MAJOR_NUMBER 232	// from the "UNASSIGNED" region
++
++// Some basic types we want to use
++#ifndef BOOL
++#define	BOOL	int
++#endif
++#ifndef TRUE
++#define TRUE	1
++#endif
++#ifndef FALSE
++#define FALSE	0
++#endif
++
++#define  SPACE                  0x20
++#define  LF                     0x0A
++#define  CR                     0x0D
++
++#define OMS_IOC_TYP    'm'
++
++struct oms_ioctl {
++	unsigned char *command;	//  IN
++	unsigned int command_len;	//  IN
++	unsigned char *response;	//  OUT
++	unsigned int response_len;	//  IN and OUT
++};
++
++// IOCTL codes
++#define IOCTL_OMS_GET_VERSION         _IOWR(OMS_IOC_TYP,  0, struct oms_ioctl)
++
++#define IOCTL_OMS_COMMAND             _IOW(OMS_IOC_TYP,   1, struct oms_ioctl)
++#define IOCTL_OMS_COMMAND_NONALPHA    _IOW(OMS_IOC_TYP,   2, struct oms_ioctl)
++#define IOCTL_OMS_QUERY               _IOWR(OMS_IOC_TYP,  3, struct oms_ioctl)
++#define IOCTL_OMS_QUERY_NONALPHA      _IOWR(OMS_IOC_TYP,  4, struct oms_ioctl)
++
++#define IOCTL_OMS_READ_SHARED_MEM     _IOWR(OMS_IOC_TYP,  5, struct oms_ioctl)
++#define IOCTL_OMS_WRITE_SHARED_MEM    _IOWR(OMS_IOC_TYP,  6, struct oms_ioctl)
++
++#define IOCTL_OMS_READ_STATUS_FLAGS   _IOWR(OMS_IOC_TYP,  7, struct oms_ioctl)
++#define IOCTL_OMS_CLEAR_STATUS_FLAGS  _IOW(OMS_IOC_TYP,   8, struct oms_ioctl)
++
++#define IOCTL_OMS_READ_DONE_FLAGS     _IOWR(OMS_IOC_TYP,  9, struct oms_ioctl)
++#define IOCTL_OMS_CLEAR_DONE_FLAGS    _IOW(OMS_IOC_TYP,  10, struct oms_ioctl)
++
++#define IOCTL_OMS_READ_PLIMIT_FLAGS   _IOWR(OMS_IOC_TYP, 11, struct oms_ioctl)
++#define IOCTL_OMS_CLEAR_PLIMIT_FLAGS  _IOW(OMS_IOC_TYP,  12, struct oms_ioctl)
++
++#define IOCTL_OMS_READ_NLIMIT_FLAGS   _IOWR(OMS_IOC_TYP, 13, struct oms_ioctl)
++#define IOCTL_OMS_CLEAR_NLIMIT_FLAGS  _IOW(OMS_IOC_TYP,  14, struct oms_ioctl)
++
++#define IOCTL_OMS_READ_SLIP_FLAGS     _IOWR(OMS_IOC_TYP, 15, struct oms_ioctl)
++#define IOCTL_OMS_CLEAR_SLIP_FLAGS    _IOW(OMS_IOC_TYP,  16, struct oms_ioctl)
++
++#define IOCTL_OMS_READ_AXIS_POSITIONS _IOWR(OMS_IOC_TYP, 17, struct oms_ioctl)
++
++#define IOCTL_OMS_CMD_BUFF_FREE       _IOWR(OMS_IOC_TYP, 18, struct oms_ioctl)
++
++/* NOTE: Card-specific code may define additional codes starting at: */
++#define CSIOCTL_BASE	100
++
++// not used by shared library functions:  put driver in INTERACTIVE_MODE
++// to support read/write/poll operations
++//  Notes:  exclusive open enforced for a card in INTERACTIVE_MODE.  This
++//  ioctl will fail (EBUSY) if the count of opens is not one.  Once a
++//  card has been put in interactive mode, any further opens will fail
++//  (EBUSY) until the 'owner' closes or calls EXIT.
++#define IOCTL_OMS_ENTER_INTERACTIVE_MODE	_IO(OMS_IOC_TYP, 200)
++#define IOCTL_OMS_EXIT_INTERACTIVE_MODE		_IO(OMS_IOC_TYP, 201)
++
++/* Should only be called after an upgrade */
++#define IOCTL_OMS_REINIT			_IO(OMS_IOC_TYP, 210)
++
++#endif /* __OMS_CORE_H_ */
