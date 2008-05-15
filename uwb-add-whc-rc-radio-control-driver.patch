@@ -1,56 +1,54 @@
-From 38e9695e73afe26e9cfe7d8f10df331682f4b744 Mon Sep 17 00:00:00 2001
-From: Greg Kroah-Hartman <gregkh@suse.de>
-Date: Tue, 8 Apr 2008 13:24:46 -0700
-Subject: wusb: add whc-rc radio control driver
+uwb: add whc-rc radio control driver
 
-Originally written by Intel and Inaky, but cleaned up massively by Greg
-to get it into a mergable state.
+From: Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
 
-Cc: Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+Add the driver for WHCI radio controllers.
 
+Signed-off-by: David Vrabel <david.vrabel@csr.com>
 ---
- drivers/uwb/Kconfig  |   18 +
- drivers/uwb/Makefile |    1 
- drivers/uwb/whc-rc.c |  552 +++++++++++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 571 insertions(+)
+ drivers/uwb/Kconfig  |   20 +
+ drivers/uwb/Makefile |    2 
+ drivers/uwb/whc-rc.c |  511 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 532 insertions(+), 1 deletion(-)
 
 --- a/drivers/uwb/Kconfig
 +++ b/drivers/uwb/Kconfig
-@@ -26,4 +26,22 @@ menuconfig UWB
+@@ -26,3 +26,23 @@ menuconfig UWB
  	  <file:Documentation/usb/>.
  
  	  To compile the UWB stack as a module, choose M here.
++
 +if UWB
- 
++
 +config UWB_WHCI
-+	tristate "UWB Radio Control driver for WHCI-compliant cards"
-+	depends on PCI
-+	help
-+	  This driver enables the radio controller for WHCI cards.
++        tristate "UWB Radio Control driver for WHCI-compliant cards"
++        depends on PCI
++        help
++          This driver enables the radio controller for WHCI cards.
 +
-+	  WCHI is an specification developed by Intel
-+	  (http://www.intel.com/technology/comms/wusb/whci.htm) much
-+	  in the spirit of USB's EHCI, but for UWB and Wireless USB
-+	  radio/host controllers connected via memmory mapping (eg:
-+	  PCI). Most of these cards come also with a Wireless USB host
-+	  controller.
++          WHCI is an specification developed by Intel
++          (http://www.intel.com/technology/comms/wusb/whci.htm) much
++          in the spirit of USB's EHCI, but for UWB and Wireless USB
++          radio/host controllers connected via memmory mapping (eg:
++          PCI). Most of these cards come also with a Wireless USB host
++          controller.
 +
-+	  To compile this driver select Y (built in) or M (module). It
-+	  is safe to select any even if you do not have the hardware.
++          To compile this driver select Y (built in) or M (module). It
++          is safe to select any even if you do not have the hardware.
 +
-+endif # UWB_SUPPORT
++endif # UWB
 --- a/drivers/uwb/Makefile
 +++ b/drivers/uwb/Makefile
-@@ -1,4 +1,5 @@
- obj-$(CONFIG_UWB)		+= uwb.o umc.o whci.o
-+obj-$(CONFIG_UWB_WHCI)		+= whc-rc.o
+@@ -1,5 +1,5 @@
+ obj-$(CONFIG_UWB)		+= uwb.o
+-obj-$(CONFIG_UWB_WHCI)		+= umc.o whci.o
++obj-$(CONFIG_UWB_WHCI)		+= umc.o whci.o whc-rc.o
  
  uwb-objs :=		\
  	address.o	\
 --- /dev/null
 +++ b/drivers/uwb/whc-rc.c
-@@ -0,0 +1,552 @@
+@@ -0,0 +1,511 @@
 +/*
 + * Wireless Host Controller: Radio Control Interface (WHCI v0.95[2.3])
 + * Radio Control command/event transport to the UWB stack
@@ -96,6 +94,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#include <linux/init.h>
 +#include <linux/module.h>
 +#include <linux/pci.h>
++#include <linux/dma-mapping.h>
 +#include <linux/interrupt.h>
 +#include <linux/workqueue.h>
 +#include <linux/uwb.h>
@@ -118,11 +117,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	struct uwb_rc *uwb_rc;		/* UWB host controller */
 +
 +	unsigned long area;
-+	void __iomem *rc_base;		// Radio control bar mapping
++	void __iomem *rc_base;
 +	size_t rc_len;
 +	spinlock_t irq_lock;
 +
-+	void *evt_buf, *cmd_buf;	// PAGE_SIZE each
++	void *evt_buf, *cmd_buf;
 +	dma_addr_t evt_dma_buf, cmd_dma_buf;
 +	wait_queue_head_t cmd_wq;
 +	struct work_struct event_work;
@@ -167,18 +166,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		goto error;
 +	}
 +
-+	d_printf(3, dev,
-+		 "CMD [bef submit]: urccmd 0x%08x urcsts 0x%08x "
-+		 "urcintr 0x%08x urccmdaddr 0x%016Lx (0x%08zx) "
-+		 "urcevtaddr 0x%016Lx (0x%08zx)\n",
-+		 le_readl(whcrc->rc_base + URCCMD),
-+		 le_readl(whcrc->rc_base + URCSTS),
-+		 le_readl(whcrc->rc_base + URCINTR),
-+		 le_readq(whcrc->rc_base + URCCMDADDR),
-+		 (size_t)whcrc->cmd_dma_buf,
-+		 le_readq(whcrc->rc_base + URCEVTADDR),
-+		 (size_t)whcrc->evt_dma_buf);
-+
 +	memmove(whcrc->cmd_buf, cmd, cmd_size);
 +	le_writeq(whcrc->cmd_dma_buf, whcrc->rc_base + URCCMDADDR);
 +
@@ -189,17 +176,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		  whcrc->rc_base + URCCMD);
 +	spin_unlock(&whcrc->irq_lock);
 +
-+	d_printf(3, dev,
-+		 "CMD [aft submit]: urccmd 0x%08x urcsts 0x%08x "
-+		 "urcintr 0x%08x urccmdaddr 0x%016Lx (0x%08zx) "
-+		 "urcevtaddr 0x%016Lx (0x%08zx)\n",
-+		 le_readl(whcrc->rc_base + URCCMD),
-+		 le_readl(whcrc->rc_base + URCSTS),
-+		 le_readl(whcrc->rc_base + URCINTR),
-+		 le_readq(whcrc->rc_base + URCCMDADDR),
-+		 (size_t)whcrc->cmd_dma_buf,
-+		 le_readq(whcrc->rc_base + URCEVTADDR),
-+		 (size_t)whcrc->evt_dma_buf);
 +error:
 +	d_fnend(3, dev, "(%p, %p, %zu) = %d\n",
 +		uwb_rc, cmd, cmd_size, result);
@@ -251,8 +227,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	urcevtaddr = le_readq(whcrc->rc_base + URCEVTADDR);
 +	size = urcevtaddr & URCEVTADDR_OFFSET_MASK;
 +
-+	d_printf(3, dev, "%lu: received event @ ercevtaddr 0x%016Lx, "
-+		 "%zu bytes\n", jiffies, urcevtaddr, size);
++	d_printf(3, dev, "received %zu octet event\n", size);
 +	d_dump(4, dev, whcrc->evt_buf, size > 32? 32 : size);
 +
 +	uwb_rc_neh_grok(whcrc->uwb_rc, whcrc->evt_buf, size);
@@ -288,12 +263,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		goto out;
 +	}
 +
-+	if (urcsts & URCSTS_HSE) {		// Host system error
++	if (urcsts & URCSTS_HSE) {
 +		dev_err(dev, "host system error -- hardware halted\n");
 +		/* FIXME: do something sensible here */
 +		goto out;
 +	}
-+	if (urcsts & URCSTS_ER) {		// Event ready
++	if (urcsts & URCSTS_ER) {
 +		d_printf(3, dev, "ER: event ready\n");
 +		schedule_work(&whcrc->event_work);
 +	}
@@ -420,8 +395,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +				     jiffies_to_msecs(duration));
 +	}
 +
-+	// Set the event buffer, start the controller (enable IRQs later)
-+	le_writel(0, whcrc->rc_base + URCINTR);		// IRQs have to be off
++	/* Set the event buffer, start the controller (enable IRQs later) */
++	le_writel(0, whcrc->rc_base + URCINTR);
 +	le_writel(URCCMD_RS, whcrc->rc_base + URCCMD);
 +	result = -ETIMEDOUT;
 +	if (d_test(3))
@@ -486,8 +461,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	struct uwb_rc *uwb_rc;
 +	struct whcrc *whcrc;
 +	struct device *dev = &umc_dev->dev;
-+	/* FIXME: should check parent is a PCI device. */
-+	struct pci_dev *pci_dev = to_pci_dev(umc_dev->dev.parent);
 +
 +	d_fnstart(3, dev, "(umc_dev %p)\n", umc_dev);
 +	result = -ENOMEM;
@@ -502,36 +475,20 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		goto error_alloc;
 +	}
 +	whcrc_init(whcrc);
-+ 	whcrc->umc_dev = umc_dev;
++	whcrc->umc_dev = umc_dev;
 +
-+	if (pci_dev->vendor == PCI_VENDOR_ID_INTEL
-+	    && (pci_dev->device == 0x0c3b || pci_dev->device == 0004)
-+	    && pci_dev->class == 0x0d1010)
-+		BUG_SET(UWB_BUG_543, uwb_rc->uwb_bug_543);
-+	else if (pci_dev->vendor == PCI_VENDOR_ID_NEC
-+		 && pci_dev->device == 0x015e ) {
-+		/* no known bugs to workaround */
-+	}
-+	else
-+		dev_info(dev, "WARNING! Untested board (0x%04x/%04x/%06x)\n",
-+			 pci_dev->vendor, pci_dev->device, pci_dev->class);
-+ 	result = whcrc_setup_rc_umc(whcrc);
++	result = whcrc_setup_rc_umc(whcrc);
 +	if (result < 0) {
-+ 		dev_err(dev, "Can't setup RC UMC interface: %d\n", result);
++		dev_err(dev, "Can't setup RC UMC interface: %d\n", result);
 +		goto error_setup_rc_umc;
 +	}
 +	result = whcrc_start_rc(whcrc);
 +	if (result < 0) {
-+ 		dev_err(dev, "Can't setup RC interface: %d\n", result);
++		dev_err(dev, "Can't setup RC interface: %d\n", result);
 +		goto error_start_rc;
 +	}
-+	whcrc->uwb_rc = uwb_rc;		// see note in function header
-+	if (UWB_BUG_514 == 1 && pci_dev->vendor == PCI_VENDOR_ID_INTEL) {
-+		uwb_rc->version = 0x0100;
-+		result = uwb_rc_add(uwb_rc, dev, whcrc, whcrc_cmd,
-+				    hwarc_filter_cmd, hwarc_filter_event);
-+	} else
-+		result = uwb_rc_add(uwb_rc, dev, whcrc, whcrc_cmd, NULL, NULL);
++	whcrc->uwb_rc = uwb_rc;
++	result = uwb_rc_add(uwb_rc, dev, whcrc, whcrc_cmd, NULL, NULL);
 +	if (result < 0)
 +		goto error_rc_add;
 +	umc_set_drvdata(umc_dev, whcrc);
@@ -582,10 +539,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +MODULE_DEVICE_TABLE(pci, whcrc_id_table);
 +
 +static struct umc_driver whcrc_driver = {
-+	.name = "whc-rc",
++	.name   = "whc-rc",
 +	.cap_id = UMC_CAP_ID_WHCI_RC,
-+ 	.probe = whcrc_probe,
-+ 	.remove = whcrc_remove,
++	.probe  = whcrc_probe,
++	.remove = whcrc_remove,
 +};
 +
 +static int __init whcrc_driver_init(void)

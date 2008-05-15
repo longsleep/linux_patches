@@ -1,0 +1,1959 @@
+uwb: add the i1480 DFU driver
+
+From: Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
+
+Add the driver for downloading the firmware to an Intel i1480 device.
+
+Signed-off-by: David Vrabel <david.vrabel@csr.com>
+---
+ drivers/uwb/Kconfig               |   12 
+ drivers/uwb/Makefile              |    1 
+ drivers/uwb/i1480/Makefile        |    1 
+ drivers/uwb/i1480/dfu/Makefile    |    9 
+ drivers/uwb/i1480/dfu/dfu.c       |  281 ++++++++++++++++++++
+ drivers/uwb/i1480/dfu/i1480-dfu.h |  263 ++++++++++++++++++
+ drivers/uwb/i1480/dfu/mac.c       |  529 ++++++++++++++++++++++++++++++++++++++
+ drivers/uwb/i1480/dfu/phy.c       |  203 ++++++++++++++
+ drivers/uwb/i1480/dfu/usb.c       |  501 +++++++++++++++++++++++++++++++++++
+ drivers/uwb/i1480/i1480-est.c     |   99 +++++++
+ 10 files changed, 1899 insertions(+)
+
+--- /dev/null
++++ b/drivers/uwb/i1480/dfu/dfu.c
+@@ -0,0 +1,281 @@
++/*
++ * Intel Wireless UWB Link 1480
++ * Main driver
++ *
++ * Copyright (C) 2005-2006 Intel Corporation
++ * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ *
++ *
++ * Common code for firmware upload used by the USB and PCI version;
++ * i1480_fw_upload() takes a device descriptor and uses the function
++ * pointers it provides to upload firmware and prepare the PHY.
++ *
++ * As well, provides common functions used by the rest of the code.
++ */
++#include "i1480-dfu.h"
++#include <linux/errno.h>
++#include <linux/delay.h>
++#include <linux/pci.h>
++#include <linux/device.h>
++#include <linux/uwb.h>
++#include <linux/random.h>
++
++#define D_LOCAL 0
++#include <linux/uwb/debug.h>
++
++/** @return 0 if If @evt is a valid reply event; otherwise complain */
++int i1480_rceb_check(const struct i1480 *i1480, const struct uwb_rceb *rceb,
++		     const char *cmd, u8 context,
++		     unsigned expected_type, unsigned expected_event)
++{
++	int result = 0;
++	struct device *dev = i1480->dev;
++	if (rceb->bEventContext != context) {
++		dev_err(dev, "%s: "
++			"unexpected context id 0x%02x (expected 0x%02x)\n",
++			cmd, rceb->bEventContext, context);
++		result = -EINVAL;
++	}
++	if (rceb->bEventType != expected_type) {
++		dev_err(dev, "%s: "
++			"unexpected event type 0x%02x (expected 0x%02x)\n",
++			cmd, rceb->bEventType, expected_type);
++		result = -EINVAL;
++	}
++	if (le16_to_cpu(rceb->wEvent) != expected_event) {
++		dev_err(dev, "%s: "
++			"unexpected event 0x%04x (expected 0x%04x)\n",
++			cmd, le16_to_cpu(rceb->wEvent), expected_event);
++		result = -EINVAL;
++	}
++	return result;
++}
++EXPORT_SYMBOL_GPL(i1480_rceb_check);
++
++
++/**
++ * Execute a Radio Control Command
++ *
++ * Command data has to be in i1480->cmd_buf.
++ *
++ * @returns size of the reply data filled in i1480->evt_buf or < 0 errno
++ *          code on error.
++ */
++ssize_t i1480_cmd(struct i1480 *i1480, const char *cmd_name, size_t cmd_size,
++		  size_t reply_size)
++{
++	ssize_t result;
++	struct uwb_rceb *reply = i1480->evt_buf;
++	struct uwb_rccb *cmd = i1480->cmd_buf;
++	u16 expected_event = reply->wEvent;
++	u8 expected_type = reply->bEventType;
++	u8 context;
++
++	d_fnstart(3, i1480->dev, "(%p, %s, %zu)\n", i1480, cmd_name, cmd_size);
++	init_completion(&i1480->evt_complete);
++	i1480->evt_result = -EINPROGRESS;
++	do {
++		get_random_bytes(&context, 1);
++	} while (context == 0x00 || context == 0xff);
++	cmd->bCommandContext = context;
++	result = i1480->cmd(i1480, cmd_name, cmd_size);
++	if (result < 0)
++		goto error;
++	/* wait for the callback to report a event was received */
++	result = wait_for_completion_interruptible_timeout(
++		&i1480->evt_complete, HZ);
++	if (result == 0) {
++		result = -ETIMEDOUT;
++		goto error;
++	}
++	if (result < 0)
++		goto error;
++	result = i1480->evt_result;
++	if (result < 0) {
++		dev_err(i1480->dev, "%s: command reply reception failed: %zd\n",
++			cmd_name, result);
++		goto error;
++	}
++	if (result != reply_size) {
++		dev_err(i1480->dev, "%s returned only %zu bytes, %zu expected\n",
++			cmd_name, result, reply_size);
++		result = -EINVAL;
++		goto error;
++	}
++	/* Verify we got the right event in response */
++	result = i1480_rceb_check(i1480, i1480->evt_buf, cmd_name, context,
++				  expected_type, expected_event);
++error:
++	d_fnend(3, i1480->dev, "(%p, %s, %zu) = %zd\n",
++		i1480, cmd_name, cmd_size, result);
++	return result;
++}
++EXPORT_SYMBOL_GPL(i1480_cmd);
++
++
++/**
++ * Get information about the MAC and PHY
++ *
++ * @wa:      Wired adaptor
++ * @neh:     Notification/event handler
++ * @reply:   Pointer to the reply event buffer
++ * @returns: 0 if ok, < 0 errno code on error.
++ */
++static
++int i1480_cmd_get_mac_phy_info(struct i1480 *i1480)
++{
++	int result;
++	struct uwb_rccb *cmd = i1480->cmd_buf;
++	struct i1480_evt_confirm_GMPI *reply = i1480->evt_buf;
++
++	cmd->bCommandType = i1480_CET_VS1;
++	cmd->wCommand = cpu_to_le16(i1480_CMD_GET_MAC_PHY_INFO);
++	reply->rceb.bEventType = i1480_CET_VS1;
++	reply->rceb.wEvent = i1480_EVT_GET_MAC_PHY_INFO;
++	result = i1480_cmd(i1480, "GET_MAC_PHY_INFO", sizeof(*cmd),
++			   sizeof(*reply));
++	if (result < 0)
++		goto out;
++	if (le16_to_cpu(reply->status) != 0x00) {
++		dev_err(i1480->dev,
++			"GET_MAC_PHY_INFO: command execution failed: %d\n",
++			reply->status);
++		result = -EIO;
++	}
++out:
++	return result;
++}
++
++
++/**
++ * Get i1480's info and print it
++ *
++ * @wa:      Wire Adapter
++ * @neh:     Notification/event handler
++ * @returns: 0 if ok, < 0 errno code on error.
++ */
++static
++int i1480_check_info(struct i1480 *i1480)
++{
++	struct i1480_evt_confirm_GMPI *reply = i1480->evt_buf;
++	int result;
++	unsigned mac_fw_rev;
++#if i1480_FW <= 0x00000302
++	unsigned phy_fw_rev;
++#endif
++	if (i1480->quirk_no_check_info) {
++		dev_err(i1480->dev, "firmware info check disabled\n");
++		return 0;
++	}
++
++	result = i1480_cmd_get_mac_phy_info(i1480);
++	if (result < 0) {
++		dev_err(i1480->dev, "Cannot get MAC & PHY information: %d\n",
++			result);
++		goto out;
++	}
++	mac_fw_rev = le16_to_cpu(reply->mac_fw_rev);
++#if i1480_FW > 0x00000302
++	dev_info(i1480->dev,
++		 "HW v%02hx  "
++		 "MAC FW v%02hx.%02hx caps %04hx  "
++		 "PHY type %02hx v%02hx caps %02hx %02hx %02hx\n",
++		 reply->hw_rev, mac_fw_rev >> 8, mac_fw_rev & 0xff,
++		 le16_to_cpu(reply->mac_caps),
++		 reply->phy_vendor, reply->phy_rev,
++		 reply->phy_caps[0], reply->phy_caps[1], reply->phy_caps[2]);
++#else
++	phy_fw_rev = le16_to_cpu(reply->phy_fw_rev);
++	dev_info(i1480->dev, "MAC FW v%02hx.%02hx caps %04hx "
++		 " PHY FW v%02hx.%02hx caps %04hx\n",
++		 mac_fw_rev >> 8, mac_fw_rev & 0xff,
++		 le16_to_cpu(reply->mac_caps),
++		 phy_fw_rev >> 8, phy_fw_rev & 0xff,
++		 le16_to_cpu(reply->phy_caps));
++#endif
++	dev_dbg(i1480->dev,
++		"key-stores:%hu mcast-addr-stores:%hu sec-modes:%hu\n",
++		(unsigned short) reply->key_stores,
++		le16_to_cpu(reply->mcast_addr_stores),
++		(unsigned short) reply->sec_mode_supported);
++	/* FIXME: complain if fw version too low -- pending for
++	 * numbering to stabilize */
++out:
++	return result;
++}
++
++
++static
++int i1480_print_state(struct i1480 *i1480)
++{
++	int result;
++	u32 *buf = (u32 *) i1480->cmd_buf;
++
++	result = i1480->read(i1480, 0x80080000, 2 * sizeof(*buf));
++	if (result < 0) {
++		dev_err(i1480->dev, "cannot read U & L states: %d\n", result);
++		goto error;
++	}
++	dev_info(i1480->dev, "state U 0x%08x, L 0x%08x\n", buf[0], buf[1]);
++error:
++	return result;
++}
++
++
++/*
++ * PCI probe, firmware uploader
++ *
++ * _mac_fw_upload() will call rc_setup(), which needs an rc_release().
++ */
++int i1480_fw_upload(struct i1480 *i1480)
++{
++	int result;
++
++	result = i1480_pre_fw_upload(i1480);	/* PHY pre fw */
++	if (result < 0 && result != -ENOENT) {
++		i1480_print_state(i1480);
++		goto error;
++	}
++	result = i1480_mac_fw_upload(i1480);	/* MAC fw */
++	if (result < 0) {
++		if (result == -ENOENT)
++			dev_err(i1480->dev, "Cannot locate MAC FW file '%s'\n",
++				i1480->mac_fw_name);
++		else
++			i1480_print_state(i1480);
++		goto error;
++	}
++	result = i1480_phy_fw_upload(i1480);	/* PHY fw */
++	if (result < 0 && result != -ENOENT) {
++		i1480_print_state(i1480);
++		goto error_rc_release;
++	}
++	result = i1480_check_info(i1480);
++	if (result < 0) {
++		dev_warn(i1480->dev, "Warning! Cannot check firmware info: %d\n",
++			 result);
++		result = 0;
++	}
++	dev_info(i1480->dev, "firmware uploaded successfully\n");
++error_rc_release:
++	if (i1480->rc_release)
++		i1480->rc_release(i1480);
++	result = 0;
++error:
++	return result;
++}
++EXPORT_SYMBOL_GPL(i1480_fw_upload);
+--- /dev/null
++++ b/drivers/uwb/i1480/dfu/i1480-dfu.h
+@@ -0,0 +1,263 @@
++/*
++ * i1480 Device Firmware Upload
++ *
++ * Copyright (C) 2005-2006 Intel Corporation
++ * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ *
++ *
++ * This driver is the firmware uploader for the Intel Wireless UWB
++ * Link 1480 device (both in the USB and PCI incarnations).
++ *
++ * The process is quite simple: we stop the device, write the firmware
++ * to its memory and then restart it. Wait for the device to let us
++ * know it is done booting firmware. Ready.
++ *
++ * We might have to upload before or after a phy firmware (which might
++ * be done in two methods, using a normal firmware image or through
++ * the MPI port).
++ *
++ * Because USB and PCI use common methods, we just make ops out of the
++ * common operations (read, write, wait_init_done and cmd) and
++ * implement them in usb.c and pci.c.
++ *
++ * The flow is (some parts omitted):
++ *
++ * i1480_{usb,pci}_probe()	  On enumerate/discovery
++ *   i1480_fw_upload()
++ *     i1480_pre_fw_upload()
++ *       __mac_fw_upload()
++ *         fw_hdrs_load()
++ *         mac_fw_hdrs_push()
++ *           i1480->write()       [i1480_{usb,pci}_write()]
++ *           i1480_fw_cmp()
++ *             i1480->read()      [i1480_{usb,pci}_read()]
++ *     i1480_mac_fw_upload()
++ *       __mac_fw_upload()
++ *       i1480->setup(()
++ *       i1480->wait_init_done()
++ *       i1480_cmd_reset()
++ *         i1480->cmd()           [i1480_{usb,pci}_cmd()]
++ *         ...
++ *     i1480_phy_fw_upload()
++ *       request_firmware()
++ *       i1480_mpi_write()
++ *         i1480->cmd()           [i1480_{usb,pci}_cmd()]
++ *       i1480_check_info()
++ *
++ * Once the probe function enumerates the device and uploads the
++ * firmware, we just exit with -ENODEV, as we don't really want to
++ * attach to the device.
++ */
++#ifndef __i1480_DFU_H__
++#define __i1480_DFU_H__
++
++#include <linux/uwb/spec.h>
++#include <linux/types.h>
++#include <linux/completion.h>
++
++#define i1480_FW_UPLOAD_MODE_MASK (cpu_to_le32(0x00000018))
++
++#if i1480_FW > 0x00000302
++#define i1480_RCEB_EXTENDED
++#endif
++
++struct uwb_rccb;
++struct uwb_rceb;
++
++/*
++ * Common firmware upload handlers
++ *
++ * Normally you embed this struct in another one specific to your hw.
++ *
++ * @write	Write to device's memory from buffer.
++ * @read	Read from device's memory to i1480->evt_buf.
++ * @setup	Setup device after basic firmware is uploaded
++ * @wait_init_done
++ *              Wait for the device to send a notification saying init
++ *              is done.
++ * @cmd         FOP for issuing the command to the hardware. The
++ *              command data is contained in i1480->cmd_buf and the size
++ *              is supplied as an argument. The command replied is put
++ *              in i1480->evt_buf and the size in i1480->evt_result (or if
++ *              an error, a < 0 errno code).
++ *
++ * @cmd_buf	Memory buffer used to send commands to the device.
++ *              Allocated by the upper layers i1480_fw_upload().
++ *              Size has to be @buf_size.
++ * @evt_buf	Memory buffer used to place the async notifications
++ *              received by the hw. Allocated by the upper layers
++ *              i1480_fw_upload().
++ *              Size has to be @buf_size.
++ * @cmd_complete
++ *              Low level driver uses this to notify code waiting afor
++ *              an event that the event has arrived and data is in
++ *              i1480->evt_buf (and size/result in i1480->evt_result).
++ * @hw_rev
++ *              Use this value to activate dfu code to support new revisions
++ *              of hardware.  i1480_init() sets this to a default value.
++ *              It should be updated by the USB and PCI code.
++ */
++struct i1480 {
++	struct device *dev;
++
++	int (*write)(struct i1480 *, u32 addr, const void *, size_t);
++	int (*read)(struct i1480 *, u32 addr, size_t);
++	int (*rc_setup)(struct i1480 *);
++	void (*rc_release)(struct i1480 *);
++	int (*wait_init_done)(struct i1480 *);
++	int (*cmd)(struct i1480 *, const char *cmd_name, size_t cmd_size);
++	const char *pre_fw_name;
++	const char *mac_fw_name;
++	const char *mac_fw_name_deprecate;	/* FIXME: Will go away */
++	const char *phy_fw_name;
++	u8 hw_rev;
++
++	size_t buf_size;	/* size of both evt_buf and cmd_buf */
++	void *evt_buf, *cmd_buf;
++	ssize_t evt_result;
++	struct completion evt_complete;
++
++	u8 quirk_no_check_info:1;
++};
++
++static inline
++void i1480_init(struct i1480 *i1480)
++{
++	i1480->hw_rev = 1;
++	init_completion(&i1480->evt_complete);
++}
++
++extern int i1480_fw_upload(struct i1480 *);
++extern int i1480_pre_fw_upload(struct i1480 *);
++extern int i1480_mac_fw_upload(struct i1480 *);
++extern int i1480_phy_fw_upload(struct i1480 *);
++extern ssize_t i1480_cmd(struct i1480 *, const char *, size_t, size_t);
++extern int i1480_rceb_check(const struct i1480 *,
++			    const struct uwb_rceb *, const char *, u8,
++			    unsigned, unsigned);
++
++enum {
++	/* Vendor specific command type */
++	i1480_CET_VS1 = 		0xfd,
++	/* i1480 commands */
++	i1480_CMD_SET_IP_MAS = 		0x000e,
++	i1480_CMD_GET_MAC_PHY_INFO = 	0x0003,
++	i1480_CMD_MPI_WRITE =		0x000f,
++	i1480_CMD_MPI_READ = 		0x0010,
++	/* i1480 events */
++#if i1480_FW > 0x00000302
++	i1480_EVT_CONFIRM = 		0x0002,
++	i1480_EVT_RM_INIT_DONE = 	0x0101,
++	i1480_EVT_DEV_ADD = 		0x0103,
++	i1480_EVT_DEV_RM = 		0x0104,
++	i1480_EVT_DEV_ID_CHANGE = 	0x0105,
++	i1480_EVT_GET_MAC_PHY_INFO =	i1480_CMD_GET_MAC_PHY_INFO,
++#else
++	i1480_EVT_CONFIRM = 		0x0002,
++	i1480_EVT_RM_INIT_DONE = 	0x0101,
++	i1480_EVT_DEV_ADD = 		0x0103,
++	i1480_EVT_DEV_RM = 		0x0104,
++	i1480_EVT_DEV_ID_CHANGE = 	0x0105,
++	i1480_EVT_GET_MAC_PHY_INFO =	i1480_EVT_CONFIRM,
++#endif
++};
++
++
++struct i1480_evt_confirm {
++	struct uwb_rceb rceb;
++#ifdef i1480_RCEB_EXTENDED
++	__le16 wParamLength;
++#endif
++	u8 bResultCode;
++} __attribute__((packed));
++
++
++struct i1480_rceb {
++	struct uwb_rceb rceb;
++#ifdef i1480_RCEB_EXTENDED
++	__le16 wParamLength;
++#endif
++} __attribute__((packed));
++
++
++/**
++ * Get MAC & PHY Information confirm event structure
++ *
++ * Confirm event returned by the command.
++ */
++struct i1480_evt_confirm_GMPI {
++#if i1480_FW > 0x00000302
++	struct uwb_rceb rceb;
++	__le16 wParamLength;
++	__le16 status;
++	u8 mac_addr[6];		/* EUI-64 bit IEEE address [still 8 bytes?] */
++	u8 dev_addr[2];
++	__le16 mac_fw_rev;	/* major = v >> 8; minor = v & 0xff */
++	u8 hw_rev;
++	u8 phy_vendor;
++	u8 phy_rev;		/* major v = >> 8; minor = v & 0xff */
++	__le16 mac_caps;
++	u8 phy_caps[3];
++	u8 key_stores;
++	__le16 mcast_addr_stores;
++	u8 sec_mode_supported;
++#else
++	struct uwb_rceb rceb;
++	u8 status;
++	u8 mac_addr[8];         /* EUI-64 bit IEEE address [still 8 bytes?] */
++	u8 dev_addr[2];
++	__le16 mac_fw_rev;      /* major = v >> 8; minor = v & 0xff */
++	__le16 phy_fw_rev;      /* major v = >> 8; minor = v & 0xff */
++	__le16 mac_caps;
++	u8 phy_caps;
++	u8 key_stores;
++	__le16 mcast_addr_stores;
++	u8 sec_mode_supported;
++#endif
++} __attribute__((packed));
++
++
++struct i1480_cmd_mpi_write {
++	struct uwb_rccb rccb;
++	__le16 size;
++	u8 data[];
++};
++
++
++struct i1480_cmd_mpi_read {
++	struct uwb_rccb rccb;
++	__le16 size;
++	struct {
++		u8 page, offset;
++	} __attribute__((packed)) data[];
++} __attribute__((packed));
++
++
++struct i1480_evt_mpi_read {
++	struct uwb_rceb rceb;
++#ifdef i1480_RCEB_EXTENDED
++	__le16 wParamLength;
++#endif
++	u8 bResultCode;
++	__le16 size;
++	struct {
++		u8 page, offset, value;
++	} __attribute__((packed)) data[];
++} __attribute__((packed));
++
++
++#endif /* #ifndef __i1480_DFU_H__ */
+--- /dev/null
++++ b/drivers/uwb/i1480/dfu/mac.c
+@@ -0,0 +1,529 @@
++/*
++ * Intel Wireless UWB Link 1480
++ * MAC Firmware upload implementation
++ *
++ * Copyright (C) 2005-2006 Intel Corporation
++ * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ *
++ *
++ * Implementation of the code for parsing the firmware file (extract
++ * the headers and binary code chunks) in the fw_*() functions. The
++ * code to upload pre and mac firmwares is the same, so it uses a
++ * common entry point in __mac_fw_upload(), which uses the i1480
++ * function pointers to push the firmware to the device.
++ */
++#include <linux/delay.h>
++#include <linux/firmware.h>
++#include <linux/uwb.h>
++#include "i1480-dfu.h"
++
++#define D_LOCAL 0
++#include <linux/uwb/debug.h>
++
++/*
++ * Descriptor for a continuous segment of MAC fw data
++ */
++struct fw_hdr {
++	unsigned long address;
++	size_t length;
++	const u32 *bin;
++	struct fw_hdr *next;
++};
++
++
++/* Free a chain of firmware headers */
++static
++void fw_hdrs_free(struct fw_hdr *hdr)
++{
++	struct fw_hdr *next;
++
++	while (hdr) {
++		next = hdr->next;
++		kfree(hdr);
++		hdr = next;
++	}
++}
++
++
++/* Fill a firmware header descriptor from a memory buffer */
++static
++int fw_hdr_load(struct i1480 *i1480, struct fw_hdr *hdr, unsigned hdr_cnt,
++		const char *_data, const u32 *data_itr, const u32 *data_top)
++{
++	size_t hdr_offset =  (const char *) data_itr - _data;
++	size_t remaining_size = (void *) data_top - (void *) data_itr;
++	if (data_itr + 2 > data_top) {
++		dev_err(i1480->dev, "fw hdr #%u/%zu: EOF reached in header at "
++		       "offset %zu, limit %zu\n",
++		       hdr_cnt, hdr_offset,
++		       (const char *) data_itr + 2 - _data,
++		       (const char *) data_top - _data);
++		return -EINVAL;
++	}
++	hdr->next = NULL;
++	hdr->address = le32_to_cpu(*data_itr++);
++	hdr->length = le32_to_cpu(*data_itr++);
++	hdr->bin = data_itr;
++	if (hdr->length > remaining_size) {
++		dev_err(i1480->dev, "fw hdr #%u/%zu: EOF reached in data; "
++		       "chunk too long (%zu bytes), only %zu left\n",
++		       hdr_cnt, hdr_offset, hdr->length, remaining_size);
++		return -EINVAL;
++	}
++	return 0;
++}
++
++
++/**
++ * Get a buffer where the firmware is supposed to be and create a
++ * chain of headers linking them together.
++ *
++ * @phdr: where to place the pointer to the first header (headers link
++ *        to the next via the @hdr->next ptr); need to free the whole
++ *        chain when done.
++ *
++ * @_data: Pointer to the data buffer.
++ *
++ * @_data_size: Size of the data buffer (bytes); data size has to be a
++ *              multiple of 4. Function will fail if not.
++ *
++ * Goes over the whole binary blob; reads the first chunk and creates
++ * a fw hdr from it (which points to where the data is in @_data and
++ * the length of the chunk); then goes on to the next chunk until
++ * done. Each header is linked to the next.
++ */
++static
++int fw_hdrs_load(struct i1480 *i1480, struct fw_hdr **phdr,
++		 const char *_data, size_t data_size)
++{
++	int result;
++	unsigned hdr_cnt = 0;
++	u32 *data = (u32 *) _data, *data_itr, *data_top;
++	struct fw_hdr *hdr, **prev_hdr = phdr;
++
++	result = -EINVAL;
++	/* Check size is ok and pointer is aligned */
++	if (data_size % sizeof(u32) != 0)
++		goto error;
++	if ((unsigned long) _data % sizeof(u16) != 0)
++		goto error;
++	*phdr = NULL;
++	data_itr = data;
++	data_top = (u32 *) (_data + data_size);
++	while (data_itr < data_top) {
++		result = -ENOMEM;
++		hdr = kmalloc(sizeof(*hdr), GFP_KERNEL);
++		if (hdr == NULL) {
++			dev_err(i1480->dev, "Cannot allocate fw header "
++			       "for chunk #%u\n", hdr_cnt);
++			goto error_alloc;
++		}
++		result = fw_hdr_load(i1480, hdr, hdr_cnt,
++				     _data, data_itr, data_top);
++		if (result < 0)
++			goto error_load;
++		data_itr += 2 + hdr->length;
++		*prev_hdr = hdr;
++		prev_hdr = &hdr->next;
++		hdr_cnt++;
++	};
++	*prev_hdr = NULL;
++	return 0;
++
++error_load:
++	kfree(hdr);
++error_alloc:
++	fw_hdrs_free(*phdr);
++error:
++	return result;
++}
++
++
++/**
++ * Compares a chunk of fw with one in the devices's memory
++ *
++ * @i1480:     Device instance
++ * @hdr:     Pointer to the firmware chunk
++ * @returns: 0 if equal, < 0 errno on error. If > 0, it is the offset
++ *           where the difference was found (plus one).
++ *
++ * Kind of dirty and simplistic, but does the trick in both the PCI
++ * and USB version. We do a quick[er] memcmp(), and if it fails, we do
++ * a byte-by-byte to find the offset.
++ */
++static
++ssize_t i1480_fw_cmp(struct i1480 *i1480, struct fw_hdr *hdr)
++{
++	ssize_t result = 0;
++	u32 src_itr = 0, cnt;
++	size_t size = hdr->length*sizeof(hdr->bin[0]);
++	size_t chunk_size;
++	u8 *bin = (u8 *) hdr->bin;
++
++	while (size > 0) {
++		chunk_size = size < i1480->buf_size? size : i1480->buf_size;
++		result = i1480->read(i1480, hdr->address + src_itr, chunk_size);
++		if (result < 0) {
++			dev_err(i1480->dev, "error reading for verification: "
++				"%zd\n", result);
++			goto error;
++		}
++		if (memcmp(i1480->cmd_buf, bin + src_itr, result)) {
++			u8 *buf = i1480->cmd_buf;
++			d_printf(2, i1480->dev,
++				 "original data @ %p + %u, %zu bytes\n",
++				 bin, src_itr, result);
++			d_dump(4, i1480->dev, bin + src_itr, result);
++			for (cnt = 0; cnt < result; cnt++)
++				if (bin[src_itr + cnt] != buf[cnt]) {
++					dev_err(i1480->dev, "byte failed at "
++						"src_itr %u cnt %u [0x%02x "
++						"vs 0x%02x]\n", src_itr, cnt,
++						bin[src_itr + cnt], buf[cnt]);
++					result = src_itr + cnt + 1;
++					goto cmp_failed;
++				}
++		}
++		src_itr += result;
++		size -= result;
++	}
++	result = 0;
++error:
++cmp_failed:
++	return result;
++}
++
++
++/**
++ * Writes firmware headers to the device.
++ *
++ * @prd:     PRD instance
++ * @hdr:     Processed firmware
++ * @returns: 0 if ok, < 0 errno on error.
++ */
++static
++int mac_fw_hdrs_push(struct i1480 *i1480, struct fw_hdr *hdr,
++		     const char *fw_name, const char *fw_tag)
++{
++	struct device *dev = i1480->dev;
++	ssize_t result = 0;
++	struct fw_hdr *hdr_itr;
++	int verif_retry_count;
++
++	d_fnstart(3, dev, "(%p, %p)\n", i1480, hdr);
++	/* Now, header by header, push them to the hw */
++	for (hdr_itr = hdr; hdr_itr != NULL; hdr_itr = hdr_itr->next) {
++		verif_retry_count = 0;
++retry:
++		dev_dbg(dev, "fw chunk (%zu @ 0x%08lx)\n",
++			hdr_itr->length * sizeof(hdr_itr->bin[0]),
++			hdr_itr->address);
++		result = i1480->write(i1480, hdr_itr->address, hdr_itr->bin,
++				    hdr_itr->length*sizeof(hdr_itr->bin[0]));
++		if (result < 0) {
++			dev_err(dev, "%s fw '%s': write failed (%zuB @ 0x%lx):"
++				" %zd\n", fw_tag, fw_name,
++				hdr_itr->length * sizeof(hdr_itr->bin[0]),
++				hdr_itr->address, result);
++			break;
++		}
++		result = i1480_fw_cmp(i1480, hdr_itr);
++		if (result < 0) {
++			dev_err(dev, "%s fw '%s': verification read "
++				"failed (%zuB @ 0x%lx): %zd\n",
++				fw_tag, fw_name,
++				hdr_itr->length * sizeof(hdr_itr->bin[0]),
++				hdr_itr->address, result);
++			break;
++		}
++		if (result > 0) {	/* Offset where it failed + 1 */
++			result--;
++			dev_err(dev, "%s fw '%s': WARNING: verification "
++				"failed at 0x%lx: retrying\n",
++				fw_tag, fw_name, hdr_itr->address + result);
++			if (++verif_retry_count < 3)
++				goto retry;	/* write this block again! */
++			dev_err(dev, "%s fw '%s': verification failed at 0x%lx: "
++				"tried %d times\n", fw_tag, fw_name,
++				hdr_itr->address + result, verif_retry_count);
++			result = -EINVAL;
++			break;
++		}
++	}
++	d_fnend(3, dev, "(%zd)\n", result);
++	return result;
++}
++
++
++/** Puts the device in firmware upload mode.*/
++static
++int mac_fw_upload_enable(struct i1480 *i1480)
++{
++	int result;
++	u32 reg = 0x800000c0;
++	u32 *buffer = (u32 *)i1480->cmd_buf;
++
++	if (i1480->hw_rev > 1)
++		reg = 0x8000d0d4;
++	result = i1480->read(i1480, reg, sizeof(u32));
++	if (result < 0)
++		goto error_cmd;
++	*buffer &= ~i1480_FW_UPLOAD_MODE_MASK;
++	result = i1480->write(i1480, reg, buffer, sizeof(u32));
++	if (result < 0)
++		goto error_cmd;
++	return 0;
++error_cmd:
++	dev_err(i1480->dev, "can't enable fw upload mode: %d\n", result);
++	return result;
++}
++
++
++/** Gets the device out of firmware upload mode. */
++static
++int mac_fw_upload_disable(struct i1480 *i1480)
++{
++	int result;
++	u32 reg = 0x800000c0;
++	u32 *buffer = (u32 *)i1480->cmd_buf;
++
++	if (i1480->hw_rev > 1)
++		reg = 0x8000d0d4;
++	result = i1480->read(i1480, reg, sizeof(u32));
++	if (result < 0)
++		goto error_cmd;
++	*buffer |= i1480_FW_UPLOAD_MODE_MASK;
++	result = i1480->write(i1480, reg, buffer, sizeof(u32));
++	if (result < 0)
++		goto error_cmd;
++	return 0;
++error_cmd:
++	dev_err(i1480->dev, "can't disable fw upload mode: %d\n", result);
++	return result;
++}
++
++
++
++/**
++ * Generic function for uploading a MAC firmware.
++ *
++ * @i1480:     Device instance
++ * @fw_name: Name of firmware file to upload.
++ * @fw_tag:  Name of the firmware type (for messages)
++ *           [eg: MAC, PRE]
++ * @do_wait: Wait for device to emit initialization done message (0
++ *           for PRE fws, 1 for MAC fws).
++ * @returns: 0 if ok, < 0 errno on error.
++ */
++static
++int __mac_fw_upload(struct i1480 *i1480, const char *fw_name,
++		    const char *fw_tag)
++{
++	int result;
++	const struct firmware *fw;
++	struct fw_hdr *fw_hdrs;
++
++	d_fnstart(3, i1480->dev, "(%p, %s, %s)\n", i1480, fw_name, fw_tag);
++	result = request_firmware(&fw, fw_name, i1480->dev);
++	if (result < 0)	/* Up to caller to complain on -ENOENT */
++		goto out;
++	d_printf(3, i1480->dev, "%s fw '%s': uploading\n", fw_tag, fw_name);
++	result = fw_hdrs_load(i1480, &fw_hdrs, fw->data, fw->size);
++	if (result < 0) {
++		dev_err(i1480->dev, "%s fw '%s': failed to parse firmware "
++			"file: %d\n", fw_tag, fw_name, result);
++		goto out_release;
++	}
++	result = mac_fw_upload_enable(i1480);
++	if (result < 0)
++		goto out_hdrs_release;
++	result = mac_fw_hdrs_push(i1480, fw_hdrs, fw_name, fw_tag);
++	mac_fw_upload_disable(i1480);
++out_hdrs_release:
++	if (result >= 0)
++		dev_info(i1480->dev, "%s fw '%s': uploaded\n", fw_tag, fw_name);
++	else
++		dev_err(i1480->dev, "%s fw '%s': failed to upload (%d), "
++			"power cycle device\n", fw_tag, fw_name, result);
++	fw_hdrs_free(fw_hdrs);
++out_release:
++	release_firmware(fw);
++out:
++	d_fnend(3, i1480->dev, "(%p, %s, %s) = %d\n", i1480, fw_name, fw_tag,
++		result);
++	return result;
++}
++
++
++/**
++ * Upload a pre-PHY firmware
++ *
++ */
++int i1480_pre_fw_upload(struct i1480 *i1480)
++{
++	int result;
++	result = __mac_fw_upload(i1480, i1480->pre_fw_name, "PRE");
++	if (result == 0)
++		msleep(400);
++	return result;
++}
++
++
++/**
++ * Reset a the MAC and PHY
++ *
++ * @i1480:     Device's instance
++ * @returns: 0 if ok, < 0 errno code on error
++ *
++ * We put the command on kmalloc'ed memory as some arches cannot do
++ * USB from the stack. The reply event is copied from an stage buffer,
++ * so it can be in the stack. See WUSB1.0[8.6.2.4] for more details.
++ *
++ * We issue the reset to make sure the UWB controller reinits the PHY;
++ * this way we can now if the PHY init went ok.
++ */
++static
++int i1480_cmd_reset(struct i1480 *i1480)
++{
++	int result;
++	struct uwb_rccb *cmd = (void *) i1480->cmd_buf;
++	struct i1480_evt_reset {
++		struct uwb_rceb rceb;
++		u8 bResultCode;
++	} __attribute__((packed)) *reply = (void *) i1480->evt_buf;
++
++	result = -ENOMEM;
++	cmd->bCommandType = UWB_RC_CET_GENERAL;
++	cmd->wCommand = cpu_to_le16(UWB_RC_CMD_RESET);
++	reply->rceb.bEventType = UWB_RC_CET_GENERAL;
++	reply->rceb.wEvent = UWB_RC_CMD_RESET;
++	result = i1480_cmd(i1480, "RESET", sizeof(*cmd), sizeof(*reply));
++	if (result < 0)
++		goto out;
++	if (reply->bResultCode != UWB_RC_RES_SUCCESS) {
++		dev_err(i1480->dev, "RESET: command execution failed: %u\n",
++			reply->bResultCode);
++		result = -EIO;
++	}
++out:
++	return result;
++
++}
++
++
++/** Wait for the MAC FW to start running */
++static
++int i1480_fw_is_running_q(struct i1480 *i1480)
++{
++	int cnt = 0;
++	int result;
++	u32 *val = (u32 *) i1480->cmd_buf;
++
++	d_fnstart(3, i1480->dev, "(i1480 %p)\n", i1480);
++	for (cnt = 0; cnt < 10; cnt++) {
++		msleep(100);
++		result = i1480->read(i1480, 0x80080000, 4);
++		if (result < 0) {
++			dev_err(i1480->dev, "Can't read 0x8008000: %d\n", result);
++			goto out;
++		}
++		if (*val == 0x55555555UL)	/* fw running? cool */
++			goto out;
++		if (printk_ratelimit())
++			d_printf(5, i1480->dev, "read #%d: 0x%08x\n", cnt, *val);
++	}
++	dev_err(i1480->dev, "Timed out waiting for fw to start\n");
++	result = -ETIMEDOUT;
++out:
++	d_fnend(3, i1480->dev, "(i1480 %p) = %d\n", i1480, result);
++	return result;
++
++}
++
++
++/**
++ * Upload MAC firmware, wait for it to start
++ *
++ * @i1480:     Device instance
++ * @fw_name: Name of the file that contains the firmware
++ *
++ * This has to be called after the pre fw has been uploaded (if
++ * there is any).
++ */
++int i1480_mac_fw_upload(struct i1480 *i1480)
++{
++	int result = 0, deprecated_name = 0;
++	struct i1480_rceb *rcebe = (void *) i1480->evt_buf;
++
++	d_fnstart(3, i1480->dev, "(%p)\n", i1480);
++	result = __mac_fw_upload(i1480, i1480->mac_fw_name, "MAC");
++	if (result == -ENOENT) {
++		result = __mac_fw_upload(i1480, i1480->mac_fw_name_deprecate,
++					 "MAC");
++		deprecated_name = 1;
++	}
++	if (result < 0)
++		return result;
++	if (deprecated_name == 1)
++		dev_warn(i1480->dev,
++			 "WARNING: firmware file name %s is deprecated, "
++			 "please rename to %s\n",
++			 i1480->mac_fw_name_deprecate, i1480->mac_fw_name);
++	result = i1480_fw_is_running_q(i1480);
++	if (result < 0)
++		goto error_fw_not_running;
++	result = i1480->rc_setup? i1480->rc_setup(i1480) : 0;
++	if (result < 0) {
++		dev_err(i1480->dev, "Cannot setup after MAC fw upload: %d\n",
++			result);
++		goto error_setup;
++	}
++	result = i1480->wait_init_done(i1480);	/* wait init'on */
++	if (result < 0) {
++		dev_err(i1480->dev, "MAC fw '%s': Initialization timed out "
++			"(%d)\n", i1480->mac_fw_name, result);
++		goto error_init_timeout;
++	}
++	/* verify we got the right initialization done event */
++	if (i1480->evt_result != sizeof(*rcebe)) {
++		dev_err(i1480->dev, "MAC fw '%s': initialization event returns "
++			"wrong size (%zu bytes vs %zu needed)\n",
++			i1480->mac_fw_name, i1480->evt_result, sizeof(*rcebe));
++		dump_bytes(i1480->dev, rcebe, min(i1480->evt_result, (ssize_t)32));
++		goto error_size;
++	}
++	result = -EIO;
++	if (rcebe->rceb.bEventType != i1480_CET_VS1
++	    || le16_to_cpu(rcebe->rceb.wEvent) != i1480_EVT_RM_INIT_DONE) {
++		dev_err(i1480->dev, "wrong initialization event 0x%02x/%04x/%02x "
++			"received; expected 0x%02x/%04x/00\n",
++			rcebe->rceb.bEventType, le16_to_cpu(rcebe->rceb.wEvent),
++			rcebe->rceb.bEventContext, i1480_CET_VS1,
++			i1480_EVT_RM_INIT_DONE);
++		goto error_init_timeout;
++	}
++	result = i1480_cmd_reset(i1480);
++	if (result < 0)
++		dev_err(i1480->dev, "MAC fw '%s': MBOA reset failed (%d)\n",
++			i1480->mac_fw_name, result);
++error_fw_not_running:
++error_init_timeout:
++error_size:
++error_setup:
++	d_fnend(3, i1480->dev, "(i1480 %p) = %d\n", i1480, result);
++	return result;
++}
+--- /dev/null
++++ b/drivers/uwb/i1480/dfu/Makefile
+@@ -0,0 +1,9 @@
++obj-$(CONFIG_UWB_I1480U)	+= i1480-dfu-usb.o
++
++i1480-dfu-usb-objs := \
++	dfu.o 	\
++	mac.o	\
++	phy.o	\
++	usb.o
++
++
+--- /dev/null
++++ b/drivers/uwb/i1480/dfu/phy.c
+@@ -0,0 +1,203 @@
++/*
++ * Intel Wireless UWB Link 1480
++ * PHY parameters upload
++ *
++ * Copyright (C) 2005-2006 Intel Corporation
++ * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ *
++ *
++ * Code for uploading the PHY parameters to the PHY through the UWB
++ * Radio Control interface.
++ *
++ * We just send the data through the MPI interface using HWA-like
++ * commands and then reset the PHY to make sure it is ok.
++ */
++#include <linux/delay.h>
++#include <linux/device.h>
++#include <linux/firmware.h>
++#include <linux/usb/wusb.h>
++#include "i1480-dfu.h"
++
++
++/**
++ * Write a value array to an address of the MPI interface
++ *
++ * @i1480:	Device descriptor
++ * @data:	Data array to write
++ * @size:	Size of the data array
++ * @returns:	0 if ok, < 0 errno code on error.
++ *
++ * The data array is organized into pairs:
++ *
++ * ADDRESS VALUE
++ *
++ * ADDRESS is BE 16 bit unsigned, VALUE 8 bit unsigned. Size thus has
++ * to be a multiple of three.
++ */
++static
++int i1480_mpi_write(struct i1480 *i1480, const void *data, size_t size)
++{
++	int result;
++	struct i1480_cmd_mpi_write *cmd = i1480->cmd_buf;
++	struct i1480_evt_confirm *reply = i1480->evt_buf;
++
++	BUG_ON(size > 480);
++	result = -ENOMEM;
++	cmd->rccb.bCommandType = i1480_CET_VS1;
++	cmd->rccb.wCommand = cpu_to_le16(i1480_CMD_MPI_WRITE);
++	cmd->size = cpu_to_le16(size);
++	memcpy(cmd->data, data, size);
++	reply->rceb.bEventType = i1480_CET_VS1;
++	reply->rceb.wEvent = i1480_CMD_MPI_WRITE;
++	result = i1480_cmd(i1480, "MPI-WRITE", sizeof(*cmd) + size, sizeof(*reply));
++	if (result < 0)
++		goto out;
++	if (reply->bResultCode != UWB_RC_RES_SUCCESS) {
++		dev_err(i1480->dev, "MPI-WRITE: command execution failed: %d\n",
++			reply->bResultCode);
++		result = -EIO;
++	}
++out:
++	return result;
++}
++
++
++/**
++ * Read a value array to from an address of the MPI interface
++ *
++ * @i1480:	Device descriptor
++ * @data:	where to place the read array
++ * @srcaddr:	Where to read from
++ * @size:	Size of the data read array
++ * @returns:	0 if ok, < 0 errno code on error.
++ *
++ * The command data array is organized into pairs ADDR0 ADDR1..., and
++ * the returned data in ADDR0 VALUE0 ADDR1 VALUE1...
++ *
++ * We generate the command array to be a sequential read and then
++ * rearrange the result.
++ *
++ * We use the i1480->cmd_buf for the command, i1480->evt_buf for the reply.
++ *
++ * As the reply has to fit in 512 bytes (i1480->evt_buffer), the max amount
++ * of values we can read is (512 - sizeof(*reply)) / 3
++ */
++static
++int i1480_mpi_read(struct i1480 *i1480, u8 *data, u16 srcaddr, size_t size)
++{
++	int result;
++	struct i1480_cmd_mpi_read *cmd = i1480->cmd_buf;
++	struct i1480_evt_mpi_read *reply = i1480->evt_buf;
++	unsigned cnt;
++
++	memset(i1480->cmd_buf, 0x69, 512);
++	memset(i1480->evt_buf, 0x69, 512);
++
++	BUG_ON(size > (i1480->buf_size - sizeof(*reply)) / 3);
++	result = -ENOMEM;
++	cmd->rccb.bCommandType = i1480_CET_VS1;
++	cmd->rccb.wCommand = cpu_to_le16(i1480_CMD_MPI_READ);
++	cmd->size = cpu_to_le16(3*size);
++	for (cnt = 0; cnt < size; cnt++) {
++		cmd->data[cnt].page = (srcaddr + cnt) >> 8;
++		cmd->data[cnt].offset = (srcaddr + cnt) & 0xff;
++	}
++	reply->rceb.bEventType = i1480_CET_VS1;
++	reply->rceb.wEvent = i1480_CMD_MPI_READ;
++	result = i1480_cmd(i1480, "MPI-READ", sizeof(*cmd) + 2*size,
++			sizeof(*reply) + 3*size);
++	if (result < 0)
++		goto out;
++	if (reply->bResultCode != UWB_RC_RES_SUCCESS) {
++		dev_err(i1480->dev, "MPI-READ: command execution failed: %d\n",
++			reply->bResultCode);
++		result = -EIO;
++	}
++	for (cnt = 0; cnt < size; cnt++) {
++		if (reply->data[cnt].page != (srcaddr + cnt) >> 8)
++			dev_err(i1480->dev, "MPI-READ: page inconsistency at "
++				"index %u: expected 0x%02x, got 0x%02x\n", cnt,
++				(srcaddr + cnt) >> 8, reply->data[cnt].page);
++		if (reply->data[cnt].offset != ((srcaddr + cnt) & 0x00ff))
++			dev_err(i1480->dev, "MPI-READ: offset inconsistency at "
++				"index %u: expected 0x%02x, got 0x%02x\n", cnt,
++				(srcaddr + cnt) & 0x00ff,
++				reply->data[cnt].offset);
++		data[cnt] = reply->data[cnt].value;
++	}
++	result = 0;
++out:
++	return result;
++}
++
++
++/**
++ * Upload a PHY firmware, wait for it to start
++ *
++ * @i1480:     Device instance
++ * @fw_name: Name of the file that contains the firmware
++ *
++ * We assume the MAC fw is up and running. This means we can use the
++ * MPI interface to write the PHY firmware. Once done, we issue an
++ * MBOA Reset, which will force the MAC to reset and reinitialize the
++ * PHY. If that works, we are ready to go.
++ *
++ * Max packet size for the MPI write is 512, so the max buffer is 480
++ * (which gives us 160 byte triads of MSB, LSB and VAL for the data).
++ */
++int i1480_phy_fw_upload(struct i1480 *i1480)
++{
++	int result;
++	const struct firmware *fw;
++	const char *data_itr, *data_top;
++	const size_t MAX_BLK_SIZE = 480;	/* 160 triads */
++	size_t data_size;
++	u8 phy_stat;
++
++	result = request_firmware(&fw, i1480->phy_fw_name, i1480->dev);
++	if (result < 0)
++		goto out;
++	/* Loop writing data in chunks as big as possible until done. */
++	for (data_itr = fw->data, data_top = data_itr + fw->size;
++	     data_itr < data_top; data_itr += MAX_BLK_SIZE) {
++		data_size = min(MAX_BLK_SIZE, (size_t) (data_top - data_itr));
++		result = i1480_mpi_write(i1480, data_itr, data_size);
++		if (result < 0)
++			goto error_mpi_write;
++	}
++	/* Read MPI page 0, offset 6; if 0, PHY was initialized correctly. */
++	result = i1480_mpi_read(i1480, &phy_stat, 0x0006, 1);
++	if (result < 0) {
++		dev_err(i1480->dev, "PHY: can't get status: %d\n", result);
++		goto error_mpi_status;
++	}
++	if (phy_stat != 0) {
++		result = -ENODEV;
++		dev_info(i1480->dev, "error, PHY not ready: %u\n", phy_stat);
++		goto error_phy_status;
++	}
++	dev_info(i1480->dev, "PHY fw '%s': uploaded\n", i1480->phy_fw_name);
++error_phy_status:
++error_mpi_status:
++error_mpi_write:
++	release_firmware(fw);
++	if (result < 0)
++		dev_err(i1480->dev, "PHY fw '%s': failed to upload (%d), "
++			"power cycle device\n", i1480->phy_fw_name, result);
++out:
++	return result;
++}
+--- /dev/null
++++ b/drivers/uwb/i1480/dfu/usb.c
+@@ -0,0 +1,501 @@
++/*
++ * Intel Wireless UWB Link 1480
++ * USB SKU firmware upload implementation
++ *
++ * Copyright (C) 2005-2006 Intel Corporation
++ * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ *
++ *
++ * This driver will prepare the i1480 device to behave as a real
++ * Wireless USB HWA adaptor by uploading the firmware.
++ *
++ * When the device is connected or driver is loaded, i1480_usb_probe()
++ * is called--this will allocate and initialize the device structure,
++ * fill in the pointers to the common functions (read, write,
++ * wait_init_done and cmd for HWA command execution) and once that is
++ * done, call the common firmware uploading routine. Then clean up and
++ * return -ENODEV, as we don't attach to the device.
++ *
++ * The rest are the basic ops we implement that the fw upload code
++ * uses to do its job. All the ops in the common code are i1480->NAME,
++ * the functions are i1480_usb_NAME().
++ */
++#include <linux/module.h>
++#include <linux/version.h>
++#include <linux/usb.h>
++#include <linux/interrupt.h>
++#include <linux/delay.h>
++#include <linux/uwb.h>
++#include <linux/usb/wusb.h>
++#include <linux/usb/wusb-wa.h>
++#include "i1480-dfu.h"
++
++#define D_LOCAL 0
++#include <linux/uwb/debug.h>
++
++
++struct i1480_usb {
++	struct i1480 i1480;
++	struct usb_device *usb_dev;
++	struct usb_interface *usb_iface;
++	struct urb *neep_urb;	/* URB for reading from EP1 */
++};
++
++
++static
++void i1480_usb_init(struct i1480_usb *i1480_usb)
++{
++	i1480_init(&i1480_usb->i1480);
++}
++
++
++static
++int i1480_usb_create(struct i1480_usb *i1480_usb, struct usb_interface *iface)
++{
++	struct usb_device *usb_dev = interface_to_usbdev(iface);
++	int result = -ENOMEM;
++
++	i1480_usb->usb_dev = usb_get_dev(usb_dev);	/* bind the USB device */
++	i1480_usb->usb_iface = usb_get_intf(iface);
++	usb_set_intfdata(iface, i1480_usb);		/* Bind the driver to iface0 */
++	i1480_usb->neep_urb = usb_alloc_urb(0, GFP_KERNEL);
++	if (i1480_usb->neep_urb == NULL)
++		goto error;
++	return 0;
++
++error:
++	usb_set_intfdata(iface, NULL);
++	usb_put_intf(iface);
++	usb_put_dev(usb_dev);
++	return result;
++}
++
++
++static
++void i1480_usb_destroy(struct i1480_usb *i1480_usb)
++{
++	usb_kill_urb(i1480_usb->neep_urb);
++	usb_free_urb(i1480_usb->neep_urb);
++	usb_set_intfdata(i1480_usb->usb_iface, NULL);
++	usb_put_intf(i1480_usb->usb_iface);
++	usb_put_dev(i1480_usb->usb_dev);
++}
++
++
++/**
++ * Write a buffer to a memory address in the i1480 device
++ *
++ * @i1480:  i1480 instance
++ * @memory_address:
++ *          Address where to write the data buffer to.
++ * @buffer: Buffer to the data
++ * @size:   Size of the buffer [has to be < 512].
++ * @returns: 0 if ok, < 0 errno code on error.
++ *
++ * Data buffers to USB cannot be on the stack or in vmalloc'ed areas,
++ * so we copy it to the local i1480 buffer before proceeding. In any
++ * case, we have a max size we can send, soooo.
++ */
++static
++int i1480_usb_write(struct i1480 *i1480, u32 memory_address,
++		    const void *buffer, size_t size)
++{
++	int result = 0;
++	struct i1480_usb *i1480_usb = container_of(i1480, struct i1480_usb, i1480);
++	size_t buffer_size, itr = 0;
++
++	d_fnstart(3, i1480->dev, "(%p, 0x%08x, %p, %zu)\n",
++		  i1480, memory_address, buffer, size);
++	BUG_ON(size & 0x3); /* Needs to be a multiple of 4 */
++	while (size > 0) {
++		buffer_size = size < i1480->buf_size?
++			 size : i1480->buf_size;
++		memcpy(i1480->cmd_buf, buffer + itr, buffer_size);
++		result = usb_control_msg(
++			i1480_usb->usb_dev, usb_sndctrlpipe(i1480_usb->usb_dev, 0),
++			0xf0, USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
++			cpu_to_le16(memory_address & 0xffff),
++			cpu_to_le16((memory_address >> 16) & 0xffff),
++			i1480->cmd_buf, buffer_size, 100 /* FIXME: arbitrary */);
++		if (result < 0)
++			break;
++		d_printf(3, i1480->dev,
++			 "wrote @ 0x%08x %u bytes (of %zu bytes requested)\n",
++			 memory_address, result, buffer_size);
++		d_dump(4, i1480->dev, i1480->cmd_buf, result);
++		itr += result;
++		memory_address += result;
++		size -= result;
++	}
++	d_fnend(3, i1480->dev, "(%p, 0x%08x, %p, %zu) = %d\n",
++		i1480, memory_address, buffer, size, result);
++	return result;
++}
++
++
++/**
++ * Read a block [max size 512] of the device's memory to @i1480's buffer.
++ *
++ * @i1480: i1480 instance
++ * @memory_address:
++ *         Address where to read from.
++ * @size:  Size to read. Smaller than or equal to 512.
++ * @returns: >= 0 number of bytes written if ok, < 0 errno code on error.
++ *
++ * NOTE: if the memory address or block is incorrect, you might get a
++ *       stall or a different memory read. Caller has to verify the
++ *       memory address and size passed back in the @neh structure.
++ */
++static
++int i1480_usb_read(struct i1480 *i1480, u32 addr, size_t size)
++{
++	ssize_t result = 0, bytes = 0;
++	size_t itr, read_size = i1480->buf_size;
++	struct i1480_usb *i1480_usb = container_of(i1480, struct i1480_usb, i1480);
++
++	d_fnstart(3, i1480->dev, "(%p, 0x%08x, %zu)\n",
++		  i1480, addr, size);
++	BUG_ON(size > i1480->buf_size);
++	BUG_ON(size & 0x3); /* Needs to be a multiple of 4 */
++	BUG_ON(read_size > 512);
++
++	if (addr >= 0x8000d200 && addr < 0x8000d400)	/* Yeah, HW quirk */
++		read_size = 4;
++
++	for (itr = 0; itr < size; itr += read_size) {
++		size_t itr_addr = addr + itr;
++		size_t itr_size = min(read_size, size - itr);
++		result = usb_control_msg(
++			i1480_usb->usb_dev, usb_rcvctrlpipe(i1480_usb->usb_dev, 0),
++			0xf0, USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
++			cpu_to_le16(itr_addr & 0xffff),
++			cpu_to_le16((itr_addr >> 16) & 0xffff),
++			i1480->cmd_buf + itr, itr_size,
++			100 /* FIXME: arbitrary */);
++		if (result < 0) {
++			dev_err(i1480->dev, "%s: USB read error: %zd\n",
++				__func__, result);
++			goto out;
++		}
++		if (result != itr_size) {
++			result = -EIO;
++			dev_err(i1480->dev,
++				"%s: partial read got only %zu bytes vs %zu expected\n",
++				__func__, result, itr_size);
++			goto out;
++		}
++		bytes += result;
++	}
++	result = bytes;
++out:
++	d_fnend(3, i1480->dev, "(%p, 0x%08x, %zu) = %zd\n",
++		i1480, addr, size, result);
++	if (result > 0)
++		d_dump(4, i1480->dev, i1480->cmd_buf, result);
++	return result;
++}
++
++
++/**
++ * Callback for reads on the notification/event endpoint
++ *
++ * Just enables the completion read handler.
++ */
++static
++void i1480_usb_neep_cb(struct urb *urb)
++{
++	struct i1480 *i1480 = urb->context;
++	struct device *dev = i1480->dev;
++
++	switch (urb->status) {
++	case 0:
++		break;
++	case -ECONNRESET:	/* Not an error, but a controlled situation; */
++	case -ENOENT:		/* (we killed the URB)...so, no broadcast */
++		dev_dbg(dev, "NEEP: reset/noent %d\n", urb->status);
++		break;
++	case -ESHUTDOWN:	/* going away! */
++		dev_dbg(dev, "NEEP: down %d\n", urb->status);
++		break;
++	default:
++		dev_err(dev, "NEEP: unknown status %d\n", urb->status);
++		break;
++	}
++	i1480->evt_result = urb->actual_length;
++	complete(&i1480->evt_complete);
++	return;
++}
++
++
++/**
++ * Wait for the MAC FW to initialize
++ *
++ * MAC FW sends a 0xfd/0101/00 notification to EP1 when done
++ * initializing. Get that notification into i1480->evt_buf; upper layer
++ * will verify it.
++ *
++ * Set i1480->evt_result with the result of getting the event or its
++ * size (if succesful).
++ *
++ * Delivers the data directly to i1480->evt_buf
++ */
++static
++int i1480_usb_wait_init_done(struct i1480 *i1480)
++{
++	int result;
++	struct device *dev = i1480->dev;
++	struct i1480_usb *i1480_usb = container_of(i1480, struct i1480_usb, i1480);
++	struct usb_endpoint_descriptor *epd;
++
++	d_fnstart(3, dev, "(%p)\n", i1480);
++	init_completion(&i1480->evt_complete);
++	i1480->evt_result = -EINPROGRESS;
++	epd = &i1480_usb->usb_iface->cur_altsetting->endpoint[0].desc;
++	usb_fill_int_urb(i1480_usb->neep_urb, i1480_usb->usb_dev,
++			 usb_rcvintpipe(i1480_usb->usb_dev, epd->bEndpointAddress),
++			 i1480->evt_buf, i1480->buf_size,
++			 i1480_usb_neep_cb, i1480, epd->bInterval);
++	result = usb_submit_urb(i1480_usb->neep_urb, GFP_KERNEL);
++	if (result < 0) {
++		dev_err(dev, "init done: cannot submit NEEP read: %d\n",
++			result);
++		goto error_submit;
++	}
++	/* Wait for the USB callback to get the data */
++	result = wait_for_completion_interruptible_timeout(
++		&i1480->evt_complete, HZ);
++	if (result <= 0) {
++		result = result == 0? -ETIMEDOUT : result;
++		goto error_wait;
++	}
++	usb_kill_urb(i1480_usb->neep_urb);
++	d_fnend(3, dev, "(%p) = 0\n", i1480);
++	return 0;
++
++error_wait:
++	usb_kill_urb(i1480_usb->neep_urb);
++error_submit:
++	i1480->evt_result = result;
++	d_fnend(3, dev, "(%p) = %d\n", i1480, result);
++	return result;
++}
++
++
++/**
++ * Generic function for issuing commands to the i1480
++ *
++ * @i1480:      i1480 instance
++ * @cmd_name:   Name of the command (for error messages)
++ * @cmd:        Pointer to command buffer
++ * @cmd_size:   Size of the command buffer
++ * @reply:      Buffer for the reply event
++ * @reply_size: Expected size back (including RCEB); the reply buffer
++ *              is assumed to be as big as this.
++ * @returns:    >= 0 size of the returned event data if ok,
++ *              < 0 errno code on error.
++ *
++ * Arms the NE handle, issues the command to the device and checks the
++ * basics of the reply event.
++ */
++static
++int i1480_usb_cmd(struct i1480 *i1480, const char *cmd_name, size_t cmd_size)
++{
++	int result;
++	struct device *dev = i1480->dev;
++	struct i1480_usb *i1480_usb = container_of(i1480, struct i1480_usb, i1480);
++	struct usb_endpoint_descriptor *epd;
++	struct uwb_rccb *cmd = i1480->cmd_buf;
++	u8 iface_no;
++
++	d_fnstart(3, dev, "(%p, %s, %zu)\n", i1480, cmd_name, cmd_size);
++	/* Post a read on the notification & event endpoint */
++	iface_no = i1480_usb->usb_iface->cur_altsetting->desc.bInterfaceNumber;
++	epd = &i1480_usb->usb_iface->cur_altsetting->endpoint[0].desc;
++	usb_fill_int_urb(
++		i1480_usb->neep_urb, i1480_usb->usb_dev,
++		usb_rcvintpipe(i1480_usb->usb_dev, epd->bEndpointAddress),
++		i1480->evt_buf, i1480->buf_size,
++		i1480_usb_neep_cb, i1480, epd->bInterval);
++	result = usb_submit_urb(i1480_usb->neep_urb, GFP_KERNEL);
++	if (result < 0) {
++		dev_err(dev, "%s: cannot submit NEEP read: %d\n",
++			cmd_name, result);
++			goto error_submit_ep1;
++	}
++	/* Now post the command on EP0 */
++	result = usb_control_msg(
++		i1480_usb->usb_dev, usb_sndctrlpipe(i1480_usb->usb_dev, 0),
++		WA_EXEC_RC_CMD,
++		USB_DIR_OUT | USB_RECIP_INTERFACE | USB_TYPE_CLASS,
++		0, iface_no,
++		cmd, cmd_size,
++		100 /* FIXME: this is totally arbitrary */);
++	if (result < 0) {
++		dev_err(dev, "%s: control request failed: %d\n",
++			cmd_name, result);
++		goto error_submit_ep0;
++	}
++	d_fnend(3, dev, "(%p, %s, %zu) = %d\n",
++		i1480, cmd_name, cmd_size, result);
++	return result;
++
++error_submit_ep0:
++	usb_kill_urb(i1480_usb->neep_urb);
++error_submit_ep1:
++	d_fnend(3, dev, "(%p, %s, %zu) = %d\n",
++		i1480, cmd_name, cmd_size, result);
++	return result;
++}
++
++
++/*
++ * Probe a i1480 device for uploading firmware.
++ *
++ * We attach only to interface #0, which is the radio control interface.
++ */
++static
++int i1480_usb_probe(struct usb_interface *iface, const struct usb_device_id *id)
++{
++	struct i1480_usb *i1480_usb;
++	struct i1480 *i1480;
++	struct device *dev = &iface->dev;
++	int result;
++
++	result = -ENODEV;
++	if (iface->cur_altsetting->desc.bInterfaceNumber != 0) {
++		dev_dbg(dev, "not attaching to iface %d\n",
++			iface->cur_altsetting->desc.bInterfaceNumber);
++		goto error;
++	}
++	if (iface->num_altsetting > 1
++	    && interface_to_usbdev(iface)->descriptor.idProduct == 0xbabe) {
++		/* Need altsetting #1 [HW QUIRK] or EP1 won't work */
++		result = usb_set_interface(interface_to_usbdev(iface), 0, 1);
++		if (result < 0)
++			dev_warn(dev,
++				 "can't set altsetting 1 on iface 0: %d\n",
++				 result);
++	}
++
++	result = -ENOMEM;
++	i1480_usb = kzalloc(sizeof(*i1480_usb), GFP_KERNEL);
++	if (i1480_usb == NULL) {
++		dev_err(dev, "Unable to allocate instance\n");
++		goto error;
++	}
++	i1480_usb_init(i1480_usb);
++
++	i1480 = &i1480_usb->i1480;
++	i1480->buf_size = 512;
++	i1480->cmd_buf = kmalloc(2 * i1480->buf_size, GFP_KERNEL);
++	if (i1480->cmd_buf == NULL) {
++		dev_err(dev, "Cannot allocate transfer buffers\n");
++		result = -ENOMEM;
++		goto error_buf_alloc;
++	}
++	i1480->evt_buf = i1480->cmd_buf + i1480->buf_size;
++
++	result = i1480_usb_create(i1480_usb, iface);
++	if (result < 0) {
++		dev_err(dev, "Cannot create instance: %d\n", result);
++		goto error_create;
++	}
++
++	/* setup the fops and upload the firmare */
++	i1480->pre_fw_name = "i1480-pre-phy-0.0.bin";
++	i1480->mac_fw_name = "i1480-usb-0.0.bin";
++	i1480->mac_fw_name_deprecate = "ptc-0.0.bin";
++	i1480->phy_fw_name = "i1480-phy-0.0.bin";
++	i1480->dev = &iface->dev;
++	i1480->write = i1480_usb_write;
++	i1480->read = i1480_usb_read;
++	i1480->rc_setup = NULL;
++	i1480->wait_init_done = i1480_usb_wait_init_done;
++	i1480->cmd = i1480_usb_cmd;
++
++	result = i1480_fw_upload(&i1480_usb->i1480);	/* the real thing */
++	if (result >= 0) {
++		usb_reset_device(i1480_usb->usb_dev);
++		result = -ENODEV;	/* we don't want to bind to the iface */
++	}
++	i1480_usb_destroy(i1480_usb);
++error_create:
++	kfree(i1480->cmd_buf);
++error_buf_alloc:
++	kfree(i1480_usb);
++error:
++	return result;
++}
++
++#define i1480_USB_DEV(v, p)				\
++{							\
++	.match_flags = USB_DEVICE_ID_MATCH_DEVICE	\
++		 | USB_DEVICE_ID_MATCH_DEV_INFO		\
++		 | USB_DEVICE_ID_MATCH_INT_INFO,	\
++	.idVendor = (v),				\
++	.idProduct = (p),				\
++	.bDeviceClass = 0xff,				\
++	.bDeviceSubClass = 0xff,			\
++	.bDeviceProtocol = 0xff,			\
++	.bInterfaceClass = 0xff,			\
++	.bInterfaceSubClass = 0xff,			\
++	.bInterfaceProtocol = 0xff,			\
++}
++
++
++/** USB device ID's that we handle */
++static struct usb_device_id i1480_usb_id_table[] = {
++	i1480_USB_DEV(0x8086, 0xdf3b),
++	i1480_USB_DEV(0x15a9, 0x0005),
++	i1480_USB_DEV(0x07d1, 0x3802),
++	i1480_USB_DEV(0x050d, 0x305a),
++	i1480_USB_DEV(0x3495, 0x3007),
++	{},
++};
++MODULE_DEVICE_TABLE(usb, i1480_usb_id_table);
++
++
++static struct usb_driver i1480_dfu_driver = {
++	.name =		"i1480-dfu-usb",
++	.id_table =	i1480_usb_id_table,
++	.probe =	i1480_usb_probe,
++	.disconnect =	NULL,
++};
++
++
++/*
++ * Initialize the i1480 DFU driver.
++ *
++ * We also need to register our function for guessing event sizes.
++ */
++static int __init i1480_dfu_driver_init(void)
++{
++	return usb_register(&i1480_dfu_driver);
++}
++module_init(i1480_dfu_driver_init);
++
++
++static void __exit i1480_dfu_driver_exit(void)
++{
++	usb_deregister(&i1480_dfu_driver);
++}
++module_exit(i1480_dfu_driver_exit);
++
++
++MODULE_AUTHOR("Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>");
++MODULE_DESCRIPTION("Intel Wireless UWB Link 1480 firmware uploader for USB");
++MODULE_LICENSE("GPL");
+--- /dev/null
++++ b/drivers/uwb/i1480/i1480-est.c
+@@ -0,0 +1,99 @@
++/*
++ * Intel Wireless UWB Link 1480
++ * Event Size tables for Wired Adaptors
++ *
++ * Copyright (C) 2005-2006 Intel Corporation
++ * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ *
++ *
++ * FIXME: docs
++ */
++
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/usb.h>
++#include <linux/uwb.h>
++#include "dfu/i1480-dfu.h"
++
++
++/** Event size table for wEvents 0x00XX */
++static struct uwb_est_entry i1480_est_fd00[] = {
++	/* Anybody expecting this response has to use
++	 * neh->extra_size to specify the real size that will
++	 * come back. */
++	[i1480_EVT_CONFIRM] = { .size = sizeof(struct i1480_evt_confirm) },
++	[i1480_CMD_SET_IP_MAS] = { .size = sizeof(struct i1480_evt_confirm) },
++#ifdef i1480_RCEB_EXTENDED
++	[0x09] = {
++		.size = sizeof(struct i1480_rceb),
++		.offset = 1 + offsetof(struct i1480_rceb, wParamLength),
++	},
++#endif
++};
++
++/** Event size table for wEvents 0x01XX */
++static struct uwb_est_entry i1480_est_fd01[] = {
++	[0xff & i1480_EVT_RM_INIT_DONE] = { .size = sizeof(struct i1480_rceb) },
++	[0xff & i1480_EVT_DEV_ADD] = { .size = sizeof(struct i1480_rceb) + 9 },
++	[0xff & i1480_EVT_DEV_RM] = { .size = sizeof(struct i1480_rceb) + 9 },
++	[0xff & i1480_EVT_DEV_ID_CHANGE] = {
++		.size = sizeof(struct i1480_rceb) + 2 },
++};
++
++static int i1480_est_init(void)
++{
++	int result = uwb_est_register(i1480_CET_VS1, 0x00, 0x8086, 0x0c3b,
++				      i1480_est_fd00,
++				      ARRAY_SIZE(i1480_est_fd00));
++	if (result < 0) {
++		printk(KERN_ERR "Can't register EST table fd00: %d\n", result);
++		return result;
++	}
++	result = uwb_est_register(i1480_CET_VS1, 0x01, 0x8086, 0x0c3b,
++				  i1480_est_fd01, ARRAY_SIZE(i1480_est_fd01));
++	if (result < 0) {
++		printk(KERN_ERR "Can't register EST table fd01: %d\n", result);
++		return result;
++	}
++	return 0;
++}
++module_init(i1480_est_init);
++
++static void i1480_est_exit(void)
++{
++	uwb_est_unregister(i1480_CET_VS1, 0x00, 0x8086, 0x0c3b,
++			   i1480_est_fd00, ARRAY_SIZE(i1480_est_fd00));
++	uwb_est_unregister(i1480_CET_VS1, 0x01, 0x8086, 0x0c3b,
++			   i1480_est_fd01, ARRAY_SIZE(i1480_est_fd01));
++}
++module_exit(i1480_est_exit);
++
++MODULE_AUTHOR("Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>");
++MODULE_DESCRIPTION("i1480's Vendor Specific Event Size Tables");
++MODULE_LICENSE("GPL");
++
++/**
++ * USB device ID's that we handle
++ *
++ * [so we are loaded when this kind device is connected]
++ */
++static struct usb_device_id i1480_est_id_table[] = {
++	{ USB_DEVICE(0x8086, 0xdf3b), },
++	{ USB_DEVICE(0x8086, 0x0c3b), },
++	{ },
++};
++MODULE_DEVICE_TABLE(usb, i1480_est_id_table);
+--- /dev/null
++++ b/drivers/uwb/i1480/Makefile
+@@ -0,0 +1 @@
++obj-$(CONFIG_UWB_I1480U)	+= dfu/ i1480-est.o
+--- a/drivers/uwb/Kconfig
++++ b/drivers/uwb/Kconfig
+@@ -64,4 +64,16 @@ config UWB_WLP
+ 	  This is a common library for drivers that implement
+ 	  networking over UWB.
+ 
++config UWB_I1480U
++        tristate "Support for Intel Wireless UWB Link 1480 HWA"
++        depends on UWB_HWA
++        select FW_LOADER
++        help
++         This driver enables support for the i1480 when connected via
++         USB. It consists of a firmware uploader that will enable it
++         to behave as an HWA device.
++
++         To compile this driver select Y (built in) or M (module). It
++         is safe to select any even if you do not have the hardware.
++
+ endif # UWB
+--- a/drivers/uwb/Makefile
++++ b/drivers/uwb/Makefile
+@@ -2,6 +2,7 @@ obj-$(CONFIG_UWB)		+= uwb.o
+ obj-$(CONFIG_UWB_WLP)		+= wlp/
+ obj-$(CONFIG_UWB_WHCI)		+= umc.o whci.o whc-rc.o
+ obj-$(CONFIG_UWB_HWA)		+= hwa-rc.o
++obj-$(CONFIG_UWB_I1480U)	+= i1480/
+ 
+ uwb-objs :=		\
+ 	address.o	\

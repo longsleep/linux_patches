@@ -1,0 +1,413 @@
+uwb: add the driver to enumerate WHCI capabilities
+
+From: David Vrabel <david.vrabel@csr.com>
+
+This enumerates the capabilties of a WHCI device, adding a umc device for
+each one.
+
+Signed-off-by: David Vrabel <david.vrabel@csr.com>
+---
+ drivers/uwb/Makefile     |    2 
+ drivers/uwb/whci.c       |  267 +++++++++++++++++++++++++++++++++++++++++++++++
+ include/linux/uwb/whci.h |  117 ++++++++++++++++++++
+ 3 files changed, 385 insertions(+), 1 deletion(-)
+
+--- a/drivers/uwb/Makefile
++++ b/drivers/uwb/Makefile
+@@ -1,5 +1,5 @@
+ obj-$(CONFIG_UWB)		+= uwb.o
+-obj-$(CONFIG_UWB_WHCI)		+= umc.o
++obj-$(CONFIG_UWB_WHCI)		+= umc.o whci.o
+ 
+ uwb-objs :=		\
+ 	address.o	\
+--- /dev/null
++++ b/drivers/uwb/whci.c
+@@ -0,0 +1,267 @@
++/*
++ * WHCI UWB Multi-interface Controller enumerator.
++ *
++ * Copyright (C) 2007 Cambridge Silicon Radio Ltd.
++ *
++ * This file is released under the GNU GPL v2.
++ */
++#include <linux/delay.h>
++#include <linux/kernel.h>
++#include <linux/pci.h>
++#include <linux/dma-mapping.h>
++#include <linux/uwb/whci.h>
++#include <linux/uwb/umc.h>
++
++struct whci_card {
++	struct pci_dev *pci;
++	void __iomem *uwbbase;
++	u8 n_caps;
++	struct umc_dev *devs[0];
++};
++
++
++/* Fix faulty HW :( */
++static
++u64 whci_capdata_quirks(struct whci_card *card, u64 capdata)
++{
++	u64 capdata_orig = capdata;
++	struct pci_dev *pci_dev = card->pci;
++	if (pci_dev->vendor == PCI_VENDOR_ID_INTEL
++	    && (pci_dev->device == 0x0c3b || pci_dev->device == 0004)
++	    && pci_dev->class == 0x0d1010) {
++		switch (UWBCAPDATA_TO_CAP_ID(capdata)) {
++			/* NIC capability has 0x100 bytes of aperture */
++		case 0x80: capdata |= 0x40 << 8; break;
++			/* WUSB capability has 0x80 bytes of aperture
++			 * and ID is 1 */
++		case 0x02:
++			capdata &= ~0xffff;
++			capdata |= 0x2001;
++			break;
++		}
++	}
++	if (capdata_orig != capdata)
++		dev_warn(&pci_dev->dev,
++			 "PCI v%04x d%04x c%06x#%02x: "
++			 "corrected capdata from %016Lx to %016Lx\n",
++			 pci_dev->vendor, pci_dev->device, pci_dev->class,
++			 (unsigned)UWBCAPDATA_TO_CAP_ID(capdata),
++			 (unsigned long long)capdata_orig,
++			 (unsigned long long)capdata);
++	return capdata;
++}
++
++
++/**
++ * whci_wait_for - wait for a WHCI register to be set
++ *
++ * Polls (for at most @max_ms ms) until '*@reg & @mask == @result'.
++ */
++int whci_wait_for(struct device *dev, u32 __iomem *reg, u32 mask, u32 result,
++	unsigned long max_ms, const char *tag)
++{
++	unsigned t = 0;
++	u32 val;
++	for (;;) {
++		val = le_readl(reg);
++		if ((val & mask) == result)
++			break;
++		msleep(10);
++		if (t >= max_ms) {
++			dev_err(dev, "timed out waiting for %s ", tag);
++			return -ETIMEDOUT;
++		}
++		t += 10;
++	}
++	return 0;
++}
++EXPORT_SYMBOL_GPL(whci_wait_for);
++
++
++/*
++ * NOTE: the capinfo and capdata registers are slightly different
++ *       (size and cap-id fields). So for cap #0, we need to fill
++ *       in. Size comes from the size of the register block
++ *       (statically calculated); cap_id comes from nowhere, we use
++ *       zero, that is reserved, for the radio controller, because
++ *       none was defined at the spec level.
++ */
++static int whci_add_cap(struct whci_card *card, int n)
++{
++	struct umc_dev *umc;
++	u64 capdata;
++	int bar, err;
++
++	umc = umc_device_create(&card->pci->dev, n);
++	if (umc == NULL)
++		return -ENOMEM;
++
++	capdata = le_readq(card->uwbbase + UWBCAPDATA(n));
++
++	bar = UWBCAPDATA_TO_BAR(capdata) << 1;
++
++	capdata = whci_capdata_quirks(card, capdata);
++	/* Capability 0 is the radio controller. It's size is 32
++	 * bytes (WHCI0.95[2.3, T2-9]). */
++	umc->version         = UWBCAPDATA_TO_VERSION(capdata);
++	umc->cap_id          = n == 0? 0 : UWBCAPDATA_TO_CAP_ID(capdata);
++	umc->bar	     = bar;
++	umc->resource.start  = pci_resource_start(card->pci, bar)
++		+ UWBCAPDATA_TO_OFFSET(capdata);
++	umc->resource.end    = umc->resource.start
++		+ (n == 0? 0x20 : UWBCAPDATA_TO_SIZE(capdata)) - 1;
++	umc->resource.name   = umc->dev.bus_id;
++	umc->resource.flags  = card->pci->resource[bar].flags;
++	umc->resource.parent = &card->pci->resource[bar];
++	umc->irq             = card->pci->irq;
++
++	err = umc_device_register(umc);
++	if (err < 0)
++		goto error;
++	card->devs[n] = umc;
++	return 0;
++
++error:
++	kfree(umc);
++	return err;
++}
++
++static void whci_del_cap(struct whci_card *card, int n)
++{
++	struct umc_dev *umc = card->devs[n];
++
++	if (umc != NULL)
++		umc_device_unregister(umc);
++}
++
++static int whci_n_caps(struct pci_dev *pci)
++{
++	void __iomem *uwbbase;
++	u64 capinfo;
++
++	uwbbase = pci_iomap(pci, 0, 8);
++	if (!uwbbase)
++		return -ENOMEM;
++	capinfo = le_readq(uwbbase + UWBCAPINFO);
++	pci_iounmap(pci, uwbbase);
++
++	return UWBCAPINFO_TO_N_CAPS(capinfo);
++}
++
++static int whci_probe(struct pci_dev *pci, const struct pci_device_id *id)
++{
++	struct whci_card *card;
++	int err, n_caps, n;
++
++	err = pci_enable_device(pci);
++	if (err < 0)
++		goto error;
++	pci_enable_msi(pci);
++	pci_set_master(pci);
++	err = -ENXIO;
++	if (!pci_set_dma_mask(pci, DMA_64BIT_MASK))
++		pci_set_consistent_dma_mask(pci, DMA_64BIT_MASK);
++	else if (!pci_set_dma_mask(pci, DMA_32BIT_MASK))
++		pci_set_consistent_dma_mask(pci, DMA_32BIT_MASK);
++	else
++		goto error_dma;
++
++	err = n_caps = whci_n_caps(pci);
++	if (n_caps < 0)
++		goto error_ncaps;
++
++	err = -ENOMEM;
++	card = kzalloc(sizeof(struct whci_card)
++		       + sizeof(struct whci_dev *) * (n_caps + 1),
++		       GFP_KERNEL);
++	if (card == NULL)
++		goto error_kzalloc;
++	card->pci = pci;
++	card->n_caps = n_caps;
++
++	err = -EBUSY;
++	if (!request_mem_region(pci_resource_start(pci, 0),
++				UWBCAPDATA_SIZE(card->n_caps),
++				"whci (capability data)"))
++		goto error_request_memregion;
++	err = -ENOMEM;
++	card->uwbbase = pci_iomap(pci, 0, UWBCAPDATA_SIZE(card->n_caps));
++	if (!card->uwbbase)
++		goto error_iomap;
++
++	/* Add each capability. */
++	for (n = 0; n <= card->n_caps; n++) {
++		err = whci_add_cap(card, n);
++		if (err < 0 && n == 0) {
++			dev_err(&pci->dev, "cannot bind UWB radio controller:"
++				" %d\n", err);
++			goto error_bind;
++		}
++		if (err < 0)
++			dev_warn(&pci->dev, "warning: cannot bind capability "
++				 "#%u: %d\n", n, err);
++	}
++	pci_set_drvdata(pci, card);
++	return 0;
++
++error_bind:
++	pci_iounmap(pci, card->uwbbase);
++error_iomap:
++	release_mem_region(pci_resource_start(pci, 0), UWBCAPDATA_SIZE(card->n_caps));
++error_request_memregion:
++	kfree(card);
++error_kzalloc:
++error_ncaps:
++error_dma:
++	pci_disable_device(pci);
++error:
++	return err;
++}
++
++static void whci_remove(struct pci_dev *pci)
++{
++	struct whci_card *card = pci_get_drvdata(pci);
++	int n;
++
++	pci_set_drvdata(pci, NULL);
++	/* Unregister each capability in reverse (so the master device
++	 * is unregistered last). */
++	for (n = card->n_caps; n >= 0 ; n--)
++		whci_del_cap(card, n);
++	pci_iounmap(pci, card->uwbbase);
++	release_mem_region(pci_resource_start(pci, 0), UWBCAPDATA_SIZE(card->n_caps));
++	kfree(card);
++	pci_disable_msi(pci);
++	pci_disable_device(pci);
++}
++
++static struct pci_device_id whci_id_table[] = {
++	{ PCI_DEVICE_CLASS(PCI_CLASS_WIRELESS_WHCI, ~0) },
++	{ 0 },
++};
++MODULE_DEVICE_TABLE(pci, whci_id_table);
++
++
++static struct pci_driver whci_driver = {
++	.name     = "whci",
++	.id_table = whci_id_table,
++	.probe    = whci_probe,
++	.remove   = whci_remove,
++};
++
++static int __init whci_init(void)
++{
++	return pci_register_driver(&whci_driver);
++}
++
++static void __exit whci_exit(void)
++{
++	pci_unregister_driver(&whci_driver);
++}
++
++module_init(whci_init);
++module_exit(whci_exit);
++
++MODULE_DESCRIPTION("WHCI UWB Multi-interface Controller enumerator");
++MODULE_AUTHOR("Cambridge Silicon Radio Ltd.");
++MODULE_LICENSE("GPL");
+--- /dev/null
++++ b/include/linux/uwb/whci.h
+@@ -0,0 +1,117 @@
++/*
++ * Wireless Host Controller Interface for Ultra-Wide-Band and Wireless USB
++ *
++ * Copyright (C) 2005-2006 Intel Corporation
++ * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ *
++ *
++ *
++ * References:
++ *   [WHCI] Wireless Host Controller Interface Specification for
++ *          Certified Wireless Universal Serial Bus, revision 0.95.
++ */
++#ifndef _LINUX_UWB_WHCI_H_
++#define _LINUX_UWB_WHCI_H_
++
++#include <linux/pci.h>
++
++/*
++ * UWB interface capability registers (offsets from UWBBASE)
++ *
++ * [WHCI] section 2.2
++ */
++#define UWBCAPINFO	0x00 /* == UWBCAPDATA(0) */
++#  define UWBCAPINFO_TO_N_CAPS(c)	(((c) >> 0)  & 0xFull)
++#define UWBCAPDATA(n)	(8*(n))
++#  define UWBCAPDATA_TO_VERSION(c)	(((c) >> 32) & 0xFFFFull)
++#  define UWBCAPDATA_TO_OFFSET(c)	(((c) >> 18) & 0x3FFFull)
++#  define UWBCAPDATA_TO_BAR(c)		(((c) >> 16) & 0x3ull)
++#  define UWBCAPDATA_TO_SIZE(c)		((((c) >> 8) & 0xFFull) * sizeof(u32))
++#  define UWBCAPDATA_TO_CAP_ID(c)	(((c) >> 0)  & 0xFFull)
++
++/* Size of the WHCI capability data (including the RC capability) for
++   a device with n capabilities. */
++#define UWBCAPDATA_SIZE(n) (8 + 8*(n))
++
++
++/*
++ * URC registers (offsets from URCBASE)
++ *
++ * [WHCI] section 2.3
++ */
++#define URCCMD		0x00
++#  define URCCMD_RESET		(1 << 31)  /* UMC Hardware reset */
++#  define URCCMD_RS		(1 << 30)  /* Run/Stop */
++#  define URCCMD_EARV		(1 << 29)  /* Event Address Register Valid */
++#  define URCCMD_ACTIVE		(1 << 15)  /* Command is active */
++#  define URCCMD_IWR		(1 << 14)  /* Interrupt When Ready */
++#  define URCCMD_SIZE_MASK	0x00000fff /* Command size mask */
++#define URCSTS		0x04
++#  define URCSTS_EPS		(1 << 17)  /* Event Processing Status */
++#  define URCSTS_HALTED		(1 << 16)  /* RC halted */
++#  define URCSTS_HSE		(1 << 10)  /* Host System Error...fried */
++#  define URCSTS_ER		(1 <<  9)  /* Event Ready */
++#  define URCSTS_RCI		(1 <<  8)  /* Ready for Command Interrupt */
++#  define URCSTS_INT_MASK	0x00000700 /* URC interrupt sources */
++#  define URCSTS_ISI		0x000000ff /* Interrupt Source Identification */
++#define URCINTR		0x08
++#  define URCINTR_EN_ALL	0x000007ff /* Enable all interrupt sources */
++#define URCCMDADDR	0x10
++#define URCEVTADDR	0x18
++#  define URCEVTADDR_OFFSET_MASK 0xfff    /* Event pointer offset mask */
++
++
++/** Write 32 bit @value to little endian register at @addr */
++static inline
++void le_writel(u32 value, void __iomem *addr)
++{
++	iowrite32(value, addr);
++}
++
++
++/** Read from 32 bit little endian register at @addr */
++static inline
++u32 le_readl(void __iomem *addr)
++{
++	return ioread32(addr);
++}
++
++
++/** Write 64 bit @value to little endian register at @addr */
++static inline
++void le_writeq(u64 value, void __iomem *addr)
++{
++	iowrite32(value, addr);
++	iowrite32(value >> 32, addr + 4);
++}
++
++
++/** Read from 64 bit little endian register at @addr */
++static inline
++u64 le_readq(void __iomem *addr)
++{
++	u64 value;
++	value  = ioread32(addr);
++	value |= (u64)ioread32(addr + 4) << 32;
++	return value;
++}
++
++extern int whci_wait_for(struct device *dev, u32 __iomem *reg,
++			 u32 mask, u32 result,
++			 unsigned long max_ms,  const char *tag);
++
++#endif /* #ifndef _LINUX_UWB_WHCI_H_ */

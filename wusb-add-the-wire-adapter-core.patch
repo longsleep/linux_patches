@@ -1,19 +1,18 @@
-From 38e9695e73afe26e9cfe7d8f10df331682f4b744 Mon Sep 17 00:00:00 2001
-From: Greg Kroah-Hartman <gregkh@suse.de>
-Date: Tue, 8 Apr 2008 13:24:46 -0700
-Subject: WUSB: add the Wire Adapter (WA) core
+wusb: add the Wire Adapter (WA) core
 
-Cc: Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+From: Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
 
+Common code for supporting Host Wire Adapters and Device Wire Adapters.
+
+Signed-off-by: David Vrabel <david.vrabel@csr.com>
 ---
  drivers/usb/wusbcore/Makefile   |    6 
  drivers/usb/wusbcore/wa-hc.c    |   83 +
- drivers/usb/wusbcore/wa-hc.h    |  420 +++++++++
+ drivers/usb/wusbcore/wa-hc.h    |  416 +++++++++
  drivers/usb/wusbcore/wa-nep.c   |  313 +++++++
- drivers/usb/wusbcore/wa-rpipe.c |  548 ++++++++++++
- drivers/usb/wusbcore/wa-xfer.c  | 1710 ++++++++++++++++++++++++++++++++++++++++
- 6 files changed, 3080 insertions(+)
+ drivers/usb/wusbcore/wa-rpipe.c |  562 +++++++++++++
+ drivers/usb/wusbcore/wa-xfer.c  | 1709 ++++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 3089 insertions(+)
 
 --- a/drivers/usb/wusbcore/Makefile
 +++ b/drivers/usb/wusbcore/Makefile
@@ -120,7 +119,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +MODULE_LICENSE("GPL");
 --- /dev/null
 +++ b/drivers/usb/wusbcore/wa-hc.h
-@@ -0,0 +1,420 @@
+@@ -0,0 +1,416 @@
 +/*
 + * HWA Host Controller Driver
 + * Wire Adapter Control/Data Streaming Iface (WUSB1.0[8])
@@ -221,9 +220,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + * @descr's fields are kept in LE, as we need to send it back and
 + * forth.
 + *
-+ * @mutex has to be a mutex because we cannot operate on the rpipe
-+ * with an spinlock, as we have to wait.
-+ *
 + * @wa is referenced when set
 + *
 + * @segs_available is the number of requests segments that still can
@@ -237,7 +233,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + */
 +struct wa_rpipe {
 +	struct kref refcnt;
-+	struct semaphore mutex;
 +	struct usb_rpipe_descriptor descr;
 +	struct usb_host_endpoint *ep;
 +	struct wahc *wa;
@@ -302,10 +297,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	atomic_t notifs_queued;
 +
-+	struct mutex rpipe_lock;	/* protects rpipe_bm */
-+	unsigned long *rpipe_bm;	/* rpipe usage bitmap */
 +	u16 rpipes;
-+	struct semaphore rpipe_sem;	/* assigning resources to endpoints */
++	unsigned long *rpipe_bm;	/* rpipe usage bitmap */
++	spinlock_t rpipe_bm_lock;	/* protect rpipe_bm */
++	struct mutex rpipe_mutex;	/* assigning resources to endpoints */
 +
 +	struct urb *dti_urb;		/* URB for reading xfer results */
 +	struct urb *buf_in_urb;		/* URB for reading data in */
@@ -358,8 +353,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +/* RPipes */
 +static inline void wa_rpipe_init(struct wahc *wa)
 +{
-+	mutex_init(&wa->rpipe_lock);
-+	sema_init(&wa->rpipe_sem, 1);
++	spin_lock_init(&wa->rpipe_bm_lock);
++	mutex_init(&wa->rpipe_mutex);
 +}
 +
 +static inline void wa_init(struct wahc *wa)
@@ -859,7 +854,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +}
 --- /dev/null
 +++ b/drivers/usb/wusbcore/wa-rpipe.c
-@@ -0,0 +1,548 @@
+@@ -0,0 +1,562 @@
 +/*
 + * WUSB Wire Adapter
 + * rpipe management
@@ -903,8 +898,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + * are done transferring, you drop that reference. At the end the
 + * rpipe is always allocated and bound to the endpoint. There it might
 + * be recycled when not used.
-+ *
-+ * Before transmiting requests to an rpipe, be sure to lock rpipe->mutex
 + *
 + * Addresses:
 + *
@@ -1008,9 +1001,30 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static void rpipe_init(struct wa_rpipe *rpipe)
 +{
 +	kref_init(&rpipe->refcnt);
-+	sema_init(&rpipe->mutex, 1);
 +	spin_lock_init(&rpipe->seg_lock);
 +	INIT_LIST_HEAD(&rpipe->seg_list);
++}
++
++static unsigned rpipe_get_idx(struct wahc *wa, unsigned rpipe_idx)
++{
++	unsigned flags;
++
++	spin_lock_irqsave(&wa->rpipe_bm_lock, flags);
++	rpipe_idx = find_next_zero_bit(wa->rpipe_bm, wa->rpipes, rpipe_idx);
++	if (rpipe_idx < wa->rpipes)
++		set_bit(rpipe_idx, wa->rpipe_bm);
++	spin_unlock_irqrestore(&wa->rpipe_bm_lock, flags);
++
++	return rpipe_idx;
++}
++
++static void rpipe_put_idx(struct wahc *wa, unsigned rpipe_idx)
++{
++	unsigned flags;
++
++	spin_lock_irqsave(&wa->rpipe_bm_lock, flags);
++	clear_bit(rpipe_idx, wa->rpipe_bm);
++	spin_unlock_irqrestore(&wa->rpipe_bm_lock, flags);
 +}
 +
 +void rpipe_destroy(struct kref *_rpipe)
@@ -1020,7 +1034,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	d_fnstart(1, NULL, "(rpipe %p %u)\n", rpipe, index);
 +	if (rpipe->ep)
 +		rpipe->ep->hcpriv = NULL;
-+	clear_bit(index, rpipe->wa->rpipe_bm);
++	rpipe_put_idx(rpipe->wa, index);
 +	wa_put(rpipe->wa);
 +	kfree(rpipe);
 +	d_fnend(1, NULL, "(rpipe %p %u)\n", rpipe, index);
@@ -1051,24 +1065,20 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		return -ENOMEM;
 +	rpipe_init(rpipe);
 +
-+	mutex_lock(&wa->rpipe_lock);	/* Look for an idle pipe */
-+	rpipe_idx = 0;
++	/* Look for an idle pipe */
 +	for (rpipe_idx = 0; rpipe_idx < wa->rpipes; rpipe_idx++) {
-+		rpipe_idx = find_next_zero_bit(wa->rpipe_bm, wa->rpipes,
-+					       rpipe_idx);
++		rpipe_idx = rpipe_get_idx(wa, rpipe_idx);
 +		if (rpipe_idx >= wa->rpipes)	/* no more pipes :( */
 +			break;
 +		result =  __rpipe_get_descr(wa, &rpipe->descr, rpipe_idx);
-+		if (result < 0) {
++		if (result < 0)
 +			dev_err(dev, "Can't get descriptor for rpipe %u: %d\n",
 +				rpipe_idx, result);
-+			continue;
-+		}
-+		if ((rpipe->descr.bmCharacteristics & crs) != 0)
++		else if ((rpipe->descr.bmCharacteristics & crs) != 0)
 +			goto found;
++		rpipe_put_idx(wa, rpipe_idx);
 +	}
 +	*prpipe = NULL;
-+	mutex_unlock(&wa->rpipe_lock);
 +	kfree(rpipe);
 +	d_fnend(3, dev, "(wa %p crs 0x%02x) = -ENXIO\n", wa, crs);
 +	return -ENXIO;
@@ -1077,7 +1087,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	set_bit(rpipe_idx, wa->rpipe_bm);
 +	rpipe->wa = wa_get(wa);
 +	*prpipe = rpipe;
-+	mutex_unlock(&wa->rpipe_lock);
 +	d_fnstart(3, dev, "(wa %p crs 0x%02x) = 0\n", wa, crs);
 +	return 0;
 +}
@@ -1301,7 +1310,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	d_fnstart(3, dev, "(wa %p ep %p urb %p gfp 0x%08x)\n", wa, ep, urb,
 +		  gfp);
-+	down(&wa->rpipe_sem);
++	mutex_lock(&wa->rpipe_mutex);
 +	rpipe = ep->hcpriv;
 +	if (rpipe != NULL) {
 +		if (CONFIG_BUG == 1) {
@@ -1334,7 +1343,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	}
 +	d_dump(4, dev, &rpipe->descr, sizeof(rpipe->descr));
 +error:
-+	up(&wa->rpipe_sem);
++	mutex_unlock(&wa->rpipe_mutex);
 +	d_fnend(3, dev, "(wa %p ep %p urb %p gfp 0x%08x)\n", wa, ep, urb, gfp);
 +	return result;
 +}
@@ -1381,7 +1390,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	struct device *dev = &wa->usb_iface->dev;
 +	struct wa_rpipe *rpipe;
 +	d_fnstart(2, dev, "(wa %p ep %p)\n", wa, ep);
-+	down(&wa->rpipe_sem);
++	mutex_lock(&wa->rpipe_mutex);
 +	rpipe = ep->hcpriv;
 +	if (rpipe != NULL) {
 +		unsigned rc = atomic_read(&rpipe->refcnt.refcount);
@@ -1403,14 +1412,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +				 wa, index, result);
 +		rpipe_put(rpipe);
 +	}
-+	up(&wa->rpipe_sem);
++	mutex_unlock(&wa->rpipe_mutex);
 +	d_fnend(2, dev, "(wa %p ep %p)\n", wa, ep);
 +	return;
 +}
 +EXPORT_SYMBOL_GPL(rpipe_ep_disable);
 --- /dev/null
 +++ b/drivers/usb/wusbcore/wa-xfer.c
-@@ -0,0 +1,1710 @@
+@@ -0,0 +1,1709 @@
 +/*
 + * WUSB Wire Adapter
 + * Data transfer and URB enqueing
@@ -2437,7 +2446,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	spin_unlock_irqrestore(&xfer->lock, flags);
 +	if (done)
 +		wa_xfer_completion(xfer);
-+	spin_unlock_irqrestore(&xfer->lock, flags);
 +	d_fnend(3, dev, "(wa %p urb %p) = (void) %d\n", wa, urb, result);
 +	return;
 +}

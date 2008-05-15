@@ -1,0 +1,1837 @@
+uwb: add the UWB stack (MLME)
+
+From: Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
+
+Most of the MAC Layer Management Entity (MLME) support: address, beacon, IE
+and scan management.
+
+Signed-off-by: David Vrabel <david.vrabel@csr.com>
+---
+ drivers/uwb/address.c |  374 ++++++++++++++++++++++++++
+ drivers/uwb/beacon.c  |  707 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ drivers/uwb/ie.c      |  570 ++++++++++++++++++++++++++++++++++++++++
+ drivers/uwb/scan.c    |  159 +++++++++++
+ 4 files changed, 1810 insertions(+)
+
+--- /dev/null
++++ b/drivers/uwb/address.c
+@@ -0,0 +1,374 @@
++/*
++ * Ultra Wide Band
++ * Address management
++ *
++ * Copyright (C) 2005-2006 Intel Corporation
++ * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ *
++ *
++ * FIXME: docs
++ */
++
++#include <linux/errno.h>
++#include <linux/module.h>
++#include <linux/device.h>
++#include <linux/random.h>
++#include <linux/etherdevice.h>
++#include <linux/uwb/debug.h>
++#include "uwb-internal.h"
++
++
++/** Device Address Management command */
++struct uwb_rc_cmd_dev_addr_mgmt {
++	struct uwb_rccb rccb;
++	u8 bmOperationType;
++	u8 baAddr[6];
++} __attribute__((packed));
++
++
++/**
++ * Low level command for setting/getting UWB radio's addresses
++ *
++ * @hwarc:	HWA Radio Control interface instance
++ * @bmOperationType:
++ * 		Set/get, MAC/DEV (see WUSB1.0[8.6.2.2])
++ * @baAddr:	address buffer--assumed to have enough data to hold
++ *              the address type requested.
++ * @reply:	Pointer to reply buffer (can be stack allocated)
++ * @returns:	0 if ok, < 0 errno code on error.
++ *
++ * @cmd has to be allocated because USB cannot grok USB or vmalloc
++ * buffers depending on your combination of host architecture.
++ */
++static
++int uwb_rc_dev_addr_mgmt(struct uwb_rc *rc,
++			 u8 bmOperationType, const u8 *baAddr,
++			 struct uwb_rc_evt_dev_addr_mgmt *reply)
++{
++	int result;
++	struct uwb_rc_cmd_dev_addr_mgmt *cmd;
++
++	result = -ENOMEM;
++	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
++	if (cmd == NULL)
++		goto error_kzalloc;
++	cmd->rccb.bCommandType = UWB_RC_CET_GENERAL;
++	cmd->rccb.wCommand = cpu_to_le16(UWB_RC_CMD_DEV_ADDR_MGMT);
++	cmd->bmOperationType = bmOperationType;
++	if (baAddr) {
++		size_t size = 0;
++		switch (bmOperationType >> 1) {
++		case 0:	size = 2; break;
++		case 1:	size = 6; break;
++		default: BUG();
++		}
++		memcpy(cmd->baAddr, baAddr, size);
++	}
++	reply->rceb.bEventType = UWB_RC_CET_GENERAL;
++	reply->rceb.wEvent = UWB_RC_CMD_DEV_ADDR_MGMT;
++	result = uwb_rc_cmd(rc, "DEV-ADDR-MGMT",
++			    &cmd->rccb, sizeof(*cmd),
++			    &reply->rceb, sizeof(*reply));
++	if (result < 0)
++		goto error_cmd;
++	if (result < sizeof(*reply)) {
++		dev_err(&rc->uwb_dev.dev,
++			"DEV-ADDR-MGMT: not enough data replied: "
++			"%d vs %zu bytes needed\n", result, sizeof(*reply));
++		result = -ENOMSG;
++	} else if (reply->bResultCode != UWB_RC_RES_SUCCESS) {
++		dev_err(&rc->uwb_dev.dev,
++			"DEV-ADDR-MGMT: command execution failed: %s (%d)\n",
++			uwb_rc_strerror(reply->bResultCode),
++			reply->bResultCode);
++		result = -EIO;
++	} else
++		result = 0;
++error_cmd:
++	kfree(cmd);
++error_kzalloc:
++	return result;
++}
++
++
++/**
++ * Set the UWB RC MAC or device address.
++ *
++ * @rc:      UWB Radio Controller
++ * @_addr:   Pointer to address to write [assumed to be either a
++ *           'struct uwb_mac_addr *' or a 'struct uwb_dev_addr *'].
++ * @type:    Type of address to set (UWB_ADDR_DEV or UWB_ADDR_MAC).
++ * @returns: 0 if ok, < 0 errno code on error.
++ *
++ * Some anal retentivity here: even if both 'struct
++ * uwb_{dev,mac}_addr' have the actual byte array in the same offset
++ * and I could just pass _addr to hwarc_cmd_dev_addr_mgmt(), I prefer
++ * to use some syntatic sugar in case someday we decide to change the
++ * format of the structs. The compiler will optimize it out anyway.
++ */
++static int uwb_rc_addr_set(struct uwb_rc *rc,
++		    const void *_addr, enum uwb_addr_type type)
++{
++	int result;
++	u8 bmOperationType = 0x1; 		/* Set address */
++	const struct uwb_dev_addr *dev_addr = _addr;
++	const struct uwb_mac_addr *mac_addr = _addr;
++	struct uwb_rc_evt_dev_addr_mgmt reply;
++	const u8 *baAddr;
++
++	result = -EINVAL;
++	switch (type) {
++	case UWB_ADDR_DEV:
++		baAddr = dev_addr->data;
++		break;
++	case UWB_ADDR_MAC:
++		baAddr = mac_addr->data;
++		bmOperationType |= 0x2;
++		break;
++	default:
++		return result;
++	}
++	return uwb_rc_dev_addr_mgmt(rc, bmOperationType, baAddr, &reply);
++}
++
++
++/**
++ * Get the UWB radio's MAC or device address.
++ *
++ * @rc:      UWB Radio Controller
++ * @_addr:   Where to write the address data [assumed to be either a
++ *           'struct uwb_mac_addr *' or a 'struct uwb_dev_addr *'].
++ * @type:    Type of address to get (UWB_ADDR_DEV or UWB_ADDR_MAC).
++ * @returns: 0 if ok (and *_addr set), < 0 errno code on error.
++ *
++ * See comment in uwb_rc_addr_set() about anal retentivity in the
++ * type handling of the address variables.
++ */
++static int uwb_rc_addr_get(struct uwb_rc *rc,
++		    void *_addr, enum uwb_addr_type type)
++{
++	int result;
++	u8 bmOperationType = 0x0; 		/* Get address */
++	struct uwb_rc_evt_dev_addr_mgmt evt;
++	struct uwb_dev_addr *dev_addr = _addr;
++	struct uwb_mac_addr *mac_addr = _addr;
++	u8 *baAddr;
++
++	result = -EINVAL;
++	switch (type) {
++	case UWB_ADDR_DEV:
++		baAddr = dev_addr->data;
++		break;
++	case UWB_ADDR_MAC:
++		bmOperationType |= 0x2;
++		baAddr = mac_addr->data;
++		break;
++	default:
++		return result;
++	}
++	result = uwb_rc_dev_addr_mgmt(rc, bmOperationType, baAddr, &evt);
++	if (result == 0)
++		switch (type) {
++		case UWB_ADDR_DEV:
++			memcpy(&dev_addr->data, evt.baAddr,
++			       sizeof(dev_addr->data));
++			break;
++		case UWB_ADDR_MAC:
++			memcpy(&mac_addr->data, evt.baAddr,
++			       sizeof(mac_addr->data));
++			break;
++		default:		/* shut gcc up */
++			BUG();
++		}
++	return result;
++}
++
++
++/** Get @rc's MAC address to @addr */
++int uwb_rc_mac_addr_get(struct uwb_rc *rc,
++			struct uwb_mac_addr *addr) {
++	return uwb_rc_addr_get(rc, addr, UWB_ADDR_MAC);
++}
++EXPORT_SYMBOL_GPL(uwb_rc_mac_addr_get);
++
++
++/** Get @rc's device address to @addr */
++int uwb_rc_dev_addr_get(struct uwb_rc *rc,
++			struct uwb_dev_addr *addr) {
++	return uwb_rc_addr_get(rc, addr, UWB_ADDR_DEV);
++}
++EXPORT_SYMBOL_GPL(uwb_rc_dev_addr_get);
++
++
++/** Set @rc's address to @addr */
++int uwb_rc_mac_addr_set(struct uwb_rc *rc,
++			const struct uwb_mac_addr *addr)
++{
++	int result = -EINVAL;
++	mutex_lock(&rc->uwb_dev.mutex);
++	result = uwb_rc_addr_set(rc, addr, UWB_ADDR_MAC);
++	mutex_unlock(&rc->uwb_dev.mutex);
++	return result;
++}
++
++
++/** Set @rc's address to @addr */
++int uwb_rc_dev_addr_set(struct uwb_rc *rc,
++			const struct uwb_dev_addr *addr)
++{
++	int result = -EINVAL;
++	mutex_lock(&rc->uwb_dev.mutex);
++	result = uwb_rc_addr_set(rc, addr, UWB_ADDR_DEV);
++	rc->uwb_dev.dev_addr = *addr;
++	mutex_unlock(&rc->uwb_dev.mutex);
++	return result;
++}
++
++/* Returns !0 if given address is already assigned to device. */
++int __uwb_mac_addr_assigned_check(struct device *dev, void *_addr)
++{
++	struct uwb_dev *uwb_dev = to_uwb_dev(dev);
++	struct uwb_mac_addr *addr = _addr;
++
++	if (!uwb_mac_addr_cmp(addr, &uwb_dev->mac_addr))
++		return !0;
++	return 0;
++}
++
++/* Returns !0 if given address is already assigned to device. */
++int __uwb_dev_addr_assigned_check(struct device *dev, void *_addr)
++{
++	struct uwb_dev *uwb_dev = to_uwb_dev(dev);
++	struct uwb_dev_addr *addr = _addr;
++	if (!uwb_dev_addr_cmp(addr, &uwb_dev->dev_addr))
++		return !0;
++	return 0;
++}
++
++/**
++ * uwb_dev_addr_assign - assigned a generated DevAddr to a radio controller
++ * @rc:      the (local) radio controller device requiring a new DevAddr
++ *
++ * A new DevAddr is required when:
++ *    - first setting up a radio controller
++ *    - if the hardware reports a DevAddr conflict
++ *
++ * The DevAddr is randomly generated in the generated DevAddr range
++ * [0x100, 0xfeff]. The number of devices in a beacon group is limited
++ * by mMaxBPLength (96) so this address space will never be exhausted.
++ *
++ * [ECMA-368] 17.1.1, 17.16.
++ */
++int uwb_rc_dev_addr_assign(struct uwb_rc *rc)
++{
++	struct uwb_dev_addr new_addr;
++
++	do {
++		get_random_bytes(new_addr.data, sizeof(new_addr.data));
++	} while (new_addr.data[0] == 0x00 || new_addr.data[0] == 0xff
++		 || __uwb_dev_addr_assigned(rc, &new_addr));
++
++	return uwb_rc_dev_addr_set(rc, &new_addr);
++}
++
++/**
++ * uwbd_evt_handle_rc_dev_addr_conflict - handle a DEV_ADDR_CONFLICT event
++ * @evt: the DEV_ADDR_CONFLICT notification from the radio controller
++ *
++ * A new (non-conflicting) DevAddr is assigned to the radio controller.
++ *
++ * [ECMA-368] 17.1.1.1.
++ */
++int uwbd_evt_handle_rc_dev_addr_conflict(struct uwb_event *evt)
++{
++	struct uwb_rc *rc = evt->rc;
++
++	return uwb_rc_dev_addr_assign(rc);
++}
++
++/*
++ * Print the 48-bit EUI MAC address of the radio controller when
++ * reading /sys/class/uwb_rc/XX/mac_address
++ */
++static ssize_t uwb_rc_mac_addr_show(struct device *dev,
++				    struct device_attribute *attr, char *buf)
++{
++	struct uwb_dev *uwb_dev = to_uwb_dev(dev);
++	struct uwb_rc *rc = uwb_dev->rc;
++	struct uwb_mac_addr addr;
++	ssize_t result;
++
++	mutex_lock(&rc->uwb_dev.mutex);
++	result = uwb_rc_addr_get(rc, &addr, UWB_ADDR_MAC);
++	mutex_unlock(&rc->uwb_dev.mutex);
++	if (result >= 0) {
++		result = uwb_mac_addr_print(buf, UWB_ADDR_STRSIZE, &addr);
++		buf[result++] = '\n';
++	}
++	return result;
++}
++
++/*
++ * Parse a 48 bit address written to /sys/class/uwb_rc/XX/mac_address
++ * and if correct, set it.
++ */
++static ssize_t uwb_rc_mac_addr_store(struct device *dev,
++				     struct device_attribute *attr,
++				     const char *buf, size_t size)
++{
++	struct uwb_dev *uwb_dev = to_uwb_dev(dev);
++	struct uwb_rc *rc = uwb_dev->rc;
++	struct uwb_mac_addr addr;
++	ssize_t result;
++
++	result = sscanf(buf, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx\n",
++			&addr.data[0], &addr.data[1], &addr.data[2],
++			&addr.data[3], &addr.data[4], &addr.data[5]);
++	if (result != 6) {
++		result = -EINVAL;
++		goto out;
++	}
++	if (is_multicast_ether_addr(addr.data)) {
++		dev_err(&rc->uwb_dev.dev, "refusing to set multicast "
++			"MAC address %s\n", buf);
++		result = -EINVAL;
++		goto out;
++	}
++	result = uwb_rc_mac_addr_set(rc, &addr);
++	if (result == 0)
++		rc->uwb_dev.mac_addr = addr;
++out:
++	return result < 0? result : size;
++}
++DEVICE_ATTR(mac_address, S_IRUGO | S_IWUSR, uwb_rc_mac_addr_show, uwb_rc_mac_addr_store);
++
++/** Print @addr to @buf, @return bytes written */
++size_t __uwb_addr_print(char *buf, size_t buf_size, const unsigned char *addr,
++			int type)
++{
++	size_t result;
++	if (type)
++		result = scnprintf(buf, buf_size,
++				  "%02x:%02x:%02x:%02x:%02x:%02x",
++				  addr[0], addr[1], addr[2],
++				  addr[3], addr[4], addr[5]);
++	else
++		result = scnprintf(buf, buf_size, "%02x:%02x",
++				  addr[1], addr[0]);
++	return result;
++}
++EXPORT_SYMBOL_GPL(__uwb_addr_print);
+--- /dev/null
++++ b/drivers/uwb/beacon.c
+@@ -0,0 +1,707 @@
++/*
++ * Ultra Wide Band
++ * Beacon management
++ *
++ * Copyright (C) 2005-2006 Intel Corporation
++ * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ *
++ *
++ * FIXME: docs
++ */
++
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/device.h>
++#include <linux/err.h>
++#include <linux/kdev_t.h>
++#include "uwb-internal.h"
++
++#define D_LOCAL 0
++#include <linux/uwb/debug.h>
++
++/** Start Beaconing command structure */
++struct uwb_rc_cmd_start_beacon {
++	struct uwb_rccb rccb;
++	__le16 wBPSTOffset;
++	u8 bChannelNumber;
++} __attribute__((packed));
++
++
++static int uwb_rc_start_beacon(struct uwb_rc *rc, u16 bpst_offset, u8 channel)
++{
++	int result;
++	struct uwb_rc_cmd_start_beacon *cmd;
++	struct uwb_rc_evt_confirm reply;
++
++	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
++	if (cmd == NULL)
++		return -ENOMEM;
++	cmd->rccb.bCommandType = UWB_RC_CET_GENERAL;
++	cmd->rccb.wCommand = cpu_to_le16(UWB_RC_CMD_START_BEACON);
++	cmd->wBPSTOffset = cpu_to_le16(bpst_offset);
++	cmd->bChannelNumber = channel;
++	reply.rceb.bEventType = UWB_RC_CET_GENERAL;
++	reply.rceb.wEvent = UWB_RC_CMD_START_BEACON;
++	result = uwb_rc_cmd(rc, "START-BEACON", &cmd->rccb, sizeof(*cmd),
++			    &reply.rceb, sizeof(reply));
++	if (result < 0)
++		goto error_cmd;
++	if (reply.bResultCode != UWB_RC_RES_SUCCESS) {
++		dev_err(&rc->uwb_dev.dev,
++			"START-BEACON: command execution failed: %s (%d)\n",
++			uwb_rc_strerror(reply.bResultCode), reply.bResultCode);
++		result = -EIO;
++	}
++error_cmd:
++	kfree(cmd);
++	return result;
++}
++
++static int uwb_rc_stop_beacon(struct uwb_rc *rc)
++{
++	int result;
++	struct uwb_rccb *cmd;
++	struct uwb_rc_evt_confirm reply;
++
++	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
++	if (cmd == NULL)
++		return -ENOMEM;
++	cmd->bCommandType = UWB_RC_CET_GENERAL;
++	cmd->wCommand = cpu_to_le16(UWB_RC_CMD_STOP_BEACON);
++	reply.rceb.bEventType = UWB_RC_CET_GENERAL;
++	reply.rceb.wEvent = UWB_RC_CMD_STOP_BEACON;
++	result = uwb_rc_cmd(rc, "STOP-BEACON", cmd, sizeof(*cmd),
++			    &reply.rceb, sizeof(reply));
++	if (result < 0)
++		goto error_cmd;
++	if (reply.bResultCode != UWB_RC_RES_SUCCESS) {
++		dev_err(&rc->uwb_dev.dev,
++			"STOP-BEACON: command execution failed: %s (%d)\n",
++			uwb_rc_strerror(reply.bResultCode), reply.bResultCode);
++		result = -EIO;
++	}
++error_cmd:
++	kfree(cmd);
++	return result;
++}
++
++/*
++ * Start/stop beacons
++ *
++ * @rc:          UWB Radio Controller to operate on
++ * @channel:     UWB channel on which to beacon (WUSB[table
++ *               5-12]). If -1, stop beaconing.
++ * @bpst_offset: Beacon Period Start Time offset; FIXME-do zero
++ *
++ * According to WHCI 0.95 [4.13.6] the driver will only receive the RCEB
++ * of a SET IE command after the device sent the first beacon that includes
++ * the IEs specified in the SET IE command. So, after we start beaconing we
++ * check if there is anything in the IE cache and call the SET IE command
++ * if needed.
++ */
++int uwb_rc_beacon(struct uwb_rc *rc, int channel, unsigned bpst_offset)
++{
++	int result;
++	struct device *dev = &rc->uwb_dev.dev;
++
++	mutex_lock(&rc->uwb_dev.mutex);
++	if (channel < 0)
++		channel = -1;
++	if (channel == -1)
++		result = uwb_rc_stop_beacon(rc);
++	else {
++		/* channel >= 0...dah */
++		result = uwb_rc_start_beacon(rc, bpst_offset, channel);
++		if (result < 0)
++			goto out_up;
++		if (le16_to_cpu(rc->ies->wIELength) > 0) {
++			result = uwb_rc_set_ie(rc, rc->ies);
++			if (result < 0) {
++				dev_err(dev, "Cannot set new IE on device: "
++					"%d\n", result);
++				result = uwb_rc_stop_beacon(rc);
++				channel = -1;
++				bpst_offset = 0;
++			} else
++				result = 0;
++		}
++	}
++
++	if (result < 0)
++		goto out_up;
++	rc->beaconing = channel;
++
++	uwb_notify(rc, NULL, uwb_bg_joined(rc) ? UWB_NOTIF_BG_JOIN : UWB_NOTIF_BG_LEAVE);
++
++out_up:
++	mutex_unlock(&rc->uwb_dev.mutex);
++	return result;
++}
++
++/*
++ * Beacon cache
++ *
++ * The purpose of this is to speed up the lookup of becon information
++ * when a new beacon arrives. The UWB Daemon uses it also to keep a
++ * tab of which devices are in radio distance and which not. When a
++ * device's beacon stays present for more than a certain amount of
++ * time, it is considered a new, usable device. When a beacon ceases
++ * to be received for a certain amount of time, it is considered that
++ * the device is gone.
++ *
++ * FIXME: use an allocator for the entries
++ * FIXME: use something faster for search than a list
++ */
++
++struct uwb_beca uwb_beca = {
++	.list = LIST_HEAD_INIT(uwb_beca.list),
++	.mutex = __MUTEX_INITIALIZER(uwb_beca.mutex)
++};
++
++
++void uwb_bce_kfree(struct kref *_bce)
++{
++	struct uwb_beca_e *bce = container_of(_bce, struct uwb_beca_e, refcnt);
++
++	kfree(bce->be);
++	kfree(bce);
++}
++
++
++/* Find a beacon by dev addr in the cache */
++static
++struct uwb_beca_e *__uwb_beca_find_bydev(const struct uwb_dev_addr *dev_addr)
++{
++	struct uwb_beca_e *bce, *next;
++	list_for_each_entry_safe(bce, next, &uwb_beca.list, node) {
++		d_printf(6, NULL, "looking for addr %02x:%02x in %02x:%02x\n",
++			 dev_addr->data[0], dev_addr->data[1],
++			 bce->dev_addr.data[0], bce->dev_addr.data[1]);
++		if (!memcmp(&bce->dev_addr, dev_addr, sizeof(bce->dev_addr)))
++			goto out;
++	}
++	bce = NULL;
++out:
++	return bce;
++}
++
++/* Find a beacon by dev addr in the cache */
++static
++struct uwb_beca_e *__uwb_beca_find_bymac(const struct uwb_mac_addr *mac_addr)
++{
++	struct uwb_beca_e *bce, *next;
++	list_for_each_entry_safe(bce, next, &uwb_beca.list, node) {
++		if (!memcmp(bce->mac_addr, mac_addr->data,
++			    sizeof(bce->mac_addr)))
++			goto out;
++	}
++	bce = NULL;
++out:
++	return bce;
++}
++
++/**
++ * uwb_dev_get_by_devaddr - get a UWB device with a specific DevAddr
++ * @rc:      the radio controller that saw the device
++ * @devaddr: DevAddr of the UWB device to find
++ *
++ * There may be more than one matching device (in the case of a
++ * DevAddr conflict), but only the first one is returned.
++ */
++struct uwb_dev *uwb_dev_get_by_devaddr(struct uwb_rc *rc,
++				       const struct uwb_dev_addr *devaddr)
++{
++	struct uwb_dev *found = NULL;
++	struct uwb_beca_e *bce;
++
++	mutex_lock(&uwb_beca.mutex);
++	bce = __uwb_beca_find_bydev(devaddr);
++	if (bce)
++		found = uwb_dev_try_get(rc, bce->uwb_dev);
++	mutex_unlock(&uwb_beca.mutex);
++
++	return found;
++}
++
++/**
++ * uwb_dev_get_by_macaddr - get a UWB device with a specific EUI-48
++ * @rc:      the radio controller that saw the device
++ * @devaddr: EUI-48 of the UWB device to find
++ */
++struct uwb_dev *uwb_dev_get_by_macaddr(struct uwb_rc *rc,
++				       const struct uwb_mac_addr *macaddr)
++{
++	struct uwb_dev *found = NULL;
++	struct uwb_beca_e *bce;
++
++	mutex_lock(&uwb_beca.mutex);
++	bce = __uwb_beca_find_bymac(macaddr);
++	if (bce)
++		found = uwb_dev_try_get(rc, bce->uwb_dev);
++	mutex_unlock(&uwb_beca.mutex);
++
++	return found;
++}
++
++/* Initialize a beacon cache entry */
++static void uwb_beca_e_init(struct uwb_beca_e *bce)
++{
++	mutex_init(&bce->mutex);
++	kref_init(&bce->refcnt);
++	stats_init(&bce->lqe_stats);
++	stats_init(&bce->rssi_stats);
++}
++
++/*
++ * Add a beacon to the cache
++ *
++ * @be:         Beacon event information
++ * @bf:         Beacon frame (part of b, really)
++ * @ts_jiffies: Timestamp (in jiffies) when the beacon was received
++ */
++struct uwb_beca_e *__uwb_beca_add(struct uwb_rc_evt_beacon *be,
++				  struct uwb_beacon_frame *bf,
++				  unsigned long ts_jiffies)
++{
++	struct uwb_beca_e *bce;
++
++	bce = kzalloc(sizeof(*bce), GFP_KERNEL);
++	if (bce == NULL)
++		return NULL;
++	uwb_beca_e_init(bce);
++	bce->ts_jiffies = ts_jiffies;
++	bce->uwb_dev = NULL;
++	list_add(&bce->node, &uwb_beca.list);
++	return bce;
++}
++
++/*
++ * Wipe out beacon entries that became stale
++ *
++ * Remove associated devicest too.
++ */
++void uwb_beca_purge(void)
++{
++	struct uwb_beca_e *bce, *next;
++	unsigned long now = jiffies;
++	mutex_lock(&uwb_beca.mutex);
++	list_for_each_entry_safe(bce, next, &uwb_beca.list, node) {
++		if (now - bce->ts_jiffies
++		    > msecs_to_jiffies(beacon_timeout_ms)) {
++			uwbd_dev_offair(bce);
++			list_del(&bce->node);
++			uwb_bce_put(bce);
++		}
++	}
++	mutex_unlock(&uwb_beca.mutex);
++}
++
++/* Clean up the whole beacon cache. Called on shutdown */
++void uwb_beca_release(void)
++{
++	struct uwb_beca_e *bce, *next;
++	mutex_lock(&uwb_beca.mutex);
++	list_for_each_entry_safe(bce, next, &uwb_beca.list, node) {
++		list_del(&bce->node);
++		uwb_bce_put(bce);
++	}
++	mutex_unlock(&uwb_beca.mutex);
++}
++
++static void uwb_beacon_print(struct uwb_rc *rc, struct uwb_rc_evt_beacon *be,
++			     struct uwb_beacon_frame *bf)
++{
++	char macbuf[UWB_ADDR_STRSIZE];
++	char devbuf[UWB_ADDR_STRSIZE];
++	char dstbuf[UWB_ADDR_STRSIZE];
++
++	uwb_mac_addr_print(macbuf, sizeof(macbuf), &bf->Device_Identifier);
++	uwb_dev_addr_print(devbuf, sizeof(devbuf), &bf->hdr.SrcAddr);
++	uwb_dev_addr_print(dstbuf, sizeof(dstbuf), &bf->hdr.DestAddr);
++	dev_info(&rc->uwb_dev.dev,
++		 "BEACON from %s to %s (ch%u offset %u slot %u MAC %s)\n",
++		 devbuf, dstbuf, be->bChannelNumber, be->wBPSTOffset,
++		 bf->Beacon_Slot_Number, macbuf);
++}
++
++/*
++ * @bce: beacon cache entry, referenced
++ */
++ssize_t uwb_bce_print_IEs(struct uwb_dev *uwb_dev, struct uwb_beca_e *bce,
++			  char *buf, size_t size)
++{
++	ssize_t result = 0;
++	struct uwb_rc_evt_beacon *be;
++	struct uwb_beacon_frame *bf;
++	struct uwb_buf_ctx ctx = {
++		.buf = buf,
++		.bytes = 0,
++		.size = size
++	};
++
++	mutex_lock(&bce->mutex);
++	be = bce->be;
++	if (be == NULL)
++		goto out;
++	bf = (void *) be->BeaconInfo;
++	uwb_ie_for_each(uwb_dev, uwb_ie_dump_hex, &ctx,
++			bf->IEData, be->wBeaconInfoLength - sizeof(*bf));
++	result = ctx.bytes;
++out:
++	mutex_unlock(&bce->mutex);
++	return result;
++}
++
++/*
++ * Verify that the beacon event, frame and IEs are ok
++ */
++static int uwb_verify_beacon(struct uwb_rc *rc, struct uwb_event *evt,
++			     struct uwb_rc_evt_beacon *be)
++{
++	int result = -EINVAL;
++	struct uwb_beacon_frame *bf;
++	struct device *dev = &rc->uwb_dev.dev;
++
++	/* Is there enough data to decode a beacon frame? */
++	if (evt->size < sizeof(*be) + sizeof(*bf)) {
++		dev_err(dev, "BEACON event: Not enough data to decode "
++			"(%zu vs %zu bytes needed)\n", evt->size,
++			sizeof(*be) + sizeof(*bf));
++		goto error;
++	}
++	/* FIXME: make sure beacon frame IEs are fine and that the whole thing
++	 * is consistent */
++	result = 0;
++error:
++	return result;
++}
++
++/*
++ * Handle UWB_RC_EVT_BEACON events
++ *
++ * We check the beacon cache to see how the received beacon fares. If
++ * is there already we refresh the timestamp. If not we create a new
++ * entry.
++ *
++ * According to the WHCI and WUSB specs, only one beacon frame is
++ * allowed per notification block, so we don't bother about scanning
++ * for more.
++ */
++int uwbd_evt_handle_rc_beacon(struct uwb_event *evt)
++{
++	int result = -EINVAL;
++	struct uwb_rc *rc;
++	struct uwb_rc_evt_beacon *be;
++	struct uwb_beacon_frame *bf;
++	struct uwb_beca_e *bce;
++	struct device *dev = &evt->rc->uwb_dev.dev;
++	unsigned long last_ts;
++
++	rc = evt->rc;
++	be = container_of(evt->rceb, struct uwb_rc_evt_beacon, rceb);
++	result = uwb_verify_beacon(rc, evt, be);
++	if (result < 0)
++		return result;
++
++	/* Ignore beacon if it is from an alien. */
++	if (be->bBeaconType == UWB_RC_BEACON_TYPE_OL_ALIEN ||
++	    be->bBeaconType == UWB_RC_BEACON_TYPE_NOL_ALIEN) {
++		if (printk_ratelimit())
++			dev_err(dev, "BEACON received from ALIEN. Action? \n");
++		result = -ENOSYS;
++		return 0;
++	}
++	bf = (struct uwb_beacon_frame *) be->BeaconInfo;
++
++	/*
++	 * Drop beacons from devices with a NULL EUI-48 -- they cannot
++	 * be uniquely identified.
++	 *
++	 * It's expected that these will all be WUSB devices and they
++	 * have a WUSB specific connection method so ignoring them
++	 * here shouldn't be a problem.
++	 */
++	if (uwb_mac_addr_bcast(&bf->Device_Identifier))
++		return 0;
++
++	mutex_lock(&uwb_beca.mutex);
++	bce = __uwb_beca_find_bymac(&bf->Device_Identifier);
++	if (bce == NULL) {
++		/* Not in there, a new device is pinging */
++		uwb_beacon_print(evt->rc, be, bf);
++		bce = __uwb_beca_add(be, bf, evt->ts_jiffies);
++		if (bce == NULL) {
++			mutex_unlock(&uwb_beca.mutex);
++			return -ENOMEM;
++		}
++	}
++	mutex_unlock(&uwb_beca.mutex);
++
++	mutex_lock(&bce->mutex);
++	/* purge old beacon data */
++	kfree(bce->be);
++
++	last_ts = bce->ts_jiffies;
++
++	/* Update commonly used fields */
++	bce->ts_jiffies = evt->ts_jiffies;
++	bce->be = be;
++	bce->dev_addr = bf->hdr.SrcAddr;
++	bce->mac_addr = &bf->Device_Identifier;
++	be->wBPSTOffset = le16_to_cpu(be->wBPSTOffset);
++	be->wBeaconInfoLength = le16_to_cpu(be->wBeaconInfoLength);
++	stats_add_sample(&bce->lqe_stats, be->bLQI - 7);
++	stats_add_sample(&bce->rssi_stats, be->bRSSI + 18);
++
++	/*
++	 * Wait until at least mMaxLostBeacons beacons have been
++	 * received before considering a new device as present.
++	 */
++	bce->hits++;
++	if (bce->uwb_dev == NULL && bce->hits > UWB_MAX_LOST_BEACONS) {
++		if (time_before(bce->ts_jiffies,
++				last_ts + msecs_to_jiffies(beacon_timeout_ms)))
++			uwbd_dev_onair(evt->rc, bce);
++		else
++			bce->hits = 0;
++	}
++	mutex_unlock(&bce->mutex);
++
++	return 1; /* we keep the event data */
++}
++
++/*
++ * Handle UWB_RC_EVT_BEACON_SIZE events
++ *
++ * XXXXX
++ */
++int uwbd_evt_handle_rc_beacon_size(struct uwb_event *evt)
++{
++	int result = -EINVAL;
++	struct device *dev = &evt->rc->uwb_dev.dev;
++	struct uwb_rc_evt_beacon_size *bs;
++
++	/* Is there enough data to decode the event? */
++	if (evt->size < sizeof(*bs)) {
++		dev_err(dev, "BEACON SIZE notification: Not enough data to "
++			"decode (%zu vs %zu bytes needed)\n",
++			evt->size, sizeof(*bs));
++		goto error;
++	}
++	bs = container_of(evt->rceb, struct uwb_rc_evt_beacon_size, rceb);
++	if (0)
++		dev_info(dev, "Beacon size changed to %u bytes "
++			"(FIXME: action?)\n", le16_to_cpu(bs->wNewBeaconSize));
++	else {
++		/* temporary hack until we do something with this message... */
++		static unsigned count;
++		if (++count % 1000 == 0)
++			dev_info(dev, "Beacon size changed %u times "
++				"(FIXME: action?)\n", count);
++	}
++	result = 0;
++error:
++	return result;
++}
++
++/*
++ * Handle UWB_RC_EVT_BP_SLOT_CHANGE events
++ *
++ * XXXXX
++ */
++int uwbd_evt_handle_rc_bp_slot_change(struct uwb_event *evt)
++{
++	int result = -EINVAL;
++	struct device *dev = &evt->rc->uwb_dev.dev;
++	struct uwb_rc_evt_bp_slot_change *bpsc;
++
++	/* Is there enough data to decode a beacon frame? */
++	if (evt->size < sizeof(*bpsc)) {
++		printk(KERN_ERR "BP SLOT CHANGE event: Not enough data\n");
++		goto error;
++	}
++	bpsc = container_of(evt->rceb, struct uwb_rc_evt_bp_slot_change, rceb);
++	dev_info(dev, "BP slot changed to #%u (FIXME: action?)\n",
++		 bpsc->bSlotNumber);
++	result = 0;
++error:
++	return result;
++}
++
++/**
++ * Handle UWB_RC_EVT_BP_SLOT_CHANGE events
++ *
++ * XXXXX
++ */
++struct uwb_ie_bpo {
++	struct uwb_ie_hdr hdr;
++	u8                bp_length;
++	u8                data[];
++} __attribute__((packed));
++
++int uwbd_evt_handle_rc_bpoie_change(struct uwb_event *evt)
++{
++	int result = -EINVAL;
++	struct device *dev = &evt->rc->uwb_dev.dev;
++	struct uwb_rc_evt_bpoie_change *bpoiec;
++	struct uwb_ie_bpo *bpoie;
++	static unsigned count;	/* FIXME: this is a temp hack */
++	size_t iesize;
++
++	/* Is there enough data to decode it? */
++	if (evt->size < sizeof(*bpoiec)) {
++		dev_err(dev, "BPOIEC notification: Not enough data to "
++			"decode (%zu vs %zu bytes needed)\n",
++			evt->size, sizeof(*bpoiec));
++		goto error;
++	}
++	bpoiec = container_of(evt->rceb, struct uwb_rc_evt_bpoie_change, rceb);
++	iesize = le16_to_cpu(bpoiec->wBPOIELength);
++	if (iesize < sizeof(*bpoie)) {
++		dev_err(dev, "BPOIEC notification: Not enough IE data to "
++			"decode (%zu vs %zu bytes needed)\n",
++			iesize, sizeof(*bpoie));
++		goto error;
++	}
++	if (++count % 1000 == 0)	/* Lame placeholder */
++		dev_info(dev, "BPOIE: %u changes received\n", count);
++	/*
++	 * FIXME: At this point we should go over all the IEs in the
++	 *        bpoiec->BPOIE array and act on each.
++	 */
++	result = 0;
++error:
++	return result;
++}
++
++/**
++ * uwb_bg_joined - is the RC in a beacon group?
++ * @rc: the radio controller
++ *
++ * Returns true if the radio controller is in a beacon group (even if
++ * it's the sole member).
++ */
++int uwb_bg_joined(struct uwb_rc *rc)
++{
++	return rc->beaconing != -1;
++}
++EXPORT_SYMBOL_GPL(uwb_bg_joined);
++
++/*
++ * Print beaconing state.
++ */
++static ssize_t uwb_rc_beacon_show(struct device *dev,
++				  struct device_attribute *attr, char *buf)
++{
++	struct uwb_dev *uwb_dev = to_uwb_dev(dev);
++	struct uwb_rc *rc = uwb_dev->rc;
++	ssize_t result;
++
++	mutex_lock(&rc->uwb_dev.mutex);
++	result = sprintf(buf,
++			 "state: %s\n"
++			 "channel: %d\n"
++			 "\n"
++			 "# CHANNEL [BPST-OFFSET]\n"
++			 "#   start beaconing on CHANNEL "
++			 "(or stop if CHANNEL is -1)\n"
++			 "# AA:BB:CC:DD:EE:FF\n"
++			 "# XX:YY\n"
++			 "#   try joining the beacon group containing a "
++			 "specific device\n"
++			 "#   (EUI-48 or DevAddr)\n",
++			 rc->beaconing == -1? "disabled" : "enabled",
++			 rc->beaconing);
++	mutex_unlock(&rc->uwb_dev.mutex);
++	return result;
++}
++
++/*
++ * Start beaconing on the specified channel, or stop beaconing.
++ *
++ * The BPST offset of when to start searching for a beacon group to
++ * join may be specified.
++ */
++static ssize_t uwb_rc_beacon_store(struct device *dev,
++				   struct device_attribute *attr,
++				   const char *buf, size_t size)
++{
++	struct uwb_dev *uwb_dev = to_uwb_dev(dev);
++	struct uwb_rc *rc = uwb_dev->rc;
++	struct uwb_dev_addr devaddr;
++	struct uwb_mac_addr macaddr;
++	unsigned bpst_offset = 0;
++	ssize_t result;
++	int channel;
++
++	result = sscanf(buf, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx\n",
++			&macaddr.data[0], &macaddr.data[1], &macaddr.data[2],
++			&macaddr.data[3], &macaddr.data[4], &macaddr.data[5]);
++	if (result == 6) {
++		/* given a device, extract params */
++		struct uwb_beca_e *beca;
++		result = -ENODEV;
++		mutex_lock(&uwb_beca.mutex);
++		beca = __uwb_beca_find_bymac(&macaddr);
++		if (beca != NULL) {
++			mutex_lock(&beca->mutex);
++			channel = beca->be->bChannelNumber;
++			bpst_offset = beca->be->wBPSTOffset;
++			mutex_unlock(&beca->mutex);
++			result = 0;
++		}
++		mutex_unlock(&uwb_beca.mutex);
++		if (result < 0)
++			goto error;
++		if (rc->scan_type != UWB_SCAN_DISABLED)
++			uwb_rc_scan(rc, channel, UWB_SCAN_DISABLED, 0);
++		goto out_beacon;
++	}
++	result = sscanf(buf, "%hhx:%hhx\n", &devaddr.data[1], &devaddr.data[0]);
++	if (result == 2) {
++		/* given a device, extract params */
++		struct uwb_beca_e *beca;
++		result = -ENODEV;
++		mutex_lock(&uwb_beca.mutex);
++		beca = __uwb_beca_find_bydev(&devaddr);
++		if (beca != NULL) {
++			mutex_lock(&beca->mutex);
++			channel = beca->be->bChannelNumber;
++			bpst_offset = beca->be->wBPSTOffset;
++			mutex_unlock(&beca->mutex);
++			result = 0;
++		}
++		mutex_unlock(&uwb_beca.mutex);
++		if (result < 0)
++			goto error;
++		if (rc->scan_type != UWB_SCAN_DISABLED)
++			uwb_rc_scan(rc, channel, UWB_SCAN_DISABLED, 0);
++		goto out_beacon;
++	}
++	result = sscanf(buf, "%d %u\n", &channel, &bpst_offset);
++	if (result >= 1)
++		goto out_beacon;
++	result = -EINVAL;
++	goto error;
++
++out_beacon:
++	result = uwb_rc_beacon(rc, channel, bpst_offset);
++error:
++	return result < 0 ? result : size;
++}
++DEVICE_ATTR(beacon, S_IRUGO | S_IWUSR, uwb_rc_beacon_show, uwb_rc_beacon_store);
+--- /dev/null
++++ b/drivers/uwb/ie.c
+@@ -0,0 +1,570 @@
++/*
++ * Ultra Wide Band
++ * Information Element Handling
++ *
++ * Copyright (C) 2005-2006 Intel Corporation
++ * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
++ * Reinette Chatre <reinette.chatre@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ *
++ *
++ * FIXME: docs
++ */
++
++#include "uwb-internal.h"
++#define D_LOCAL 0
++#include <linux/uwb/debug.h>
++
++/**
++ * uwb_ie_next - get the next IE in a buffer
++ * @ptr: start of the buffer containing the IE data
++ * @len: length of the buffer
++ *
++ * Both @ptr and @len are updated so subsequent calls to uwb_ie_next()
++ * will get the next IE.
++ *
++ * NULL is returned (and @ptr and @len will not be updated) if there
++ * are no more IEs in the buffer or the buffer is too short.
++ */
++struct uwb_ie_hdr *uwb_ie_next(void **ptr, size_t *len)
++{
++	struct uwb_ie_hdr *hdr;
++	size_t ie_len;
++
++	if (*len < sizeof(struct uwb_ie_hdr))
++		return NULL;
++
++	hdr = *ptr;
++	ie_len = sizeof(struct uwb_ie_hdr) + hdr->length;
++
++	if (*len < ie_len)
++		return NULL;
++
++	*ptr += ie_len;
++	*len -= ie_len;
++
++	return hdr;
++}
++EXPORT_SYMBOL_GPL(uwb_ie_next);
++
++/**
++ * Get the IEs that a radio controller is sending in its beacon
++ *
++ * @uwb_rc:  UWB Radio Controller
++ * @returns: Size read from the system
++ *
++ * We don't need to lock the uwb_rc's mutex because we don't modify
++ * anything. Once done with the iedata buffer, call
++ * uwb_rc_ie_release(iedata). Don't call kfree on it.
++ */
++ssize_t uwb_rc_get_ie(struct uwb_rc *uwb_rc, struct uwb_rc_evt_get_ie **pget_ie)
++{
++	ssize_t result;
++	struct device *dev = &uwb_rc->uwb_dev.dev;
++	struct uwb_rccb *cmd = NULL;
++	struct uwb_rceb *reply = NULL;
++	struct uwb_rc_evt_get_ie *get_ie;
++
++	d_fnstart(3, dev, "(%p, %p)\n", uwb_rc, pget_ie);
++	result = -ENOMEM;
++	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
++	if (cmd == NULL)
++		goto error_kzalloc;
++	cmd->bCommandType = UWB_RC_CET_GENERAL;
++	cmd->wCommand = cpu_to_le16(UWB_RC_CMD_GET_IE);
++	result = uwb_rc_vcmd(uwb_rc, "GET_IE", cmd, sizeof(*cmd),
++			     UWB_RC_CET_GENERAL, UWB_RC_CMD_GET_IE,
++			     &reply);
++	if (result < 0)
++		goto error_cmd;
++	get_ie = container_of(reply, struct uwb_rc_evt_get_ie, rceb);
++	if (result < sizeof(*get_ie)) {
++		dev_err(dev, "not enough data returned for decoding GET IE "
++			"(%zu bytes received vs %zu needed)\n",
++			result, sizeof(*get_ie));
++		result = -EINVAL;
++	} else if (result < sizeof(*get_ie) + le16_to_cpu(get_ie->wIELength)) {
++		dev_err(dev, "not enough data returned for decoding GET IE "
++			"payload (%zu bytes received vs %zu needed)\n", result,
++			sizeof(*get_ie) + le16_to_cpu(get_ie->wIELength));
++		result = -EINVAL;
++	} else
++		*pget_ie = get_ie;
++error_cmd:
++	kfree(cmd);
++error_kzalloc:
++	d_fnend(3, dev, "(%p, %p) = %d\n", uwb_rc, pget_ie, (int)result);
++	return result;
++}
++EXPORT_SYMBOL_GPL(uwb_rc_get_ie);
++
++
++/*
++ * Given a pointer to an IE, print it in ASCII/hex followed by a new line
++ *
++ * @ie_hdr: pointer to the IE header. Length is in there, and it is
++ *          guaranteed that the ie_hdr->length bytes following it are
++ *          safely accesible.
++ *
++ * @_data: context data passed from uwb_ie_for_each(), an struct output_ctx
++ */
++int uwb_ie_dump_hex(struct uwb_dev *uwb_dev, const struct uwb_ie_hdr *ie_hdr,
++		    size_t offset, void *_ctx)
++{
++	struct uwb_buf_ctx *ctx = _ctx;
++	const u8 *pl = (void *)(ie_hdr + 1);
++	u8 pl_itr;
++
++	ctx->bytes += scnprintf(ctx->buf + ctx->bytes, ctx->size - ctx->bytes,
++				"%02x %02x ", (unsigned) ie_hdr->element_id,
++				(unsigned) ie_hdr->length);
++	pl_itr = 0;
++	while (pl_itr < ie_hdr->length && ctx->bytes < ctx->size)
++		ctx->bytes += scnprintf(ctx->buf + ctx->bytes,
++					ctx->size - ctx->bytes,
++					"%02x ", (unsigned) pl[pl_itr++]);
++	if (ctx->bytes < ctx->size)
++		ctx->buf[ctx->bytes++] = '\n';
++	return 0;
++}
++EXPORT_SYMBOL_GPL(uwb_ie_dump_hex);
++
++
++/**
++ * Verify that a pointer in a buffer points to valid IE
++ *
++ * @start: pointer to start of buffer in which IE appears
++ * @itr:   pointer to IE inside buffer that will be verified
++ * @top:   pointer to end of buffer
++ *
++ * @returns: 0 if IE is valid, <0 otherwise
++ *
++ * Verification involves checking that the buffer can contain a
++ * header and the amount of data reported in the IE header can be found in
++ * the buffer.
++ */
++static
++int uwb_rc_ie_verify(struct uwb_dev *uwb_dev, const void *start,
++		     const void *itr, const void *top)
++{
++	struct device *dev = &uwb_dev->dev;
++	const struct uwb_ie_hdr *ie_hdr;
++
++	if (top - itr < sizeof(*ie_hdr)) {
++		dev_err(dev, "Bad IE: no data to decode header "
++			"(%zu bytes left vs %zu needed) at offset %zu\n",
++			top - itr, sizeof(*ie_hdr), itr - start);
++		return -EINVAL;
++	}
++	ie_hdr = itr;
++	itr += sizeof(*ie_hdr);
++	if (top - itr < ie_hdr->length) {
++		dev_err(dev, "Bad IE: not enough data for payload "
++			"(%zu bytes left vs %zu needed) at offset %zu\n",
++			top - itr, (size_t)ie_hdr->length,
++			(void *)ie_hdr - start);
++		return -EINVAL;
++	}
++	return 0;
++}
++
++
++/**
++ * Walk a buffer filled with consecutive IE's a buffer
++ *
++ * @uwb_dev: UWB device this IEs belong to (for err messages mainly)
++ *
++ * @fn: function to call with each IE; if it returns 0, we keep
++ *      traversing the buffer. If it returns !0, we'll stop and return
++ *      that value.
++ *
++ * @data: pointer passed to @fn
++ *
++ * @buf: buffer where the consecutive IEs are located
++ *
++ * @size: size of @buf
++ *
++ * Each IE is checked for basic correctness (there is space left for
++ * the header and the payload). If that test is failed, we stop
++ * processing. For every good IE, @fn is called.
++ */
++ssize_t uwb_ie_for_each(struct uwb_dev *uwb_dev, uwb_ie_f fn, void *data,
++			const void *buf, size_t size)
++{
++	ssize_t result = 0;
++	const struct uwb_ie_hdr *ie_hdr;
++	const void *itr = buf, *top = itr + size;
++
++	while (itr < top) {
++		if (uwb_rc_ie_verify(uwb_dev, buf, itr, top) != 0)
++			break;
++		ie_hdr = itr;
++		itr += sizeof(*ie_hdr) + ie_hdr->length;
++		result = fn(uwb_dev, ie_hdr, itr - buf, data);
++		if (result != 0)
++			break;
++	}
++	return result;
++}
++EXPORT_SYMBOL_GPL(uwb_ie_for_each);
++
++
++/**
++ * Replace all IEs currently being transmitted by a device
++ *
++ * @cmd:    pointer to the SET-IE command with the IEs to set
++ * @size:   size of @buf
++ */
++int uwb_rc_set_ie(struct uwb_rc *rc, struct uwb_rc_cmd_set_ie *cmd)
++{
++	int result;
++	struct device *dev = &rc->uwb_dev.dev;
++	struct uwb_rc_evt_set_ie reply;
++
++	reply.rceb.bEventType = UWB_RC_CET_GENERAL;
++	reply.rceb.wEvent = UWB_RC_CMD_SET_IE;
++	result = uwb_rc_cmd(rc, "SET-IE", &cmd->rccb,
++			    sizeof(*cmd) + le16_to_cpu(cmd->wIELength),
++			    &reply.rceb, sizeof(reply));
++	if (result < 0)
++		goto error_cmd;
++	else if (result != sizeof(reply)) {
++		dev_err(dev, "SET-IE: not enough data to decode reply "
++			"(%d bytes received vs %zu needed)\n",
++			result, sizeof(reply));
++		result = -EIO;
++	} else if (reply.bResultCode != UWB_RC_RES_SUCCESS) {
++		dev_err(dev, "SET-IE: command execution failed: %s (%d)\n",
++			uwb_rc_strerror(reply.bResultCode), reply.bResultCode);
++		result = -EIO;
++	} else
++		result = 0;
++error_cmd:
++	return result;
++}
++
++/**
++ * Determine by IE id if IE is host settable
++ * WUSB 1.0 [8.6.2.8 Table 8.85]
++ *
++ * EXCEPTION:
++ * All but UWB_IE_WLP appears in Table 8.85 from WUSB 1.0. Setting this IE
++ * is required for the WLP substack to perform association with its WSS so
++ * we hope that the WUSB spec will be changed to reflect this.
++ */
++static
++int uwb_rc_ie_is_host_settable(enum uwb_ie element_id)
++{
++	if (element_id == UWB_PCA_AVAILABILITY ||
++	    element_id == UWB_BP_SWITCH_IE ||
++	    element_id == UWB_MAC_CAPABILITIES_IE ||
++	    element_id == UWB_PHY_CAPABILITIES_IE ||
++	    element_id == UWB_APP_SPEC_PROBE_IE ||
++	    element_id == UWB_IDENTIFICATION_IE ||
++	    element_id == UWB_MASTER_KEY_ID_IE ||
++	    element_id == UWB_IE_WLP ||
++	    element_id == UWB_APP_SPEC_IE)
++		return 1;
++	return 0;
++}
++
++
++/**
++ * Extract Host Settable IEs from IE
++ *
++ * @ie_data: pointer to buffer containing all IEs
++ * @size:    size of buffer
++ *
++ * @returns: length of buffer that only includes host settable IEs
++ *
++ * Given a buffer of IEs we move all Host Settable IEs to front of buffer
++ * by overwriting the IEs that are not Host Settable.
++ * Buffer length is adjusted accordingly.
++ */
++static
++ssize_t uwb_rc_parse_host_settable_ie(struct uwb_dev *uwb_dev,
++				      void *ie_data, size_t size)
++{
++	size_t new_len = size;
++	struct uwb_ie_hdr *ie_hdr;
++	size_t ie_length;
++	void *itr = ie_data, *top = itr + size;
++
++	while (itr < top) {
++		if (uwb_rc_ie_verify(uwb_dev, ie_data, itr, top) != 0)
++			break;
++		ie_hdr = itr;
++		ie_length = sizeof(*ie_hdr) + ie_hdr->length;
++		if (uwb_rc_ie_is_host_settable(ie_hdr->element_id)) {
++			itr += ie_length;
++		} else {
++			memmove(itr, itr + ie_length, top - (itr + ie_length));
++			new_len -= ie_length;
++			top -= ie_length;
++		}
++	}
++	return new_len;
++}
++
++
++/* Cleanup the whole IE management subsystem */
++void uwb_rc_ie_init(struct uwb_rc *uwb_rc)
++{
++	mutex_init(&uwb_rc->ies_mutex);
++}
++
++
++/**
++ * Set up cache for host settable IEs currently being transmitted
++ *
++ * First we just call GET-IE to get the current IEs being transmitted
++ * (or we workaround and pretend we did) and (because the format is
++ * the same) reuse that as the IE cache (with the command prefix, as
++ * explained in 'struct uwb_rc').
++ *
++ * @returns: size of cache created
++ */
++ssize_t uwb_rc_ie_setup(struct uwb_rc *uwb_rc)
++{
++	struct device *dev = &uwb_rc->uwb_dev.dev;
++	ssize_t result;
++	size_t capacity;
++	struct uwb_rc_evt_get_ie *ie_info;
++
++	d_fnstart(3, dev, "(%p)\n", uwb_rc);
++	mutex_lock(&uwb_rc->ies_mutex);
++	result = uwb_rc_get_ie(uwb_rc, &ie_info);
++	if (result < 0)
++		goto error_get_ie;
++	capacity = result;
++	d_printf(5, dev, "Got IEs %zu bytes (%zu long at %p)\n", result,
++		 (size_t)le16_to_cpu(ie_info->wIELength), ie_info);
++
++	/* Remove IEs that host should not set. */
++	result = uwb_rc_parse_host_settable_ie(&uwb_rc->uwb_dev,
++			ie_info->IEData, le16_to_cpu(ie_info->wIELength));
++	if (result < 0)
++		goto error_parse;
++	d_printf(5, dev, "purged non-settable IEs to %zu bytes\n", result);
++	uwb_rc->ies = (void *) ie_info;
++	uwb_rc->ies->rccb.bCommandType = UWB_RC_CET_GENERAL;
++	uwb_rc->ies->rccb.wCommand = cpu_to_le16(UWB_RC_CMD_SET_IE);
++	uwb_rc->ies_capacity = capacity;
++	d_printf(5, dev, "IE cache at %p %zu bytes, %zu capacity\n",
++		 ie_info, result, capacity);
++	result = 0;
++error_parse:
++error_get_ie:
++	mutex_unlock(&uwb_rc->ies_mutex);
++	d_fnend(3, dev, "(%p) = %zu\n", uwb_rc, result);
++	return result;
++}
++
++
++/* Cleanup the whole IE management subsystem */
++void uwb_rc_ie_release(struct uwb_rc *uwb_rc)
++{
++	kfree(uwb_rc->ies);
++	uwb_rc->ies = NULL;
++	uwb_rc->ies_capacity = 0;
++}
++
++
++static
++int __acc_size(struct uwb_dev *uwb_dev, const struct uwb_ie_hdr *ie_hdr,
++	       size_t offset, void *_ctx)
++{
++	size_t *acc_size = _ctx;
++	*acc_size += sizeof(*ie_hdr) + ie_hdr->length;
++	d_printf(6, &uwb_dev->dev, "new acc size %zu\n", *acc_size);
++	return 0;
++}
++
++
++/**
++ * Add a new IE to IEs currently being transmitted by device
++ *
++ * @ies: the buffer containing the new IE or IEs to be added to
++ *       the device's beacon. The buffer will be verified for
++ *       consistence (meaning the headers should be right) and
++ *       consistent with the buffer size.
++ * @size: size of @ies (in bytes, total buffer size)
++ * @returns: 0 if ok, <0 errno code on error
++ *
++ * According to WHCI 0.95 [4.13.6] the driver will only receive the RCEB
++ * after the device sent the first beacon that includes the IEs specified
++ * in the SET IE command. We thus cannot send this command if the device is
++ * not beaconing. Instead, a SET IE command will be sent later right after
++ * we start beaconing.
++ *
++ * Setting an IE on the device will overwrite all current IEs in device. So
++ * we take the current IEs being transmitted by the device, append the
++ * new one, and call SET IE with all the IEs needed.
++ *
++ * The local IE cache will only be updated with the new IE if SET IE
++ * completed successfully.
++ */
++int uwb_rc_ie_add(struct uwb_rc *uwb_rc,
++		  const struct uwb_ie_hdr *ies, size_t size)
++{
++	int result = 0;
++	struct device *dev = &uwb_rc->uwb_dev.dev;
++	struct uwb_rc_cmd_set_ie *new_ies;
++	size_t ies_size, total_size, acc_size = 0;
++
++	if (uwb_rc->ies == NULL)
++		return -ESHUTDOWN;
++	uwb_ie_for_each(&uwb_rc->uwb_dev, __acc_size, &acc_size, ies, size);
++	if (acc_size != size) {
++		dev_err(dev, "BUG: bad IEs, misconstructed headers "
++			"[%zu bytes reported vs %zu calculated]\n",
++			size, acc_size);
++		WARN_ON(1);
++		return -EINVAL;
++	}
++	mutex_lock(&uwb_rc->ies_mutex);
++	ies_size = le16_to_cpu(uwb_rc->ies->wIELength);
++	total_size = sizeof(*uwb_rc->ies) + ies_size;
++	if (total_size + size > uwb_rc->ies_capacity) {
++		d_printf(4, dev, "Reallocating IE cache from %p capacity %zu "
++			 "to capacity %zu\n", uwb_rc->ies, uwb_rc->ies_capacity,
++			 total_size + size);
++		new_ies = kzalloc(total_size + size, GFP_KERNEL);
++		if (new_ies == NULL) {
++			dev_err(dev, "No memory for adding new IE\n");
++			result = -ENOMEM;
++			goto error_alloc;
++		}
++		memcpy(new_ies, uwb_rc->ies, total_size);
++		uwb_rc->ies_capacity = total_size + size;
++		kfree(uwb_rc->ies);
++		uwb_rc->ies = new_ies;
++		d_printf(4, dev, "New IE cache at %p capacity %zu\n",
++			 uwb_rc->ies, uwb_rc->ies_capacity);
++	}
++	memcpy((void *)uwb_rc->ies + total_size, ies, size);
++	uwb_rc->ies->wIELength = cpu_to_le16(ies_size + size);
++	if (uwb_rc->beaconing != -1) {
++		result = uwb_rc_set_ie(uwb_rc, uwb_rc->ies);
++		if (result < 0) {
++			dev_err(dev, "Cannot set new IE on device: %d\n",
++				result);
++			uwb_rc->ies->wIELength = cpu_to_le16(ies_size);
++		} else
++			result = 0;
++	}
++	d_printf(4, dev, "IEs now occupy %hu bytes of %zu capacity at %p\n",
++		 le16_to_cpu(uwb_rc->ies->wIELength), uwb_rc->ies_capacity,
++		 uwb_rc->ies);
++error_alloc:
++	mutex_unlock(&uwb_rc->ies_mutex);
++	return result;
++}
++EXPORT_SYMBOL_GPL(uwb_rc_ie_add);
++
++
++/*
++ * Remove an IE from internal cache
++ *
++ * We are dealing with our internal IE cache so no need to verify that the
++ * IEs are valid (it has been done already).
++ *
++ * Should be called with ies_mutex held
++ *
++ * We do not break out once an IE is found in the cache. It is currently
++ * possible to have more than one IE with the same ID included in the
++ * beacon. We don't reallocate, we just mark the size smaller.
++ */
++static
++int uwb_rc_ie_cache_rm(struct uwb_rc *uwb_rc, enum uwb_ie to_remove)
++{
++	struct uwb_ie_hdr *ie_hdr;
++	size_t new_len = le16_to_cpu(uwb_rc->ies->wIELength);
++	void *itr = uwb_rc->ies->IEData;
++	void *top = itr + new_len;
++
++	while (itr < top) {
++		ie_hdr = itr;
++		if (ie_hdr->element_id != to_remove) {
++			itr += sizeof(*ie_hdr) + ie_hdr->length;
++		} else {
++			int ie_length;
++			ie_length = sizeof(*ie_hdr) + ie_hdr->length;
++			if (top - itr != ie_length)
++				memmove(itr, itr + ie_length, top - itr + ie_length);
++			top -= ie_length;
++			new_len -= ie_length;
++		}
++	}
++	uwb_rc->ies->wIELength = cpu_to_le16(new_len);
++	return 0;
++}
++
++
++/**
++ * Remove an IE currently being transmitted by device
++ *
++ * @element_id: id of IE to be removed from device's beacon
++ */
++int uwb_rc_ie_rm(struct uwb_rc *uwb_rc, enum uwb_ie element_id)
++{
++	struct device *dev = &uwb_rc->uwb_dev.dev;
++	int result;
++
++	if (uwb_rc->ies == NULL)
++		return -ESHUTDOWN;
++	mutex_lock(&uwb_rc->ies_mutex);
++	result = uwb_rc_ie_cache_rm(uwb_rc, element_id);
++	if (result < 0)
++		dev_err(dev, "Cannot remove IE from cache.\n");
++	if (uwb_rc->beaconing != -1) {
++		result = uwb_rc_set_ie(uwb_rc, uwb_rc->ies);
++		if (result < 0)
++			dev_err(dev, "Cannot set new IE on device.\n");
++	}
++	mutex_unlock(&uwb_rc->ies_mutex);
++	return result;
++}
++EXPORT_SYMBOL_GPL(uwb_rc_ie_rm);
++
++
++/**
++ * Create and set new Identification IE
++ *
++ * Currently only sets the Vendor ID. The Vendor ID is set from the OUI,
++ * which is obtained from the first three bytes from the MAC address.
++ */
++int uwb_rc_set_identification_ie(struct uwb_rc *uwb_rc)
++{
++	struct {
++		struct uwb_identification_ie id_ie;
++		struct uwb_dev_info dev_info;
++		struct uwb_vendor_id vendor_id;
++	} ie_data;
++
++	ie_data.id_ie.hdr.element_id = UWB_IDENTIFICATION_IE;
++	ie_data.id_ie.hdr.length = sizeof(struct uwb_dev_info) +
++				   sizeof(struct uwb_vendor_id);
++
++	ie_data.dev_info.type = UWB_DEV_INFO_VENDOR_ID;
++	ie_data.dev_info.length = sizeof(struct uwb_vendor_id);
++
++	ie_data.vendor_id.data[0] = uwb_rc->uwb_dev.mac_addr.data[0];
++	ie_data.vendor_id.data[1] = uwb_rc->uwb_dev.mac_addr.data[1];
++	ie_data.vendor_id.data[2] = uwb_rc->uwb_dev.mac_addr.data[2];
++
++	return uwb_rc_ie_add(uwb_rc, &ie_data.id_ie.hdr, sizeof(ie_data));
++}
+--- /dev/null
++++ b/drivers/uwb/scan.c
+@@ -0,0 +1,159 @@
++/*
++ * Ultra Wide Band
++ * Scanning management
++ *
++ * Copyright (C) 2005-2006 Intel Corporation
++ * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ *
++ *
++ *
++ * FIXME: docs
++ * FIXME: there are issues here on how BEACON and SCAN on USB RCI deal
++ *        with each other. Currently seems that START_BEACON while
++ *        SCAN_ONLY will cancel the scan, so we need to update the
++ *        state here. Clarification request sent by email on
++ *        10/05/2005.
++ *        10/28/2005 No clear answer heard--maybe we'll hack the API
++ *                   so that when we start beaconing, if the HC is
++ *                   scanning in a mode not compatible with beaconing
++ *                   we just fail.
++ */
++
++#include <linux/device.h>
++#include <linux/err.h>
++#include "uwb-internal.h"
++
++
++/**
++ * Start/stop scanning in a radio controller
++ *
++ * @rc:      UWB Radio Controlller
++ * @channel: Channel to scan; encodings in WUSB1.0[Table 5.12]
++ * @type:    Type of scanning to do.
++ * @bpst_offset: value at which to start scanning (if type ==
++ *                UWB_SCAN_ONLY_STARTTIME)
++ * @returns: 0 if ok, < 0 errno code on error
++ *
++ * We put the command on kmalloc'ed memory as some arches cannot do
++ * USB from the stack. The reply event is copied from an stage buffer,
++ * so it can be in the stack. See WUSB1.0[8.6.2.4] for more details.
++ */
++int uwb_rc_scan(struct uwb_rc *rc,
++		unsigned channel, enum uwb_scan_type type,
++		unsigned bpst_offset)
++{
++	int result;
++	struct uwb_rc_cmd_scan *cmd;
++	struct uwb_rc_evt_confirm reply;
++
++	result = -ENOMEM;
++	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
++	if (cmd == NULL)
++		goto error_kzalloc;
++	mutex_lock(&rc->uwb_dev.mutex);
++	cmd->rccb.bCommandType = UWB_RC_CET_GENERAL;
++	cmd->rccb.wCommand = cpu_to_le16(UWB_RC_CMD_SCAN);
++	cmd->bChannelNumber = channel;
++	cmd->bScanState = type;
++	cmd->wStartTime = cpu_to_le16(bpst_offset);
++	reply.rceb.bEventType = UWB_RC_CET_GENERAL;
++	reply.rceb.wEvent = UWB_RC_CMD_SCAN;
++	result = uwb_rc_cmd(rc, "SCAN", &cmd->rccb, sizeof(*cmd),
++			    &reply.rceb, sizeof(reply));
++	if (result < 0)
++		goto error_cmd;
++	if (reply.bResultCode != UWB_RC_RES_SUCCESS) {
++		dev_err(&rc->uwb_dev.dev,
++			"SCAN: command execution failed: %s (%d)\n",
++			uwb_rc_strerror(reply.bResultCode), reply.bResultCode);
++		result = -EIO;
++		goto error_cmd;
++	}
++	rc->scanning = channel;
++	rc->scan_type = type;
++error_cmd:
++	mutex_unlock(&rc->uwb_dev.mutex);
++	kfree(cmd);
++error_kzalloc:
++	return result;
++}
++
++static const char *scan_type_name[] = {
++	"scanning-only",
++	"scanning-outside beacon period",
++	"scanning-while inactive",
++	"scanning-disabled",
++	"scanning-only starttime"
++};
++
++/*
++ * Print scanning state
++ */
++static ssize_t uwb_rc_scan_show(struct device *dev,
++				struct device_attribute *attr, char *buf)
++{
++	struct uwb_dev *uwb_dev = to_uwb_dev(dev);
++	struct uwb_rc *rc = uwb_dev->rc;
++	enum uwb_scan_type type;
++	ssize_t result;
++	unsigned cnt;
++
++	mutex_lock(&rc->uwb_dev.mutex);
++	type = rc->scan_type;
++	BUG_ON(type > UWB_SCAN_ONLY_STARTTIME || type < UWB_SCAN_ONLY);
++	result = sprintf(buf,
++			 "state: %s\n"
++			 "channel: %d\n"
++			 "\n"
++			 "# CHANNEL TYPE [BPST-OFFSET]\n"
++			 "#   start/stop scanning on CHANNEL\n"
++			 "#\n"
++			 "# Types:\n",
++			 scan_type_name[type], rc->scanning);
++	mutex_unlock(&rc->uwb_dev.mutex);
++	for (cnt = 0; cnt <= UWB_SCAN_ONLY_STARTTIME; cnt++)
++		result += sprintf(buf + result, "#  %d - %s\n",
++				  cnt, scan_type_name[cnt]);
++	return result;
++}
++
++/*
++ *
++ */
++static ssize_t uwb_rc_scan_store(struct device *dev,
++				 struct device_attribute *attr,
++				 const char *buf, size_t size)
++{
++	struct uwb_dev *uwb_dev = to_uwb_dev(dev);
++	struct uwb_rc *rc = uwb_dev->rc;
++	ssize_t result;
++	unsigned channel;
++	unsigned type;
++	unsigned bpst_offset = 0;
++
++	result = sscanf(buf, "%u %u %u\n", &channel, &type, &bpst_offset);
++	if (result < 2 || type >= UWB_SCAN_TOP) {
++		result = -EINVAL;
++		goto error;
++	}
++	result = uwb_rc_scan(rc, channel, type, bpst_offset);
++error:
++	return result < 0 ? result : size;
++}
++
++/** Radio Control sysfs interface (declaration) */
++DEVICE_ATTR(scan, S_IRUGO | S_IWUSR, uwb_rc_scan_show, uwb_rc_scan_store);
