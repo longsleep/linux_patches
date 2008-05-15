@@ -1,0 +1,2870 @@
+From David Vrabel <david.vrabel@csr.com> Tue May 13 10:33:22 2008
+From: Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
+Date: Tue, 13 May 2008 10:32:48 +0100
+Subject: uwb: add the i1480 WLP driver
+To: linux-uwb@bughost.org
+Cc: linux-usb@vger.kernel.org, David Vrabel <david.vrabel@csr.com>
+Message-ID: <20080513093322.082232819@csr.com>>
+Content-Disposition: inline; filename=uwb-i1480-wlp-driver.patch
+
+
+From: Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
+
+Add the driver for the WLP capability of the Intel i1480 device.
+
+Signed-off-by: David Vrabel <david.vrabel@csr.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+---
+ drivers/uwb/Kconfig                       |   10 
+ drivers/uwb/i1480/Makefile                |    1 
+ drivers/uwb/i1480/i1480-wlp.h             |  155 +++++++
+ drivers/uwb/i1480/i1480u-wlp/Makefile     |    8 
+ drivers/uwb/i1480/i1480u-wlp/i1480u-wlp.h |  269 ++++++++++++
+ drivers/uwb/i1480/i1480u-wlp/lc.c         |  421 +++++++++++++++++++
+ drivers/uwb/i1480/i1480u-wlp/netdev.c     |  367 +++++++++++++++++
+ drivers/uwb/i1480/i1480u-wlp/rx.c         |  491 +++++++++++++++++++++++
+ drivers/uwb/i1480/i1480u-wlp/sysfs.c      |  446 ++++++++++++++++++++
+ drivers/uwb/i1480/i1480u-wlp/tx.c         |  638 ++++++++++++++++++++++++++++++
+ 10 files changed, 2806 insertions(+)
+
+--- a/drivers/uwb/Kconfig
++++ b/drivers/uwb/Kconfig
+@@ -76,4 +76,14 @@ config UWB_I1480U
+          To compile this driver select Y (built in) or M (module). It
+          is safe to select any even if you do not have the hardware.
+ 
++config UWB_I1480U_WLP
++        tristate "Support for Intel Wireless UWB Link 1480 HWA's WLP interface"
++        depends on UWB_I1480U &&  UWB_WLP && NET
++        help
++         This driver enables WLP support for the i1480 when connected via
++         USB. WLP is the WiMedia Link Protocol, or IP over UWB.
++
++         To compile this driver select Y (built in) or M (module). It
++         is safe to select any even if you don't have the hardware.
++
+ endif # UWB
+--- a/drivers/uwb/i1480/Makefile
++++ b/drivers/uwb/i1480/Makefile
+@@ -1 +1,2 @@
+ obj-$(CONFIG_UWB_I1480U)	+= dfu/ i1480-est.o
++obj-$(CONFIG_UWB_I1480U_WLP)	+= i1480u-wlp/
+--- /dev/null
++++ b/drivers/uwb/i1480/i1480-wlp.h
+@@ -0,0 +1,155 @@
++/*
++ * Intel 1480 Wireless UWB Link
++ * WLP specific definitions
++ *
++ *
++ * Copyright (C) 2005-2006 Intel Corporation
++ * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ *
++ *
++ * FIXME: docs
++ */
++
++#ifndef __i1480_wlp_h__
++#define __i1480_wlp_h__
++
++#include <linux/spinlock.h>
++#include <linux/list.h>
++#include <linux/uwb.h>
++#include <linux/if_ether.h>
++
++/* New simplified header format? */
++#undef WLP_HDR_FMT_2 		/* FIXME: rename */
++
++/**
++ * Values of the Delivery ID & Type field when PCA or DRP
++ *
++ * The Delivery ID & Type field in the WLP TX header indicates whether
++ * the frame is PCA or DRP. This is done based on the high level bit of
++ * this field.
++ * We use this constant to test if the traffic is PCA or DRP as follows:
++ * if (wlp_tx_hdr->delivery_id_type & WLP_DRP)
++ * 	this is DRP traffic
++ * else
++ * 	this is PCA traffic
++ */
++enum deliver_id_type_bit {
++	WLP_DRP = 8,
++};
++
++/**
++ * WLP TX header
++ *
++ * Indicates UWB/WLP-specific transmission parameters for a network
++ * packet.
++ */
++struct wlp_tx_hdr {
++	/* dword 0 */
++	struct uwb_dev_addr		dstaddr;
++	u8		    		key_index;
++	DECL_BF_LE3(
++		u8			delivery_id_type:4,
++		enum uwb_ack_pol	ack_pol:3,
++		u8			rts_cts:1
++	) __attribute__((packed));
++	/* dword 1 */
++	DECL_BF_LE2(
++		enum uwb_phy_rate	phy_rate:4,
++		s8			tx_power_ctl:4
++	) __attribute__((packed));
++#ifndef WLP_HDR_FMT_2
++	u8		    reserved;
++	__le16		    oui01;		/* FIXME: not so sure if __le16 or u8[2] */
++	/* dword 2 */
++	u8		    oui2;		/*        if all LE, it could be merged */
++	__le16		    prid;
++#endif
++} __attribute__((packed));
++
++
++/**
++ * WLP RX header
++ *
++ * Provides UWB/WLP-specific transmission data for a received
++ * network packet.
++ */
++struct wlp_rx_hdr {
++	/* dword 0 */
++	struct uwb_dev_addr dstaddr;
++	struct uwb_dev_addr srcaddr;
++	/* dword 1 */
++	u8 		    LQI;
++	s8		    RSSI;
++	u8		    reserved3;
++#ifndef WLP_HDR_FMT_2
++	u8 		    oui0;
++	/* dword 2 */
++	__le16		    oui12;
++	__le16		    prid;
++#endif
++} __attribute__((packed));
++
++
++/** User configurable options for WLP */
++struct wlp_options {
++	struct mutex mutex; /* access to user configurable options*/
++	struct wlp_tx_hdr def_tx_hdr;	/* default tx hdr */
++	u8 pca_base_priority;
++	u8 bw_alloc; /*index into bw_allocs[] for PCA/DRP reservations*/
++};
++
++
++static inline
++void wlp_options_init(struct wlp_options *options)
++{
++	mutex_init(&options->mutex);
++	options->def_tx_hdr.ack_pol = UWB_ACK_INM;
++	options->def_tx_hdr.rts_cts = 1;
++	/* FIXME: default to phy caps */
++	options->def_tx_hdr.phy_rate = UWB_PHY_RATE_480;
++#ifndef WLP_HDR_FMT_2
++	options->def_tx_hdr.prid = cpu_to_le16(0x0000);
++#endif
++}
++
++
++/* sysfs helpers */
++
++extern ssize_t uwb_pca_base_priority_store(struct wlp_options *,
++					   const char *, size_t);
++extern ssize_t uwb_pca_base_priority_show(const struct wlp_options *, char *);
++extern ssize_t uwb_bw_alloc_store(struct wlp_options *, const char *, size_t);
++extern ssize_t uwb_bw_alloc_show(const struct wlp_options *, char *);
++extern ssize_t uwb_ack_policy_store(struct wlp_options *,
++				    const char *, size_t);
++extern ssize_t uwb_ack_policy_show(const struct wlp_options *, char *);
++extern ssize_t uwb_rts_cts_store(struct wlp_options *, const char *, size_t);
++extern ssize_t uwb_rts_cts_show(const struct wlp_options *, char *);
++extern ssize_t uwb_phy_rate_store(struct wlp_options *, const char *, size_t);
++extern ssize_t uwb_phy_rate_show(const struct wlp_options *, char *);
++
++
++/** Simple bandwidth allocation (temporary and too simple) */
++struct wlp_bw_allocs {
++	const char *name;
++	struct {
++		u8 mask, stream;
++	} tx, rx;
++};
++
++
++#endif /* #ifndef __i1480_wlp_h__ */
+--- /dev/null
++++ b/drivers/uwb/i1480/i1480u-wlp/Makefile
+@@ -0,0 +1,8 @@
++obj-$(CONFIG_UWB_I1480U_WLP) += i1480u-wlp.o
++
++i1480u-wlp-objs :=	\
++	lc.o		\
++	netdev.o	\
++	rx.o		\
++	sysfs.o		\
++	tx.o
+--- /dev/null
++++ b/drivers/uwb/i1480/i1480u-wlp/i1480u-wlp.h
+@@ -0,0 +1,269 @@
++/*
++ * Intel 1480 Wireless UWB Link USB
++ * Header formats, constants, general internal interfaces
++ *
++ *
++ * Copyright (C) 2005-2006 Intel Corporation
++ * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ *
++ *
++ * This is not an standard interface.
++ *
++ * FIXME: docs
++ *
++ * i1480u-wlp is pretty simple: two endpoints, one for tx, one for
++ * rx. rx is polled. Network packets (ethernet, whatever) are wrapped
++ * in i1480 TX or RX headers (for sending over the air), and these
++ * packets are wrapped in UNTD headers (for sending to the WLP UWB
++ * controller).
++ *
++ * UNTD packets (UNTD hdr + i1480 hdr + network packet) packets
++ * cannot be bigger than i1480u_MAX_FRG_SIZE. When this happens, the
++ * i1480 packet is broken in chunks/packets:
++ *
++ * UNTD-1st.hdr + i1480.hdr + payload
++ * UNTD-next.hdr + payload
++ * ...
++ * UNTD-last.hdr + payload
++ *
++ * so that each packet is smaller or equal than i1480u_MAX_FRG_SIZE.
++ *
++ * All HW structures and bitmaps are little endian, so we need to play
++ * ugly tricks when defining bitfields. Hoping for the day GCC
++ * implements __attribute__((endian(1234))).
++ *
++ * FIXME: ROADMAP to the whole implementation
++ */
++
++#ifndef __i1480u_wlp_h__
++#define __i1480u_wlp_h__
++
++#include <linux/usb.h>
++#include <linux/netdevice.h>
++#include <linux/uwb.h>		/* struct uwb_rc, struct uwb_notifs_handler */
++#include <linux/wlp.h>
++#include "../i1480-wlp.h"
++
++#undef i1480u_FLOW_CONTROL	/* Enable flow control code */
++
++/**
++ * Basic flow control
++ */
++enum {
++	i1480u_TX_INFLIGHT_MAX = 1000,
++	i1480u_TX_INFLIGHT_THRESHOLD = 100,
++};
++
++/** Maximum size of a transaction that we can tx/rx */
++enum {
++	/* Maximum packet size computed as follows: max UNTD header (8) +
++	 * i1480 RX header (8) + max Ethernet header and payload (4096) +
++	 * Padding added by skb_reserve (2) to make post Ethernet payload
++	 * start on 16 byte boundary*/
++	i1480u_MAX_RX_PKT_SIZE = 4114,
++	i1480u_MAX_FRG_SIZE = 512,
++	i1480u_RX_BUFS = 9,
++};
++
++
++/**
++ * UNTD packet type
++ *
++ * We need to fragment any payload whose UNTD packet is going to be
++ * bigger than i1480u_MAX_FRG_SIZE.
++ */
++enum i1480u_pkt_type {
++	i1480u_PKT_FRAG_1ST = 0x1,
++	i1480u_PKT_FRAG_NXT = 0x0,
++	i1480u_PKT_FRAG_LST = 0x2,
++	i1480u_PKT_FRAG_CMP = 0x3
++};
++enum {
++	i1480u_PKT_NONE = 0x4,
++};
++
++/** USB Network Transfer Descriptor - common */
++struct untd_hdr {
++	DECL_BF_LE4(
++		enum i1480u_pkt_type	type:2,
++		u8			rx_tx:1,	/* !0 == rx */
++		u8			reserved1:2,
++		u8			reserved2:3
++	) __attribute__((packed));
++	__le16			len;
++} __attribute__((packed));
++
++
++/**
++ * USB Network Transfer Descriptor - Complete Packet
++ *
++ * This is for a packet that is smaller (header + payload) than
++ * i1480u_MAX_FRG_SIZE.
++ *
++ * @hdr.total_len is the size of the payload; the payload doesn't
++ * count this header nor the padding, but includes the size of i1480
++ * header.
++ */
++struct untd_hdr_cmp {
++	struct untd_hdr	hdr;
++	u8		padding;
++} __attribute__((packed));
++
++
++/**
++ * USB Network Transfer Descriptor - First fragment
++ *
++ * @hdr.len is the size of the *whole packet* (excluding UNTD
++ * headers); @fragment_len is the size of the payload (excluding UNTD
++ * headers, but including i1480 headers).
++ */
++struct untd_hdr_1st {
++	struct untd_hdr	hdr;
++	__le16		fragment_len;
++	u8		padding[3];
++} __attribute__((packed));
++
++
++/**
++ * USB Network Transfer Descriptor - Next / Last [Rest]
++ *
++ * @hdr.len is the size of the payload, not including headrs.
++ */
++struct untd_hdr_rst {
++	struct untd_hdr	hdr;
++	u8		padding;
++} __attribute__((packed));
++
++
++/**
++ * Transmission context
++ *
++ * Wraps all the stuff needed to track a pending/active tx
++ * operation.
++ */
++struct i1480u_tx {
++	struct list_head list_node;
++	struct i1480u *i1480u;
++	struct urb *urb;
++
++	struct sk_buff *skb;
++	struct wlp_tx_hdr *wlp_tx_hdr;
++
++	void *buf;	/* if NULL, no new buf was used */
++	size_t buf_size;
++};
++
++/**
++ * Basic flow control
++ *
++ * We maintain a basic flow control counter. "count" how many TX URBs are
++ * outstanding. Only allow "max"
++ * TX URBs to be outstanding. If this value is reached the queue will be
++ * stopped. The queue will be restarted when there are
++ * "threshold" URBs outstanding.
++ * Maintain a counter of how many time the TX queue needed to be restarted
++ * due to the "max" being exceeded and the "threshold" reached again. The
++ * timestamp "restart_ts" is to keep track from when the counter was last
++ * queried (see sysfs handling of file wlp_tx_inflight).
++ */
++struct i1480u_tx_inflight {
++	atomic_t count;
++	unsigned long max;
++	unsigned long threshold;
++	unsigned long restart_ts;
++	atomic_t restart_count;
++};
++
++/**
++ * Instance of a i1480u WLP interface
++ *
++ * Keeps references to the USB device that wraps it, as well as it's
++ * interface and associated UWB host controller. As well, it also
++ * keeps a link to the netdevice for integration into the networking
++ * stack.
++ * We maintian separate error history for the tx and rx endpoints because
++ * the implementation does not rely on locking - having one shared
++ * structure between endpoints may cause problems. Adding locking to the
++ * implementation will have higher cost than adding a separate structure.
++ */
++struct i1480u {
++	struct usb_device *usb_dev;
++	struct usb_interface *usb_iface;
++	struct net_device *net_dev;
++
++	spinlock_t lock;
++	struct net_device_stats stats;
++
++	/* RX context handling */
++	struct sk_buff *rx_skb;
++	struct uwb_dev_addr rx_srcaddr;
++	size_t rx_untd_pkt_size;
++	struct i1480u_rx_buf {
++		struct i1480u *i1480u;	/* back pointer */
++		struct urb *urb;
++		struct sk_buff *data;	/* i1480u_MAX_RX_PKT_SIZE each */
++	} rx_buf[i1480u_RX_BUFS];	/* N bufs */
++
++	spinlock_t tx_list_lock;	/* TX context */
++	struct list_head tx_list;
++	u8 tx_stream;
++
++	struct stats lqe_stats, rssi_stats;	/* radio statistics */
++
++	/* Options we can set from sysfs */
++	struct wlp_options options;
++	struct uwb_notifs_handler uwb_notifs_handler;
++	struct edc tx_errors;
++	struct edc rx_errors;
++	struct wlp wlp;
++#ifdef i1480u_FLOW_CONTROL
++	struct urb *notif_urb;
++	struct edc notif_edc;		/* error density counter */
++	u8 notif_buffer[1];
++#endif
++	struct i1480u_tx_inflight tx_inflight;
++};
++
++/* Internal interfaces */
++extern void i1480u_rx_cb(struct urb *urb);
++extern int i1480u_rx_setup(struct i1480u *);
++extern void i1480u_rx_release(struct i1480u *);
++extern void i1480u_tx_release(struct i1480u *);
++extern int i1480u_xmit_frame(struct wlp *, struct sk_buff *,
++			     struct uwb_dev_addr *);
++extern void i1480u_stop_queue(struct wlp *);
++extern void i1480u_start_queue(struct wlp *);
++extern int i1480u_sysfs_setup(struct i1480u *);
++extern void i1480u_sysfs_release(struct i1480u *);
++
++/* netdev interface */
++extern int i1480u_open(struct net_device *);
++extern int i1480u_stop(struct net_device *);
++extern int i1480u_hard_start_xmit(struct sk_buff *, struct net_device *);
++extern void i1480u_tx_timeout(struct net_device *);
++extern int i1480u_set_config(struct net_device *, struct ifmap *);
++extern struct net_device_stats *i1480u_get_stats(struct net_device *);
++extern int i1480u_change_mtu(struct net_device *, int);
++extern void i1480u_uwb_notifs_cb(void *, struct uwb_dev *, enum uwb_notifs);
++
++/* bandwidth allocation callback */
++extern void  i1480u_bw_alloc_cb(struct uwb_rsv *);
++
++/* Sys FS */
++extern struct attribute_group i1480u_wlp_attr_group;
++
++#endif /* #ifndef __i1480u_wlp_h__ */
+--- /dev/null
++++ b/drivers/uwb/i1480/i1480u-wlp/lc.c
+@@ -0,0 +1,421 @@
++/*
++ * WUSB Wire Adapter: WLP interface
++ * Driver for the Linux Network stack.
++ *
++ * Copyright (C) 2005-2006 Intel Corporation
++ * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ *
++ *
++ * FIXME: docs
++ *
++ * This implements a very simple network driver for the WLP USB
++ * device that is associated to a UWB (Ultra Wide Band) host.
++ *
++ * This is seen as an interface of a composite device. Once the UWB
++ * host has an association to another WLP capable device, the
++ * networking interface (aka WLP) can start to send packets back and
++ * forth.
++ *
++ * Limitations:
++ *
++ *  - Hand cranked; can't ifup the interface until there is an association
++ *
++ *  - BW allocation very simplistic [see i1480u_mas_set() and callees].
++ *
++ *
++ * ROADMAP:
++ *
++ *   ENTRY POINTS (driver model):
++ *
++ *     i1480u_driver_{exit,init}(): initialization of the driver.
++ *
++ *     i1480u_probe(): called by the driver code when a device
++ *                     matching 'i1480u_id_table' is connected.
++ *
++ *                     This allocs a netdev instance, inits with
++ *                     i1480u_add(), then registers_netdev().
++ *         i1480u_init()
++ *         i1480u_add()
++ *
++ *     i1480u_disconnect(): device has been disconnected/module
++ *                          is being removed.
++ *         i1480u_rm()
++ */
++#include <linux/version.h>
++#include <linux/if_arp.h>
++#include <linux/etherdevice.h>
++#include <linux/uwb/debug.h>
++#include "i1480u-wlp.h"
++
++
++
++static inline
++void i1480u_init(struct i1480u *i1480u)
++{
++	/* nothing so far... doesn't it suck? */
++	spin_lock_init(&i1480u->lock);
++	INIT_LIST_HEAD(&i1480u->tx_list);
++	spin_lock_init(&i1480u->tx_list_lock);
++	wlp_options_init(&i1480u->options);
++	edc_init(&i1480u->tx_errors);
++	edc_init(&i1480u->rx_errors);
++#ifdef i1480u_FLOW_CONTROL
++	edc_init(&i1480u->notif_edc);
++#endif
++	stats_init(&i1480u->lqe_stats);
++	stats_init(&i1480u->rssi_stats);
++	wlp_init(&i1480u->wlp);
++}
++
++/**
++ * Fill WLP device information structure
++ *
++ * The structure will contain a few character arrays, each ending with a
++ * null terminated string. Each string has to fit (excluding terminating
++ * character) into a specified range obtained from the WLP substack.
++ *
++ * It is still not clear exactly how this device information should be
++ * obtained. Until we find out we use the USB device descriptor as backup, some
++ * information elements have intuitive mappings, other not.
++ */
++static
++void i1480u_fill_device_info(struct wlp *wlp, struct wlp_device_info *dev_info)
++{
++	struct i1480u *i1480u = container_of(wlp, struct i1480u, wlp);
++	struct usb_device *usb_dev = i1480u->usb_dev;
++	/* Treat device name and model name the same */
++	if (usb_dev->descriptor.iProduct) {
++		usb_string(usb_dev, usb_dev->descriptor.iProduct,
++			   dev_info->name, sizeof(dev_info->name));
++		usb_string(usb_dev, usb_dev->descriptor.iProduct,
++			   dev_info->model_name, sizeof(dev_info->model_name));
++	}
++	if (usb_dev->descriptor.iManufacturer)
++		usb_string(usb_dev, usb_dev->descriptor.iManufacturer,
++			   dev_info->manufacturer,
++			   sizeof(dev_info->manufacturer));
++	scnprintf(dev_info->model_nr, sizeof(dev_info->model_nr), "%04x",
++		  __le16_to_cpu(usb_dev->descriptor.bcdDevice));
++	if (usb_dev->descriptor.iSerialNumber)
++		usb_string(usb_dev, usb_dev->descriptor.iSerialNumber,
++			   dev_info->serial, sizeof(dev_info->serial));
++	/* FIXME: where should we obtain category? */
++	dev_info->prim_dev_type.category = cpu_to_le16(WLP_DEV_CAT_OTHER);
++	/* FIXME: Complete OUI and OUIsubdiv attributes */
++}
++
++#ifdef i1480u_FLOW_CONTROL
++/**
++ * Callback for the notification endpoint
++ *
++ * This mostly controls the xon/xoff protocol. In case of hard error,
++ * we stop the queue. If not, we always retry.
++ */
++static
++void i1480u_notif_cb(struct urb *urb, struct pt_regs *regs)
++{
++	struct i1480u *i1480u = urb->context;
++	struct usb_interface *usb_iface = i1480u->usb_iface;
++	struct device *dev = &usb_iface->dev;
++	int result;
++
++	switch (urb->status) {
++	case 0:				/* Got valid data, do xon/xoff */
++		switch (i1480u->notif_buffer[0]) {
++		case 'N':
++			dev_err(dev, "XOFF STOPPING queue at %lu\n", jiffies);
++			netif_stop_queue(i1480u->net_dev);
++			break;
++		case 'A':
++			dev_err(dev, "XON STARTING queue at %lu\n", jiffies);
++			netif_start_queue(i1480u->net_dev);
++			break;
++		default:
++			dev_err(dev, "NEP: unknown data 0x%02hhx\n",
++				i1480u->notif_buffer[0]);
++		}
++		break;
++	case -ECONNRESET:		/* Controlled situation ... */
++	case -ENOENT:			/* we killed the URB... */
++		dev_err(dev, "NEP: URB reset/noent %d\n", urb->status);
++		goto error;
++	case -ESHUTDOWN:		/* going away! */
++		dev_err(dev, "NEP: URB down %d\n", urb->status);
++		goto error;
++	default:			/* Retry unless it gets ugly */
++		if (edc_inc(&i1480u->notif_edc, EDC_MAX_ERRORS,
++			    EDC_ERROR_TIMEFRAME)) {
++			dev_err(dev, "NEP: URB max acceptable errors "
++				"exceeded; resetting device\n");
++			goto error_reset;
++		}
++		dev_err(dev, "NEP: URB error %d\n", urb->status);
++		break;
++	}
++	result = usb_submit_urb(urb, GFP_ATOMIC);
++	if (result < 0) {
++		dev_err(dev, "NEP: Can't resubmit URB: %d; resetting device\n",
++			result);
++		goto error_reset;
++	}
++	return;
++
++error_reset:
++	usb_dev_reset_delayed(i1480u->usb_dev);
++error:
++	netif_stop_queue(i1480u->net_dev);
++	return;
++}
++#endif
++
++static
++int i1480u_add(struct i1480u *i1480u, struct usb_interface *iface)
++{
++	int result = -ENODEV;
++	struct wlp *wlp = &i1480u->wlp;
++	struct usb_device *usb_dev = interface_to_usbdev(iface);
++	struct net_device *net_dev = i1480u->net_dev;
++	struct uwb_rc *rc;
++	struct uwb_dev *uwb_dev;
++#ifdef i1480u_FLOW_CONTROL
++	struct usb_endpoint_descriptor *epd;
++#endif
++
++	i1480u->usb_dev = usb_get_dev(usb_dev);
++	i1480u->usb_iface = iface;
++	rc = uwb_rc_get_by_grandpa(&i1480u->usb_dev->dev);
++	if (rc == NULL) {
++		dev_err(&iface->dev, "Cannot get associated UWB Radio "
++			"Controller\n");
++		goto out;
++	}
++	wlp->xmit_frame = i1480u_xmit_frame;
++	wlp->fill_device_info = i1480u_fill_device_info;
++	wlp->stop_queue = i1480u_stop_queue;
++	wlp->start_queue = i1480u_start_queue;
++	result = wlp_setup(wlp, rc);
++	if (result < 0) {
++		dev_err(&iface->dev, "Cannot setup WLP\n");
++		goto error_wlp_setup;
++	}
++	result = 0;
++	ether_setup(net_dev);			/* make it an etherdevice */
++	uwb_dev = &rc->uwb_dev;
++	/* FIXME: hookup address change notifications? */
++
++	memcpy(net_dev->dev_addr, uwb_dev->mac_addr.data,
++	       sizeof(net_dev->dev_addr));
++
++	net_dev->hard_header_len = sizeof(struct untd_hdr_cmp)
++		+ sizeof(struct wlp_tx_hdr)
++		+ WLP_DATA_HLEN
++		+ ETH_HLEN;
++	net_dev->mtu = 3500;
++	net_dev->tx_queue_len = 20;		/* FIXME: maybe use 1000? */
++
++/*	net_dev->flags &= ~IFF_BROADCAST;	FIXME: BUG in firmware */
++	/* FIXME: multicast disabled */
++	net_dev->flags &= ~IFF_MULTICAST;
++	net_dev->features &= ~NETIF_F_SG;
++	net_dev->features &= ~NETIF_F_FRAGLIST;
++	/* All NETIF_F_*_CSUM disabled */
++	net_dev->features |= NETIF_F_HIGHDMA;
++	net_dev->watchdog_timeo = 5*HZ;		/* FIXME: a better default? */
++
++	net_dev->open = i1480u_open;
++	net_dev->stop = i1480u_stop;
++	net_dev->hard_start_xmit = i1480u_hard_start_xmit;
++	net_dev->tx_timeout = i1480u_tx_timeout;
++	net_dev->get_stats = i1480u_get_stats;
++	net_dev->set_config = i1480u_set_config;
++	net_dev->change_mtu = i1480u_change_mtu;
++
++#ifdef i1480u_FLOW_CONTROL
++	/* Notification endpoint setup (submitted when we open the device) */
++	i1480u->notif_urb = usb_alloc_urb(0, GFP_KERNEL);
++	if (i1480u->notif_urb == NULL) {
++		dev_err(&iface->dev, "Unable to allocate notification URB\n");
++		result = -ENOMEM;
++		goto error_urb_alloc;
++	}
++	epd = &iface->cur_altsetting->endpoint[0].desc;
++	usb_fill_int_urb(i1480u->notif_urb, usb_dev,
++			 usb_rcvintpipe(usb_dev, epd->bEndpointAddress),
++			 i1480u->notif_buffer, sizeof(i1480u->notif_buffer),
++			 i1480u_notif_cb, i1480u, epd->bInterval);
++
++#endif
++
++	i1480u->tx_inflight.max = i1480u_TX_INFLIGHT_MAX;
++	i1480u->tx_inflight.threshold = i1480u_TX_INFLIGHT_THRESHOLD;
++	i1480u->tx_inflight.restart_ts = jiffies;
++	usb_set_intfdata(iface, i1480u);
++	return result;
++
++#ifdef i1480u_FLOW_CONTROL
++error_urb_alloc:
++#endif
++	wlp_remove(wlp);
++error_wlp_setup:
++	uwb_rc_put(rc);
++out:
++	usb_put_dev(i1480u->usb_dev);
++	return result;
++}
++
++static void i1480u_rm(struct i1480u *i1480u)
++{
++	struct uwb_rc *rc = i1480u->wlp.rc;
++	usb_set_intfdata(i1480u->usb_iface, NULL);
++#ifdef i1480u_FLOW_CONTROL
++	usb_kill_urb(i1480u->notif_urb);
++	usb_free_urb(i1480u->notif_urb);
++#endif
++	wlp_remove(&i1480u->wlp);
++	uwb_rc_put(rc);
++	usb_put_dev(i1480u->usb_dev);
++}
++
++/** Just setup @net_dev's i1480u private data */
++static void i1480u_netdev_setup(struct net_device *net_dev)
++{
++	struct i1480u *i1480u = netdev_priv(net_dev);
++	/* Initialize @i1480u */
++	memset(i1480u, 0, sizeof(*i1480u));
++	i1480u_init(i1480u);
++}
++
++/**
++ * Probe a i1480u interface and register it
++ *
++ * @iface:   USB interface to link to
++ * @id:      USB class/subclass/protocol id
++ * @returns: 0 if ok, < 0 errno code on error.
++ *
++ * Does basic housekeeping stuff and then allocs a netdev with space
++ * for the i1480u  data. Initializes, registers in i1480u, registers in
++ * netdev, ready to go.
++ */
++static int i1480u_probe(struct usb_interface *iface,
++			const struct usb_device_id *id)
++{
++	int result;
++	struct net_device *net_dev;
++	struct device *dev = &iface->dev;
++	struct i1480u *i1480u;
++
++	/* Allocate instance [calls i1480u_netdev_setup() on it] */
++	result = -ENOMEM;
++	net_dev = alloc_netdev(sizeof(*i1480u), "wlp%d", i1480u_netdev_setup);
++	if (net_dev == NULL) {
++		dev_err(dev, "no memory for network device instance\n");
++		goto error_alloc_netdev;
++	}
++	SET_NETDEV_DEV(net_dev, dev);
++	i1480u = netdev_priv(net_dev);
++	i1480u->net_dev = net_dev;
++	result = i1480u_add(i1480u, iface);	/* Now setup all the wlp stuff */
++	if (result < 0) {
++		dev_err(dev, "cannot add i1480u device: %d\n", result);
++		goto error_i1480u_add;
++	}
++	result = register_netdev(net_dev);	/* Okey dokey, bring it up */
++	if (result < 0) {
++		dev_err(dev, "cannot register network device: %d\n", result);
++		goto error_register_netdev;
++	}
++	i1480u_sysfs_setup(i1480u);
++	if (result < 0)
++		goto error_sysfs_init;
++	return 0;
++
++error_sysfs_init:
++	unregister_netdev(net_dev);
++error_register_netdev:
++	i1480u_rm(i1480u);
++error_i1480u_add:
++	free_netdev(net_dev);
++error_alloc_netdev:
++	return result;
++}
++
++
++/**
++ * Disconect a i1480u from the system.
++ *
++ * i1480u_stop() has been called before, so al the rx and tx contexts
++ * have been taken down already. Make sure the queue is stopped,
++ * unregister netdev and i1480u, free and kill.
++ */
++static void i1480u_disconnect(struct usb_interface *iface)
++{
++	struct i1480u *i1480u;
++	struct net_device *net_dev;
++
++	i1480u = usb_get_intfdata(iface);
++	net_dev = i1480u->net_dev;
++	netif_stop_queue(net_dev);
++#ifdef i1480u_FLOW_CONTROL
++	usb_kill_urb(i1480u->notif_urb);
++#endif
++	i1480u_sysfs_release(i1480u);
++	unregister_netdev(net_dev);
++	i1480u_rm(i1480u);
++	free_netdev(net_dev);
++}
++
++static struct usb_device_id i1480u_id_table[] = {
++	{
++		.match_flags = USB_DEVICE_ID_MATCH_DEVICE \
++				|  USB_DEVICE_ID_MATCH_DEV_INFO \
++				|  USB_DEVICE_ID_MATCH_INT_INFO,
++		.idVendor = 0x8086,
++		.idProduct = 0x0c3b,
++		.bDeviceClass = 0xef,
++		.bDeviceSubClass = 0x02,
++		.bDeviceProtocol = 0x02,
++		.bInterfaceClass = 0xff,
++		.bInterfaceSubClass = 0xff,
++		.bInterfaceProtocol = 0xff,
++	},
++	{},
++};
++MODULE_DEVICE_TABLE(usb, i1480u_id_table);
++
++static struct usb_driver i1480u_driver = {
++	.name =		KBUILD_MODNAME,
++	.probe =	i1480u_probe,
++	.disconnect =	i1480u_disconnect,
++	.id_table =	i1480u_id_table,
++};
++
++static int __init i1480u_driver_init(void)
++{
++	return usb_register(&i1480u_driver);
++}
++module_init(i1480u_driver_init);
++
++
++static void __exit i1480u_driver_exit(void)
++{
++	usb_deregister(&i1480u_driver);
++}
++module_exit(i1480u_driver_exit);
++
++MODULE_AUTHOR("Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>");
++MODULE_DESCRIPTION("i1480 Wireless UWB Link WLP networking for USB");
++MODULE_LICENSE("GPL");
+--- /dev/null
++++ b/drivers/uwb/i1480/i1480u-wlp/netdev.c
+@@ -0,0 +1,367 @@
++/*
++ * WUSB Wire Adapter: WLP interface
++ * Driver for the Linux Network stack.
++ *
++ * Copyright (C) 2005-2006 Intel Corporation
++ * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ *
++ *
++ * FIXME: docs
++ *
++ * Implementation of the netdevice linkage (except tx and rx related stuff).
++ *
++ * ROADMAP:
++ *
++ *   ENTRY POINTS (Net device):
++ *
++ *     i1480u_open(): Called when we ifconfig up the interface;
++ *                    associates to a UWB host controller, reserves
++ *                    bandwidth (MAS), sets up RX USB URB and starts
++ *                    the queue.
++ *
++ *     i1480u_stop(): Called when we ifconfig down a interface;
++ *                    reverses _open().
++ *
++ *     i1480u_set_config():
++ */
++
++#include <linux/if_arp.h>
++#include <linux/etherdevice.h>
++#include <linux/uwb/debug.h>
++#include "i1480u-wlp.h"
++
++struct i1480u_cmd_set_ip_mas {
++	struct uwb_rccb     rccb;
++	struct uwb_dev_addr addr;
++	u8                  stream;
++	u8                  owner;
++	u8                  type;	/* enum uwb_drp_type */
++	u8                  baMAS[32];
++} __attribute__((packed));
++
++
++static
++int i1480u_set_ip_mas(
++	struct uwb_rc *rc,
++	const struct uwb_dev_addr *dstaddr,
++	u8 stream, u8 owner, u8 type, unsigned long *mas)
++{
++
++	int result;
++	struct i1480u_cmd_set_ip_mas *cmd;
++	struct uwb_rc_evt_confirm reply;
++
++	result = -ENOMEM;
++	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
++	if (cmd == NULL)
++		goto error_kzalloc;
++	cmd->rccb.bCommandType = 0xfd;
++	cmd->rccb.wCommand = cpu_to_le16(0x000e);
++	cmd->addr = *dstaddr;
++	cmd->stream = stream;
++	cmd->owner = owner;
++	cmd->type = type;
++	if (mas == NULL)
++		memset(cmd->baMAS, 0x00, sizeof(cmd->baMAS));
++	else
++		memcpy(cmd->baMAS, mas, sizeof(cmd->baMAS));
++	reply.rceb.bEventType = 0xfd;
++	reply.rceb.wEvent = cpu_to_le16(0x000e);
++	result = uwb_rc_cmd(rc, "SET-IP-MAS", &cmd->rccb, sizeof(*cmd),
++			    &reply.rceb, sizeof(reply));
++	if (result < 0)
++		goto error_cmd;
++	if (reply.bResultCode != UWB_RC_RES_FAIL) {
++		dev_err(&rc->uwb_dev.dev,
++			"SET-IP-MAS: command execution failed: %d\n",
++			reply.bResultCode);
++		result = -EIO;
++	}
++error_cmd:
++	kfree(cmd);
++error_kzalloc:
++	return result;
++}
++
++/*
++ * Inform a WLP interface of a MAS reservation
++ *
++ * @rc is assumed refcnted.
++ */
++/* FIXME: detect if remote device is WLP capable? */
++static int i1480u_mas_set_dev(struct uwb_dev *uwb_dev, struct uwb_rc *rc,
++			      u8 stream, u8 owner, u8 type, unsigned long *mas)
++{
++	int result = 0;
++	struct device *dev = &rc->uwb_dev.dev;
++
++	result = i1480u_set_ip_mas(rc, &uwb_dev->dev_addr, stream, owner,
++				   type, mas);
++	if (result < 0) {
++		char rcaddrbuf[UWB_ADDR_STRSIZE], devaddrbuf[UWB_ADDR_STRSIZE];
++		uwb_dev_addr_print(rcaddrbuf, sizeof(rcaddrbuf),
++				   &rc->uwb_dev.dev_addr);
++		uwb_dev_addr_print(devaddrbuf, sizeof(devaddrbuf),
++				   &uwb_dev->dev_addr);
++		dev_err(dev, "Set IP MAS (%s to %s) failed: %d\n",
++			rcaddrbuf, devaddrbuf, result);
++	}
++	return result;
++}
++
++/**
++ * Called by bandwidth allocator when change occurs in reservation.
++ *
++ * @rsv:     The reservation that is being established, modified, or
++ *           terminated.
++ *
++ * When a reservation is established, modified, or terminated the upper layer
++ * (WLP here) needs set/update the currently available Media Access Slots
++ * that can be use for IP traffic.
++ *
++ * Our action taken during failure depends on how the reservation is being
++ * changed:
++ * - if reservation is being established we do nothing if we cannot set the
++ *   new MAS to be used
++ * - if reservation is being terminated we revert back to PCA whether the
++ *   SET IP MAS command succeeds or not.
++ */
++void i1480u_bw_alloc_cb(struct uwb_rsv *rsv)
++{
++	int result = 0;
++	struct i1480u *i1480u = rsv->pal_priv;
++	struct device *dev = &i1480u->usb_iface->dev;
++	struct uwb_dev *target_dev = rsv->target.dev;
++	struct uwb_rc *rc = i1480u->wlp.rc;
++	u8 stream = rsv->stream;
++	int type = rsv->type;
++	int is_owner = rsv->owner == &rc->uwb_dev;
++	unsigned long *bmp = rsv->mas.bm;
++
++	dev_err(dev, "WLP callback called - sending set ip mas\n");
++	/*user cannot change options while setting configuration*/
++	mutex_lock(&i1480u->options.mutex);
++	switch (rsv->state) {
++	case UWB_RSV_STATE_T_ACCEPTED:
++	case UWB_RSV_STATE_O_ESTABLISHED:
++		result = i1480u_mas_set_dev(target_dev, rc, stream, is_owner,
++					type, bmp);
++		if (result < 0) {
++			dev_err(dev, "MAS reservation failed: %d\n", result);
++			goto out;
++		}
++		if (is_owner) {
++			i1480u->options.def_tx_hdr.delivery_id_type = 8 | stream;
++			i1480u->options.def_tx_hdr.rts_cts = 0;
++		}
++		break;
++	case UWB_RSV_STATE_NONE:
++		/* revert back to PCA */
++		result = i1480u_mas_set_dev(target_dev, rc, stream, is_owner,
++					    type, bmp);
++		if (result < 0)
++			dev_err(dev, "MAS reservation failed: %d\n", result);
++		/* Revert to PCA even though SET IP MAS failed. */
++		i1480u->options.def_tx_hdr.delivery_id_type =
++			i1480u->options.pca_base_priority;
++		i1480u->options.def_tx_hdr.rts_cts = 1;
++		break;
++	default:
++		dev_err(dev, "unexpected WLP reservation state: %s (%d).\n",
++			uwb_rsv_state_str(rsv->state), rsv->state);
++		break;
++	}
++out:
++	mutex_unlock(&i1480u->options.mutex);
++	return;
++}
++
++/**
++ *
++ * Called on 'ifconfig up'
++ */
++int i1480u_open(struct net_device *net_dev)
++{
++	int result;
++	struct i1480u *i1480u = netdev_priv(net_dev);
++	struct wlp *wlp = &i1480u->wlp;
++	struct uwb_rc *rc;
++	struct device *dev = &i1480u->usb_iface->dev;
++
++	rc = wlp->rc;
++	result = i1480u_rx_setup(i1480u);		/* Alloc RX stuff */
++	if (result < 0)
++		goto error_rx_setup;
++	netif_wake_queue(net_dev);
++#ifdef i1480u_FLOW_CONTROL
++	result = usb_submit_urb(i1480u->notif_urb, GFP_KERNEL);;
++	if (result < 0) {
++		dev_err(dev, "Can't submit notification URB: %d\n", result);
++		goto error_notif_urb_submit;
++	}
++#endif
++	i1480u->uwb_notifs_handler.cb = i1480u_uwb_notifs_cb;
++	i1480u->uwb_notifs_handler.data = i1480u;
++	if (uwb_bg_joined(rc))
++		netif_carrier_on(net_dev);
++	else
++		netif_carrier_off(net_dev);
++	uwb_notifs_register(rc, &i1480u->uwb_notifs_handler);
++	/* Interface is up with an address, now we can create WSS */
++	result = wlp_wss_setup(net_dev, &wlp->wss);
++	if (result < 0) {
++		dev_err(dev, "Can't create WSS: %d. \n", result);
++		goto error_notif_deregister;
++	}
++	return 0;
++error_notif_deregister:
++	uwb_notifs_deregister(rc, &i1480u->uwb_notifs_handler);
++#ifdef i1480u_FLOW_CONTROL
++error_notif_urb_submit:
++#endif
++	netif_stop_queue(net_dev);
++	i1480u_rx_release(i1480u);
++error_rx_setup:
++	return result;
++}
++
++
++/**
++ * Called on 'ifconfig down'
++ */
++int i1480u_stop(struct net_device *net_dev)
++{
++	struct i1480u *i1480u = netdev_priv(net_dev);
++	struct wlp *wlp = &i1480u->wlp;
++	struct uwb_rc *rc = wlp->rc;
++
++	BUG_ON(wlp->rc == NULL);
++	wlp_wss_remove(&wlp->wss);
++	uwb_notifs_deregister(rc, &i1480u->uwb_notifs_handler);
++	netif_carrier_off(net_dev);
++#ifdef i1480u_FLOW_CONTROL
++	usb_kill_urb(i1480u->notif_urb);
++#endif
++	netif_stop_queue(net_dev);
++	i1480u_rx_release(i1480u);
++	i1480u_tx_release(i1480u);
++	return 0;
++}
++
++
++/** Report statistics */
++struct net_device_stats *i1480u_get_stats(struct net_device *net_dev)
++{
++	struct i1480u *i1480u = netdev_priv(net_dev);
++	return &i1480u->stats;
++}
++
++
++/**
++ *
++ * Change the interface config--we probably don't have to do anything.
++ */
++int i1480u_set_config(struct net_device *net_dev, struct ifmap *map)
++{
++	int result;
++	struct i1480u *i1480u = netdev_priv(net_dev);
++	BUG_ON(i1480u->wlp.rc == NULL);
++	result = 0;
++	return result;
++}
++
++/**
++ * Change the MTU of the interface
++ */
++int i1480u_change_mtu(struct net_device *net_dev, int mtu)
++{
++	static union {
++		struct wlp_tx_hdr tx;
++		struct wlp_rx_hdr rx;
++	} i1480u_all_hdrs;
++
++	if (mtu < ETH_HLEN)	/* We encap eth frames */
++		return -ERANGE;
++	if (mtu > 4000 - sizeof(i1480u_all_hdrs))
++		return -ERANGE;
++	net_dev->mtu = mtu;
++	return 0;
++}
++
++
++/**
++ * Callback function to handle events from UWB
++ * When we see other devices we know the carrier is ok,
++ * if we are the only device in the beacon group we set the carrier
++ * state to off.
++ * */
++void i1480u_uwb_notifs_cb(void *data, struct uwb_dev *uwb_dev,
++			  enum uwb_notifs event)
++{
++	struct i1480u *i1480u = data;
++	struct net_device *net_dev = i1480u->net_dev;
++	struct device *dev = &i1480u->usb_iface->dev;
++	switch (event) {
++	case UWB_NOTIF_BG_JOIN:
++		netif_carrier_on(net_dev);
++		dev_info(dev, "Link is up\n");
++		break;
++	case UWB_NOTIF_BG_LEAVE:
++		netif_carrier_off(net_dev);
++		dev_info(dev, "Link is down\n");
++		break;
++	default:
++		dev_err(dev, "don't know how to handle event %d from uwb\n",
++				event);
++	}
++}
++
++/**
++ * Stop the network queue
++ *
++ * Enable WLP substack to stop network queue. We also set the flow control
++ * threshold at this time to prevent the flow control from restarting the
++ * queue.
++ *
++ * we are loosing the current threshold value here ... FIXME?
++ */
++void i1480u_stop_queue(struct wlp *wlp)
++{
++	struct i1480u *i1480u = container_of(wlp, struct i1480u, wlp);
++	struct net_device *net_dev = i1480u->net_dev;
++	i1480u->tx_inflight.threshold = 0;
++	netif_stop_queue(net_dev);
++}
++
++/**
++ * Start the network queue
++ *
++ * Enable WLP substack to start network queue. Also re-enable the flow
++ * control to manage the queue again.
++ *
++ * We re-enable the flow control by storing the default threshold in the
++ * flow control threshold. This means that if the user modified the
++ * threshold before the queue was stopped and restarted that information
++ * will be lost. FIXME?
++ */
++void i1480u_start_queue(struct wlp *wlp)
++{
++	struct i1480u *i1480u = container_of(wlp, struct i1480u, wlp);
++	struct net_device *net_dev = i1480u->net_dev;
++	i1480u->tx_inflight.threshold = i1480u_TX_INFLIGHT_THRESHOLD;
++	netif_start_queue(net_dev);
++}
+--- /dev/null
++++ b/drivers/uwb/i1480/i1480u-wlp/rx.c
+@@ -0,0 +1,491 @@
++/*
++ * WUSB Wire Adapter: WLP interface
++ * Driver for the Linux Network stack.
++ *
++ * Copyright (C) 2005-2006 Intel Corporation
++ * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ *
++ *
++ * i1480u's RX handling is simple. i1480u will send the received
++ * network packets broken up in fragments; 1 to N fragments make a
++ * packet, we assemble them together and deliver the packet with netif_rx().
++ *
++ * Beacuse each USB transfer is a *single* fragment (except when the
++ * transfer contains a first fragment), each URB called thus
++ * back contains one or two fragments. So we queue N URBs, each with its own
++ * fragment buffer. When a URB is done, we process it (adding to the
++ * current skb from the fragment buffer until complete). Once
++ * processed, we requeue the URB. There is always a bunch of URBs
++ * ready to take data, so the intergap should be minimal.
++ *
++ * An URB's transfer buffer is the data field of a socket buffer. This
++ * reduces copying as data can be passed directly to network layer. If a
++ * complete packet or 1st fragment is received the URB's transfer buffer is
++ * taken away from it and used to send data to the network layer. In this
++ * case a new transfer buffer is allocated to the URB before being requeued.
++ * If a "NEXT" or "LAST" fragment is received, the fragment contents is
++ * appended to the RX packet under construction and the transfer buffer
++ * is reused. To be able to use this buffer to assemble complete packets
++ * we set each buffer's size to that of the MAX ethernet packet that can
++ * be received. There is thus room for improvement in memory usage.
++ *
++ * When the max tx fragment size increases, we should be able to read
++ * data into the skbs directly with very simple code.
++ *
++ * ROADMAP:
++ *
++ *   ENTRY POINTS:
++ *
++ *     i1480u_rx_setup(): setup RX context [from i1480u_open()]
++ *
++ *     i1480u_rx_release(): release RX context [from i1480u_stop()]
++ *
++ *     i1480u_rx_cb(): called when the RX USB URB receives a
++ *                     packet. It removes the header and pushes it up
++ *                     the Linux netdev stack with netif_rx().
++ *
++ *       i1480u_rx_buffer()
++ *         i1480u_drop() and i1480u_fix()
++ *         i1480u_skb_deliver
++ *
++ */
++
++#include <linux/netdevice.h>
++#include <linux/etherdevice.h>
++#include "i1480u-wlp.h"
++
++#define D_LOCAL 0
++#include <linux/uwb/debug.h>
++
++
++/**
++ * Setup the RX context
++ *
++ * Each URB is provided with a transfer_buffer that is the data field
++ * of a new socket buffer.
++ */
++int i1480u_rx_setup(struct i1480u *i1480u)
++{
++	int result, cnt;
++	struct device *dev = &i1480u->usb_iface->dev;
++	struct net_device *net_dev = i1480u->net_dev;
++	struct usb_endpoint_descriptor *epd;
++	struct sk_buff *skb;
++
++	/* Alloc RX stuff */
++	i1480u->rx_skb = NULL;	/* not in process of receiving packet */
++	result = -ENOMEM;
++	epd = &i1480u->usb_iface->cur_altsetting->endpoint[1].desc;
++	for (cnt = 0; cnt < i1480u_RX_BUFS; cnt++) {
++		struct i1480u_rx_buf *rx_buf = &i1480u->rx_buf[cnt];
++		rx_buf->i1480u = i1480u;
++		skb = dev_alloc_skb(i1480u_MAX_RX_PKT_SIZE);
++		if (!skb) {
++			dev_err(dev,
++				"RX: cannot allocate RX buffer %d\n", cnt);
++			result = -ENOMEM;
++			goto error;
++		}
++		skb->dev = net_dev;
++		skb->ip_summed = CHECKSUM_NONE;
++		skb_reserve(skb, 2);
++		rx_buf->data = skb;
++		rx_buf->urb = usb_alloc_urb(0, GFP_KERNEL);
++		if (unlikely(rx_buf->urb == NULL)) {
++			dev_err(dev, "RX: cannot allocate URB %d\n", cnt);
++			result = -ENOMEM;
++			goto error;
++		}
++		usb_fill_bulk_urb(rx_buf->urb, i1480u->usb_dev,
++			  usb_rcvbulkpipe(i1480u->usb_dev, epd->bEndpointAddress),
++			  rx_buf->data->data, i1480u_MAX_RX_PKT_SIZE - 2,
++			  i1480u_rx_cb, rx_buf);
++		result = usb_submit_urb(rx_buf->urb, GFP_NOIO);
++		if (unlikely(result < 0)) {
++			dev_err(dev, "RX: cannot submit URB %d: %d\n",
++				cnt, result);
++			goto error;
++		}
++	}
++	return 0;
++
++error:
++	i1480u_rx_release(i1480u);
++	return result;
++}
++
++
++/** Release resources associated to the rx context */
++void i1480u_rx_release(struct i1480u *i1480u)
++{
++	int cnt;
++	for (cnt = 0; cnt < i1480u_RX_BUFS; cnt++) {
++		if (i1480u->rx_buf[cnt].data)
++			dev_kfree_skb(i1480u->rx_buf[cnt].data);
++		if (i1480u->rx_buf[cnt].urb) {
++			usb_kill_urb(i1480u->rx_buf[cnt].urb);
++			usb_free_urb(i1480u->rx_buf[cnt].urb);
++		}
++	}
++	if (i1480u->rx_skb != NULL)
++		dev_kfree_skb(i1480u->rx_skb);
++}
++
++static
++void i1480u_rx_unlink_urbs(struct i1480u *i1480u)
++{
++	int cnt;
++	for (cnt = 0; cnt < i1480u_RX_BUFS; cnt++) {
++		if (i1480u->rx_buf[cnt].urb)
++			usb_unlink_urb(i1480u->rx_buf[cnt].urb);
++	}
++}
++
++/** Fix an out-of-sequence packet */
++#define i1480u_fix(i1480u, msg...)			\
++do {							\
++	if (printk_ratelimit())				\
++		dev_err(&i1480u->usb_iface->dev, msg);	\
++	dev_kfree_skb_irq(i1480u->rx_skb);		\
++	i1480u->rx_skb = NULL;				\
++	i1480u->rx_untd_pkt_size = 0;			\
++} while (0)
++
++
++/** Drop an out-of-sequence packet */
++#define i1480u_drop(i1480u, msg...)			\
++do {							\
++	if (printk_ratelimit())				\
++		dev_err(&i1480u->usb_iface->dev, msg);	\
++	i1480u->stats.rx_dropped++;			\
++} while (0)
++
++
++
++
++/** Finalizes setting up the SKB and delivers it
++ *
++ * We first pass the incoming frame to WLP substack for verification. It
++ * may also be a WLP association frame in which case WLP will take over the
++ * processing. If WLP does not take it over it will still verify it, if the
++ * frame is invalid the skb will be freed by WLP and we will not continue
++ * parsing.
++ * */
++static
++void i1480u_skb_deliver(struct i1480u *i1480u)
++{
++	int should_parse;
++	struct net_device *net_dev = i1480u->net_dev;
++	struct device *dev = &i1480u->usb_iface->dev;
++
++	d_printf(6, dev, "RX delivered pre skb(%p), %u bytes\n",
++		 i1480u->rx_skb, i1480u->rx_skb->len);
++	d_dump(7, dev, i1480u->rx_skb->data, i1480u->rx_skb->len);
++	should_parse = wlp_receive_frame(dev, &i1480u->wlp, i1480u->rx_skb,
++					 &i1480u->rx_srcaddr);
++	if (!should_parse)
++		goto out;
++	i1480u->rx_skb->protocol = eth_type_trans(i1480u->rx_skb, net_dev);
++	d_printf(5, dev, "RX delivered skb(%p), %u bytes\n",
++		 i1480u->rx_skb, i1480u->rx_skb->len);
++	d_dump(7, dev, i1480u->rx_skb->data,
++	       i1480u->rx_skb->len > 72? 72 : i1480u->rx_skb->len);
++	i1480u->stats.rx_packets++;
++	i1480u->stats.rx_bytes += i1480u->rx_untd_pkt_size;
++	net_dev->last_rx = jiffies;
++	/* FIXME: flow control: check netif_rx() retval */
++
++	netif_rx(i1480u->rx_skb);		/* deliver */
++out:
++	i1480u->rx_skb = NULL;
++	i1480u->rx_untd_pkt_size = 0;
++}
++
++
++/**
++ * Process a buffer of data received from the USB RX endpoint
++ *
++ * First fragment arrives with next or last fragment. All other fragments
++ * arrive alone.
++ *
++ * /me hates long functions.
++ */
++static
++void i1480u_rx_buffer(struct i1480u_rx_buf *rx_buf)
++{
++	unsigned pkt_completed = 0;	/* !0 when we got all pkt fragments */
++	size_t untd_hdr_size, untd_frg_size;
++	size_t i1480u_hdr_size;
++	struct wlp_rx_hdr *i1480u_hdr = NULL;
++
++	struct i1480u *i1480u = rx_buf->i1480u;
++	struct sk_buff *skb = rx_buf->data;
++	int size_left = rx_buf->urb->actual_length;
++	void *ptr = rx_buf->urb->transfer_buffer; /* also rx_buf->data->data */
++	struct untd_hdr *untd_hdr;
++
++	struct net_device *net_dev = i1480u->net_dev;
++	struct device *dev = &i1480u->usb_iface->dev;
++	struct sk_buff *new_skb;
++
++#if 0
++	dev_fnstart(dev,
++		    "(i1480u %p ptr %p size_left %zu)\n", i1480u, ptr, size_left);
++	dev_err(dev, "RX packet, %zu bytes\n", size_left);
++	dump_bytes(dev, ptr, size_left);
++#endif
++	i1480u_hdr_size = sizeof(struct wlp_rx_hdr);
++
++	while (size_left > 0) {
++		if (pkt_completed) {
++			i1480u_drop(i1480u, "RX: fragment follows completed"
++					 "packet in same buffer. Dropping\n");
++			break;
++		}
++		untd_hdr = ptr;
++		if (size_left < sizeof(*untd_hdr)) {	/*  Check the UNTD header */
++			i1480u_drop(i1480u, "RX: short UNTD header! Dropping\n");
++			goto out;
++		}
++		if (unlikely(untd_hdr->rx_tx == 0)) {	/* Paranoia: TX set? */
++			i1480u_drop(i1480u, "RX: TX bit set! Dropping\n");
++			goto out;
++		}
++		if (untd_hdr->reserved1) {
++			i1480u_drop(i1480u, "RX: reserved1 is not 0 (but %u)! "
++				    "Dropping\n", untd_hdr->reserved1);
++			goto out;
++		}
++		switch (untd_hdr->type) {	/* Check the UNTD header type */
++		case i1480u_PKT_FRAG_1ST: {
++			struct untd_hdr_1st *untd_hdr_1st = (void *) untd_hdr;
++			dev_dbg(dev, "1st fragment\n");
++			untd_hdr_size = sizeof(struct untd_hdr_1st);
++			if (i1480u->rx_skb != NULL)
++				i1480u_fix(i1480u, "RX: 1st fragment out of "
++					"sequence! Fixing\n");
++			if (size_left < untd_hdr_size + i1480u_hdr_size) {
++				i1480u_drop(i1480u, "RX: short 1st fragment! "
++					"Dropping\n");
++				goto out;
++			}
++			i1480u->rx_untd_pkt_size = le16_to_cpu(untd_hdr->len)
++						 - i1480u_hdr_size;
++			untd_frg_size = le16_to_cpu(untd_hdr_1st->fragment_len);
++			if (size_left < untd_hdr_size + untd_frg_size) {
++				i1480u_drop(i1480u,
++					    "RX: short payload! Dropping\n");
++				goto out;
++			}
++			i1480u->rx_skb = skb;
++			i1480u_hdr = (void *) untd_hdr_1st + untd_hdr_size;
++			i1480u->rx_srcaddr = i1480u_hdr->srcaddr;
++			skb_put(i1480u->rx_skb, untd_hdr_size + untd_frg_size);
++			skb_pull(i1480u->rx_skb, untd_hdr_size + i1480u_hdr_size);
++			stats_add_sample(&i1480u->lqe_stats, (s8) i1480u_hdr->LQI - 7);
++			stats_add_sample(&i1480u->rssi_stats, i1480u_hdr->RSSI + 18);
++			rx_buf->data = NULL; /* need to create new buffer */
++			break;
++		}
++		case i1480u_PKT_FRAG_NXT: {
++			dev_dbg(dev, "nxt fragment\n");
++			untd_hdr_size = sizeof(struct untd_hdr_rst);
++			if (i1480u->rx_skb == NULL) {
++				i1480u_drop(i1480u, "RX: next fragment out of "
++					    "sequence! Dropping\n");
++				goto out;
++			}
++			if (size_left < untd_hdr_size) {
++				i1480u_drop(i1480u, "RX: short NXT fragment! "
++					    "Dropping\n");
++				goto out;
++			}
++			untd_frg_size = le16_to_cpu(untd_hdr->len);
++			if (size_left < untd_hdr_size + untd_frg_size) {
++				i1480u_drop(i1480u,
++					    "RX: short payload! Dropping\n");
++				goto out;
++			}
++			memmove(skb_put(i1480u->rx_skb, untd_frg_size),
++					ptr + untd_hdr_size, untd_frg_size);
++			break;
++		}
++		case i1480u_PKT_FRAG_LST: {
++			dev_dbg(dev, "Lst fragment\n");
++			untd_hdr_size = sizeof(struct untd_hdr_rst);
++			if (i1480u->rx_skb == NULL) {
++				i1480u_drop(i1480u, "RX: last fragment out of "
++					    "sequence! Dropping\n");
++				goto out;
++			}
++			if (size_left < untd_hdr_size) {
++				i1480u_drop(i1480u, "RX: short LST fragment! "
++					    "Dropping\n");
++				goto out;
++			}
++			untd_frg_size = le16_to_cpu(untd_hdr->len);
++			if (size_left < untd_frg_size + untd_hdr_size) {
++				i1480u_drop(i1480u,
++					    "RX: short payload! Dropping\n");
++				goto out;
++			}
++			memmove(skb_put(i1480u->rx_skb, untd_frg_size),
++					ptr + untd_hdr_size, untd_frg_size);
++			pkt_completed = 1;
++			break;
++		}
++		case i1480u_PKT_FRAG_CMP: {
++			dev_dbg(dev, "cmp fragment\n");
++			untd_hdr_size = sizeof(struct untd_hdr_cmp);
++			if (i1480u->rx_skb != NULL)
++				i1480u_fix(i1480u, "RX: fix out-of-sequence CMP"
++					   " fragment!\n");
++			if (size_left < untd_hdr_size + i1480u_hdr_size) {
++				i1480u_drop(i1480u, "RX: short CMP fragment! "
++					    "Dropping\n");
++				goto out;
++			}
++			i1480u->rx_untd_pkt_size = le16_to_cpu(untd_hdr->len);
++			untd_frg_size = i1480u->rx_untd_pkt_size;
++			if (size_left < i1480u->rx_untd_pkt_size + untd_hdr_size) {
++				i1480u_drop(i1480u,
++					    "RX: short payload! Dropping\n");
++				goto out;
++			}
++			i1480u->rx_skb = skb;
++			i1480u_hdr = (void *) untd_hdr + untd_hdr_size;
++			i1480u->rx_srcaddr = i1480u_hdr->srcaddr;
++			stats_add_sample(&i1480u->lqe_stats, (s8) i1480u_hdr->LQI - 7);
++			stats_add_sample(&i1480u->rssi_stats, i1480u_hdr->RSSI + 18);
++			skb_put(i1480u->rx_skb, untd_hdr_size + i1480u->rx_untd_pkt_size);
++			skb_pull(i1480u->rx_skb, untd_hdr_size + i1480u_hdr_size);
++			rx_buf->data = NULL;	/* for hand off skb to network stack */
++			pkt_completed = 1;
++			i1480u->rx_untd_pkt_size -= i1480u_hdr_size; /* accurate stat */
++			break;
++		}
++		default:
++			i1480u_drop(i1480u, "RX: unknown packet type %u! "
++					 "Dropping\n", untd_hdr->type);
++			goto out;
++		}
++		size_left -= untd_hdr_size + untd_frg_size;
++		if (size_left > 0)
++			ptr += untd_hdr_size + untd_frg_size;
++	}
++	if (pkt_completed)
++		i1480u_skb_deliver(i1480u);
++out:
++	/* recreate needed RX buffers*/
++	if (rx_buf->data == NULL) {
++		/* buffer is being used to receive packet, create new */
++		new_skb = dev_alloc_skb(i1480u_MAX_RX_PKT_SIZE);
++		if (!new_skb) {
++			if (printk_ratelimit())
++				dev_err(dev,
++				"RX: cannot allocate RX buffer\n");
++		} else {
++			new_skb->dev = net_dev;
++			new_skb->ip_summed = CHECKSUM_NONE;
++			skb_reserve(new_skb, 2);
++			rx_buf->data = new_skb;
++		}
++	}
++	return;
++}
++
++
++/**
++ * Called when an RX URB has finished receiving or has found some kind
++ * of error condition.
++ *
++ * LIMITATIONS:
++ *
++ *  - We read USB-transfers, each transfer contains a SINGLE fragment
++ *    (can contain a complete packet, or a 1st, next, or last fragment
++ *    of a packet).
++ *    Looks like a transfer can contain more than one fragment (07/18/06)
++ *
++ *  - Each transfer buffer is the size of the maximum packet size (minus
++ *    headroom), i1480u_MAX_PKT_SIZE - 2
++ *
++ *  - We always read the full USB-transfer, no partials.
++ *
++ *  - Each transfer is read directly into a skb. This skb will be used to
++ *    send data to the upper layers if it is the first fragment or a complete
++ *    packet. In the other cases the data will be copied from the skb to
++ *    another skb that is being prepared for the upper layers from a prev
++ *    first fragment.
++ *
++ * It is simply too much of a pain. Gosh, there should be a unified
++ * SG infrastructure for *everything* [so that I could declare a SG
++ * buffer, pass it to USB for receiving, append some space to it if
++ * I wish, receive more until I have the whole chunk, adapt
++ * pointers on each fragment to remove hardware headers and then
++ * attach that to an skbuff and netif_rx()].
++ */
++void i1480u_rx_cb(struct urb *urb)
++{
++	int result;
++	int do_parse_buffer = 1;
++	struct i1480u_rx_buf *rx_buf = urb->context;
++	struct i1480u *i1480u = rx_buf->i1480u;
++	struct device *dev = &i1480u->usb_iface->dev;
++	unsigned long flags;
++	u8 rx_buf_idx = rx_buf - i1480u->rx_buf;
++
++	switch (urb->status) {
++	case 0:
++		break;
++	case -ECONNRESET:	/* Not an error, but a controlled situation; */
++	case -ENOENT:		/* (we killed the URB)...so, no broadcast */
++	case -ESHUTDOWN:	/* going away! */
++		dev_err(dev, "RX URB[%u]: goind down %d\n",
++			rx_buf_idx, urb->status);
++		goto error;
++	default:
++		dev_err(dev, "RX URB[%u]: unknown status %d\n",
++			rx_buf_idx, urb->status);
++		if (edc_inc(&i1480u->rx_errors, EDC_MAX_ERRORS,
++					EDC_ERROR_TIMEFRAME)) {
++			dev_err(dev, "RX: max acceptable errors exceeded,"
++					" resetting device.\n");
++			i1480u_rx_unlink_urbs(i1480u);
++			usb_dev_reset_delayed(i1480u->usb_dev);
++			goto error;
++		}
++		do_parse_buffer = 0;
++		break;
++	}
++	spin_lock_irqsave(&i1480u->lock, flags);
++	/* chew the data fragments, extract network packets */
++	if (do_parse_buffer) {
++		i1480u_rx_buffer(rx_buf);
++		if (rx_buf->data) {
++			rx_buf->urb->transfer_buffer = rx_buf->data->data;
++			result = usb_submit_urb(rx_buf->urb, GFP_ATOMIC);
++			if (result < 0) {
++				dev_err(dev, "RX URB[%u]: cannot submit %d\n",
++					rx_buf_idx, result);
++			}
++		}
++	}
++	spin_unlock_irqrestore(&i1480u->lock, flags);
++error:
++	return;
++}
++
+--- /dev/null
++++ b/drivers/uwb/i1480/i1480u-wlp/sysfs.c
+@@ -0,0 +1,446 @@
++/*
++ * WUSB Wire Adapter: WLP interface
++ * Sysfs interfaces
++ *
++ * Copyright (C) 2005-2006 Intel Corporation
++ * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ *
++ *
++ * FIXME: docs
++ */
++
++#include <linux/netdevice.h>
++#include <linux/etherdevice.h>
++#include <linux/uwb/debug.h>
++#include <linux/device.h>
++#include "i1480u-wlp.h"
++
++
++/**
++ *
++ * @dev: Class device from the net_device; assumed refcnted.
++ *
++ * Yes, I don't lock--we assume it is refcounted and I am getting a
++ * single byte value that is kind of atomic to read.
++ */
++ssize_t uwb_phy_rate_show(const struct wlp_options *options, char *buf)
++{
++	return sprintf(buf,
++		       "%u\n"
++		       "\n"
++		       "# echo UWB-PHY-RATE\n"
++		       "#\n"
++		       "# 0 - 53.3 Mbps\n"
++		       "# 1 - 80 Mbps\n"
++		       "# 2 - 106 Mbps\n"
++		       "# 3 - 160 Mbps\n"
++		       "# 4 - 200 Mbps\n"
++		       "# 5 - 320 Mbps\n"
++		       "# 6 - 400 Mbps\n"
++		       "# 7 - 480 Mbps\n",
++		       options->def_tx_hdr.phy_rate);
++}
++EXPORT_SYMBOL_GPL(uwb_phy_rate_show);
++
++
++ssize_t uwb_phy_rate_store(struct wlp_options *options,
++			   const char *buf, size_t size)
++{
++	ssize_t result;
++	unsigned rate;
++
++	result = sscanf(buf, "%u\n", &rate);
++	if (result != 1) {
++		result = -EINVAL;
++		goto out;
++	}
++	result = -EINVAL;
++	if (rate >= UWB_PHY_RATE_INVALID)
++		goto out;
++	options->def_tx_hdr.phy_rate = rate;
++	result = 0;
++out:
++	return result < 0? result : size;
++}
++EXPORT_SYMBOL_GPL(uwb_phy_rate_store);
++
++
++ssize_t uwb_rts_cts_show(const struct wlp_options *options, char *buf)
++{
++	return sprintf(buf,
++		       "%u\n"
++		       "\n"
++		       "# echo UWB-RTS-CTS\n"
++		       "#\n"
++		       "# 0 - RTS/CTS disabled\n"
++		       "# 1 - RTS/CTS enabled\n",
++		       options->def_tx_hdr.rts_cts);
++}
++EXPORT_SYMBOL_GPL(uwb_rts_cts_show);
++
++
++ssize_t uwb_rts_cts_store(struct wlp_options *options,
++			  const char *buf, size_t size)
++{
++	ssize_t result;
++	unsigned value;
++
++	result = sscanf(buf, "%u\n", &value);
++	if (result != 1) {
++		result = -EINVAL;
++		goto out;
++	}
++	result = -EINVAL;
++	options->def_tx_hdr.rts_cts = value? 1 : 0;
++	result = 0;
++out:
++	return result < 0? result : size;
++}
++EXPORT_SYMBOL_GPL(uwb_rts_cts_store);
++
++
++ssize_t uwb_ack_policy_show(const struct wlp_options *options, char *buf)
++{
++	return sprintf(buf,
++		       "%u\n"
++		       "\n"
++		       "# echo ACK-POLICY\n"
++		       "#\n"
++		       "# 0 - No Ack\n"
++		       "# 1 - Immediate Ack\n"
++		       "# 2 - B Ack\n"
++		       "# 2 - B Req Ack\n",
++		       options->def_tx_hdr.ack_pol);
++}
++EXPORT_SYMBOL_GPL(uwb_ack_policy_show);
++
++
++ssize_t uwb_ack_policy_store(struct wlp_options *options,
++			     const char *buf, size_t size)
++{
++	ssize_t result;
++	unsigned value;
++
++	result = sscanf(buf, "%u\n", &value);
++	if (result != 1 || value > UWB_ACK_B_REQ) {
++		result = -EINVAL;
++		goto out;
++	}
++	options->def_tx_hdr.ack_pol = value;
++	result = 0;
++out:
++	return result < 0? result : size;
++}
++EXPORT_SYMBOL_GPL(uwb_ack_policy_store);
++
++
++/**
++ * Show the PCA base priority.
++ *
++ * We can access without locking, as the value is (for now) orthogonal
++ * to other values.
++ */
++ssize_t uwb_pca_base_priority_show(const struct wlp_options *options,
++				   char *buf)
++{
++	return scnprintf(buf, PAGE_SIZE,
++			 "%u\n"
++			 "\n"
++			 "# echo PCA BASE PRIORITY\n"
++			 "#\n"
++			 "# 0 - AC_BE (Best effort)\n"
++			 "# 1 - AC_BK (Background)\n"
++			 "# 2 - AC_BK (Background)\n"
++			 "# 3 - AC_BE (Best Effort)\n"
++			 "# 4 - AC_VI (Video)\n"
++			 "# 5 - AC_VI (Video)\n"
++			 "# 6 - AC_VO (Voice)\n"
++			 "# 7 - AC_VO (Voice)\n",
++			 options->pca_base_priority);
++}
++EXPORT_SYMBOL_GPL(uwb_pca_base_priority_show);
++
++
++/**
++ * Set the PCA base priority.
++ *
++ * We can access without locking, as the value is (for now) orthogonal
++ * to other values.
++ */
++ssize_t uwb_pca_base_priority_store(struct wlp_options *options,
++				    const char *buf, size_t size)
++{
++	ssize_t result = -EINVAL;
++	u8 pca_base_priority;
++
++	result = sscanf(buf, "%hhu\n", &pca_base_priority);
++	if (result != 1) {
++		result = -EINVAL;
++		goto out;
++	}
++	result = -EINVAL;
++	if (pca_base_priority >= 8)
++		goto out;
++	options->pca_base_priority = pca_base_priority;
++	/* Update TX header if we are currently using PCA. */
++	if (result >= 0 && (options->def_tx_hdr.delivery_id_type & 8) == 0)
++		options->def_tx_hdr.delivery_id_type = options->pca_base_priority;
++	result = 0;
++out:
++	return result < 0? result : size;
++}
++EXPORT_SYMBOL_GPL(uwb_pca_base_priority_store);
++
++/**
++ * Show current inflight values
++ *
++ * Will print the current MAX and THRESHOLD values for the basic flow
++ * control. In addition it will report how many times the TX queue needed
++ * to be restarted since the last time this query was made.
++ */
++static ssize_t wlp_tx_inflight_show(struct i1480u_tx_inflight *inflight,
++				    char *buf)
++{
++	ssize_t result;
++	unsigned long sec_elapsed = (jiffies - inflight->restart_ts)/HZ;
++	unsigned long restart_count = atomic_read(&inflight->restart_count);
++
++	result = scnprintf(buf, PAGE_SIZE, "%lu %lu %d %lu %lu %lu\n"
++			   "#read: threshold max inflight_count restarts "
++			   "seconds restarts/sec\n"
++			   "#write: threshold max\n",
++			   inflight->threshold, inflight->max,
++			   atomic_read(&inflight->count),
++			   restart_count, sec_elapsed,
++			   sec_elapsed == 0 ? 0 : restart_count/sec_elapsed);
++	inflight->restart_ts = jiffies;
++	atomic_set(&inflight->restart_count, 0);
++	return result;
++}
++
++static
++ssize_t wlp_tx_inflight_store(struct i1480u_tx_inflight *inflight,
++				const char *buf, size_t size)
++{
++	unsigned long in_threshold, in_max;
++	ssize_t result;
++	result = sscanf(buf, "%lu %lu", &in_threshold, &in_max);
++	if (result != 2)
++		return -EINVAL;
++	if (in_max <= in_threshold)
++		return -EINVAL;
++	inflight->max = in_max;
++	inflight->threshold = in_threshold;
++	return size;
++}
++/*
++ * Glue (or function adaptors) for accesing info on sysfs
++ *
++ * [we need this indirection because the PCI driver does almost the
++ * same]
++ *
++ * Linux 2.6.21 changed how 'struct netdevice' does attributes (from
++ * having a 'struct class_dev' to having a 'struct device'). That is
++ * quite of a pain.
++ *
++ * So we try to abstract that here. i1480u_SHOW() and i1480u_STORE()
++ * create adaptors for extracting the 'struct i1480u' from a 'struct
++ * dev' and calling a function for doing a sysfs operation (as we have
++ * them factorized already). i1480u_ATTR creates the attribute file
++ * (CLASS_DEVICE_ATTR or DEVICE_ATTR) and i1480u_ATTR_NAME produces a
++ * class_device_attr_NAME or device_attr_NAME (for group registration).
++ */
++#include <linux/version.h>
++
++#define i1480u_SHOW(name, fn, param)				\
++static ssize_t i1480u_show_##name(struct device *dev,		\
++				  struct device_attribute *attr,\
++				  char *buf)			\
++{								\
++	struct i1480u *i1480u = netdev_priv(to_net_dev(dev));	\
++	return fn(&i1480u->param, buf);				\
++}
++
++#define i1480u_STORE(name, fn, param)				\
++static ssize_t i1480u_store_##name(struct device *dev,		\
++				   struct device_attribute *attr,\
++				   const char *buf, size_t size)\
++{								\
++	struct i1480u *i1480u = netdev_priv(to_net_dev(dev));	\
++	return fn(&i1480u->param, buf, size);			\
++}
++
++#define i1480u_ATTR(name, perm) static DEVICE_ATTR(name, perm,  \
++					     i1480u_show_##name,\
++					     i1480u_store_##name)
++
++#define i1480u_ATTR_SHOW(name) static DEVICE_ATTR(name,		\
++					S_IRUGO,		\
++					i1480u_show_##name, NULL)
++
++#define i1480u_ATTR_NAME(a) (dev_attr_##a)
++
++
++/*
++ * Sysfs adaptors
++ */
++i1480u_SHOW(uwb_phy_rate, uwb_phy_rate_show, options);
++i1480u_STORE(uwb_phy_rate, uwb_phy_rate_store, options);
++i1480u_ATTR(uwb_phy_rate, S_IRUGO | S_IWUSR);
++
++i1480u_SHOW(uwb_rts_cts, uwb_rts_cts_show, options);
++i1480u_STORE(uwb_rts_cts, uwb_rts_cts_store, options);
++i1480u_ATTR(uwb_rts_cts, S_IRUGO | S_IWUSR);
++
++i1480u_SHOW(uwb_ack_policy, uwb_ack_policy_show, options);
++i1480u_STORE(uwb_ack_policy, uwb_ack_policy_store, options);
++i1480u_ATTR(uwb_ack_policy, S_IRUGO | S_IWUSR);
++
++i1480u_SHOW(uwb_pca_base_priority, uwb_pca_base_priority_show, options);
++i1480u_STORE(uwb_pca_base_priority, uwb_pca_base_priority_store, options);
++i1480u_ATTR(uwb_pca_base_priority, S_IRUGO | S_IWUSR);
++
++i1480u_SHOW(wlp_eda, wlp_eda_show, wlp);
++i1480u_STORE(wlp_eda, wlp_eda_store, wlp);
++i1480u_ATTR(wlp_eda, S_IRUGO | S_IWUSR);
++
++i1480u_SHOW(wlp_uuid, wlp_uuid_show, wlp);
++i1480u_STORE(wlp_uuid, wlp_uuid_store, wlp);
++i1480u_ATTR(wlp_uuid, S_IRUGO | S_IWUSR);
++
++i1480u_SHOW(wlp_dev_name, wlp_dev_name_show, wlp);
++i1480u_STORE(wlp_dev_name, wlp_dev_name_store, wlp);
++i1480u_ATTR(wlp_dev_name, S_IRUGO | S_IWUSR);
++
++i1480u_SHOW(wlp_dev_manufacturer, wlp_dev_manufacturer_show, wlp);
++i1480u_STORE(wlp_dev_manufacturer, wlp_dev_manufacturer_store, wlp);
++i1480u_ATTR(wlp_dev_manufacturer, S_IRUGO | S_IWUSR);
++
++i1480u_SHOW(wlp_dev_model_name, wlp_dev_model_name_show, wlp);
++i1480u_STORE(wlp_dev_model_name, wlp_dev_model_name_store, wlp);
++i1480u_ATTR(wlp_dev_model_name, S_IRUGO | S_IWUSR);
++
++i1480u_SHOW(wlp_dev_model_nr, wlp_dev_model_nr_show, wlp);
++i1480u_STORE(wlp_dev_model_nr, wlp_dev_model_nr_store, wlp);
++i1480u_ATTR(wlp_dev_model_nr, S_IRUGO | S_IWUSR);
++
++i1480u_SHOW(wlp_dev_serial, wlp_dev_serial_show, wlp);
++i1480u_STORE(wlp_dev_serial, wlp_dev_serial_store, wlp);
++i1480u_ATTR(wlp_dev_serial, S_IRUGO | S_IWUSR);
++
++i1480u_SHOW(wlp_dev_prim_category, wlp_dev_prim_category_show, wlp);
++i1480u_STORE(wlp_dev_prim_category, wlp_dev_prim_category_store, wlp);
++i1480u_ATTR(wlp_dev_prim_category, S_IRUGO | S_IWUSR);
++
++i1480u_SHOW(wlp_dev_prim_OUI, wlp_dev_prim_OUI_show, wlp);
++i1480u_STORE(wlp_dev_prim_OUI, wlp_dev_prim_OUI_store, wlp);
++i1480u_ATTR(wlp_dev_prim_OUI, S_IRUGO | S_IWUSR);
++
++i1480u_SHOW(wlp_dev_prim_OUI_sub, wlp_dev_prim_OUI_sub_show, wlp);
++i1480u_STORE(wlp_dev_prim_OUI_sub, wlp_dev_prim_OUI_sub_store, wlp);
++i1480u_ATTR(wlp_dev_prim_OUI_sub, S_IRUGO | S_IWUSR);
++
++i1480u_SHOW(wlp_dev_prim_subcat, wlp_dev_prim_subcat_show, wlp);
++i1480u_STORE(wlp_dev_prim_subcat, wlp_dev_prim_subcat_store, wlp);
++i1480u_ATTR(wlp_dev_prim_subcat, S_IRUGO | S_IWUSR);
++
++i1480u_SHOW(wlp_neighborhood, wlp_neighborhood_show, wlp);
++i1480u_ATTR_SHOW(wlp_neighborhood);
++
++i1480u_SHOW(wss_activate, wlp_wss_activate_show, wlp.wss);
++i1480u_STORE(wss_activate, wlp_wss_activate_store, wlp.wss);
++i1480u_ATTR(wss_activate, S_IRUGO | S_IWUSR);
++
++/*
++ * Show the (min, max, avg) Line Quality Estimate (LQE, in dB) as over
++ * the last 256 received WLP frames (ECMA-368 13.3).
++ *
++ * [the -7dB that have to be substracted from the LQI to make the LQE
++ * are already taken into account].
++ */
++i1480u_SHOW(wlp_lqe, stats_show, lqe_stats);
++i1480u_STORE(wlp_lqe, stats_store, lqe_stats);
++i1480u_ATTR(wlp_lqe, S_IRUGO | S_IWUSR);
++
++/*
++ * Show the Receive Signal Strength Indicator averaged over all the
++ * received WLP frames (ECMA-368 13.3). Still is not clear what
++ * this value is, but is kind of a percentage of the signal strength
++ * at the antenna.
++ */
++i1480u_SHOW(wlp_rssi, stats_show, rssi_stats);
++i1480u_STORE(wlp_rssi, stats_store, rssi_stats);
++i1480u_ATTR(wlp_rssi, S_IRUGO | S_IWUSR);
++
++/**
++ * We maintain a basic flow control counter. "count" how many TX URBs are
++ * outstanding. Only allow "max"
++ * TX URBs to be outstanding. If this value is reached the queue will be
++ * stopped. The queue will be restarted when there are
++ * "threshold" URBs outstanding.
++ */
++i1480u_SHOW(wlp_tx_inflight, wlp_tx_inflight_show, tx_inflight);
++i1480u_STORE(wlp_tx_inflight, wlp_tx_inflight_store, tx_inflight);
++i1480u_ATTR(wlp_tx_inflight, S_IRUGO | S_IWUSR);
++
++static struct attribute *i1480u_attrs[] = {
++	&i1480u_ATTR_NAME(uwb_phy_rate).attr,
++	&i1480u_ATTR_NAME(uwb_rts_cts).attr,
++	&i1480u_ATTR_NAME(uwb_ack_policy).attr,
++	&i1480u_ATTR_NAME(uwb_pca_base_priority).attr,
++	&i1480u_ATTR_NAME(wlp_lqe).attr,
++	&i1480u_ATTR_NAME(wlp_rssi).attr,
++	&i1480u_ATTR_NAME(wlp_eda).attr,
++	&i1480u_ATTR_NAME(wlp_uuid).attr,
++	&i1480u_ATTR_NAME(wlp_dev_name).attr,
++	&i1480u_ATTR_NAME(wlp_dev_manufacturer).attr,
++	&i1480u_ATTR_NAME(wlp_dev_model_name).attr,
++	&i1480u_ATTR_NAME(wlp_dev_model_nr).attr,
++	&i1480u_ATTR_NAME(wlp_dev_serial).attr,
++	&i1480u_ATTR_NAME(wlp_dev_prim_category).attr,
++	&i1480u_ATTR_NAME(wlp_dev_prim_OUI).attr,
++	&i1480u_ATTR_NAME(wlp_dev_prim_OUI_sub).attr,
++	&i1480u_ATTR_NAME(wlp_dev_prim_subcat).attr,
++	&i1480u_ATTR_NAME(wlp_neighborhood).attr,
++	&i1480u_ATTR_NAME(wss_activate).attr,
++	&i1480u_ATTR_NAME(wlp_tx_inflight).attr,
++	NULL,
++};
++
++static struct attribute_group i1480u_attr_group = {
++	.name = NULL,	/* we want them in the same directory */
++	.attrs = i1480u_attrs,
++};
++
++int i1480u_sysfs_setup(struct i1480u *i1480u)
++{
++	int result;
++	struct device *dev = &i1480u->usb_iface->dev;
++	result = sysfs_create_group(&i1480u->net_dev->dev.kobj,
++				    &i1480u_attr_group);
++	if (result < 0)
++		dev_err(dev, "cannot initialize sysfs attributes: %d\n",
++			result);
++	return result;
++}
++
++
++void i1480u_sysfs_release(struct i1480u *i1480u)
++{
++	sysfs_remove_group(&i1480u->net_dev->dev.kobj,
++			   &i1480u_attr_group);
++}
+--- /dev/null
++++ b/drivers/uwb/i1480/i1480u-wlp/tx.c
+@@ -0,0 +1,638 @@
++/*
++ * WUSB Wire Adapter: WLP interface
++ * Deal with TX (massaging data to transmit, handling it)
++ *
++ * Copyright (C) 2005-2006 Intel Corporation
++ * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ *
++ *
++ * Transmission engine. Get an skb, create from that a WLP transmit
++ * context, add a WLP TX header (which we keep prefilled in the
++ * device's instance), fill out the target-specific fields and
++ * fire it.
++ *
++ * ROADMAP:
++ *
++ *   Entry points:
++ *
++ *     i1480u_tx_release(): called by i1480u_disconnect() to release
++ *                          pending tx contexts.
++ *
++ *     i1480u_tx_cb(): callback for TX contexts (USB URBs)
++ *       i1480u_tx_destroy():
++ *
++ *     i1480u_tx_timeout(): called for timeout handling from the
++ *                          network stack.
++ *
++ *     i1480u_hard_start_xmit(): called for transmitting an skb from
++ *                               the network stack. Will interact with WLP
++ *                               substack to verify and prepare frame.
++ *       i1480u_xmit_frame(): actual transmission on hardware
++ *
++ *         i1480u_tx_create()	    Creates TX context
++ *            i1480u_tx_create_1()    For packets in 1 fragment
++ *            i1480u_tx_create_n()    For packets in >1 fragments
++ *
++ * TODO:
++ *
++ * - FIXME: rewrite using usb_sg_*(), add asynch support to
++ *          usb_sg_*(). It might not make too much sense as most of
++ *          the times the MTU will be smaller than one page...
++ */
++
++#include "i1480u-wlp.h"
++#define D_LOCAL 5
++#include <linux/uwb/debug.h>
++
++enum {
++	/* This is only for Next and Last TX packets */
++	i1480u_MAX_PL_SIZE = i1480u_MAX_FRG_SIZE
++		- sizeof(struct untd_hdr_rst),
++};
++
++/** Free resources allocated to a i1480u tx context. */
++static
++void i1480u_tx_free(struct i1480u_tx *wtx)
++{
++	kfree(wtx->buf);
++	if (wtx->skb)
++		dev_kfree_skb_irq(wtx->skb);
++	usb_free_urb(wtx->urb);
++	kfree(wtx);
++}
++
++static
++void i1480u_tx_destroy(struct i1480u *i1480u, struct i1480u_tx *wtx)
++{
++	unsigned long flags;
++	spin_lock_irqsave(&i1480u->tx_list_lock, flags);	/* not active any more */
++	list_del(&wtx->list_node);
++	i1480u_tx_free(wtx);
++	spin_unlock_irqrestore(&i1480u->tx_list_lock, flags);
++}
++
++static
++void i1480u_tx_unlink_urbs(struct i1480u *i1480u)
++{
++	unsigned long flags;
++	struct i1480u_tx *wtx, *next;
++
++	spin_lock_irqsave(&i1480u->tx_list_lock, flags);
++	list_for_each_entry_safe(wtx, next, &i1480u->tx_list, list_node) {
++		usb_unlink_urb(wtx->urb);
++	}
++	spin_unlock_irqrestore(&i1480u->tx_list_lock, flags);
++}
++
++
++/**
++ * Callback for a completed tx USB URB.
++ *
++ * TODO:
++ *
++ * - FIXME: recover errors more gracefully
++ * - FIXME: handle NAKs (I dont think they come here) for flow ctl
++ */
++static
++void i1480u_tx_cb(struct urb *urb)
++{
++	struct i1480u_tx *wtx = urb->context;
++	struct i1480u *i1480u = wtx->i1480u;
++	struct net_device *net_dev = i1480u->net_dev;
++	struct device *dev = &i1480u->usb_iface->dev;
++	unsigned long flags;
++
++	switch (urb->status) {
++	case 0:
++		spin_lock_irqsave(&i1480u->lock, flags);
++		i1480u->stats.tx_packets++;
++		i1480u->stats.tx_bytes += urb->actual_length;
++		spin_unlock_irqrestore(&i1480u->lock, flags);
++		break;
++	case -ECONNRESET:	/* Not an error, but a controlled situation; */
++	case -ENOENT:		/* (we killed the URB)...so, no broadcast */
++		dev_dbg(dev, "notif endp: reset/noent %d\n", urb->status);
++		netif_stop_queue(net_dev);
++		break;
++	case -ESHUTDOWN:	/* going away! */
++		dev_dbg(dev, "notif endp: down %d\n", urb->status);
++		netif_stop_queue(net_dev);
++		break;
++	default:
++		dev_err(dev, "TX: unknown URB status %d\n", urb->status);
++		if (edc_inc(&i1480u->tx_errors, EDC_MAX_ERRORS,
++					EDC_ERROR_TIMEFRAME)) {
++			dev_err(dev, "TX: max acceptable errors exceeded."
++					"Reset device.\n");
++			netif_stop_queue(net_dev);
++			i1480u_tx_unlink_urbs(i1480u);
++			usb_dev_reset_delayed(i1480u->usb_dev);
++		}
++		break;
++	}
++	i1480u_tx_destroy(i1480u, wtx);
++	if (atomic_dec_return(&i1480u->tx_inflight.count)
++	    <= i1480u->tx_inflight.threshold
++	    && netif_queue_stopped(net_dev)
++	    && i1480u->tx_inflight.threshold != 0) {
++		if (d_test(2) && printk_ratelimit())
++			d_printf(2, dev, "Restart queue. \n");
++		netif_start_queue(net_dev);
++		atomic_inc(&i1480u->tx_inflight.restart_count);
++	}
++	return;
++}
++
++
++/**
++ * Given a buffer that doesn't fit in a single fragment, create an
++ * scatter/gather structure for delivery to the USB pipe.
++ *
++ * Implements functionality of i1480u_tx_create().
++ *
++ * @wtx:	tx descriptor
++ * @skb:	skb to send
++ * @gfp_mask:	gfp allocation mask
++ * @returns:    Pointer to @wtx if ok, NULL on error.
++ *
++ * Sorry, TOO LONG a function, but breaking it up is kind of hard
++ *
++ * This will break the buffer in chunks smaller than
++ * i1480u_MAX_FRG_SIZE (including the header) and add proper headers
++ * to each:
++ *
++ *   1st header           \
++ *   i1480 tx header      |  fragment 1
++ *   fragment data        /
++ *   nxt header           \  fragment 2
++ *   fragment data        /
++ *   ..
++ *   ..
++ *   last header          \  fragment 3
++ *   last fragment data   /
++ *
++ * This does not fill the i1480 TX header, it is left up to the
++ * caller to do that; you can get it from @wtx->wlp_tx_hdr.
++ *
++ * This function consumes the skb unless there is an error.
++ */
++static
++int i1480u_tx_create_n(struct i1480u_tx *wtx, struct sk_buff *skb,
++		       gfp_t gfp_mask)
++{
++	int result;
++	void *pl;
++	size_t pl_size;
++
++	void *pl_itr, *buf_itr;
++	size_t pl_size_left, frgs, pl_size_1st, frg_pl_size = 0;
++	struct untd_hdr_1st *untd_hdr_1st;
++	struct wlp_tx_hdr *wlp_tx_hdr;
++	struct untd_hdr_rst *untd_hdr_rst;
++
++	wtx->skb = NULL;
++	pl = skb->data;
++	pl_itr = pl;
++	pl_size = skb->len;
++	pl_size_left = pl_size;	/* payload size */
++	/* First fragment; fits as much as i1480u_MAX_FRG_SIZE minus
++	 * the headers */
++	pl_size_1st = i1480u_MAX_FRG_SIZE
++		- sizeof(struct untd_hdr_1st) - sizeof(struct wlp_tx_hdr);
++	BUG_ON(pl_size_1st > pl_size);
++	pl_size_left -= pl_size_1st;
++	/* The rest have an smaller header (no i1480 TX header). We
++	 * need to break up the payload in blocks smaller than
++	 * i1480u_MAX_PL_SIZE (payload excluding header). */
++	frgs = (pl_size_left + i1480u_MAX_PL_SIZE - 1) / i1480u_MAX_PL_SIZE;
++	/* Allocate space for the new buffer. In this new buffer we'll
++	 * place the headers followed by the data fragment, headers,
++	 * data fragments, etc..
++	 */
++	result = -ENOMEM;
++	wtx->buf_size = sizeof(*untd_hdr_1st)
++		+ sizeof(*wlp_tx_hdr)
++		+ frgs * sizeof(*untd_hdr_rst)
++		+ pl_size;
++	wtx->buf = kmalloc(wtx->buf_size, gfp_mask);
++	if (wtx->buf == NULL)
++		goto error_buf_alloc;
++
++	buf_itr = wtx->buf;		/* We got the space, let's fill it up */
++	/* Fill 1st fragment */
++	untd_hdr_1st = buf_itr;
++	buf_itr += sizeof(*untd_hdr_1st);
++	untd_hdr_1st->hdr.type = i1480u_PKT_FRAG_1ST;
++	untd_hdr_1st->hdr.rx_tx = 0;
++	untd_hdr_1st->hdr.reserved1 = 0;
++	untd_hdr_1st->hdr.reserved2 = 0;
++	untd_hdr_1st->hdr.len = cpu_to_le16(pl_size + sizeof(*wlp_tx_hdr));
++	untd_hdr_1st->fragment_len =
++		cpu_to_le16(pl_size_1st + sizeof(*wlp_tx_hdr));
++	memset(untd_hdr_1st->padding, 0, sizeof(untd_hdr_1st->padding));
++	/* Set up i1480 header info */
++	wlp_tx_hdr = wtx->wlp_tx_hdr = buf_itr;
++	buf_itr += sizeof(*wlp_tx_hdr);
++	/* Copy the first fragment */
++	memcpy(buf_itr, pl_itr, pl_size_1st);
++	pl_itr += pl_size_1st;
++	buf_itr += pl_size_1st;
++
++	/* Now do each remaining fragment */
++	result = -EINVAL;
++	while (pl_size_left > 0) {
++		d_printf(5, NULL, "ITR HDR: pl_size_left %zu buf_itr %zu\n",
++			 pl_size_left, buf_itr - wtx->buf);
++		if (buf_itr + sizeof(*untd_hdr_rst) - wtx->buf
++		    > wtx->buf_size) {
++			printk(KERN_ERR "BUG: no space for header\n");
++			goto error_bug;
++		}
++		d_printf(5, NULL, "ITR HDR 2: pl_size_left %zu buf_itr %zu\n",
++			 pl_size_left, buf_itr - wtx->buf);
++		untd_hdr_rst = buf_itr;
++		buf_itr += sizeof(*untd_hdr_rst);
++		if (pl_size_left > i1480u_MAX_PL_SIZE) {
++			frg_pl_size = i1480u_MAX_PL_SIZE;
++			untd_hdr_rst->hdr.type = i1480u_PKT_FRAG_NXT;
++		} else {
++			frg_pl_size = pl_size_left;
++			untd_hdr_rst->hdr.type = i1480u_PKT_FRAG_LST;
++		}
++		d_printf(5, NULL,
++			 "ITR PL: pl_size_left %zu buf_itr %zu frg_pl_size %zu\n",
++			 pl_size_left, buf_itr - wtx->buf, frg_pl_size);
++		untd_hdr_rst->hdr.rx_tx = 0;
++		untd_hdr_rst->hdr.reserved1 = 0;
++		untd_hdr_rst->hdr.reserved2 = 0;
++		untd_hdr_rst->hdr.len = cpu_to_le16(frg_pl_size);
++		untd_hdr_rst->padding = 0;
++		if (buf_itr + frg_pl_size - wtx->buf
++		    > wtx->buf_size) {
++			printk(KERN_ERR "BUG: no space for payload\n");
++			goto error_bug;
++		}
++		memcpy(buf_itr, pl_itr, frg_pl_size);
++		buf_itr += frg_pl_size;
++		pl_itr += frg_pl_size;
++		pl_size_left -= frg_pl_size;
++		d_printf(5, NULL,
++			 "ITR PL 2: pl_size_left %zu buf_itr %zu frg_pl_size %zu\n",
++			 pl_size_left, buf_itr - wtx->buf, frg_pl_size);
++	}
++	dev_kfree_skb_irq(skb);
++	return 0;
++
++error_bug:
++	printk(KERN_ERR
++	       "BUG: skb %u bytes\n"
++	       "BUG: frg_pl_size %zd i1480u_MAX_FRG_SIZE %u\n"
++	       "BUG: buf_itr %zu buf_size %zu pl_size_left %zu\n",
++	       skb->len,
++	       frg_pl_size, i1480u_MAX_FRG_SIZE,
++	       buf_itr - wtx->buf, wtx->buf_size, pl_size_left);
++
++	kfree(wtx->buf);
++error_buf_alloc:
++	return result;
++}
++
++
++/**
++ * Given a buffer that fits in a single fragment, fill out a @wtx
++ * struct for transmitting it down the USB pipe.
++ *
++ * Uses the fact that we have space reserved in front of the skbuff
++ * for hardware headers :]
++ *
++ * This does not fill the i1480 TX header, it is left up to the
++ * caller to do that; you can get it from @wtx->wlp_tx_hdr.
++ *
++ * @pl:		pointer to payload data
++ * @pl_size:    size of the payuload
++ *
++ * This function does not consume the @skb.
++ */
++static
++int i1480u_tx_create_1(struct i1480u_tx *wtx, struct sk_buff *skb,
++		       gfp_t gfp_mask)
++{
++	struct untd_hdr_cmp *untd_hdr_cmp;
++	struct wlp_tx_hdr *wlp_tx_hdr;
++
++	wtx->buf = NULL;
++	wtx->skb = skb;
++	BUG_ON(skb_headroom(skb) < sizeof(*wlp_tx_hdr));
++	wlp_tx_hdr = (void *) __skb_push(skb, sizeof(*wlp_tx_hdr));
++	wtx->wlp_tx_hdr = wlp_tx_hdr;
++	BUG_ON(skb_headroom(skb) < sizeof(*untd_hdr_cmp));
++	untd_hdr_cmp = (void *) __skb_push(skb, sizeof(*untd_hdr_cmp));
++
++	untd_hdr_cmp->hdr.type = i1480u_PKT_FRAG_CMP;
++	untd_hdr_cmp->hdr.rx_tx = 0;
++	untd_hdr_cmp->hdr.reserved1 = 0;
++	untd_hdr_cmp->hdr.len = cpu_to_le16(skb->len - sizeof(*untd_hdr_cmp));
++	untd_hdr_cmp->hdr.reserved2 = 0;
++	untd_hdr_cmp->padding = 0;
++	return 0;
++}
++
++
++/**
++ * Given a skb to transmit, massage it to become palatable for the TX pipe
++ *
++ * This will break the buffer in chunks smaller than
++ * i1480u_MAX_FRG_SIZE and add proper headers to each.
++ *
++ *   1st header           \
++ *   i1480 tx header      |  fragment 1
++ *   fragment data        /
++ *   nxt header           \  fragment 2
++ *   fragment data        /
++ *   ..
++ *   ..
++ *   last header          \  fragment 3
++ *   last fragment data   /
++ *
++ * Each fragment will be always smaller or equal to i1480u_MAX_FRG_SIZE.
++ *
++ * If the first fragment is smaller than i1480u_MAX_FRG_SIZE, then the
++ * following is composed:
++ *
++ *   complete header      \
++ *   i1480 tx header      | single fragment
++ *   packet data          /
++ *
++ * We were going to use s/g support, but because the interface is
++ * synch and at the end there is plenty of overhead to do it, it
++ * didn't seem that worth for data that is going to be smaller than
++ * one page.
++ */
++static
++struct i1480u_tx *i1480u_tx_create(struct i1480u *i1480u,
++				   struct sk_buff *skb, gfp_t gfp_mask)
++{
++	int result;
++	struct usb_endpoint_descriptor *epd;
++	int usb_pipe;
++	unsigned long flags;
++
++	struct i1480u_tx *wtx;
++	const size_t pl_max_size =
++		i1480u_MAX_FRG_SIZE - sizeof(struct untd_hdr_cmp)
++		- sizeof(struct wlp_tx_hdr);
++
++	wtx = kmalloc(sizeof(*wtx), gfp_mask);
++	if (wtx == NULL)
++		goto error_wtx_alloc;
++	wtx->urb = usb_alloc_urb(0, gfp_mask);
++	if (wtx->urb == NULL)
++		goto error_urb_alloc;
++	epd = &i1480u->usb_iface->cur_altsetting->endpoint[2].desc;
++	usb_pipe = usb_sndbulkpipe(i1480u->usb_dev, epd->bEndpointAddress);
++	/* Fits in a single complete packet or need to split? */
++	if (skb->len > pl_max_size) {
++		result = i1480u_tx_create_n(wtx, skb, gfp_mask);
++		if (result < 0)
++			goto error_create;
++		usb_fill_bulk_urb(wtx->urb, i1480u->usb_dev, usb_pipe,
++				  wtx->buf, wtx->buf_size, i1480u_tx_cb, wtx);
++	} else {
++		result = i1480u_tx_create_1(wtx, skb, gfp_mask);
++		if (result < 0)
++			goto error_create;
++		usb_fill_bulk_urb(wtx->urb, i1480u->usb_dev, usb_pipe,
++				  skb->data, skb->len, i1480u_tx_cb, wtx);
++	}
++	spin_lock_irqsave(&i1480u->tx_list_lock, flags);
++	list_add(&wtx->list_node, &i1480u->tx_list);
++	spin_unlock_irqrestore(&i1480u->tx_list_lock, flags);
++	return wtx;
++
++error_create:
++	kfree(wtx->urb);
++error_urb_alloc:
++	kfree(wtx);
++error_wtx_alloc:
++	return NULL;
++}
++
++/**
++ * Actual fragmentation and transmission of frame
++ *
++ * @wlp:  WLP substack data structure
++ * @skb:  To be transmitted
++ * @dst:  Device address of destination
++ * @returns: 0 on success, <0 on failure
++ *
++ * This function can also be called directly (not just from
++ * hard_start_xmit), so we also check here if the interface is up before
++ * taking sending anything.
++ */
++int i1480u_xmit_frame(struct wlp *wlp, struct sk_buff *skb,
++		      struct uwb_dev_addr *dst)
++{
++	int result = -ENXIO;
++	struct i1480u *i1480u = container_of(wlp, struct i1480u, wlp);
++	struct device *dev = &i1480u->usb_iface->dev;
++	struct net_device *net_dev = i1480u->net_dev;
++	struct i1480u_tx *wtx;
++	struct wlp_tx_hdr *wlp_tx_hdr;
++	static unsigned char dev_bcast[2] = { 0xff, 0xff };
++#if 0
++	int lockup = 50;
++#endif
++
++	d_fnstart(6, dev, "(skb %p (%u), net_dev %p)\n", skb, skb->len,
++		  net_dev);
++	BUG_ON(i1480u->wlp.rc == NULL);
++	if ((net_dev->flags & IFF_UP) == 0)
++		goto out;
++	result = -EBUSY;
++	if (atomic_read(&i1480u->tx_inflight.count) >= i1480u->tx_inflight.max) {
++		if (d_test(2) && printk_ratelimit())
++			d_printf(2, dev, "Max frames in flight "
++				 "stopping queue.\n");
++		netif_stop_queue(net_dev);
++		goto error_max_inflight;
++	}
++	result = -ENOMEM;
++	wtx = i1480u_tx_create(i1480u, skb, GFP_ATOMIC);
++	if (unlikely(wtx == NULL)) {
++		if (printk_ratelimit())
++			dev_err(dev, "TX: no memory for WLP TX URB,"
++				"dropping packet (in flight %d)\n",
++				atomic_read(&i1480u->tx_inflight.count));
++		netif_stop_queue(net_dev);
++		goto error_wtx_alloc;
++	}
++	wtx->i1480u = i1480u;
++	/* Fill out the i1480 header; @i1480u->def_tx_hdr read without
++	 * locking. We do so because they are kind of orthogonal to
++	 * each other (and thus not changed in an atomic batch).
++	 * The ETH header is right after the WLP TX header. */
++	wlp_tx_hdr = wtx->wlp_tx_hdr;
++	*wlp_tx_hdr = i1480u->options.def_tx_hdr;
++	wlp_tx_hdr->dstaddr = *dst;
++	if (!memcmp(&wlp_tx_hdr->dstaddr, dev_bcast, sizeof(dev_bcast)) &&
++			(wlp_tx_hdr->delivery_id_type & WLP_DRP)) {
++		/*Broadcast message directed to DRP host. Send as best effort
++		 * on PCA. */
++		wlp_tx_hdr->delivery_id_type = i1480u->options.pca_base_priority;
++	}
++
++#if 0
++	dev_info(dev, "TX delivering skb -> USB, %zu bytes\n", skb->len);
++	dump_bytes(dev, skb->data, skb->len > 72? 72 : skb->len);
++#endif
++#if 0
++	/* simulates a device lockup after every lockup# packets */
++	if (lockup && ((i1480u->stats.tx_packets + 1) % lockup) == 0) {
++		/* Simulate a dropped transmit interrupt */
++		net_dev->trans_start = jiffies;
++		netif_stop_queue(net_dev);
++		dev_err(dev, "Simulate lockup at %ld\n", jiffies);
++		return result;
++	}
++#endif
++
++	result = usb_submit_urb(wtx->urb, GFP_ATOMIC);		/* Go baby */
++	if (result < 0) {
++		dev_err(dev, "TX: cannot submit URB: %d\n", result);
++		/* We leave the freeing of skb to calling function */
++		wtx->skb = NULL;
++		goto error_tx_urb_submit;
++	}
++	atomic_inc(&i1480u->tx_inflight.count);
++	net_dev->trans_start = jiffies;
++	d_fnend(6, dev, "(skb %p (%u), net_dev %p) = %d\n", skb, skb->len,
++		net_dev, result);
++	return result;
++
++error_tx_urb_submit:
++	i1480u_tx_destroy(i1480u, wtx);
++error_wtx_alloc:
++error_max_inflight:
++out:
++	d_fnend(6, dev, "(skb %p (%u), net_dev %p) = %d\n", skb, skb->len,
++		net_dev, result);
++	return result;
++}
++
++
++/**
++ * Transmit an skb  Called when an skbuf has to be transmitted
++ *
++ * The skb is first passed to WLP substack to ensure this is a valid
++ * frame. If valid the device address of destination will be filled and
++ * the WLP header prepended to the skb. If this step fails we fake sending
++ * the frame, if we return an error the network stack will just keep trying.
++ *
++ * Broadcast frames inside a WSS needs to be treated special as multicast is
++ * not supported. A broadcast frame is sent as unicast to each member of the
++ * WSS - this is done by the WLP substack when it finds a broadcast frame.
++ * So, we test if the WLP substack took over the skb and only transmit it
++ * if it has not (been taken over).
++ *
++ * @net_dev->xmit_lock is held
++ */
++int i1480u_hard_start_xmit(struct sk_buff *skb, struct net_device *net_dev)
++{
++	int result;
++	struct i1480u *i1480u = netdev_priv(net_dev);
++	struct device *dev = &i1480u->usb_iface->dev;
++	struct uwb_dev_addr dst;
++
++	d_fnstart(6, dev, "(skb %p (%u), net_dev %p)\n", skb, skb->len,
++		  net_dev);
++	BUG_ON(i1480u->wlp.rc == NULL);
++	if ((net_dev->flags & IFF_UP) == 0)
++		goto error;
++	result = wlp_prepare_tx_frame(dev, &i1480u->wlp, skb, &dst);
++	if (result < 0) {
++		dev_err(dev, "WLP verification of TX frame failed (%d). "
++			"Dropping packet.\n", result);
++		goto error;
++	} else if (result == 1) {
++		d_printf(6, dev, "WLP will transmit frame. \n");
++		/* trans_start time will be set when WLP actually transmits
++		 * the frame */
++		goto out;
++	}
++	d_printf(6, dev, "Transmitting frame. \n");
++	result = i1480u_xmit_frame(&i1480u->wlp, skb, &dst);
++	if (result < 0) {
++		dev_err(dev, "Frame TX failed (%d).\n", result);
++		goto error;
++	}
++	d_fnend(6, dev, "(skb %p (%u), net_dev %p) = %d\n", skb, skb->len,
++		net_dev, result);
++	return NETDEV_TX_OK;
++error:
++	dev_kfree_skb_any(skb);
++	i1480u->stats.tx_dropped++;
++out:
++	d_fnend(6, dev, "(skb %p (%u), net_dev %p) = %d\n", skb, skb->len,
++		net_dev, result);
++	return NETDEV_TX_OK;
++}
++
++
++/**
++ * Called when a pkt transmission doesn't complete in a reasonable period
++ * Device reset may sleep - do it outside of interrupt context (delayed)
++ */
++void i1480u_tx_timeout(struct net_device *net_dev)
++{
++	struct i1480u *i1480u = netdev_priv(net_dev);
++
++	usb_dev_reset_delayed(i1480u->usb_dev);
++}
++
++
++void i1480u_tx_release(struct i1480u *i1480u)
++{
++	unsigned long flags;
++	struct i1480u_tx *wtx, *next;
++	int count = 0, empty;
++
++	spin_lock_irqsave(&i1480u->tx_list_lock, flags);
++	list_for_each_entry_safe(wtx, next, &i1480u->tx_list, list_node) {
++		count++;
++		usb_unlink_urb(wtx->urb);
++	}
++	spin_unlock_irqrestore(&i1480u->tx_list_lock, flags);
++	count = count*10; /* i1480ut 200ms per unlinked urb (intervals of 20ms) */
++	/*
++	 * We don't like this sollution too much (dirty as it is), but
++	 * it is cheaper than putting a refcount on each i1480u_tx and
++	 * i1480uting for all of them to go away...
++	 *
++	 * Called when no more packets can be added to tx_list
++	 * so can i1480ut for it to be empty.
++	 */
++	while (1) {
++		spin_lock_irqsave(&i1480u->tx_list_lock, flags);
++		empty = list_empty(&i1480u->tx_list);
++		spin_unlock_irqrestore(&i1480u->tx_list_lock, flags);
++		if (empty)
++			break;
++		count--;
++		BUG_ON(count == 0);
++		msleep(20);
++	}
++}

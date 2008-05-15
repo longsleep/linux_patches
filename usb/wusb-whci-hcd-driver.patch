@@ -1,0 +1,2980 @@
+From David Vrabel <david.vrabel@csr.com> Tue May 13 10:33:24 2008
+From: David Vrabel <david.vrabel@csr.com>
+Date: Tue, 13 May 2008 10:32:55 +0100
+Subject: wusb: WHCI host controller driver
+To: linux-uwb@bughost.org
+Cc: linux-usb@vger.kernel.org, David Vrabel <david.vrabel@csr.com>
+Message-ID: <20080513093323.850432701@csr.com>>
+Content-Disposition: inline; filename=wusb-whci-hcd-driver.patch
+
+
+From: David Vrabel <david.vrabel@csr.com>
+
+A driver for Wireless USB host controllers that comply with the
+Wireless Host Controller Interface (HCI) specification as published by
+Intel.
+
+The latest publically available version of the specification (0.95) is
+supported (except for isochronous transfers).
+
+Signed-off-by: David Vrabel <david.vrabel@csr.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+---
+ drivers/usb/host/Kconfig        |   12 
+ drivers/usb/host/Makefile       |    2 
+ drivers/usb/host/whci/Kbuild    |   11 
+ drivers/usb/host/whci/asl.c     |  365 +++++++++++++++++++++++++
+ drivers/usb/host/whci/hcd.c     |  339 ++++++++++++++++++++++++
+ drivers/usb/host/whci/hw.c      |   81 +++++
+ drivers/usb/host/whci/init.c    |  182 ++++++++++++
+ drivers/usb/host/whci/int.c     |   95 ++++++
+ drivers/usb/host/whci/pzl.c     |  397 ++++++++++++++++++++++++++++
+ drivers/usb/host/whci/qset.c    |  562 ++++++++++++++++++++++++++++++++++++++++
+ drivers/usb/host/whci/whcd.h    |  195 +++++++++++++
+ drivers/usb/host/whci/whci-hc.h |  413 +++++++++++++++++++++++++++++
+ drivers/usb/host/whci/wusb.c    |  241 +++++++++++++++++
+ 13 files changed, 2895 insertions(+)
+
+--- a/drivers/usb/host/Kconfig
++++ b/drivers/usb/host/Kconfig
+@@ -305,3 +305,15 @@ config SUPERH_ON_CHIP_R8A66597
+ 	help
+ 	   Renesas SuperH processor has USB like the R8A66597.
+ 	   This driver supported processor is SH7366.
++
++config USB_WHCI_HCD
++	tristate "Wireless USB Host Controller Interface (WHCI) driver"
++	depends on PCI
++	select USB_WUSB
++	select UWB_WHCI
++	help
++	  A driver for PCI-based Wireless USB Host Controllers that are
++	  compliant with the WHCI specification.
++
++	  To compile this driver a module, choose M here: the module
++	  will be called "whci-hcd".
+--- a/drivers/usb/host/Makefile
++++ b/drivers/usb/host/Makefile
+@@ -8,6 +8,8 @@ endif
+ 
+ isp1760-objs := isp1760-hcd.o isp1760-if.o
+ 
++obj-y				+= whci/
++
+ obj-$(CONFIG_PCI)		+= pci-quirks.o
+ 
+ obj-$(CONFIG_USB_EHCI_HCD)	+= ehci-hcd.o
+--- /dev/null
++++ b/drivers/usb/host/whci/Kbuild
+@@ -0,0 +1,11 @@
++obj-$(CONFIG_USB_WHCI_HCD) += whci-hcd.o
++
++whci-hcd-y := \
++	asl.o	\
++	hcd.o 	\
++	hw.o	\
++	init.o	\
++	int.o	\
++	pzl.o	\
++	qset.o	\
++	wusb.o
+--- /dev/null
++++ b/drivers/usb/host/whci/asl.c
+@@ -0,0 +1,365 @@
++/*
++ * Wireless Host Controller (WHC) asynchronous schedule management.
++ *
++ * Copyright (C) 2007 Cambridge Silicon Radio Ltd.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++#include <linux/kernel.h>
++#include <linux/uwb/umc.h>
++#include <linux/usb.h>
++#define D_LOCAL 0
++#include <linux/uwb/debug.h>
++
++#include "../../wusbcore/wusbhc.h"
++
++#include "whcd.h"
++
++#if D_LOCAL >= 4
++static void dump_asl(struct whc *whc, const char *tag)
++{
++	struct device *dev = &whc->umc->dev;
++	struct whc_qset *qset;
++
++	d_printf(4, dev, "ASL %s\n", tag);
++
++	list_for_each_entry(qset, &whc->async_list, list_node) {
++		dump_qset(qset, dev);
++	}
++}
++#else
++static inline void dump_asl(struct whc *whc, const char *tag)
++{
++}
++#endif
++
++
++static void qset_get_next_prev(struct whc *whc, struct whc_qset *qset,
++			       struct whc_qset **next, struct whc_qset **prev)
++{
++	struct list_head *n, *p;
++
++	BUG_ON(list_empty(&whc->async_list));
++
++	n = qset->list_node.next;
++	if (n == &whc->async_list)
++		n = n->next;
++	p = qset->list_node.prev;
++	if (p == &whc->async_list)
++		p = p->prev;
++
++	*next = container_of(n, struct whc_qset, list_node);
++	*prev = container_of(p, struct whc_qset, list_node);
++
++}
++
++static void asl_qset_insert_begin(struct whc *whc, struct whc_qset *qset)
++{
++	qset_clear(whc, qset);
++	list_move(&qset->list_node, &whc->async_list);
++	qset->in_sw_list = true;
++}
++
++static void asl_qset_insert(struct whc *whc, struct whc_qset *qset)
++{
++	struct whc_qset *next, *prev;
++
++	/* Link into ASL. */
++	qset_get_next_prev(whc, qset, &next, &prev);
++	whc_qset_set_link_ptr(&qset->qh.link, next->qset_dma);
++	whc_qset_set_link_ptr(&prev->qh.link, qset->qset_dma);
++	qset->in_hw_list = true;
++}
++
++static void asl_qset_remove(struct whc *whc, struct whc_qset *qset)
++{
++	struct whc_qset *prev, *next;
++
++	qset_get_next_prev(whc, qset, &next, &prev);
++
++	list_move(&qset->list_node, &whc->async_removed_list);
++	qset->in_sw_list = false;
++
++	/*
++	 * No more qsets in the ASL?  The caller must stop the ASL as
++	 * it's no longer valid.
++	 */
++	if (list_empty(&whc->async_list))
++		return;
++
++	/* Remove from ASL. */
++	whc_qset_set_link_ptr(&prev->qh.link, next->qset_dma);
++	qset->in_hw_list = false;
++}
++
++/**
++ * process_qset - process any recently inactivated or halted qTDs in a
++ * qset.
++ *
++ * After inactive qTDs are removed, new qTDs can be added if the
++ * urb queue still contains URBs.
++ *
++ * Returns any additional WUSBCMD bits for the ASL sync command (i.e.,
++ * WUSBCMD_ASYNC_QSET_RM if a halted qset was removed).
++ */
++static uint32_t process_qset(struct whc *whc, struct whc_qset *qset)
++{
++	enum whc_update update = 0;
++	uint32_t status = 0;
++
++	while (qset->ntds) {
++		struct whc_qtd *td;
++		int t;
++
++		t = qset->td_start;
++		td = &qset->qtd[qset->td_start];
++		status = le32_to_cpu(td->status);
++
++		/*
++		 * Nothing to do with a still active qTD.
++		 */
++		if (status & QTD_STS_ACTIVE)
++			break;
++
++		if (status & QTD_STS_HALTED) {
++			/* Ug, an error. */
++			process_halted_qtd(whc, qset, td);
++			goto done;
++		}
++
++		/* Mmm, a completed qTD. */
++		process_inactive_qtd(whc, qset, td);
++	}
++
++	update |= qset_add_qtds(whc, qset);
++
++done:
++	/*
++	 * Remove this qset from the ASL if requested, but only if has
++	 * no qTDs.
++	 */
++	if (qset->remove && qset->ntds == 0) {
++		asl_qset_remove(whc, qset);
++		update |= WHC_UPDATE_REMOVED;
++	}
++	return update;
++}
++
++void asl_start(struct whc *whc)
++{
++	struct whc_qset *qset;
++
++	qset = list_first_entry(&whc->async_list, struct whc_qset, list_node);
++
++	le_writeq(qset->qset_dma | QH_LINK_NTDS(8), whc->base + WUSBASYNCLISTADDR);
++
++	whc_write_wusbcmd(whc, WUSBCMD_ASYNC_EN, WUSBCMD_ASYNC_EN);
++	whci_wait_for(&whc->umc->dev, whc->base + WUSBSTS,
++		      WUSBSTS_ASYNC_SCHED, WUSBSTS_ASYNC_SCHED,
++		      1000, "start ASL");
++}
++
++void asl_stop(struct whc *whc)
++{
++	whc_write_wusbcmd(whc, WUSBCMD_ASYNC_EN, 0);
++	whci_wait_for(&whc->umc->dev, whc->base + WUSBSTS,
++		      WUSBSTS_ASYNC_SCHED, 0,
++		      1000, "stop ASL");
++}
++
++void asl_update(struct whc *whc, uint32_t wusbcmd)
++{
++	whc_write_wusbcmd(whc, wusbcmd, wusbcmd);
++	wait_event(whc->async_list_wq,
++		   (le_readl(whc->base + WUSBCMD) & WUSBCMD_ASYNC_UPDATED) == 0);
++}
++
++/**
++ * scan_async_work - scan the ASL for qsets to process.
++ *
++ * Process each qset in the ASL in turn and then signal the WHC that
++ * the ASL has been updated.
++ *
++ * Then start, stop or update the asynchronous schedule as required.
++ */
++void scan_async_work(struct work_struct *work)
++{
++	struct whc *whc = container_of(work, struct whc, async_work);
++	struct whc_qset *qset, *t;
++	enum whc_update update = 0;
++
++	spin_lock_irq(&whc->lock);
++
++	dump_asl(whc, "before processing");
++
++	/*
++	 * Transerve the software list backwards so new qsets can be
++	 * safely inserted into the ASL without making it non-circular.
++	 */
++	list_for_each_entry_safe_reverse(qset, t, &whc->async_list, list_node) {
++		if (!qset->in_hw_list) {
++			asl_qset_insert(whc, qset);
++			update |= WHC_UPDATE_ADDED;
++		}
++
++		update |= process_qset(whc, qset);
++	}
++
++	dump_asl(whc, "after processing");
++
++	spin_unlock_irq(&whc->lock);
++
++	if (update) {
++		uint32_t wusbcmd = WUSBCMD_ASYNC_UPDATED | WUSBCMD_ASYNC_SYNCED_DB;
++		if (update & WHC_UPDATE_REMOVED)
++			wusbcmd |= WUSBCMD_ASYNC_QSET_RM;
++		asl_update(whc, wusbcmd);
++	}
++
++	/*
++	 * Now that the ASL is updated, complete the removal of any
++	 * removed qsets.
++	 */
++	spin_lock(&whc->lock);
++
++	list_for_each_entry_safe(qset, t, &whc->async_removed_list, list_node) {
++		qset_remove_complete(whc, qset);
++	}
++
++	spin_unlock(&whc->lock);
++}
++
++/**
++ * asl_urb_enqueue - queue an URB onto the asynchronous list (ASL).
++ * @whc: the WHCI host controller
++ * @urb: the URB to enqueue
++ * @mem_flags: flags for any memory allocations
++ *
++ * The qset for the endpoint is obtained and the urb queued on to it.
++ *
++ * Work is scheduled to update the hardware's view of the ASL.
++ */
++int asl_urb_enqueue(struct whc *whc, struct urb *urb, gfp_t mem_flags)
++{
++	struct whc_qset *qset;
++	int err;
++	unsigned flags;
++
++	spin_lock_irqsave(&whc->lock, flags);
++
++	qset = get_qset(whc, urb, GFP_ATOMIC);
++	if (qset == NULL)
++		err = -ENOMEM;
++	else
++		err = qset_add_urb(whc, qset, urb, GFP_ATOMIC);
++	if (!err) {
++		usb_hcd_link_urb_to_ep(&whc->wusbhc.usb_hcd, urb);
++		if (!qset->in_sw_list)
++			asl_qset_insert_begin(whc, qset);
++	}
++
++	spin_unlock_irqrestore(&whc->lock, flags);
++
++	if (!err)
++		queue_work(whc->workqueue, &whc->async_work);
++
++	return 0;
++}
++
++/**
++ * asl_urb_dequeue - remove an URB (qset) from the async list.
++ * @whc: the WHCI host controller
++ * @urb: the URB to dequeue
++ * @status: the current status of the URB
++ *
++ * URBs that do yet have qTDs can simply be removed from the software
++ * queue, otherwise the qset must be removed from the ASL so the qTDs
++ * can be removed.
++ */
++int asl_urb_dequeue(struct whc *whc, struct urb *urb, int status)
++{
++	struct whc_urb *wurb = urb->hcpriv;
++	struct whc_qset *qset = wurb->qset;
++	struct whc_std *std, *t;
++	int ret;
++	unsigned flags;
++
++	spin_lock_irqsave(&whc->lock, flags);
++
++	ret = usb_hcd_check_unlink_urb(&whc->wusbhc.usb_hcd, urb, status);
++	if (ret < 0)
++		goto out;
++
++	list_for_each_entry_safe(std, t, &qset->stds, list_node) {
++		if (std->urb == urb)
++			qset_free_std(whc, std);
++		else
++			std->qtd = NULL; /* so this std is re-added when the qset is */
++	}
++
++	asl_qset_remove(whc, qset);
++	wurb->status = status;
++	wurb->is_async = true;
++	queue_work(whc->workqueue, &wurb->dequeue_work);
++
++out:
++	spin_unlock_irqrestore(&whc->lock, flags);
++
++	return ret;
++}
++
++/**
++ * asl_qset_delete - delete a qset from the ASL
++ */
++void asl_qset_delete(struct whc *whc, struct whc_qset *qset)
++{
++	qset->remove = 1;
++	queue_work(whc->workqueue, &whc->async_work);
++	qset_delete(whc, qset);
++}
++
++/**
++ * asl_init - initialize the asynchronous schedule list
++ *
++ * A dummy qset with no qTDs is added to the ASL to simplify removing
++ * qsets (no need to stop the ASL when the last qset is removed).
++ */
++int asl_init(struct whc *whc)
++{
++	struct whc_qset *qset;
++
++	qset = qset_alloc(whc, GFP_KERNEL);
++	if (qset == NULL)
++		return -ENOMEM;
++
++	asl_qset_insert_begin(whc, qset);
++	asl_qset_insert(whc, qset);
++
++	return 0;
++}
++
++/**
++ * asl_clean_up - free ASL resources
++ *
++ * The ASL is stopped and empty except for the dummy qset.
++ */
++void asl_clean_up(struct whc *whc)
++{
++	struct whc_qset *qset;
++
++	if (!list_empty(&whc->async_list)) {
++		qset = list_first_entry(&whc->async_list, struct whc_qset, list_node);
++		list_del(&qset->list_node);
++		qset_free(whc, qset);
++	}
++}
+--- /dev/null
++++ b/drivers/usb/host/whci/hcd.c
+@@ -0,0 +1,339 @@
++/*
++ * Wireless Host Controller (WHC) driver.
++ *
++ * Copyright (C) 2007 Cambridge Silicon Radio Ltd.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++#include <linux/version.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/uwb/umc.h>
++
++#include "../../wusbcore/wusbhc.h"
++
++#include "whcd.h"
++
++/*
++ * One time initialization.
++ *
++ * Nothing to do here.
++ */
++static int whc_reset(struct usb_hcd *usb_hcd)
++{
++	return 0;
++}
++
++/*
++ * Start the wireless host controller.
++ *
++ * Start device notification.
++ *
++ * Put hc into run state, set DNTS parameters.
++ */
++static int whc_start(struct usb_hcd *usb_hcd)
++{
++	struct wusbhc *wusbhc = usb_hcd_to_wusbhc(usb_hcd);
++	struct whc *whc = wusbhc_to_whc(wusbhc);
++	u8 bcid;
++	int ret;
++
++	mutex_lock(&wusbhc->mutex);
++
++	le_writel(WUSBINTR_GEN_CMD_DONE
++		  | WUSBINTR_HOST_ERR
++		  | WUSBINTR_ASYNC_SCHED_SYNCED
++		  | WUSBINTR_DNTS_INT
++		  | WUSBINTR_ERR_INT
++		  | WUSBINTR_INT,
++		  whc->base + WUSBINTR);
++
++	/* set cluster ID */
++	bcid = wusb_cluster_id_get();
++	ret = whc_set_cluster_id(whc, bcid);
++	if (ret < 0)
++		goto out;
++	wusbhc->cluster_id = bcid;
++
++	/* start HC */
++	whc_write_wusbcmd(whc, WUSBCMD_RUN, WUSBCMD_RUN);
++
++	usb_hcd->uses_new_polling = 1;
++	usb_hcd->poll_rh = 1;
++	usb_hcd->state = HC_STATE_RUNNING;
++
++out:
++	mutex_unlock(&wusbhc->mutex);
++	return ret;
++}
++
++
++/*
++ * Stop the wireless host controller.
++ *
++ * Stop device notification.
++ *
++ * Wait for pending transfer to stop? Put hc into stop state?
++ */
++static void whc_stop(struct usb_hcd *usb_hcd)
++{
++	struct wusbhc *wusbhc = usb_hcd_to_wusbhc(usb_hcd);
++	struct whc *whc = wusbhc_to_whc(wusbhc);
++
++	mutex_lock(&wusbhc->mutex);
++
++	wusbhc_stop(wusbhc);
++
++	/* stop HC */
++	le_writel(0, whc->base + WUSBINTR);
++	whc_write_wusbcmd(whc, WUSBCMD_RUN, 0);
++	whci_wait_for(&whc->umc->dev, whc->base + WUSBSTS,
++		      WUSBSTS_HCHALTED, WUSBSTS_HCHALTED,
++		      100, "HC to halt");
++
++	wusb_cluster_id_put(wusbhc->cluster_id);
++
++	mutex_unlock(&wusbhc->mutex);
++}
++
++static int whc_get_frame_number(struct usb_hcd *usb_hcd)
++{
++	/* Frame numbers are not applicable to WUSB. */
++	return -ENOSYS;
++}
++
++
++/*
++ * Queue an URB to the ASL or PZL
++ */
++static int whc_urb_enqueue(struct usb_hcd *usb_hcd, struct urb *urb,
++			   gfp_t mem_flags)
++{
++	struct wusbhc *wusbhc = usb_hcd_to_wusbhc(usb_hcd);
++	struct whc *whc = wusbhc_to_whc(wusbhc);
++	int ret;
++
++	switch (usb_pipetype(urb->pipe)) {
++	case PIPE_INTERRUPT:
++		ret = pzl_urb_enqueue(whc, urb, mem_flags);
++		break;
++	case PIPE_ISOCHRONOUS:
++		dev_err(&whc->umc->dev, "isochronous transfers unsupported\n");
++		ret = -ENOTSUPP;
++		break;
++	case PIPE_CONTROL:
++	case PIPE_BULK:
++	default:
++		ret = asl_urb_enqueue(whc, urb, mem_flags);
++		break;
++	};
++
++	return ret;
++}
++
++/*
++ * Remove a queued URB from the ASL or PZL.
++ */
++static int whc_urb_dequeue(struct usb_hcd *usb_hcd, struct urb *urb, int status)
++{
++	struct wusbhc *wusbhc = usb_hcd_to_wusbhc(usb_hcd);
++	struct whc *whc = wusbhc_to_whc(wusbhc);
++	int ret;
++
++	switch (usb_pipetype(urb->pipe)) {
++	case PIPE_INTERRUPT:
++		ret = pzl_urb_dequeue(whc, urb, status);
++		break;
++	case PIPE_ISOCHRONOUS:
++		ret = -ENOTSUPP;
++		break;
++	case PIPE_CONTROL:
++	case PIPE_BULK:
++	default:
++		ret = asl_urb_dequeue(whc, urb, status);
++		break;
++	};
++
++	return ret;
++}
++
++/*
++ * Wait for all URBs to the endpoint to be completed, then delete the
++ * qset.
++ */
++static void whc_endpoint_disable(struct usb_hcd *usb_hcd,
++				 struct usb_host_endpoint *ep)
++{
++	struct wusbhc *wusbhc = usb_hcd_to_wusbhc(usb_hcd);
++	struct whc *whc = wusbhc_to_whc(wusbhc);
++	struct whc_qset *qset;
++
++	qset = ep->hcpriv;
++	if (qset) {
++		ep->hcpriv = NULL;
++		if (usb_endpoint_xfer_bulk(&ep->desc)
++		    || usb_endpoint_xfer_control(&ep->desc))
++			asl_qset_delete(whc, qset);
++		else
++			pzl_qset_delete(whc, qset);
++	}
++}
++
++static struct hc_driver whc_hc_driver = {
++	.description = "whci-hcd",
++	.product_desc = "Wireless host controller",
++	.hcd_priv_size = sizeof(struct whc) - sizeof(struct usb_hcd),
++	.irq = whc_int_handler,
++	.flags = HCD_USB2,
++
++	.reset = whc_reset,
++	.start = whc_start,
++	.stop = whc_stop,
++	.get_frame_number = whc_get_frame_number,
++	.urb_enqueue = whc_urb_enqueue,
++	.urb_dequeue = whc_urb_dequeue,
++	.endpoint_disable = whc_endpoint_disable,
++
++	.hub_status_data = wusbhc_rh_status_data,
++	.hub_control = wusbhc_rh_control,
++	.bus_suspend = wusbhc_rh_suspend,
++	.bus_resume = wusbhc_rh_resume,
++	.start_port_reset = wusbhc_rh_start_port_reset,
++};
++
++static int whc_probe(struct umc_dev *umc)
++{
++	int ret = -ENOMEM;
++	struct usb_hcd *usb_hcd;
++	struct wusbhc *wusbhc = NULL;
++	struct whc *whc = NULL;
++	struct device *dev = &umc->dev;
++
++	usb_hcd = usb_create_hcd(&whc_hc_driver, dev, "whci");
++	if (usb_hcd == NULL) {
++		dev_err(dev, "unable to create hcd\n");
++		goto error;
++	}
++
++	usb_hcd->wireless = 1;
++
++	wusbhc = usb_hcd_to_wusbhc(usb_hcd);
++	whc = wusbhc_to_whc(wusbhc);
++	whc->umc = umc;
++
++	ret = whc_init(whc);
++	if (ret)
++		goto error;
++
++	wusbhc->dev = dev;
++	wusbhc->uwb_rc = uwb_rc_get_by_grandpa(umc->dev.parent);
++	if (!wusbhc->uwb_rc) {
++		ret = -ENODEV;
++		dev_err(dev, "cannot get radio controller\n");
++		goto error;
++	}
++
++	if (whc->n_devices > USB_MAXCHILDREN) {
++		dev_warn(dev, "USB_MAXCHILDREN too low for WUSB adapter (%u ports)\n",
++			 whc->n_devices);
++		wusbhc->ports_max = USB_MAXCHILDREN;
++	} else
++		wusbhc->ports_max = whc->n_devices;
++	wusbhc->mmcies_max      = whc->n_mmc_ies;
++	wusbhc->start           = whc_wusbhc_start;
++	wusbhc->stop            = whc_wusbhc_stop;
++	wusbhc->mmcie_add       = whc_mmcie_add;
++	wusbhc->mmcie_rm        = whc_mmcie_rm;
++	wusbhc->dev_info_set    = whc_dev_info_set;
++	wusbhc->bwa_set         = whc_bwa_set;
++	wusbhc->set_num_dnts    = whc_set_num_dnts;
++	wusbhc->set_ptk         = whc_set_ptk;
++	wusbhc->set_gtk         = whc_set_gtk;
++
++	ret = wusbhc_create(wusbhc);
++	if (ret)
++		goto error_wusbhc_create;
++
++	ret = usb_add_hcd(usb_hcd, whc->umc->irq, IRQF_SHARED);
++	if (ret) {
++		dev_err(dev, "cannot add HCD: %d\n", ret);
++		goto error_usb_add_hcd;
++	}
++
++	ret = wusbhc_b_create(wusbhc);
++	if (ret) {
++		dev_err(dev, "WUSBHC phase B setup failed: %d\n", ret);
++		goto error_wusbhc_b_create;
++	}
++
++	return 0;
++
++error_wusbhc_b_create:
++	usb_remove_hcd(usb_hcd);
++error_usb_add_hcd:
++	wusbhc_destroy(wusbhc);
++error_wusbhc_create:
++	uwb_rc_put(wusbhc->uwb_rc);
++error:
++	whc_clean_up(whc);
++	if (usb_hcd)
++		usb_put_hcd(usb_hcd);
++	return ret;
++}
++
++
++static void whc_remove(struct umc_dev *umc)
++{
++	struct usb_hcd *usb_hcd = dev_get_drvdata(&umc->dev);
++	struct wusbhc *wusbhc = usb_hcd_to_wusbhc(usb_hcd);
++	struct whc *whc = wusbhc_to_whc(wusbhc);
++
++	if (usb_hcd) {
++		wusbhc_b_destroy(wusbhc);
++		usb_remove_hcd(usb_hcd);
++		wusbhc_destroy(wusbhc);
++		uwb_rc_put(wusbhc->uwb_rc);
++		whc_clean_up(whc);
++		usb_put_hcd(usb_hcd);
++	}
++}
++
++static struct umc_driver whci_hc_driver = {
++	.name =		"whci-hcd",
++	.cap_id =       UMC_CAP_ID_WHCI_WUSB_HC,
++	.probe =	whc_probe,
++	.remove =	whc_remove,
++};
++
++static int __init whci_hc_driver_init(void)
++{
++	return umc_driver_register(&whci_hc_driver);
++}
++module_init(whci_hc_driver_init);
++
++static void __exit whci_hc_driver_exit(void)
++{
++	umc_driver_unregister(&whci_hc_driver);
++}
++module_exit(whci_hc_driver_exit);
++
++/* PCI device ID's that we handle (so it gets loaded) */
++static struct pci_device_id whci_hcd_id_table[] = {
++        { PCI_DEVICE_CLASS(PCI_CLASS_WIRELESS_WHCI, ~0) },
++        { /* empty last entry */ }
++};
++MODULE_DEVICE_TABLE(pci, whci_hcd_id_table);
++
++MODULE_DESCRIPTION("WHCI Wireless USB host controller driver");
++MODULE_AUTHOR("Cambridge Silicon Radio Ltd.");
++MODULE_LICENSE("GPL");
+--- /dev/null
++++ b/drivers/usb/host/whci/hw.c
+@@ -0,0 +1,81 @@
++/*
++ * Wireless Host Controller (WHC) hardware access helpers.
++ *
++ * Copyright (C) 2007 Cambridge Silicon Radio Ltd.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++#include <linux/version.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/uwb/umc.h>
++
++#include "../../wusbcore/wusbhc.h"
++
++#include "whcd.h"
++
++void whc_write_wusbcmd(struct whc *whc, u32 mask, u32 val)
++{
++	unsigned long flags;
++	u32 cmd;
++
++	spin_lock_irqsave(&whc->lock, flags);
++
++	cmd = le_readl(whc->base + WUSBCMD);
++	cmd = (cmd & ~mask) | val;
++	le_writel(cmd, whc->base + WUSBCMD);
++
++	spin_unlock_irqrestore(&whc->lock, flags);
++}
++
++int whc_do_gencmd(struct whc *whc, u32 cmd, u32 params, void *addr, size_t len)
++{
++	unsigned long flags;
++	dma_addr_t dma_addr;
++	int t, ret = 0;
++
++	if (addr)
++		dma_addr = dma_map_single(&whc->umc->dev, addr, len, DMA_TO_DEVICE);
++	else
++		dma_addr = 0;
++
++	mutex_lock(&whc->mutex);
++
++	/* poke registers to start cmd */
++	spin_lock_irqsave(&whc->lock, flags);
++
++	le_writel(params, whc->base + WUSBGENCMDPARAMS);
++	le_writeq(dma_addr, whc->base + WUSBGENADDR);
++
++	le_writel(WUSBGENCMDSTS_ACTIVE | WUSBGENCMDSTS_IOC | cmd,
++		  whc->base + WUSBGENCMDSTS);
++
++	spin_unlock_irqrestore(&whc->lock, flags);
++
++	/* wait for command to complete */
++	t = wait_event_timeout(whc->cmd_wq,
++			       (le_readl(whc->base + WUSBGENCMDSTS) & WUSBGENCMDSTS_ACTIVE) == 0,
++			       WHC_GENCMD_TIMEOUT_MS);
++	if (t == 0) {
++		ret = -ETIMEDOUT;
++		dev_err(&whc->umc->dev, "generic command timeout (%04x/%04x)\n",
++			cmd, params);
++	}
++
++	mutex_unlock(&whc->mutex);
++
++	if (addr)
++		dma_unmap_single(&whc->umc->dev, dma_addr, len, DMA_TO_DEVICE);
++
++	return ret;
++}
+--- /dev/null
++++ b/drivers/usb/host/whci/init.c
+@@ -0,0 +1,182 @@
++/*
++ * Wireless Host Controller (WHC) initialization.
++ *
++ * Copyright (C) 2007 Cambridge Silicon Radio Ltd.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++#include <linux/version.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/uwb/umc.h>
++
++#include "../../wusbcore/wusbhc.h"
++
++#include "whcd.h"
++
++/*
++ * Reset the host controller.
++ */
++static void whc_hw_reset(struct whc *whc)
++{
++	le_writel(WUSBCMD_WHCRESET, whc->base + WUSBCMD);
++	whci_wait_for(&whc->umc->dev, whc->base + WUSBCMD, WUSBCMD_WHCRESET, 0,
++		      100, "reset");
++}
++
++static void whc_hw_init_di_buf(struct whc *whc)
++{
++	int d;
++
++	/* Disable all entries in the Device Information buffer. */
++	for (d = 0; d < whc->n_devices; d++)
++		whc->di_buf[d].addr_sec_info = WHC_DI_DISABLE;
++
++	le_writeq(whc->di_buf_dma, whc->base + WUSBDEVICEINFOADDR);
++}
++
++static void whc_hw_init_dn_buf(struct whc *whc)
++{
++	/* Clear the Device Notification buffer to ensure the V (valid)
++	 * bits are clear.  */
++	memset(whc->dn_buf, 0, 4096);
++
++	le_writeq(whc->dn_buf_dma, whc->base + WUSBDNTSBUFADDR);
++}
++
++int whc_init(struct whc *whc)
++{
++	u32 whcsparams;
++	int ret, i;
++	resource_size_t start, len;
++
++	spin_lock_init(&whc->lock);
++	mutex_init(&whc->mutex);
++	init_waitqueue_head(&whc->cmd_wq);
++	init_waitqueue_head(&whc->async_list_wq);
++	init_waitqueue_head(&whc->periodic_list_wq);
++	whc->workqueue = create_singlethread_workqueue(whc->umc->dev.bus_id);
++	if (whc->workqueue == NULL) {
++		ret = -ENOMEM;
++		goto error;
++	}
++	INIT_WORK(&whc->dn_work, whc_dn_work);
++
++	INIT_WORK(&whc->async_work, scan_async_work);
++	INIT_LIST_HEAD(&whc->async_list);
++	INIT_LIST_HEAD(&whc->async_removed_list);
++
++	INIT_WORK(&whc->periodic_work, scan_periodic_work);
++	for (i = 0; i < 5; i++)
++		INIT_LIST_HEAD(&whc->periodic_list[i]);
++	INIT_LIST_HEAD(&whc->periodic_removed_list);
++
++	/*
++	 * Map HC registers.
++	 */
++	start = whc->umc->resource.start;
++	len   = whc->umc->resource.end - start + 1;
++	if (!request_mem_region(start, len, "whci-hc")) {
++		dev_err(&whc->umc->dev, "can't request HC region\n");
++		ret = -EBUSY;
++		goto error;
++	}
++	whc->base_phys = start;
++	whc->base = ioremap(start, len);
++	if (!whc->base) {
++		dev_err(&whc->umc->dev, "ioremap\n");
++		ret = -ENOMEM;
++		goto error;
++	}
++
++	whc_hw_reset(whc);
++
++	/* Read maximum number of devices, keys and MMC IEs. */
++	whcsparams = le_readl(whc->base + WHCSPARAMS);
++	whc->n_devices = WHCSPARAMS_TO_N_DEVICES(whcsparams);
++	whc->n_keys    = WHCSPARAMS_TO_N_KEYS(whcsparams);
++	whc->n_mmc_ies = WHCSPARAMS_TO_N_MMC_IES(whcsparams);
++
++	dev_dbg(&whc->umc->dev, "N_DEVICES = %d, N_KEYS = %d, N_MMC_IES = %d\n",
++		whc->n_devices, whc->n_keys, whc->n_mmc_ies);
++
++	whc->qset_pool = dma_pool_create("qset", &whc->umc->dev,
++					 sizeof(struct whc_qset), 64, 0);
++	if (whc->qset_pool == NULL) {
++		ret = -ENOMEM;
++		goto error;
++	}
++
++	ret = asl_init(whc);
++	if (ret < 0)
++		goto error;
++	ret = pzl_init(whc);
++	if (ret < 0)
++		goto error;
++
++	/*
++	 * Allocate and initialize the Device Information buffer and
++	 * the Device Notification buffer.
++	 */
++
++	whc->dn_buf = dma_alloc_coherent(&whc->umc->dev,
++					 sizeof(struct dn_buf_entry) * WHC_N_DN_ENTRIES,
++					 &whc->dn_buf_dma, GFP_KERNEL);
++	if (!whc->dn_buf) {
++		ret = -ENOMEM;
++		goto error;
++	}
++	whc_hw_init_dn_buf(whc);
++
++	whc->di_buf = dma_alloc_coherent(&whc->umc->dev,
++					 sizeof(struct di_buf_entry) * whc->n_devices,
++					 &whc->di_buf_dma, GFP_KERNEL);
++	if (!whc->di_buf) {
++		ret = -ENOMEM;
++		goto error;
++	}
++	whc_hw_init_di_buf(whc);
++
++	return 0;
++
++error:
++	whc_clean_up(whc);
++	return ret;
++}
++
++void whc_clean_up(struct whc *whc)
++{
++	resource_size_t len;
++
++	if (whc->di_buf)
++		dma_free_coherent(&whc->umc->dev, sizeof(struct di_buf_entry) * whc->n_devices,
++				  whc->di_buf, whc->di_buf_dma);
++	if (whc->dn_buf)
++		dma_free_coherent(&whc->umc->dev, sizeof(struct dn_buf_entry) * WHC_N_DN_ENTRIES,
++				  whc->dn_buf, whc->dn_buf_dma);
++
++	pzl_clean_up(whc);
++	asl_clean_up(whc);
++
++	if (whc->qset_pool)
++		dma_pool_destroy(whc->qset_pool);
++
++	len   = whc->umc->resource.end - whc->umc->resource.start + 1;
++	if (whc->base)
++		iounmap(whc->base);
++	if (whc->base_phys)
++		release_mem_region(whc->base_phys, len);
++
++	if (whc->workqueue)
++		destroy_workqueue(whc->workqueue);
++}
+--- /dev/null
++++ b/drivers/usb/host/whci/int.c
+@@ -0,0 +1,95 @@
++/*
++ * Wireless Host Controller (WHC) interrupt handling.
++ *
++ * Copyright (C) 2007 Cambridge Silicon Radio Ltd.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++#include <linux/version.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/uwb/umc.h>
++
++#include "../../wusbcore/wusbhc.h"
++
++#include "whcd.h"
++
++static void transfer_done(struct whc *whc)
++{
++	queue_work(whc->workqueue, &whc->async_work);
++	queue_work(whc->workqueue, &whc->periodic_work);
++}
++
++irqreturn_t whc_int_handler(struct usb_hcd *hcd)
++{
++	struct wusbhc *wusbhc = usb_hcd_to_wusbhc(hcd);
++	struct whc *whc = wusbhc_to_whc(wusbhc);
++	u32 sts;
++
++	sts = le_readl(whc->base + WUSBSTS);
++	if (!(sts & WUSBSTS_INT_MASK))
++		return IRQ_NONE;
++	le_writel(sts & WUSBSTS_INT_MASK, whc->base + WUSBSTS);
++
++	if (sts & WUSBSTS_GEN_CMD_DONE)
++		wake_up(&whc->cmd_wq);
++
++	if (sts & WUSBSTS_HOST_ERR)
++		dev_err(&whc->umc->dev, "FIXME: host system error\n");
++
++	if (sts & WUSBSTS_ASYNC_SCHED_SYNCED)
++		wake_up(&whc->async_list_wq);
++
++	if (sts & WUSBSTS_PERIODIC_SCHED_SYNCED)
++		wake_up(&whc->periodic_list_wq);
++
++	if (sts & WUSBSTS_DNTS_INT)
++		queue_work(whc->workqueue, &whc->dn_work);
++
++	/*
++	 * A transfer completed (see [WHCI] section 4.7.1.2 for when
++	 * this occurs).
++	 */
++	if (sts & (WUSBSTS_INT | WUSBSTS_ERR_INT))
++		transfer_done(whc);
++
++	return IRQ_HANDLED;
++}
++
++static int process_dn_buf(struct whc *whc)
++{
++	struct wusbhc *wusbhc = &whc->wusbhc;
++	struct dn_buf_entry *dn;
++	int processed = 0;
++
++	for (dn = whc->dn_buf; dn < whc->dn_buf + WHC_N_DN_ENTRIES; dn++) {
++		if (dn->status & WHC_DN_STATUS_VALID) {
++			wusbhc_handle_dn(wusbhc, dn->src_addr,
++					 (struct wusb_dn_hdr *)dn->dn_data,
++					 dn->msg_size);
++			dn->status &= ~WHC_DN_STATUS_VALID;
++			processed++;
++		}
++	}
++	return processed;
++}
++
++void whc_dn_work(struct work_struct *work)
++{
++	struct whc *whc = container_of(work, struct whc, dn_work);
++	int processed;
++
++	do {
++		processed = process_dn_buf(whc);
++	} while (processed);
++}
+--- /dev/null
++++ b/drivers/usb/host/whci/pzl.c
+@@ -0,0 +1,397 @@
++/*
++ * Wireless Host Controller (WHC) periodic schedule management.
++ *
++ * Copyright (C) 2007 Cambridge Silicon Radio Ltd.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++#include <linux/kernel.h>
++#include <linux/uwb/umc.h>
++#include <linux/usb.h>
++#define D_LOCAL 0
++#include <linux/uwb/debug.h>
++
++#include "../../wusbcore/wusbhc.h"
++
++#include "whcd.h"
++
++#if D_LOCAL >= 4
++static void dump_pzl(struct whc *whc, const char *tag)
++{
++	struct device *dev = &whc->umc->dev;
++	struct whc_qset *qset;
++	int period = 0;
++
++	d_printf(4, dev, "PZL %s\n", tag);
++
++	for (period = 0; period < 5; period++) {
++		d_printf(4, dev, "Period %d\n", period);
++		list_for_each_entry(qset, &whc->periodic_list[period], list_node) {
++			dump_qset(qset, dev);
++		}
++	}
++}
++#else
++static inline void dump_pzl(struct whc *whc, const char *tag)
++{
++}
++#endif
++
++static void update_pzl_pointers(struct whc *whc, int period, u64 addr)
++{
++	switch (period) {
++	case 0:
++		whc_qset_set_link_ptr(&whc->pz_list[0], addr);
++		whc_qset_set_link_ptr(&whc->pz_list[2], addr);
++		whc_qset_set_link_ptr(&whc->pz_list[4], addr);
++		whc_qset_set_link_ptr(&whc->pz_list[6], addr);
++		whc_qset_set_link_ptr(&whc->pz_list[8], addr);
++		whc_qset_set_link_ptr(&whc->pz_list[10], addr);
++		whc_qset_set_link_ptr(&whc->pz_list[12], addr);
++		whc_qset_set_link_ptr(&whc->pz_list[14], addr);
++		break;
++	case 1:
++		whc_qset_set_link_ptr(&whc->pz_list[1], addr);
++		whc_qset_set_link_ptr(&whc->pz_list[5], addr);
++		whc_qset_set_link_ptr(&whc->pz_list[9], addr);
++		whc_qset_set_link_ptr(&whc->pz_list[13], addr);
++		break;
++	case 2:
++		whc_qset_set_link_ptr(&whc->pz_list[3], addr);
++		whc_qset_set_link_ptr(&whc->pz_list[11], addr);
++		break;
++	case 3:
++		whc_qset_set_link_ptr(&whc->pz_list[7], addr);
++		break;
++	case 4:
++		whc_qset_set_link_ptr(&whc->pz_list[15], addr);
++		break;
++	}
++}
++
++/*
++ * Return the 'period' to use for this qset.  The minimum interval for
++ * the endpoint is used so whatever urbs are submitted the device is
++ * polled often enough.
++ */
++static int qset_get_period(struct whc *whc, struct whc_qset *qset)
++{
++	uint8_t bInterval = qset->ep->desc.bInterval;
++
++	if (bInterval < 6)
++		bInterval = 6;
++	if (bInterval > 10)
++		bInterval = 10;
++	return bInterval - 6;
++}
++
++static void qset_insert_in_sw_list(struct whc *whc, struct whc_qset *qset)
++{
++	int period;
++
++	period = qset_get_period(whc, qset);
++
++	qset_clear(whc, qset);
++	list_move(&qset->list_node, &whc->periodic_list[period]);
++	qset->in_sw_list = true;
++}
++
++static void pzl_qset_remove(struct whc *whc, struct whc_qset *qset)
++{
++	list_move(&qset->list_node, &whc->periodic_removed_list);
++	qset->in_hw_list = false;
++	qset->in_sw_list = false;
++}
++
++/**
++ * pzl_process_qset - process any recently inactivated or halted qTDs
++ * in a qset.
++ *
++ * After inactive qTDs are removed, new qTDs can be added if the
++ * urb queue still contains URBs.
++ *
++ * Returns the schedule updates required.
++ */
++static enum whc_update pzl_process_qset(struct whc *whc, struct whc_qset *qset)
++{
++	enum whc_update update = 0;
++	uint32_t status = 0;
++
++	while (qset->ntds) {
++		struct whc_qtd *td;
++		int t;
++
++		t = qset->td_start;
++		td = &qset->qtd[qset->td_start];
++		status = le32_to_cpu(td->status);
++
++		/*
++		 * Nothing to do with a still active qTD.
++		 */
++		if (status & QTD_STS_ACTIVE)
++			break;
++
++		if (status & QTD_STS_HALTED) {
++			/* Ug, an error. */
++			process_halted_qtd(whc, qset, td);
++			goto done;
++		}
++
++		/* Mmm, a completed qTD. */
++		process_inactive_qtd(whc, qset, td);
++	}
++
++	update |= qset_add_qtds(whc, qset);
++
++done:
++	/*
++	 * If there are no qTDs in this qset, remove it from the PZL.
++	 */
++	if (qset->remove && qset->ntds == 0) {
++		pzl_qset_remove(whc, qset);
++		update |= WHC_UPDATE_REMOVED;
++	}
++
++	return update;
++}
++
++/**
++ * pzl_start - start the periodic schedule
++ * @whc: the WHCI host controller
++ *
++ * The PZL must be valid (e.g., all entries in the list should have
++ * the T bit set).
++ */
++void pzl_start(struct whc *whc)
++{
++	le_writeq(whc->pz_list_dma, whc->base + WUSBPERIODICLISTBASE);
++
++	whc_write_wusbcmd(whc, WUSBCMD_PERIODIC_EN, WUSBCMD_PERIODIC_EN);
++	whci_wait_for(&whc->umc->dev, whc->base + WUSBSTS,
++		      WUSBSTS_PERIODIC_SCHED, WUSBSTS_PERIODIC_SCHED,
++		      1000, "start PZL");
++}
++
++/**
++ * pzl_stop - stop the periodic schedule
++ * @whc: the WHCI host controller
++ */
++void pzl_stop(struct whc *whc)
++{
++	whc_write_wusbcmd(whc, WUSBCMD_PERIODIC_EN, 0);
++	whci_wait_for(&whc->umc->dev, whc->base + WUSBSTS,
++		      WUSBSTS_PERIODIC_SCHED, 0,
++		      1000, "stop PZL");
++}
++
++void pzl_update(struct whc *whc, uint32_t wusbcmd)
++{
++	whc_write_wusbcmd(whc, wusbcmd, wusbcmd);
++	wait_event(whc->periodic_list_wq,
++		   (le_readl(whc->base + WUSBCMD) & WUSBCMD_PERIODIC_UPDATED) == 0);
++}
++
++static void update_pzl_hw_view(struct whc *whc)
++{
++	struct whc_qset *qset, *t;
++	int period;
++	u64 tmp_qh = 0;
++
++	for (period = 0; period < 5; period++) {
++		list_for_each_entry_safe(qset, t, &whc->periodic_list[period], list_node) {
++			whc_qset_set_link_ptr(&qset->qh.link, tmp_qh);
++			tmp_qh = qset->qset_dma;
++			qset->in_hw_list = true;
++		}
++		update_pzl_pointers(whc, period, tmp_qh);
++	}
++}
++
++/**
++ * scan_periodic_work - scan the PZL for qsets to process.
++ *
++ * Process each qset in the PZL in turn and then signal the WHC that
++ * the PZL has been updated.
++ *
++ * Then start, stop or update the periodic schedule as required.
++ */
++void scan_periodic_work(struct work_struct *work)
++{
++	struct whc *whc = container_of(work, struct whc, periodic_work);
++	struct whc_qset *qset, *t;
++	enum whc_update update = 0;
++	int period;
++
++	spin_lock_irq(&whc->lock);
++
++	dump_pzl(whc, "before processing");
++
++	for (period = 4; period >= 0; period--) {
++		list_for_each_entry_safe(qset, t, &whc->periodic_list[period], list_node) {
++			if (!qset->in_hw_list)
++				update |= WHC_UPDATE_ADDED;
++			update |= pzl_process_qset(whc, qset);
++		}
++	}
++
++	if (update & (WHC_UPDATE_ADDED | WHC_UPDATE_REMOVED))
++		update_pzl_hw_view(whc);
++
++	dump_pzl(whc, "after processing");
++
++	spin_unlock_irq(&whc->lock);
++
++	if (update) {
++		uint32_t wusbcmd = WUSBCMD_PERIODIC_UPDATED | WUSBCMD_PERIODIC_SYNCED_DB;
++		if (update & WHC_UPDATE_REMOVED)
++			wusbcmd |= WUSBCMD_PERIODIC_QSET_RM;
++		pzl_update(whc, wusbcmd);
++	}
++
++	/*
++	 * Now that the PZL is updated, complete the removal of any
++	 * removed qsets.
++	 */
++	spin_lock(&whc->lock);
++
++	list_for_each_entry_safe(qset, t, &whc->periodic_removed_list, list_node) {
++		qset_remove_complete(whc, qset);
++	}
++
++	spin_unlock(&whc->lock);
++}
++
++/**
++ * pzl_urb_enqueue - queue an URB onto the periodic list (PZL)
++ * @whc: the WHCI host controller
++ * @urb: the URB to enqueue
++ * @mem_flags: flags for any memory allocations
++ *
++ * The qset for the endpoint is obtained and the urb queued on to it.
++ *
++ * Work is scheduled to update the hardware's view of the PZL.
++ */
++int pzl_urb_enqueue(struct whc *whc, struct urb *urb, gfp_t mem_flags)
++{
++	struct whc_qset *qset;
++	int err;
++	unsigned flags;
++
++	spin_lock_irqsave(&whc->lock, flags);
++
++	qset = get_qset(whc, urb, GFP_ATOMIC);
++	if (qset == NULL)
++		err = -ENOMEM;
++	else
++		err = qset_add_urb(whc, qset, urb, GFP_ATOMIC);
++	if (!err) {
++		usb_hcd_link_urb_to_ep(&whc->wusbhc.usb_hcd, urb);
++		if (!qset->in_sw_list)
++			qset_insert_in_sw_list(whc, qset);
++	}
++
++	spin_unlock_irqrestore(&whc->lock, flags);
++
++	if (!err)
++		queue_work(whc->workqueue, &whc->periodic_work);
++
++	return 0;
++}
++
++/**
++ * pzl_urb_dequeue - remove an URB (qset) from the periodic list
++ * @whc: the WHCI host controller
++ * @urb: the URB to dequeue
++ * @status: the current status of the URB
++ *
++ * URBs that do yet have qTDs can simply be removed from the software
++ * queue, otherwise the qset must be removed so the qTDs can be safely
++ * removed.
++ */
++int pzl_urb_dequeue(struct whc *whc, struct urb *urb, int status)
++{
++	struct whc_urb *wurb = urb->hcpriv;
++	struct whc_qset *qset = wurb->qset;
++	struct whc_std *std, *t;
++	int ret;
++	unsigned flags;
++
++	spin_lock_irqsave(&whc->lock, flags);
++
++	ret = usb_hcd_check_unlink_urb(&whc->wusbhc.usb_hcd, urb, status);
++	if (ret < 0)
++		goto out;
++
++	list_for_each_entry_safe(std, t, &qset->stds, list_node) {
++		if (std->urb == urb)
++			qset_free_std(whc, std);
++		else
++			std->qtd = NULL; /* so this std is re-added when the qset is */
++	}
++
++	pzl_qset_remove(whc, qset);
++	wurb->status = status;
++	wurb->is_async = false;
++	queue_work(whc->workqueue, &wurb->dequeue_work);
++
++out:
++	spin_unlock_irqrestore(&whc->lock, flags);
++
++	return ret;
++}
++
++/**
++ * pzl_qset_delete - delete a qset from the PZL
++ */
++void pzl_qset_delete(struct whc *whc, struct whc_qset *qset)
++{
++	qset->remove = 1;
++	queue_work(whc->workqueue, &whc->periodic_work);
++	qset_delete(whc, qset);
++}
++
++
++/**
++ * pzl_init - initialize the periodic zone list
++ * @whc: the WHCI host controller
++ */
++int pzl_init(struct whc *whc)
++{
++	int i;
++
++	whc->pz_list = dma_alloc_coherent(&whc->umc->dev, sizeof(u64) * 16,
++					  &whc->pz_list_dma, GFP_KERNEL);
++	if (whc->pz_list == NULL)
++		return -ENOMEM;
++
++	/* Set T bit on all elements in PZL. */
++	for (i = 0; i < 16; i++)
++		whc->pz_list[i] = cpu_to_le64(QH_LINK_NTDS(8) | QH_LINK_T);
++
++	le_writeq(whc->pz_list_dma, whc->base + WUSBPERIODICLISTBASE);
++
++	return 0;
++}
++
++/**
++ * pzl_clean_up - free PZL resources
++ * @whc: the WHCI host controller
++ *
++ * The PZL is stopped and empty.
++ */
++void pzl_clean_up(struct whc *whc)
++{
++	if (whc->pz_list)
++		dma_free_coherent(&whc->umc->dev,  sizeof(u64) * 16, whc->pz_list,
++				  whc->pz_list_dma);
++}
+--- /dev/null
++++ b/drivers/usb/host/whci/qset.c
+@@ -0,0 +1,562 @@
++/*
++ * Wireless Host Controller (WHC) qset management.
++ *
++ * Copyright (C) 2007 Cambridge Silicon Radio Ltd.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++#include <linux/kernel.h>
++#include <linux/uwb/umc.h>
++#include <linux/usb.h>
++
++#include "../../wusbcore/wusbhc.h"
++
++#include "whcd.h"
++
++void dump_qset(struct whc_qset *qset, struct device *dev)
++{
++	struct whc_std *std;
++	struct urb *urb = NULL;
++	int i;
++
++	dev_dbg(dev, "qset %08x\n", (u32)qset->qset_dma);
++	dev_dbg(dev, "  -> %08x\n", (u32)qset->qh.link);
++	dev_dbg(dev, "  info: %08x %08x %08x\n",
++		qset->qh.info1, qset->qh.info2,  qset->qh.info3);
++	dev_dbg(dev, "  sts: %04x errs: %d\n", qset->qh.status, qset->qh.err_count);
++	dev_dbg(dev, "  TD: sts: %08x opts: %08x\n",
++		qset->qh.overlay.qtd.status, qset->qh.overlay.qtd.options);
++
++	for (i = 0; i < WHCI_QSET_TD_MAX; i++) {
++		dev_dbg(dev, "  %c%c TD[%d]: sts: %08x opts: %08x ptr: %08x\n",
++			i == qset->td_start ? 'S' : ' ',
++			i == qset->td_end ? 'E' : ' ',
++			i, qset->qtd[i].status, qset->qtd[i].options,
++			(u32)qset->qtd[i].page_list_ptr);
++	}
++	dev_dbg(dev, "  ntds: %d\n", qset->ntds);
++	list_for_each_entry(std, &qset->stds, list_node) {
++		if (urb != std->urb) {
++			urb = std->urb;
++			dev_dbg(dev, "  urb %p transferred: %d bytes\n", urb,
++				urb->actual_length);
++		}
++		if (std->qtd)
++			dev_dbg(dev, "    sTD[%td]: %zu bytes @ %08x\n",
++				std->qtd - &qset->qtd[0],
++				std->len, std->num_pointers ?
++				(u32)(std->pl_virt[0].buf_ptr) : (u32)std->dma_addr);
++		else
++			dev_dbg(dev, "    sTD[-]: %zd bytes @ %08x\n",
++				std->len, std->num_pointers ?
++				(u32)(std->pl_virt[0].buf_ptr) : (u32)std->dma_addr);
++	}
++}
++
++struct whc_qset *qset_alloc(struct whc *whc, gfp_t mem_flags)
++{
++	struct whc_qset *qset;
++	dma_addr_t dma;
++
++	qset = dma_pool_alloc(whc->qset_pool, mem_flags, &dma);
++	if (qset == NULL)
++		return NULL;
++	memset(qset, 0, sizeof(struct whc_qset));
++
++	qset->qset_dma = dma;
++	qset->whc = whc;
++
++	INIT_LIST_HEAD(&qset->list_node);
++	INIT_LIST_HEAD(&qset->stds);
++
++	return qset;
++}
++
++/**
++ * qset_fill_qh - fill the static endpoint state in a qset's QHead
++ * @qset: the qset whose QH needs initializing with static endpoint
++ *        state
++ * @urb:  an urb for a transfer to this endpoint
++ */
++static void qset_fill_qh(struct whc_qset *qset, struct urb *urb)
++{
++	struct usb_device *usb_dev = urb->dev;
++	struct usb_wireless_ep_comp_descriptor *epcd;
++	bool is_out;
++
++	is_out = usb_pipeout(urb->pipe);
++
++	epcd = (struct usb_wireless_ep_comp_descriptor *)qset->ep->extra;
++
++	if (epcd) {
++		qset->max_seq = epcd->bMaxSequence;
++		qset->max_burst = epcd->bMaxBurst;
++	} else {
++		qset->max_seq = 2;
++		qset->max_burst = 1;
++	}
++
++	qset->qh.info1 = cpu_to_le32(
++		QH_INFO1_EP(usb_pipeendpoint(urb->pipe))
++		| (is_out ? QH_INFO1_DIR_OUT : QH_INFO1_DIR_IN)
++		| usb_pipe_to_qh_type(urb->pipe)
++		| QH_INFO1_DEV_INFO_IDX(wusb_port_no_to_idx(usb_dev->portnum))
++		| QH_INFO1_MAX_PKT_LEN(usb_maxpacket(urb->dev, urb->pipe, is_out))
++		);
++	qset->qh.info2 = cpu_to_le32(
++		QH_INFO2_BURST(qset->max_burst)
++		| QH_INFO2_DBP(0)
++		| QH_INFO2_MAX_COUNT(3)
++		| QH_INFO2_MAX_RETRY(3)
++		| QH_INFO2_MAX_SEQ(qset->max_seq - 1)
++		);
++	/* FIXME: where can we obtain these Tx parameters from?  Why
++	 * doesn't the chip know what Tx power to use? It knows the Rx
++	 * strength and can presumably guess the Tx power required
++	 * from that? */
++	qset->qh.info3 = cpu_to_le32(
++		QH_INFO3_TX_RATE_53_3
++		| QH_INFO3_TX_PWR(0) /* 0 == max power */
++		);
++}
++
++/**
++ * qset_clear - clear fields in a qset so it may be reinserted into a
++ * schedule
++ */
++void qset_clear(struct whc *whc, struct whc_qset *qset)
++{
++	qset->td_start = qset->td_end = qset->ntds = 0;
++	qset->remove = 0;
++
++	qset->qh.link = cpu_to_le32(QH_LINK_NTDS(8) | QH_LINK_T);
++	qset->qh.status = cpu_to_le16(QH_STATUS_ICUR(qset->td_start));
++	qset->qh.err_count = 0;
++	qset->qh.cur_window = cpu_to_le32((1 << qset->max_burst) - 1);
++	qset->qh.scratch[0] = 0;
++	qset->qh.scratch[1] = 0;
++	qset->qh.scratch[2] = 0;
++
++	memset(&qset->qh.overlay, 0, sizeof(qset->qh.overlay));
++
++	init_completion(&qset->remove_complete);
++}
++
++/**
++ * get_qset - get the qset for an async endpoint
++ *
++ * A new qset is created if one does not already exist.
++ */
++struct whc_qset *get_qset(struct whc *whc, struct urb *urb,
++				 gfp_t mem_flags)
++{
++	struct whc_qset *qset;
++
++	qset = urb->ep->hcpriv;
++	if (qset == NULL) {
++		qset = qset_alloc(whc, mem_flags);
++		if (qset == NULL)
++			return NULL;
++
++		qset->ep = urb->ep;
++		urb->ep->hcpriv = qset;
++		qset_fill_qh(qset, urb);
++	}
++	return qset;
++}
++
++void qset_remove_complete(struct whc *whc, struct whc_qset *qset)
++{
++	list_del_init(&qset->list_node);
++	complete(&qset->remove_complete);
++}
++
++/**
++ * qset_add_qtds - add qTDs for an URB to a qset
++ *
++ * Returns true if the list (ASL/PZL) must be updated because (for a
++ * WHCI 0.95 controller) an activated qTD was pointed to be iCur.
++ */
++enum whc_update qset_add_qtds(struct whc *whc, struct whc_qset *qset)
++{
++	struct whc_std *std;
++	enum whc_update update = 0;
++
++	list_for_each_entry(std, &qset->stds, list_node) {
++		struct whc_qtd *qtd;
++		uint32_t status;
++
++		if (qset->ntds >= WHCI_QSET_TD_MAX
++		    || (qset->pause_after_urb && std->urb != qset->pause_after_urb))
++			break;
++
++		if (std->qtd)
++			continue; /* already has a qTD */
++
++		qtd = std->qtd = &qset->qtd[qset->td_end];
++
++		/* Fill in setup bytes for control transfers. */
++		if (usb_pipecontrol(std->urb->pipe))
++			memcpy(qtd->setup, std->urb->setup_packet, 8);
++
++		status = QTD_STS_ACTIVE | QTD_STS_LEN(std->len);
++
++		if (whc_std_last(std) && usb_pipeout(std->urb->pipe))
++			status |= QTD_STS_LAST_PKT;
++
++		/*
++		 * For an IN transfer the iAlt field should be set so
++		 * the h/w will automatically advance to the next
++		 * transfer. However, if there are 8 or more TDs
++		 * remaining in this transfer then iAlt cannot be set
++		 * as it could point to somewhere in this transfer.
++		 */
++		if (std->ntds_remaining < WHCI_QSET_TD_MAX) {
++			int ialt;
++			ialt = (qset->td_end + std->ntds_remaining) % WHCI_QSET_TD_MAX;
++			status |= QTD_STS_IALT(ialt);
++		} else if (usb_pipein(std->urb->pipe))
++			qset->pause_after_urb = std->urb;
++
++		if (std->num_pointers)
++			qtd->options = cpu_to_le32(QTD_OPT_IOC);
++		else
++			qtd->options = cpu_to_le32(QTD_OPT_IOC | QTD_OPT_SMALL);
++		qtd->page_list_ptr = cpu_to_le64(std->dma_addr);
++
++		qtd->status = cpu_to_le32(status);
++
++		if (QH_STATUS_TO_ICUR(qset->qh.status) == qset->td_end)
++			update = WHC_UPDATE_UPDATED;
++
++		if (++qset->td_end >= WHCI_QSET_TD_MAX)
++			qset->td_end = 0;
++		qset->ntds++;
++	}
++
++	return update;
++}
++
++/**
++ * qset_remove_qtd - remove the first qTD from a qset.
++ *
++ * The qTD might be still active (if it's part of a IN URB that
++ * resulted in a short read) so ensure it's deactivated.
++ */
++static void qset_remove_qtd(struct whc *whc, struct whc_qset *qset)
++{
++	qset->qtd[qset->td_start].status = 0;
++
++	if (++qset->td_start >= WHCI_QSET_TD_MAX)
++		qset->td_start = 0;
++	qset->ntds--;
++}
++
++/**
++ * qset_free_std - remove an sTD and free it.
++ * @whc: the WHCI host controller
++ * @std: the sTD to remove and free.
++ */
++void qset_free_std(struct whc *whc, struct whc_std *std)
++{
++	list_del(&std->list_node);
++	if (std->num_pointers)
++		dma_unmap_single(whc->wusbhc.dev, std->dma_addr,
++				 std->num_pointers * sizeof(struct whc_page_list_entry),
++				 DMA_TO_DEVICE);
++	kfree(std);
++}
++
++/**
++ * qset_remove_qtds - remove an URB's qTDs (and sTDs).
++ */
++static void qset_remove_qtds(struct whc *whc, struct whc_qset *qset,
++			     struct urb *urb)
++{
++	struct whc_std *std, *t;
++
++	list_for_each_entry_safe(std, t, &qset->stds, list_node) {
++		if (std->urb != urb)
++			break;
++		if (std->qtd != NULL)
++			qset_remove_qtd(whc, qset);
++		qset_free_std(whc, std);
++	}
++}
++
++/**
++ * qset_free_stds - free any remaining sTDs for an URB.
++ */
++static void qset_free_stds(struct whc_qset *qset, struct urb *urb)
++{
++	struct whc_std *std, *t;
++
++	list_for_each_entry_safe(std, t, &qset->stds, list_node) {
++		if (std->urb == urb)
++			qset_free_std(qset->whc, std);
++	}
++}
++
++static int qset_fill_page_list(struct whc *whc, struct whc_std *std, gfp_t mem_flags)
++{
++	dma_addr_t dma_addr = std->dma_addr;
++	dma_addr_t sp, ep;
++	size_t std_len = std->len;
++	size_t pl_len;
++	int p;
++
++	sp = ALIGN(dma_addr, WHCI_PAGE_SIZE);
++	ep = dma_addr + std_len;
++	std->num_pointers = DIV_ROUND_UP(ep - sp, WHCI_PAGE_SIZE);
++
++	pl_len = std->num_pointers * sizeof(struct whc_page_list_entry);
++	std->pl_virt = kmalloc(pl_len, mem_flags);
++	if (std->pl_virt == NULL)
++		return -ENOMEM;
++	std->dma_addr = dma_map_single(whc->wusbhc.dev, std->pl_virt, pl_len, DMA_TO_DEVICE);
++
++	for (p = 0; p < std->num_pointers; p++) {
++		std->pl_virt[p].buf_ptr = cpu_to_le64(dma_addr);
++		dma_addr = ALIGN(dma_addr + WHCI_PAGE_SIZE, WHCI_PAGE_SIZE);
++	}
++
++	return 0;
++}
++
++/**
++ * urb_dequeue_work - executes asl/pzl update and gives back the urb to the system.
++ */
++static void urb_dequeue_work(struct work_struct *work)
++{
++	struct whc_urb *wurb = container_of(work, struct whc_urb, dequeue_work);
++	struct whc_qset *qset = wurb->qset;
++	struct whc *whc = qset->whc;
++	unsigned flags;
++
++	if (wurb->is_async == true)
++		asl_update(whc, WUSBCMD_ASYNC_UPDATED
++			   | WUSBCMD_ASYNC_SYNCED_DB
++			   | WUSBCMD_ASYNC_QSET_RM);
++	else
++		pzl_update(whc, WUSBCMD_PERIODIC_UPDATED
++			   | WUSBCMD_PERIODIC_SYNCED_DB
++			   | WUSBCMD_PERIODIC_QSET_RM);
++
++	spin_lock_irqsave(&whc->lock, flags);
++	qset_remove_urb(whc, qset, wurb->urb, wurb->status);
++	spin_unlock_irqrestore(&whc->lock, flags);
++}
++
++/**
++ * qset_add_urb - add an urb to the qset's queue.
++ *
++ * The URB is chopped into sTDs, one for each qTD that will required.
++ * At least one qTD (and sTD) is required even if the transfer has no
++ * data (e.g., for some control transfers).
++ */
++int qset_add_urb(struct whc *whc, struct whc_qset *qset, struct urb *urb,
++	gfp_t mem_flags)
++{
++	struct whc_urb *wurb;
++	int remaining = urb->transfer_buffer_length;
++	u64 transfer_dma = urb->transfer_dma;
++	int ntds_remaining;
++
++	ntds_remaining = DIV_ROUND_UP(remaining, QTD_MAX_XFER_SIZE);
++	if (ntds_remaining == 0)
++		ntds_remaining = 1;
++
++	wurb = kzalloc(sizeof(struct whc_urb), mem_flags);
++	if (wurb == NULL)
++		goto err_no_mem;
++	urb->hcpriv = wurb;
++	wurb->qset = qset;
++	wurb->urb = urb;
++	INIT_WORK(&wurb->dequeue_work, urb_dequeue_work);
++
++	while (ntds_remaining) {
++		struct whc_std *std;
++		size_t std_len;
++
++		std = kmalloc(sizeof(struct whc_std), mem_flags);
++		if (std == NULL)
++			goto err_no_mem;
++
++		std_len = remaining;
++		if (std_len > QTD_MAX_XFER_SIZE)
++			std_len = QTD_MAX_XFER_SIZE;
++
++		std->urb = urb;
++		std->dma_addr = transfer_dma;
++		std->len = std_len;
++		std->ntds_remaining = ntds_remaining;
++		std->qtd = NULL;
++
++		INIT_LIST_HEAD(&std->list_node);
++		list_add_tail(&std->list_node, &qset->stds);
++
++		if (std_len > WHCI_PAGE_SIZE) {
++			if (qset_fill_page_list(whc, std, mem_flags) < 0)
++				goto err_no_mem;
++		} else
++			std->num_pointers = 0;
++
++		ntds_remaining--;
++		remaining -= std_len;
++		transfer_dma += std_len;
++	}
++
++	return 0;
++
++err_no_mem:
++	qset_free_stds(qset, urb);
++	return -ENOMEM;
++}
++
++/**
++ * qset_remove_urb - remove an URB from the urb queue.
++ *
++ * The URB is returned to the USB subsystem.
++ */
++void qset_remove_urb(struct whc *whc, struct whc_qset *qset,
++			    struct urb *urb, int status)
++{
++	struct wusbhc *wusbhc = &whc->wusbhc;
++
++	usb_hcd_unlink_urb_from_ep(&wusbhc->usb_hcd, urb);
++	/* Drop the lock as urb->complete() may enqueue another urb. */
++	spin_unlock(&whc->lock);
++	wusbhc_giveback_urb(wusbhc, urb, status);
++	spin_lock(&whc->lock);
++
++	kfree(urb->hcpriv);
++}
++
++/**
++ * get_urb_status_from_qtd - get the completed urb status from qTD status
++ * @urb:    completed urb
++ * @status: qTD status
++ */
++static int get_urb_status_from_qtd(struct urb *urb, u32 status)
++{
++	if (status & QTD_STS_HALTED) {
++		if (status & QTD_STS_DBE)
++			return usb_pipein(urb->pipe) ? -ENOSR : -ECOMM;
++		else if (status & QTD_STS_BABBLE)
++			return -EOVERFLOW;
++		else if (status & QTD_STS_RCE)
++			return -ETIME;
++		return -EPIPE;
++	}
++	if (usb_pipein(urb->pipe)
++	    && (urb->transfer_flags & URB_SHORT_NOT_OK)
++	    && urb->actual_length < urb->transfer_buffer_length)
++		return -EREMOTEIO;
++	return 0;
++}
++
++/**
++ * process_inactive_qtd - process an inactive (but not halted) qTD.
++ *
++ * Update the urb with the transfer bytes from the qTD, if the urb is
++ * completely transfered or (in the case of an IN only) the LPF is
++ * set, then the transfer is complete and the urb should be returned
++ * to the system.
++ */
++void process_inactive_qtd(struct whc *whc, struct whc_qset *qset,
++				 struct whc_qtd *qtd)
++{
++	struct whc_std *std = list_first_entry(&qset->stds, struct whc_std, list_node);
++	struct urb *urb = std->urb;
++	uint32_t status;
++	bool complete;
++
++	status = le32_to_cpu(qtd->status);
++
++	urb->actual_length += std->len - QTD_STS_TO_LEN(status);
++
++	if (usb_pipein(urb->pipe) && (status & QTD_STS_LAST_PKT))
++		complete = true;
++	else
++		complete = whc_std_last(std);
++
++	qset_remove_qtd(whc, qset);
++	qset_free_std(whc, std);
++
++	/*
++	 * Transfers for this URB are complete?  Then return it to the
++	 * USB subsystem.
++	 */
++	if (complete) {
++		qset_remove_qtds(whc, qset, urb);
++		qset_remove_urb(whc, qset, urb, get_urb_status_from_qtd(urb, status));
++
++		/*
++		 * If iAlt isn't valid then the hardware didn't
++		 * advance iCur. Adjust the start and end pointers to
++		 * match iCur.
++		 */
++		if (!(status & QTD_STS_IALT_VALID))
++			qset->td_start = qset->td_end
++				= QH_STATUS_TO_ICUR(le16_to_cpu(qset->qh.status));
++		qset->pause_after_urb = NULL;
++	}
++}
++
++/**
++ * process_halted_qtd - process a qset with a halted qtd
++ *
++ * Remove all the qTDs for the failed URB and return the failed URB to
++ * the USB subsystem.  Then remove all other qTDs so the qset can be
++ * removed.
++ *
++ * FIXME: this is the point where rate adaptation can be done.  If a
++ * transfer failed because it exceeded the maximum number of retries
++ * then it could be reactivated with a slower rate without having to
++ * remove the qset.
++ */
++void process_halted_qtd(struct whc *whc, struct whc_qset *qset,
++			       struct whc_qtd *qtd)
++{
++	struct whc_std *std = list_first_entry(&qset->stds, struct whc_std, list_node);
++	struct urb *urb = std->urb;
++	int urb_status;
++
++	urb_status = get_urb_status_from_qtd(urb, le32_to_cpu(qtd->status));
++
++	qset_remove_qtds(whc, qset, urb);
++	qset_remove_urb(whc, qset, urb, urb_status);
++
++	list_for_each_entry(std, &qset->stds, list_node) {
++		if (qset->ntds == 0)
++			break;
++		qset_remove_qtd(whc, qset);
++		std->qtd = NULL;
++	}
++
++	qset->remove = 1;
++}
++
++void qset_free(struct whc *whc, struct whc_qset *qset)
++{
++	dma_pool_free(whc->qset_pool, qset, qset->qset_dma);
++}
++
++/**
++ * qset_delete - wait for a qset to be unused, then free it.
++ */
++void qset_delete(struct whc *whc, struct whc_qset *qset)
++{
++	wait_for_completion(&qset->remove_complete);
++	qset_free(whc, qset);
++}
+--- /dev/null
++++ b/drivers/usb/host/whci/whcd.h
+@@ -0,0 +1,195 @@
++/*
++ * Wireless Host Controller (WHC) private header.
++ *
++ * Copyright (C) 2007 Cambridge Silicon Radio Ltd.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ */
++#ifndef __WHCD_H
++#define __WHCD_H
++
++#include <linux/uwb/whci.h>
++#include <linux/workqueue.h>
++
++#include "whci-hc.h"
++
++/* Generic command timeout. */
++#define WHC_GENCMD_TIMEOUT_MS 100
++
++
++struct whc {
++	struct wusbhc wusbhc;
++	struct umc_dev *umc;
++
++	resource_size_t base_phys;
++	void __iomem *base;
++	int irq;
++
++	u8 n_devices;
++	u8 n_keys;
++	u8 n_mmc_ies;
++
++	u64 *pz_list;
++	struct dn_buf_entry *dn_buf;
++	struct di_buf_entry *di_buf;
++	dma_addr_t pz_list_dma;
++	dma_addr_t dn_buf_dma;
++	dma_addr_t di_buf_dma;
++
++	spinlock_t   lock;
++	struct mutex mutex;
++
++	wait_queue_head_t cmd_wq;
++
++	struct workqueue_struct *workqueue;
++	struct work_struct       dn_work;
++
++	struct dma_pool *qset_pool;
++
++	struct list_head async_list;
++	struct list_head async_removed_list;
++	wait_queue_head_t async_list_wq;
++	struct work_struct async_work;
++
++	struct list_head periodic_list[5];
++	struct list_head periodic_removed_list;
++	wait_queue_head_t periodic_list_wq;
++	struct work_struct periodic_work;
++};
++
++#define wusbhc_to_whc(w) (container_of((w), struct whc, wusbhc))
++
++/**
++ * struct whc_std - a software TD.
++ * @urb: the URB this sTD is for.
++ * @offset: start of the URB's data for this TD.
++ * @len: the length of data in the associated TD.
++ * @ntds_remaining: number of TDs (starting from this one) in this transfer.
++ *
++ * Queued URBs may require more TDs than are available in a qset so we
++ * use a list of these "software TDs" (sTDs) to hold per-TD data.
++ */
++struct whc_std {
++	struct urb *urb;
++	size_t len;
++	int    ntds_remaining;
++	struct whc_qtd *qtd;
++
++	struct list_head list_node;
++	int num_pointers;
++	dma_addr_t dma_addr;
++	struct whc_page_list_entry *pl_virt;
++};
++
++/**
++ * struct whc_urb - per URB host controller structure.
++ * @urb: the URB this struct is for.
++ * @qset: the qset associated to the URB.
++ * @dequeue_work: the work to remove the URB when dequeued.
++ * @is_async: the URB belongs to async sheduler or not.
++ * @status: the status to be returned when calling wusbhc_giveback_urb.
++ */
++struct whc_urb {
++	struct urb *urb;
++	struct whc_qset *qset;
++	struct work_struct dequeue_work;
++	bool is_async;
++	int status;
++};
++
++/**
++ * whc_std_last - is this sTD the URB's last?
++ * @std: the sTD to check.
++ */
++static inline bool whc_std_last(struct whc_std *std)
++{
++	return std->ntds_remaining <= 1;
++}
++
++enum whc_update {
++	WHC_UPDATE_ADDED   = 0x01,
++	WHC_UPDATE_REMOVED = 0x02,
++	WHC_UPDATE_UPDATED = 0x04,
++};
++
++/* init.c */
++int whc_init(struct whc *whc);
++void whc_clean_up(struct whc *whc);
++
++/* hw.c */
++void whc_write_wusbcmd(struct whc *whc, u32 mask, u32 val);
++int whc_do_gencmd(struct whc *whc, u32 cmd, u32 params, void *addr, size_t len);
++
++/* wusb.c */
++int whc_wusbhc_start(struct wusbhc *wusbhc);
++void whc_wusbhc_stop(struct wusbhc *wusbhc);
++int whc_mmcie_add(struct wusbhc *wusbhc, u8 interval, u8 repeat_cnt,
++		  u8 handle, struct wuie_hdr *wuie);
++int whc_mmcie_rm(struct wusbhc *wusbhc, u8 handle);
++int whc_bwa_set(struct wusbhc *wusbhc, s8 stream_index, const struct uwb_mas_bm *mas_bm);
++int whc_dev_info_set(struct wusbhc *wusbhc, struct wusb_dev *wusb_dev);
++int whc_set_num_dnts(struct wusbhc *wusbhc, u8 interval, u8 slots);
++int whc_set_ptk(struct wusbhc *wusbhc, u8 port_idx, u32 tkid,
++		const void *ptk, size_t key_size);
++int whc_set_gtk(struct wusbhc *wusbhc, u32 tkid,
++		const void *gtk, size_t key_size);
++int whc_set_cluster_id(struct whc *whc, u8 bcid);
++
++/* int.c */
++irqreturn_t whc_int_handler(struct usb_hcd *hcd);
++void whc_dn_work(struct work_struct *work);
++
++/* asl.c */
++void asl_start(struct whc *whc);
++void asl_stop(struct whc *whc);
++int  asl_init(struct whc *whc);
++void asl_clean_up(struct whc *whc);
++int  asl_urb_enqueue(struct whc *whc, struct urb *urb, gfp_t mem_flags);
++int  asl_urb_dequeue(struct whc *whc, struct urb *urb, int status);
++void asl_qset_delete(struct whc *whc, struct whc_qset *qset);
++void scan_async_work(struct work_struct *work);
++
++/* pzl.c */
++int  pzl_init(struct whc *whc);
++void pzl_clean_up(struct whc *whc);
++void pzl_start(struct whc *whc);
++void pzl_stop(struct whc *whc);
++int  pzl_urb_enqueue(struct whc *whc, struct urb *urb, gfp_t mem_flags);
++int  pzl_urb_dequeue(struct whc *whc, struct urb *urb, int status);
++void pzl_qset_delete(struct whc *whc, struct whc_qset *qset);
++void scan_periodic_work(struct work_struct *work);
++
++/* qset.c */
++struct whc_qset *qset_alloc(struct whc *whc, gfp_t mem_flags);
++void qset_free(struct whc *whc, struct whc_qset *qset);
++struct whc_qset *get_qset(struct whc *whc, struct urb *urb, gfp_t mem_flags);
++void qset_delete(struct whc *whc, struct whc_qset *qset);
++void qset_clear(struct whc *whc, struct whc_qset *qset);
++int qset_add_urb(struct whc *whc, struct whc_qset *qset, struct urb *urb,
++		 gfp_t mem_flags);
++void qset_free_std(struct whc *whc, struct whc_std *std);
++void qset_remove_urb(struct whc *whc, struct whc_qset *qset,
++			    struct urb *urb, int status);
++void process_halted_qtd(struct whc *whc, struct whc_qset *qset,
++			       struct whc_qtd *qtd);
++void process_inactive_qtd(struct whc *whc, struct whc_qset *qset,
++				 struct whc_qtd *qtd);
++enum whc_update qset_add_qtds(struct whc *whc, struct whc_qset *qset);
++void qset_remove_complete(struct whc *whc, struct whc_qset *qset);
++void dump_qset(struct whc_qset *qset, struct device *dev);
++void pzl_update(struct whc *whc, uint32_t wusbcmd);
++void asl_update(struct whc *whc, uint32_t wusbcmd);
++
++#endif /* #ifndef __WHCD_H */
+--- /dev/null
++++ b/drivers/usb/host/whci/whci-hc.h
+@@ -0,0 +1,413 @@
++/*
++ * Wireless Host Controller (WHC) data structures.
++ *
++ * Copyright (C) 2007 Cambridge Silicon Radio Ltd.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ */
++#ifndef _WHCI_WHCI_HC_H
++#define _WHCI_WHCI_HC_H
++
++#include <linux/list.h>
++
++/**
++ * WHCI_PAGE_SIZE - page size use by WHCI
++ *
++ * WHCI assumes that host system uses pages of 4096 octets.
++ */
++#define WHCI_PAGE_SIZE 4096
++
++
++/**
++ * QTD_MAX_TXFER_SIZE - max number of bytes to transfer with a single
++ * qtd.
++ *
++ * This is 2^20 - 1.
++ */
++#define QTD_MAX_XFER_SIZE 1048575
++
++
++/**
++ * struct whc_qtd - Queue Element Transfer Descriptors (qTD)
++ *
++ * This describes the data for a bulk, control or interrupt transfer.
++ *
++ * [WHCI] section 3.2.4
++ */
++struct whc_qtd {
++	__le32 status; /*< remaining transfer len and transfer status */
++	__le32 options;
++	__le64 page_list_ptr; /*< physical pointer to data buffer page list*/
++	__u8   setup[8];      /*< setup data for control transfers */
++} __attribute__((packed));
++
++#define QTD_STS_ACTIVE     (1 << 31)  /* enable execution of transaction */
++#define QTD_STS_HALTED     (1 << 30)  /* transfer halted */
++#define QTD_STS_DBE        (1 << 29)  /* data buffer error */
++#define QTD_STS_BABBLE     (1 << 28)  /* babble detected */
++#define QTD_STS_RCE        (1 << 27)  /* retry count exceeded */
++#define QTD_STS_LAST_PKT   (1 << 26)  /* set Last Packet Flag in WUSB header */
++#define QTD_STS_INACTIVE   (1 << 25)  /* queue set is marked inactive */
++#define QTD_STS_IALT_VALID (1 << 23)                          /* iAlt field is valid */
++#define QTD_STS_IALT(i)    (QTD_STS_IALT_VALID | ((i) << 20)) /* iAlt field */
++#define QTD_STS_LEN(l)     ((l) << 0) /* transfer length */
++#define QTD_STS_TO_LEN(s)  ((s) & 0x000fffff)
++
++#define QTD_OPT_IOC      (1 << 1) /* page_list_ptr points to buffer directly */
++#define QTD_OPT_SMALL    (1 << 0) /* interrupt on complete */
++
++/**
++ * struct whc_itd - Isochronous Queue Element Transfer Descriptors (iTD)
++ *
++ * This describes the data and other parameters for an isochronous
++ * transfer.
++ *
++ * [WHCI] section 3.2.5
++ */
++struct whc_itd {
++	__le16 presentation_time;    /*< presentation time for OUT transfers */
++	__u8   num_segments;         /*< number of data segments in segment list */
++	__u8   status;               /*< command execution status */
++	__le32 options;              /*< misc transfer options */
++	__le64 page_list_ptr;        /*< physical pointer to data buffer page list */
++	__le64 seg_list_ptr;         /*< physical pointer to segment list */
++} __attribute__((packed));
++
++#define ITD_STS_ACTIVE   (1 << 7) /* enable execution of transaction */
++#define ITD_STS_DBE      (1 << 5) /* data buffer error */
++#define ITD_STS_BABBLE   (1 << 4) /* babble detected */
++#define ITD_STS_INACTIVE (1 << 1) /* queue set is marked inactive */
++
++#define ITD_OPT_IOC      (1 << 1) /* interrupt on complete */
++#define ITD_OPT_SMALL    (1 << 0) /* page_list_ptr points to buffer directly */
++
++/**
++ * Page list entry.
++ *
++ * A TD's page list must contain sufficient page list entries for the
++ * total data length in the TD.
++ *
++ * [WHCI] section 3.2.4.3
++ */
++struct whc_page_list_entry {
++	__le64 buf_ptr; /*< physical pointer to buffer */
++} __attribute__((packed));
++
++/**
++ * struct whc_seg_list_entry - Segment list entry.
++ *
++ * Describes a portion of the data buffer described in the containing
++ * qTD's page list.
++ *
++ * seg_ptr = qtd->page_list_ptr[qtd->seg_list_ptr[seg].idx].buf_ptr
++ *           + qtd->seg_list_ptr[seg].offset;
++ *
++ * Segments can't cross page boundries.
++ *
++ * [WHCI] section 3.2.5.5
++ */
++struct whc_seg_list_entry {
++	__le16 len;    /*< segment length */
++	__u8   idx;    /*< index into page list */
++	__u8   status; /*< segment status */
++	__le16 offset; /*< 12 bit offset into page */
++} __attribute__((packed));
++
++/**
++ * struct whc_qhead - endpoint and status information for a qset.
++ *
++ * [WHCI] section 3.2.6
++ */
++struct whc_qhead {
++	__le64 link; /*< next qset in list */
++	__le32 info1;
++	__le32 info2;
++	__le32 info3;
++	__le16 status;
++	__le16 err_count;  /*< transaction error count */
++	__le32 cur_window;
++	__le32 scratch[3]; /*< h/w scratch area */
++	union {
++		struct whc_qtd qtd;
++		struct whc_itd itd;
++	} overlay;
++} __attribute__((packed));
++
++#define QH_LINK_PTR_MASK (~0x03Full)
++#define QH_LINK_PTR(ptr) ((ptr) & QH_LINK_PTR_MASK)
++#define QH_LINK_IQS      (1 << 4) /* isochronous queue set */
++#define QH_LINK_NTDS(n)  (((n) - 1) << 1) /* number of TDs in queue set */
++#define QH_LINK_T        (1 << 0) /* last queue set in periodic schedule list */
++
++#define QH_INFO1_EP(e)           ((e) << 0)  /* endpoint number */
++#define QH_INFO1_DIR_IN          (1 << 4)    /* IN transfer */
++#define QH_INFO1_DIR_OUT         (0 << 4)    /* OUT transfer */
++#define QH_INFO1_TR_TYPE_CTRL    (0x0 << 5)  /* control transfer */
++#define QH_INFO1_TR_TYPE_ISOC    (0x1 << 5)  /* isochronous transfer */
++#define QH_INFO1_TR_TYPE_BULK    (0x2 << 5)  /* bulk transfer */
++#define QH_INFO1_TR_TYPE_INT     (0x3 << 5)  /* interrupt */
++#define QH_INFO1_TR_TYPE_LP_INT  (0x7 << 5)  /* low power interrupt */
++#define QH_INFO1_DEV_INFO_IDX(i) ((i) << 8)  /* index into device info buffer */
++#define QH_INFO1_SET_INACTIVE    (1 << 15)   /* set inactive after transfer */
++#define QH_INFO1_MAX_PKT_LEN(l)  ((l) << 16) /* maximum packet length */
++
++#define QH_INFO2_BURST(b)        ((b) << 0)  /* maximum burst length */
++#define QH_INFO2_DBP(p)          ((p) << 5)  /* data burst policy (see [WUSB] table 5-7) */
++#define QH_INFO2_MAX_COUNT(c)    ((c) << 8)  /* max isoc/int pkts per zone */
++#define QH_INFO2_RQS             (1 << 15)   /* reactivate queue set */
++#define QH_INFO2_MAX_RETRY(r)    ((r) << 16) /* maximum transaction retries */
++#define QH_INFO2_MAX_SEQ(s)      ((s) << 20) /* maximum sequence number */
++#define QH_INFO3_MAX_DELAY(d)    ((d) << 0)  /* maximum stream delay in 125 us units (isoc only) */
++#define QH_INFO3_INTERVAL(i)     ((i) << 16) /* segment interval in 125 us units (isoc only) */
++
++#define QH_INFO3_TX_RATE_53_3    (0 << 24)
++#define QH_INFO3_TX_RATE_80      (1 << 24)
++#define QH_INFO3_TX_RATE_106_7   (2 << 24)
++#define QH_INFO3_TX_RATE_160     (3 << 24)
++#define QH_INFO3_TX_RATE_200     (4 << 24)
++#define QH_INFO3_TX_RATE_320     (5 << 24)
++#define QH_INFO3_TX_RATE_400     (6 << 24)
++#define QH_INFO3_TX_RATE_480     (7 << 24)
++#define QH_INFO3_TX_PWR(p)       ((p) << 29) /* transmit power (see [WUSB] section 5.2.1.2) */
++
++#define QH_STATUS_FLOW_CTRL      (1 << 15)
++#define QH_STATUS_ICUR(i)        ((i) << 5)
++#define QH_STATUS_TO_ICUR(s)     (((s) >> 5) & 0x7)
++
++/**
++ * usb_pipe_to_qh_type - USB core pipe type to QH transfer type
++ *
++ * Returns the QH type field for a USB core pipe type.
++ */
++static inline unsigned usb_pipe_to_qh_type(unsigned pipe)
++{
++	static const unsigned type[] = {
++		[PIPE_ISOCHRONOUS] = QH_INFO1_TR_TYPE_ISOC,
++		[PIPE_INTERRUPT]   = QH_INFO1_TR_TYPE_INT,
++		[PIPE_CONTROL]     = QH_INFO1_TR_TYPE_CTRL,
++		[PIPE_BULK]        = QH_INFO1_TR_TYPE_BULK,
++	};
++	return type[usb_pipetype(pipe)];
++}
++
++/**
++ * Maxiumum number of TDs in a qset.
++ */
++#define WHCI_QSET_TD_MAX 8
++
++/**
++ * struct whc_qset - WUSB data transfers to a specific endpoint
++ * @qh: the QHead of this qset
++ * @qtd: up to 8 qTDs (for qsets for control, bulk and interrupt
++ * transfers)
++ * @itd: up to 8 iTDs (for qsets for isochronous transfers)
++ * @qset_dma: DMA address for this qset
++ * @whc: WHCI HC this qset is for
++ * @ep: endpoint
++ * @stds: list of sTDs queued to this qset
++ * @ntds: number of qTDs queued (not necessarily the same as nTDs
++ * field in the QH)
++ * @td_start: index of the first qTD in the list
++ * @td_end: index of next free qTD in the list (provided
++ *          ntds < WHCI_QSET_TD_MAX)
++ *
++ * Queue Sets (qsets) are added to the asynchronous schedule list
++ * (ASL) or the periodic zone list (PZL).
++ *
++ * qsets may contain up to 8 TDs (either qTDs or iTDs as appropriate).
++ * Each TD may refer to at most 1 MiB of data. If a single transfer
++ * has > 8MiB of data, TDs can be reused as they are completed since
++ * the TD list is used as a circular buffer.  Similarly, several
++ * (smaller) transfers may be queued in a qset.
++ *
++ * WHCI controllers may cache portions of the qsets in the ASL and
++ * PZL, requiring the WHCD to inform the WHC that the lists have been
++ * updated (fields changed or qsets inserted or removed).  For safe
++ * insertion and removal of qsets from the lists the schedule must be
++ * stopped to avoid races in updating the QH link pointers.
++ *
++ * Since the HC is free to execute qsets in any order, all transfers
++ * to an endpoint should use the same qset to ensure transfers are
++ * executed in the order they're submitted.
++ *
++ * [WHCI] section 3.2.3
++ */
++struct whc_qset {
++	struct whc_qhead qh;
++	union {
++		struct whc_qtd qtd[WHCI_QSET_TD_MAX];
++		struct whc_itd itd[WHCI_QSET_TD_MAX];
++	};
++
++	/* private data for WHCD */
++	dma_addr_t qset_dma;
++	struct whc *whc;
++	struct usb_host_endpoint *ep;
++	struct list_head stds;
++	int ntds;
++	int td_start;
++	int td_end;
++	struct list_head list_node;
++	unsigned in_sw_list:1;
++	unsigned in_hw_list:1;
++	unsigned remove:1;
++	struct urb *pause_after_urb;
++	struct completion remove_complete;
++	int max_burst;
++	int max_seq;
++};
++
++static inline void whc_qset_set_link_ptr(u64 *ptr, u64 target)
++{
++	if (target)
++		*ptr = (*ptr & ~(QH_LINK_PTR_MASK | QH_LINK_T)) | QH_LINK_PTR(target);
++	else
++		*ptr = QH_LINK_T;
++}
++
++/**
++ * struct di_buf_entry - Device Information (DI) buffer entry.
++ *
++ * There's one of these per connected device.
++ */
++struct di_buf_entry {
++	__le32 availability_info[8]; /*< MAS availability information, one MAS per bit */
++	__le32 addr_sec_info;        /*< addressing and security info */
++	__le32 reserved[7];
++} __attribute__((packed));
++
++#define WHC_DI_SECURE           (1 << 31)
++#define WHC_DI_DISABLE          (1 << 30)
++#define WHC_DI_KEY_IDX(k)       ((k) << 8)
++#define WHC_DI_KEY_IDX_MASK     0x0000ff00
++#define WHC_DI_DEV_ADDR(a)      ((a) << 0)
++#define WHC_DI_DEV_ADDR_MASK    0x000000ff
++
++/**
++ * struct dn_buf_entry - Device Notification (DN) buffer entry.
++ *
++ * [WHCI] section 3.2.8
++ */
++struct dn_buf_entry {
++	__u8   msg_size;    /*< number of octets of valid DN data */
++	__u8   reserved1;
++	__u8   src_addr;    /*< source address */
++	__u8   status;      /*< buffer entry status */
++	__le32 tkid;        /*< TKID for source device, valid if secure bit is set */
++	__u8   dn_data[56]; /*< up to 56 octets of DN data */
++} __attribute__((packed));
++
++#define WHC_DN_STATUS_VALID  (1 << 7) /* buffer entry is valid */
++#define WHC_DN_STATUS_SECURE (1 << 6) /* notification received using secure frame */
++
++#define WHC_N_DN_ENTRIES (4096 / sizeof(struct dn_buf_entry))
++
++
++/*
++ * HC registers.
++ *
++ * [WHCI] section 2.4
++ */
++
++#define WHCIVERSION          0x00
++
++#define WHCSPARAMS           0x04
++#  define WHCSPARAMS_TO_N_MMC_IES(p) (((p) >> 16) & 0xff)
++#  define WHCSPARAMS_TO_N_KEYS(p)    (((p) >> 8) & 0xff)
++#  define WHCSPARAMS_TO_N_DEVICES(p) (((p) >> 0) & 0x7f)
++
++#define WUSBCMD              0x08
++#  define WUSBCMD_BCID(b)            ((b) << 16)
++#  define WUSBCMD_BCID_MASK          (0xff << 16)
++#  define WUSBCMD_ASYNC_QSET_RM      (1 << 12)
++#  define WUSBCMD_PERIODIC_QSET_RM   (1 << 11)
++#  define WUSBCMD_WUSBSI(s)          ((s) << 8)
++#  define WUSBCMD_WUSBSI_MASK        (0x7 << 8)
++#  define WUSBCMD_ASYNC_SYNCED_DB    (1 << 7)
++#  define WUSBCMD_PERIODIC_SYNCED_DB (1 << 6)
++#  define WUSBCMD_ASYNC_UPDATED      (1 << 5)
++#  define WUSBCMD_PERIODIC_UPDATED   (1 << 4)
++#  define WUSBCMD_ASYNC_EN           (1 << 3)
++#  define WUSBCMD_PERIODIC_EN        (1 << 2)
++#  define WUSBCMD_WHCRESET           (1 << 1)
++#  define WUSBCMD_RUN                (1 << 0)
++
++#define WUSBSTS              0x0c
++#  define WUSBSTS_ASYNC_SCHED             (1 << 15)
++#  define WUSBSTS_PERIODIC_SCHED          (1 << 14)
++#  define WUSBSTS_DNTS_SCHED              (1 << 13)
++#  define WUSBSTS_HCHALTED                (1 << 12)
++#  define WUSBSTS_GEN_CMD_DONE            (1 << 9)
++#  define WUSBSTS_CHAN_TIME_ROLLOVER      (1 << 8)
++#  define WUSBSTS_DNTS_OVERFLOW           (1 << 7)
++#  define WUSBSTS_BPST_ADJUSTMENT_CHANGED (1 << 6)
++#  define WUSBSTS_HOST_ERR                (1 << 5)
++#  define WUSBSTS_ASYNC_SCHED_SYNCED      (1 << 4)
++#  define WUSBSTS_PERIODIC_SCHED_SYNCED   (1 << 3)
++#  define WUSBSTS_DNTS_INT                (1 << 2)
++#  define WUSBSTS_ERR_INT                 (1 << 1)
++#  define WUSBSTS_INT                     (1 << 0)
++#  define WUSBSTS_INT_MASK                0x3ff
++
++#define WUSBINTR             0x10
++#  define WUSBINTR_GEN_CMD_DONE             (1 << 9)
++#  define WUSBINTR_CHAN_TIME_ROLLOVER       (1 << 8)
++#  define WUSBINTR_DNTS_OVERFLOW            (1 << 7)
++#  define WUSBINTR_BPST_ADJUSTMENT_CHANGED  (1 << 6)
++#  define WUSBINTR_HOST_ERR                 (1 << 5)
++#  define WUSBINTR_ASYNC_SCHED_SYNCED       (1 << 4)
++#  define WUSBINTR_PERIODIC_SCHED_SYNCED    (1 << 3)
++#  define WUSBINTR_DNTS_INT                 (1 << 2)
++#  define WUSBINTR_ERR_INT                  (1 << 1)
++#  define WUSBINTR_INT                      (1 << 0)
++#  define WUSBINTR_ALL 0x3ff
++
++#define WUSBGENCMDSTS        0x14
++#  define WUSBGENCMDSTS_ACTIVE (1 << 31)
++#  define WUSBGENCMDSTS_ERROR  (1 << 24)
++#  define WUSBGENCMDSTS_IOC    (1 << 23)
++#  define WUSBGENCMDSTS_MMCIE_ADD 0x01
++#  define WUSBGENCMDSTS_MMCIE_RM  0x02
++#  define WUSBGENCMDSTS_SET_MAS   0x03
++#  define WUSBGENCMDSTS_CHAN_STOP 0x04
++#  define WUSBGENCMDSTS_RWP_EN    0x05
++
++#define WUSBGENCMDPARAMS     0x18
++#define WUSBGENADDR          0x20
++#define WUSBASYNCLISTADDR    0x28
++#define WUSBDNTSBUFADDR      0x30
++#define WUSBDEVICEINFOADDR   0x38
++
++#define WUSBSETSECKEYCMD     0x40
++#  define WUSBSETSECKEYCMD_SET    (1 << 31)
++#  define WUSBSETSECKEYCMD_ERASE  (1 << 30)
++#  define WUSBSETSECKEYCMD_GTK    (1 << 8)
++#  define WUSBSETSECKEYCMD_IDX(i) ((i) << 0)
++
++#define WUSBTKID             0x44
++#define WUSBSECKEY           0x48
++#define WUSBPERIODICLISTBASE 0x58
++#define WUSBMASINDEX         0x60
++
++#define WUSBDNTSCTRL         0x64
++#  define WUSBDNTSCTRL_ACTIVE      (1 << 31)
++#  define WUSBDNTSCTRL_INTERVAL(i) ((i) << 8)
++#  define WUSBDNTSCTRL_SLOTS(s)    ((s) << 0)
++
++#define WUSBTIME             0x68
++#define WUSBBPST             0x6c
++#define WUSBDIBUPDATED       0x70
++
++#endif /* #ifndef _WHCI_WHCI_HC_H */
+--- /dev/null
++++ b/drivers/usb/host/whci/wusb.c
+@@ -0,0 +1,241 @@
++/*
++ * Wireless Host Controller (WHC) WUSB operations.
++ *
++ * Copyright (C) 2007 Cambridge Silicon Radio Ltd.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++#include <linux/version.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/uwb/umc.h>
++#define D_LOCAL 1
++#include <linux/uwb/debug.h>
++
++#include "../../wusbcore/wusbhc.h"
++
++#include "whcd.h"
++
++#if D_LOCAL >= 1
++static void dump_di(struct whc *whc, int idx)
++{
++	struct di_buf_entry *di = &whc->di_buf[idx];
++	struct device *dev = &whc->umc->dev;
++	char buf[128];
++
++	bitmap_scnprintf(buf, sizeof(buf), (unsigned long *)di->availability_info, UWB_NUM_MAS);
++
++	d_printf(1, dev, "DI[%d]\n", idx);
++	d_printf(1, dev, "  availability: %s\n", buf);
++	d_printf(1, dev, "  %c%c key idx: %d dev addr: %d\n",
++		 (di->addr_sec_info & WHC_DI_SECURE) ? 'S' : ' ',
++		 (di->addr_sec_info & WHC_DI_DISABLE) ? 'D' : ' ',
++		 (di->addr_sec_info & WHC_DI_KEY_IDX_MASK) >> 8,
++		 (di->addr_sec_info & WHC_DI_DEV_ADDR_MASK));
++}
++#else
++static inline void dump_di(struct whc *whc, int idx)
++{
++}
++#endif
++
++static int whc_update_di(struct whc *whc, int idx)
++{
++	int offset = idx / 32;
++	u32 bit = 1 << (idx % 32);
++
++	dump_di(whc, idx);
++
++	le_writel(bit, whc->base + WUSBDIBUPDATED + offset);
++
++	return whci_wait_for(&whc->umc->dev,
++			     whc->base + WUSBDIBUPDATED + offset, bit, 0,
++			     100, "DI update");
++}
++
++/*
++ * WHCI starts and stops MMCs based on there being a valid GTK so
++ * these need only start/stop the asynchronous and periodic schedules.
++ */
++
++int whc_wusbhc_start(struct wusbhc *wusbhc)
++{
++	struct whc *whc = wusbhc_to_whc(wusbhc);
++
++	asl_start(whc);
++	pzl_start(whc);
++
++	return 0;
++}
++
++void whc_wusbhc_stop(struct wusbhc *wusbhc)
++{
++	struct whc *whc = wusbhc_to_whc(wusbhc);
++
++	pzl_stop(whc);
++	asl_stop(whc);
++}
++
++int whc_mmcie_add(struct wusbhc *wusbhc, u8 interval, u8 repeat_cnt,
++		  u8 handle, struct wuie_hdr *wuie)
++{
++	struct whc *whc = wusbhc_to_whc(wusbhc);
++	u32 params;
++
++	params = (interval << 24)
++		| (repeat_cnt << 16)
++		| (wuie->bLength << 8)
++		| handle;
++
++	return whc_do_gencmd(whc, WUSBGENCMDSTS_MMCIE_ADD, params, wuie, wuie->bLength);
++}
++
++int whc_mmcie_rm(struct wusbhc *wusbhc, u8 handle)
++{
++	struct whc *whc = wusbhc_to_whc(wusbhc);
++	u32 params;
++
++	params = handle;
++
++	return whc_do_gencmd(whc, WUSBGENCMDSTS_MMCIE_RM, params, NULL, 0);
++}
++
++int whc_bwa_set(struct wusbhc *wusbhc, s8 stream_index, const struct uwb_mas_bm *mas_bm)
++{
++	struct whc *whc = wusbhc_to_whc(wusbhc);
++
++	if (stream_index >= 0)
++		whc_write_wusbcmd(whc, WUSBCMD_WUSBSI_MASK, WUSBCMD_WUSBSI(stream_index));
++
++	return whc_do_gencmd(whc, WUSBGENCMDSTS_SET_MAS, 0, (void *)mas_bm, sizeof(*mas_bm));
++}
++
++int whc_dev_info_set(struct wusbhc *wusbhc, struct wusb_dev *wusb_dev)
++{
++	struct whc *whc = wusbhc_to_whc(wusbhc);
++	int idx = wusb_dev->port_idx;
++	struct di_buf_entry *di = &whc->di_buf[idx];
++	int ret;
++
++	mutex_lock(&whc->mutex);
++
++	uwb_mas_bm_copy_le(di->availability_info, &wusb_dev->availability);
++	di->addr_sec_info &= ~(WHC_DI_DISABLE | WHC_DI_DEV_ADDR_MASK);
++	di->addr_sec_info |= WHC_DI_DEV_ADDR(wusb_dev->addr);
++
++	ret = whc_update_di(whc, idx);
++
++	mutex_unlock(&whc->mutex);
++
++	return ret;
++}
++
++/*
++ * Set the number of Device Notification Time Slots (DNTS) and enable
++ * device notifications.
++ */
++int whc_set_num_dnts(struct wusbhc *wusbhc, u8 interval, u8 slots)
++{
++	struct whc *whc = wusbhc_to_whc(wusbhc);
++	u32 dntsctrl;
++
++	dntsctrl = WUSBDNTSCTRL_ACTIVE
++		| WUSBDNTSCTRL_INTERVAL(interval)
++		| WUSBDNTSCTRL_SLOTS(slots);
++
++	le_writel(dntsctrl, whc->base + WUSBDNTSCTRL);
++
++	return 0;
++}
++
++static int whc_set_key(struct whc *whc, u8 key_index, uint32_t tkid,
++		       const void *key, size_t key_size, bool is_gtk)
++{
++	uint32_t setkeycmd;
++	uint32_t seckey[4];
++	int i;
++	int ret;
++
++	memcpy(seckey, key, key_size);
++	setkeycmd = WUSBSETSECKEYCMD_SET | WUSBSETSECKEYCMD_IDX(key_index);
++	if (is_gtk)
++		setkeycmd |= WUSBSETSECKEYCMD_GTK;
++
++	le_writel(tkid, whc->base + WUSBTKID);
++	for (i = 0; i < 4; i++)
++		le_writel(seckey[i], whc->base + WUSBSECKEY + 4*i);
++	le_writel(setkeycmd, whc->base + WUSBSETSECKEYCMD);
++
++	ret = whci_wait_for(&whc->umc->dev, whc->base + WUSBSETSECKEYCMD,
++			    WUSBSETSECKEYCMD_SET, 0, 100, "set key");
++
++	return ret;
++}
++
++/**
++ * whc_set_ptk - set the PTK to use for a device.
++ *
++ * The index into the key table for this PTK is the same as the
++ * device's port index.
++ */
++int whc_set_ptk(struct wusbhc *wusbhc, u8 port_idx, u32 tkid,
++		const void *ptk, size_t key_size)
++{
++	struct whc *whc = wusbhc_to_whc(wusbhc);
++	struct di_buf_entry *di = &whc->di_buf[port_idx];
++	int ret;
++
++	mutex_lock(&whc->mutex);
++
++	if (ptk) {
++		ret = whc_set_key(whc, port_idx, tkid, ptk, key_size, false);
++		if (ret)
++			goto out;
++
++		di->addr_sec_info &= ~WHC_DI_KEY_IDX_MASK;
++		di->addr_sec_info |= WHC_DI_SECURE | WHC_DI_KEY_IDX(port_idx);
++	} else
++		di->addr_sec_info &= ~WHC_DI_SECURE;
++
++	ret = whc_update_di(whc, port_idx);
++out:
++	mutex_unlock(&whc->mutex);
++	return ret;
++}
++
++/**
++ * whc_set_gtk - set the GTK for subsequent broadcast packets
++ *
++ * The GTK is stored in the last entry in the key table (the previous
++ * N_DEVICES entries are for the per-device PTKs).
++ */
++int whc_set_gtk(struct wusbhc *wusbhc, u32 tkid,
++		const void *gtk, size_t key_size)
++{
++	struct whc *whc = wusbhc_to_whc(wusbhc);
++	int ret;
++
++	mutex_lock(&whc->mutex);
++
++	ret = whc_set_key(whc, whc->n_devices, tkid, gtk, key_size, true);
++
++	mutex_unlock(&whc->mutex);
++
++	return ret;
++}
++
++int whc_set_cluster_id(struct whc *whc, u8 bcid)
++{
++	whc_write_wusbcmd(whc, WUSBCMD_BCID_MASK, WUSBCMD_BCID(bcid));
++	return 0;
++}

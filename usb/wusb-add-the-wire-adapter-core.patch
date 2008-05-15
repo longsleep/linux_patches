@@ -1,0 +1,3140 @@
+From David Vrabel <david.vrabel@csr.com> Tue May 13 10:33:24 2008
+From: Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
+Date: Tue, 13 May 2008 10:32:56 +0100
+Subject: wusb: add the Wire Adapter (WA) core
+To: linux-uwb@bughost.org
+Cc: linux-usb@vger.kernel.org, David Vrabel <david.vrabel@csr.com>
+Message-ID: <20080513093324.075269819@csr.com>>
+Content-Disposition: inline; filename=wusb-add-the-wire-adapter-core.patch
+
+
+From: Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
+
+Common code for supporting Host Wire Adapters and Device Wire Adapters.
+
+Signed-off-by: David Vrabel <david.vrabel@csr.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+---
+ drivers/usb/wusbcore/Makefile   |    6 
+ drivers/usb/wusbcore/wa-hc.c    |   83 +
+ drivers/usb/wusbcore/wa-hc.h    |  416 +++++++++
+ drivers/usb/wusbcore/wa-nep.c   |  313 +++++++
+ drivers/usb/wusbcore/wa-rpipe.c |  562 +++++++++++++
+ drivers/usb/wusbcore/wa-xfer.c  | 1709 ++++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 3089 insertions(+)
+
+--- a/drivers/usb/wusbcore/Makefile
++++ b/drivers/usb/wusbcore/Makefile
+@@ -1,4 +1,5 @@
+ obj-$(CONFIG_USB_WUSB)		+= wusbcore.o wusb-cbaf.o
++obj-$(CONFIG_USB_HWA_HCD)	+= wusb-wa.o
+ 
+ wusbcore-objs := 	\
+ 	crypto.o	\
+@@ -12,3 +13,8 @@ wusbcore-objs := 	\
+ 	wusbhc.o
+ 
+ wusb-cbaf-objs := cbaf.o
++
++wusb-wa-objs :=	wa-hc.o		\
++		wa-nep.o	\
++		wa-rpipe.o	\
++		wa-xfer.o
+--- /dev/null
++++ b/drivers/usb/wusbcore/wa-hc.c
+@@ -0,0 +1,83 @@
++/*
++ * Wire Adapter Host Controller Driver
++ * Common items to HWA and DWA based HCDs
++ *
++ * Copyright (C) 2005-2006 Intel Corporation
++ * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ *
++ *
++ * FIXME: docs
++ */
++#include "wa-hc.h"
++
++/**
++ * Assumes
++ *
++ * wa->usb_dev and wa->usb_iface initialized and refcounted,
++ * wa->wa_descr initialized.
++ */
++int wa_create(struct wahc *wa, struct usb_interface *iface)
++{
++	int result;
++	struct device *dev = &iface->dev;
++
++	result = wa_rpipes_create(wa);
++	if (result < 0)
++		goto error_rpipes_create;
++	/* Fill up Data Transfer EP pointers */
++	wa->dti_epd = &iface->cur_altsetting->endpoint[1].desc;
++	wa->dto_epd = &iface->cur_altsetting->endpoint[2].desc;
++	wa->xfer_result_size = le16_to_cpu(wa->dti_epd->wMaxPacketSize);
++	wa->xfer_result = kmalloc(wa->xfer_result_size, GFP_KERNEL);
++	if (wa->xfer_result == NULL)
++		goto error_xfer_result_alloc;
++	result = wa_nep_create(wa, iface);
++	if (result < 0) {
++		dev_err(dev, "WA-CDS: can't initialize notif endpoint: %d\n",
++			result);
++		goto error_nep_create;
++	}
++	return 0;
++
++error_nep_create:
++	kfree(wa->xfer_result);
++error_xfer_result_alloc:
++	wa_rpipes_destroy(wa);
++error_rpipes_create:
++	return result;
++}
++EXPORT_SYMBOL_GPL(wa_create);
++
++
++void __wa_destroy(struct wahc *wa)
++{
++	if (wa->dti_urb) {
++		usb_kill_urb(wa->dti_urb);
++		usb_put_urb(wa->dti_urb);
++		usb_kill_urb(wa->buf_in_urb);
++		usb_put_urb(wa->buf_in_urb);
++	}
++	kfree(wa->xfer_result);
++	wa_nep_destroy(wa);
++	wa_rpipes_destroy(wa);
++}
++EXPORT_SYMBOL_GPL(__wa_destroy);
++
++
++MODULE_AUTHOR("Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>");
++MODULE_DESCRIPTION("Wireless USB Wire Adapter core");
++MODULE_LICENSE("GPL");
+--- /dev/null
++++ b/drivers/usb/wusbcore/wa-hc.h
+@@ -0,0 +1,416 @@
++/*
++ * HWA Host Controller Driver
++ * Wire Adapter Control/Data Streaming Iface (WUSB1.0[8])
++ *
++ * Copyright (C) 2005-2006 Intel Corporation
++ * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ *
++ *
++ * This driver implements a USB Host Controller (struct usb_hcd) for a
++ * Wireless USB Host Controller based on the Wireless USB 1.0
++ * Host-Wire-Adapter specification (in layman terms, a USB-dongle that
++ * implements a Wireless USB host).
++ *
++ * Check out the Design-overview.txt file in the source documentation
++ * for other details on the implementation.
++ *
++ * Main blocks:
++ *
++ *  driver     glue with the driver API, workqueue daemon
++ *
++ *  lc         RC instance life cycle management (create, destroy...)
++ *
++ *  hcd        glue with the USB API Host Controller Interface API.
++ *
++ *  nep        Notification EndPoint managent: collect notifications
++ *             and queue them with the workqueue daemon.
++ *
++ *             Handle notifications as coming from the NEP. Sends them
++ *             off others to their respective modules (eg: connect,
++ *             disconnect and reset go to devconnect).
++ *
++ *  rpipe      Remote Pipe management; rpipe is what we use to write
++ *             to an endpoint on a WUSB device that is connected to a
++ *             HWA RC.
++ *
++ *  xfer       Transfer managment -- this is all the code that gets a
++ *             buffer and pushes it to a device (or viceversa). *
++ *
++ * Some day a lot of this code will be shared between this driver and
++ * the drivers for DWA (xfer, rpipe).
++ *
++ * All starts at driver.c:hwahc_probe(), when one of this guys is
++ * connected. hwahc_disconnect() stops it.
++ *
++ * During operation, the main driver is devices connecting or
++ * disconnecting. They cause the HWA RC to send notifications into
++ * nep.c:hwahc_nep_cb() that will dispatch them to
++ * notif.c:wa_notif_dispatch(). From there they will fan to cause
++ * device connects, disconnects, etc.
++ *
++ * Note much of the activity is difficult to follow. For example a
++ * device connect goes to devconnect, which will cause the "fake" root
++ * hub port to show a connect and stop there. Then khubd will notice
++ * and call into the rh.c:hwahc_rc_port_reset() code to authenticate
++ * the device (and this might require user intervention) and enable
++ * the port.
++ *
++ * We also have a timer workqueue going from devconnect.c that
++ * schedules in hwahc_devconnect_create().
++ *
++ * The rest of the traffic is in the usual entry points of a USB HCD,
++ * which are hooked up in driver.c:hwahc_rc_driver, and defined in
++ * hcd.c.
++ */
++
++#ifndef __HWAHC_INTERNAL_H__
++#define __HWAHC_INTERNAL_H__
++
++#include <linux/completion.h>
++#include <linux/usb.h>
++#include <linux/mutex.h>
++#include <linux/spinlock.h>
++#include <linux/uwb.h>
++#include <linux/usb/wusb.h>
++#include <linux/usb/wusb-wa.h>
++
++struct wusbhc;
++struct wahc;
++extern void wa_urb_enqueue_run(struct work_struct *ws);
++
++/**
++ * RPipe instance
++ *
++ * @descr's fields are kept in LE, as we need to send it back and
++ * forth.
++ *
++ * @wa is referenced when set
++ *
++ * @segs_available is the number of requests segments that still can
++ *                 be submitted to the controller without overloading
++ *                 it. It is initialized to descr->wRequests when
++ *                 aiming.
++ *
++ * A rpipe supports a max of descr->wRequests at the same time; before
++ * submitting seg_lock has to be taken. If segs_avail > 0, then we can
++ * submit; if not, we have to queue them.
++ */
++struct wa_rpipe {
++	struct kref refcnt;
++	struct usb_rpipe_descriptor descr;
++	struct usb_host_endpoint *ep;
++	struct wahc *wa;
++	spinlock_t seg_lock;
++	struct list_head seg_list;
++	atomic_t segs_available;
++	u8 buffer[1];	/* For reads/writes on USB */
++};
++
++
++/**
++ * Instance of a HWA Host Controller
++ *
++ * Except where a more specific lock/mutex applies or atomic, all
++ * fields protected by @mutex.
++ *
++ * @wa_descr  Can be accessed without locking because it is in
++ *            the same area where the device descriptors were
++ *            read, so it is guaranteed to exist umodified while
++ *            the device exists.
++ *
++ *            Endianess has been converted to CPU's.
++ *
++ * @nep_* can be accessed without locking as its processing is
++ *        serialized; we submit a NEP URB and it comes to
++ *        hwahc_nep_cb(), which won't issue another URB until it is
++ *        done processing it.
++ *
++ * @xfer_list:
++ *
++ *   List of active transfers to verify existence from a xfer id
++ *   gotten from the xfer result message. Can't use urb->list because
++ *   it goes by endpoint, and we don't know the endpoint at the time
++ *   when we get the xfer result message. We can't really rely on the
++ *   pointer (will have to change for 64 bits) as the xfer id is 32 bits.
++ *
++ * @xfer_delayed_list:   List of transfers that need to be started
++ *                       (with a workqueue, because they were
++ *                       submitted from an atomic context).
++ *
++ * FIXME: this needs to be layered up: a wusbhc layer (for sharing
++ *        comonalities with WHCI), a wa layer (for sharing
++ *        comonalities with DWA-RC).
++ */
++struct wahc {
++	struct usb_device *usb_dev;
++	struct usb_interface *usb_iface;
++
++	/* HC to deliver notifications */
++	union {
++		struct wusbhc *wusb;
++		struct dwahc *dwa;
++	};
++
++	const struct usb_endpoint_descriptor *dto_epd, *dti_epd;
++	const struct usb_wa_descriptor *wa_descr;
++
++	struct urb *nep_urb;		/* Notification EndPoint [lockless] */
++	struct edc nep_edc;
++	void *nep_buffer;
++	size_t nep_buffer_size;
++
++	atomic_t notifs_queued;
++
++	u16 rpipes;
++	unsigned long *rpipe_bm;	/* rpipe usage bitmap */
++	spinlock_t rpipe_bm_lock;	/* protect rpipe_bm */
++	struct mutex rpipe_mutex;	/* assigning resources to endpoints */
++
++	struct urb *dti_urb;		/* URB for reading xfer results */
++	struct urb *buf_in_urb;		/* URB for reading data in */
++	struct edc dti_edc;		/* DTI error density counter */
++	struct wa_xfer_result *xfer_result; /* real size = dti_ep maxpktsize */
++	size_t xfer_result_size;
++
++	s32 status;			/* For reading status */
++
++	struct list_head xfer_list;
++	struct list_head xfer_delayed_list;
++	spinlock_t xfer_list_lock;
++	struct work_struct xfer_work;
++	atomic_t xfer_id_count;
++};
++
++
++extern int wa_create(struct wahc *wa, struct usb_interface *iface);
++extern void __wa_destroy(struct wahc *wa);
++
++
++/* Miscellaneous constants */
++enum {
++	/** Max number of EPROTO errors we tolerate on the NEP in a
++	 * period of time */
++	HWAHC_EPROTO_MAX = 16,
++	/** Period of time for EPROTO errors (in jiffies) */
++	HWAHC_EPROTO_PERIOD = 4 * HZ,
++};
++
++
++/* Notification endpoint handling */
++extern int wa_nep_create(struct wahc *, struct usb_interface *);
++extern void wa_nep_destroy(struct wahc *);
++
++static inline int wa_nep_arm(struct wahc *wa, gfp_t gfp_mask)
++{
++	struct urb *urb = wa->nep_urb;
++	urb->transfer_buffer = wa->nep_buffer;
++	urb->transfer_buffer_length = wa->nep_buffer_size;
++	return usb_submit_urb(urb, gfp_mask);
++}
++
++static inline void wa_nep_disarm(struct wahc *wa)
++{
++	usb_kill_urb(wa->nep_urb);
++}
++
++
++/* RPipes */
++static inline void wa_rpipe_init(struct wahc *wa)
++{
++	spin_lock_init(&wa->rpipe_bm_lock);
++	mutex_init(&wa->rpipe_mutex);
++}
++
++static inline void wa_init(struct wahc *wa)
++{
++	edc_init(&wa->nep_edc);
++	atomic_set(&wa->notifs_queued, 0);
++	wa_rpipe_init(wa);
++	edc_init(&wa->dti_edc);
++	INIT_LIST_HEAD(&wa->xfer_list);
++	INIT_LIST_HEAD(&wa->xfer_delayed_list);
++	spin_lock_init(&wa->xfer_list_lock);
++	INIT_WORK(&wa->xfer_work, wa_urb_enqueue_run);
++	atomic_set(&wa->xfer_id_count, 1);
++}
++
++/**
++ * Destroy a pipe (when refcount drops to zero)
++ *
++ * Assumes it has been moved to the "QUIESCING" state.
++ */
++struct wa_xfer;
++extern void rpipe_destroy(struct kref *_rpipe);
++static inline
++void __rpipe_get(struct wa_rpipe *rpipe)
++{
++	kref_get(&rpipe->refcnt);
++}
++extern int rpipe_get_by_ep(struct wahc *, struct usb_host_endpoint *,
++			   struct urb *, gfp_t);
++static inline void rpipe_put(struct wa_rpipe *rpipe)
++{
++	kref_put(&rpipe->refcnt, rpipe_destroy);
++
++}
++extern void rpipe_ep_disable(struct wahc *, struct usb_host_endpoint *);
++extern int wa_rpipes_create(struct wahc *);
++extern void wa_rpipes_destroy(struct wahc *);
++static inline void rpipe_avail_dec(struct wa_rpipe *rpipe)
++{
++	atomic_dec(&rpipe->segs_available);
++}
++
++/**
++ * Returns true if the rpipe is ready to submit more segments.
++ */
++static inline int rpipe_avail_inc(struct wa_rpipe *rpipe)
++{
++	return atomic_inc_return(&rpipe->segs_available) > 0
++		&& !list_empty(&rpipe->seg_list);
++}
++
++
++/* Transferring data */
++extern int wa_urb_enqueue(struct wahc *, struct usb_host_endpoint *,
++			  struct urb *, gfp_t);
++extern int wa_urb_dequeue(struct wahc *, struct urb *);
++extern void wa_handle_notif_xfer(struct wahc *, struct wa_notif_hdr *);
++
++
++/* Misc
++ *
++ * FIXME: Refcounting for the actual @hwahc object is not correct; I
++ *        mean, this should be refcounting on the HCD underneath, but
++ *        it is not. In any case, the semantics for HCD refcounting
++ *        are *weird*...on refcount reaching zero it just frees
++ *        it...no RC specific function is called...unless I miss
++ *        something.
++ *
++ * FIXME: has to go away in favour of an 'struct' hcd based sollution
++ */
++static inline struct wahc *wa_get(struct wahc *wa)
++{
++	usb_get_intf(wa->usb_iface);
++	return wa;
++}
++
++static inline void wa_put(struct wahc *wa)
++{
++	usb_put_intf(wa->usb_iface);
++}
++
++
++static inline int __wa_feature(struct wahc *wa, unsigned op, u16 feature)
++{
++	return usb_control_msg(wa->usb_dev, usb_sndctrlpipe(wa->usb_dev, 0),
++			op ? USB_REQ_SET_FEATURE : USB_REQ_CLEAR_FEATURE,
++			USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
++			feature,
++			wa->usb_iface->cur_altsetting->desc.bInterfaceNumber,
++			NULL, 0, 1000 /* FIXME: arbitrary */);
++}
++
++
++static inline int __wa_set_feature(struct wahc *wa, u16 feature)
++{
++	return  __wa_feature(wa, 1, feature);
++}
++
++
++static inline int __wa_clear_feature(struct wahc *wa, u16 feature)
++{
++	return __wa_feature(wa, 0, feature);
++}
++
++
++/**
++ * Return the status of a Wire Adapter
++ *
++ * @wa:		Wire Adapter instance
++ * @returns     < 0 errno code on error, or status bitmap as described
++ *              in WUSB1.0[8.3.1.6].
++ *
++ * NOTE: need malloc, some arches don't take USB from the stack
++ */
++static inline
++s32 __wa_get_status(struct wahc *wa)
++{
++	s32 result;
++	result = usb_control_msg(
++		wa->usb_dev, usb_rcvctrlpipe(wa->usb_dev, 0),
++		USB_REQ_GET_STATUS,
++		USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
++		0, wa->usb_iface->cur_altsetting->desc.bInterfaceNumber,
++		&wa->status, sizeof(wa->status),
++		1000 /* FIXME: arbitrary */);
++	if (result >= 0)
++		result = wa->status;
++	return result;
++}
++
++
++/**
++ * Waits until the Wire Adapter's status matches @mask/@value
++ *
++ * @wa:		Wire Adapter instance.
++ * @returns     < 0 errno code on error, otherwise status.
++ *
++ * Loop until the WAs status matches the mask and value (status & mask
++ * == value). Timeout if it doesn't happen.
++ *
++ * FIXME: is there an official specification on how long status
++ *        changes can take?
++ */
++static inline s32 __wa_wait_status(struct wahc *wa, u32 mask, u32 value)
++{
++	s32 result;
++	unsigned loops = 10;
++	do {
++		msleep(50);
++		result = __wa_get_status(wa);
++		if ((result & mask) == value)
++			break;
++		if (loops-- == 0) {
++			result = -ETIMEDOUT;
++			break;
++		}
++	} while (result >= 0);
++	return result;
++}
++
++
++/** Command @hwahc to stop, @returns 0 if ok, < 0 errno code on error */
++static inline int __wa_stop(struct wahc *wa)
++{
++	int result;
++	struct device *dev = &wa->usb_iface->dev;
++
++	result = __wa_clear_feature(wa, WA_ENABLE);
++	if (result < 0 && result != -ENODEV) {
++		dev_err(dev, "error commanding HC to stop: %d\n", result);
++		goto out;
++	}
++	result = __wa_wait_status(wa, WA_ENABLE, 0);
++	if (result < 0 && result != -ENODEV)
++		dev_err(dev, "error waiting for HC to stop: %d\n", result);
++out:
++	return 0;
++}
++
++
++#endif /* #ifndef __HWAHC_INTERNAL_H__ */
+--- /dev/null
++++ b/drivers/usb/wusbcore/wa-nep.c
+@@ -0,0 +1,313 @@
++/*
++ * WUSB Wire Adapter: Control/Data Streaming Interface (WUSB[8])
++ * Notification EndPoint support
++ *
++ * Copyright (C) 2006 Intel Corporation
++ * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ *
++ *
++ * This part takes care of getting the notification from the hw
++ * only and dispatching through wusbwad into
++ * wa_notif_dispatch. Handling is done there.
++ *
++ * WA notifications are limited in size; most of them are three or
++ * four bytes long, and the longest is the HWA Device Notification,
++ * which would not exceed 38 bytes (DNs are limited in payload to 32
++ * bytes plus 3 bytes header (WUSB1.0[7.6p2]), plus 3 bytes HWA
++ * header (WUSB1.0[8.5.4.2]).
++ *
++ * It is not clear if more than one Device Notification can be packed
++ * in a HWA Notification, I assume no because of the wording in
++ * WUSB1.0[8.5.4.2]. In any case, the bigger any notification could
++ * get is 256 bytes (as the bLength field is a byte).
++ *
++ * So what we do is we have this buffer and read into it; when a
++ * notification arrives we schedule work to a specific, single thread
++ * workqueue (so notifications are serialized) and copy the
++ * notification data. After scheduling the work, we rearm the read from
++ * the notification endpoint.
++ *
++ * Entry points here are:
++ *
++ * wa_nep_[create|destroy]()   To initialize/release this subsystem
++ *
++ * wa_nep_cb()                 Callback for the notification
++ *                                endpoint; when data is ready, this
++ *                                does the dispatching.
++ */
++#include <linux/workqueue.h>
++#include <linux/ctype.h>
++#include <linux/uwb/debug.h>
++#include "wa-hc.h"
++#include "wusbhc.h"
++
++/* Structure for queueing notifications to the workqueue */
++struct wa_notif_work {
++	struct work_struct work;
++	struct wahc *wa;
++	size_t size;
++	u8 data[];
++};
++
++/*
++ * Process incoming notifications from the WA's Notification EndPoint
++ * [the wuswad daemon, basically]
++ *
++ * @_nw:	Pointer to a descriptor which has the pointer to the
++ * 		@wa, the size of the buffer and the work queue
++ * 		structure (so we can free all when done).
++ * @returns     0 if ok, < 0 errno code on error.
++ *
++ * All notifications follow the same format; they need to start with a
++ * 'struct wa_notif_hdr' header, so it is easy to parse through
++ * them. We just break the buffer in individual notifications (the
++ * standard doesn't say if it can be done or is forbidden, so we are
++ * cautious) and dispatch each.
++ *
++ * So the handling layers are is:
++ *
++ *   WA specific notification (from NEP)
++ *      Device Notification Received -> wa_handle_notif_dn()
++ *        WUSB Device notification generic handling
++ *      BPST Adjustment -> wa_handle_notif_bpst_adj()
++ *      ... -> ...
++ *
++ * @wa has to be referenced
++ */
++static void wa_notif_dispatch(struct work_struct *ws)
++{
++	void *itr;
++	u8 missing = 0;
++	struct wa_notif_work *nw = container_of(ws, struct wa_notif_work, work);
++	struct wahc *wa = nw->wa;
++	struct wa_notif_hdr *notif_hdr;
++	size_t size;
++
++	struct device *dev = &wa->usb_iface->dev;
++
++#if 0
++	/* FIXME: need to check for this??? */
++	if (usb_hcd->state == HC_STATE_QUIESCING)	/* Going down? */
++		goto out;				/* screw it */
++#endif
++	atomic_dec(&wa->notifs_queued);		/* Throttling ctl */
++	dev = &wa->usb_iface->dev;
++	size = nw->size;
++	itr = nw->data;
++
++	while (size) {
++		if (size < sizeof(*notif_hdr)) {
++			missing = sizeof(*notif_hdr) - size;
++			goto exhausted_buffer;
++		}
++		notif_hdr = itr;
++		if (size < notif_hdr->bLength)
++			goto exhausted_buffer;
++		itr += notif_hdr->bLength;
++		size -= notif_hdr->bLength;
++		/* Dispatch the notification [don't use itr or size!] */
++		switch (notif_hdr->bNotifyType) {
++		case HWA_NOTIF_DN: {
++			struct hwa_notif_dn *hwa_dn;
++			hwa_dn = container_of(notif_hdr, struct hwa_notif_dn,
++					      hdr);
++			if (hwa_dn->secure)
++				dev_info(dev, "HWA DN: secure = %u\n",
++					 hwa_dn->secure);
++			wusbhc_handle_dn(wa->wusb, hwa_dn->bSourceDeviceAddr,
++					 hwa_dn->dndata,
++					 notif_hdr->bLength - sizeof(*hwa_dn));
++			break;
++		}
++		case WA_NOTIF_TRANSFER:
++			wa_handle_notif_xfer(wa, notif_hdr);
++			break;
++		case DWA_NOTIF_RWAKE:
++		case DWA_NOTIF_PORTSTATUS:
++		case HWA_NOTIF_BPST_ADJ:
++			/* FIXME: unimplemented WA NOTIFs */
++			/* fallthru */
++		default:
++			if (printk_ratelimit()) {
++				dev_err(dev, "HWA: unknown notification 0x%x, "
++					"%zu bytes; discarding\n",
++					notif_hdr->bNotifyType,
++					(size_t)notif_hdr->bLength);
++				dump_bytes(dev, notif_hdr, 16);
++			}
++			break;
++		}
++	}
++out:
++	wa_put(wa);
++	kfree(nw);
++	return;
++
++	/* THIS SHOULD NOT HAPPEN
++	 *
++	 * Buffer exahusted with partial data remaining; just warn and
++	 * discard the data, as this should not happen.
++	 */
++exhausted_buffer:
++	if (!printk_ratelimit())
++		goto out;
++	dev_warn(dev, "HWA: device sent short notification, "
++		 "%d bytes missing; discarding %d bytes.\n",
++		 missing, (int)size);
++	dump_bytes(dev, itr, size);
++	goto out;
++}
++
++/*
++ * Deliver incoming WA notifications to the wusbwa workqueue
++ *
++ * @wa:	Pointer the Wire Adapter Controller Data Streaming
++ *              instance (part of an 'struct usb_hcd').
++ * @size:       Size of the received buffer
++ * @returns     0 if ok, < 0 errno code on error.
++ *
++ * The input buffer is @wa->nep_buffer, with @size bytes
++ * (guaranteed to fit in the allocated space,
++ * @wa->nep_buffer_size).
++ */
++static int wa_nep_queue(struct wahc *wa, size_t size)
++{
++	int result = 0;
++	struct device *dev = &wa->usb_iface->dev;
++	struct wa_notif_work *nw;
++
++	/* dev_fnstart(dev, "(wa %p, size %zu)\n", wa, size); */
++	BUG_ON(size > wa->nep_buffer_size);
++	if (size == 0)
++		goto out;
++	if (atomic_read(&wa->notifs_queued) > 200) {
++		if (printk_ratelimit())
++			dev_err(dev, "Too many notifications queued, "
++				"throttling back\n");
++		goto out;
++	}
++	nw = kzalloc(sizeof(*nw) + size, GFP_ATOMIC);
++	if (nw == NULL) {
++		if (printk_ratelimit())
++			dev_err(dev, "No memory to queue notification\n");
++		goto out;
++	}
++	INIT_WORK(&nw->work, wa_notif_dispatch);
++	nw->wa = wa_get(wa);
++	nw->size = size;
++	memcpy(nw->data, wa->nep_buffer, size);
++	atomic_inc(&wa->notifs_queued);		/* Throttling ctl */
++	queue_work(wusbd, &nw->work);
++out:
++	/* dev_fnend(dev, "(wa %p, size %zu) = result\n", wa, size, result); */
++	return result;
++}
++
++/*
++ * Callback for the notification event endpoint
++ *
++ * Check's that everything is fine and then passes the data to be
++ * queued to the workqueue.
++ */
++static void wa_nep_cb(struct urb *urb)
++{
++	int result;
++	struct wahc *wa = urb->context;
++	struct device *dev = &wa->usb_iface->dev;
++
++	switch (result = urb->status) {
++	case 0:
++		result = wa_nep_queue(wa, urb->actual_length);
++		if (result < 0)
++			dev_err(dev, "NEP: unable to process notification(s): "
++				"%d\n", result);
++		break;
++	case -ECONNRESET:	/* Not an error, but a controlled situation; */
++	case -ENOENT:		/* (we killed the URB)...so, no broadcast */
++	case -ESHUTDOWN:
++		dev_dbg(dev, "NEP: going down %d\n", urb->status);
++		goto out;
++	default:	/* On general errors, we retry unless it gets ugly */
++		if (edc_inc(&wa->nep_edc, EDC_MAX_ERRORS,
++			    EDC_ERROR_TIMEFRAME)) {
++			dev_err(dev, "NEP: URB max acceptable errors "
++				"exceeded, resetting device\n");
++			usb_dev_reset_delayed(wa->usb_dev);
++			goto out;
++		}
++		dev_err(dev, "NEP: URB error %d\n", urb->status);
++	}
++	result = wa_nep_arm(wa, GFP_ATOMIC);
++	if (result < 0) {
++		dev_err(dev, "NEP: cannot submit URB: %d\n", result);
++		usb_dev_reset_delayed(wa->usb_dev);
++	}
++out:
++	return;
++}
++
++/*
++ * Initialize @wa's notification and event's endpoint stuff
++ *
++ * This includes the allocating the read buffer, the context ID
++ * allocation bitmap, the URB and submitting the URB.
++ */
++int wa_nep_create(struct wahc *wa, struct usb_interface *iface)
++{
++	int result;
++	struct usb_endpoint_descriptor *epd;
++	struct usb_device *usb_dev = interface_to_usbdev(iface);
++	struct device *dev = &iface->dev;
++
++	edc_init(&wa->nep_edc);
++	epd = &iface->cur_altsetting->endpoint[0].desc;
++	wa->nep_buffer_size = 1024;
++	wa->nep_buffer = kmalloc(wa->nep_buffer_size, GFP_KERNEL);
++	if (wa->nep_buffer == NULL) {
++		dev_err(dev, "Unable to allocate notification's read buffer\n");
++		goto error_nep_buffer;
++	}
++	wa->nep_urb = usb_alloc_urb(0, GFP_KERNEL);
++	if (wa->nep_urb == NULL) {
++		dev_err(dev, "Unable to allocate notification URB\n");
++		goto error_urb_alloc;
++	}
++	usb_fill_int_urb(wa->nep_urb, usb_dev,
++			 usb_rcvintpipe(usb_dev, epd->bEndpointAddress),
++			 wa->nep_buffer, wa->nep_buffer_size,
++			 wa_nep_cb, wa, epd->bInterval);
++	result = wa_nep_arm(wa, GFP_KERNEL);
++	if (result < 0) {
++		dev_err(dev, "Cannot submit notification URB: %d\n", result);
++		goto error_nep_arm;
++	}
++	return 0;
++
++error_nep_arm:
++	usb_free_urb(wa->nep_urb);
++error_urb_alloc:
++	kfree(wa->nep_buffer);
++error_nep_buffer:
++	return -ENOMEM;
++}
++
++void wa_nep_destroy(struct wahc *wa)
++{
++	wa_nep_disarm(wa);
++	usb_free_urb(wa->nep_urb);
++	kfree(wa->nep_buffer);
++}
+--- /dev/null
++++ b/drivers/usb/wusbcore/wa-rpipe.c
+@@ -0,0 +1,562 @@
++/*
++ * WUSB Wire Adapter
++ * rpipe management
++ *
++ * Copyright (C) 2005-2006 Intel Corporation
++ * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ *
++ *
++ * FIXME: docs
++ *
++ * RPIPE
++ *
++ *   Targetted at different downstream endpoints
++ *
++ *   Descriptor: use to config the remote pipe.
++ *
++ *   The number of blocks could be dynamic (wBlocks in descriptor is
++ *   0)--need to schedule them then.
++ *
++ * Each bit in wa->rpipe_bm represents if an rpipe is being used or
++ * not. Rpipes are represented with a 'struct wa_rpipe' that is
++ * attached to the hcpriv member of a 'struct usb_host_endpoint'.
++ *
++ * When you need to xfer data to an endpoint, you get an rpipe for it
++ * with wa_ep_rpipe_get(), which gives you a reference to the rpipe
++ * and keeps a single one (the first one) with the endpoint. When you
++ * are done transferring, you drop that reference. At the end the
++ * rpipe is always allocated and bound to the endpoint. There it might
++ * be recycled when not used.
++ *
++ * Addresses:
++ *
++ *  We use a 1:1 mapping mechanism between port address (0 based
++ *  index, actually) and the address. The USB stack knows about this.
++ *
++ *  USB Stack port number    4 (1 based)
++ *  WUSB code port index     3 (0 based)
++ *  USB Addresss             5 (2 based -- 0 is for default, 1 for root hub)
++ *
++ *  Now, because we don't use the concept as default address exactly
++ *  like the (wired) USB code does, we need to kind of skip it. So we
++ *  never take addresses from the urb->pipe, but from the
++ *  urb->dev->devnum, to make sure that we always have the right
++ *  destination address.
++ */
++#include <linux/init.h>
++#include <asm/atomic.h>
++#include <linux/bitmap.h>
++#include "wusbhc.h"
++#include "wa-hc.h"
++
++#define D_LOCAL 0
++#include <linux/uwb/debug.h>
++
++
++static int __rpipe_get_descr(struct wahc *wa,
++			     struct usb_rpipe_descriptor *descr, u16 index)
++{
++	ssize_t result;
++	struct device *dev = &wa->usb_iface->dev;
++
++	/* Get the RPIPE descriptor -- we cannot use the usb_get_descriptor()
++	 * function because the arguments are different.
++	 */
++	d_printf(1, dev, "rpipe %u: get descr\n", index);
++	result = usb_control_msg(
++		wa->usb_dev, usb_rcvctrlpipe(wa->usb_dev, 0),
++		USB_REQ_GET_DESCRIPTOR,
++		USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_RPIPE,
++		USB_DT_RPIPE<<8, index, descr, sizeof(*descr),
++		1000 /* FIXME: arbitrary */);
++	if (result < 0) {
++		dev_err(dev, "rpipe %u: get descriptor failed: %d\n",
++			index, (int)result);
++		goto error;
++	}
++	if (result < sizeof(*descr)) {
++		dev_err(dev, "rpipe %u: got short descriptor "
++			"(%zd vs %zd bytes needed)\n",
++			index, result, sizeof(*descr));
++		result = -EINVAL;
++		goto error;
++	}
++	result = 0;
++
++error:
++	return result;
++}
++
++/*
++ *
++ * The descriptor is assumed to be properly initialized (ie: you got
++ * it through __rpipe_get_descr()).
++ */
++static int __rpipe_set_descr(struct wahc *wa,
++			     struct usb_rpipe_descriptor *descr, u16 index)
++{
++	ssize_t result;
++	struct device *dev = &wa->usb_iface->dev;
++
++	/* we cannot use the usb_get_descriptor() function because the
++	 * arguments are different.
++	 */
++	d_printf(1, dev, "rpipe %u: set descr\n", index);
++	result = usb_control_msg(
++		wa->usb_dev, usb_sndctrlpipe(wa->usb_dev, 0),
++		USB_REQ_SET_DESCRIPTOR,
++		USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_RPIPE,
++		USB_DT_RPIPE<<8, index, descr, sizeof(*descr),
++		HZ / 10);
++	if (result < 0) {
++		dev_err(dev, "rpipe %u: set descriptor failed: %d\n",
++			index, (int)result);
++		goto error;
++	}
++	if (result < sizeof(*descr)) {
++		dev_err(dev, "rpipe %u: sent short descriptor "
++			"(%zd vs %zd bytes required)\n",
++			index, result, sizeof(*descr));
++		result = -EINVAL;
++		goto error;
++	}
++	result = 0;
++
++error:
++	return result;
++
++}
++
++static void rpipe_init(struct wa_rpipe *rpipe)
++{
++	kref_init(&rpipe->refcnt);
++	spin_lock_init(&rpipe->seg_lock);
++	INIT_LIST_HEAD(&rpipe->seg_list);
++}
++
++static unsigned rpipe_get_idx(struct wahc *wa, unsigned rpipe_idx)
++{
++	unsigned flags;
++
++	spin_lock_irqsave(&wa->rpipe_bm_lock, flags);
++	rpipe_idx = find_next_zero_bit(wa->rpipe_bm, wa->rpipes, rpipe_idx);
++	if (rpipe_idx < wa->rpipes)
++		set_bit(rpipe_idx, wa->rpipe_bm);
++	spin_unlock_irqrestore(&wa->rpipe_bm_lock, flags);
++
++	return rpipe_idx;
++}
++
++static void rpipe_put_idx(struct wahc *wa, unsigned rpipe_idx)
++{
++	unsigned flags;
++
++	spin_lock_irqsave(&wa->rpipe_bm_lock, flags);
++	clear_bit(rpipe_idx, wa->rpipe_bm);
++	spin_unlock_irqrestore(&wa->rpipe_bm_lock, flags);
++}
++
++void rpipe_destroy(struct kref *_rpipe)
++{
++	struct wa_rpipe *rpipe = container_of(_rpipe, struct wa_rpipe, refcnt);
++	u8 index = le16_to_cpu(rpipe->descr.wRPipeIndex);
++	d_fnstart(1, NULL, "(rpipe %p %u)\n", rpipe, index);
++	if (rpipe->ep)
++		rpipe->ep->hcpriv = NULL;
++	rpipe_put_idx(rpipe->wa, index);
++	wa_put(rpipe->wa);
++	kfree(rpipe);
++	d_fnend(1, NULL, "(rpipe %p %u)\n", rpipe, index);
++}
++EXPORT_SYMBOL_GPL(rpipe_destroy);
++
++/*
++ * Locate an idle rpipe, create an structure for it and return it
++ *
++ * @wa 	  is referenced and unlocked
++ * @crs   enum rpipe_attr, required endpoint characteristics
++ *
++ * The rpipe can be used only sequentially (not in parallel).
++ *
++ * The rpipe is moved into the "ready" state.
++ */
++static int rpipe_get_idle(struct wa_rpipe **prpipe, struct wahc *wa, u8 crs,
++			  gfp_t gfp)
++{
++	int result;
++	unsigned rpipe_idx;
++	struct wa_rpipe *rpipe;
++	struct device *dev = &wa->usb_iface->dev;
++
++	d_fnstart(3, dev, "(wa %p crs 0x%02x)\n", wa, crs);
++	rpipe = kzalloc(sizeof(*rpipe), gfp);
++	if (rpipe == NULL)
++		return -ENOMEM;
++	rpipe_init(rpipe);
++
++	/* Look for an idle pipe */
++	for (rpipe_idx = 0; rpipe_idx < wa->rpipes; rpipe_idx++) {
++		rpipe_idx = rpipe_get_idx(wa, rpipe_idx);
++		if (rpipe_idx >= wa->rpipes)	/* no more pipes :( */
++			break;
++		result =  __rpipe_get_descr(wa, &rpipe->descr, rpipe_idx);
++		if (result < 0)
++			dev_err(dev, "Can't get descriptor for rpipe %u: %d\n",
++				rpipe_idx, result);
++		else if ((rpipe->descr.bmCharacteristics & crs) != 0)
++			goto found;
++		rpipe_put_idx(wa, rpipe_idx);
++	}
++	*prpipe = NULL;
++	kfree(rpipe);
++	d_fnend(3, dev, "(wa %p crs 0x%02x) = -ENXIO\n", wa, crs);
++	return -ENXIO;
++
++found:
++	set_bit(rpipe_idx, wa->rpipe_bm);
++	rpipe->wa = wa_get(wa);
++	*prpipe = rpipe;
++	d_fnstart(3, dev, "(wa %p crs 0x%02x) = 0\n", wa, crs);
++	return 0;
++}
++
++static int __rpipe_reset(struct wahc *wa, unsigned index)
++{
++	int result;
++	struct device *dev = &wa->usb_iface->dev;
++
++	d_printf(1, dev, "rpipe %u: reset\n", index);
++	result = usb_control_msg(
++		wa->usb_dev, usb_sndctrlpipe(wa->usb_dev, 0),
++		USB_REQ_RPIPE_RESET,
++		USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_RPIPE,
++		0, index, NULL, 0, 1000 /* FIXME: arbitrary */);
++	if (result < 0)
++		dev_err(dev, "rpipe %u: reset failed: %d\n",
++			index, result);
++	return result;
++}
++
++/*
++ * Fake companion descriptor for ep0
++ *
++ * See WUSB1.0[7.4.4], most of this is zero for bulk/int/ctl
++ */
++static struct usb_wireless_ep_comp_descriptor epc0 = {
++	.bLength = sizeof(epc0),
++	.bDescriptorType = USB_DT_WIRELESS_ENDPOINT_COMP,
++/*	.bMaxBurst = 1, */
++	.bMaxSequence = 31,
++};
++
++/*
++ * Look for EP companion descriptor
++ *
++ * Get there, look for Inara in the endpoint's extra descriptors
++ */
++static struct usb_wireless_ep_comp_descriptor *rpipe_epc_find(
++		struct device *dev, struct usb_host_endpoint *ep)
++{
++	void *itr;
++	size_t itr_size;
++	struct usb_descriptor_header *hdr;
++	struct usb_wireless_ep_comp_descriptor *epcd;
++
++	d_fnstart(3, dev, "(ep %p)\n", ep);
++	if (ep->desc.bEndpointAddress == 0) {
++		epcd = &epc0;
++		goto out;
++	}
++	itr = ep->extra;
++	itr_size = ep->extralen;
++	epcd = NULL;
++	while (itr_size > 0) {
++		if (itr_size < sizeof(*hdr)) {
++			dev_err(dev, "HW Bug? ep 0x%02x: extra descriptors "
++				"at offset %zu: only %zu bytes left\n",
++				ep->desc.bEndpointAddress,
++				itr - (void *) ep->extra, itr_size);
++			break;
++		}
++		hdr = itr;
++		if (hdr->bDescriptorType == USB_DT_WIRELESS_ENDPOINT_COMP) {
++			epcd = itr;
++			break;
++		}
++		if (hdr->bLength > itr_size) {
++			dev_err(dev, "HW Bug? ep 0x%02x: extra descriptor "
++				"at offset %zu (type 0x%02x) "
++				"length %d but only %zu bytes left\n",
++				ep->desc.bEndpointAddress,
++				itr - (void *) ep->extra, hdr->bDescriptorType,
++				hdr->bLength, itr_size);
++			break;
++		}
++		itr += hdr->bLength;
++		itr_size -= hdr->bDescriptorType;
++	}
++out:
++	d_fnend(3, dev, "(ep %p) = %p\n", ep, epcd);
++	return epcd;
++}
++
++/*
++ * Aim an rpipe to its device & endpoint destination
++ *
++ * Make sure we change the address to unauthenticathed if the device
++ * is WUSB and it is not authenticated.
++ */
++static int rpipe_aim(struct wa_rpipe *rpipe, struct wahc *wa,
++		     struct usb_host_endpoint *ep, struct urb *urb, gfp_t gfp)
++{
++	int result = -ENOMSG;	/* better code for lack of companion? */
++	struct device *dev = &wa->usb_iface->dev;
++	struct usb_device *usb_dev = urb->dev;
++	struct usb_wireless_ep_comp_descriptor *epcd;
++	u8 unauth;
++
++	d_fnstart(3, dev, "(rpipe %p wa %p ep %p, urb %p)\n",
++		    rpipe, wa, ep, urb);
++	epcd = rpipe_epc_find(dev, ep);
++	if (epcd == NULL) {
++		dev_err(dev, "ep 0x%02x: can't find companion descriptor\n",
++			ep->desc.bEndpointAddress);
++		goto error;
++	}
++	unauth = usb_dev->wusb && !usb_dev->authenticated? 0x80 : 0;
++	__rpipe_reset(wa, le16_to_cpu(rpipe->descr.wRPipeIndex));
++	atomic_set(&rpipe->segs_available, le16_to_cpu(rpipe->descr.wRequests));
++	/* FIXME: block allocation system; request with queuing and timeout */
++	/* FIXME: compute so seg_size > ep->maxpktsize */
++	rpipe->descr.wBlocks = cpu_to_le16(16);		/* given */
++	/* ep0 maxpktsize is 0x200 (WUSB1.0[4.8.1]) */
++	rpipe->descr.wMaxPacketSize = cpu_to_le16(ep->desc.wMaxPacketSize);
++	rpipe->descr.bHSHubAddress = 0;			/* reserved: zero */
++	rpipe->descr.bHSHubPort = wusb_port_no_to_idx(urb->dev->portnum);
++	/* FIXME: use maximum speed as supported or recommended by device */
++	rpipe->descr.bSpeed = usb_pipeendpoint(urb->pipe) == 0?
++		UWB_PHY_RATE_53 : UWB_PHY_RATE_200;
++	d_printf(2, dev, "addr %u (0x%02x) rpipe #%u ep# %u speed %d\n",
++		 urb->dev->devnum, urb->dev->devnum | unauth,
++		 le16_to_cpu(rpipe->descr.wRPipeIndex),
++		 usb_pipeendpoint(urb->pipe), rpipe->descr.bSpeed);
++	/* see security.c:wusb_update_address() */
++	if (unlikely(urb->dev->devnum == 0x80))
++		rpipe->descr.bDeviceAddress = 0;
++	else
++		rpipe->descr.bDeviceAddress = urb->dev->devnum | unauth;
++	rpipe->descr.bEndpointAddress = ep->desc.bEndpointAddress;
++	/* FIXME: bDataSequence */
++	rpipe->descr.bDataSequence = 0;
++	/* FIXME: dwCurrentWindow */
++	rpipe->descr.dwCurrentWindow = cpu_to_le32(1);
++	/* FIXME: bMaxDataSequence */
++	rpipe->descr.bMaxDataSequence = epcd->bMaxSequence - 1;
++	rpipe->descr.bInterval = ep->desc.bInterval;
++	/* FIXME: bOverTheAirInterval */
++	rpipe->descr.bOverTheAirInterval = 0;	/* 0 if not isoc */
++	/* FIXME: xmit power & preamble blah blah */
++	rpipe->descr.bmAttribute = ep->desc.bmAttributes & 0x03;
++	/* rpipe->descr.bmCharacteristics RO */
++	/* FIXME: bmRetryOptions */
++	rpipe->descr.bmRetryOptions = 15;
++	/* FIXME: use for assessing link quality? */
++	rpipe->descr.wNumTransactionErrors = 0;
++	result = __rpipe_set_descr(wa, &rpipe->descr,
++				   le16_to_cpu(rpipe->descr.wRPipeIndex));
++	if (result < 0) {
++		dev_err(dev, "Cannot aim rpipe: %d\n", result);
++		goto error;
++	}
++	result = 0;
++error:
++	d_fnend(3, dev, "(rpipe %p wa %p ep %p urb %p) = %d\n",
++		  rpipe, wa, ep, urb, result);
++	return result;
++}
++
++/*
++ * Check an aimed rpipe to make sure it points to where we want
++ *
++ * We use bit 19 of the Linux USB pipe bitmap for unauth vs auth
++ * space; when it is like that, we or 0x80 to make an unauth address.
++ */
++static int rpipe_check_aim(const struct wa_rpipe *rpipe, const struct wahc *wa,
++			   const struct usb_host_endpoint *ep,
++			   const struct urb *urb, gfp_t gfp)
++{
++	int result = 0;		/* better code for lack of companion? */
++	struct device *dev = &wa->usb_iface->dev;
++	struct usb_device *usb_dev = urb->dev;
++	u8 unauth = (usb_dev->wusb && !usb_dev->authenticated)? 0x80 : 0;
++	u8 portnum = wusb_port_no_to_idx(urb->dev->portnum);
++
++	d_fnstart(3, dev, "(rpipe %p wa %p ep %p, urb %p)\n",
++		    rpipe, wa, ep, urb);
++#define AIM_CHECK(rdf, val, text)					\
++	do {								\
++		if (rpipe->descr.rdf != (val)) {			\
++			dev_err(dev,					\
++				"rpipe aim discrepancy: " #rdf " " text "\n", \
++				rpipe->descr.rdf, (val));		\
++			result = -EINVAL;				\
++			WARN_ON(1);					\
++		}							\
++	} while (0)
++	AIM_CHECK(wMaxPacketSize, cpu_to_le16(ep->desc.wMaxPacketSize),
++		  "(%u vs %u)");
++	AIM_CHECK(bHSHubPort, portnum, "(%u vs %u)");
++	AIM_CHECK(bSpeed, usb_pipeendpoint(urb->pipe) == 0 ?
++			UWB_PHY_RATE_53 : UWB_PHY_RATE_200,
++		  "(%u vs %u)");
++	AIM_CHECK(bDeviceAddress, urb->dev->devnum | unauth, "(%u vs %u)");
++	AIM_CHECK(bEndpointAddress, ep->desc.bEndpointAddress, "(%u vs %u)");
++	AIM_CHECK(bInterval, ep->desc.bInterval, "(%u vs %u)");
++	AIM_CHECK(bmAttribute, ep->desc.bmAttributes & 0x03, "(%u vs %u)");
++#undef AIM_CHECK
++	return result;
++}
++
++#ifndef CONFIG_BUG
++#define CONFIG_BUG 0
++#endif
++
++/*
++ * Make sure there is an rpipe allocated for an endpoint
++ *
++ * If already allocated, we just refcount it; if not, we get an
++ * idle one, aim it to the right location and take it.
++ *
++ * Attaches to ep->hcpriv and rpipe->ep to ep.
++ */
++int rpipe_get_by_ep(struct wahc *wa, struct usb_host_endpoint *ep,
++		    struct urb *urb, gfp_t gfp)
++{
++	int result = 0;
++	struct device *dev = &wa->usb_iface->dev;
++	struct wa_rpipe *rpipe;
++	u8 eptype;
++
++	d_fnstart(3, dev, "(wa %p ep %p urb %p gfp 0x%08x)\n", wa, ep, urb,
++		  gfp);
++	mutex_lock(&wa->rpipe_mutex);
++	rpipe = ep->hcpriv;
++	if (rpipe != NULL) {
++		if (CONFIG_BUG == 1) {
++			result = rpipe_check_aim(rpipe, wa, ep, urb, gfp);
++			if (result < 0)
++				goto error;
++		}
++		__rpipe_get(rpipe);
++		d_printf(2, dev, "ep 0x%02x: reusing rpipe %u\n",
++			 ep->desc.bEndpointAddress,
++			 le16_to_cpu(rpipe->descr.wRPipeIndex));
++	} else {
++		/* hmm, assign idle rpipe, aim it */
++		result = -ENOBUFS;
++		eptype = ep->desc.bmAttributes & 0x03;
++		result = rpipe_get_idle(&rpipe, wa, 1 << eptype, gfp);
++		if (result < 0)
++			goto error;
++		result = rpipe_aim(rpipe, wa, ep, urb, gfp);
++		if (result < 0) {
++			rpipe_put(rpipe);
++			goto error;
++		}
++		ep->hcpriv = rpipe;
++		rpipe->ep = ep;
++		__rpipe_get(rpipe);	/* for caching into ep->hcpriv */
++		d_printf(2, dev, "ep 0x%02x: using rpipe %u\n",
++			 ep->desc.bEndpointAddress,
++			 le16_to_cpu(rpipe->descr.wRPipeIndex));
++	}
++	d_dump(4, dev, &rpipe->descr, sizeof(rpipe->descr));
++error:
++	mutex_unlock(&wa->rpipe_mutex);
++	d_fnend(3, dev, "(wa %p ep %p urb %p gfp 0x%08x)\n", wa, ep, urb, gfp);
++	return result;
++}
++
++/*
++ * Allocate the bitmap for each rpipe.
++ */
++int wa_rpipes_create(struct wahc *wa)
++{
++	wa->rpipes = wa->wa_descr->wNumRPipes;
++	wa->rpipe_bm = kzalloc(BITS_TO_LONGS(wa->rpipes)*sizeof(unsigned long),
++			       GFP_KERNEL);
++	if (wa->rpipe_bm == NULL)
++		return -ENOMEM;
++	return 0;
++}
++
++void wa_rpipes_destroy(struct wahc *wa)
++{
++	struct device *dev = &wa->usb_iface->dev;
++	d_fnstart(3, dev, "(wa %p)\n", wa);
++	if (!bitmap_empty(wa->rpipe_bm, wa->rpipes)) {
++		char buf[256];
++		WARN_ON(1);
++		bitmap_scnprintf(buf, sizeof(buf), wa->rpipe_bm, wa->rpipes);
++		dev_err(dev, "BUG: pipes not released on exit: %s\n", buf);
++	}
++	kfree(wa->rpipe_bm);
++	d_fnend(3, dev, "(wa %p)\n", wa);
++}
++
++/*
++ * Release resources allocated for an endpoint
++ *
++ * If there is an associated rpipe to this endpoint, Abort any pending
++ * transfers and put it. If the rpipe ends up being destroyed,
++ * __rpipe_destroy() will cleanup ep->hcpriv.
++ *
++ * This is called before calling hcd->stop(), so you don't need to do
++ * anything else in there.
++ */
++void rpipe_ep_disable(struct wahc *wa, struct usb_host_endpoint *ep)
++{
++	struct device *dev = &wa->usb_iface->dev;
++	struct wa_rpipe *rpipe;
++	d_fnstart(2, dev, "(wa %p ep %p)\n", wa, ep);
++	mutex_lock(&wa->rpipe_mutex);
++	rpipe = ep->hcpriv;
++	if (rpipe != NULL) {
++		unsigned rc = atomic_read(&rpipe->refcnt.refcount);
++		int result;
++		u16 index = le16_to_cpu(rpipe->descr.wRPipeIndex);
++
++		if (rc != 1)
++			d_printf(1, dev, "(wa %p ep %p) rpipe %p refcnt %u\n",
++				 wa, ep, rpipe, rc);
++
++		d_printf(1, dev, "rpipe %u: abort\n", index);
++		result = usb_control_msg(
++			wa->usb_dev, usb_rcvctrlpipe(wa->usb_dev, 0),
++			USB_REQ_RPIPE_ABORT,
++			USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_RPIPE,
++			0, index, NULL, 0, 1000 /* FIXME: arbitrary */);
++		if (result < 0 && result != -ENODEV /* dev is gone */)
++			d_printf(1, dev, "(wa %p rpipe %u): abort failed: %d\n",
++				 wa, index, result);
++		rpipe_put(rpipe);
++	}
++	mutex_unlock(&wa->rpipe_mutex);
++	d_fnend(2, dev, "(wa %p ep %p)\n", wa, ep);
++	return;
++}
++EXPORT_SYMBOL_GPL(rpipe_ep_disable);
+--- /dev/null
++++ b/drivers/usb/wusbcore/wa-xfer.c
+@@ -0,0 +1,1709 @@
++/*
++ * WUSB Wire Adapter
++ * Data transfer and URB enqueing
++ *
++ * Copyright (C) 2005-2006 Intel Corporation
++ * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ *
++ *
++ * How transfers work: get a buffer, break it up in segments (segment
++ * size is a multiple of the maxpacket size). For each segment issue a
++ * segment request (struct wa_xfer_*), then send the data buffer if
++ * out or nothing if in (all over the DTO endpoint).
++ *
++ * For each submitted segment request, a notification will come over
++ * the NEP endpoint and a transfer result (struct xfer_result) will
++ * arrive in the DTI URB. Read it, get the xfer ID, see if there is
++ * data coming (inbound transfer), schedule a read and handle it.
++ *
++ * Sounds simple, it is a pain to implement.
++ *
++ *
++ * ENTRY POINTS
++ *
++ *   FIXME
++ *
++ * LIFE CYCLE / STATE DIAGRAM
++ *
++ *   FIXME
++ *
++ * THIS CODE IS DISGUSTING
++ *
++ *   Warned you are; it's my second try and still not happy with it.
++ *
++ * NOTES:
++ *
++ *   - No iso
++ *
++ *   - Supports DMA xfers, control, bulk and maybe interrupt
++ *
++ *   - Does not recycle unused rpipes
++ *
++ *     An rpipe is assigned to an endpoint the first time it is used,
++ *     and then it's there, assigned, until the endpoint is disabled
++ *     (destroyed [{h,d}wahc_op_ep_disable()]. The assignment of the
++ *     rpipe to the endpoint is done under the wa->rpipe_sem semaphore
++ *     (should be a mutex).
++ *
++ *     Two methods it could be done:
++ *
++ *     (a) set up a timer everytime an rpipe's use count drops to 1
++ *         (which means unused) or when a transfer ends. Reset the
++ *         timer when a xfer is queued. If the timer expires, release
++ *         the rpipe [see rpipe_ep_disable()].
++ *
++ *     (b) when looking for free rpipes to attach [rpipe_get_by_ep()],
++ *         when none are found go over the list, check their endpoint
++ *         and their activity record (if no last-xfer-done-ts in the
++ *         last x seconds) take it
++ *
++ *     However, due to the fact that we have a set of limited
++ *     resources (max-segments-at-the-same-time per xfer,
++ *     xfers-per-ripe, blocks-per-rpipe, rpipes-per-host), at the end
++ *     we are going to have to rebuild all this based on an scheduler,
++ *     to where we have a list of transactions to do and based on the
++ *     availability of the different requried components (blocks,
++ *     rpipes, segment slots, etc), we go scheduling them. Painful.
++ */
++#include <linux/init.h>
++#include <linux/spinlock.h>
++#include <linux/hash.h>
++#include "wa-hc.h"
++#include "wusbhc.h"
++
++#undef D_LOCAL
++#define D_LOCAL 0 /* 0 disabled, > 0 different levels... */
++#include <linux/uwb/debug.h>
++
++enum {
++	WA_SEGS_MAX = 255,
++};
++
++enum wa_seg_status {
++	WA_SEG_NOTREADY,
++	WA_SEG_READY,
++	WA_SEG_DELAYED,
++	WA_SEG_SUBMITTED,
++	WA_SEG_PENDING,
++	WA_SEG_DTI_PENDING,
++	WA_SEG_DONE,
++	WA_SEG_ERROR,
++	WA_SEG_ABORTED,
++};
++
++static void wa_xfer_delayed_run(struct wa_rpipe *);
++
++/*
++ * Life cycle governed by 'struct urb' (the refcount of the struct is
++ * that of the 'struct urb' and usb_free_urb() would free the whole
++ * struct).
++ */
++struct wa_seg {
++	struct urb urb;
++	struct urb *dto_urb;		/* for data output? */
++	struct list_head list_node;	/* for rpipe->req_list */
++	struct wa_xfer *xfer;		/* out xfer */
++	u8 index;			/* which segment we are */
++	enum wa_seg_status status;
++	ssize_t result;			/* bytes xfered or error */
++	struct wa_xfer_hdr xfer_hdr;
++	u8 xfer_extra[];		/* xtra space for xfer_hdr_ctl */
++};
++
++static void wa_seg_init(struct wa_seg *seg)
++{
++	/* usb_init_urb() repeats a lot of work, so we do it here */
++	kref_init(&seg->urb.kref);
++}
++
++/*
++ * Protected by xfer->lock
++ *
++ */
++struct wa_xfer {
++	struct kref refcnt;
++	struct list_head list_node;
++	spinlock_t lock;
++	u32 id;
++
++	struct wahc *wa;		/* Wire adapter we are plugged to */
++	struct usb_host_endpoint *ep;
++	struct urb *urb;		/* URB we are transfering for */
++	struct wa_seg **seg;		/* transfer segments */
++	u8 segs, segs_submitted, segs_done;
++	unsigned is_inbound:1;
++	unsigned is_dma:1;
++	size_t seg_size;
++	int result;
++
++	gfp_t gfp;			/* allocation mask */
++
++	struct wusb_dev *wusb_dev;	/* for activity timestamps */
++};
++
++static inline void wa_xfer_init(struct wa_xfer *xfer)
++{
++	kref_init(&xfer->refcnt);
++	INIT_LIST_HEAD(&xfer->list_node);
++	spin_lock_init(&xfer->lock);
++}
++
++/*
++ * Destory a transfer structure
++ *
++ * Note that the xfer->seg[index] thingies follow the URB life cycle,
++ * so we need to put them, not free them.
++ */
++static void wa_xfer_destroy(struct kref *_xfer)
++{
++	struct wa_xfer *xfer = container_of(_xfer, struct wa_xfer, refcnt);
++	if (xfer->seg) {
++		unsigned cnt;
++		for (cnt = 0; cnt < xfer->segs; cnt++) {
++			if (xfer->is_inbound)
++				usb_put_urb(xfer->seg[cnt]->dto_urb);
++			usb_put_urb(&xfer->seg[cnt]->urb);
++		}
++	}
++	kfree(xfer);
++	d_printf(2, NULL, "xfer %p destroyed\n", xfer);
++}
++
++static void wa_xfer_get(struct wa_xfer *xfer)
++{
++	kref_get(&xfer->refcnt);
++}
++
++static void wa_xfer_put(struct wa_xfer *xfer)
++{
++	d_fnstart(3, NULL, "(xfer %p) -- ref count bef put %d\n",
++		    xfer, atomic_read(&xfer->refcnt.refcount));
++	kref_put(&xfer->refcnt, wa_xfer_destroy);
++	d_fnend(3, NULL, "(xfer %p) = void\n", xfer);
++}
++
++/*
++ * xfer is referenced
++ *
++ * xfer->lock has to be unlocked
++ *
++ * We take xfer->lock for setting the result; this is a barrier
++ * against drivers/usb/core/hcd.c:unlink1() being called after we call
++ * usb_hcd_giveback_urb() and wa_urb_dequeue() trying to get a
++ * reference to the transfer.
++ */
++static void wa_xfer_giveback(struct wa_xfer *xfer)
++{
++	unsigned long flags;
++	d_fnstart(3, NULL, "(xfer %p)\n", xfer);
++	spin_lock_irqsave(&xfer->wa->xfer_list_lock, flags);
++	list_del_init(&xfer->list_node);
++	spin_unlock_irqrestore(&xfer->wa->xfer_list_lock, flags);
++	/* FIXME: segmentation broken -- kills DWA */
++	wusbhc_giveback_urb(xfer->wa->wusb, xfer->urb, xfer->result);
++	wa_put(xfer->wa);
++	wa_xfer_put(xfer);
++	d_fnend(3, NULL, "(xfer %p) = void\n", xfer);
++}
++
++/*
++ * xfer is referenced
++ *
++ * xfer->lock has to be unlocked
++ */
++static void wa_xfer_completion(struct wa_xfer *xfer)
++{
++	d_fnstart(3, NULL, "(xfer %p)\n", xfer);
++	if (xfer->wusb_dev)
++		wusb_dev_put(xfer->wusb_dev);
++	rpipe_put(xfer->ep->hcpriv);
++	wa_xfer_giveback(xfer);
++	d_fnend(3, NULL, "(xfer %p) = void\n", xfer);
++	return;
++}
++
++/*
++ * If transfer is done, wrap it up and return true
++ *
++ * xfer->lock has to be locked
++ */
++static unsigned __wa_xfer_is_done(struct wa_xfer *xfer)
++{
++	unsigned result, cnt;
++	struct wa_seg *seg;
++	struct urb *urb = xfer->urb;
++	unsigned found_short = 0;
++
++	d_fnstart(3, NULL, "(xfer %p)\n", xfer);
++	result = xfer->segs_done == xfer->segs_submitted;
++	if (result == 0)
++		goto out;
++	urb->actual_length = 0;
++	for (cnt = 0; cnt < xfer->segs; cnt++) {
++		seg = xfer->seg[cnt];
++		switch (seg->status) {
++		case WA_SEG_DONE:
++			if (found_short && seg->result > 0) {
++				if (printk_ratelimit())
++					printk(KERN_ERR "xfer %p#%u: bad short "
++					       "segments (%zu)\n", xfer, cnt,
++					       seg->result);
++				urb->status = -EINVAL;
++				goto out;
++			}
++			urb->actual_length += seg->result;
++			if (seg->result < xfer->seg_size
++			    && cnt != xfer->segs-1)
++				found_short = 1;
++			d_printf(2, NULL, "xfer %p#%u: DONE short %d "
++				 "result %zu urb->actual_length %d\n",
++				 xfer, seg->index, found_short, seg->result,
++				 urb->actual_length);
++			break;
++		case WA_SEG_ERROR:
++			xfer->result = seg->result;
++			d_printf(2, NULL, "xfer %p#%u: ERROR result %zu\n",
++				 xfer, seg->index, seg->result);
++			goto out;
++		case WA_SEG_ABORTED:
++			WARN_ON(urb->status != -ECONNRESET
++				&& urb->status != -ENOENT);
++			d_printf(2, NULL, "xfer %p#%u ABORTED: result %d\n",
++				 xfer, seg->index, urb->status);
++			xfer->result = urb->status;
++			goto out;
++		default:
++			/* if (printk_ratelimit()) */
++				printk(KERN_ERR "xfer %p#%u: "
++				       "is_done bad state %d\n",
++				       xfer, cnt, seg->status);
++			xfer->result = -EINVAL;
++			WARN_ON(1);
++			goto out;
++		}
++	}
++	xfer->result = 0;
++out:
++	d_fnend(3, NULL, "(xfer %p) = void\n", xfer);
++	return result;
++}
++
++/*
++ * Initialize a transfer's ID
++ *
++ * We need to use a sequential number; if we use the pointer or the
++ * hash of the pointer, it can repeat over sequential transfers and
++ * then it will confuse the HWA....wonder why in hell they put a 32
++ * bit handle in there then.
++ */
++static void wa_xfer_id_init(struct wa_xfer *xfer)
++{
++	xfer->id = atomic_add_return(1, &xfer->wa->xfer_id_count);
++}
++
++/*
++ * Return the xfer's ID associated with xfer
++ *
++ * Need to generate a
++ */
++static u32 wa_xfer_id(struct wa_xfer *xfer)
++{
++	return xfer->id;
++}
++
++/*
++ * Search for a transfer list ID on the HCD's URB list
++ *
++ * For 32 bit architectures, we use the pointer itself; for 64 bits, a
++ * 32-bit hash of the pointer.
++ *
++ * @returns NULL if not found.
++ */
++static struct wa_xfer *wa_xfer_get_by_id(struct wahc *wa, u32 id)
++{
++	unsigned long flags;
++	struct wa_xfer *xfer_itr;
++	spin_lock_irqsave(&wa->xfer_list_lock, flags);
++	list_for_each_entry(xfer_itr, &wa->xfer_list, list_node) {
++		if (id == xfer_itr->id) {
++			wa_xfer_get(xfer_itr);
++			goto out;
++		}
++	}
++	xfer_itr = NULL;
++out:
++	spin_unlock_irqrestore(&wa->xfer_list_lock, flags);
++	return xfer_itr;
++}
++
++struct wa_xfer_abort_buffer {
++	struct urb urb;
++	struct wa_xfer_abort cmd;
++};
++
++static void __wa_xfer_abort_cb(struct urb *urb)
++{
++	struct wa_xfer_abort_buffer *b = urb->context;
++	usb_put_urb(&b->urb);
++}
++
++/*
++ * Aborts an ongoing transaction
++ *
++ * Assumes the transfer is referenced and locked and in a submitted
++ * state (mainly that there is an endpoint/rpipe assigned).
++ *
++ * The callback (see above) does nothing but freeing up the data by
++ * putting the URB. Because the URB is allocated at the head of the
++ * struct, the whole space we allocated is kfreed.
++ *
++ * We'll get an 'aborted transaction' xfer result on DTI, that'll
++ * politely ignore because at this point the transaction has been
++ * marked as aborted already.
++ */
++static void __wa_xfer_abort(struct wa_xfer *xfer)
++{
++	int result;
++	struct device *dev = &xfer->wa->usb_iface->dev;
++	struct wa_xfer_abort_buffer *b;
++	struct wa_rpipe *rpipe = xfer->ep->hcpriv;
++
++	b = kmalloc(sizeof(*b), GFP_ATOMIC);
++	if (b == NULL)
++		goto error_kmalloc;
++	b->cmd.bLength =  sizeof(b->cmd);
++	b->cmd.bRequestType = WA_XFER_ABORT;
++	b->cmd.wRPipe = rpipe->descr.wRPipeIndex;
++	b->cmd.dwTransferID = wa_xfer_id(xfer);
++
++	usb_init_urb(&b->urb);
++	usb_fill_bulk_urb(&b->urb, xfer->wa->usb_dev,
++		usb_sndbulkpipe(xfer->wa->usb_dev,
++				xfer->wa->dto_epd->bEndpointAddress),
++		&b->cmd, sizeof(b->cmd), __wa_xfer_abort_cb, b);
++	result = usb_submit_urb(&b->urb, GFP_ATOMIC);
++	if (result < 0)
++		goto error_submit;
++	return;				/* callback frees! */
++
++
++error_submit:
++	if (printk_ratelimit())
++		dev_err(dev, "xfer %p: Can't submit abort request: %d\n",
++			xfer, result);
++	kfree(b);
++error_kmalloc:
++	return;
++
++}
++
++/*
++ *
++ * @returns < 0 on error, transfer segment request size if ok
++ */
++static ssize_t __wa_xfer_setup_sizes(struct wa_xfer *xfer,
++				     enum wa_xfer_type *pxfer_type)
++{
++	ssize_t result;
++	struct device *dev = &xfer->wa->usb_iface->dev;
++	size_t maxpktsize;
++	struct urb *urb = xfer->urb;
++	struct wa_rpipe *rpipe = xfer->ep->hcpriv;
++
++	d_fnstart(3, dev, "(xfer %p [rpipe %p] urb %p)\n",
++		  xfer, rpipe, urb);
++	switch (rpipe->descr.bmAttribute & 0x3) {
++	case USB_ENDPOINT_XFER_CONTROL:
++		*pxfer_type = WA_XFER_TYPE_CTL;
++		result = sizeof(struct wa_xfer_ctl);
++		break;
++	case USB_ENDPOINT_XFER_INT:
++	case USB_ENDPOINT_XFER_BULK:
++		*pxfer_type = WA_XFER_TYPE_BI;
++		result = sizeof(struct wa_xfer_bi);
++		break;
++	case USB_ENDPOINT_XFER_ISOC:
++		dev_err(dev, "FIXME: ISOC not implemented\n");
++		result = -ENOSYS;
++		goto error;
++	default:
++		/* never happens */
++		BUG();
++		result = -EINVAL;	/* shut gcc up */
++	};
++	xfer->is_inbound = urb->pipe & USB_DIR_IN? 1 : 0;
++	xfer->is_dma = urb->transfer_flags & URB_NO_TRANSFER_DMA_MAP? 1 : 0;
++	xfer->seg_size = le16_to_cpu(rpipe->descr.wBlocks)
++		* 1 << (xfer->wa->wa_descr->bRPipeBlockSize - 1);
++	/* Compute the segment size and make sure it is a multiple of
++	 * the maxpktsize (WUSB1.0[8.3.3.1])...not really too much of
++	 * a check (FIXME) */
++	maxpktsize = le16_to_cpu(rpipe->descr.wMaxPacketSize);
++	if (xfer->seg_size < maxpktsize) {
++		dev_err(dev, "HW BUG? seg_size %zu smaller than maxpktsize "
++			"%zu\n", xfer->seg_size, maxpktsize);
++		result = -EINVAL;
++		goto error;
++	}
++	xfer->seg_size = (xfer->seg_size / maxpktsize) * maxpktsize;
++	xfer->segs = (urb->transfer_buffer_length + xfer->seg_size - 1)
++		/ xfer->seg_size;
++	if (xfer->segs >= WA_SEGS_MAX) {
++		dev_err(dev, "BUG? ops, number of segments %d bigger than %d\n",
++			(int)(urb->transfer_buffer_length / xfer->seg_size),
++			WA_SEGS_MAX);
++		result = -EINVAL;
++		goto error;
++	}
++	if (xfer->segs == 0 && *pxfer_type == WA_XFER_TYPE_CTL)
++		xfer->segs = 1;
++error:
++	d_fnend(3, dev, "(xfer %p [rpipe %p] urb %p) = %d\n",
++		xfer, rpipe, urb, (int)result);
++	return result;
++}
++
++/** Fill in the common request header and xfer-type specific data. */
++static void __wa_xfer_setup_hdr0(struct wa_xfer *xfer,
++				 struct wa_xfer_hdr *xfer_hdr0,
++				 enum wa_xfer_type xfer_type,
++				 size_t xfer_hdr_size)
++{
++	struct wa_rpipe *rpipe = xfer->ep->hcpriv;
++
++	xfer_hdr0 = &xfer->seg[0]->xfer_hdr;
++	xfer_hdr0->bLength = xfer_hdr_size;
++	xfer_hdr0->bRequestType = xfer_type;
++	xfer_hdr0->wRPipe = rpipe->descr.wRPipeIndex;
++	xfer_hdr0->dwTransferID = wa_xfer_id(xfer);
++	xfer_hdr0->bTransferSegment = 0;
++	switch (xfer_type) {
++	case WA_XFER_TYPE_CTL: {
++		struct wa_xfer_ctl *xfer_ctl =
++			container_of(xfer_hdr0, struct wa_xfer_ctl, hdr);
++		xfer_ctl->bmAttribute = xfer->is_inbound? 1 : 0;
++		BUG_ON(xfer->urb->transfer_flags & URB_NO_SETUP_DMA_MAP
++		       && xfer->urb->setup_packet == NULL);
++		memcpy(&xfer_ctl->baSetupData, xfer->urb->setup_packet,
++		       sizeof(xfer_ctl->baSetupData));
++		break;
++	}
++	case WA_XFER_TYPE_BI:
++		break;
++	case WA_XFER_TYPE_ISO:
++		printk(KERN_ERR "FIXME: ISOC not implemented\n");
++	default:
++		BUG();
++	};
++}
++
++/*
++ * Callback for the OUT data phase of the segment request
++ *
++ * Check wa_seg_cb(); most comments also apply here because this
++ * function does almost the same thing and they work closely
++ * together.
++ *
++ * If the seg request has failed but this DTO phase has suceeded,
++ * wa_seg_cb() has already failed the segment and moved the
++ * status to WA_SEG_ERROR, so this will go through 'case 0' and
++ * effectively do nothing.
++ */
++static void wa_seg_dto_cb(struct urb *urb)
++{
++	struct wa_seg *seg = urb->context;
++	struct wa_xfer *xfer = seg->xfer;
++	struct wahc *wa;
++	struct device *dev;
++	struct wa_rpipe *rpipe;
++	unsigned long flags;
++	unsigned rpipe_ready = 0;
++	u8 done = 0;
++
++	d_fnstart(3, NULL, "(urb %p [%d])\n", urb, urb->status);
++	switch (urb->status) {
++	case 0:
++		spin_lock_irqsave(&xfer->lock, flags);
++		wa = xfer->wa;
++		dev = &wa->usb_iface->dev;
++		d_printf(2, dev, "xfer %p#%u: data out done (%d bytes)\n",
++			   xfer, seg->index, urb->actual_length);
++		if (seg->status < WA_SEG_PENDING)
++			seg->status = WA_SEG_PENDING;
++		seg->result = urb->actual_length;
++		spin_unlock_irqrestore(&xfer->lock, flags);
++		break;
++	case -ECONNRESET:	/* URB unlinked; no need to do anything */
++	case -ENOENT:		/* as it was done by the who unlinked us */
++		break;
++	default:		/* Other errors ... */
++		spin_lock_irqsave(&xfer->lock, flags);
++		wa = xfer->wa;
++		dev = &wa->usb_iface->dev;
++		rpipe = xfer->ep->hcpriv;
++		if (printk_ratelimit())
++			dev_err(dev, "xfer %p#%u: data out error %d\n",
++				xfer, seg->index, urb->status);
++		if (edc_inc(&wa->nep_edc, EDC_MAX_ERRORS,
++			    EDC_ERROR_TIMEFRAME)){
++			dev_err(dev, "DTO: URB max acceptable errors "
++				"exceeded, resetting device\n");
++			usb_dev_reset_delayed(wa->usb_dev);
++		}
++		if (seg->status != WA_SEG_ERROR) {
++			seg->status = WA_SEG_ERROR;
++			seg->result = urb->status;
++			xfer->segs_done++;
++			__wa_xfer_abort(xfer);
++			rpipe_ready = rpipe_avail_inc(rpipe);
++			done = __wa_xfer_is_done(xfer);
++		}
++		spin_unlock_irqrestore(&xfer->lock, flags);
++		if (done)
++			wa_xfer_completion(xfer);
++		if (rpipe_ready)
++			wa_xfer_delayed_run(rpipe);
++	}
++	d_fnend(3, NULL, "(urb %p [%d]) = void\n", urb, urb->status);
++}
++
++/*
++ * Callback for the segment request
++ *
++ * If succesful transition state (unless already transitioned or
++ * outbound transfer); otherwise, take a note of the error, mark this
++ * segment done and try completion.
++ *
++ * Note we don't access until we are sure that the transfer hasn't
++ * been cancelled (ECONNRESET, ENOENT), which could mean that
++ * seg->xfer could be already gone.
++ *
++ * We have to check before setting the status to WA_SEG_PENDING
++ * because sometimes the xfer result callback arrives before this
++ * callback (geeeeeeze), so it might happen that we are already in
++ * another state. As well, we don't set it if the transfer is inbound,
++ * as in that case, wa_seg_dto_cb will do it when the OUT data phase
++ * finishes.
++ */
++static void wa_seg_cb(struct urb *urb)
++{
++	struct wa_seg *seg = urb->context;
++	struct wa_xfer *xfer = seg->xfer;
++	struct wahc *wa;
++	struct device *dev;
++	struct wa_rpipe *rpipe;
++	unsigned long flags;
++	unsigned rpipe_ready;
++	u8 done = 0;
++
++	d_fnstart(3, NULL, "(urb %p [%d])\n", urb, urb->status);
++	switch (urb->status) {
++	case 0:
++		spin_lock_irqsave(&xfer->lock, flags);
++		wa = xfer->wa;
++		dev = &wa->usb_iface->dev;
++		d_printf(2, dev, "xfer %p#%u: request done\n",
++			   xfer, seg->index);
++		if (xfer->is_inbound && seg->status < WA_SEG_PENDING)
++			seg->status = WA_SEG_PENDING;
++		spin_unlock_irqrestore(&xfer->lock, flags);
++		break;
++	case -ECONNRESET:	/* URB unlinked; no need to do anything */
++	case -ENOENT:		/* as it was done by the who unlinked us */
++		break;
++	default:		/* Other errors ... */
++		spin_lock_irqsave(&xfer->lock, flags);
++		wa = xfer->wa;
++		dev = &wa->usb_iface->dev;
++		rpipe = xfer->ep->hcpriv;
++		if (printk_ratelimit())
++			dev_err(dev, "xfer %p#%u: request error %d\n",
++				xfer, seg->index, urb->status);
++		if (edc_inc(&wa->nep_edc, EDC_MAX_ERRORS,
++			    EDC_ERROR_TIMEFRAME)){
++			dev_err(dev, "DTO: URB max acceptable errors "
++				"exceeded, resetting device\n");
++			usb_dev_reset_delayed(wa->usb_dev);
++		}
++		usb_unlink_urb(seg->dto_urb);
++		seg->status = WA_SEG_ERROR;
++		seg->result = urb->status;
++		xfer->segs_done++;
++		__wa_xfer_abort(xfer);
++		rpipe_ready = rpipe_avail_inc(rpipe);
++		done = __wa_xfer_is_done(xfer);
++		spin_unlock_irqrestore(&xfer->lock, flags);
++		if (done)
++			wa_xfer_completion(xfer);
++		if (rpipe_ready)
++			wa_xfer_delayed_run(rpipe);
++	}
++	d_fnend(3, NULL, "(urb %p [%d]) = void\n", urb, urb->status);
++}
++
++/*
++ * Allocate the segs array and initialize each of them
++ *
++ * The segments are freed by wa_xfer_destroy() when the xfer use count
++ * drops to zero; however, because each segment is given the same life
++ * cycle as the USB URB it contains, it is actually freed by
++ * usb_put_urb() on the contained USB URB (twisted, eh?).
++ */
++static int __wa_xfer_setup_segs(struct wa_xfer *xfer, size_t xfer_hdr_size)
++{
++	int result, cnt;
++	size_t alloc_size = sizeof(*xfer->seg[0])
++		- sizeof(xfer->seg[0]->xfer_hdr) + xfer_hdr_size;
++	struct usb_device *usb_dev = xfer->wa->usb_dev;
++	const struct usb_endpoint_descriptor *dto_epd = xfer->wa->dto_epd;
++	struct wa_seg *seg;
++	size_t buf_itr, buf_size, buf_itr_size;
++
++	result = -ENOMEM;
++	xfer->seg = kzalloc(xfer->segs * sizeof(xfer->seg[0]), GFP_ATOMIC);
++	if (xfer->seg == NULL)
++		goto error_segs_kzalloc;
++	buf_itr = 0;
++	buf_size = xfer->urb->transfer_buffer_length;
++	for (cnt = 0; cnt < xfer->segs; cnt++) {
++		seg = xfer->seg[cnt] = kzalloc(alloc_size, GFP_ATOMIC);
++		if (seg == NULL)
++			goto error_seg_kzalloc;
++		wa_seg_init(seg);
++		seg->xfer = xfer;
++		seg->index = cnt;
++		usb_fill_bulk_urb(&seg->urb, usb_dev,
++				  usb_sndbulkpipe(usb_dev,
++						  dto_epd->bEndpointAddress),
++				  &seg->xfer_hdr, xfer_hdr_size,
++				  wa_seg_cb, seg);
++		buf_itr_size = buf_size > xfer->seg_size?
++			xfer->seg_size : buf_size;
++		if (xfer->is_inbound == 0 && buf_size > 0) {
++			seg->dto_urb = usb_alloc_urb(0, GFP_ATOMIC);
++			if (seg->dto_urb == NULL)
++				goto error_dto_alloc;
++			usb_fill_bulk_urb(
++				seg->dto_urb, usb_dev,
++				usb_sndbulkpipe(usb_dev,
++						dto_epd->bEndpointAddress),
++				NULL, 0, wa_seg_dto_cb, seg);
++			if (xfer->is_dma) {
++				seg->dto_urb->transfer_dma =
++					xfer->urb->transfer_dma + buf_itr;
++				seg->dto_urb->transfer_flags |=
++					URB_NO_TRANSFER_DMA_MAP;
++			} else
++				seg->dto_urb->transfer_buffer =
++					xfer->urb->transfer_buffer + buf_itr;
++			seg->dto_urb->transfer_buffer_length = buf_itr_size;
++		}
++		seg->status = WA_SEG_READY;
++		buf_itr += buf_itr_size;
++		buf_size -= buf_itr_size;
++	}
++	return 0;
++
++error_dto_alloc:
++	kfree(xfer->seg[cnt]);
++	cnt--;
++error_seg_kzalloc:
++	/* use the fact that cnt is left at were it failed */
++	for (; cnt > 0; cnt--) {
++		if (xfer->is_inbound == 0)
++			kfree(xfer->seg[cnt]->dto_urb);
++		kfree(xfer->seg[cnt]);
++	}
++error_segs_kzalloc:
++	return result;
++}
++
++/*
++ * Allocates all the stuff needed to submit a transfer
++ *
++ * Breaks the whole data buffer in a list of segments, each one has a
++ * structure allocated to it and linked in xfer->seg[index]
++ *
++ * FIXME: merge setup_segs() and the last part of this function, no
++ *        need to do two for loops when we could run everything in a
++ *        single one
++ */
++static int __wa_xfer_setup(struct wa_xfer *xfer, struct urb *urb)
++{
++	int result;
++	struct device *dev = &xfer->wa->usb_iface->dev;
++	enum wa_xfer_type xfer_type = 0; /* shut up GCC */
++	size_t xfer_hdr_size, cnt, transfer_size;
++	struct wa_xfer_hdr *xfer_hdr0, *xfer_hdr;
++
++	d_fnstart(3, dev, "(xfer %p [rpipe %p] urb %p)\n",
++		  xfer, xfer->ep->hcpriv, urb);
++
++	result = __wa_xfer_setup_sizes(xfer, &xfer_type);
++	if (result < 0)
++		goto error_setup_sizes;
++	xfer_hdr_size = result;
++	result = __wa_xfer_setup_segs(xfer, xfer_hdr_size);
++	if (result < 0) {
++		dev_err(dev, "xfer %p: Failed to allocate %d segments: %d\n",
++			xfer, xfer->segs, result);
++		goto error_setup_segs;
++	}
++	/* Fill the first header */
++	xfer_hdr0 = &xfer->seg[0]->xfer_hdr;
++	wa_xfer_id_init(xfer);
++	__wa_xfer_setup_hdr0(xfer, xfer_hdr0, xfer_type, xfer_hdr_size);
++
++	/* Fill remainig headers */
++	xfer_hdr = xfer_hdr0;
++	transfer_size = urb->transfer_buffer_length;
++	xfer_hdr0->dwTransferLength = transfer_size > xfer->seg_size?
++		xfer->seg_size : transfer_size;
++	transfer_size -=  xfer->seg_size;
++	for (cnt = 1; cnt < xfer->segs; cnt++) {
++		xfer_hdr = &xfer->seg[cnt]->xfer_hdr;
++		memcpy(xfer_hdr, xfer_hdr0, xfer_hdr_size);
++		xfer_hdr->bTransferSegment = cnt;
++		xfer_hdr->dwTransferLength = transfer_size > xfer->seg_size?
++			cpu_to_le32(xfer->seg_size)
++			: cpu_to_le32(transfer_size);
++		xfer->seg[cnt]->status = WA_SEG_READY;
++		transfer_size -=  xfer->seg_size;
++	}
++	xfer_hdr->bTransferSegment |= 0x80;	/* this is the last segment */
++	result = 0;
++error_setup_segs:
++error_setup_sizes:
++	d_fnend(3, dev, "(xfer %p [rpipe %p] urb %p) = %d\n",
++		xfer, xfer->ep->hcpriv, urb, result);
++	return result;
++}
++
++/*
++ *
++ *
++ * rpipe->seg_lock is held!
++ */
++static int __wa_seg_submit(struct wa_rpipe *rpipe, struct wa_xfer *xfer,
++			   struct wa_seg *seg)
++{
++	int result;
++	result = usb_submit_urb(&seg->urb, GFP_ATOMIC);
++	if (result < 0) {
++		printk(KERN_ERR "xfer %p#%u: REQ submit failed: %d\n",
++		       xfer, seg->index, result);
++		goto error_seg_submit;
++	}
++	if (seg->dto_urb) {
++		result = usb_submit_urb(seg->dto_urb, GFP_ATOMIC);
++		if (result < 0) {
++			printk(KERN_ERR "xfer %p#%u: DTO submit failed: %d\n",
++			       xfer, seg->index, result);
++			goto error_dto_submit;
++		}
++	}
++	seg->status = WA_SEG_SUBMITTED;
++	rpipe_avail_dec(rpipe);
++	return 0;
++
++error_dto_submit:
++	usb_unlink_urb(&seg->urb);
++error_seg_submit:
++	seg->status = WA_SEG_ERROR;
++	seg->result = result;
++	return result;
++}
++
++/*
++ * Execute more queued request segments until the maximum concurrent allowed
++ *
++ * The ugly unlock/lock sequence on the error path is needed as the
++ * xfer->lock normally nests the seg_lock and not viceversa.
++ *
++ */
++static void wa_xfer_delayed_run(struct wa_rpipe *rpipe)
++{
++	int result;
++	struct device *dev = &rpipe->wa->usb_iface->dev;
++	struct wa_seg *seg;
++	struct wa_xfer *xfer;
++	unsigned long flags;
++
++	d_fnstart(1, dev, "(rpipe #%d) %d segments available\n",
++		  le16_to_cpu(rpipe->descr.wRPipeIndex),
++		  atomic_read(&rpipe->segs_available));
++	spin_lock_irqsave(&rpipe->seg_lock, flags);
++	while (atomic_read(&rpipe->segs_available) > 0
++	      && !list_empty(&rpipe->seg_list)) {
++		seg = list_entry(rpipe->seg_list.next, struct wa_seg,
++				 list_node);
++		list_del(&seg->list_node);
++		xfer = seg->xfer;
++		result = __wa_seg_submit(rpipe, xfer, seg);
++		d_printf(1, dev, "xfer %p#%u submitted from delayed "
++			 "[%d segments available] %d\n",
++			 xfer, seg->index,
++			 atomic_read(&rpipe->segs_available), result);
++		if (unlikely(result < 0)) {
++			spin_unlock_irqrestore(&rpipe->seg_lock, flags);
++			spin_lock_irqsave(&xfer->lock, flags);
++			__wa_xfer_abort(xfer);
++			xfer->segs_done++;
++			spin_unlock_irqrestore(&xfer->lock, flags);
++			spin_lock_irqsave(&rpipe->seg_lock, flags);
++		}
++	}
++	spin_unlock_irqrestore(&rpipe->seg_lock, flags);
++	d_fnend(1, dev, "(rpipe #%d) = void, %d segments available\n",
++		le16_to_cpu(rpipe->descr.wRPipeIndex),
++		atomic_read(&rpipe->segs_available));
++
++}
++
++/*
++ *
++ * xfer->lock is taken
++ *
++ * On failure submitting we just stop submitting and return error;
++ * wa_urb_enqueue_b() will execute the completion path
++ */
++static int __wa_xfer_submit(struct wa_xfer *xfer)
++{
++	int result;
++	struct wahc *wa = xfer->wa;
++	struct device *dev = &wa->usb_iface->dev;
++	unsigned cnt;
++	struct wa_seg *seg;
++	unsigned long flags;
++	struct wa_rpipe *rpipe = xfer->ep->hcpriv;
++	size_t maxrequests = le16_to_cpu(rpipe->descr.wRequests);
++	u8 available;
++	u8 empty;
++
++	d_fnstart(3, dev, "(xfer %p [rpipe %p])\n",
++		  xfer, xfer->ep->hcpriv);
++
++	spin_lock_irqsave(&wa->xfer_list_lock, flags);
++	list_add_tail(&xfer->list_node, &wa->xfer_list);
++	spin_unlock_irqrestore(&wa->xfer_list_lock, flags);
++
++	BUG_ON(atomic_read(&rpipe->segs_available) > maxrequests);
++	result = 0;
++	spin_lock_irqsave(&rpipe->seg_lock, flags);
++	for (cnt = 0; cnt < xfer->segs; cnt++) {
++		available = atomic_read(&rpipe->segs_available);
++		empty = list_empty(&rpipe->seg_list);
++		seg = xfer->seg[cnt];
++		d_printf(2, dev, "xfer %p#%u: available %u empty %u (%s)\n",
++			 xfer, cnt, available, empty,
++			 available == 0 || !empty? "delayed" : "submitted");
++		if (available == 0 || !empty) {
++			d_printf(1, dev, "xfer %p#%u: delayed\n", xfer, cnt);
++			seg->status = WA_SEG_DELAYED;
++			list_add_tail(&seg->list_node, &rpipe->seg_list);
++		} else {
++			result = __wa_seg_submit(rpipe, xfer, seg);
++			if (result < 0)
++				goto error_seg_submit;
++		}
++		xfer->segs_submitted++;
++	}
++	spin_unlock_irqrestore(&rpipe->seg_lock, flags);
++	d_fnend(3, dev, "(xfer %p [rpipe %p]) = void\n", xfer,
++		xfer->ep->hcpriv);
++	return result;
++
++error_seg_submit:
++	__wa_xfer_abort(xfer);
++	spin_unlock_irqrestore(&rpipe->seg_lock, flags);
++	d_fnend(3, dev, "(xfer %p [rpipe %p]) = void\n", xfer,
++		xfer->ep->hcpriv);
++	return result;
++}
++
++/*
++ * Second part of a URB/transfer enqueuement
++ *
++ * Assumes this comes from wa_urb_enqueue() [maybe through
++ * wa_urb_enqueue_run()]. At this point:
++ *
++ * xfer->wa	filled and refcounted
++ * xfer->ep	filled with rpipe refcounted if
++ *              delayed == 0
++ * xfer->urb 	filled and refcounted (this is the case when called
++ *              from wa_urb_enqueue() as we come from usb_submit_urb()
++ *              and when called by wa_urb_enqueue_run(), as we took an
++ *              extra ref dropped by _run() after we return).
++ * xfer->gfp	filled
++ *
++ * If we fail at __wa_xfer_submit(), then we just check if we are done
++ * and if so, we run the completion procedure. However, if we are not
++ * yet done, we do nothing and wait for the completion handlers from
++ * the submitted URBs or from the xfer-result path to kick in. If xfer
++ * result never kicks in, the xfer will timeout from the USB code and
++ * dequeue() will be called.
++ */
++static void wa_urb_enqueue_b(struct wa_xfer *xfer)
++{
++	int result;
++	unsigned long flags;
++	struct urb *urb = xfer->urb;
++	struct wahc *wa = xfer->wa;
++	struct wusbhc *wusbhc = wa->wusb;
++	struct device *dev = &wa->usb_iface->dev;
++	struct wusb_dev *wusb_dev;
++	unsigned done;
++
++	d_fnstart(3, dev, "(wa %p urb %p)\n", wa, urb);
++	result = rpipe_get_by_ep(wa, xfer->ep, urb, xfer->gfp);
++	if (result < 0)
++		goto error_rpipe_get;
++	result = -ENODEV;
++	/* FIXME: segmentation broken -- kills DWA */
++	mutex_lock(&wusbhc->mutex);		/* get a WUSB dev */
++	if (urb->dev == NULL)
++		goto error_dev_gone;
++	wusb_dev = __wusb_dev_get_by_usb_dev(wusbhc, urb->dev);
++	if (wusb_dev == NULL) {
++		mutex_unlock(&wusbhc->mutex);
++		goto error_dev_gone;
++	}
++	mutex_unlock(&wusbhc->mutex);
++
++	spin_lock_irqsave(&xfer->lock, flags);
++	xfer->wusb_dev = wusb_dev;
++	result = urb->status;
++	if (urb->status != -EINPROGRESS)
++		goto error_dequeued;
++
++	result = __wa_xfer_setup(xfer, urb);
++	if (result < 0)
++		goto error_xfer_setup;
++	result = __wa_xfer_submit(xfer);
++	if (result < 0)
++		goto error_xfer_submit;
++	spin_unlock_irqrestore(&xfer->lock, flags);
++	d_fnend(3, dev, "(wa %p urb %p) = void\n", wa, urb);
++	return;
++
++	/* this is basically wa_xfer_completion() broken up wa_xfer_giveback()
++	 * does a wa_xfer_put() that will call wa_xfer_destroy() and clean
++	 * upundo setup().
++	 */
++error_xfer_setup:
++error_dequeued:
++	spin_unlock_irqrestore(&xfer->lock, flags);
++	/* FIXME: segmentation broken, kills DWA */
++	if (wusb_dev)
++		wusb_dev_put(wusb_dev);
++error_dev_gone:
++	rpipe_put(xfer->ep->hcpriv);
++error_rpipe_get:
++	xfer->result = result;
++	wa_xfer_giveback(xfer);
++	d_fnend(3, dev, "(wa %p urb %p) = (void) %d\n", wa, urb, result);
++	return;
++
++error_xfer_submit:
++	done = __wa_xfer_is_done(xfer);
++	xfer->result = result;
++	spin_unlock_irqrestore(&xfer->lock, flags);
++	if (done)
++		wa_xfer_completion(xfer);
++	d_fnend(3, dev, "(wa %p urb %p) = (void) %d\n", wa, urb, result);
++	return;
++}
++
++/*
++ * Execute the delayed transfers in the Wire Adapter @wa
++ *
++ * We need to be careful here, as dequeue() could be called in the
++ * middle.  That's why we do the whole thing under the
++ * wa->xfer_list_lock. If dequeue() jumps in, it first locks urb->lock
++ * and then checks the list -- so as we would be acquiring in inverse
++ * order, we just drop the lock once we have the xfer and reacquire it
++ * later.
++ */
++void wa_urb_enqueue_run(struct work_struct *ws)
++{
++	struct wahc *wa = container_of(ws, struct wahc, xfer_work);
++	struct device *dev = &wa->usb_iface->dev;
++	struct wa_xfer *xfer, *next;
++	struct urb *urb;
++
++	d_fnstart(3, dev, "(wa %p)\n", wa);
++	spin_lock_irq(&wa->xfer_list_lock);
++	list_for_each_entry_safe(xfer, next, &wa->xfer_delayed_list,
++				 list_node) {
++		list_del_init(&xfer->list_node);
++		spin_unlock_irq(&wa->xfer_list_lock);
++
++		urb = xfer->urb;
++		wa_urb_enqueue_b(xfer);
++		usb_put_urb(urb);	/* taken when queuing */
++
++		spin_lock_irq(&wa->xfer_list_lock);
++	}
++	spin_unlock_irq(&wa->xfer_list_lock);
++	d_fnend(3, dev, "(wa %p) = void\n", wa);
++}
++EXPORT_SYMBOL_GPL(wa_urb_enqueue_run);
++
++/*
++ * Submit a transfer to the Wire Adapter in a delayed way
++ *
++ * The process of enqueuing involves possible sleeps() [see
++ * enqueue_b(), for the rpipe_get() and the mutex_lock()]. If we are
++ * in an atomic section, we defer the enqueue_b() call--else we call direct.
++ *
++ * @urb: We own a reference to it done by the HCI Linux USB stack that
++ *       will be given up by calling usb_hcd_giveback_urb() or by
++ *       returning error from this function -> ergo we don't have to
++ *       refcount it.
++ */
++int wa_urb_enqueue(struct wahc *wa, struct usb_host_endpoint *ep,
++		   struct urb *urb, gfp_t gfp)
++{
++	int result;
++	struct device *dev = &wa->usb_iface->dev;
++	struct wa_xfer *xfer;
++	unsigned long my_flags;
++	unsigned cant_sleep = irqs_disabled() | in_atomic();
++
++	d_fnstart(3, dev, "(wa %p ep %p urb %p [%d] gfp 0x%x)\n",
++		  wa, ep, urb, urb->transfer_buffer_length, gfp);
++
++	if (urb->transfer_buffer == NULL
++	    && !(urb->transfer_flags & URB_NO_TRANSFER_DMA_MAP)
++	    && urb->transfer_buffer_length != 0) {
++		dev_err(dev, "BUG? urb %p: NULL xfer buffer & NODMA\n", urb);
++		dump_stack();
++	}
++
++	result = -ENOMEM;
++	xfer = kzalloc(sizeof(*xfer), gfp);
++	if (xfer == NULL)
++		goto error_kmalloc;
++
++	result = -ENOENT;
++	if (urb->status != -EINPROGRESS)	/* cancelled */
++		goto error_dequeued;		/* before starting? */
++	wa_xfer_init(xfer);
++	xfer->wa = wa_get(wa);
++	xfer->urb = urb;
++	xfer->gfp = gfp;
++	xfer->ep = ep;
++	urb->hcpriv = xfer;
++	d_printf(2, dev, "xfer %p urb %p pipe 0x%02x [%d bytes] %s %s %s\n",
++		 xfer, urb, urb->pipe, urb->transfer_buffer_length,
++		 urb->transfer_flags & URB_NO_TRANSFER_DMA_MAP? "dma" : "nodma",
++		 urb->pipe & USB_DIR_IN? "inbound" : "outbound",
++		 cant_sleep? "deferred" : "inline");
++	if (cant_sleep) {
++		usb_get_urb(urb);
++		spin_lock_irqsave(&wa->xfer_list_lock, my_flags);
++		list_add_tail(&xfer->list_node, &wa->xfer_delayed_list);
++		spin_unlock_irqrestore(&wa->xfer_list_lock, my_flags);
++		queue_work(wusbd, &wa->xfer_work);
++	} else {
++		wa_urb_enqueue_b(xfer);
++	}
++	d_fnend(3, dev, "(wa %p ep %p urb %p [%d] gfp 0x%x) = 0\n",
++		wa, ep, urb, urb->transfer_buffer_length, gfp);
++	return 0;
++
++error_dequeued:
++	kfree(xfer);
++error_kmalloc:
++	d_fnend(3, dev, "(wa %p ep %p urb %p [%d] gfp 0x%x) = %d\n",
++		wa, ep, urb, urb->transfer_buffer_length, gfp, result);
++	return result;
++}
++EXPORT_SYMBOL_GPL(wa_urb_enqueue);
++
++/*
++ * Dequeue a URB and make sure uwb_hcd_giveback_urb() [completion
++ * handler] is called.
++ *
++ * Until a transfer goes successfully through wa_urb_enqueue() it
++ * needs to be dequeued with completion calling; when stuck in delayed
++ * or before wa_xfer_setup() is called, we need to do completion.
++ *
++ *  not setup  If there is no hcpriv yet, that means that that enqueue
++ *             still had no time to set the xfer up. Because
++ *             urb->status should be other than -EINPROGRESS,
++ *             enqueue() will catch that and bail out.
++ *
++ * If the transfer has gone through setup, we just need to clean it
++ * up. If it has gone through submit(), we have to abort it [with an
++ * asynch request] and then make sure we cancel each segment.
++ *
++ */
++int wa_urb_dequeue(struct wahc *wa, struct urb *urb)
++{
++	struct device *dev = &wa->usb_iface->dev;
++	unsigned long flags, flags2;
++	struct wa_xfer *xfer;
++	struct wa_seg *seg;
++	struct wa_rpipe *rpipe;
++	unsigned cnt;
++	unsigned rpipe_ready = 0;
++
++	d_fnstart(3, dev, "(wa %p, urb %p)\n", wa, urb);
++
++	d_printf(1, dev, "xfer %p urb %p: aborting\n", urb->hcpriv, urb);
++	xfer = urb->hcpriv;
++	if (xfer == NULL) {
++		/* NOthing setup yet enqueue will see urb->status !=
++		 * -EINPROGRESS (by hcd layer) and bail out with
++		 * error, no need to do completion
++		 */
++		BUG_ON(urb->status == -EINPROGRESS);
++		goto out;
++	}
++	spin_lock_irqsave(&xfer->lock, flags);
++	rpipe = xfer->ep->hcpriv;
++	/* Check the delayed list -> if there, release and complete */
++	spin_lock_irqsave(&wa->xfer_list_lock, flags2);
++	if (!list_empty(&xfer->list_node) && xfer->seg == NULL)
++		goto dequeue_delayed;
++	spin_unlock_irqrestore(&wa->xfer_list_lock, flags2);
++	if (xfer->seg == NULL)  	/* still hasn't reached */
++		goto out_unlock;	/* setup(), enqueue_b() completes */
++	/* Ok, the xfer is in flight already, it's been setup and submitted.*/
++	__wa_xfer_abort(xfer);
++	for (cnt = 0; cnt < xfer->segs; cnt++) {
++		seg = xfer->seg[cnt];
++		switch (seg->status) {
++		case WA_SEG_NOTREADY:
++		case WA_SEG_READY:
++			printk(KERN_ERR "xfer %p#%u: dequeue bad state %u\n",
++			       xfer, cnt, seg->status);
++			WARN_ON(1);
++			break;
++		case WA_SEG_DELAYED:
++			seg->status = WA_SEG_ABORTED;
++			spin_lock_irqsave(&rpipe->seg_lock, flags2);
++			list_del(&seg->list_node);
++			xfer->segs_done++;
++			rpipe_ready = rpipe_avail_inc(rpipe);
++			spin_unlock_irqrestore(&rpipe->seg_lock, flags2);
++			break;
++		case WA_SEG_SUBMITTED:
++			seg->status = WA_SEG_ABORTED;
++			usb_unlink_urb(&seg->urb);
++			if (xfer->is_inbound == 0)
++				usb_unlink_urb(seg->dto_urb);
++			xfer->segs_done++;
++			rpipe_ready = rpipe_avail_inc(rpipe);
++			break;
++		case WA_SEG_PENDING:
++			seg->status = WA_SEG_ABORTED;
++			xfer->segs_done++;
++			rpipe_ready = rpipe_avail_inc(rpipe);
++			break;
++		case WA_SEG_DTI_PENDING:
++			usb_unlink_urb(wa->dti_urb);
++			seg->status = WA_SEG_ABORTED;
++			xfer->segs_done++;
++			rpipe_ready = rpipe_avail_inc(rpipe);
++			break;
++		case WA_SEG_DONE:
++		case WA_SEG_ERROR:
++		case WA_SEG_ABORTED:
++			break;
++		}
++	}
++	xfer->result = urb->status;	/* -ENOENT or -ECONNRESET */
++	__wa_xfer_is_done(xfer);
++	spin_unlock_irqrestore(&xfer->lock, flags);
++	wa_xfer_completion(xfer);
++	if (rpipe_ready)
++		wa_xfer_delayed_run(rpipe);
++	d_fnend(3, dev, "(wa %p, urb %p) = 0\n", wa, urb);
++	return 0;
++
++out_unlock:
++	spin_unlock_irqrestore(&xfer->lock, flags);
++out:
++	d_fnend(3, dev, "(wa %p, urb %p) = 0\n", wa, urb);
++	return 0;
++
++dequeue_delayed:
++	list_del_init(&xfer->list_node);
++	spin_unlock_irqrestore(&wa->xfer_list_lock, flags2);
++	xfer->result = urb->status;
++	spin_unlock_irqrestore(&xfer->lock, flags);
++	wa_xfer_giveback(xfer);
++	usb_put_urb(urb);		/* we got a ref in enqueue() */
++	d_fnend(3, dev, "(wa %p, urb %p) = 0\n", wa, urb);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(wa_urb_dequeue);
++
++/*
++ * Translation from WA status codes (WUSB1.0 Table 8.15) to errno
++ * codes
++ *
++ * Positive errno values are internal inconsistencies and should be
++ * flagged louder. Negative are to be passed up to the user in the
++ * normal way.
++ *
++ * @status: USB WA status code -- high two bits are stripped.
++ */
++static int wa_xfer_status_to_errno(u8 status)
++{
++	int errno;
++	u8 real_status = status;
++	static int xlat[] = {
++		[WA_XFER_STATUS_SUCCESS] = 		0,
++		[WA_XFER_STATUS_HALTED] = 		-EPIPE,
++		[WA_XFER_STATUS_DATA_BUFFER_ERROR] = 	-ENOBUFS,
++		[WA_XFER_STATUS_BABBLE] = 		-EOVERFLOW,
++		[WA_XFER_RESERVED] = 			EINVAL,
++		[WA_XFER_STATUS_NOT_FOUND] =		0,
++		[WA_XFER_STATUS_INSUFFICIENT_RESOURCE] = -ENOMEM,
++		[WA_XFER_STATUS_TRANSACTION_ERROR] = 	-EILSEQ,
++		[WA_XFER_STATUS_ABORTED] = 		-EINTR,
++		[WA_XFER_STATUS_RPIPE_NOT_READY] = 	EINVAL,
++		[WA_XFER_INVALID_FORMAT] = 		EINVAL,
++		[WA_XFER_UNEXPECTED_SEGMENT_NUMBER] = 	EINVAL,
++		[WA_XFER_STATUS_RPIPE_TYPE_MISMATCH] = 	EINVAL,
++	};
++	status &= 0x3f;
++
++	if (status == 0)
++		return 0;
++	if (status >= ARRAY_SIZE(xlat)) {
++		if (printk_ratelimit())
++			printk(KERN_ERR "%s(): BUG? "
++			       "Unknown WA transfer status 0x%02x\n",
++			       __func__, real_status);
++		return -EINVAL;
++	}
++	errno = xlat[status];
++	if (unlikely(errno > 0)) {
++		if (printk_ratelimit())
++			printk(KERN_ERR "%s(): BUG? "
++			       "Inconsistent WA status: 0x%02x\n",
++			       __func__, real_status);
++		errno = -errno;
++	}
++	return errno;
++}
++
++/*
++ * Process a xfer result completion message
++ *
++ * inbound transfers: need to schedule a DTI read
++ *
++ * FIXME: this functio needs to be broken up in parts
++ */
++static void wa_xfer_result_chew(struct wahc *wa, struct wa_xfer *xfer)
++{
++	int result;
++	struct device *dev = &wa->usb_iface->dev;
++	unsigned long flags;
++	u8 seg_idx;
++	struct wa_seg *seg;
++	struct wa_rpipe *rpipe;
++	struct wa_xfer_result *xfer_result = wa->xfer_result;
++	u8 done = 0;
++	u8 usb_status;
++	unsigned rpipe_ready = 0;
++
++	d_fnstart(3, dev, "(wa %p xfer %p)\n", wa, xfer);
++	spin_lock_irqsave(&xfer->lock, flags);
++	seg_idx = xfer_result->bTransferSegment & 0x7f;
++	if (unlikely(seg_idx >= xfer->segs))
++		goto error_bad_seg;
++	seg = xfer->seg[seg_idx];
++	rpipe = xfer->ep->hcpriv;
++	usb_status = xfer_result->bTransferStatus;
++	d_printf(2, dev, "xfer %p#%u: bTransferStatus 0x%02x (seg %u)\n",
++		 xfer, seg_idx, usb_status, seg->status);
++	if (seg->status == WA_SEG_ABORTED
++	    || seg->status == WA_SEG_ERROR)	/* already handled */
++		goto segment_aborted;
++	if (seg->status == WA_SEG_SUBMITTED)	/* ops, got here */
++		seg->status = WA_SEG_PENDING;	/* before wa_seg{_dto}_cb() */
++	if (seg->status != WA_SEG_PENDING) {
++		if (printk_ratelimit())
++			dev_err(dev, "xfer %p#%u: Bad segment state %u\n",
++				xfer, seg_idx, seg->status);
++		seg->status = WA_SEG_PENDING;	/* workaround/"fix" it */
++	}
++	if (usb_status & 0x80) {
++		seg->result = wa_xfer_status_to_errno(usb_status);
++		dev_err(dev, "DTI: xfer %p#%u failed (0x%02x)\n",
++			xfer, seg->index, usb_status);
++		goto error_complete;
++	}
++	/* FIXME: we ignore warnings, tally them for stats */
++	if (usb_status & 0x40) 		/* Warning?... */
++		usb_status = 0;		/* ... pass */
++	if (xfer->is_inbound) {	/* IN data phase: read to buffer */
++		seg->status = WA_SEG_DTI_PENDING;
++		BUG_ON(wa->buf_in_urb->status == -EINPROGRESS);
++		if (xfer->is_dma) {
++			wa->buf_in_urb->transfer_dma =
++				xfer->urb->transfer_dma
++				+ seg_idx * xfer->seg_size;
++			wa->buf_in_urb->transfer_flags
++				|= URB_NO_TRANSFER_DMA_MAP;
++		} else {
++			wa->buf_in_urb->transfer_buffer =
++				xfer->urb->transfer_buffer
++				+ seg_idx * xfer->seg_size;
++			wa->buf_in_urb->transfer_flags
++				&= ~URB_NO_TRANSFER_DMA_MAP;
++		}
++		wa->buf_in_urb->transfer_buffer_length =
++			le32_to_cpu(xfer_result->dwTransferLength);
++		wa->buf_in_urb->context = seg;
++		result = usb_submit_urb(wa->buf_in_urb, GFP_ATOMIC);
++		if (result < 0)
++			goto error_submit_buf_in;
++	} else {
++		/* OUT data phase, complete it -- */
++		seg->status = WA_SEG_DONE;
++		seg->result = le32_to_cpu(xfer_result->dwTransferLength);
++		xfer->segs_done++;
++		rpipe_ready = rpipe_avail_inc(rpipe);
++		done = __wa_xfer_is_done(xfer);
++	}
++	spin_unlock_irqrestore(&xfer->lock, flags);
++	if (done)
++		wa_xfer_completion(xfer);
++	if (rpipe_ready)
++		wa_xfer_delayed_run(rpipe);
++	d_fnend(3, dev, "(wa %p xfer %p) = void\n", wa, xfer);
++	return;
++
++
++error_submit_buf_in:
++	if (edc_inc(&wa->dti_edc, EDC_MAX_ERRORS, EDC_ERROR_TIMEFRAME)) {
++		dev_err(dev, "DTI: URB max acceptable errors "
++			"exceeded, resetting device\n");
++		usb_dev_reset_delayed(wa->usb_dev);
++	}
++	if (printk_ratelimit())
++		dev_err(dev, "xfer %p#%u: can't submit DTI data phase: %d\n",
++			xfer, seg_idx, result);
++	seg->result = result;
++error_complete:
++	seg->status = WA_SEG_ERROR;
++	xfer->segs_done++;
++	rpipe_ready = rpipe_avail_inc(rpipe);
++	__wa_xfer_abort(xfer);
++	done = __wa_xfer_is_done(xfer);
++	spin_unlock_irqrestore(&xfer->lock, flags);
++	if (done)
++		wa_xfer_completion(xfer);
++	if (rpipe_ready)
++		wa_xfer_delayed_run(rpipe);
++	d_fnend(3, dev, "(wa %p xfer %p) = void [segment/DTI-submit error]\n",
++		wa, xfer);
++	return;
++
++
++error_bad_seg:
++	spin_unlock_irqrestore(&xfer->lock, flags);
++	wa_urb_dequeue(wa, xfer->urb);
++	if (printk_ratelimit())
++		dev_err(dev, "xfer %p#%u: bad segment\n", xfer, seg_idx);
++	if (edc_inc(&wa->dti_edc, EDC_MAX_ERRORS, EDC_ERROR_TIMEFRAME)) {
++		dev_err(dev, "DTI: URB max acceptable errors "
++			"exceeded, resetting device\n");
++		usb_dev_reset_delayed(wa->usb_dev);
++	}
++	d_fnend(3, dev, "(wa %p xfer %p) = void [bad seg]\n", wa, xfer);
++	return;
++
++
++segment_aborted:
++	/* nothing to do, as the aborter did the completion */
++	spin_unlock_irqrestore(&xfer->lock, flags);
++	d_fnend(3, dev, "(wa %p xfer %p) = void [segment aborted]\n",
++		wa, xfer);
++	return;
++
++}
++
++/*
++ * Callback for the IN data phase
++ *
++ * If succesful transition state; otherwise, take a note of the
++ * error, mark this segment done and try completion.
++ *
++ * Note we don't access until we are sure that the transfer hasn't
++ * been cancelled (ECONNRESET, ENOENT), which could mean that
++ * seg->xfer could be already gone.
++ */
++static void wa_buf_in_cb(struct urb *urb)
++{
++	struct wa_seg *seg = urb->context;
++	struct wa_xfer *xfer = seg->xfer;
++	struct wahc *wa;
++	struct device *dev;
++	struct wa_rpipe *rpipe;
++	unsigned rpipe_ready;
++	unsigned long flags;
++	u8 done = 0;
++
++	d_fnstart(3, NULL, "(urb %p [%d])\n", urb, urb->status);
++	switch (urb->status) {
++	case 0:
++		spin_lock_irqsave(&xfer->lock, flags);
++		wa = xfer->wa;
++		dev = &wa->usb_iface->dev;
++		rpipe = xfer->ep->hcpriv;
++		d_printf(2, dev, "xfer %p#%u: data in done (%zu bytes)\n",
++			   xfer, seg->index, (size_t)urb->actual_length);
++		seg->status = WA_SEG_DONE;
++		seg->result = urb->actual_length;
++		xfer->segs_done++;
++		rpipe_ready = rpipe_avail_inc(rpipe);
++		done = __wa_xfer_is_done(xfer);
++		spin_unlock_irqrestore(&xfer->lock, flags);
++		if (done)
++			wa_xfer_completion(xfer);
++		if (rpipe_ready)
++			wa_xfer_delayed_run(rpipe);
++		break;
++	case -ECONNRESET:	/* URB unlinked; no need to do anything */
++	case -ENOENT:		/* as it was done by the who unlinked us */
++		break;
++	default:		/* Other errors ... */
++		spin_lock_irqsave(&xfer->lock, flags);
++		wa = xfer->wa;
++		dev = &wa->usb_iface->dev;
++		rpipe = xfer->ep->hcpriv;
++		if (printk_ratelimit())
++			dev_err(dev, "xfer %p#%u: data in error %d\n",
++				xfer, seg->index, urb->status);
++		if (edc_inc(&wa->nep_edc, EDC_MAX_ERRORS,
++			    EDC_ERROR_TIMEFRAME)){
++			dev_err(dev, "DTO: URB max acceptable errors "
++				"exceeded, resetting device\n");
++			usb_dev_reset_delayed(wa->usb_dev);
++		}
++		seg->status = WA_SEG_ERROR;
++		seg->result = urb->status;
++		xfer->segs_done++;
++		rpipe_ready = rpipe_avail_inc(rpipe);
++		__wa_xfer_abort(xfer);
++		done = __wa_xfer_is_done(xfer);
++		spin_unlock_irqrestore(&xfer->lock, flags);
++		if (done)
++			wa_xfer_completion(xfer);
++		if (rpipe_ready)
++			wa_xfer_delayed_run(rpipe);
++	}
++	d_fnend(3, NULL, "(urb %p [%d]) = void\n", urb, urb->status);
++}
++
++/*
++ * Handle an incoming transfer result buffer
++ *
++ * Given a transfer result buffer, it completes the transfer (possibly
++ * scheduling and buffer in read) and then resubmits the DTI URB for a
++ * new transfer result read.
++ *
++ *
++ * The xfer_result DTI URB state machine
++ *
++ * States: OFF | RXR (Read-Xfer-Result) | RBI (Read-Buffer-In)
++ *
++ * We start in OFF mode, the first xfer_result notification [through
++ * wa_handle_notif_xfer()] moves us to RXR by posting the DTI-URB to
++ * read.
++ *
++ * We receive a buffer -- if it is not a xfer_result, we complain and
++ * repost the DTI-URB. If it is a xfer_result then do the xfer seg
++ * request accounting. If it is an IN segment, we move to RBI and post
++ * a BUF-IN-URB to the right buffer. The BUF-IN-URB callback will
++ * repost the DTI-URB and move to RXR state. if there was no IN
++ * segment, it will repost the DTI-URB.
++ *
++ * We go back to OFF when we detect a ENOENT or ESHUTDOWN (or too many
++ * errors) in the URBs.
++ */
++static void wa_xfer_result_cb(struct urb *urb)
++{
++	int result;
++	struct wahc *wa = urb->context;
++	struct device *dev = &wa->usb_iface->dev;
++	struct wa_xfer_result *xfer_result;
++	u32 xfer_id;
++	struct wa_xfer *xfer;
++	u8 usb_status;
++
++	d_fnstart(3, dev, "(%p)\n", wa);
++	BUG_ON(wa->dti_urb != urb);
++	switch (wa->dti_urb->status) {
++	case 0:
++		/* We have a xfer result buffer; check it */
++		d_printf(2, dev, "DTI: xfer result %d bytes at %p\n",
++			   urb->actual_length, urb->transfer_buffer);
++		d_dump(3, dev, urb->transfer_buffer, urb->actual_length);
++		if (wa->dti_urb->actual_length != sizeof(*xfer_result)) {
++			dev_err(dev, "DTI Error: xfer result--bad size "
++				"xfer result (%d bytes vs %zu needed)\n",
++				urb->actual_length, sizeof(*xfer_result));
++			break;
++		}
++		xfer_result = wa->xfer_result;
++		if (xfer_result->hdr.bLength != sizeof(*xfer_result)) {
++			dev_err(dev, "DTI Error: xfer result--"
++				"bad header length %u\n",
++				xfer_result->hdr.bLength);
++			break;
++		}
++		if (xfer_result->hdr.bNotifyType != WA_XFER_RESULT) {
++			dev_err(dev, "DTI Error: xfer result--"
++				"bad header type 0x%02x\n",
++				xfer_result->hdr.bNotifyType);
++			break;
++		}
++		usb_status = xfer_result->bTransferStatus & 0x3f;
++		if (usb_status == WA_XFER_STATUS_ABORTED
++		    || usb_status == WA_XFER_STATUS_NOT_FOUND)
++			/* taken care of already */
++			break;
++		xfer_id = xfer_result->dwTransferID;
++		xfer = wa_xfer_get_by_id(wa, xfer_id);
++		if (xfer == NULL) {
++			/* FIXME: transaction might have been cancelled */
++			dev_err(dev, "DTI Error: xfer result--"
++				"unknown xfer 0x%08x (status 0x%02x)\n",
++				xfer_id, usb_status);
++			break;
++		}
++		wa_xfer_result_chew(wa, xfer);
++		wa_xfer_put(xfer);
++		break;
++	case -ENOENT:		/* (we killed the URB)...so, no broadcast */
++	case -ESHUTDOWN:	/* going away! */
++		dev_dbg(dev, "DTI: going down! %d\n", urb->status);
++		goto out;
++	default:
++		/* Unknown error */
++		if (edc_inc(&wa->dti_edc, EDC_MAX_ERRORS,
++			    EDC_ERROR_TIMEFRAME)) {
++			dev_err(dev, "DTI: URB max acceptable errors "
++				"exceeded, resetting device\n");
++			usb_dev_reset_delayed(wa->usb_dev);
++			goto out;
++		}
++		if (printk_ratelimit())
++			dev_err(dev, "DTI: URB error %d\n", urb->status);
++		break;
++	}
++	/* Resubmit the DTI URB */
++	result = usb_submit_urb(wa->dti_urb, GFP_ATOMIC);
++	if (result < 0) {
++		dev_err(dev, "DTI Error: Could not submit DTI URB (%d), "
++			"resetting\n", result);
++		usb_dev_reset_delayed(wa->usb_dev);
++	}
++out:
++	d_fnend(3, dev, "(%p) = void\n", wa);
++	return;
++}
++
++/*
++ * Transfer complete notification
++ *
++ * Called from the notif.c code. We get a notification on EP2 saying
++ * that some endpoint has some transfer result data available. We are
++ * about to read it.
++ *
++ * To speed up things, we always have a URB reading the DTI URB; we
++ * don't really set it up and start it until the first xfer complete
++ * notification arrives, which is what we do here.
++ *
++ * Follow up in wa_xfer_result_cb(), as that's where the whole state
++ * machine starts.
++ *
++ * So here we just initialize the DTI URB for reading transfer result
++ * notifications and also the buffer-in URB, for reading buffers. Then
++ * we just submit the DTI URB.
++ *
++ * @wa shall be referenced
++ */
++void wa_handle_notif_xfer(struct wahc *wa, struct wa_notif_hdr *notif_hdr)
++{
++	int result;
++	struct device *dev = &wa->usb_iface->dev;
++	struct wa_notif_xfer *notif_xfer;
++	const struct usb_endpoint_descriptor *dti_epd = wa->dti_epd;
++
++	d_fnstart(4, dev, "(%p, %p)\n", wa, notif_hdr);
++	notif_xfer = container_of(notif_hdr, struct wa_notif_xfer, hdr);
++	BUG_ON(notif_hdr->bNotifyType != WA_NOTIF_TRANSFER);
++
++	if ((0x80 | notif_xfer->bEndpoint) != dti_epd->bEndpointAddress) {
++		/* FIXME: hardcoded limitation, adapt */
++		dev_err(dev, "BUG: DTI ep is %u, not %u (hack me)\n",
++			notif_xfer->bEndpoint, dti_epd->bEndpointAddress);
++		goto error;
++	}
++	if (wa->dti_urb != NULL)	/* DTI URB already started */
++		goto out;
++
++	wa->dti_urb = usb_alloc_urb(0, GFP_KERNEL);
++	if (wa->dti_urb == NULL) {
++		dev_err(dev, "Can't allocate DTI URB\n");
++		goto error_dti_urb_alloc;
++	}
++	usb_fill_bulk_urb(
++		wa->dti_urb, wa->usb_dev,
++		usb_rcvbulkpipe(wa->usb_dev, 0x80 | notif_xfer->bEndpoint),
++		wa->xfer_result, wa->xfer_result_size,
++		wa_xfer_result_cb, wa);
++
++	wa->buf_in_urb = usb_alloc_urb(0, GFP_KERNEL);
++	if (wa->buf_in_urb == NULL) {
++		dev_err(dev, "Can't allocate BUF-IN URB\n");
++		goto error_buf_in_urb_alloc;
++	}
++	usb_fill_bulk_urb(
++		wa->buf_in_urb, wa->usb_dev,
++		usb_rcvbulkpipe(wa->usb_dev, 0x80 | notif_xfer->bEndpoint),
++		NULL, 0, wa_buf_in_cb, wa);
++	result = usb_submit_urb(wa->dti_urb, GFP_KERNEL);
++	if (result < 0) {
++		dev_err(dev, "DTI Error: Could not submit DTI URB (%d), "
++			"resetting\n", result);
++		goto error_dti_urb_submit;
++	}
++out:
++	d_fnend(4, dev, "(%p, %p) = void\n", wa, notif_hdr);
++	return;
++
++error_dti_urb_submit:
++	usb_put_urb(wa->buf_in_urb);
++error_buf_in_urb_alloc:
++	usb_put_urb(wa->dti_urb);
++	wa->dti_urb = NULL;
++error_dti_urb_alloc:
++error:
++	usb_dev_reset_delayed(wa->usb_dev);
++	d_fnend(4, dev, "(%p, %p) = void\n", wa, notif_hdr);
++	return;
++}

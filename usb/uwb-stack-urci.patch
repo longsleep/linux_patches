@@ -1,0 +1,1379 @@
+From David Vrabel <david.vrabel@csr.com> Tue May 13 10:33:19 2008
+From: Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
+Date: Tue, 13 May 2008 10:32:34 +0100
+Subject: uwb: add the UWB stack (radio controller interface)
+To: linux-uwb@bughost.org
+Cc: linux-usb@vger.kernel.org, David Vrabel <david.vrabel@csr.com>
+Message-ID: <20080513093318.960134206@csr.com>>
+Content-Disposition: inline; filename=uwb-stack-urci.patch
+
+
+From: Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
+
+Add the UWB radio controller interface (URCI) support.
+
+Signed-off-by: David Vrabel <david.vrabel@csr.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+---
+ drivers/uwb/est.c   |  414 +++++++++++++++++++++++++++++++++++
+ drivers/uwb/neh.c   |  615 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ drivers/uwb/reset.c |  319 ++++++++++++++++++++++++++
+ 3 files changed, 1348 insertions(+)
+
+--- /dev/null
++++ b/drivers/uwb/est.c
+@@ -0,0 +1,414 @@
++/*
++ * Ultra Wide Band Radio Control
++ * Event Size Tables management
++ *
++ * Copyright (C) 2005-2006 Intel Corporation
++ * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ *
++ *
++ * FIXME: docs
++ *
++ * Infrastructure, code and data tables for guessing the size of
++ * events received on the notification endpoints of UWB radio
++ * controllers.
++ *
++ * You define a table of events and for each, its size and how to get
++ * the extra size.
++ *
++ * ENTRY POINTS:
++ *
++ * uwb_est_{init/destroy}(): To initialize/release the EST subsystem.
++ *
++ * uwb_est_[u]register(): To un/register event size tables
++ *   uwb_est_grow()
++ *
++ * uwb_est_find_size(): Get the size of an event
++ *   uwb_est_get_size()
++ */
++#include <linux/spinlock.h>
++#define D_LOCAL 0
++#include <linux/uwb/debug.h>
++#include "uwb-internal.h"
++
++
++struct uwb_est {
++	u16 type_event_high;
++	u16 vendor, product;
++	u8 entries;
++	const struct uwb_est_entry *entry;
++};
++
++
++static struct uwb_est *uwb_est;
++static u8 uwb_est_size;
++static u8 uwb_est_used;
++static DEFINE_RWLOCK(uwb_est_lock);
++
++/**
++ * WUSB Standard Event Size Table, HWA-RC interface
++ *
++ * Sizes for events and notifications type 0 (general), high nibble 0.
++ */
++static
++struct uwb_est_entry uwb_est_00_00xx[] = {
++	[UWB_RC_EVT_BEACON] = {
++		.size = sizeof(struct uwb_rc_evt_beacon),
++		.offset = 1 + offsetof(struct uwb_rc_evt_beacon,
++				       wBeaconInfoLength),
++	},
++	[UWB_RC_EVT_BEACON_SIZE] = {
++		.size = sizeof(struct uwb_rc_evt_beacon_size),
++	},
++	[UWB_RC_EVT_BPOIE_CHANGE] = {
++		.size = sizeof(struct uwb_rc_evt_bpoie_change),
++		.offset = 1 + offsetof(struct uwb_rc_evt_bpoie_change,
++				       wBPOIELength),
++	},
++	[UWB_RC_EVT_DRP_AVAIL] = {
++		.size = sizeof(struct uwb_rc_evt_drp_avail)
++	},
++	[UWB_RC_EVT_DRP] = {
++		.size = sizeof(struct uwb_rc_evt_drp),
++		.offset = 1 + offsetof(struct uwb_rc_evt_drp, wIELength),
++	},
++	[UWB_RC_EVT_BP_SLOT_CHANGE] = {
++		.size = sizeof(struct uwb_rc_evt_bp_slot_change),
++	},
++	[UWB_RC_CMD_CHANNEL_CHANGE] = { .size = 5 },
++	[UWB_RC_CMD_DEV_ADDR_MGMT] = {
++		.size = sizeof(struct uwb_rc_evt_dev_addr_mgmt) },
++	[UWB_RC_CMD_GET_IE] = {
++		.size = sizeof(struct uwb_rc_evt_get_ie),
++		.offset = 1 + offsetof(struct uwb_rc_evt_get_ie, wIELength),
++	},
++	[UWB_RC_CMD_RESET] = { .size = 5 },
++	[UWB_RC_CMD_SCAN] = { .size = 5 },
++	[UWB_RC_CMD_SET_BEACON_FILTER] = { .size = 5 },
++	[UWB_RC_CMD_SET_DRP_IE] = { .size = 7 },
++	[UWB_RC_CMD_SET_IE] = { .size = 7 },
++	[UWB_RC_CMD_START_BEACON] = { .size = 5 },
++	[UWB_RC_CMD_STOP_BEACON] = { .size = 5 },
++};
++
++
++/**
++ * Initialize the EST subsystem
++ *
++ * Register the standard tables also.
++ *
++ * FIXME: tag init
++ */
++int uwb_est_create(void)
++{
++	int result;
++
++	uwb_est_size = 2;
++	uwb_est_used = 0;
++	uwb_est = kmalloc(uwb_est_size * sizeof(uwb_est[0]), GFP_KERNEL);
++	if (uwb_est == NULL)
++		return -ENOMEM;
++	memset(uwb_est, 0, uwb_est_size * sizeof(uwb_est[0]));
++	result = uwb_est_register(
++		UWB_RC_CET_GENERAL, 0, 0xffff, 0xffff, uwb_est_00_00xx,
++		sizeof(uwb_est_00_00xx) / sizeof(uwb_est_00_00xx[0]));
++	return result;
++}
++
++
++/** Clean it up */
++void uwb_est_destroy(void)
++{
++	kfree(uwb_est);
++	uwb_est = NULL;
++	uwb_est_size = uwb_est_used = 0;
++}
++
++
++/**
++ * Double the capacity of the EST table
++ *
++ * @returns 0 if ok, < 0 errno no error.
++ */
++static
++int uwb_est_grow(void)
++{
++	size_t actual_size = uwb_est_size * sizeof(uwb_est[0]);
++	void *new = kmalloc(2 * actual_size, GFP_ATOMIC);
++	if (new == NULL)
++		return -ENOMEM;
++	memcpy(new, uwb_est, actual_size);
++	memset(new + actual_size, 0, actual_size);
++	kfree(uwb_est);
++	uwb_est = new;
++	uwb_est_size *= 2;
++	return 0;
++}
++
++
++/**
++ * Register an event size table
++ *
++ * Makes room for it if the table is full, and then inserts  it in the
++ * right position (entries are sorted by type, event_high, vendor and
++ * then product).
++ *
++ * @vendor:  vendor code for matching against the device (0x0000 and
++ *           0xffff mean any); use 0x0000 to force all to match without
++ *           checking possible vendor specific ones, 0xfffff to match
++ *           after checking vendor specific ones.
++ *
++ * @product: product code from that vendor; same matching rules, use
++ *           0x0000 for not allowing vendor specific matches, 0xffff
++ *           for allowing.
++ *
++ * This arragement just makes the tables sort differenty. Because the
++ * table is sorted by growing type-event_high-vendor-product, a zero
++ * vendor will match before than a 0x456a vendor, that will match
++ * before a 0xfffff vendor.
++ *
++ * @returns 0 if ok, < 0 errno on error (-ENOENT if not found).
++ */
++/* FIXME: add bus type to vendor/product code */
++int uwb_est_register(u8 type, u8 event_high, u16 vendor, u16 product,
++		     const struct uwb_est_entry *entry, size_t entries)
++{
++	unsigned long flags;
++	unsigned itr;
++	u16 type_event_high;
++	int result = 0;
++
++	write_lock_irqsave(&uwb_est_lock, flags);
++	if (uwb_est_used == uwb_est_size) {
++		result = uwb_est_grow();
++		if (result < 0)
++			goto out;
++	}
++	/* Find the right spot to insert it in */
++	type_event_high = type << 8 | event_high;
++	for (itr = 0; itr < uwb_est_used; itr++)
++		if (uwb_est[itr].type_event_high < type
++		    && uwb_est[itr].vendor < vendor
++		    && uwb_est[itr].product < product)
++			break;
++
++	/* Shift others to make room for the new one? */
++	if (itr < uwb_est_used)
++		memmove(&uwb_est[itr+1], &uwb_est[itr], uwb_est_used - itr);
++	uwb_est[itr].type_event_high = type << 8 | event_high;
++	uwb_est[itr].vendor = vendor;
++	uwb_est[itr].product = product;
++	uwb_est[itr].entry = entry;
++	uwb_est[itr].entries = entries;
++	uwb_est_used++;
++out:
++	write_unlock_irqrestore(&uwb_est_lock, flags);
++	return result;
++}
++EXPORT_SYMBOL_GPL(uwb_est_register);
++
++
++/**
++ * Unregister an event size table
++ *
++ * This just removes the specified entry and moves the ones after it
++ * to fill in the gap. This is needed to keep the list sorted; no
++ * reallocation is done to reduce the size of the table.
++ *
++ * We unregister by all the data we used to register instead of by
++ * pointer to the @entry array because we might have used the same
++ * table for a bunch of IDs (for example).
++ *
++ * @returns 0 if ok, < 0 errno on error (-ENOENT if not found).
++ */
++int uwb_est_unregister(u8 type, u8 event_high, u16 vendor, u16 product,
++		       const struct uwb_est_entry *entry, size_t entries)
++{
++	unsigned long flags;
++	unsigned itr;
++	struct uwb_est est_cmp = {
++		.type_event_high = type << 8 | event_high,
++		.vendor = vendor,
++		.product = product,
++		.entry = entry,
++		.entries = entries
++	};
++	write_lock_irqsave(&uwb_est_lock, flags);
++	for (itr = 0; itr < uwb_est_used; itr++)
++		if (!memcmp(&uwb_est[itr], &est_cmp, sizeof(est_cmp)))
++			goto found;
++	write_unlock_irqrestore(&uwb_est_lock, flags);
++	return -ENOENT;
++
++found:
++	if (itr < uwb_est_used - 1)	/* Not last one? move ones above */
++		memmove(&uwb_est[itr], &uwb_est[itr+1], uwb_est_used - itr - 1);
++	uwb_est_used--;
++	write_unlock_irqrestore(&uwb_est_lock, flags);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(uwb_est_unregister);
++
++
++/**
++ * Get the size of an event from a table
++ *
++ * @rceb: pointer to the buffer with the event
++ * @rceb_size: size of the area pointed to by @rceb in bytes.
++ * @returns: > 0      Size of the event
++ *	     -ENOSPC  An area big enough was not provided to look
++ *		      ahead into the event's guts and guess the size.
++ *	     -EINVAL  Unknown event code (wEvent).
++ *
++ * This will look at the received RCEB and guess what is the total
++ * size. For variable sized events, it will look further ahead into
++ * their length field to see how much data should be read.
++ *
++ * Note this size is *not* final--the neh (Notification/Event Handle)
++ * might specificy an extra size to add.
++ */
++static
++ssize_t uwb_est_get_size(struct uwb_rc *uwb_rc, struct uwb_est *est,
++			 u8 event_low, const struct uwb_rceb *rceb,
++			 size_t rceb_size)
++{
++	unsigned offset;
++	ssize_t size;
++	struct device *dev = &uwb_rc->uwb_dev.dev;
++	const struct uwb_est_entry *entry;
++
++	size = -ENOENT;
++	if (event_low >= est->entries) {	/* in range? */
++		if (printk_ratelimit())
++			dev_err(dev, "EST %p 0x%04x/%04x/%04x[%u]: "
++				"event %u out of range\n",
++				est, est->type_event_high, est->vendor,
++				est->product, est->entries,
++				event_low);
++		goto out;
++	}
++	size = -ENOENT;
++	entry = &est->entry[event_low];
++	if (entry->size == 0 && entry->offset == 0) {	/* unknown? */
++		if (printk_ratelimit())
++			dev_err(dev, "EST %p 0x%04x/%04x/%04x[%u]: "
++				"event %u unknown\n",
++				est, est->type_event_high, est->vendor,
++				est->product, est->entries, event_low);
++		goto out;
++	}
++	offset = entry->offset;	/* extra fries with that? */
++	if (offset == 0)
++		size = entry->size;
++	else {
++		/* Ops, got an extra size field at 'offset'--read it */
++		const void *ptr = rceb;
++		size_t type_size = 0;
++		offset--;
++		size = -ENOSPC;			/* enough data for more? */
++		switch (entry->type) {
++		case UWB_EST_16:  type_size = sizeof(__le16); break;
++		case UWB_EST_8:   type_size = sizeof(u8);     break;
++		default: 	 BUG();
++		}
++		if (offset + type_size >= rceb_size) {
++			if (printk_ratelimit())
++				dev_err(dev, "EST %p 0x%04x/%04x/%04x[%u]: "
++					"not enough data to read extra size\n",
++					est, est->type_event_high, est->vendor,
++					est->product, est->entries);
++			goto out;
++		}
++		size = entry->size;
++		ptr += offset;
++		switch (entry->type) {
++		case UWB_EST_16:  size += le16_to_cpu(*(__le16 *)ptr); break;
++		case UWB_EST_8:   size += *(u8 *)ptr;                  break;
++		default: 	 BUG();
++		}
++	}
++out:
++	return size;
++}
++
++
++/**
++ * Guesses the size of a WA event
++ *
++ * @rceb: pointer to the buffer with the event
++ * @rceb_size: size of the area pointed to by @rceb in bytes.
++ * @returns: > 0      Size of the event
++ *	     -ENOSPC  An area big enough was not provided to look
++ *		      ahead into the event's guts and guess the size.
++ *	     -EINVAL  Unknown event code (wEvent).
++ *
++ * This will look at the received RCEB and guess what is the total
++ * size by checking all the tables registered with
++ * uwb_est_register(). For variable sized events, it will look further
++ * ahead into their length field to see how much data should be read.
++ *
++ * Note this size is *not* final--the neh (Notification/Event Handle)
++ * might specificy an extra size to add or replace.
++ */
++ssize_t uwb_est_find_size(struct uwb_rc *rc, const struct uwb_rceb *rceb,
++			  size_t rceb_size)
++{
++	/* FIXME: add vendor/product data */
++	ssize_t size;
++	struct device *dev = &rc->uwb_dev.dev;
++	unsigned long flags;
++	unsigned itr;
++	u16 type_event_high, event;
++	u8 *ptr = (u8 *) rceb;
++
++	read_lock_irqsave(&uwb_est_lock, flags);
++	d_printf(2, dev, "Size query for event 0x%02x/%04x/%02x,"
++		 " buffer size %ld\n",
++		 (unsigned) rceb->bEventType,
++		 (unsigned) le16_to_cpu(rceb->wEvent),
++		 (unsigned) rceb->bEventContext,
++		 (long) rceb_size);
++	size = -ENOSPC;
++	if (rceb_size < sizeof(*rceb))
++		goto out;
++	event = le16_to_cpu(rceb->wEvent);
++	type_event_high = rceb->bEventType << 8 | (event & 0xff00) >> 8;
++	for (itr = 0; itr < uwb_est_used; itr++) {
++		d_printf(3, dev, "Checking EST 0x%04x/%04x/%04x\n",
++			uwb_est[itr].type_event_high, uwb_est[itr].vendor,
++			uwb_est[itr].product);
++		if (uwb_est[itr].type_event_high != type_event_high)
++			continue;
++		size = uwb_est_get_size(rc, &uwb_est[itr],
++					event & 0x00ff, rceb, rceb_size);
++		/* try more tables that might handle the same type */
++		if (size != -ENOENT)
++			goto out;
++	}
++	/* FIXME: downgrade to _dbg() */
++	if (printk_ratelimit())
++		dev_err(dev, "event 0x%02x/%04x/%02x: no handlers available; "
++		"RCEB %02x %02x %02x %02x\n",
++			(unsigned) rceb->bEventType,
++			(unsigned) le16_to_cpu(rceb->wEvent),
++			(unsigned) rceb->bEventContext,
++			ptr[0], ptr[1], ptr[2], ptr[3]);
++	size = -ENOENT;
++out:
++	read_unlock_irqrestore(&uwb_est_lock, flags);
++	return size;
++}
++EXPORT_SYMBOL_GPL(uwb_est_find_size);
+--- /dev/null
++++ b/drivers/uwb/neh.c
+@@ -0,0 +1,615 @@
++/*
++ * WUSB Wire Adapter: Radio Control Interface (WUSB[8])
++ * Notification and Event Handling
++ *
++ * Copyright (C) 2005-2006 Intel Corporation
++ * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ *
++ *
++ * The RC interface of the Host Wire Adapter (USB dongle) or WHCI PCI
++ * card delivers a stream of notifications and events to the
++ * notification end event endpoint or area. This code takes care of
++ * getting a buffer with that data, breaking it up in separate
++ * notifications and events and then deliver those.
++ *
++ * Events are answers to commands and they carry a context ID that
++ * associates them to the command. Notifications are that,
++ * notifications, they come out of the blue and have a context ID of
++ * zero. Think of the context ID kind of like a handler. The
++ * uwb_rc_neh_* code deals with managing context IDs.
++ *
++ * This is why you require a handle to operate on a UWB host. When you
++ * open a handle a context ID is assigned to you.
++ *
++ * So, as it is done is:
++ *
++ * 1. Add an event handler [uwb_rc_neh_add()] (assigns a ctx id)
++ * 2. Issue command [rc->cmd(rc, ...)]
++ * 3. Arm the timeout timer [uwb_rc_neh_arm()]
++ * 4, Release the reference to the neh [uwb_rc_neh_put()]
++ * 5. Wait for the callback
++ * 6. Command result (RCEB) is passed to the callback
++ *
++ * If (2) fails, you should remove the handle [uwb_rc_neh_rm()]
++ * instead of arming the timer.
++ *
++ * Handles are for using in *serialized* code, single thread.
++ *
++ * When the notification/event comes, the IRQ handler/endpoint
++ * callback passes the data read to uwb_rc_neh_grok() which will break
++ * it up in a discrete series of events, look up who is listening for
++ * them and execute the pertinent callbacks.
++ *
++ * If the reader detects an error while reading the data stream, call
++ * uwb_rc_neh_error().
++ *
++ * CONSTRAINTS/ASSUMPTIONS:
++ *
++ * - Most notifications/events are small (less thank .5k), copying
++ *   around is ok.
++ *
++ * - Notifications/events are ALWAYS smaller than PAGE_SIZE
++ *
++ * - Notifications/events always come in a single piece (ie: a buffer
++ *   will always contain entire notifications/events).
++ *
++ * - we cannot know in advance how long each event is (because they
++ *   lack a length field in their header--smart move by the standards
++ *   body, btw). So we need a facility to get the event size given the
++ *   header. This is what the EST code does (notif/Event Size
++ *   Tables), check nest.c--as well, you can associate the size to
++ *   the handle [w/ neh->extra_size()].
++ *
++ * - Most notifications/events are fixed size; only a few are variable
++ *   size (NEST takes care of that).
++ *
++ * - Listeners of events expect them, so they usually provide a
++ *   buffer, as they know the size. Listeners to notifications don't,
++ *   so we allocate their buffers dynamically.
++ */
++#include <linux/kernel.h>
++#include <linux/timer.h>
++#include <linux/err.h>
++
++#include "uwb-internal.h"
++#define D_LOCAL 0
++#include <linux/uwb/debug.h>
++
++/*
++ * UWB Radio Controller Notification/Event Handle
++ *
++ * Represents an entity waiting for an event coming from the UWB Radio
++ * Controller with a given context id (context) and type (evt_type and
++ * evt). On reception of the notification/event, the callback (cb) is
++ * called with the event.
++ *
++ * If the timer expires before the event is received, the callback is
++ * called with -ETIMEDOUT as the event size.
++ */
++struct uwb_rc_neh {
++	struct kref kref;
++
++	struct uwb_rc *rc;
++	u8 evt_type;
++	__le16 evt;
++	u8 context;
++	uwb_rc_neh_cb_f cb;
++	void *arg;
++
++	struct timer_list timer;
++	struct list_head list_node;
++};
++
++static void uwb_rc_neh_timer(unsigned long arg);
++
++static void uwb_rc_neh_release(struct kref *kref)
++{
++	struct uwb_rc_neh *neh = container_of(kref, struct uwb_rc_neh, kref);
++
++	kfree(neh);
++}
++
++static void uwb_rc_neh_get(struct uwb_rc_neh *neh)
++{
++	kref_get(&neh->kref);
++}
++
++/**
++ * uwb_rc_neh_put - release reference to a neh
++ * @neh: the neh
++ */
++void uwb_rc_neh_put(struct uwb_rc_neh *neh)
++{
++	kref_put(&neh->kref, uwb_rc_neh_release);
++}
++
++
++/**
++ * Assigns @neh a context id from @rc's pool
++ *
++ * @rc:	    UWB Radio Controller descriptor; @rc->neh_lock taken
++ * @neh:    Notification/Event Handle
++ * @returns 0 if context id was assigned ok; < 0 errno on error (if
++ *	    all the context IDs are taken).
++ *
++ * (assumes @wa is locked).
++ *
++ * NOTE: WUSB spec reserves context ids 0x00 for notifications and
++ *	 0xff is invalid, so they must not be used. Initialization
++ *	 fills up those two in the bitmap so they are not allocated.
++ *
++ * We spread the allocation around to reduce the posiblity of two
++ * consecutive opened @neh's getting the same context ID assigned (to
++ * avoid surprises with late events that timed out long time ago). So
++ * first we search from where @rc->ctx_roll is, if not found, we
++ * search from zero.
++ */
++static
++int __uwb_rc_ctx_get(struct uwb_rc *rc, struct uwb_rc_neh *neh)
++{
++	int result;
++	result = find_next_zero_bit(rc->ctx_bm, UWB_RC_CTX_MAX,
++				    rc->ctx_roll++);
++	if (result < UWB_RC_CTX_MAX)
++		goto found;
++	result = find_first_zero_bit(rc->ctx_bm, UWB_RC_CTX_MAX);
++	if (result < UWB_RC_CTX_MAX)
++		goto found;
++	return -ENFILE;
++found:
++	set_bit(result, rc->ctx_bm);
++	neh->context = result;
++	return 0;
++}
++
++
++/** Releases @neh's context ID back to @rc (@rc->neh_lock is locked). */
++static
++void __uwb_rc_ctx_put(struct uwb_rc *rc, struct uwb_rc_neh *neh)
++{
++	struct device *dev = &rc->uwb_dev.dev;
++	if (neh->context == 0)
++		return;
++	if (test_bit(neh->context, rc->ctx_bm) == 0) {
++		dev_err(dev, "context %u not set in bitmap\n",
++			neh->context);
++		WARN_ON(1);
++	}
++	clear_bit(neh->context, rc->ctx_bm);
++	neh->context = 0;
++}
++
++/**
++ * uwb_rc_neh_add - add a neh for a radio controller command
++ * @rc:             the radio controller
++ * @cmd:            the radio controller command
++ * @expected_type:  the type of the expected response event
++ * @expected_event: the expected event ID
++ * @cb:             callback for when the event is received
++ * @arg:            argument for the callback
++ *
++ * Creates a neh and adds it to the list of those waiting for an
++ * event.  A context ID will be assigned to the command.
++ */
++struct uwb_rc_neh *uwb_rc_neh_add(struct uwb_rc *rc, struct uwb_rccb *cmd,
++				  u8 expected_type, u16 expected_event,
++				  uwb_rc_neh_cb_f cb, void *arg)
++{
++	int result;
++	unsigned long flags;
++	struct device *dev = &rc->uwb_dev.dev;
++	struct uwb_rc_neh *neh;
++
++	neh = kzalloc(sizeof(*neh), GFP_KERNEL);
++	if (neh == NULL) {
++		result = -ENOMEM;
++		goto error_kzalloc;
++	}
++
++	kref_init(&neh->kref);
++	INIT_LIST_HEAD(&neh->list_node);
++	init_timer(&neh->timer);
++	neh->timer.function = uwb_rc_neh_timer;
++	neh->timer.data     = (unsigned long)neh;
++
++	neh->rc = rc;
++	neh->evt_type = expected_type;
++	neh->evt = cpu_to_le16(expected_event);
++	neh->cb = cb;
++	neh->arg = arg;
++
++	spin_lock_irqsave(&rc->neh_lock, flags);
++	result = __uwb_rc_ctx_get(rc, neh);
++	if (result >= 0) {
++		cmd->bCommandContext = neh->context;
++		list_add_tail(&neh->list_node, &rc->neh_list);
++		uwb_rc_neh_get(neh);
++	}
++	spin_unlock_irqrestore(&rc->neh_lock, flags);
++	if (result < 0)
++		goto error_ctx_get;
++
++	return neh;
++
++error_ctx_get:
++	kfree(neh);
++error_kzalloc:
++	dev_err(dev, "cannot open handle to radio controller: %d\n", result);
++	return ERR_PTR(result);
++}
++
++static void __uwb_rc_neh_rm(struct uwb_rc *rc, struct uwb_rc_neh *neh)
++{
++	del_timer(&neh->timer);
++	__uwb_rc_ctx_put(rc, neh);
++	list_del(&neh->list_node);
++}
++
++/**
++ * uwb_rc_neh_rm - remove a neh.
++ * @rc:  the radio controller
++ * @neh: the neh to remove
++ *
++ * Remove an active neh immediately instead of waiting for the event
++ * (or a time out).
++ */
++void uwb_rc_neh_rm(struct uwb_rc *rc, struct uwb_rc_neh *neh)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&rc->neh_lock, flags);
++	__uwb_rc_neh_rm(rc, neh);
++	spin_unlock_irqrestore(&rc->neh_lock, flags);
++
++	uwb_rc_neh_put(neh);
++}
++
++/**
++ * uwb_rc_neh_arm - arm an event handler timeout timer
++ *
++ * @rc:     UWB Radio Controller
++ * @neh:    Notification/event handler for @rc
++ *
++ * The timer is only armed if the neh is active.
++ */
++void uwb_rc_neh_arm(struct uwb_rc *rc, struct uwb_rc_neh *neh)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&rc->neh_lock, flags);
++	if (neh->context)
++		mod_timer(&neh->timer,
++			  jiffies + msecs_to_jiffies(UWB_RC_CMD_TIMEOUT_MS));
++	spin_unlock_irqrestore(&rc->neh_lock, flags);
++}
++
++static void uwb_rc_neh_cb(struct uwb_rc_neh *neh, struct uwb_rceb *rceb, size_t size)
++{
++	(*neh->cb)(neh->rc, neh->arg, rceb, size);
++	uwb_rc_neh_put(neh);
++}
++
++static bool uwb_rc_neh_match(struct uwb_rc_neh *neh, const struct uwb_rceb *rceb)
++{
++	return neh->evt_type == rceb->bEventType
++		&& neh->evt == rceb->wEvent
++		&& neh->context == rceb->bEventContext;
++}
++
++/**
++ * Find the handle waiting for a RC Radio Control Event
++ *
++ * @rc:         UWB Radio Controller
++ * @rceb:       Pointer to the RCEB buffer
++ * @event_size: Pointer to the size of the RCEB buffer. Might be
++ *              adjusted to take into account the @neh->extra_size
++ *              settings.
++ *
++ * If the listener has no buffer (NULL buffer), one is allocated for
++ * the right size (the amount of data received). @neh->ptr will point
++ * to the event payload, which always starts with a 'struct
++ * uwb_rceb'. kfree() it when done.
++ */
++static
++struct uwb_rc_neh *uwb_rc_neh_lookup(struct uwb_rc *rc,
++				     const struct uwb_rceb *rceb)
++{
++	struct uwb_rc_neh *neh = NULL, *h;
++	unsigned flags;
++
++	spin_lock_irqsave(&rc->neh_lock, flags);
++
++	list_for_each_entry(h, &rc->neh_list, list_node) {
++		if (uwb_rc_neh_match(h, rceb)) {
++			neh = h;
++			break;
++		}
++	}
++
++	if (neh)
++		__uwb_rc_neh_rm(rc, neh);
++
++	spin_unlock_irqrestore(&rc->neh_lock, flags);
++
++	return neh;
++}
++
++
++/**
++ * Process notifications coming from the radio control interface
++ *
++ * @rc:    UWB Radio Control Interface descriptor
++ * @neh:   Notification/Event Handler @neh->ptr points to
++ *         @uwb_evt->buffer.
++ *
++ * This function is called by the event/notif handling subsystem when
++ * notifications arrive (hwarc_probe() arms a notification/event handle
++ * that calls back this function for every received notification; this
++ * function then will rearm itself).
++ *
++ * Notification data buffers are dynamically allocated by the NEH
++ * handling code in neh.c [uwb_rc_neh_lookup()]. What is actually
++ * allocated is space to contain the notification data.
++ *
++ * Buffers are prefixed with a Radio Control Event Block (RCEB) as
++ * defined by the WUSB Wired-Adapter Radio Control interface. We
++ * just use it for the notification code.
++ *
++ * On each case statement we just transcode endianess of the different
++ * fields. We declare a pointer to a RCI definition of an event, and
++ * then to a UWB definition of the same event (which are the same,
++ * remember). Event if we use different pointers
++ */
++static
++void uwb_rc_notif(struct uwb_rc *rc, struct uwb_rceb *rceb, ssize_t size)
++{
++	struct device *dev = &rc->uwb_dev.dev;
++	struct uwb_event *uwb_evt;
++
++	if (size == -ESHUTDOWN)
++		return;
++	if (size < 0) {
++		dev_err(dev, "ignoring event with error code %zu\n",
++			size);
++		return;
++	}
++
++	uwb_evt = kzalloc(sizeof(*uwb_evt), GFP_ATOMIC);
++	if (unlikely(uwb_evt == NULL)) {
++		dev_err(dev, "no memory to queue event 0x%02x/%04x/%02x\n",
++			rceb->bEventType, le16_to_cpu(rceb->wEvent),
++			rceb->bEventContext);
++		return;
++	}
++	uwb_evt->rc = __uwb_rc_get(rc);	/* will be put by uwbd's uwbd_event_handle() */
++	uwb_evt->rceb = rceb;
++	uwb_evt->size = size;
++	uwb_evt->ts_jiffies = jiffies;
++
++	switch (le16_to_cpu(rceb->wEvent)) {
++		/* Trap some vendor specific events
++		 *
++		 * FIXME: move this to handling in ptc-est, where we
++		 * register a NULL event handler for these two guys
++		 * using the Intel IDs.
++		 */
++	case 0x0103:
++		dev_info(dev, "FIXME: DEVICE ADD\n");
++		return;
++	case 0x0104:
++		dev_info(dev, "FIXME: DEVICE RM\n");
++		return;
++	default:
++		break;
++	}
++
++	uwbd_event_queue(uwb_evt);
++}
++
++static void uwb_rc_neh_grok_event(struct uwb_rc *rc, struct uwb_rceb *rceb, size_t size)
++{
++	struct device *dev = &rc->uwb_dev.dev;
++	struct uwb_rc_neh *neh;
++	struct uwb_rceb *notif;
++
++	if (rceb->bEventContext == 0) {
++		notif = kmalloc(size, GFP_ATOMIC);
++		if (notif) {
++			memcpy(notif, rceb, size);
++			uwb_rc_notif(rc, notif, size);
++		} else
++			dev_err(dev, "event 0x%02x/%04x/%02x (%zu bytes): no memory\n",
++				rceb->bEventType, le16_to_cpu(rceb->wEvent),
++				rceb->bEventContext, size);
++	} else {
++		neh = uwb_rc_neh_lookup(rc, rceb);
++		if (neh)
++			uwb_rc_neh_cb(neh, rceb, size);
++		else if (printk_ratelimit())
++			dev_warn(dev, "event 0x%02x/%04x/%02x (%zu bytes): nobody cared\n",
++				 rceb->bEventType, le16_to_cpu(rceb->wEvent),
++				 rceb->bEventContext, size);
++	}
++}
++
++/**
++ * Given a buffer with one or more UWB RC events/notifications, break
++ * them up and dispatch them.
++ *
++ * @rc:	      UWB Radio Controller
++ * @buf:      Buffer with the stream of notifications/events
++ * @buf_size: Amount of data in the buffer
++ *
++ * Note each notification/event starts always with a 'struct
++ * uwb_rceb', so the minimum size if 4 bytes.
++ *
++ * The device may pass us events formatted differently than expected.
++ * These are first filtered, potentially creating a new event in a new
++ * memory location. If a new event is created by the filter it is also
++ * freed here.
++ *
++ * For each notif/event, tries to guess the size looking at the EST
++ * tables, then looks for a neh that is waiting for that event and if
++ * found, copies the payload to the neh's buffer and calls it back. If
++ * not, the data is ignored.
++ *
++ * Note that if we can't find a size description in the EST tables, we
++ * still might find a size in the 'neh' handle in uwb_rc_neh_lookup().
++ *
++ * Assumptions:
++ *
++ *   @rc->neh_lock is NOT taken
++ *
++ * We keep track of various sizes here:
++ * size:      contains the size of the buffer that is processed for the
++ *            incoming event. this buffer may contain events that are not
++ *            formatted as WHCI.
++ * real_size: the actual space taken by this event in the buffer.
++ *            We need to keep track of the real size of an event to be able to
++ *            advance the buffer correctly.
++ * event_size: the size of the event as expected by the core layer
++ *            [OR] the size of the event after filtering. if the filtering
++ *            created a new event in a new memory location then this is
++ *            effectively the size of a new event buffer
++ */
++void uwb_rc_neh_grok(struct uwb_rc *rc, void *buf, size_t buf_size)
++{
++	struct device *dev = &rc->uwb_dev.dev;
++	void *itr;
++	struct uwb_rceb *rceb;
++	size_t size, real_size, event_size;
++	int needtofree;
++
++	d_fnstart(3, dev, "(rc %p buf %p %zu buf_size)\n", rc, buf, buf_size);
++	d_printf(2, dev, "groking event block: %zu bytes\n", buf_size);
++	itr = buf;
++	size = buf_size;
++	while (size > 0) {
++		if (size < sizeof(*rceb)) {
++			dev_err(dev, "not enough data in event buffer to "
++				"process incoming events (%zu left, minimum is "
++				"%zu)\n", size, sizeof(*rceb));
++			break;
++		}
++
++		rceb = itr;
++		if (rc->filter_event) {
++			needtofree = rc->filter_event(rc, &rceb, size,
++						      &real_size, &event_size);
++			if (needtofree < 0 && needtofree != -ENOANO) {
++				dev_err(dev, "BUG: Unable to filter event "
++					"(0x%02x/%04x/%02x) from "
++					"device. \n", rceb->bEventType,
++					le16_to_cpu(rceb->wEvent),
++					rceb->bEventContext);
++				break;
++			}
++		} else
++			needtofree = -ENOANO;
++		/* do real processing if there was no filtering or the
++		 * filtering didn't act */
++		if (needtofree == -ENOANO) {
++			ssize_t ret = uwb_est_find_size(rc, rceb, size);
++			if (ret < 0)
++				break;
++			if (ret > size) {
++				dev_err(dev, "BUG: hw sent incomplete event "
++					"0x%02x/%04x/%02x (%zd bytes), only got "
++					"%zu bytes. We don't handle that.\n",
++					rceb->bEventType, le16_to_cpu(rceb->wEvent),
++					rceb->bEventContext, ret, size);
++				break;
++			}
++			real_size = event_size = ret;
++		}
++		uwb_rc_neh_grok_event(rc, rceb, event_size);
++
++		if (needtofree == 1)
++			kfree(rceb);
++
++		itr += real_size;
++		size -= real_size;
++		d_printf(2, dev, "consumed %zd bytes, %zu left\n",
++			 event_size, size);
++	}
++	d_fnend(3, dev, "(rc %p buf %p %zu buf_size) = void\n", rc, buf, buf_size);
++}
++EXPORT_SYMBOL_GPL(uwb_rc_neh_grok);
++
++
++/**
++ * The entity that reads from the device notification/event channel has
++ * detected an error.
++ *
++ * @rc:    UWB Radio Controller
++ * @error: Errno error code
++ *
++ */
++void uwb_rc_neh_error(struct uwb_rc *rc, int error)
++{
++	struct uwb_rc_neh *neh, *next;
++	unsigned long flags;
++
++	BUG_ON(error >= 0);
++	spin_lock_irqsave(&rc->neh_lock, flags);
++	list_for_each_entry_safe(neh, next, &rc->neh_list, list_node) {
++		__uwb_rc_neh_rm(rc, neh);
++		uwb_rc_neh_cb(neh, NULL, error);
++	}
++	spin_unlock_irqrestore(&rc->neh_lock, flags);
++}
++EXPORT_SYMBOL_GPL(uwb_rc_neh_error);
++
++
++static void uwb_rc_neh_timer(unsigned long arg)
++{
++	struct uwb_rc_neh *neh = (struct uwb_rc_neh *)arg;
++	struct uwb_rc *rc = neh->rc;
++	unsigned flags;
++
++	spin_lock_irqsave(&rc->neh_lock, flags);
++	__uwb_rc_neh_rm(rc, neh);
++	spin_unlock_irqrestore(&rc->neh_lock, flags);
++
++	uwb_rc_neh_cb(neh, NULL, -ETIMEDOUT);
++}
++
++/** Initializes the @rc's neh subsystem
++ */
++void uwb_rc_neh_create(struct uwb_rc *rc)
++{
++	spin_lock_init(&rc->neh_lock);
++	INIT_LIST_HEAD(&rc->neh_list);
++	set_bit(0, rc->ctx_bm);		/* 0 is reserved (see [WUSB] table 8-65) */
++	set_bit(0xff, rc->ctx_bm);	/* and 0xff is invalid */
++	rc->ctx_roll = 1;
++}
++
++
++/** Release's the @rc's neh subsystem */
++void uwb_rc_neh_destroy(struct uwb_rc *rc)
++{
++	unsigned flags;
++	struct uwb_rc_neh *neh, *next;
++
++	spin_lock_irqsave(&rc->neh_lock, flags);
++	list_for_each_entry_safe(neh, next, &rc->neh_list, list_node) {
++		__uwb_rc_neh_rm(rc, neh);
++		uwb_rc_neh_put(neh);
++	}
++	spin_unlock_irqrestore(&rc->neh_lock, flags);
++}
+--- /dev/null
++++ b/drivers/uwb/reset.c
+@@ -0,0 +1,319 @@
++/*
++ * Ultra Wide Band
++ * UWB basic command support and radio reset
++ *
++ * Copyright (C) 2005-2006 Intel Corporation
++ * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ *
++ *
++ * FIXME:
++ *
++ *  - docs
++ *
++ *  - Now we are serializing (using the uwb_dev->mutex) the command
++ *    execution; it should be parallelized as much as possible some
++ *    day.
++ */
++#include <linux/kernel.h>
++#include <linux/err.h>
++
++#include "uwb-internal.h"
++#define D_LOCAL 0
++#include <linux/uwb/debug.h>
++
++/**
++ * Command result codes (WUSB1.0[T8-69])
++ */
++static
++const char *__strerror[] = {
++	"success",
++	"failure",
++	"hardware failure",
++	"no more slots",
++	"beacon is too large",
++	"invalid parameter",
++	"unsupported power level",
++	"time out (wa) or invalid ie data (whci)",
++	"beacon size exceeded",
++	"cancelled",
++	"invalid state",
++	"invalid size",
++	"ack not recieved",
++	"no more asie notification",
++};
++
++
++/** Return a string matching the given error code */
++const char *uwb_rc_strerror(unsigned code)
++{
++	if (code == 255)
++		return "time out";
++	if (code >= ARRAY_SIZE(__strerror))
++		return "unknown error";
++	return __strerror[code];
++}
++
++static
++int uwb_rc_cmd_async(struct uwb_rc *rc, const char *cmd_name,
++		     struct uwb_rccb *cmd, size_t cmd_size,
++		     u8 expected_type, u16 expected_event,
++		     uwb_rc_neh_cb_f cb, void *arg)
++{
++	struct device *dev = &rc->uwb_dev.dev;
++	struct uwb_rc_neh *neh;
++	int needtofree = 0;
++	int result;
++
++	uwb_dev_lock(&rc->uwb_dev);	/* Protect against rc->priv being removed */
++	if (rc->priv == NULL) {
++		uwb_dev_unlock(&rc->uwb_dev);
++		return -ESHUTDOWN;
++	}
++
++	if (rc->filter_cmd) {
++		needtofree = rc->filter_cmd(rc, &cmd, &cmd_size);
++		if (needtofree < 0 && needtofree != -ENOANO) {
++			dev_err(dev, "%s: filter error: %d\n",
++				cmd_name, needtofree);
++			uwb_dev_unlock(&rc->uwb_dev);
++			return needtofree;
++		}
++	}
++
++	neh = uwb_rc_neh_add(rc, cmd, expected_type, expected_event, cb, arg);
++	if (IS_ERR(neh)) {
++		result = PTR_ERR(neh);
++		goto out;
++	}
++
++	result = rc->cmd(rc, cmd, cmd_size);
++	uwb_dev_unlock(&rc->uwb_dev);
++	if (result < 0)
++		uwb_rc_neh_rm(rc, neh);
++	else
++		uwb_rc_neh_arm(rc, neh);
++	uwb_rc_neh_put(neh);
++out:
++	if (needtofree == 1)
++		kfree(cmd);
++	return result < 0 ? result : 0;
++}
++
++struct uwb_rc_cmd_done_params {
++	struct completion completion;
++	struct uwb_rceb *reply;
++	ssize_t reply_size;
++};
++
++static void uwb_rc_cmd_done(struct uwb_rc *rc, void *arg,
++			    struct uwb_rceb *reply, ssize_t reply_size)
++{
++	struct uwb_rc_cmd_done_params *p = (struct uwb_rc_cmd_done_params *)arg;
++
++	if (reply_size > 0) {
++		if (p->reply)
++			reply_size = min(p->reply_size, reply_size);
++		else
++			p->reply = kmalloc(reply_size, GFP_ATOMIC);
++
++		if (p->reply)
++			memcpy(p->reply, reply, reply_size);
++		else
++			reply_size = -ENOMEM;
++	}
++	p->reply_size = reply_size;
++	complete(&p->completion);
++}
++
++
++/**
++ * Generic function for issuing commands to the Radio Control Interface
++ *
++ * @rc:       UWB Radio Control descriptor
++ * @cmd_name: Name of the command being issued (for error messages)
++ * @cmd:      Pointer to rccb structure containing the command;
++ *            normally you embed this structure as the first member of
++ *            the full command structure.
++ * @cmd_size: Size of the whole command buffer pointed to by @cmd.
++ * @reply:    Pointer to where to store the reply
++ * @reply_size: @reply's size
++ * @expected_type: Expected type in the return event
++ * @expected_event: Expected event code in the return event
++ * @preply:   Here a pointer to where the event data is received will
++ *            be stored. Once done with the data, free with kfree().
++ *
++ * This function is generic; it works for commands that return a fixed
++ * and known size or for commands that return a variable amount of data.
++ *
++ * If a buffer is provided, that is used, although it could be chopped
++ * to the maximum size of the buffer. If the buffer is NULL, then one
++ * be allocated in *preply with the whole contents of the reply.
++ *
++ * @rc needs to be referenced
++ */
++static
++ssize_t __uwb_rc_cmd(struct uwb_rc *rc, const char *cmd_name,
++		     struct uwb_rccb *cmd, size_t cmd_size,
++		     struct uwb_rceb *reply, size_t reply_size,
++		     u8 expected_type, u16 expected_event,
++		     struct uwb_rceb **preply)
++{
++	ssize_t result = 0;
++	struct device *dev = &rc->uwb_dev.dev;
++	struct uwb_rc_cmd_done_params params;
++
++	init_completion(&params.completion);
++	params.reply = reply;
++	params.reply_size = reply_size;
++
++	result = uwb_rc_cmd_async(rc, cmd_name, cmd, cmd_size,
++				  expected_type, expected_event,
++				  uwb_rc_cmd_done, &params);
++	if (result)
++		return result;
++
++	wait_for_completion(&params.completion);
++
++	if (preply)
++		*preply = params.reply;
++
++	if (params.reply_size < 0)
++		dev_err(dev, "%s: confirmation event 0x%02x/%04x/%02x "
++			"reception failed: %d\n", cmd_name,
++			expected_type, expected_event, cmd->bCommandContext,
++			(int)params.reply_size);
++	return params.reply_size;
++}
++
++
++/**
++ * Generic function for issuing commands to the Radio Control Interface
++ *
++ * @rc:       UWB Radio Control descriptor
++ * @cmd_name: Name of the command being issued (for error messages)
++ * @cmd:      Pointer to rccb structure containing the command;
++ *            normally you embed this structure as the first member of
++ *            the full command structure.
++ * @cmd_size: Size of the whole command buffer pointed to by @cmd.
++ * @reply:    Pointer to the beginning of the confirmation event
++ *            buffer. Normally bigger than an 'struct hwarc_rceb'.
++ *            You need to fill out reply->bEventType and reply->wEvent (in
++ *            cpu order) as the function will use them to verify the
++ *            confirmation event.
++ * @reply_size: Size of the reply buffer
++ *
++ * The function checks that the length returned in the reply is at
++ * least as big as @reply_size; if not, it will be deemed an error and
++ * -EIO returned.
++ *
++ * @rc needs to be referenced
++ */
++ssize_t uwb_rc_cmd(struct uwb_rc *rc, const char *cmd_name,
++		   struct uwb_rccb *cmd, size_t cmd_size,
++		   struct uwb_rceb *reply, size_t reply_size)
++{
++	struct device *dev = &rc->uwb_dev.dev;
++	ssize_t result;
++
++	result = __uwb_rc_cmd(rc, cmd_name,
++			      cmd, cmd_size, reply, reply_size,
++			      reply->bEventType, reply->wEvent, NULL);
++
++	if (result > 0 && result < reply_size) {
++		dev_err(dev, "%s: not enough data returned for decoding reply "
++			"(%zu bytes received vs at least %zu needed)\n",
++			cmd_name, result, reply_size);
++		result = -EIO;
++	}
++	return result;
++}
++EXPORT_SYMBOL_GPL(uwb_rc_cmd);
++
++
++/**
++ * Generic function for issuing commands to the Radio Control
++ * Interface that return an unknown amount of data
++ *
++ * @rc:       UWB Radio Control descriptor
++ * @cmd_name: Name of the command being issued (for error messages)
++ * @cmd:      Pointer to rccb structure containing the command;
++ *            normally you embed this structure as the first member of
++ *            the full command structure.
++ * @cmd_size: Size of the whole command buffer pointed to by @cmd.
++ * @expected_type: Expected type in the return event
++ * @expected_event: Expected event code in the return event
++ * @preply:   Here a pointer to where the event data is received will
++ *            be stored. Once done with the data, free with kfree().
++ *
++ * The function checks that the length returned in the reply is at
++ * least as big as a 'struct uwb_rceb *'; if not, it will be deemed an
++ * error and -EIO returned.
++ *
++ * @rc needs to be referenced
++ */
++ssize_t uwb_rc_vcmd(struct uwb_rc *rc, const char *cmd_name,
++		    struct uwb_rccb *cmd, size_t cmd_size,
++		    u8 expected_type, u16 expected_event,
++		    struct uwb_rceb **preply)
++{
++	return __uwb_rc_cmd(rc, cmd_name, cmd, cmd_size, NULL, 0,
++			    expected_type, expected_event, preply);
++}
++EXPORT_SYMBOL_GPL(uwb_rc_vcmd);
++
++
++/**
++ * Reset a UWB Host Controller (and all radio settings)
++ *
++ * @rc:      Host Controller descriptor
++ * @returns: 0 if ok, < 0 errno code on error
++ *
++ * We put the command on kmalloc'ed memory as some arches cannot do
++ * USB from the stack. The reply event is copied from an stage buffer,
++ * so it can be in the stack. See WUSB1.0[8.6.2.4] for more details.
++ */
++int uwb_rc_reset(struct uwb_rc *rc)
++{
++	int result = -ENOMEM;
++	struct uwb_rc_evt_confirm reply;
++	struct uwb_rccb *cmd;
++	size_t cmd_size = sizeof(*cmd);
++
++	mutex_lock(&rc->uwb_dev.mutex);
++	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
++	if (cmd == NULL)
++		goto error_kzalloc;
++	cmd->bCommandType = UWB_RC_CET_GENERAL;
++	cmd->wCommand = cpu_to_le16(UWB_RC_CMD_RESET);
++	reply.rceb.bEventType = UWB_RC_CET_GENERAL;
++	reply.rceb.wEvent = UWB_RC_CMD_RESET;
++	result = uwb_rc_cmd(rc, "RESET", cmd, cmd_size,
++			    &reply.rceb, sizeof(reply));
++	if (result < 0)
++		goto error_cmd;
++	if (reply.bResultCode != UWB_RC_RES_SUCCESS) {
++		dev_err(&rc->uwb_dev.dev,
++			"RESET: command execution failed: %s (%d)\n",
++			uwb_rc_strerror(reply.bResultCode), reply.bResultCode);
++		result = -EIO;
++	}
++error_cmd:
++	kfree(cmd);
++error_kzalloc:
++	mutex_unlock(&rc->uwb_dev.mutex);
++	return result;
++}
