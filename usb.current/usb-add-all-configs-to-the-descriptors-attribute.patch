@@ -1,0 +1,94 @@
+From stern@rowland.harvard.edu  Wed May 21 16:31:02 2008
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Tue, 20 May 2008 16:40:42 -0400 (EDT)
+Subject: USB: add all configs to the "descriptors" attribute
+To: Greg KH <greg@kroah.com>
+Cc: Daniel Drake <dsd@gentoo.org>, USB list <linux-usb@vger.kernel.org>
+Message-ID: <Pine.LNX.4.44L0.0805201637470.7165-100000@iolanthe.rowland.org>
+
+
+This patch (as1094) changes the output of the "descriptors" binary
+attribute.  Now it will contain the device descriptor followed by all
+the configuration descriptors, not just the descriptor for the current
+config.
+
+Userspace libraries want to have access to the kernel's cached
+descriptor information, so they can learn about device characteristics
+without having to wake up suspended devices.  So far the only user of
+this attribute is the new libusb-1.0 library; thus changing its
+contents shouldn't cause any problems.
+
+This should be considered for 2.6.26, if for no other reason than to
+minimize the range of releases in which the attribute contains only the
+current config descriptor.
+
+Also, it doesn't hurt that the patch removes the device locking --
+which was formerly needed in order to know for certain which config was
+indeed current.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/sysfs.c |   44 +++++++++++++++++++++-----------------------
+ 1 file changed, 21 insertions(+), 23 deletions(-)
+
+--- a/drivers/usb/core/sysfs.c
++++ b/drivers/usb/core/sysfs.c
+@@ -588,35 +588,33 @@ read_descriptors(struct kobject *kobj, s
+ 			container_of(kobj, struct device, kobj));
+ 	size_t nleft = count;
+ 	size_t srclen, n;
++	int cfgno;
++	void *src;
+ 
+-	usb_lock_device(udev);
+-
+-	/* The binary attribute begins with the device descriptor */
+-	srclen = sizeof(struct usb_device_descriptor);
+-	if (off < srclen) {
+-		n = min_t(size_t, nleft, srclen - off);
+-		memcpy(buf, off + (char *) &udev->descriptor, n);
+-		nleft -= n;
+-		buf += n;
+-		off = 0;
+-	} else {
+-		off -= srclen;
+-	}
+-
+-	/* Then follows the raw descriptor entry for the current
+-	 * configuration (config plus subsidiary descriptors).
++	/* The binary attribute begins with the device descriptor.
++	 * Following that are the raw descriptor entries for all the
++	 * configurations (config plus subsidiary descriptors).
+ 	 */
+-	if (udev->actconfig) {
+-		int cfgno = udev->actconfig - udev->config;
+-
+-		srclen = __le16_to_cpu(udev->actconfig->desc.wTotalLength);
++	for (cfgno = -1; cfgno < udev->descriptor.bNumConfigurations &&
++			nleft > 0; ++cfgno) {
++		if (cfgno < 0) {
++			src = &udev->descriptor;
++			srclen = sizeof(struct usb_device_descriptor);
++		} else {
++			src = udev->rawdescriptors[cfgno];
++			srclen = __le16_to_cpu(udev->config[cfgno].desc.
++					wTotalLength);
++		}
+ 		if (off < srclen) {
+-			n = min_t(size_t, nleft, srclen - off);
+-			memcpy(buf, off + udev->rawdescriptors[cfgno], n);
++			n = min(nleft, srclen - (size_t) off);
++			memcpy(buf, src + off, n);
+ 			nleft -= n;
++			buf += n;
++			off = 0;
++		} else {
++			off -= srclen;
+ 		}
+ 	}
+-	usb_unlock_device(udev);
+ 	return count - nleft;
+ }
+ 

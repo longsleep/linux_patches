@@ -1,0 +1,162 @@
+From stern@rowland.harvard.edu  Wed May 21 16:34:41 2008
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Tue, 20 May 2008 16:59:10 -0400 (EDT)
+Subject: USB: EHCI: fix bug in Iso scheduling
+To: Greg KH <greg@kroah.com>
+Cc: David Brownell <david-b@pacbell.net>, Laurent Pinchart <laurent.pinchart@skynet.be>, USB list <linux-usb@vger.kernel.org>
+Message-ID: <Pine.LNX.4.44L0.0805201653460.7165-100000@iolanthe.rowland.org>
+
+
+This patch (as1098) changes the way ehci-hcd schedules its periodic
+Iso transfers.  That the current scheduling code is wrong is clear on
+the face of it: Sometimes it returns -EL2NSYNC (meaning that an URB
+couldn't be scheduled because it was submitted too late), but it does
+this even when the URB_ISO_ASAP flag is set (meaning the URB should be
+scheduled as soon as possible).
+
+The new code properly implements as-soon-as-possible scheduling,
+assigning the next unexpired slot as the URB's starting point.  It
+also is more careful about checking for Iso URB completion: It doesn't
+bother to check for activity during frames that are already over,
+and it allows for the possibility that some of the URB's packets may
+have raced the hardware when they were submitted and so never got used
+(the packet status is set to -EXDEV).
+
+This fixes problems several people have experienced with USB video
+applications.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Acked-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/ehci-sched.c |   67 +++++++++++++++++++++++++++---------------
+ 1 file changed, 44 insertions(+), 23 deletions(-)
+
+--- a/drivers/usb/host/ehci-sched.c
++++ b/drivers/usb/host/ehci-sched.c
+@@ -1349,18 +1349,27 @@ iso_stream_schedule (
+ 	/* when's the last uframe this urb could start? */
+ 	max = now + mod;
+ 
+-	/* typical case: reuse current schedule. stream is still active,
+-	 * and no gaps from host falling behind (irq delays etc)
++	/* Typical case: reuse current schedule, stream is still active.
++	 * Hopefully there are no gaps from the host falling behind
++	 * (irq delays etc), but if there are we'll take the next
++	 * slot in the schedule, implicitly assuming URB_ISO_ASAP.
+ 	 */
+ 	if (likely (!list_empty (&stream->td_list))) {
+ 		start = stream->next_uframe;
+ 		if (start < now)
+ 			start += mod;
+-		if (likely ((start + sched->span) < max))
+-			goto ready;
+-		/* else fell behind; someday, try to reschedule */
+-		status = -EL2NSYNC;
+-		goto fail;
++
++		/* Fell behind (by up to twice the slop amount)? */
++		if (start >= max - 2 * 8 * SCHEDULE_SLOP)
++			start += stream->interval * DIV_ROUND_UP(
++					max - start, stream->interval) - mod;
++
++		/* Tried to schedule too far into the future? */
++		if (unlikely((start + sched->span) >= max)) {
++			status = -EFBIG;
++			goto fail;
++		}
++		goto ready;
+ 	}
+ 
+ 	/* need to schedule; when's the next (u)frame we could start?
+@@ -1613,6 +1622,9 @@ itd_complete (
+ 		} else if (likely ((t & EHCI_ISOC_ACTIVE) == 0)) {
+ 			desc->status = 0;
+ 			desc->actual_length = EHCI_ITD_LENGTH (t);
++		} else {
++			/* URB was too late */
++			desc->status = -EXDEV;
+ 		}
+ 	}
+ 
+@@ -2095,7 +2107,7 @@ done:
+ static void
+ scan_periodic (struct ehci_hcd *ehci)
+ {
+-	unsigned	frame, clock, now_uframe, mod;
++	unsigned	now_uframe, frame, clock, clock_frame, mod;
+ 	unsigned	modified;
+ 
+ 	mod = ehci->periodic_size << 3;
+@@ -2111,6 +2123,7 @@ scan_periodic (struct ehci_hcd *ehci)
+ 	else
+ 		clock = now_uframe + mod - 1;
+ 	clock %= mod;
++	clock_frame = clock >> 3;
+ 
+ 	for (;;) {
+ 		union ehci_shadow	q, *q_p;
+@@ -2157,22 +2170,26 @@ restart:
+ 			case Q_TYPE_ITD:
+ 				/* If this ITD is still active, leave it for
+ 				 * later processing ... check the next entry.
++				 * No need to check for activity unless the
++				 * frame is current.
+ 				 */
+-				rmb ();
+-				for (uf = 0; uf < 8 && live; uf++) {
+-					if (0 == (q.itd->hw_transaction [uf]
+-							& ITD_ACTIVE(ehci)))
+-						continue;
+-					incomplete = true;
+-					q_p = &q.itd->itd_next;
+-					hw_p = &q.itd->hw_next;
+-					type = Q_NEXT_TYPE(ehci,
++				if (frame == clock_frame && live) {
++					rmb();
++					for (uf = 0; uf < 8; uf++) {
++						if (q.itd->hw_transaction[uf] &
++							    ITD_ACTIVE(ehci))
++							break;
++					}
++					if (uf < 8) {
++						incomplete = true;
++						q_p = &q.itd->itd_next;
++						hw_p = &q.itd->hw_next;
++						type = Q_NEXT_TYPE(ehci,
+ 							q.itd->hw_next);
+-					q = *q_p;
+-					break;
++						q = *q_p;
++						break;
++					}
+ 				}
+-				if (uf < 8 && live)
+-					break;
+ 
+ 				/* Take finished ITDs out of the schedule
+ 				 * and process them:  recycle, maybe report
+@@ -2189,9 +2206,12 @@ restart:
+ 			case Q_TYPE_SITD:
+ 				/* If this SITD is still active, leave it for
+ 				 * later processing ... check the next entry.
++				 * No need to check for activity unless the
++				 * frame is current.
+ 				 */
+-				if ((q.sitd->hw_results & SITD_ACTIVE(ehci))
+-						&& live) {
++				if (frame == clock_frame && live &&
++						(q.sitd->hw_results &
++							SITD_ACTIVE(ehci))) {
+ 					incomplete = true;
+ 					q_p = &q.sitd->sitd_next;
+ 					hw_p = &q.sitd->hw_next;
+@@ -2260,6 +2280,7 @@ restart:
+ 
+ 			/* rescan the rest of this frame, then ... */
+ 			clock = now;
++			clock_frame = clock >> 3;
+ 		} else {
+ 			now_uframe++;
+ 			now_uframe %= mod;

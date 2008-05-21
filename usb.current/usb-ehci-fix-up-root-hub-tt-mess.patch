@@ -1,0 +1,156 @@
+From stern@rowland.harvard.edu  Wed May 21 16:32:34 2008
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Tue, 20 May 2008 16:58:11 -0400 (EDT)
+Subject: USB: EHCI: fix up root-hub TT mess
+To: Greg KH <greg@kroah.com>
+Cc: David Brownell <david-b@pacbell.net>, Lennert Buytenhek <buytenh@wantstofly.org>, USB list <linux-usb@vger.kernel.org>
+Message-ID: <Pine.LNX.4.44L0.0805201648050.7165-100000@iolanthe.rowland.org>
+
+
+This patch (as1095) cleans up the HCD glue and several of the EHCI
+bus-glue files.  The ehci->is_tdi_rh_tt flag is redundant, since it
+means the same thing as the hcd->has_tt flag, so it is removed and the
+other flag used in its place.
+
+Some of the bus-glue files didn't get the relinquish_port method added
+to their hc_driver structures.  Although that routine currently
+doesn't do anything for controllers with an integrated TT, in the
+future it might.  So the patch adds it where it is missing.
+
+Lastly, some of the bus-glue files have erroneous entries for their
+hc_driver's suspend and resume methods.  These method pointers are
+specific to PCI and shouldn't be used otherwise.
+
+(The patch also includes an invisible whitespace fix.)
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Acked-by: David Brownell <dbrownell@users.sourceforge.net>
+
+---
+ drivers/usb/host/ehci-fsl.c    |    6 +-----
+ drivers/usb/host/ehci-ixp4xx.c |    3 ++-
+ drivers/usb/host/ehci-orion.c  |    7 ++-----
+ drivers/usb/host/ehci-pci.c    |    3 +--
+ drivers/usb/host/ehci-ppc-of.c |    1 +
+ drivers/usb/host/ehci.h        |    3 +--
+ 6 files changed, 8 insertions(+), 15 deletions(-)
+
+--- a/drivers/usb/host/ehci-fsl.c
++++ b/drivers/usb/host/ehci-fsl.c
+@@ -269,7 +269,7 @@ static int ehci_fsl_setup(struct usb_hcd
+ 	if (retval)
+ 		return retval;
+ 
+-	ehci->is_tdi_rh_tt = 1;
++	hcd->has_tt = 1;
+ 
+ 	ehci->sbrn = 0x20;
+ 
+@@ -295,10 +295,6 @@ static const struct hc_driver ehci_fsl_h
+ 	 */
+ 	.reset = ehci_fsl_setup,
+ 	.start = ehci_run,
+-#ifdef	CONFIG_PM
+-	.suspend = ehci_bus_suspend,
+-	.resume = ehci_bus_resume,
+-#endif
+ 	.stop = ehci_stop,
+ 	.shutdown = ehci_shutdown,
+ 
+--- a/drivers/usb/host/ehci.h
++++ b/drivers/usb/host/ehci.h
+@@ -112,7 +112,6 @@ struct ehci_hcd {			/* one per controlle
+ 	u32			command;
+ 
+ 	/* SILICON QUIRKS */
+-	unsigned		is_tdi_rh_tt:1;	/* TDI roothub with TT */
+ 	unsigned		no_selective_suspend:1;
+ 	unsigned		has_fsl_port_bug:1; /* FreeScale */
+ 	unsigned		big_endian_mmio:1;
+@@ -678,7 +677,7 @@ struct ehci_fstn {
+  * needed (mostly in root hub code).
+  */
+ 
+-#define	ehci_is_TDI(e)			((e)->is_tdi_rh_tt)
++#define	ehci_is_TDI(e)			(ehci_to_hcd(e)->has_tt)
+ 
+ /* Returns the speed of a device attached to a port on the root hub. */
+ static inline unsigned int
+--- a/drivers/usb/host/ehci-ixp4xx.c
++++ b/drivers/usb/host/ehci-ixp4xx.c
+@@ -26,7 +26,7 @@ static int ixp4xx_ehci_init(struct usb_h
+ 		+ HC_LENGTH(ehci_readl(ehci, &ehci->caps->hc_capbase));
+ 	ehci->hcs_params = ehci_readl(ehci, &ehci->caps->hcs_params);
+ 
+-	ehci->is_tdi_rh_tt = 1;
++	hcd->has_tt = 1;
+ 	ehci_reset(ehci);
+ 
+ 	retval = ehci_init(hcd);
+@@ -58,6 +58,7 @@ static const struct hc_driver ixp4xx_ehc
+ 	.bus_suspend		= ehci_bus_suspend,
+ 	.bus_resume		= ehci_bus_resume,
+ #endif
++	.relinquish_port	= ehci_relinquish_port,
+ };
+ 
+ static int ixp4xx_ehci_probe(struct platform_device *pdev)
+--- a/drivers/usb/host/ehci-orion.c
++++ b/drivers/usb/host/ehci-orion.c
+@@ -139,10 +139,6 @@ static const struct hc_driver ehci_orion
+ 	 */
+ 	.reset = ehci_orion_setup,
+ 	.start = ehci_run,
+-#ifdef CONFIG_PM
+-	.suspend = ehci_bus_suspend,
+-	.resume = ehci_bus_resume,
+-#endif
+ 	.stop = ehci_stop,
+ 	.shutdown = ehci_shutdown,
+ 
+@@ -165,6 +161,7 @@ static const struct hc_driver ehci_orion
+ 	.hub_control = ehci_hub_control,
+ 	.bus_suspend = ehci_bus_suspend,
+ 	.bus_resume = ehci_bus_resume,
++	.relinquish_port = ehci_relinquish_port,
+ };
+ 
+ static void __init
+@@ -250,7 +247,7 @@ static int __init ehci_orion_drv_probe(s
+ 	ehci->regs = hcd->regs + 0x100 +
+ 		HC_LENGTH(ehci_readl(ehci, &ehci->caps->hc_capbase));
+ 	ehci->hcs_params = ehci_readl(ehci, &ehci->caps->hcs_params);
+-	ehci->is_tdi_rh_tt = 1;
++	hcd->has_tt = 1;
+ 	ehci->sbrn = 0x20;
+ 
+ 	/*
+--- a/drivers/usb/host/ehci-pci.c
++++ b/drivers/usb/host/ehci-pci.c
+@@ -129,7 +129,6 @@ static int ehci_pci_setup(struct usb_hcd
+ 	switch (pdev->vendor) {
+ 	case PCI_VENDOR_ID_TDI:
+ 		if (pdev->device == PCI_DEVICE_ID_TDI_EHCI) {
+-			ehci->is_tdi_rh_tt = 1;
+ 			hcd->has_tt = 1;
+ 			tdi_reset(ehci);
+ 		}
+@@ -379,7 +378,7 @@ static const struct hc_driver ehci_pci_h
+ 	.hub_control =		ehci_hub_control,
+ 	.bus_suspend =		ehci_bus_suspend,
+ 	.bus_resume =		ehci_bus_resume,
+-	.relinquish_port = 	ehci_relinquish_port,
++	.relinquish_port =	ehci_relinquish_port,
+ };
+ 
+ /*-------------------------------------------------------------------------*/
+--- a/drivers/usb/host/ehci-ppc-of.c
++++ b/drivers/usb/host/ehci-ppc-of.c
+@@ -76,6 +76,7 @@ static const struct hc_driver ehci_ppc_o
+ 	.bus_suspend		= ehci_bus_suspend,
+ 	.bus_resume		= ehci_bus_resume,
+ #endif
++	.relinquish_port	= ehci_relinquish_port,
+ };
+ 
+ 

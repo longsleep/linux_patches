@@ -1,0 +1,81 @@
+From stern@rowland.harvard.edu  Wed May 21 16:35:28 2008
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Tue, 20 May 2008 16:59:33 -0400 (EDT)
+Subject: USB: EHCI: fix performance regression
+To: Greg KH <greg@kroah.com>
+Cc: David Brownell <david-b@pacbell.net>, Leonid <leonidv11@gmail.com>,  USB list <linux-usb@vger.kernel.org>
+Message-ID: <Pine.LNX.4.44L0.0805201654490.7165-100000@iolanthe.rowland.org>
+
+
+This patch (as1099) fixes a performance regression in ehci-hcd.  The
+fundamental problem is that queue headers get removed from the
+schedule too quickly, since the code checks for a counter advancing
+rather than making an actual time-based check.  The latency involved
+in removing the queue header and then relinking it can severely
+degrade certain kinds of workloads.
+
+The patch replaces a simple counter with a timestamp derived from the
+controller's uframe value.  In addition, the delay for unlinking an
+idle queue header is increased from 5 ms to 10 ms; since some
+controllers (nVidia) have a latency of up to 1 ms for unlinking, this
+reduces the relative impact from 20% to 10%.
+
+Finally, a logical error left over from the IAA watchdog-timer
+conversion is corrected.  Now the driver will always either unlink an
+idle queue header or set up a timer to unlink it later.  The old code
+would sometimes fail to do either.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Cc: David Brownell <david-b@pacbell.net>
+Cc: Leonid <leonidv11@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/ehci-hcd.c |    3 ++-
+ drivers/usb/host/ehci-q.c   |   15 ++++++++-------
+ 2 files changed, 10 insertions(+), 8 deletions(-)
+
+--- a/drivers/usb/host/ehci-hcd.c
++++ b/drivers/usb/host/ehci-hcd.c
+@@ -84,7 +84,8 @@ static const char	hcd_name [] = "ehci_hc
+ #define EHCI_IAA_MSECS		10		/* arbitrary */
+ #define EHCI_IO_JIFFIES		(HZ/10)		/* io watchdog > irq_thresh */
+ #define EHCI_ASYNC_JIFFIES	(HZ/20)		/* async idle timeout */
+-#define EHCI_SHRINK_JIFFIES	(HZ/200)	/* async qh unlink delay */
++#define EHCI_SHRINK_JIFFIES	(HZ/100)	/* async qh unlink delay */
++#define EHCI_SHRINK_UFRAMES	(10*8)		/* same value in uframes */
+ 
+ /* Initial IRQ latency:  faster than hw default */
+ static int log2_irq_thresh = 0;		// 0 to 6
+--- a/drivers/usb/host/ehci-q.c
++++ b/drivers/usb/host/ehci-q.c
+@@ -1116,8 +1116,7 @@ static void scan_async (struct ehci_hcd 
+ 	struct ehci_qh		*qh;
+ 	enum ehci_timer_action	action = TIMER_IO_WATCHDOG;
+ 
+-	if (!++(ehci->stamp))
+-		ehci->stamp++;
++	ehci->stamp = ehci_readl(ehci, &ehci->regs->frame_index);
+ 	timer_action_done (ehci, TIMER_ASYNC_SHRINK);
+ rescan:
+ 	qh = ehci->async->qh_next.qh;
+@@ -1148,12 +1147,14 @@ rescan:
+ 			 * doesn't stay idle for long.
+ 			 * (plus, avoids some kind of re-activation race.)
+ 			 */
+-			if (list_empty (&qh->qtd_list)) {
+-				if (qh->stamp == ehci->stamp)
++			if (list_empty(&qh->qtd_list) &&
++					qh->qh_state == QH_STATE_LINKED) {
++				if (!ehci->reclaim &&
++				    ((ehci->stamp - qh->stamp) & 8191) >=
++						EHCI_SHRINK_UFRAMES)
++					start_unlink_async(ehci, qh);
++				else
+ 					action = TIMER_ASYNC_SHRINK;
+-				else if (!ehci->reclaim
+-					    && qh->qh_state == QH_STATE_LINKED)
+-					start_unlink_async (ehci, qh);
+ 			}
+ 
+ 			qh = qh->qh_next.qh;
