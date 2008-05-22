@@ -16,15 +16,16 @@ Cc: Kay Sievers <kay.sievers@vrfy.org>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
- drivers/base/base.h    |   28 ++++++++++
- drivers/base/class.c   |  130 +++++++++++++++++++++++++++----------------------
- drivers/base/core.c    |   46 +++++++++--------
- include/linux/device.h |    9 +--
- 4 files changed, 127 insertions(+), 86 deletions(-)
+ drivers/base/base.h    |   27 +++++++++++++
+ drivers/base/class.c   |   89 +++++++++++++++++++++++++--------------------
+ drivers/base/core.c    |   41 +++++++++++---------
+ drivers/i2c/i2c-core.c |   96 ++++++++++++++++++++++++++-----------------------
+ include/linux/device.h |    8 +---
+ 5 files changed, 153 insertions(+), 108 deletions(-)
 
 --- a/drivers/base/base.h
 +++ b/drivers/base/base.h
-@@ -36,6 +36,34 @@ struct driver_private {
+@@ -36,6 +36,33 @@ struct driver_private {
  };
  #define to_driver(obj) container_of(obj, struct driver_private, kobj)
  
@@ -47,7 +48,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + */
 +struct class_private {
 +	struct kset subsys;
-+	struct list_head children;
 +	struct list_head devices;
 +	struct list_head interfaces;
 +	struct kset class_dirs;
@@ -67,11 +67,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  #define to_class_attr(_attr) container_of(_attr, struct class_attribute, attr)
 -#define to_class(obj) container_of(obj, struct class, subsys.kobj)
  
- static ssize_t
- class_attr_show(struct kobject * kobj, struct attribute * attr, char * buf)
+ static ssize_t class_attr_show(struct kobject *kobj, struct attribute *attr,
+ 			       char *buf)
  {
- 	struct class_attribute * class_attr = to_class_attr(attr);
--	struct class * dc = to_class(kobj);
+ 	struct class_attribute *class_attr = to_class_attr(attr);
+-	struct class *dc = to_class(kobj);
 +	struct class_private *cp = to_class(kobj);
  	ssize_t ret = -EIO;
  
@@ -81,11 +81,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	return ret;
  }
  
-@@ -40,17 +39,18 @@ class_attr_store(struct kobject * kobj, 
- 		 const char * buf, size_t count)
+@@ -39,17 +38,18 @@ static ssize_t class_attr_store(struct k
+ 				const char *buf, size_t count)
  {
- 	struct class_attribute * class_attr = to_class_attr(attr);
--	struct class * dc = to_class(kobj);
+ 	struct class_attribute *class_attr = to_class_attr(attr);
+-	struct class *dc = to_class(kobj);
 +	struct class_private *cp = to_class(kobj);
  	ssize_t ret = -EIO;
  
@@ -95,7 +95,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	return ret;
  }
  
- static void class_release(struct kobject * kobj)
+ static void class_release(struct kobject *kobj)
  {
 -	struct class *class = to_class(kobj);
 +	struct class_private *cp = to_class(kobj);
@@ -103,17 +103,17 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  	pr_debug("class '%s': release.\n", class->name);
  
-@@ -79,7 +79,7 @@ int class_create_file(struct class * cls
+@@ -78,7 +78,7 @@ int class_create_file(struct class *cls,
  {
  	int error;
- 	if (cls) {
+ 	if (cls)
 -		error = sysfs_create_file(&cls->subsys.kobj, &attr->attr);
 +		error = sysfs_create_file(&cls->p->subsys.kobj, &attr->attr);
- 	} else
+ 	else
  		error = -EINVAL;
  	return error;
-@@ -88,20 +88,20 @@ int class_create_file(struct class * cls
- void class_remove_file(struct class * cls, const struct class_attribute * attr)
+@@ -87,21 +87,20 @@ int class_create_file(struct class *cls,
+ void class_remove_file(struct class *cls, const struct class_attribute *attr)
  {
  	if (cls)
 -		sysfs_remove_file(&cls->subsys.kobj, &attr->attr);
@@ -123,29 +123,30 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  static struct class *class_get(struct class *cls)
  {
  	if (cls)
--		return container_of(kset_get(&cls->subsys), struct class, subsys);
+-		return container_of(kset_get(&cls->subsys),
+-				    struct class, subsys);
 -	return NULL;
 +		kset_get(&cls->p->subsys);
 +	return cls;
  }
  
- static void class_put(struct class * cls)
+ static void class_put(struct class *cls)
  {
  	if (cls)
 -		kset_put(&cls->subsys);
 +		kset_put(&cls->p->subsys);
  }
  
+ static int add_class_attrs(struct class *cls)
+@@ -136,17 +135,23 @@ static void remove_class_attrs(struct cl
  
-@@ -138,32 +138,42 @@ static void remove_class_attrs(struct cl
- int class_register(struct class * cls)
+ int class_register(struct class *cls)
  {
- 	int error;
 +	struct class_private *cp;
+ 	int error;
  
  	pr_debug("device class '%s': registering\n", cls->name);
  
--	INIT_LIST_HEAD(&cls->children);
 -	INIT_LIST_HEAD(&cls->devices);
 -	INIT_LIST_HEAD(&cls->interfaces);
 -	kset_init(&cls->class_dirs);
@@ -155,7 +156,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	cp = kzalloc(sizeof(*cp), GFP_KERNEL);
 +	if (!cp)
 +		return -ENOMEM;
-+	INIT_LIST_HEAD(&cp->children);
 +	INIT_LIST_HEAD(&cp->devices);
 +	INIT_LIST_HEAD(&cp->interfaces);
 +	kset_init(&cp->class_dirs);
@@ -166,7 +166,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		return error;
 +	}
  
- #ifdef CONFIG_SYSFS_DEPRECATED
+ 	/* set the default /sys/dev directory for devices of this class */
+ 	if (!cls->dev_kobj)
+@@ -155,17 +160,21 @@ int class_register(struct class *cls)
+ #if defined(CONFIG_SYSFS_DEPRECATED) && defined(CONFIG_BLOCK)
  	/* let the block class directory show up in the root of sysfs */
  	if (cls != &block_class)
 -		cls->subsys.kobj.kset = class_kset;
@@ -195,7 +198,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	return error;
  }
  
-@@ -171,7 +181,7 @@ void class_unregister(struct class * cls
+@@ -173,7 +182,7 @@ void class_unregister(struct class *cls)
  {
  	pr_debug("device class '%s': unregistering\n", cls->name);
  	remove_class_attrs(cls);
@@ -204,78 +207,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  }
  
  static void class_create_release(struct class *cls)
-@@ -583,7 +593,7 @@ int class_device_add(struct class_device
- 	if (parent_class_dev)
- 		class_dev->kobj.parent = &parent_class_dev->kobj;
- 	else
--		class_dev->kobj.parent = &parent_class->subsys.kobj;
-+		class_dev->kobj.parent = &parent_class->p->subsys.kobj;
- 
- 	error = kobject_add(&class_dev->kobj, class_dev->kobj.parent,
- 			    "%s", class_dev->class_id);
-@@ -592,7 +602,7 @@ int class_device_add(struct class_device
- 
- 	/* add the needed attributes to this device */
- 	error = sysfs_create_link(&class_dev->kobj,
--				  &parent_class->subsys.kobj, "subsystem");
-+				  &parent_class->p->subsys.kobj, "subsystem");
- 	if (error)
- 		goto out3;
- 
-@@ -628,13 +638,13 @@ int class_device_add(struct class_device
- 	kobject_uevent(&class_dev->kobj, KOBJ_ADD);
- 
- 	/* notify any interfaces this device is now here */
--	down(&parent_class->sem);
--	list_add_tail(&class_dev->node, &parent_class->children);
--	list_for_each_entry(class_intf, &parent_class->interfaces, node) {
-+	down(&parent_class->p->sem);
-+	list_add_tail(&class_dev->node, &parent_class->p->children);
-+	list_for_each_entry(class_intf, &parent_class->p->interfaces, node) {
- 		if (class_intf->add)
- 			class_intf->add(class_dev, class_intf);
- 	}
--	up(&parent_class->sem);
-+	up(&parent_class->p->sem);
- 
- 	goto out1;
- 
-@@ -736,12 +746,13 @@ void class_device_del(struct class_devic
- 	struct class_interface *class_intf;
- 
- 	if (parent_class) {
--		down(&parent_class->sem);
-+		down(&parent_class->p->sem);
- 		list_del_init(&class_dev->node);
--		list_for_each_entry(class_intf, &parent_class->interfaces, node)
-+		list_for_each_entry(class_intf, &parent_class->p->interfaces,
-+				    node)
- 			if (class_intf->remove)
- 				class_intf->remove(class_dev, class_intf);
--		up(&parent_class->sem);
-+		up(&parent_class->p->sem);
- 	}
- 
- 	if (class_dev->dev) {
-@@ -783,14 +794,14 @@ void class_device_destroy(struct class *
- 	struct class_device *class_dev = NULL;
- 	struct class_device *class_dev_tmp;
- 
--	down(&cls->sem);
--	list_for_each_entry(class_dev_tmp, &cls->children, node) {
-+	down(&cls->p->sem);
-+	list_for_each_entry(class_dev_tmp, &cls->p->children, node) {
- 		if (class_dev_tmp->devt == devt) {
- 			class_dev = class_dev_tmp;
- 			break;
- 		}
- 	}
--	up(&cls->sem);
-+	up(&cls->p->sem);
- 
- 	if (class_dev)
- 		class_device_unregister(class_dev);
-@@ -833,8 +844,8 @@ int class_for_each_device(struct class *
+@@ -280,8 +289,8 @@ int class_for_each_device(struct class *
  
  	if (!class)
  		return -EINVAL;
@@ -283,10 +215,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -	list_for_each_entry(dev, &class->devices, node) {
 +	down(&class->p->sem);
 +	list_for_each_entry(dev, &class->p->devices, node) {
- 		dev = get_device(dev);
- 		if (dev) {
- 			error = fn(dev, data);
-@@ -844,7 +855,7 @@ int class_for_each_device(struct class *
+ 		if (start && start != dev)
+ 			continue;
+ 		else
+@@ -292,7 +301,7 @@ int class_for_each_device(struct class *
  		if (error)
  			break;
  	}
@@ -295,7 +227,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  	return error;
  }
-@@ -879,8 +890,8 @@ struct device *class_find_device(struct 
+@@ -329,8 +338,8 @@ struct device *class_find_device(struct 
  	if (!class)
  		return NULL;
  
@@ -303,103 +235,56 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -	list_for_each_entry(dev, &class->devices, node) {
 +	down(&class->p->sem);
 +	list_for_each_entry(dev, &class->p->devices, node) {
- 		dev = get_device(dev);
- 		if (dev) {
- 			if (match(dev, data)) {
-@@ -891,7 +902,7 @@ struct device *class_find_device(struct 
+ 		if (start && start != dev)
+ 			continue;
+ 		else
+@@ -342,7 +351,7 @@ struct device *class_find_device(struct 
  		} else
- 			break;
+ 			put_device(dev);
  	}
 -	up(&class->sem);
 +	up(&class->p->sem);
  
  	return found ? dev : NULL;
  }
-@@ -925,8 +936,8 @@ struct class_device *class_find_child(st
- 	if (!class)
- 		return NULL;
- 
--	down(&class->sem);
--	list_for_each_entry(dev, &class->children, node) {
-+	down(&class->p->sem);
-+	list_for_each_entry(dev, &class->p->children, node) {
- 		dev = class_device_get(dev);
- 		if (dev) {
- 			if (match(dev, data)) {
-@@ -937,7 +948,7 @@ struct class_device *class_find_child(st
- 		} else
- 			break;
- 	}
--	up(&class->sem);
-+	up(&class->p->sem);
- 
- 	return found ? dev : NULL;
- }
-@@ -947,6 +958,7 @@ int class_interface_register(struct clas
- {
- 	struct class *parent;
- 	struct class_device *class_dev;
-+	struct class_private *cp;
- 	struct device *dev;
- 
- 	if (!class_intf || !class_intf->class)
-@@ -956,41 +968,43 @@ int class_interface_register(struct clas
+@@ -360,13 +369,13 @@ int class_interface_register(struct clas
  	if (!parent)
  		return -EINVAL;
  
 -	down(&parent->sem);
 -	list_add_tail(&class_intf->node, &parent->interfaces);
-+	cp = parent->p;
-+	down(&cp->sem);
-+	list_add_tail(&class_intf->node, &cp->interfaces);
- 	if (class_intf->add) {
--		list_for_each_entry(class_dev, &parent->children, node)
-+		list_for_each_entry(class_dev, &cp->children, node)
- 			class_intf->add(class_dev, class_intf);
- 	}
++	down(&parent->p->sem);
++	list_add_tail(&class_intf->node, &parent->p->interfaces);
  	if (class_intf->add_dev) {
 -		list_for_each_entry(dev, &parent->devices, node)
-+		list_for_each_entry(dev, &cp->devices, node)
++		list_for_each_entry(dev, &parent->p->devices, node)
  			class_intf->add_dev(dev, class_intf);
  	}
 -	up(&parent->sem);
-+	up(&cp->sem);
++	up(&parent->p->sem);
  
  	return 0;
  }
- 
- void class_interface_unregister(struct class_interface *class_intf)
- {
--	struct class * parent = class_intf->class;
-+	struct class *parent = class_intf->class;
-+	struct class_private *cp = parent->p;
- 	struct class_device *class_dev;
- 	struct device *dev;
- 
+@@ -379,13 +388,13 @@ void class_interface_unregister(struct c
  	if (!parent)
  		return;
  
 -	down(&parent->sem);
-+	down(&cp->sem);
++	down(&parent->p->sem);
  	list_del_init(&class_intf->node);
- 	if (class_intf->remove) {
--		list_for_each_entry(class_dev, &parent->children, node)
-+		list_for_each_entry(class_dev, &cp->children, node)
- 			class_intf->remove(class_dev, class_intf);
- 	}
  	if (class_intf->remove_dev) {
 -		list_for_each_entry(dev, &parent->devices, node)
-+		list_for_each_entry(dev, &cp->devices, node)
++		list_for_each_entry(dev, &parent->p->devices, node)
  			class_intf->remove_dev(dev, class_intf);
  	}
 -	up(&parent->sem);
-+	up(&cp->sem);
++	up(&parent->p->sem);
  
  	class_put(parent);
  }
 --- a/drivers/base/core.c
 +++ b/drivers/base/core.c
-@@ -588,13 +588,13 @@ static struct kobject *get_device_parent
+@@ -598,13 +598,13 @@ static struct kobject *get_device_parent
  			parent_kobj = &parent->kobj;
  
  		/* find our class-directory at the parent and reference it */
@@ -416,7 +301,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		if (kobj)
  			return kobj;
  
-@@ -602,7 +602,7 @@ static struct kobject *get_device_parent
+@@ -612,7 +612,7 @@ static struct kobject *get_device_parent
  		k = kobject_create();
  		if (!k)
  			return NULL;
@@ -425,16 +310,16 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  		retval = kobject_add(k, parent_kobj, "%s", dev->class->name);
  		if (retval < 0) {
  			kobject_put(k);
-@@ -622,7 +622,7 @@ static void cleanup_device_parent(struct
- 	struct kobject *glue_dir = dev->kobj.parent;
- 
+@@ -631,7 +631,7 @@ static void cleanup_glue_dir(struct devi
+ {
  	/* see if we live in a "glue" directory */
--	if (!dev->class || glue_dir->kset != &dev->class->class_dirs)
-+	if (!dev->class || glue_dir->kset != &dev->class->p->class_dirs)
+ 	if (!glue_dir || !dev->class ||
+-	    glue_dir->kset != &dev->class->class_dirs)
++	    glue_dir->kset != &dev->class->p->class_dirs)
  		return;
  
  	kobject_put(glue_dir);
-@@ -647,7 +647,7 @@ static int device_add_class_symlinks(str
+@@ -658,7 +658,7 @@ static int device_add_class_symlinks(str
  	if (!dev->class)
  		return 0;
  
@@ -443,7 +328,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  				  "subsystem");
  	if (error)
  		goto out;
-@@ -699,7 +699,7 @@ out_busid:
+@@ -710,7 +710,7 @@ out_busid:
  		sysfs_remove_link(&dev->class->subsys.kobj, dev->bus_id);
  #else
  	/* link in the class directory pointing to the device */
@@ -452,7 +337,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  				  dev->bus_id);
  	if (error)
  		goto out_subsys;
-@@ -713,7 +713,7 @@ out_busid:
+@@ -724,7 +724,7 @@ out_busid:
  	return 0;
  
  out_busid:
@@ -461,8 +346,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  #endif
  
  out_subsys:
-@@ -746,7 +746,7 @@ static void device_remove_class_symlinks
- 	if (dev->parent && dev->type != &part_type)
+@@ -757,7 +757,7 @@ static void device_remove_class_symlinks
+ 	if (dev->parent && device_is_not_partition(dev))
  		sysfs_remove_link(&dev->kobj, "device");
  
 -	sysfs_remove_link(&dev->class->subsys.kobj, dev->bus_id);
@@ -470,7 +355,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  #endif
  
  	sysfs_remove_link(&dev->kobj, "subsystem");
-@@ -832,15 +832,16 @@ int device_add(struct device *dev)
+@@ -889,15 +889,16 @@ int device_add(struct device *dev)
  		klist_add_tail(&dev->knode_parent, &parent->klist_children);
  
  	if (dev->class) {
@@ -491,7 +376,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	}
   Done:
  	put_device(dev);
-@@ -944,14 +945,15 @@ void device_del(struct device * dev)
+@@ -998,14 +999,15 @@ void device_del(struct device *dev)
  	if (dev->class) {
  		device_remove_class_symlinks(dev);
  
@@ -510,66 +395,181 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	}
  	device_remove_file(dev, &uevent_attr);
  	device_remove_attrs(dev);
-@@ -1158,14 +1160,14 @@ static struct device *find_device(struct
- 	struct device *dev = NULL;
- 	struct device *dev_tmp;
- 
--	down(&class->sem);
--	list_for_each_entry(dev_tmp, &class->devices, node) {
-+	down(&class->p->sem);
-+	list_for_each_entry(dev_tmp, &class->p->devices, node) {
- 		if (dev_tmp->devt == devt) {
- 			dev = dev_tmp;
- 			break;
- 		}
- 	}
--	up(&class->sem);
-+	up(&class->p->sem);
- 	return dev;
- }
- 
-@@ -1265,9 +1267,9 @@ int device_rename(struct device *dev, ch
+@@ -1341,11 +1343,12 @@ int device_rename(struct device *dev, ch
  	}
  #else
  	if (dev->class) {
--		sysfs_remove_link(&dev->class->subsys.kobj, old_device_name);
 -		error = sysfs_create_link(&dev->class->subsys.kobj, &dev->kobj,
 -					  dev->bus_id);
-+		sysfs_remove_link(&dev->class->p->subsys.kobj, old_device_name);
 +		error = sysfs_create_link(&dev->class->p->subsys.kobj,
 +					  &dev->kobj, dev->bus_id);
- 		if (error) {
- 			dev_err(dev, "%s: sysfs_create_symlink failed (%d)\n",
- 				__FUNCTION__, error);
+ 		if (error)
+ 			goto out;
+-		sysfs_remove_link(&dev->class->subsys.kobj, old_device_name);
++		sysfs_remove_link(&dev->class->p->subsys.kobj,
++				  old_device_name);
+ 	}
+ #endif
+ 
+--- a/drivers/i2c/i2c-core.c
++++ b/drivers/i2c/i2c-core.c
+@@ -646,6 +646,15 @@ EXPORT_SYMBOL(i2c_del_adapter);
+ 
+ /* ------------------------------------------------------------------------- */
+ 
++static int attach_device(struct device *dev, void *data)
++{
++	struct i2c_adapter *adapter = to_i2c_adapter(dev);
++	struct i2c_driver *driver = data;
++
++	driver->attach_adapter(adapter);
++	return 0;
++}
++
+ /*
+  * An i2c_driver is used with one or more i2c_client (device) nodes to access
+  * i2c slave chips, on a bus instance associated with some i2c_adapter.  There
+@@ -686,22 +695,52 @@ int i2c_register_driver(struct module *o
+ 	pr_debug("i2c-core: driver [%s] registered\n", driver->driver.name);
+ 
+ 	/* legacy drivers scan i2c busses directly */
+-	if (driver->attach_adapter) {
+-		struct i2c_adapter *adapter;
+-
+-		down(&i2c_adapter_class.sem);
+-		list_for_each_entry(adapter, &i2c_adapter_class.devices,
+-				    dev.node) {
+-			driver->attach_adapter(adapter);
+-		}
+-		up(&i2c_adapter_class.sem);
+-	}
++	if (driver->attach_adapter)
++		class_for_each_device(&i2c_adapter_class, (void *)driver,
++				      attach_device);
+ 
+ 	mutex_unlock(&core_lock);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(i2c_register_driver);
+ 
++static int detach_device(struct device *dev, void *data)
++{
++	struct i2c_adapter *adapter = to_i2c_adapter(dev);
++	struct i2c_driver *driver = data;
++	struct list_head *item2;
++	struct list_head *_n;
++	struct i2c_client *client;
++
++	/* Have a look at each adapter, if clients of this driver are still
++	 * attached. If so, detach them to be able to kill the driver
++	 * afterwards.
++	 */
++	if (driver->detach_adapter) {
++		if (driver->detach_adapter(adapter)) {
++			dev_err(&adapter->dev, "detach_adapter failed "
++				"for driver [%s]\n",
++				driver->driver.name);
++		}
++	} else {
++		list_for_each_safe(item2, _n, &adapter->clients) {
++			client = list_entry(item2, struct i2c_client, list);
++			if (client->driver != driver)
++				continue;
++			dev_dbg(&adapter->dev, "detaching client [%s] "
++				"at 0x%02x\n", client->name,
++				client->addr);
++			if (driver->detach_client(client)) {
++				dev_err(&adapter->dev, "detach_client "
++					"failed for client [%s] at "
++					"0x%02x\n", client->name,
++					client->addr);
++			}
++		}
++	}
++	return 0;
++}
++
+ /**
+  * i2c_del_driver - unregister I2C driver
+  * @driver: the driver being unregistered
+@@ -709,46 +748,15 @@ EXPORT_SYMBOL(i2c_register_driver);
+  */
+ void i2c_del_driver(struct i2c_driver *driver)
+ {
+-	struct list_head   *item2, *_n;
+-	struct i2c_client  *client;
+-	struct i2c_adapter *adap;
+-
+ 	mutex_lock(&core_lock);
+ 
+ 	/* new-style driver? */
+ 	if (is_newstyle_driver(driver))
+ 		goto unregister;
+ 
+-	/* Have a look at each adapter, if clients of this driver are still
+-	 * attached. If so, detach them to be able to kill the driver
+-	 * afterwards.
+-	 */
+-	down(&i2c_adapter_class.sem);
+-	list_for_each_entry(adap, &i2c_adapter_class.devices, dev.node) {
+-		if (driver->detach_adapter) {
+-			if (driver->detach_adapter(adap)) {
+-				dev_err(&adap->dev, "detach_adapter failed "
+-					"for driver [%s]\n",
+-					driver->driver.name);
+-			}
+-		} else {
+-			list_for_each_safe(item2, _n, &adap->clients) {
+-				client = list_entry(item2, struct i2c_client, list);
+-				if (client->driver != driver)
+-					continue;
+-				dev_dbg(&adap->dev, "detaching client [%s] "
+-					"at 0x%02x\n", client->name,
+-					client->addr);
+-				if (driver->detach_client(client)) {
+-					dev_err(&adap->dev, "detach_client "
+-						"failed for client [%s] at "
+-						"0x%02x\n", client->name,
+-						client->addr);
+-				}
+-			}
+-		}
+-	}
+-	up(&i2c_adapter_class.sem);
++	/* old-style driver, do it by hand */
++	class_for_each_device(&i2c_adapter_class, (void *)driver,
++			      detach_device);
+ 
+  unregister:
+ 	driver_unregister(&driver->driver);
 --- a/include/linux/device.h
 +++ b/include/linux/device.h
-@@ -34,6 +34,7 @@ struct device;
+@@ -30,6 +30,7 @@ struct device;
  struct device_driver;
  struct driver_private;
  struct class;
 +struct class_private;
- struct class_device;
  struct bus_type;
  struct bus_type_private;
-@@ -172,12 +173,6 @@ struct class {
- 	const char		* name;
- 	struct module		* owner;
+ 
+@@ -177,11 +178,6 @@ struct class {
+ 	const char		*name;
+ 	struct module		*owner;
  
 -	struct kset		subsys;
--	struct list_head	children;
 -	struct list_head	devices;
 -	struct list_head	interfaces;
 -	struct kset		class_dirs;
 -	struct semaphore	sem; /* locks children, devices, interfaces */
- 	struct class_attribute		* class_attrs;
- 	struct class_device_attribute	* class_dev_attrs;
- 	struct device_attribute		* dev_attrs;
-@@ -191,6 +186,8 @@ struct class {
+ 	struct class_attribute		*class_attrs;
+ 	struct device_attribute		*dev_attrs;
+ 	struct kobject			*dev_kobj;
+@@ -193,6 +189,8 @@ struct class {
  
- 	int	(*suspend)(struct device *, pm_message_t state);
- 	int	(*resume)(struct device *);
+ 	int (*suspend)(struct device *dev, pm_message_t state);
+ 	int (*resume)(struct device *dev);
 +
 +	struct class_private *p;
  };
  
- extern int __must_check class_register(struct class *);
+ extern struct kobject *sysfs_dev_block_kobj;
