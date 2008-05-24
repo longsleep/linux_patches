@@ -8,20 +8,16 @@ This moves the portions of struct class that are dynamic (kobject and
 lock and lists) out of the main structure and into a dymamic, private,
 structure.
 
-Note, right now this breaks the genhd.c code badly, hopefully Kay can
-fix this up for me :)
-
 
 Cc: Kay Sievers <kay.sievers@vrfy.org>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
- drivers/base/base.h    |   27 +++++++++++++
- drivers/base/class.c   |   89 +++++++++++++++++++++++++--------------------
- drivers/base/core.c    |   41 +++++++++++---------
- drivers/i2c/i2c-core.c |   96 ++++++++++++++++++++++++++-----------------------
+ drivers/base/base.h    |   27 ++++++++++++++
+ drivers/base/class.c   |   89 ++++++++++++++++++++++++++-----------------------
+ drivers/base/core.c    |   41 ++++++++++++----------
  include/linux/device.h |    8 +---
- 5 files changed, 153 insertions(+), 108 deletions(-)
+ 4 files changed, 101 insertions(+), 64 deletions(-)
 
 --- a/drivers/base/base.h
 +++ b/drivers/base/base.h
@@ -215,10 +211,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -	list_for_each_entry(dev, &class->devices, node) {
 +	down(&class->p->sem);
 +	list_for_each_entry(dev, &class->p->devices, node) {
- 		if (start && start != dev)
- 			continue;
- 		else
-@@ -292,7 +301,7 @@ int class_for_each_device(struct class *
+ 		if (start) {
+ 			if (start == dev)
+ 				start = NULL;
+@@ -293,7 +302,7 @@ int class_for_each_device(struct class *
  		if (error)
  			break;
  	}
@@ -227,7 +223,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  	return error;
  }
-@@ -329,8 +338,8 @@ struct device *class_find_device(struct 
+@@ -330,8 +339,8 @@ struct device *class_find_device(struct 
  	if (!class)
  		return NULL;
  
@@ -235,10 +231,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -	list_for_each_entry(dev, &class->devices, node) {
 +	down(&class->p->sem);
 +	list_for_each_entry(dev, &class->p->devices, node) {
- 		if (start && start != dev)
- 			continue;
- 		else
-@@ -342,7 +351,7 @@ struct device *class_find_device(struct 
+ 		if (start) {
+ 			if (start == dev)
+ 				start = NULL;
+@@ -344,7 +353,7 @@ struct device *class_find_device(struct 
  		} else
  			put_device(dev);
  	}
@@ -247,7 +243,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  	return found ? dev : NULL;
  }
-@@ -360,13 +369,13 @@ int class_interface_register(struct clas
+@@ -362,13 +371,13 @@ int class_interface_register(struct clas
  	if (!parent)
  		return -EINVAL;
  
@@ -265,7 +261,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  	return 0;
  }
-@@ -379,13 +388,13 @@ void class_interface_unregister(struct c
+@@ -381,13 +390,13 @@ void class_interface_unregister(struct c
  	if (!parent)
  		return;
  
@@ -411,137 +407,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	}
  #endif
  
---- a/drivers/i2c/i2c-core.c
-+++ b/drivers/i2c/i2c-core.c
-@@ -646,6 +646,15 @@ EXPORT_SYMBOL(i2c_del_adapter);
- 
- /* ------------------------------------------------------------------------- */
- 
-+static int attach_device(struct device *dev, void *data)
-+{
-+	struct i2c_adapter *adapter = to_i2c_adapter(dev);
-+	struct i2c_driver *driver = data;
-+
-+	driver->attach_adapter(adapter);
-+	return 0;
-+}
-+
- /*
-  * An i2c_driver is used with one or more i2c_client (device) nodes to access
-  * i2c slave chips, on a bus instance associated with some i2c_adapter.  There
-@@ -686,22 +695,52 @@ int i2c_register_driver(struct module *o
- 	pr_debug("i2c-core: driver [%s] registered\n", driver->driver.name);
- 
- 	/* legacy drivers scan i2c busses directly */
--	if (driver->attach_adapter) {
--		struct i2c_adapter *adapter;
--
--		down(&i2c_adapter_class.sem);
--		list_for_each_entry(adapter, &i2c_adapter_class.devices,
--				    dev.node) {
--			driver->attach_adapter(adapter);
--		}
--		up(&i2c_adapter_class.sem);
--	}
-+	if (driver->attach_adapter)
-+		class_for_each_device(&i2c_adapter_class, (void *)driver,
-+				      attach_device);
- 
- 	mutex_unlock(&core_lock);
- 	return 0;
- }
- EXPORT_SYMBOL(i2c_register_driver);
- 
-+static int detach_device(struct device *dev, void *data)
-+{
-+	struct i2c_adapter *adapter = to_i2c_adapter(dev);
-+	struct i2c_driver *driver = data;
-+	struct list_head *item2;
-+	struct list_head *_n;
-+	struct i2c_client *client;
-+
-+	/* Have a look at each adapter, if clients of this driver are still
-+	 * attached. If so, detach them to be able to kill the driver
-+	 * afterwards.
-+	 */
-+	if (driver->detach_adapter) {
-+		if (driver->detach_adapter(adapter)) {
-+			dev_err(&adapter->dev, "detach_adapter failed "
-+				"for driver [%s]\n",
-+				driver->driver.name);
-+		}
-+	} else {
-+		list_for_each_safe(item2, _n, &adapter->clients) {
-+			client = list_entry(item2, struct i2c_client, list);
-+			if (client->driver != driver)
-+				continue;
-+			dev_dbg(&adapter->dev, "detaching client [%s] "
-+				"at 0x%02x\n", client->name,
-+				client->addr);
-+			if (driver->detach_client(client)) {
-+				dev_err(&adapter->dev, "detach_client "
-+					"failed for client [%s] at "
-+					"0x%02x\n", client->name,
-+					client->addr);
-+			}
-+		}
-+	}
-+	return 0;
-+}
-+
- /**
-  * i2c_del_driver - unregister I2C driver
-  * @driver: the driver being unregistered
-@@ -709,46 +748,15 @@ EXPORT_SYMBOL(i2c_register_driver);
-  */
- void i2c_del_driver(struct i2c_driver *driver)
- {
--	struct list_head   *item2, *_n;
--	struct i2c_client  *client;
--	struct i2c_adapter *adap;
--
- 	mutex_lock(&core_lock);
- 
- 	/* new-style driver? */
- 	if (is_newstyle_driver(driver))
- 		goto unregister;
- 
--	/* Have a look at each adapter, if clients of this driver are still
--	 * attached. If so, detach them to be able to kill the driver
--	 * afterwards.
--	 */
--	down(&i2c_adapter_class.sem);
--	list_for_each_entry(adap, &i2c_adapter_class.devices, dev.node) {
--		if (driver->detach_adapter) {
--			if (driver->detach_adapter(adap)) {
--				dev_err(&adap->dev, "detach_adapter failed "
--					"for driver [%s]\n",
--					driver->driver.name);
--			}
--		} else {
--			list_for_each_safe(item2, _n, &adap->clients) {
--				client = list_entry(item2, struct i2c_client, list);
--				if (client->driver != driver)
--					continue;
--				dev_dbg(&adap->dev, "detaching client [%s] "
--					"at 0x%02x\n", client->name,
--					client->addr);
--				if (driver->detach_client(client)) {
--					dev_err(&adap->dev, "detach_client "
--						"failed for client [%s] at "
--						"0x%02x\n", client->name,
--						client->addr);
--				}
--			}
--		}
--	}
--	up(&i2c_adapter_class.sem);
-+	/* old-style driver, do it by hand */
-+	class_for_each_device(&i2c_adapter_class, (void *)driver,
-+			      detach_device);
- 
-  unregister:
- 	driver_unregister(&driver->driver);
 --- a/include/linux/device.h
 +++ b/include/linux/device.h
 @@ -30,6 +30,7 @@ struct device;
