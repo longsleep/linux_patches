@@ -1,0 +1,198 @@
+From foo@baz Tue Apr  9 12:12:43 2002
+Date: Wed, 28 May 2008 09:28:39 -0700
+To: Greg KH <greg@kroah.com>
+From: Dave Young <hidave.darkstar@gmail.com>
+Subject: class: change internal semaphore to a mutex
+
+From: Dave Young <hidave.darkstar@gmail.com>
+
+Now that the lockdep infrastructure in the class core is in place, we
+should be able to properly change the internal class semaphore to be a
+mutex.
+
+David wrote the original patch, and Greg fixed it up to apply properly
+due to all of the recent changes in this area.
+
+From: Dave Young <hidave.darkstar@gmail.com>
+Cc: Matthew Wilcox <matthew@wil.cx>
+Cc: Kay Sievers <kay.sievers@vrfy.org>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: James Bottomley <James.Bottomley@HansenPartnership.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+---
+ drivers/base/base.h  |    4 ++--
+ drivers/base/class.c |   23 ++++++++++++-----------
+ drivers/base/core.c  |    9 +++++----
+ 3 files changed, 19 insertions(+), 17 deletions(-)
+
+--- a/drivers/base/base.h
++++ b/drivers/base/base.h
+@@ -44,7 +44,7 @@ struct driver_private {
+  * @class_devices - list of devices associated with this class
+  * @class_interfaces - list of class_interfaces associated with this class
+  * @class_dirs - "glue" directory for virtual devices associated with this class
+- * @class_sem - semaphore to protect the children, devices, and interfaces lists.
++ * @class_mutex - mutex to protect the children, devices, and interfaces lists.
+  * @class - pointer back to the struct class that this structure is associated
+  * with.
+  *
+@@ -57,7 +57,7 @@ struct class_private {
+ 	struct list_head class_devices;
+ 	struct list_head class_interfaces;
+ 	struct kset class_dirs;
+-	struct semaphore class_sem;
++	struct mutex class_mutex;
+ 	struct class *class;
+ };
+ #define to_class(obj)	\
+--- a/drivers/base/class.c
++++ b/drivers/base/class.c
+@@ -18,6 +18,7 @@
+ #include <linux/err.h>
+ #include <linux/slab.h>
+ #include <linux/genhd.h>
++#include <linux/mutex.h>
+ #include "base.h"
+ 
+ #define to_class_attr(_attr) container_of(_attr, struct class_attribute, attr)
+@@ -147,7 +148,7 @@ int __class_register(struct class *cls, 
+ 	INIT_LIST_HEAD(&cp->class_devices);
+ 	INIT_LIST_HEAD(&cp->class_interfaces);
+ 	kset_init(&cp->class_dirs);
+-	init_MUTEX(&cp->class_sem);
++	__mutex_init(&cp->class_mutex, "struct class mutex", key);
+ 	error = kobject_set_name(&cp->class_subsys.kobj, "%s", cls->name);
+ 	if (error) {
+ 		kfree(cp);
+@@ -281,7 +282,7 @@ char *make_class_name(const char *name, 
+  * We check the return of @fn each time. If it returns anything
+  * other than 0, we break out and return that value.
+  *
+- * Note, we hold class->class_sem in this function, so it can not be
++ * Note, we hold class->class_mutex in this function, so it can not be
+  * re-acquired in @fn, otherwise it will self-deadlocking. For
+  * example, calls to add or remove class members would be verboten.
+  */
+@@ -293,7 +294,7 @@ int class_for_each_device(struct class *
+ 
+ 	if (!class)
+ 		return -EINVAL;
+-	down(&class->p->class_sem);
++	mutex_lock(&class->p->class_mutex);
+ 	list_for_each_entry(dev, &class->p->class_devices, node) {
+ 		if (start) {
+ 			if (start == dev)
+@@ -306,7 +307,7 @@ int class_for_each_device(struct class *
+ 		if (error)
+ 			break;
+ 	}
+-	up(&class->p->class_sem);
++	mutex_unlock(&class->p->class_mutex);
+ 
+ 	return error;
+ }
+@@ -329,7 +330,7 @@ EXPORT_SYMBOL_GPL(class_for_each_device)
+  *
+  * Note, you will need to drop the reference with put_device() after use.
+  *
+- * We hold class->class_sem in this function, so it can not be
++ * We hold class->class_mutex in this function, so it can not be
+  * re-acquired in @match, otherwise it will self-deadlocking. For
+  * example, calls to add or remove class members would be verboten.
+  */
+@@ -343,7 +344,7 @@ struct device *class_find_device(struct 
+ 	if (!class)
+ 		return NULL;
+ 
+-	down(&class->p->class_sem);
++	mutex_lock(&class->p->class_mutex);
+ 	list_for_each_entry(dev, &class->p->class_devices, node) {
+ 		if (start) {
+ 			if (start == dev)
+@@ -357,7 +358,7 @@ struct device *class_find_device(struct 
+ 		} else
+ 			put_device(dev);
+ 	}
+-	up(&class->p->class_sem);
++	mutex_unlock(&class->p->class_mutex);
+ 
+ 	return found ? dev : NULL;
+ }
+@@ -375,13 +376,13 @@ int class_interface_register(struct clas
+ 	if (!parent)
+ 		return -EINVAL;
+ 
+-	down(&parent->p->class_sem);
++	mutex_lock(&parent->p->class_mutex);
+ 	list_add_tail(&class_intf->node, &parent->p->class_interfaces);
+ 	if (class_intf->add_dev) {
+ 		list_for_each_entry(dev, &parent->p->class_devices, node)
+ 			class_intf->add_dev(dev, class_intf);
+ 	}
+-	up(&parent->p->class_sem);
++	mutex_unlock(&parent->p->class_mutex);
+ 
+ 	return 0;
+ }
+@@ -394,13 +395,13 @@ void class_interface_unregister(struct c
+ 	if (!parent)
+ 		return;
+ 
+-	down(&parent->p->class_sem);
++	mutex_lock(&parent->p->class_mutex);
+ 	list_del_init(&class_intf->node);
+ 	if (class_intf->remove_dev) {
+ 		list_for_each_entry(dev, &parent->p->class_devices, node)
+ 			class_intf->remove_dev(dev, class_intf);
+ 	}
+-	up(&parent->p->class_sem);
++	mutex_unlock(&parent->p->class_mutex);
+ 
+ 	class_put(parent);
+ }
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@ -21,6 +21,7 @@
+ #include <linux/genhd.h>
+ #include <linux/kallsyms.h>
+ #include <linux/semaphore.h>
++#include <linux/mutex.h>
+ 
+ #include "base.h"
+ #include "power/power.h"
+@@ -891,7 +892,7 @@ int device_add(struct device *dev)
+ 		klist_add_tail(&dev->knode_parent, &parent->klist_children);
+ 
+ 	if (dev->class) {
+-		down(&dev->class->p->class_sem);
++		mutex_lock(&dev->class->p->class_mutex);
+ 		/* tie the class to the device */
+ 		list_add_tail(&dev->node, &dev->class->p->class_devices);
+ 
+@@ -900,7 +901,7 @@ int device_add(struct device *dev)
+ 				    &dev->class->p->class_interfaces, node)
+ 			if (class_intf->add_dev)
+ 				class_intf->add_dev(dev, class_intf);
+-		up(&dev->class->p->class_sem);
++		mutex_unlock(&dev->class->p->class_mutex);
+ 	}
+  Done:
+ 	put_device(dev);
+@@ -1001,7 +1002,7 @@ void device_del(struct device *dev)
+ 	if (dev->class) {
+ 		device_remove_class_symlinks(dev);
+ 
+-		down(&dev->class->p->class_sem);
++		mutex_lock(&dev->class->p->class_mutex);
+ 		/* notify any interfaces that the device is now gone */
+ 		list_for_each_entry(class_intf,
+ 				    &dev->class->p->class_interfaces, node)
+@@ -1009,7 +1010,7 @@ void device_del(struct device *dev)
+ 				class_intf->remove_dev(dev, class_intf);
+ 		/* remove the device from the class list */
+ 		list_del_init(&dev->node);
+-		up(&dev->class->p->class_sem);
++		mutex_unlock(&dev->class->p->class_mutex);
+ 	}
+ 	device_remove_file(dev, &uevent_attr);
+ 	device_remove_attrs(dev);

@@ -1,0 +1,124 @@
+From foo@baz Tue Apr  9 12:12:43 2002
+Date: Wed, 28 May 2008 09:28:39 -0700
+To: Greg KH <greg@kroah.com>
+From: Matthew Wilcox <matthew@wil.cx>
+Subject: class: add lockdep infrastructure
+
+From: Matthew Wilcox <matthew@wil.cx>
+
+This adds the infrastructure to properly handle lockdep issues when the
+internal class semaphore is changed to a mutex.
+
+Matthew wrote the original patch, and Greg fixed it up to work properly
+with the class_create() function.
+
+
+From: Matthew Wilcox <matthew@wil.cx>
+Cc: Kay Sievers <kay.sievers@vrfy.org>
+Cc: Dave Young <hidave.darkstar@gmail.com>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: James Bottomley <James.Bottomley@HansenPartnership.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+---
+ drivers/base/class.c   |   11 ++++++-----
+ include/linux/device.h |   19 +++++++++++++++++--
+ 2 files changed, 23 insertions(+), 7 deletions(-)
+
+--- a/drivers/base/class.c
++++ b/drivers/base/class.c
+@@ -134,7 +134,7 @@ static void remove_class_attrs(struct cl
+ 	}
+ }
+ 
+-int class_register(struct class *cls)
++int __class_register(struct class *cls, struct lock_class_key *key)
+ {
+ 	struct class_private *cp;
+ 	int error;
+@@ -178,6 +178,7 @@ int class_register(struct class *cls)
+ 	class_put(cls);
+ 	return error;
+ }
++EXPORT_SYMBOL_GPL(__class_register);
+ 
+ void class_unregister(struct class *cls)
+ {
+@@ -203,7 +204,8 @@ static void class_create_release(struct 
+  * Note, the pointer created here is to be destroyed when finished by
+  * making a call to class_destroy().
+  */
+-struct class *class_create(struct module *owner, const char *name)
++struct class *__class_create(struct module *owner, const char *name,
++			     struct lock_class_key *key)
+ {
+ 	struct class *cls;
+ 	int retval;
+@@ -218,7 +220,7 @@ struct class *class_create(struct module
+ 	cls->owner = owner;
+ 	cls->class_release = class_create_release;
+ 
+-	retval = class_register(cls);
++	retval = __class_register(cls, key);
+ 	if (retval)
+ 		goto error;
+ 
+@@ -228,6 +230,7 @@ error:
+ 	kfree(cls);
+ 	return ERR_PTR(retval);
+ }
++EXPORT_SYMBOL_GPL(__class_create);
+ 
+ /**
+  * class_destroy - destroys a struct class structure
+@@ -412,9 +415,7 @@ int __init classes_init(void)
+ 
+ EXPORT_SYMBOL_GPL(class_create_file);
+ EXPORT_SYMBOL_GPL(class_remove_file);
+-EXPORT_SYMBOL_GPL(class_register);
+ EXPORT_SYMBOL_GPL(class_unregister);
+-EXPORT_SYMBOL_GPL(class_create);
+ EXPORT_SYMBOL_GPL(class_destroy);
+ 
+ EXPORT_SYMBOL_GPL(class_interface_register);
+--- a/include/linux/device.h
++++ b/include/linux/device.h
+@@ -16,6 +16,7 @@
+ #include <linux/kobject.h>
+ #include <linux/klist.h>
+ #include <linux/list.h>
++#include <linux/lockdep.h>
+ #include <linux/compiler.h>
+ #include <linux/types.h>
+ #include <linux/module.h>
+@@ -200,7 +201,13 @@ struct class {
+ 
+ extern struct kobject *sysfs_dev_block_kobj;
+ extern struct kobject *sysfs_dev_char_kobj;
+-extern int __must_check class_register(struct class *class);
++extern int __must_check __class_register(struct class *class,
++					 struct lock_class_key *key);
++static inline int __must_check class_register(struct class *class)
++{
++	static struct lock_class_key __key;
++	return __class_register(class, &__key);
++}
+ extern void class_unregister(struct class *class);
+ extern int class_for_each_device(struct class *class, struct device *start,
+ 				 void *data,
+@@ -234,7 +241,15 @@ struct class_interface {
+ extern int __must_check class_interface_register(struct class_interface *);
+ extern void class_interface_unregister(struct class_interface *);
+ 
+-extern struct class *class_create(struct module *owner, const char *name);
++extern struct class * __must_check __class_create(struct module *owner,
++						  const char *name,
++						  struct lock_class_key *key);
++static inline struct class * __must_check class_create(struct module *owner,
++						       const char *name)
++{
++	static struct lock_class_key __key;
++	return __class_create(owner, name, &__key);
++}
+ extern void class_destroy(struct class *cls);
+ 
+ /*
