@@ -1,0 +1,117 @@
+From 999a382a0f9855c85bf89dc1aa891816b4ef20f0 Mon Sep 17 00:00:00 2001
+From: David Woodhouse <dwmw2@infradead.org>
+Date: Thu, 29 May 2008 11:58:27 +0300
+Subject: maestro3: treat firmware data as const
+
+The maestro3 driver is byte-swapping its firmware to be host-endian in
+advance, when it doesn't seem to be necessary -- we could just use
+le16_to_cpu() as we load it.
+
+Doing that means that we need to switch the in-tree firmware to be
+little-endian too.
+
+Take the least intrusive way of doing this, which is to switch the
+existing snd_m3_convert_from_le() function to convert _to_ little-endian
+instead, and use it on the in-tree firmware instead of the loaded
+firmware. It's a bit suboptimal but doesn't matter much right now
+because we're about to remove the special cases for the in-tree version
+anyway.
+
+Signed-off-by: David Woodhouse <dwmw2@infradead.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ sound/pci/maestro3.c |   29 +++++++++++++++--------------
+ 1 file changed, 15 insertions(+), 14 deletions(-)
+
+--- a/sound/pci/maestro3.c
++++ b/sound/pci/maestro3.c
+@@ -2240,18 +2240,16 @@ static const struct firmware assp_minisr
+ 	.size = sizeof assp_minisrc_image
+ };
+ 
+-#else /* CONFIG_SND_MAESTRO3_FIRMWARE_IN_KERNEL */
+-
+ #ifdef __LITTLE_ENDIAN
+-static inline void snd_m3_convert_from_le(const struct firmware *fw) { }
++static inline void snd_m3_convert_to_le(const struct firmware *fw) { }
+ #else
+-static void snd_m3_convert_from_le(const struct firmware *fw)
++static void snd_m3_convert_to_le(const struct firmware *fw)
+ {
+ 	int i;
+ 	u16 *data = (u16 *)fw->data;
+ 
+ 	for (i = 0; i < fw->size / 2; ++i)
+-		le16_to_cpus(&data[i]);
++		cpu_to_le16s(&data[i]);
+ }
+ #endif
+ 
+@@ -2271,7 +2269,7 @@ static const u16 minisrc_lpf[MINISRC_LPF
+ static void snd_m3_assp_init(struct snd_m3 *chip)
+ {
+ 	unsigned int i;
+-	u16 *data;
++	const u16 *data;
+ 
+ 	/* zero kernel data */
+ 	for (i = 0; i < (REV_B_DATA_MEMORY_UNIT_LENGTH * NUM_UNITS_KERNEL_DATA) / 2; i++)
+@@ -2289,10 +2287,11 @@ static void snd_m3_assp_init(struct snd_
+ 			  KDATA_DMA_XFER0);
+ 
+ 	/* write kernel into code memory.. */
+-	data = (u16 *)chip->assp_kernel_image->data;
++	data = (const u16 *)chip->assp_kernel_image->data;
+ 	for (i = 0 ; i * 2 < chip->assp_kernel_image->size; i++) {
+ 		snd_m3_assp_write(chip, MEMTYPE_INTERNAL_CODE, 
+-				  REV_B_CODE_MEMORY_BEGIN + i, data[i]);
++				  REV_B_CODE_MEMORY_BEGIN + i,
++				  le16_to_cpu(data[i]));
+ 	}
+ 
+ 	/*
+@@ -2301,10 +2300,10 @@ static void snd_m3_assp_init(struct snd_
+ 	 * drop it there.  It seems that the minisrc doesn't
+ 	 * need vectors, so we won't bother with them..
+ 	 */
+-	data = (u16 *)chip->assp_minisrc_image->data;
++	data = (const u16 *)chip->assp_minisrc_image->data;
+ 	for (i = 0; i * 2 < chip->assp_minisrc_image->size; i++) {
+ 		snd_m3_assp_write(chip, MEMTYPE_INTERNAL_CODE, 
+-				  0x400 + i, data[i]);
++				  0x400 + i, le16_to_cpu(data[i]));
+ 	}
+ 
+ 	/*
+@@ -2749,8 +2748,7 @@ snd_m3_create(struct snd_card *card, str
+ 	if (err < 0) {
+ 		snd_m3_free(chip);
+ 		return err;
+-	} else
+-		snd_m3_convert_from_le(chip->assp_kernel_image);
++	}
+ #endif
+ 
+ #ifdef CONFIG_SND_MAESTRO3_FIRMWARE_IN_KERNEL
+@@ -2761,8 +2759,7 @@ snd_m3_create(struct snd_card *card, str
+ 	if (err < 0) {
+ 		snd_m3_free(chip);
+ 		return err;
+-	} else
+-		snd_m3_convert_from_le(chip->assp_minisrc_image);
++	}
+ #endif
+ 
+ 	if ((err = pci_request_regions(pci, card->driver)) < 0) {
+@@ -2915,6 +2912,10 @@ static struct pci_driver driver = {
+ 	
+ static int __init alsa_card_m3_init(void)
+ {
++#ifdef CONFIG_SND_MAESTRO3_FIRMWARE_IN_KERNEL
++	snd_m3_convert_to_le(&assp_kernel);
++	snd_m3_convert_to_le(&assp_minisrc);
++#endif
+ 	return pci_register_driver(&driver);
+ }
+ 
