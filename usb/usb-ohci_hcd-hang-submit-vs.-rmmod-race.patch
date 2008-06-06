@@ -1,0 +1,49 @@
+From zaitcev@redhat.com  Fri Jun  6 15:19:36 2008
+From: Pete Zaitcev <zaitcev@redhat.com>
+Date: Sun, 1 Jun 2008 21:23:07 -0700
+Subject: USB: ohci_hcd hang: submit vs. rmmod race
+To: greg@kroah.com
+Cc: linux-usb@vger.kernel.org, zaitcev@redhat.com
+Message-ID: <20080601212307.f01b8089.zaitcev@redhat.com>
+
+
+If we do rmmod ohci_hcd while an application is doing something, the
+following may happen:
+
+- a control URB completes (in finish_urb) and the ohci's endpoint is
+  set into ED_UNLINK in ed_deschedule
+- same URB is (re)submitted because of the open/close loop or other
+  such application behaviour
+- rmmod sets the state to HC_STATE_QUESCING
+- finish_unlinks happens at next SOF; normally it would set ed into
+  ED_IDLE and immediately call ed_schedule (since URB had extra TDs
+  queued), which sets it into ED_OPER. But the check in ed_schedule
+  makes it fail with -EAGAIN (which is ignored)
+- from now on we have a dead URB stuck; it cannot even be unlinked
+  because the ed status is not ED_OPER, and thus start_ed_unlink is
+  not invoked.
+
+This patch removes the check. In 2.6.25, all callers check for
+__ACTIVE bit before invoking ed_schedule, which is more appropriate.
+
+Alan Stern and David Brownell approved of this (cautiously).
+
+Signed-off-by: Pete Zaitcev <zaitcev@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/ohci-q.c |    3 ---
+ 1 file changed, 3 deletions(-)
+
+--- a/drivers/usb/host/ohci-q.c
++++ b/drivers/usb/host/ohci-q.c
+@@ -159,9 +159,6 @@ static int ed_schedule (struct ohci_hcd 
+ {
+ 	int	branch;
+ 
+-	if (ohci_to_hcd(ohci)->state == HC_STATE_QUIESCING)
+-		return -EAGAIN;
+-
+ 	ed->state = ED_OPER;
+ 	ed->ed_prev = NULL;
+ 	ed->ed_next = NULL;

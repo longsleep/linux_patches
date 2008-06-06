@@ -1,0 +1,58 @@
+From leonidv11@gmail.com  Fri Jun  6 15:17:55 2008
+From: Leonid <leonidv11@gmail.com>
+Date: Fri, 30 May 2008 11:59:01 -0700
+Subject: OHCI: fix toggle bit desynchronization when canceling URBs
+To: "USB list" <linux-usb@vger.kernel.org>
+Cc: "Greg KH" <greg@kroah.com>, "David Brownell" <david-b@pacbell.net>
+Message-ID: <efc7ee340805301159k30108141h6ceec6f4cefe840c@mail.gmail.com>
+Content-Disposition: inline
+
+
+This patch fixes a problem where canceling (bulk or interrupts) URBs
+through the OHCI controller can result in a desynchronization of the
+toggle bits between the HC and the peripheral.  The reason for this
+issue stems from the fact that during the cancellation process the TD
+is never officially "retired" by the HC and, therefore, as per the
+OHCI specification, the TD's internal toggle state does not get passed
+to the ED's toggle state.  Future TDs that obtain their toggle state
+from the ED would then be using an incorrect toggle state.
+
+The fix is simple:  the toggle state of any canceled TDs are
+propagated back to the ED in the finish_unlinks function.
+
+Signed-off-by: Leonid <leonidv11@gmail.com>
+Acked-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/ohci-q.c |   12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+--- a/drivers/usb/host/ohci-q.c
++++ b/drivers/usb/host/ohci-q.c
+@@ -952,6 +952,7 @@ rescan_this:
+ 			struct urb	*urb;
+ 			urb_priv_t	*urb_priv;
+ 			__hc32		savebits;
++			u32		tdINFO;
+ 
+ 			td = list_entry (entry, struct td, td_list);
+ 			urb = td->urb;
+@@ -966,6 +967,17 @@ rescan_this:
+ 			savebits = *prev & ~cpu_to_hc32 (ohci, TD_MASK);
+ 			*prev = td->hwNextTD | savebits;
+ 
++			/* If this was unlinked, the TD may not have been
++			 * retired ... so manually save the data toggle.
++			 * When this is ISO (no toggle), the value we save
++			 * will be ignored by the controller.
++			*/
++			tdINFO = hc32_to_cpup (ohci, &td->hwINFO);
++			if ((tdINFO & TD_T) == TD_T_DATA0)
++				ed->hwHeadP &= ~cpu_to_hc32(ohci, ED_C);
++			else if ((tdINFO & TD_T) == TD_T_DATA1)
++				ed->hwHeadP |= cpu_to_hc32(ohci, ED_C);
++
+ 			/* HC may have partly processed this TD */
+ 			td_done (ohci, urb, td);
+ 			urb_priv->td_cnt++;
