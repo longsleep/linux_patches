@@ -4,17 +4,18 @@ Date: Fri, 02 May 2008 06:02:41 +0200
 Subject: driver core: provide a dev_set_name() that handles names longer than 20 chars
 Message-ID: <1209700961.3100.7.camel@linux.site>
 
-After all drivers are converted, the 20 char bus_id array
-can be removed.
+All device names are dynamically allocated now and are set and
+read from the kobject, instead of keeping a 20 char long copy
+of the string in every struct device.
 
 Signed-off-by: Kay Sievers <kay.sievers@vrfy.org>
 Signed-off-by: Cornelia Huck <cornelia.huck@de.ibm.com>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
- drivers/base/core.c    |   74 ++++++++++++++++++++++++++++++++++++-------------
- include/linux/device.h |   10 +++++-
- 2 files changed, 63 insertions(+), 21 deletions(-)
+ drivers/base/core.c    |   89 +++++++++++++++++++++++++++++++------------------
+ include/linux/device.h |   10 +++--
+ 2 files changed, 64 insertions(+), 35 deletions(-)
 
 --- a/drivers/base/core.c
 +++ b/drivers/base/core.c
@@ -98,7 +99,21 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  /**
   * device_add - add device to device hierarchy.
   * @dev: device.
-@@ -867,12 +896,15 @@ int device_add(struct device *dev)
+@@ -850,12 +879,7 @@ int device_add(struct device *dev)
+ 	if (!dev)
+ 		goto done;
+ 
+-	/* Temporarily support init_name if it is set.
+-	 * It will override bus_id for now */
+-	if (dev->init_name)
+-		dev_set_name(dev, "%s", dev->init_name);
+-
+-	if (!strlen(dev->bus_id))
++	if (!strlen(dev->init_name))
+ 		goto done;
+ 
+ 	pr_debug("device: '%s': %s\n", dev_name(dev), __func__);
+@@ -867,12 +891,15 @@ int device_add(struct device *dev)
  	if (parent)
  		set_dev_node(dev, dev_to_node(parent));
  
@@ -117,7 +132,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	if (platform_notify)
  		platform_notify(dev);
  
-@@ -927,6 +959,7 @@ int device_add(struct device *dev)
+@@ -927,6 +954,7 @@ int device_add(struct device *dev)
  done:
  	put_device(dev);
  	return error;
@@ -125,7 +140,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
   PMError:
  	bus_remove_device(dev);
   BusError:
-@@ -1233,7 +1266,9 @@ struct device *device_create_vargs(struc
+@@ -1233,7 +1261,9 @@ struct device *device_create_vargs(struc
  	dev->release = device_create_release;
  	dev_set_drvdata(dev, drvdata);
  
@@ -136,7 +151,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	retval = device_register(dev);
  	if (retval)
  		goto error;
-@@ -1241,6 +1276,7 @@ struct device *device_create_vargs(struc
+@@ -1241,6 +1271,7 @@ struct device *device_create_vargs(struc
  	return dev;
  
  error:
@@ -144,10 +159,35 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	kfree(dev);
  	return ERR_PTR(retval);
  }
+@@ -1340,19 +1371,15 @@ int device_rename(struct device *dev, ch
+ 		old_class_name = make_class_name(dev->class->name, &dev->kobj);
+ #endif
+ 
+-	old_device_name = kmalloc(BUS_ID_SIZE, GFP_KERNEL);
++	old_device_name = kstrdup(dev_name(dev), GFP_KERNEL);
+ 	if (!old_device_name) {
+ 		error = -ENOMEM;
+ 		goto out;
+ 	}
+-	strlcpy(old_device_name, dev_name(dev), BUS_ID_SIZE);
+-	strlcpy(dev->bus_id, new_name, BUS_ID_SIZE);
+ 
+ 	error = kobject_rename(&dev->kobj, new_name);
+-	if (error) {
+-		strlcpy(dev->bus_id, old_device_name, BUS_ID_SIZE);
++	if (error)
+ 		goto out;
+-	}
+ 
+ #ifdef CONFIG_SYSFS_DEPRECATED
+ 	if (old_class_name) {
 --- a/include/linux/device.h
 +++ b/include/linux/device.h
-@@ -352,7 +352,8 @@ struct device {
- 	char	bus_id[20];	/* will be removed */
+@@ -349,10 +349,10 @@ struct device {
+ 	struct device		*parent;
+ 
+ 	struct kobject kobj;
+-	char	bus_id[20];	/* will be removed */
  	const char *init_name;
  	struct device_type	*type;
 -	unsigned		uevent_suppress:1;
@@ -156,17 +196,16 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  	struct semaphore	sem;	/* semaphore to synchronize calls to
  					 * its driver.
-@@ -401,7 +402,12 @@ struct device {
+@@ -401,8 +401,10 @@ struct device {
  
  static inline const char *dev_name(struct device *dev)
  {
 -	/* will be changed into kobject_name(&dev->kobj) in the near future */
+-	return dev->bus_id;
 +	/* return sensible value between dev_set_name() and device_add() */
 +	if (dev->init_name)
 +		return dev->init_name;
-+	/* support bus_id until everything is converted, and it is removed */
-+	if (kobject_name(&dev->kobj))
-+		return kobject_name(&dev->kobj);
- 	return dev->bus_id;
++	return kobject_name(&dev->kobj);
  }
  
+ extern int dev_set_name(struct device *dev, const char *name, ...)
