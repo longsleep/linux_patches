@@ -1,0 +1,102 @@
+From david-b@pacbell.net  Fri Jun 13 17:35:27 2008
+From: David Brownell <david-b@pacbell.net>
+Date: Tue, 3 Jun 2008 22:21:55 -0700
+Subject: USB: ehci-hcd unlink speedups
+To: Greg KH <greg@kroah.com>
+Cc: linux-usb@vger.kernel.org, Alan Stern <stern@rowland.harvard.edu>, Leonid <leonidv11@gmail.com>
+Message-ID: <200806032221.56047.david-b@pacbell.net>
+Content-Disposition: inline
+
+
+From: Alan Stern <stern@rowland.harvard.edu>
+
+This patch fixes a performance issue observed with some workloads
+when unlinking EHCI queue header (QH) descriptors from the async
+ring (control/bulk schedule).  The mechanism intended to let an
+empty QH stay scheduled for (only) a brief period, in case it's
+quickly reused, was not working as intended.  Sometimes the unlink
+proceeded too quickly (which can be a strong negative effect);
+sometimes it was too slow (wasting DMA cycles, usually a minor
+issue except for bus contention and power usage).
+
+The fix replaces a simple counter with a timestamp derived from
+the controller's microframe value.
+
+Finally, a logical error left over from the IAA watchdog-timer
+conversion is corrected.  Now the driver will always either unlink
+an idle queue header or set up a timer to unlink it later.  The old
+code would sometimes fail to do either.
+
+[ dbrownell@users.sourceforge.net: cleanup timestamping + shrink timer ]
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/ehci-hcd.c |    2 +-
+ drivers/usb/host/ehci-q.c   |   15 ++++++++-------
+ drivers/usb/host/ehci.h     |    6 +-----
+ 3 files changed, 10 insertions(+), 13 deletions(-)
+
+--- a/drivers/usb/host/ehci.h
++++ b/drivers/usb/host/ehci.h
+@@ -189,14 +189,10 @@ timer_action (struct ehci_hcd *ehci, enu
+ 			break;
+ 		// case TIMER_ASYNC_SHRINK:
+ 		default:
+-			t = EHCI_SHRINK_JIFFIES;
++			t = DIV_ROUND_UP(EHCI_SHRINK_FRAMES * HZ, 1000);
+ 			break;
+ 		}
+ 		t += jiffies;
+-		// all timings except IAA watchdog can be overridden.
+-		// async queue SHRINK often precedes IAA.  while it's ready
+-		// to go OFF neither can matter, and afterwards the IO
+-		// watchdog stops unless there's still periodic traffic.
+ 		if (time_before_eq(t, ehci->watchdog.expires)
+ 				&& timer_pending (&ehci->watchdog))
+ 			return;
+--- a/drivers/usb/host/ehci-hcd.c
++++ b/drivers/usb/host/ehci-hcd.c
+@@ -84,7 +84,7 @@ static const char	hcd_name [] = "ehci_hc
+ #define EHCI_IAA_MSECS		10		/* arbitrary */
+ #define EHCI_IO_JIFFIES		(HZ/10)		/* io watchdog > irq_thresh */
+ #define EHCI_ASYNC_JIFFIES	(HZ/20)		/* async idle timeout */
+-#define EHCI_SHRINK_JIFFIES	(HZ/200)	/* async qh unlink delay */
++#define EHCI_SHRINK_FRAMES	5		/* async qh unlink delay */
+ 
+ /* Initial IRQ latency:  faster than hw default */
+ static int log2_irq_thresh = 0;		// 0 to 6
+--- a/drivers/usb/host/ehci-q.c
++++ b/drivers/usb/host/ehci-q.c
+@@ -1116,8 +1116,7 @@ static void scan_async (struct ehci_hcd 
+ 	struct ehci_qh		*qh;
+ 	enum ehci_timer_action	action = TIMER_IO_WATCHDOG;
+ 
+-	if (!++(ehci->stamp))
+-		ehci->stamp++;
++	ehci->stamp = ehci_readl(ehci, &ehci->regs->frame_index);
+ 	timer_action_done (ehci, TIMER_ASYNC_SHRINK);
+ rescan:
+ 	qh = ehci->async->qh_next.qh;
+@@ -1148,12 +1147,14 @@ rescan:
+ 			 * doesn't stay idle for long.
+ 			 * (plus, avoids some kind of re-activation race.)
+ 			 */
+-			if (list_empty (&qh->qtd_list)) {
+-				if (qh->stamp == ehci->stamp)
++			if (list_empty(&qh->qtd_list)
++					&& qh->qh_state == QH_STATE_LINKED) {
++				if (!ehci->reclaim
++					&& ((ehci->stamp - qh->stamp) & 0x1fff)
++						>= (EHCI_SHRINK_FRAMES * 8))
++					start_unlink_async(ehci, qh);
++				else
+ 					action = TIMER_ASYNC_SHRINK;
+-				else if (!ehci->reclaim
+-					    && qh->qh_state == QH_STATE_LINKED)
+-					start_unlink_async (ehci, qh);
+ 			}
+ 
+ 			qh = qh->qh_next.qh;
