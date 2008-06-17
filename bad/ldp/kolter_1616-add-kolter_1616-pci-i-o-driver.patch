@@ -1,0 +1,243 @@
+From 05e280870cced1d3ff65455f845dabf51057da66 Mon Sep 17 00:00:00 2001
+From: Greg Kroah-Hartman <gregkh@suse.de>
+Date: Mon, 16 Jun 2008 17:06:10 -0700
+Subject: kolter_1616: add kolter_1616 PCI I/O driver
+
+Originally written by Bernhard Kuhn <bkuhn@linux-magazin.de> for the
+2.2 kernel series.
+
+Forward ported and cleaned up by Greg Kroah-Hartman
+
+Cc: Bernhard Kuhn <bkuhn@linux-magazin.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+---
+ drivers/misc/Kconfig       |    8 +
+ drivers/misc/Makefile      |    1 
+ drivers/misc/kolter_1616.c |  199 +++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 208 insertions(+)
+ create mode 100644 drivers/misc/kolter_1616.c
+
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -415,4 +415,12 @@ config OMS
+ 	  To compile this driver as a module, choose M here: the module
+ 	  will be called oms.
+ 
++config KOLTER_1616
++	tristate "Kolter 1616 PCI-IO-Card"
++	depends on PCI
++	default n
++	help
++	  This driver supports the Kolter 1616 PCI I/O card.
++
++
+ endif # MISC_DEVICES
+--- /dev/null
++++ b/drivers/misc/kolter_1616.c
+@@ -0,0 +1,199 @@
++/* kolter_1616.c
++ *
++ * Copyright (C) 1999 by Bernhard Kuhn <bkuhn@linux-magazin.de>
++ * Copying Licence: GPL
++ * Last Modification: Die Aug 17 11:29:37 CEST 1999
++ *
++ * history:
++ * version 1.0beta1: initial version
++ * version 1.0beta2: added openb/close for "module in use"-counter
++ */
++
++#include <linux/module.h>	/* generic module infos */
++#include <linux/pci.h>		/* pci-bios functions   */
++#include <linux/fs.h>		/* definitions for ioctl */
++#include <linux/delay.h>	/* udelay()             */
++#include <linux/io.h>		/* inb(), outb() etc.   */
++#include <linux/uaccess.h>	/* copy_to_user()       */
++
++#define KOLTER_1616_OUTPUT   1
++#define KOLTER_1616_INPUT    2
++
++/* define the number of maximum supported boards */
++#define KOLTER_1616_MAXBOARDS 8
++
++/* kolter 1616 general definitions */
++#define PCI_VENDOR_ID_KOLTER             0x1001
++#define PCI_DEVICE_ID_KOLTER_1616        0x0010
++#define PCI_DEVICE_ID_KOLTER_1616_RELAIS 0x0013
++
++/* kolter 1616 uses 8 io-port bytes */
++#define KOLTER_1616_IO_EXTENT 0x08
++
++/* Major number for /dev/kolter_1616.[0-7] */
++#define KOLTER_1616_MAJOR 240
++
++/* kolter 1616 register file */
++#define KOLTER_1616_OUTPUT_A_ADDR   0x00
++#define KOLTER_1616_OUTPUT_B_ADDR   0x01
++#define KOLTER_1616_INPUT_A_ADDR    0x04
++#define KOLTER_1616_INPUT_B_ADDR    0x05
++
++/* the base addresses of the 1616-cards will stored here */
++static u32 kolter_1616_pci_ioaddr[KOLTER_1616_MAXBOARDS];
++
++/* number of detected cards will be stored here */
++static int kolter_1616_pci_cards;
++
++static DEFINE_PCI_DEVICE_TABLE(id_table) = {
++	{ PCI_DEVICE(PCI_VENDOR_ID_KOLTER, PCI_DEVICE_ID_KOLTER_1616) },
++	{ PCI_DEVICE(PCI_VENDOR_ID_KOLTER, PCI_DEVICE_ID_KOLTER_1616_RELAIS) },
++	{  },
++};
++MODULE_DEVICE_TABLE(pci, id_table);
++
++/* open-routine: only used to look if selected device is valid */
++static int kolter_1616_open(struct inode *inode, struct file *file)
++{
++
++	/* find out accessed device: /dev/kolter_1616.<minor> */
++	unsigned int minor = MINOR(inode->i_rdev);
++
++	/* ignore access to non-existent cards */
++	if (minor >= kolter_1616_pci_cards)
++		return -EIO;
++
++	return 0;
++};
++
++/* close-routine: only used to look if selected device is valid */
++static int kolter_1616_release(struct inode *inode, struct file *file)
++{
++	/* find out accessed device: /dev/kolter_1616.<minor> */
++	unsigned int minor = MINOR(inode->i_rdev);
++
++	/* ignore access to non-existent cards */
++	if (minor >= kolter_1616_pci_cards)
++		return -EIO;
++
++	return 0;
++};
++
++/* ioctl-routine for input and output */
++static int kolter_1616_ioctl(struct inode *inode, struct file *file,
++			     unsigned int cmd, unsigned long arg)
++{
++	/* find out accessed device: /dev/kolter_1616.<minor> */
++	unsigned int minor = MINOR(inode->i_rdev);
++
++	/* ignore access to non-existent cards */
++	if (minor >= kolter_1616_pci_cards)
++		return -EIO;
++
++	/* process ioctl-command */
++	switch (cmd) {
++
++	case KOLTER_1616_OUTPUT:
++		/* pass data to output */
++		outw(arg,
++		     kolter_1616_pci_ioaddr[minor] + KOLTER_1616_OUTPUT_A_ADDR);
++		return 0;
++
++	case KOLTER_1616_INPUT:
++		/* get data from input */
++		{
++			unsigned int value = inw(kolter_1616_pci_ioaddr[minor]
++						 + KOLTER_1616_INPUT_A_ADDR);
++			copy_to_user((int *)arg, (int *)&value,
++				     sizeof(unsigned int));
++		};
++		return 0;
++
++	};
++
++	/* invalid ioctl-command */
++	return -EIO;
++};
++
++/* what to do when specific file-operations occur */
++static struct file_operations kolter_1616_fops = {
++	.owner =	THIS_MODULE,
++	.ioctl =	kolter_1616_ioctl,
++	.open =		kolter_1616_open,
++	.release =	kolter_1616_release,
++};
++
++
++static int __devinit kolter_probe(struct pci_dev *pci_dev,
++				  const struct pci_device_id *id)
++{
++	u32 pci_ioaddr;
++
++	/* read base io-address */
++	pci_read_config_dword(pci_dev, PCI_BASE_ADDRESS_0, &pci_ioaddr);
++
++	/* mask out io/mem-info since we know it is an io-address */
++	pci_ioaddr &= PCI_BASE_ADDRESS_IO_MASK;
++
++	/* normaly, regions should not yet be occupied by other cards, so we
++	 * can omit checking if regions are already reserved */
++	request_region(pci_ioaddr, KOLTER_1616_IO_EXTENT, "kolter_1616");
++
++	/* inform user */
++	dev_info(&pci_dev->dev, "card found at address 0x%x, ", pci_ioaddr);
++
++	/* store io-address of found pci-card */
++	kolter_1616_pci_ioaddr[kolter_1616_pci_cards] = pci_ioaddr;
++
++	return 0;
++}
++
++static void kolter_remove(struct pci_dev *dev)
++{
++}
++
++static struct pci_driver kolter_1616_driver = {
++	.name = "kolter_1616",
++	.id_table = id_table,
++	.probe = kolter_probe,
++	.remove = kolter_remove,
++};
++
++/* initialisize module, called at 'insmod' */
++static int __init kolter_init(void)
++{
++	int retval;
++
++	/* reset number of found cards */
++	kolter_1616_pci_cards = 0;
++
++	/* try to register major number for device access */
++	retval = register_chrdev(KOLTER_1616_MAJOR, "kolter_1616",
++				 &kolter_1616_fops);
++	if (retval)
++		return retval;
++
++
++	retval = pci_register_driver(&kolter_1616_driver);
++	return retval;
++};
++
++/* deinitialisize module, called at 'rmmod' */
++static __exit void kolter_exit(void)
++{
++	int index;
++
++	/* unregister character device from defined major number */
++	unregister_chrdev(KOLTER_1616_MAJOR, "kolter_1616");
++
++	/* unregister io-regions from the kernel */
++	for (index = 0; index < kolter_1616_pci_cards; index++) {
++		release_region(kolter_1616_pci_ioaddr[index],
++			       KOLTER_1616_IO_EXTENT);
++	};
++};
++
++module_init(kolter_init);
++module_exit(kolter_exit);
++
++
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -29,3 +29,4 @@ obj-$(CONFIG_KGDB_TESTS)	+= kgdbts.o
+ obj-$(CONFIG_SGI_XP)		+= sgi-xp/
+ obj-$(CONFIG_ME4000)		+= me4000.o
+ obj-$(CONFIG_OMS)		+= oms/
++obj-$(CONFIG_KOLTER_1616)	+= kolter_1616.o
