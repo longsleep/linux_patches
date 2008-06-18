@@ -5,58 +5,59 @@ Subject: USB: ehci-hcd unlink speedups
 To: Greg KH <greg@kroah.com>
 Cc: linux-usb@vger.kernel.org, Alan Stern <stern@rowland.harvard.edu>, Leonid <leonidv11@gmail.com>
 Message-ID: <200806032221.56047.david-b@pacbell.net>
-Content-Disposition: inline
 
+From: David Brownell <dbrownell@users.sourceforge.net>
 
-From: Alan Stern <stern@rowland.harvard.edu>
+This patch fixes some performance bugs observed with some workloads
+when unlinking EHCI queue header (QH) descriptors from the async ring
+(control/bulk schedule).
 
-This patch fixes a performance issue observed with some workloads
-when unlinking EHCI queue header (QH) descriptors from the async
-ring (control/bulk schedule).  The mechanism intended to let an
-empty QH stay scheduled for (only) a brief period, in case it's
-quickly reused, was not working as intended.  Sometimes the unlink
-proceeded too quickly (which can be a strong negative effect);
-sometimes it was too slow (wasting DMA cycles, usually a minor
-issue except for bus contention and power usage).
+The mechanism intended to defer unlinking an empty QH (so there is no
+penalty in common cases where it's quickly reused) was not working as
+intended.  Sometimes the unlink was scheduled:
 
-The fix replaces a simple counter with a timestamp derived from
-the controller's microframe value.
+ - too quickly ... which can be a *strong* negative effect, since
+   that QH becomes unavailable for immediate re-use;
 
-Finally, a logical error left over from the IAA watchdog-timer
-conversion is corrected.  Now the driver will always either unlink
-an idle queue header or set up a timer to unlink it later.  The old
-code would sometimes fail to do either.
+ - too slowly ... wasting DMA cycles, usually a minor issue except
+   for increased bus contention and power usage;
 
-[ dbrownell@users.sourceforge.net: cleanup timestamping + shrink timer ]
+Plus there was an extreme case of "too slowly":  a logical error in the
+IAA watchdog-timer conversion meant that sometimes the unlink never
+got scheduled.
 
-Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+The fix replaces a simple counter with a timestamp derived from the
+controller's 8 KHz microframe counter, and adjusts the timer usage
+for some issues associated with HZ being less than 8K.
+
+(Based on a patch originally by Alan Stern, and good troubleshooting
+from  Leonid.)
+
 Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Cc: Alan Stern <stern@rowland.harvard.edu>
+Cc: Leonid <leonidv11@gmail.com>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
  drivers/usb/host/ehci-hcd.c |    2 +-
- drivers/usb/host/ehci-q.c   |   15 ++++++++-------
- drivers/usb/host/ehci.h     |    6 +-----
- 3 files changed, 10 insertions(+), 13 deletions(-)
+ drivers/usb/host/ehci-q.c   |   17 +++++++++--------
+ drivers/usb/host/ehci.h     |    5 ++++-
+ 3 files changed, 14 insertions(+), 10 deletions(-)
 
 --- a/drivers/usb/host/ehci.h
 +++ b/drivers/usb/host/ehci.h
-@@ -189,14 +189,10 @@ timer_action (struct ehci_hcd *ehci, enu
+@@ -189,7 +189,10 @@ timer_action (struct ehci_hcd *ehci, enu
  			break;
  		// case TIMER_ASYNC_SHRINK:
  		default:
 -			t = EHCI_SHRINK_JIFFIES;
-+			t = DIV_ROUND_UP(EHCI_SHRINK_FRAMES * HZ, 1000);
++			/* add a jiffie since we synch against the
++			 * 8 KHz uframe counter.
++			 */
++			t = DIV_ROUND_UP(EHCI_SHRINK_FRAMES * HZ, 1000) + 1;
  			break;
  		}
  		t += jiffies;
--		// all timings except IAA watchdog can be overridden.
--		// async queue SHRINK often precedes IAA.  while it's ready
--		// to go OFF neither can matter, and afterwards the IO
--		// watchdog stops unless there's still periodic traffic.
- 		if (time_before_eq(t, ehci->watchdog.expires)
- 				&& timer_pending (&ehci->watchdog))
- 			return;
 --- a/drivers/usb/host/ehci-hcd.c
 +++ b/drivers/usb/host/ehci-hcd.c
 @@ -84,7 +84,7 @@ static const char	hcd_name [] = "ehci_hc
@@ -80,7 +81,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	timer_action_done (ehci, TIMER_ASYNC_SHRINK);
  rescan:
  	qh = ehci->async->qh_next.qh;
-@@ -1148,12 +1147,14 @@ rescan:
+@@ -1142,18 +1141,20 @@ rescan:
+ 				}
+ 			}
+ 
+-			/* unlink idle entries, reducing HC PCI usage as well
++			/* unlink idle entries, reducing DMA usage as well
+ 			 * as HCD schedule-scanning costs.  delay for any qh
+ 			 * we just scanned, there's a not-unusual case that it
  			 * doesn't stay idle for long.
  			 * (plus, avoids some kind of re-activation race.)
  			 */
