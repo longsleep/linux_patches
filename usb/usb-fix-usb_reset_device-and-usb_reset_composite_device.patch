@@ -1,0 +1,234 @@
+From tom.leiming@gmail.com  Thu Jun 19 13:23:42 2008
+From: tom.leiming@gmail.com
+Date: Wed, 18 Jun 2008 22:00:29 +0800
+Subject: USB: fix usb_reset_device and usb_reset_composite_device(take 3)
+To: stern@rowland.harvard.edu, greg@kroah.com
+Cc: linux-usb@vger.kernel.org, Ming Lei <tom.leiming@gmail.com>
+Message-ID: <1213797629-13667-1-git-send-email-tom.leiming@gmail.com>
+
+
+From: Ming Lei <tom.leiming@gmail.com>
+
+This patch renames the existing usb_reset_device in hub.c to
+usb_reset_and_verify_device and renames the existing
+usb_reset_composite_device to usb_reset_device. Also the new
+usb_reset_and_verify_device does't need to be EXPORTED .
+
+The idea of the patch is that external interface driver
+should warn the other interfaces' driver of the same
+device before and after reseting the usb device. One interface
+driver shoud call _old_ usb_reset_composite_device instead of
+_old_ usb_reset_device since it can't assume the device contains
+only one interface. The _old_ usb_reset_composite_device
+is safe for single interface device also. we rename the two
+functions to make the change easily.
+
+This patch is under guideline from Alan Stern.
+
+Signed-off-by: Ming Lei <tom.leiming@gmail.com>
+---
+ drivers/hid/usbhid/hid-core.c   |    2 +-
+ drivers/usb/core/devio.c        |    2 +-
+ drivers/usb/core/hub.c          |   33 +++++++++++++++++----------------
+ drivers/usb/storage/transport.c |    4 ++--
+ include/linux/usb.h             |    5 ++---
+ 5 files changed, 23 insertions(+), 23 deletions(-)
+
+--- a/drivers/hid/usbhid/hid-core.c
++++ b/drivers/hid/usbhid/hid-core.c
+@@ -122,7 +122,7 @@ static void hid_reset(struct work_struct
+ 		dev_dbg(&usbhid->intf->dev, "resetting device\n");
+ 		rc = rc_lock = usb_lock_device_for_reset(hid_to_usb_dev(hid), usbhid->intf);
+ 		if (rc_lock >= 0) {
+-			rc = usb_reset_composite_device(hid_to_usb_dev(hid));
++			rc = usb_reset_device(hid_to_usb_dev(hid));
+ 			if (rc_lock)
+ 				usb_unlock_device(hid_to_usb_dev(hid));
+ 		}
+--- a/drivers/usb/core/devio.c
++++ b/drivers/usb/core/devio.c
+@@ -870,7 +870,7 @@ static int proc_connectinfo(struct dev_s
+ 
+ static int proc_resetdevice(struct dev_state *ps)
+ {
+-	return usb_reset_composite_device(ps->dev);
++	return usb_reset_device(ps->dev);
+ }
+ 
+ static int proc_setintf(struct dev_state *ps, void __user *arg)
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -135,6 +135,8 @@ EXPORT_SYMBOL_GPL(ehci_cf_port_reset_rws
+ #define HUB_DEBOUNCE_STABLE	 100
+ 
+ 
++static int usb_reset_and_verify_device(struct usb_device *udev);
++
+ static inline char *portspeed(int portstatus)
+ {
+ 	if (portstatus & (1 << USB_PORT_FEAT_HIGHSPEED))
+@@ -1971,7 +1973,7 @@ static int finish_port_resume(struct usb
+ 	 * resumed.
+ 	 */
+ 	if (udev->reset_resume)
+-		status = usb_reset_device(udev);
++		status = usb_reset_and_verify_device(udev);
+ 
+  	/* 10.5.4.5 says be sure devices in the tree are still there.
+  	 * For now let's assume the device didn't go crazy on resume,
+@@ -2030,7 +2032,7 @@ static int finish_port_resume(struct usb
+  * to it will be lost.  Using the USB_PERSIST facility, the device can be
+  * made to appear as if it had not disconnected.
+  *
+- * This facility can be dangerous.  Although usb_reset_device() makes
++ * This facility can be dangerous.  Although usb_reset_and_verify_device() makes
+  * every effort to insure that the same device is present after the
+  * reset as before, it cannot provide a 100% guarantee.  Furthermore it's
+  * quite possible for a device to remain unaltered but its media to be
+@@ -2137,7 +2139,7 @@ int usb_port_resume(struct usb_device *u
+ 		hub_port_logical_disconnect(hub, port1);
+ 	} else if (udev->reset_resume) {
+ 		dev_dbg(&udev->dev, "reset-resume\n");
+-		status = usb_reset_device(udev);
++		status = usb_reset_and_verify_device(udev);
+ 	}
+ 	return status;
+ }
+@@ -2318,7 +2320,7 @@ static int hub_set_address(struct usb_de
+  * Returns device in USB_STATE_ADDRESS, except on error.
+  *
+  * If this is called for an already-existing device (as part of
+- * usb_reset_device), the caller must own the device lock.  For a
++ * usb_reset_and_verify_device), the caller must own the device lock.  For a
+  * newly detected device that is not accessible through any global
+  * pointers, it's not necessary to lock the device.
+  */
+@@ -2635,7 +2637,7 @@ hub_power_remaining (struct usb_hub *hub
+  * This routine is called when:
+  * 	a port connection-change occurs;
+  *	a port enable-change occurs (often caused by EMI);
+- *	usb_reset_device() encounters changed descriptors (as from
++ *	usb_reset_and_verify_device() encounters changed descriptors (as from
+  *		a firmware download)
+  * caller already locked the hub
+  */
+@@ -2709,7 +2711,7 @@ static void hub_port_connect_change(stru
+ #endif
+ 
+ 		} else {
+-			status = usb_reset_composite_device(udev);
++			status = usb_reset_device(udev);
+ 		}
+ 		usb_unlock_device(udev);
+ 
+@@ -2937,7 +2939,7 @@ static void hub_events(void)
+ 			dev_dbg (hub_dev, "resetting for error %d\n",
+ 				hub->error);
+ 
+-			ret = usb_reset_composite_device(hdev);
++			ret = usb_reset_device(hdev);
+ 			if (ret) {
+ 				dev_dbg (hub_dev,
+ 					"error resetting hub: %d\n", ret);
+@@ -3225,12 +3227,12 @@ static int descriptors_changed(struct us
+ }
+ 
+ /**
+- * usb_reset_device - perform a USB port reset to reinitialize a device
++ * usb_reset_and_verify_device - perform a USB port reset to reinitialize a device
+  * @udev: device to reset (not in SUSPENDED or NOTATTACHED state)
+  *
+  * WARNING - don't use this routine to reset a composite device
+  * (one with multiple interfaces owned by separate drivers)!
+- * Use usb_reset_composite_device() instead.
++ * Use usb_reset_device() instead.
+  *
+  * Do a port reset, reassign the device's address, and establish its
+  * former operating configuration.  If the reset fails, or the device's
+@@ -3254,7 +3256,7 @@ static int descriptors_changed(struct us
+  * holding the device lock because these tasks should always call
+  * usb_autopm_resume_device(), thereby preventing any unwanted autoresume.
+  */
+-int usb_reset_device(struct usb_device *udev)
++static int usb_reset_and_verify_device(struct usb_device *udev)
+ {
+ 	struct usb_device		*parent_hdev = udev->parent;
+ 	struct usb_hub			*parent_hub;
+@@ -3340,24 +3342,23 @@ re_enumerate:
+ 	hub_port_logical_disconnect(parent_hub, port1);
+ 	return -ENODEV;
+ }
+-EXPORT_SYMBOL_GPL(usb_reset_device);
+ 
+ /**
+- * usb_reset_composite_device - warn interface drivers and perform a USB port reset
++ * usb_reset_device - warn interface drivers and perform a USB port reset
+  * @udev: device to reset (not in SUSPENDED or NOTATTACHED state)
+  *
+  * Warns all drivers bound to registered interfaces (using their pre_reset
+  * method), performs the port reset, and then lets the drivers know that
+  * the reset is over (using their post_reset method).
+  *
+- * Return value is the same as for usb_reset_device().
++ * Return value is the same as for usb_reset_and_verify_device().
+  *
+  * The caller must own the device lock.  For example, it's safe to use
+  * this from a driver probe() routine after downloading new firmware.
+  * For calls that might not occur during probe(), drivers should lock
+  * the device using usb_lock_device_for_reset().
+  */
+-int usb_reset_composite_device(struct usb_device *udev)
++int usb_reset_device(struct usb_device *udev)
+ {
+ 	int ret;
+ 	int i;
+@@ -3387,7 +3388,7 @@ int usb_reset_composite_device(struct us
+ 		}
+ 	}
+ 
+-	ret = usb_reset_device(udev);
++	ret = usb_reset_and_verify_device(udev);
+ 
+ 	if (config) {
+ 		for (i = config->desc.bNumInterfaces - 1; i >= 0; --i) {
+@@ -3406,4 +3407,4 @@ int usb_reset_composite_device(struct us
+ 	usb_autosuspend_device(udev);
+ 	return ret;
+ }
+-EXPORT_SYMBOL_GPL(usb_reset_composite_device);
++EXPORT_SYMBOL_GPL(usb_reset_device);
+--- a/drivers/usb/storage/transport.c
++++ b/drivers/usb/storage/transport.c
+@@ -1172,8 +1172,8 @@ int usb_stor_port_reset(struct us_data *
+ 			result = -EIO;
+ 			US_DEBUGP("No reset during disconnect\n");
+ 		} else {
+-			result = usb_reset_composite_device(us->pusb_dev);
+-			US_DEBUGP("usb_reset_composite_device returns %d\n",
++			result = usb_reset_device(us->pusb_dev);
++			US_DEBUGP("usb_reset_device returns %d\n",
+ 					result);
+ 		}
+ 		if (rc_lock)
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -497,7 +497,6 @@ extern int usb_lock_device_for_reset(str
+ 
+ /* USB port reset for device reinitialization */
+ extern int usb_reset_device(struct usb_device *dev);
+-extern int usb_reset_composite_device(struct usb_device *dev);
+ 
+ extern struct usb_device *usb_find_device(u16 vendor_id, u16 product_id);
+ 
+@@ -957,9 +956,9 @@ struct usbdrv_wrap {
+  * @resume: Called when the device is being resumed by the system.
+  * @reset_resume: Called when the suspended device has been reset instead
+  *	of being resumed.
+- * @pre_reset: Called by usb_reset_composite_device() when the device
++ * @pre_reset: Called by usb_reset_device() when the device
+  *	is about to be reset.
+- * @post_reset: Called by usb_reset_composite_device() after the device
++ * @post_reset: Called by usb_reset_device() after the device
+  *	has been reset
+  * @id_table: USB drivers use ID table to support hotplugging.
+  *	Export this with MODULE_DEVICE_TABLE(usb,...).  This must be set
