@@ -1,15 +1,18 @@
-From foo@baz Tue Apr  9 12:12:43 2002
+From cornelia.huck@de.ibm.com Mon Jun 23 08:23:35 2008
 From: Cornelia Huck <cornelia.huck@de.ibm.com>
-To: Greg KH <greg@kroah.com>
-From: Cornelia Huck <cornelia.huck@de.ibm.com>
-Message-ID: <20080529160005.1b9257f4@gondolin.boeblingen.de.ibm.com>
+Date: Mon, 23 Jun 2008 17:23:29 +0200
 Subject: s390: bus_id -> dev_set_name() changes
+To: Greg KH <greg@kroah.com>
+Cc: Stephen Rothwell <sfr@canb.auug.org.au>, linux-next@vger.kernel.org, Martin Schwidefsky <schwidefsky@de.ibm.com>
+Message-ID: <20080623172329.13e24d0a@gondolin.boeblingen.de.ibm.com>
+
 
 From: Cornelia Huck <cornelia.huck@de.ibm.com>
 
-Convert s390 users setting bus_id to dev_set_name() or init_name.
+Convert most s390 users setting bus_id to dev_set_name().
+css and ccw busses are deferred since they need some special
+treatment.
 
-Cc: Kay Sievers <kay.sievers@vrfy.org>
 Signed-off-by: Cornelia Huck <cornelia.huck@de.ibm.com>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
@@ -18,15 +21,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  drivers/s390/char/vmlogrdr.c |    3 +--
  drivers/s390/cio/ccwgroup.c  |    3 +--
  drivers/s390/cio/chp.c       |    3 +--
- drivers/s390/cio/cio.c       |   13 +++++++++++--
- drivers/s390/cio/cio.h       |    4 ++++
  drivers/s390/cio/css.c       |    4 ++--
- drivers/s390/cio/device.c    |   16 ++++++++++++++--
  drivers/s390/crypto/ap_bus.c |    4 ++--
  drivers/s390/net/netiucv.c   |    2 +-
  drivers/s390/s390_rdev.c     |    2 +-
  drivers/s390/scsi/zfcp_aux.c |   23 ++++++++---------------
- 12 files changed, 47 insertions(+), 32 deletions(-)
+ 9 files changed, 18 insertions(+), 28 deletions(-)
 
 --- a/drivers/s390/block/dcssblk.c
 +++ b/drivers/s390/block/dcssblk.c
@@ -75,60 +75,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  	/* Obtain channel path description and fill it in. */
  	ret = chsc_determine_channel_path_description(chpid, &chp->desc);
---- a/drivers/s390/cio/cio.c
-+++ b/drivers/s390/cio/cio.c
-@@ -529,8 +529,10 @@ cio_validate_subchannel (struct subchann
- 	}
- 	mutex_init(&sch->reg_mutex);
- 	/* Set a name for the subchannel */
--	snprintf (dev_name(&sch->dev), BUS_ID_SIZE, "0.%x.%04x", schid.ssid,
--		  schid.sch_no);
-+	if (cio_is_console(schid))
-+		sch->dev.init_name = cio_get_console_sch_name(schid);
-+	else
-+		dev_set_name(&sch->dev, "0.%x.%04x", schid.ssid, schid.sch_no);
- 
- 	/*
- 	 * The first subchannel that is not-operational (ccode==3)
-@@ -681,6 +683,7 @@ do_IRQ (struct pt_regs *regs)
- 
- #ifdef CONFIG_CCW_CONSOLE
- static struct subchannel console_subchannel;
-+static char console_sch_name[10] = "0.x.xxxx";
- static struct io_subchannel_private console_priv;
- static int console_subchannel_in_use;
- 
-@@ -831,6 +834,12 @@ cio_get_console_subchannel(void)
- 	return &console_subchannel;
- }
- 
-+const char *cio_get_console_sch_name(struct subchannel_id schid)
-+{
-+	snprintf(console_sch_name, 10, "0.%x.%04x", schid.ssid, schid.sch_no);
-+	return (const char *)console_sch_name;
-+}
-+
- #endif
- static int
- __disable_subchannel_easy(struct subchannel_id schid, struct schib *schib)
---- a/drivers/s390/cio/cio.h
-+++ b/drivers/s390/cio/cio.h
-@@ -111,11 +111,15 @@ extern int cio_is_console(struct subchan
- extern struct subchannel *cio_get_console_subchannel(void);
- extern spinlock_t * cio_get_console_lock(void);
- extern void *cio_get_console_priv(void);
-+extern const char *cio_get_console_sch_name(struct subchannel_id schid);
-+extern const char *cio_get_console_cdev_name(struct subchannel *sch);
- #else
- #define cio_is_console(schid) 0
- #define cio_get_console_subchannel() NULL
- #define cio_get_console_lock() NULL
- #define cio_get_console_priv() NULL
-+#define cio_get_console_sch_name(schid) NULL
-+#define cio_get_console_cdev_name(sch) NULL
- #endif
- 
- #endif
 --- a/drivers/s390/cio/css.c
 +++ b/drivers/s390/cio/css.c
 @@ -741,7 +741,7 @@ static int __init setup_css(int nr)
@@ -149,45 +95,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	css->device.release = channel_subsystem_release;
  	tod_high = (u32) (get_clock() >> 32);
  	css_generate_pgid(css, tod_high);
---- a/drivers/s390/cio/device.c
-+++ b/drivers/s390/cio/device.c
-@@ -1051,8 +1051,11 @@ io_subchannel_recog(struct ccw_device *c
- 	init_timer(&priv->timer);
- 
- 	/* Set an initial name for the device. */
--	snprintf (cdev->dev.bus_id, BUS_ID_SIZE, "0.%x.%04x",
--		  sch->schid.ssid, sch->schib.pmcw.dev);
-+	if (cio_is_console(sch->schid))
-+		cdev->dev.init_name = cio_get_console_cdev_name(sch);
-+	else
-+		dev_set_name(&cdev->dev, "0.%x.%04x",
-+			     sch->schid.ssid, sch->schib.pmcw.dev);
- 
- 	/* Increase counter of devices currently in recognition. */
- 	atomic_inc(&ccw_device_init_count);
-@@ -1287,6 +1290,7 @@ io_subchannel_shutdown(struct subchannel
- 
- #ifdef CONFIG_CCW_CONSOLE
- static struct ccw_device console_cdev;
-+static char console_cdev_name[10] = "0.x.xxxx";
- static struct ccw_device_private console_private;
- static int console_cdev_in_use;
- 
-@@ -1355,6 +1359,14 @@ ccw_device_probe_console(void)
- 	console_cdev.online = 1;
- 	return &console_cdev;
- }
-+
-+
-+const char *cio_get_console_cdev_name(struct subchannel *sch)
-+{
-+	snprintf(console_cdev_name, 10, "0.%x.%04x",
-+		 sch->schid.ssid, sch->schib.pmcw.dev);
-+	return (const char *)console_cdev_name;
-+}
- #endif
- 
- /*
 --- a/drivers/s390/crypto/ap_bus.c
 +++ b/drivers/s390/crypto/ap_bus.c
 @@ -859,8 +859,8 @@ static void ap_scan_bus(struct work_stru
