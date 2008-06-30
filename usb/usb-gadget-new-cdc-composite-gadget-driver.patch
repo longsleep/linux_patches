@@ -1,0 +1,344 @@
+From david-b@pacbell.net  Mon Jun 30 11:19:25 2008
+From: David Brownell <david-b@pacbell.net>
+Date: Thu, 19 Jun 2008 18:20:26 -0700
+Subject: usb gadget: new "CDC Composite" gadget driver
+To: linux-usb@vger.kernel.org
+Cc: Tony Lindgren <tony@atomide.com>, Felipe Balbi <felipebalbi@users.sourceforge.net>, Al Borchers <alborchers@steinerpoint.com>, "Dima Zavin" <dmitriyz@google.com>, Greg KH <greg@kroah.com>
+Message-ID: <200806191820.26287.david-b@pacbell.net>
+Content-Disposition: inline
+
+
+From: David Brownell <dbrownell@users.sourceforge.net>
+
+This is a simple example of a composite gadget, combining two
+Communications Class Device (CDC) functions:  ECM and ACM.
+
+This provides a clear example of how the composite gadget framework
+is intended to work.  It's surprising that MS-Windows (or at least,
+XP and previous) won't "just work" with something this simple...
+
+One /proc/bus/usb/devices listing looks like:
+
+  T:  Bus=03 Lev=01 Prnt=01 Port=00 Cnt=01 Dev#= 46 Spd=480 MxCh= 0
+  D:  Ver= 2.00 Cls=02(comm.) Sub=00 Prot=00 MxPS=64 #Cfgs=  1
+  P:  Vendor=0525 ProdID=a4aa Rev= 3.01
+  S:  Manufacturer=Linux 2.6.26-rc6-pnut with net2280
+  S:  Product=CDC Composite Gadget
+  C:* #Ifs= 4 Cfg#= 1 Atr=c0 MxPwr=  2mA
+  I:* If#= 0 Alt= 0 #EPs= 1 Cls=02(comm.) Sub=06 Prot=00 Driver=cdc_ether
+  E:  Ad=83(I) Atr=03(Int.) MxPS=  16 Ivl=32ms
+  I:  If#= 1 Alt= 0 #EPs= 0 Cls=0a(data ) Sub=00 Prot=00 Driver=cdc_ether
+  I:* If#= 1 Alt= 1 #EPs= 2 Cls=0a(data ) Sub=00 Prot=00 Driver=cdc_ether
+  E:  Ad=81(I) Atr=02(Bulk) MxPS= 512 Ivl=0ms
+  E:  Ad=02(O) Atr=02(Bulk) MxPS= 512 Ivl=0ms
+  I:* If#= 2 Alt= 0 #EPs= 1 Cls=02(comm.) Sub=02 Prot=01 Driver=cdc_acm
+  E:  Ad=86(I) Atr=03(Int.) MxPS=   8 Ivl=32ms
+  I:* If#= 3 Alt= 0 #EPs= 2 Cls=0a(data ) Sub=00 Prot=00 Driver=cdc_acm
+  E:  Ad=84(I) Atr=02(Bulk) MxPS= 512 Ivl=0ms
+  E:  Ad=05(O) Atr=02(Bulk) MxPS= 512 Ivl=0ms
+
+Not all USB peripheral controller hardware can support this driver.
+All the highspeed-capable peripheral controllers with drivers now in
+the mainline kernel seem to support this, as does omap_udc.  But
+many full speed controllers don't have enough endpoints, or (as with
+the PXA controllers) don't support altsettings.
+
+Lightly tested.
+
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/gadget/Kconfig  |   13 ++
+ drivers/usb/gadget/Makefile |    3 
+ drivers/usb/gadget/cdc2.c   |  246 ++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 262 insertions(+)
+
+--- /dev/null
++++ b/drivers/usb/gadget/cdc2.c
+@@ -0,0 +1,246 @@
++/*
++ * cdc2.c -- CDC Composite driver, with ECM and ACM support
++ *
++ * Copyright (C) 2008 David Brownell
++ * Copyright (C) 2008 Nokia Corporation
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++
++#include <linux/kernel.h>
++#include <linux/utsname.h>
++
++#include "u_ether.h"
++#include "u_serial.h"
++
++
++#define DRIVER_DESC		"CDC Composite Gadget"
++#define DRIVER_VERSION		"King Kamehameha Day 2008"
++
++/*-------------------------------------------------------------------------*/
++
++/* DO NOT REUSE THESE IDs with a protocol-incompatible driver!!  Ever!!
++ * Instead:  allocate your own, using normal USB-IF procedures.
++ */
++
++/* Thanks to NetChip Technologies for donating this product ID.
++ * It's for devices with only this composite CDC configuration.
++ */
++#define CDC_VENDOR_NUM		0x0525	/* NetChip */
++#define CDC_PRODUCT_NUM		0xa4aa	/* CDC Composite: ECM + ACM */
++
++/*-------------------------------------------------------------------------*/
++
++static struct usb_device_descriptor device_desc = {
++	.bLength =		sizeof device_desc,
++	.bDescriptorType =	USB_DT_DEVICE,
++
++	.bcdUSB =		__constant_cpu_to_le16(0x0200),
++
++	.bDeviceClass =		USB_CLASS_COMM,
++	.bDeviceSubClass =	0,
++	.bDeviceProtocol =	0,
++	/* .bMaxPacketSize0 = f(hardware) */
++
++	/* Vendor and product id can be overridden by module parameters.  */
++	.idVendor =		__constant_cpu_to_le16(CDC_VENDOR_NUM),
++	.idProduct =		__constant_cpu_to_le16(CDC_PRODUCT_NUM),
++	/* .bcdDevice = f(hardware) */
++	/* .iManufacturer = DYNAMIC */
++	/* .iProduct = DYNAMIC */
++	/* NO SERIAL NUMBER */
++	.bNumConfigurations =	1,
++};
++
++static struct usb_otg_descriptor otg_descriptor = {
++	.bLength =		sizeof otg_descriptor,
++	.bDescriptorType =	USB_DT_OTG,
++
++	/* REVISIT SRP-only hardware is possible, although
++	 * it would not be called "OTG" ...
++	 */
++	.bmAttributes =		USB_OTG_SRP | USB_OTG_HNP,
++};
++
++static const struct usb_descriptor_header *otg_desc[] = {
++	(struct usb_descriptor_header *) &otg_descriptor,
++	NULL,
++};
++
++
++/* string IDs are assigned dynamically */
++
++#define STRING_MANUFACTURER_IDX		0
++#define STRING_PRODUCT_IDX		1
++
++static char manufacturer[50];
++
++static struct usb_string strings_dev[] = {
++	[STRING_MANUFACTURER_IDX].s = manufacturer,
++	[STRING_PRODUCT_IDX].s = DRIVER_DESC,
++	{  } /* end of list */
++};
++
++static struct usb_gadget_strings stringtab_dev = {
++	.language	= 0x0409,	/* en-us */
++	.strings	= strings_dev,
++};
++
++static struct usb_gadget_strings *dev_strings[] = {
++	&stringtab_dev,
++	NULL,
++};
++
++static u8 hostaddr[ETH_ALEN];
++
++/*-------------------------------------------------------------------------*/
++
++/*
++ * We _always_ have both CDC ECM and CDC ACM functions.
++ */
++static int __init cdc_do_config(struct usb_configuration *c)
++{
++	int	status;
++
++	if (gadget_is_otg(c->cdev->gadget)) {
++		c->descriptors = otg_desc;
++		c->bmAttributes |= USB_CONFIG_ATT_WAKEUP;
++	}
++
++	status = ecm_bind_config(c, hostaddr);
++	if (status < 0)
++		return status;
++
++	status = acm_bind_config(c, 0);
++	if (status == 0)
++		return status;
++
++	return 0;
++}
++
++static struct usb_configuration cdc_config_driver = {
++	.label			= "CDC Composite (ECM + ACM)",
++	.bind			= cdc_do_config,
++	.bConfigurationValue	= 1,
++	/* .iConfiguration = DYNAMIC */
++	.bmAttributes		= USB_CONFIG_ATT_SELFPOWER,
++	.bMaxPower		= 1,	/* 2 mA, minimal */
++};
++
++/*-------------------------------------------------------------------------*/
++
++static int __init cdc_bind(struct usb_composite_dev *cdev)
++{
++	int			gcnum;
++	struct usb_gadget	*gadget = cdev->gadget;
++	int			status;
++
++	if (!can_support_ecm(cdev->gadget)) {
++		ERROR(cdev, "controller '%s' not usable\n", gadget->name);
++		return -EINVAL;
++	}
++
++	/* set up network link layer */
++	status = gether_setup(cdev->gadget, hostaddr);
++	if (status < 0)
++		return status;
++
++	/* set up serial link layer */
++	status = gserial_setup(cdev->gadget, 1);
++	if (status < 0)
++		goto fail0;
++
++	gcnum = usb_gadget_controller_number(gadget);
++	if (gcnum >= 0)
++		device_desc.bcdDevice = cpu_to_le16(0x0300 | gcnum);
++	else {
++		/* We assume that can_support_ecm() tells the truth;
++		 * but if the controller isn't recognized at all then
++		 * that assumption is a bit more likely to be wrong.
++		 */
++		WARN(cdev, "controller '%s' not recognized; trying %s\n",
++				gadget->name,
++				cdc_config_driver.label);
++		device_desc.bcdDevice =
++			__constant_cpu_to_le16(0x0300 | 0x0099);
++	}
++
++
++	/* Allocate string descriptor numbers ... note that string
++	 * contents can be overridden by the composite_dev glue.
++	 */
++
++	/* device descriptor strings: manufacturer, product */
++	snprintf(manufacturer, sizeof manufacturer, "%s %s with %s",
++		init_utsname()->sysname, init_utsname()->release,
++		gadget->name);
++	status = usb_string_id(cdev);
++	if (status < 0)
++		goto fail1;
++	strings_dev[STRING_MANUFACTURER_IDX].id = status;
++	device_desc.iManufacturer = status;
++
++	status = usb_string_id(cdev);
++	if (status < 0)
++		goto fail1;
++	strings_dev[STRING_PRODUCT_IDX].id = status;
++	device_desc.iProduct = status;
++
++	/* register our configuration */
++	status = usb_add_config(cdev, &cdc_config_driver);
++	if (status < 0)
++		goto fail1;
++
++	INFO(cdev, "%s, version: " DRIVER_VERSION "\n", DRIVER_DESC);
++
++	return 0;
++
++fail1:
++	gserial_cleanup();
++fail0:
++	gether_cleanup();
++	return status;
++}
++
++static int __exit cdc_unbind(struct usb_composite_dev *cdev)
++{
++	gserial_cleanup();
++	gether_cleanup();
++	return 0;
++}
++
++static struct usb_composite_driver cdc_driver = {
++	.name		= "g_cdc",
++	.dev		= &device_desc,
++	.strings	= dev_strings,
++	.bind		= cdc_bind,
++	.unbind		= __exit_p(cdc_unbind),
++};
++
++MODULE_DESCRIPTION(DRIVER_DESC);
++MODULE_AUTHOR("David Brownell");
++MODULE_LICENSE("GPL");
++
++static int __init init(void)
++{
++	return usb_composite_register(&cdc_driver);
++}
++module_init(init);
++
++static void __exit cleanup(void)
++{
++	usb_composite_unregister(&cdc_driver);
++}
++module_exit(cleanup);
+--- a/drivers/usb/gadget/Kconfig
++++ b/drivers/usb/gadget/Kconfig
+@@ -586,6 +586,19 @@ config USB_G_PRINTER
+ 	  For more information, see Documentation/usb/gadget_printer.txt
+ 	  which includes sample code for accessing the device file.
+ 
++config USB_CDC_COMPOSITE
++	tristate "CDC Composite Device (Ethernet and ACM)"
++	help
++	  This driver provides two functions in one configuration:
++	  a CDC Ethernet (ECM) link, and a CDC ACM (serial port) link.
++
++	  This driver requires four bulk and two interrupt endpoints,
++	  plus the ability to handle altsettings.  Not all peripheral
++	  controllers are that capable.
++
++	  Say "y" to link the driver statically, or "m" to build a
++	  dynamically linked module.
++
+ # put drivers that need isochronous transfer support (for audio
+ # or video class gadget drivers), or specific hardware, here.
+ 
+--- a/drivers/usb/gadget/Makefile
++++ b/drivers/usb/gadget/Makefile
+@@ -33,6 +33,8 @@ g_file_storage-objs		:= file_storage.o u
+ 					epautoconf.o
+ g_printer-objs			:= printer.o usbstring.o config.o \
+ 					epautoconf.o
++g_cdc-objs			:= cdc2.o u_ether.o f_ecm.o \
++					u_serial.o f_acm.o $(C_UTILS)
+ 
+ ifeq ($(CONFIG_USB_ETH_RNDIS),y)
+ 	g_ether-objs		+= f_rndis.o rndis.o
+@@ -45,4 +47,5 @@ obj-$(CONFIG_USB_FILE_STORAGE)	+= g_file
+ obj-$(CONFIG_USB_G_SERIAL)	+= g_serial.o
+ obj-$(CONFIG_USB_G_PRINTER)	+= g_printer.o
+ obj-$(CONFIG_USB_MIDI_GADGET)	+= g_midi.o
++obj-$(CONFIG_USB_CDC_COMPOSITE) += g_cdc.o
+ 

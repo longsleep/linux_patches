@@ -1,21 +1,23 @@
-From david-b@pacbell.net  Mon May 19 17:09:43 2008
+From david-b@pacbell.net  Mon Jun 30 11:08:16 2008
 From: David Brownell <david-b@pacbell.net>
-Date: Fri, 16 May 2008 10:42:09 -0700
-Subject: usb serial gadget: modular tty glue
+Date: Thu, 19 Jun 2008 17:51:44 -0700
+Subject: usb gadget: split out serial core
 To: linux-usb@vger.kernel.org
-Cc: Greg KH <greg@kroah.com>, Alan Cox <alan@lxorguk.ukuu.org.uk>
-Message-ID: <200805161042.09655.david-b@pacbell.net>
+Cc: Al Borchers <alborchers@steinerpoint.com>, Greg KH <greg@kroah.com>
+Message-ID: <200806191751.44673.david-b@pacbell.net>
 Content-Disposition: inline
 
 
+From: David Brownell <dbrownell@users.sourceforge.net>
+
 This abstracts the "gadget serial" driver TTY glue into a separate
-module, cleaning it up and disentangling it from connection state.
+component, cleaning it up and disentangling it from connection state.
 
 It also changed some behaviors for the better:
 
   - Stops using "experimental" major #127, and switches over to
     having the TTY layer allocate the dev_t numbers.
- 
+    
   - Provides /sys/class/tty/ttyGS* nodes, thus mdev/udev support.
     (Note "mdev" hotplug bug in Busybox v1.7.2: /dev/ttyGS0 will
     be a *block* device without CONFIG_SYSFS_DEPRECATED_V2.)
@@ -44,18 +46,19 @@ Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
- drivers/usb/gadget/u_serial.c | 1270 ++++++++++++++++++++++++++++++++++++++++++
- drivers/usb/gadget/u_serial.h |   51 +
- 2 files changed, 1321 insertions(+)
+ drivers/usb/gadget/u_serial.c | 1243 ++++++++++++++++++++++++++++++++++++++++++
+ drivers/usb/gadget/u_serial.h |   62 ++
+ 2 files changed, 1305 insertions(+)
 
 --- /dev/null
 +++ b/drivers/usb/gadget/u_serial.c
-@@ -0,0 +1,1270 @@
+@@ -0,0 +1,1243 @@
 +/*
 + * u_serial.c - utilities for USB gadget "serial port"/TTY support
 + *
 + * Copyright (C) 2003 Al Borchers (alborchers@steinerpoint.com)
 + * Copyright (C) 2008 David Brownell
++ * Copyright (C) 2008 by Nokia Corporation
 + *
 + * This code also borrows from usbserial.c, which is
 + * Copyright (C) 1999 - 2002 Greg Kroah-Hartman (greg@kroah.com)
@@ -66,6 +69,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + * Public License ("GPL") as published by the Free Software Foundation,
 + * either version 2 of that License or (at your option) any later version.
 + */
++
++/* #define VERBOSE_DEBUG */
 +
 +#include <linux/kernel.h>
 +#include <linux/interrupt.h>
@@ -78,7 +83,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +
 +/*
-+ * This module encapsulates the TTY layer glue needed to provide basic
++ * This component encapsulates the TTY layer glue needed to provide basic
 + * "serial port" functionality through the USB gadget stack.  Each such
 + * port is exposed through a /dev/ttyGS* node.
 + *
@@ -93,7 +98,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + * login application.  In one case that might use CDC ACM interface 0,
 + * while another configuration might use interface 3 for that.  The
 + * work to handle that (including descriptor management) is not part
-+ * of this module.
++ * of this component.
 + *
 + * Configurations may expose more than one TTY port.  For example, if
 + * ttyGS0 provides login service, then ttyGS1 might provide dialer access
@@ -138,7 +143,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + * (and thus for each /dev/ node).
 + */
 +struct gs_port {
-+	spinlock_t		port_lock;
++	spinlock_t		port_lock;	/* guard port_* access */
 +
 +	struct gserial		*port_usb;
 +	struct tty_struct	*port_tty;
@@ -196,7 +201,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		return -ENOMEM;
 +
 +	gb->buf_size = size;
-+	gb->buf_get = gb->buf_put = gb->buf_buf;
++	gb->buf_put = gb->buf_buf;
++	gb->buf_get = gb->buf_buf;
 +
 +	return 0;
 +}
@@ -971,32 +977,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			port->port_num, started);
 +}
 +
-+#if 0
-+
-+static void gs_break(struct tty_struct *tty, int break_state)
-+{
-+}
-+
-+static int gs_ioctl(struct tty_struct *tty, struct file *file,
-+		unsigned cmd, unsigned long arg)
-+{
-+	struct gs_port *port = tty->driver_data;
-+
-+	pr_debug("gs_ioctl: (%d,%p,%p) cmd=0x%4.4x, arg=%lu\n",
-+		port->port_num, tty, file, cmd, arg);
-+
-+	/* handle ioctls */
-+
-+	/* could not handle ioctl */
-+	return -ENOIOCTLCMD;
-+}
-+
-+static void gs_set_termios(struct tty_struct *tty, struct ktermios *old)
-+{
-+}
-+
-+#endif
-+
 +static const struct tty_operations gs_tty_ops = {
 +	.open =			gs_open,
 +	.close =		gs_close,
@@ -1006,11 +986,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	.write_room =		gs_write_room,
 +	.chars_in_buffer =	gs_chars_in_buffer,
 +	.unthrottle =		gs_unthrottle,
-+#if 0
-+	.break_ctl =		gs_break,
-+	.ioctl =		gs_ioctl,
-+	.set_termios =		gs_set_termios,
-+#endif
 +};
 +
 +/*-------------------------------------------------------------------------*/
@@ -1323,7 +1298,18 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +}
 --- /dev/null
 +++ b/drivers/usb/gadget/u_serial.h
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,62 @@
++/*
++ * u_serial.h - interface to USB gadget "serial port"/TTY utilities
++ *
++ * Copyright (C) 2008 David Brownell
++ * Copyright (C) 2008 by Nokia Corporation
++ *
++ * This software is distributed under the terms of the GNU General
++ * Public License ("GPL") as published by the Free Software Foundation,
++ * either version 2 of that License or (at your option) any later version.
++ */
++
 +#ifndef __U_SERIAL_H
 +#define __U_SERIAL_H
 +
@@ -1337,12 +1323,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + * One non-multiplexed "serial" I/O port ... there can be several of these
 + * on any given USB peripheral device, if it provides enough endpoints.
 + *
-+ * The "u_serial" utility module exists to do one thing:  manage TTY style
-+ * I/O using the USB peripheral endpoints listed here, including hookups
-+ * to sysfs and /dev for each logical "tty" device.
++ * The "u_serial" utility component exists to do one thing:  manage TTY
++ * style I/O using the USB peripheral endpoints listed here, including
++ * hookups to sysfs and /dev for each logical "tty" device.
 + *
 + * REVISIT need TTY --> USB event flow too, so ACM can report open/close
-+ * as carrier detect events.  There's other ACM state too...
++ * as carrier detect events.  Model after ECM.  There's more ACM state too.
 + *
 + * REVISIT someday, allow multiplexing several TTYs over these endpoints.
 + */
