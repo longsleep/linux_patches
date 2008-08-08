@@ -1,0 +1,436 @@
+From felipe.balbi@nokia.com  Fri Aug  8 16:57:25 2008
+From: Felipe Balbi <felipe.balbi@nokia.com>
+Date: Fri,  8 Aug 2008 12:40:54 +0300
+Subject: usb: musb: pass configuration specifics via pdata
+To: linux-usb@vger.kernel.org
+Cc: Greg Kroah-Hartman <gregkh@suse.de>, David Brownell <david-b@pacbell.net>, Felipe Balbi <felipe.balbi@nokia.com>
+Message-ID: <1218188455-12110-1-git-send-email-felipe.balbi@nokia.com>
+
+
+Use platform_data to pass musb configuration-specific
+details to musb driver.
+
+This patch will prevent that other platforms selecting
+HAVE_CLK and enabling musb won't break tree building.
+
+The other parts of it will come when linux-omap merge
+up more omap2/3 board-files.
+
+Signed-off-by: Felipe Balbi <felipe.balbi@nokia.com>
+Acked-by: Paul Mundt <lethal@linux-sh.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ arch/arm/mach-omap2/usb-tusb6010.c |    1 
+ drivers/usb/musb/musb_core.c       |   37 +++-----
+ drivers/usb/musb/musb_core.h       |   14 ---
+ drivers/usb/musb/tusb6010.h        |  169 -------------------------------------
+ include/linux/usb/musb.h           |   38 +++++++-
+ 5 files changed, 51 insertions(+), 208 deletions(-)
+
+--- a/arch/arm/mach-omap2/usb-tusb6010.c
++++ b/arch/arm/mach-omap2/usb-tusb6010.c
+@@ -317,7 +317,6 @@ tusb6010_setup_interface(struct musb_hdr
+ 		printk(error, 6, status);
+ 		return -ENODEV;
+ 	}
+-	data->multipoint = 1;
+ 	tusb_device.dev.platform_data = data;
+ 
+ 	/* REVISIT let the driver know what DMA channels work */
+--- a/drivers/usb/musb/musb_core.c
++++ b/drivers/usb/musb/musb_core.c
+@@ -990,12 +990,6 @@ static void musb_shutdown(struct platfor
+  * We don't currently use dynamic fifo setup capability to do anything
+  * more than selecting one of a bunch of predefined configurations.
+  */
+-#ifdef MUSB_C_DYNFIFO_DEF
+-#define	can_dynfifo()	1
+-#else
+-#define	can_dynfifo()	0
+-#endif
+-
+ #if defined(CONFIG_USB_TUSB6010) || \
+ 	defined(CONFIG_ARCH_OMAP2430) || defined(CONFIG_ARCH_OMAP34XX)
+ static ushort __initdata fifo_mode = 4;
+@@ -1008,8 +1002,6 @@ module_param(fifo_mode, ushort, 0);
+ MODULE_PARM_DESC(fifo_mode, "initial endpoint configuration");
+ 
+ 
+-#define DYN_FIFO_SIZE (1<<(MUSB_C_RAM_BITS+2))
+-
+ enum fifo_style { FIFO_RXTX, FIFO_TX, FIFO_RX } __attribute__ ((packed));
+ enum buf_mode { BUF_SINGLE, BUF_DOUBLE } __attribute__ ((packed));
+ 
+@@ -1119,11 +1111,12 @@ fifo_setup(struct musb *musb, struct mus
+ 
+ 	c_size = size - 3;
+ 	if (cfg->mode == BUF_DOUBLE) {
+-		if ((offset + (maxpacket << 1)) > DYN_FIFO_SIZE)
++		if ((offset + (maxpacket << 1)) >
++				(1 << (musb->config->ram_bits + 2)))
+ 			return -EMSGSIZE;
+ 		c_size |= MUSB_FIFOSZ_DPB;
+ 	} else {
+-		if ((offset + maxpacket) > DYN_FIFO_SIZE)
++		if ((offset + maxpacket) > (1 << (musb->config->ram_bits + 2)))
+ 			return -EMSGSIZE;
+ 	}
+ 
+@@ -1219,13 +1212,13 @@ static int __init ep_config_from_table(s
+ 	/* assert(offset > 0) */
+ 
+ 	/* NOTE:  for RTL versions >= 1.400 EPINFO and RAMINFO would
+-	 * be better than static MUSB_C_NUM_EPS and DYN_FIFO_SIZE...
++	 * be better than static musb->config->num_eps and DYN_FIFO_SIZE...
+ 	 */
+ 
+ 	for (i = 0; i < n; i++) {
+ 		u8	epn = cfg->hw_ep_num;
+ 
+-		if (epn >= MUSB_C_NUM_EPS) {
++		if (epn >= musb->config->num_eps) {
+ 			pr_debug("%s: invalid ep %d\n",
+ 					musb_driver_name, epn);
+ 			continue;
+@@ -1242,8 +1235,8 @@ static int __init ep_config_from_table(s
+ 
+ 	printk(KERN_DEBUG "%s: %d/%d max ep, %d/%d memory\n",
+ 			musb_driver_name,
+-			n + 1, MUSB_C_NUM_EPS * 2 - 1,
+-			offset, DYN_FIFO_SIZE);
++			n + 1, musb->config->num_eps * 2 - 1,
++			offset, (1 << (musb->config->ram_bits + 2)));
+ 
+ #ifdef CONFIG_USB_MUSB_HDRC_HCD
+ 	if (!musb->bulk_ep) {
+@@ -1270,7 +1263,7 @@ static int __init ep_config_from_hw(stru
+ 
+ 	/* FIXME pick up ep0 maxpacket size */
+ 
+-	for (epnum = 1; epnum < MUSB_C_NUM_EPS; epnum++) {
++	for (epnum = 1; epnum < musb->config->num_eps; epnum++) {
+ 		musb_ep_select(mbase, epnum);
+ 		hw_ep = musb->endpoints + epnum;
+ 
+@@ -1424,14 +1417,14 @@ static int __init musb_core_init(u16 mus
+ 	musb->epmask = 1;
+ 
+ 	if (reg & MUSB_CONFIGDATA_DYNFIFO) {
+-		if (can_dynfifo())
++		if (musb->config->dyn_fifo)
+ 			status = ep_config_from_table(musb);
+ 		else {
+ 			ERR("reconfigure software for Dynamic FIFOs\n");
+ 			status = -ENODEV;
+ 		}
+ 	} else {
+-		if (!can_dynfifo())
++		if (!musb->config->dyn_fifo)
+ 			status = ep_config_from_hw(musb);
+ 		else {
+ 			ERR("reconfigure software for static FIFOs\n");
+@@ -1788,7 +1781,8 @@ static void musb_irq_work(struct work_st
+  */
+ 
+ static struct musb *__init
+-allocate_instance(struct device *dev, void __iomem *mbase)
++allocate_instance(struct device *dev,
++		struct musb_hdrc_config *config, void __iomem *mbase)
+ {
+ 	struct musb		*musb;
+ 	struct musb_hw_ep	*ep;
+@@ -1820,8 +1814,9 @@ allocate_instance(struct device *dev, vo
+ 	musb->mregs = mbase;
+ 	musb->ctrl_base = mbase;
+ 	musb->nIrq = -ENODEV;
++	musb->config = config;
+ 	for (epnum = 0, ep = musb->endpoints;
+-			epnum < MUSB_C_NUM_EPS;
++			epnum < musb->config->num_eps;
+ 			epnum++, ep++) {
+ 
+ 		ep->musb = musb;
+@@ -1929,7 +1924,7 @@ bad_config:
+ 	}
+ 
+ 	/* allocate */
+-	musb = allocate_instance(dev, ctrl);
++	musb = allocate_instance(dev, plat->config, ctrl);
+ 	if (!musb)
+ 		return -ENOMEM;
+ 
+@@ -1987,7 +1982,7 @@ bad_config:
+ 	musb_generic_disable(musb);
+ 
+ 	/* setup musb parts of the core (especially endpoints) */
+-	status = musb_core_init(plat->multipoint
++	status = musb_core_init(plat->config->multipoint
+ 			? MUSB_CONTROLLER_MHDRC
+ 			: MUSB_CONTROLLER_HDRC, musb);
+ 	if (status < 0)
+--- a/drivers/usb/musb/musb_core.h
++++ b/drivers/usb/musb/musb_core.h
+@@ -56,18 +56,6 @@ struct musb_ep;
+ #include "musb_debug.h"
+ #include "musb_dma.h"
+ 
+-#ifdef CONFIG_USB_MUSB_SOC
+-/*
+- * Get core configuration from a header converted (by cfg_conv)
+- * from the Verilog config file generated by the core config utility
+- *
+- * For now we assume that header is provided along with other
+- * arch-specific files.  Discrete chips will need a build tweak.
+- * So will using AHB IDs from silicon that provides them.
+- */
+-#include <asm/arch/hdrc_cnf.h>
+-#endif
+-
+ #include "musb_io.h"
+ #include "musb_regs.h"
+ 
+@@ -440,6 +428,8 @@ struct musb {
+ 	struct usb_gadget_driver *gadget_driver;	/* its driver */
+ #endif
+ 
++	struct musb_hdrc_config	*config;
++
+ #ifdef MUSB_CONFIG_PROC_FS
+ 	struct proc_dir_entry *proc_entry;
+ #endif
+--- a/drivers/usb/musb/tusb6010.h
++++ b/drivers/usb/musb/tusb6010.h
+@@ -230,173 +230,4 @@ extern u8 tusb_get_revision(struct musb 
+ #define TUSB_REV_30	0x30
+ #define TUSB_REV_31	0x31
+ 
+-/*----------------------------------------------------------------------------*/
+-
+-#ifdef CONFIG_USB_TUSB6010
+-
+-/* configuration parameters specific to this silicon */
+-
+-/* Number of Tx endpoints. Legal values are 1 - 16 (this value includes EP0) */
+-#define MUSB_C_NUM_EPT 16
+-
+-/* Number of Rx endpoints. Legal values are 1 - 16 (this value includes EP0) */
+-#define MUSB_C_NUM_EPR 16
+-
+-/* Endpoint 1 to 15 direction types. C_EP1_DEF is defined if either Tx endpoint
+- * 1 or Rx endpoint 1 are used.
+- */
+-#define MUSB_C_EP1_DEF
+-
+-/* C_EP1_TX_DEF is defined if Tx endpoint 1 is used */
+-#define MUSB_C_EP1_TX_DEF
+-
+-/* C_EP1_RX_DEF is defined if Rx endpoint 1 is used */
+-#define MUSB_C_EP1_RX_DEF
+-
+-/* C_EP1_TOR_DEF is defined if Tx endpoint 1 and Rx endpoint 1 share a FIFO */
+-/* #define C_EP1_TOR_DEF */
+-
+-/* C_EP1_TAR_DEF is defined if both Tx endpoint 1 and Rx endpoint 1 are used
+- * and do not share a FIFO.
+- */
+-#define MUSB_C_EP1_TAR_DEF
+-
+-/* Similarly for all other used endpoints */
+-#define MUSB_C_EP2_DEF
+-#define MUSB_C_EP2_TX_DEF
+-#define MUSB_C_EP2_RX_DEF
+-#define MUSB_C_EP2_TAR_DEF
+-#define MUSB_C_EP3_DEF
+-#define MUSB_C_EP3_TX_DEF
+-#define MUSB_C_EP3_RX_DEF
+-#define MUSB_C_EP3_TAR_DEF
+-#define MUSB_C_EP4_DEF
+-#define MUSB_C_EP4_TX_DEF
+-#define MUSB_C_EP4_RX_DEF
+-#define MUSB_C_EP4_TAR_DEF
+-
+-/* Endpoint 1 to 15 FIFO address bits. Legal values are 3 to 13 - corresponding
+- * to FIFO sizes of 8 to 8192 bytes. If an Tx endpoint shares a FIFO with an Rx
+- * endpoint then the Rx FIFO size must be the same as the Tx FIFO size. All
+- * endpoints 1 to 15 must be defined, unused endpoints should be set to 2.
+- */
+-#define MUSB_C_EP1T_BITS 5
+-#define MUSB_C_EP1R_BITS 5
+-#define MUSB_C_EP2T_BITS 5
+-#define MUSB_C_EP2R_BITS 5
+-#define MUSB_C_EP3T_BITS 3
+-#define MUSB_C_EP3R_BITS 3
+-#define MUSB_C_EP4T_BITS 3
+-#define MUSB_C_EP4R_BITS 3
+-
+-#define MUSB_C_EP5T_BITS 2
+-#define MUSB_C_EP5R_BITS 2
+-#define MUSB_C_EP6T_BITS 2
+-#define MUSB_C_EP6R_BITS 2
+-#define MUSB_C_EP7T_BITS 2
+-#define MUSB_C_EP7R_BITS 2
+-#define MUSB_C_EP8T_BITS 2
+-#define MUSB_C_EP8R_BITS 2
+-#define MUSB_C_EP9T_BITS 2
+-#define MUSB_C_EP9R_BITS 2
+-#define MUSB_C_EP10T_BITS 2
+-#define MUSB_C_EP10R_BITS 2
+-#define MUSB_C_EP11T_BITS 2
+-#define MUSB_C_EP11R_BITS 2
+-#define MUSB_C_EP12T_BITS 2
+-#define MUSB_C_EP12R_BITS 2
+-#define MUSB_C_EP13T_BITS 2
+-#define MUSB_C_EP13R_BITS 2
+-#define MUSB_C_EP14T_BITS 2
+-#define MUSB_C_EP14R_BITS 2
+-#define MUSB_C_EP15T_BITS 2
+-#define MUSB_C_EP15R_BITS 2
+-
+-/* Define the following constant if the USB2.0 Transceiver Macrocell data width
+- * is 16-bits.
+- */
+-/* #define C_UTM_16 */
+-
+-/* Define this constant if the CPU uses big-endian byte ordering. */
+-/* #define C_BIGEND */
+-
+-/* Define the following constant if any Tx endpoint is required to support
+- * multiple bulk packets.
+- */
+-/* #define C_MP_TX */
+-
+-/* Define the following constant if any Rx endpoint is required to support
+- * multiple bulk packets.
+- */
+-/* #define C_MP_RX */
+-
+-/* Define the following constant if any Tx endpoint is required to support high
+- * bandwidth ISO.
+- */
+-/* #define C_HB_TX */
+-
+-/* Define the following constant if any Rx endpoint is required to support high
+- * bandwidth ISO.
+- */
+-/* #define C_HB_RX */
+-
+-/* Define the following constant if software connect/disconnect control is
+- * required.
+- */
+-#define MUSB_C_SOFT_CON
+-
+-/* Define the following constant if Vendor Control Registers are required. */
+-/* #define C_VEND_REG */
+-
+-/* Vendor control register widths. */
+-#define MUSB_C_VCTL_BITS 4
+-#define MUSB_C_VSTAT_BITS 8
+-
+-/* Define the following constant to include a DMA controller. */
+-/* #define C_DMA */
+-
+-/* Define the following constant if 2 or more DMA channels are required. */
+-/* #define C_DMA2 */
+-
+-/* Define the following constant if 3 or more DMA channels are required. */
+-/* #define C_DMA3 */
+-
+-/* Define the following constant if 4 or more DMA channels are required. */
+-/* #define C_DMA4 */
+-
+-/* Define the following constant if 5 or more DMA channels are required. */
+-/* #define C_DMA5 */
+-
+-/* Define the following constant if 6 or more DMA channels are required. */
+-/* #define C_DMA6 */
+-
+-/* Define the following constant if 7 or more DMA channels are required. */
+-/* #define C_DMA7 */
+-
+-/* Define the following constant if 8 or more DMA channels are required. */
+-/* #define C_DMA8 */
+-
+-/* Enable Dynamic FIFO Sizing */
+-#define MUSB_C_DYNFIFO_DEF
+-
+-/* Derived constants. The following constants are derived from the previous
+- * configuration constants
+- */
+-
+-/* Total number of endpoints. Legal values are 2 - 16. This must be equal to
+- * the larger of C_NUM_EPT, C_NUM_EPR
+- */
+-/* #define MUSB_C_NUM_EPS 5 */
+-
+-/* C_EPMAX_BITS is equal to the largest endpoint FIFO word address bits */
+-#define MUSB_C_EPMAX_BITS 11
+-
+-/* C_RAM_BITS is the number of address bits required to address the RAM (32-bit
+- * addresses).  It is defined as log2 of the sum of 2** of all the endpoint FIFO
+- * dword address bits (rounded up).
+- */
+-#define MUSB_C_RAM_BITS 12
+-
+-#endif /* CONFIG_USB_TUSB6010 */
+-
+ #endif /* __TUSB6010_H__ */
+--- a/include/linux/usb/musb.h
++++ b/include/linux/usb/musb.h
+@@ -19,6 +19,36 @@ enum musb_mode {
+ 
+ struct clk;
+ 
++struct musb_hdrc_eps_bits {
++	const char	name[16];
++	u8		bits;
++};
++
++struct musb_hdrc_config {
++	/* MUSB configuration-specific details */
++	unsigned	multipoint:1;	/* multipoint device */
++	unsigned	dyn_fifo:1;	/* supports dynamic fifo sizing */
++	unsigned	soft_con:1;	/* soft connect required */
++	unsigned	utm_16:1;	/* utm data witdh is 16 bits */
++	unsigned	big_endian:1;	/* true if CPU uses big-endian */
++	unsigned	mult_bulk_tx:1;	/* Tx ep required for multbulk pkts */
++	unsigned	mult_bulk_rx:1;	/* Rx ep required for multbulk pkts */
++	unsigned	high_iso_tx:1;	/* Tx ep required for HB iso */
++	unsigned	high_iso_rx:1;	/* Rx ep required for HD iso */
++	unsigned	dma:1;		/* supports DMA */
++	unsigned	vendor_req:1;	/* vendor registers required */
++
++	u8		num_eps;	/* number of endpoints _with_ ep0 */
++	u8		dma_channels;	/* number of dma channels */
++	u8		dyn_fifo_size;	/* dynamic size in bytes */
++	u8		vendor_ctrl;	/* vendor control reg width */
++	u8		vendor_stat;	/* vendor status reg witdh */
++	u8		dma_req_chan;	/* bitmask for required dma channels */
++	u8		ram_bits;	/* ram address size */
++
++	struct musb_hdrc_eps_bits *eps_bits;
++};
++
+ struct musb_hdrc_platform_data {
+ 	/* MUSB_HOST, MUSB_PERIPHERAL, or MUSB_OTG */
+ 	u8		mode;
+@@ -38,16 +68,14 @@ struct musb_hdrc_platform_data {
+ 	/* (HOST or OTG) msec/2 after VBUS on till power good */
+ 	u8		potpgt;
+ 
+-	/* TBD:  chip defaults should probably go someplace else,
+-	 * e.g. number of tx/rx endpoints, etc
+-	 */
+-	unsigned	multipoint:1;
+-
+ 	/* Power the device on or off */
+ 	int		(*set_power)(int state);
+ 
+ 	/* Turn device clock on or off */
+ 	int		(*set_clock)(struct clk *clock, int is_on);
++
++	/* MUSB configuration-specific details */
++	struct musb_hdrc_config	*config;
+ };
+ 
+ 
