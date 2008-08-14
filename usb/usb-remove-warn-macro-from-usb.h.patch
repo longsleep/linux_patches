@@ -1,0 +1,963 @@
+From foo@baz Tue Apr  9 12:12:43 2002
+Date: Thu, 14 Aug 2008 09:37:34 -0700
+To: Greg KH <greg@kroah.com>
+From: Greg Kroah-Hartman <gregkh@suse.de>
+Subject: USB: remove warn() macro from usb.h
+
+USB should not be having it's own printk macros, so remove warn() and
+use the system-wide standard of dev_warn() wherever possible.  In the
+few places that will not work out, use a basic printk().
+
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/hid/usbhid/hid-core.c                     |   17 ++++++----
+ drivers/hid/usbhid/hid-tmff.c                     |   16 ++++++---
+ drivers/hid/usbhid/usbkbd.c                       |    3 +
+ drivers/input/joystick/iforce/iforce-ff.c         |   36 ++++++++++++++--------
+ drivers/input/joystick/iforce/iforce-main.c       |   14 ++++----
+ drivers/input/joystick/iforce/iforce-packets.c    |    8 +++-
+ drivers/input/joystick/iforce/iforce-usb.c        |    2 -
+ drivers/input/misc/ati_remote.c                   |   14 ++++----
+ drivers/input/tablet/aiptek.c                     |   13 ++++---
+ drivers/media/dvb/cinergyT2/cinergyT2.c           |    3 +
+ drivers/media/radio/dsbr100.c                     |   13 ++++---
+ drivers/media/video/dabusb.c                      |    4 +-
+ drivers/media/video/ov511.c                       |   19 +++++++----
+ drivers/media/video/usbvideo/konicawc.c           |    8 +++-
+ drivers/media/video/usbvideo/quickcam_messenger.c |   14 ++++----
+ drivers/net/irda/stir4200.c                       |   10 +++---
+ drivers/net/usb/catc.c                            |    5 +--
+ drivers/net/usb/kaweth.c                          |    8 ++--
+ drivers/net/usb/rtl8150.c                         |   16 ++++-----
+ drivers/usb/atm/xusbatm.c                         |    2 -
+ drivers/usb/core/devio.c                          |    3 +
+ drivers/usb/core/inode.c                          |    6 ++-
+ drivers/usb/core/message.c                        |    3 +
+ drivers/usb/image/mdc800.c                        |    8 +++-
+ drivers/usb/misc/usblcd.c                         |    2 -
+ drivers/usb/misc/uss720.c                         |    7 ++--
+ include/linux/usb.h                               |    2 -
+ 27 files changed, 151 insertions(+), 105 deletions(-)
+
+--- a/drivers/hid/usbhid/hid-core.c
++++ b/drivers/hid/usbhid/hid-core.c
+@@ -221,7 +221,8 @@ static void hid_irq_in(struct urb *urb)
+ 			hid_io_error(hid);
+ 			return;
+ 		default:		/* error */
+-			warn("input irq status %d received", urb->status);
++			dev_warn(&urb->dev->dev, "input irq status %d "
++				 "received\n", urb->status);
+ 	}
+ 
+ 	status = usb_submit_urb(urb, GFP_ATOMIC);
+@@ -329,7 +330,8 @@ static void hid_irq_out(struct urb *urb)
+ 		case -ENOENT:
+ 			break;
+ 		default:		/* error */
+-			warn("output irq status %d received", urb->status);
++			dev_warn(&urb->dev->dev, "output irq status %d "
++				 "received\n", urb->status);
+ 	}
+ 
+ 	spin_lock_irqsave(&usbhid->outlock, flags);
+@@ -381,7 +383,8 @@ static void hid_ctrl(struct urb *urb)
+ 		case -EPIPE:		/* report not available */
+ 			break;
+ 		default:		/* error */
+-			warn("ctrl urb status %d received", urb->status);
++			dev_warn(&urb->dev->dev, "ctrl urb status %d "
++				 "received\n", urb->status);
+ 	}
+ 
+ 	if (unplug)
+@@ -418,7 +421,7 @@ void usbhid_submit_report(struct hid_dev
+ 
+ 		if ((head = (usbhid->outhead + 1) & (HID_OUTPUT_FIFO_SIZE - 1)) == usbhid->outtail) {
+ 			spin_unlock_irqrestore(&usbhid->outlock, flags);
+-			warn("output queue full");
++			dev_warn(hid->dev, "output queue full\n");
+ 			return;
+ 		}
+ 
+@@ -437,7 +440,7 @@ void usbhid_submit_report(struct hid_dev
+ 
+ 	if ((head = (usbhid->ctrlhead + 1) & (HID_CONTROL_FIFO_SIZE - 1)) == usbhid->ctrltail) {
+ 		spin_unlock_irqrestore(&usbhid->ctrllock, flags);
+-		warn("control queue full");
++		dev_warn(hid->dev, "control queue full\n");
+ 		return;
+ 	}
+ 
+@@ -465,7 +468,7 @@ static int usb_hidinput_input_event(stru
+ 		return -1;
+ 
+ 	if ((offset = hidinput_find_field(hid, type, code, &field)) == -1) {
+-		warn("event field not found");
++		dev_warn(&dev->dev, "event field not found\n");
+ 		return -1;
+ 	}
+ 
+@@ -568,7 +571,7 @@ void usbhid_init_reports(struct hid_devi
+ 	}
+ 
+ 	if (err)
+-		warn("timeout initializing reports");
++		dev_warn(hid->dev, "timeout initializing reports\n");
+ }
+ 
+ /*
+--- a/drivers/hid/usbhid/hid-tmff.c
++++ b/drivers/hid/usbhid/hid-tmff.c
+@@ -163,22 +163,26 @@ int hid_tmff_init(struct hid_device *hid
+ 			switch (field->usage[0].hid) {
+ 			case THRUSTMASTER_USAGE_FF:
+ 				if (field->report_count < 2) {
+-					warn("ignoring FF field with report_count < 2");
++					dev_warn(hid->dev,
++						 "ignoring FF field with report_count < 2\n");
+ 					continue;
+ 				}
+ 
+ 				if (field->logical_maximum == field->logical_minimum) {
+-					warn("ignoring FF field with logical_maximum == logical_minimum");
++					dev_warn(hid->dev,
++						 "ignoring FF field with logical_maximum == logical_minimum\n");
+ 					continue;
+ 				}
+ 
+ 				if (tmff->report && tmff->report != report) {
+-					warn("ignoring FF field in other report");
++					dev_warn(hid->dev,
++						 "ignoring FF field in other report\n");
+ 					continue;
+ 				}
+ 
+ 				if (tmff->ff_field && tmff->ff_field != field) {
+-					warn("ignoring duplicate FF field");
++					dev_warn(hid->dev,
++						 "ignoring duplicate FF field\n");
+ 					continue;
+ 				}
+ 
+@@ -199,7 +203,9 @@ int hid_tmff_init(struct hid_device *hid
+ 				break;
+ 
+ 			default:
+-				warn("ignoring unknown output usage %08x", field->usage[0].hid);
++				dev_warn(hid->dev,
++					 "ignoring unknown output usage %08x\n",
++					 field->usage[0].hid);
+ 				continue;
+ 			}
+ 		}
+--- a/drivers/hid/usbhid/usbkbd.c
++++ b/drivers/hid/usbhid/usbkbd.c
+@@ -159,7 +159,8 @@ static void usb_kbd_led(struct urb *urb)
+ 	struct usb_kbd *kbd = urb->context;
+ 
+ 	if (urb->status)
+-		warn("led urb status %d received", urb->status);
++		dev_warn(&urb->dev->dev, "led urb status %d received\n",
++			 urb->status);
+ 
+ 	if (*(kbd->leds) == kbd->newleds)
+ 		return;
+--- a/drivers/input/joystick/iforce/iforce-ff.c
++++ b/drivers/input/joystick/iforce/iforce-ff.c
+@@ -197,13 +197,16 @@ static unsigned char find_button(struct 
+  * Analyse the changes in an effect, and tell if we need to send an condition
+  * parameter packet
+  */
+-static int need_condition_modifier(struct ff_effect *old, struct ff_effect *new)
++static int need_condition_modifier(struct iforce *iforce,
++				   struct ff_effect *old,
++				   struct ff_effect *new)
+ {
+ 	int ret = 0;
+ 	int i;
+ 
+ 	if (new->type != FF_SPRING && new->type != FF_FRICTION) {
+-		warn("bad effect type in need_condition_modifier");
++		dev_warn(&iforce->dev->dev, "bad effect type in %s\n",
++			 __func__);
+ 		return 0;
+ 	}
+ 
+@@ -222,10 +225,13 @@ static int need_condition_modifier(struc
+  * Analyse the changes in an effect, and tell if we need to send a magnitude
+  * parameter packet
+  */
+-static int need_magnitude_modifier(struct ff_effect *old, struct ff_effect *effect)
++static int need_magnitude_modifier(struct iforce *iforce,
++				   struct ff_effect *old,
++				   struct ff_effect *effect)
+ {
+ 	if (effect->type != FF_CONSTANT) {
+-		warn("bad effect type in need_envelope_modifier");
++		dev_warn(&iforce->dev->dev, "bad effect type in %s\n",
++			 __func__);
+ 		return 0;
+ 	}
+ 
+@@ -236,7 +242,8 @@ static int need_magnitude_modifier(struc
+  * Analyse the changes in an effect, and tell if we need to send an envelope
+  * parameter packet
+  */
+-static int need_envelope_modifier(struct ff_effect *old, struct ff_effect *effect)
++static int need_envelope_modifier(struct iforce *iforce, struct ff_effect *old,
++				  struct ff_effect *effect)
+ {
+ 	switch (effect->type) {
+ 	case FF_CONSTANT:
+@@ -256,7 +263,8 @@ static int need_envelope_modifier(struct
+ 		break;
+ 
+ 	default:
+-		warn("bad effect type in need_envelope_modifier");
++		dev_warn(&iforce->dev->dev, "bad effect type in %s\n",
++			 __func__);
+ 	}
+ 
+ 	return 0;
+@@ -266,10 +274,12 @@ static int need_envelope_modifier(struct
+  * Analyse the changes in an effect, and tell if we need to send a periodic
+  * parameter effect
+  */
+-static int need_period_modifier(struct ff_effect *old, struct ff_effect *new)
++static int need_period_modifier(struct iforce *iforce, struct ff_effect *old,
++				struct ff_effect *new)
+ {
+ 	if (new->type != FF_PERIODIC) {
+-		warn("bad effect type in need_period_modifier");
++		dev_warn(&iforce->dev->dev, "bad effect type in %s\n",
++			 __func__);
+ 		return 0;
+ 	}
+ 	return (old->u.periodic.period != new->u.periodic.period
+@@ -355,7 +365,7 @@ int iforce_upload_periodic(struct iforce
+ 	int param2_err = 1;
+ 	int core_err = 0;
+ 
+-	if (!old || need_period_modifier(old, effect)) {
++	if (!old || need_period_modifier(iforce, old, effect)) {
+ 		param1_err = make_period_modifier(iforce, mod1_chunk,
+ 			old != NULL,
+ 			effect->u.periodic.magnitude, effect->u.periodic.offset,
+@@ -365,7 +375,7 @@ int iforce_upload_periodic(struct iforce
+ 		set_bit(FF_MOD1_IS_USED, core_effect->flags);
+ 	}
+ 
+-	if (!old || need_envelope_modifier(old, effect)) {
++	if (!old || need_envelope_modifier(iforce, old, effect)) {
+ 		param2_err = make_envelope_modifier(iforce, mod2_chunk,
+ 			old !=NULL,
+ 			effect->u.periodic.envelope.attack_length,
+@@ -425,7 +435,7 @@ int iforce_upload_constant(struct iforce
+ 	int param2_err = 1;
+ 	int core_err = 0;
+ 
+-	if (!old || need_magnitude_modifier(old, effect)) {
++	if (!old || need_magnitude_modifier(iforce, old, effect)) {
+ 		param1_err = make_magnitude_modifier(iforce, mod1_chunk,
+ 			old != NULL,
+ 			effect->u.constant.level);
+@@ -434,7 +444,7 @@ int iforce_upload_constant(struct iforce
+ 		set_bit(FF_MOD1_IS_USED, core_effect->flags);
+ 	}
+ 
+-	if (!old || need_envelope_modifier(old, effect)) {
++	if (!old || need_envelope_modifier(iforce, old, effect)) {
+ 		param2_err = make_envelope_modifier(iforce, mod2_chunk,
+ 			old != NULL,
+ 			effect->u.constant.envelope.attack_length,
+@@ -487,7 +497,7 @@ int iforce_upload_condition(struct iforc
+ 		default: return -1;
+ 	}
+ 
+-	if (!old || need_condition_modifier(old, effect)) {
++	if (!old || need_condition_modifier(iforce, old, effect)) {
+ 		param_err = make_condition_modifier(iforce, mod1_chunk,
+ 			old != NULL,
+ 			effect->u.condition[0].right_saturation,
+--- a/drivers/input/joystick/iforce/iforce-main.c
++++ b/drivers/input/joystick/iforce/iforce-main.c
+@@ -218,7 +218,9 @@ static void iforce_release(struct input_
+ 		/* Check: no effects should be present in memory */
+ 		for (i = 0; i < dev->ff->max_effects; i++) {
+ 			if (test_bit(FF_CORE_IS_USED, iforce->core_effects[i].flags)) {
+-				warn("iforce_release: Device still owns effects");
++				dev_warn(&dev->dev,
++					"%s: Device still owns effects\n",
++					__func__);
+ 				break;
+ 			}
+ 		}
+@@ -335,26 +337,26 @@ int iforce_init_device(struct iforce *if
+ 	if (!iforce_get_id_packet(iforce, "M"))
+ 		input_dev->id.vendor = (iforce->edata[2] << 8) | iforce->edata[1];
+ 	else
+-		warn("Device does not respond to id packet M");
++		dev_warn(&iforce->dev->dev, "Device does not respond to id packet M\n");
+ 
+ 	if (!iforce_get_id_packet(iforce, "P"))
+ 		input_dev->id.product = (iforce->edata[2] << 8) | iforce->edata[1];
+ 	else
+-		warn("Device does not respond to id packet P");
++		dev_warn(&iforce->dev->dev, "Device does not respond to id packet P\n");
+ 
+ 	if (!iforce_get_id_packet(iforce, "B"))
+ 		iforce->device_memory.end = (iforce->edata[2] << 8) | iforce->edata[1];
+ 	else
+-		warn("Device does not respond to id packet B");
++		dev_warn(&iforce->dev->dev, "Device does not respond to id packet B\n");
+ 
+ 	if (!iforce_get_id_packet(iforce, "N"))
+ 		ff_effects = iforce->edata[1];
+ 	else
+-		warn("Device does not respond to id packet N");
++		dev_warn(&iforce->dev->dev, "Device does not respond to id packet N\n");
+ 
+ 	/* Check if the device can store more effects than the driver can really handle */
+ 	if (ff_effects > IFORCE_EFFECTS_MAX) {
+-		warn("Limiting number of effects to %d (device reports %d)",
++		dev_warn(&iforce->dev->dev, "Limiting number of effects to %d (device reports %d)\n",
+ 		       IFORCE_EFFECTS_MAX, ff_effects);
+ 		ff_effects = IFORCE_EFFECTS_MAX;
+ 	}
+--- a/drivers/input/joystick/iforce/iforce-packets.c
++++ b/drivers/input/joystick/iforce/iforce-packets.c
+@@ -65,7 +65,8 @@ int iforce_send_packet(struct iforce *if
+ 
+ 
+ 	if (CIRC_SPACE(head, tail, XMIT_SIZE) < n+2) {
+-		warn("not enough space in xmit buffer to send new packet");
++		dev_warn(&iforce->dev->dev,
++			 "not enough space in xmit buffer to send new packet\n");
+ 		spin_unlock_irqrestore(&iforce->xmit_lock, flags);
+ 		return -1;
+ 	}
+@@ -148,7 +149,7 @@ static int mark_core_as_ready(struct ifo
+ 			return 0;
+ 		}
+ 	}
+-	warn("unused effect %04x updated !!!", addr);
++	dev_warn(&iforce->dev->dev, "unused effect %04x updated !!!\n", addr);
+ 	return -1;
+ }
+ 
+@@ -159,7 +160,8 @@ void iforce_process_packet(struct iforce
+ 	static int being_used = 0;
+ 
+ 	if (being_used)
+-		warn("re-entrant call to iforce_process %d", being_used);
++		dev_warn(&iforce->dev->dev,
++			 "re-entrant call to iforce_process %d\n", being_used);
+ 	being_used++;
+ 
+ #ifdef CONFIG_JOYSTICK_IFORCE_232
+--- a/drivers/input/joystick/iforce/iforce-usb.c
++++ b/drivers/input/joystick/iforce/iforce-usb.c
+@@ -64,7 +64,7 @@ void iforce_usb_xmit(struct iforce *ifor
+ 
+ 	if ( (n=usb_submit_urb(iforce->out, GFP_ATOMIC)) ) {
+ 		clear_bit(IFORCE_XMIT_RUNNING, iforce->xmit_flags);
+-		warn("usb_submit_urb failed %d\n", n);
++		dev_warn(&iforce->dev->dev, "usb_submit_urb failed %d\n", n);
+ 	}
+ 
+ 	/* The IFORCE_XMIT_RUNNING bit is not cleared here. That's intended.
+--- a/drivers/input/misc/ati_remote.c
++++ b/drivers/input/misc/ati_remote.c
+@@ -285,7 +285,6 @@ static const struct {
+ };
+ 
+ /* Local function prototypes */
+-static void ati_remote_dump		(unsigned char *data, unsigned int actual_length);
+ static int ati_remote_open		(struct input_dev *inputdev);
+ static void ati_remote_close		(struct input_dev *inputdev);
+ static int ati_remote_sendpacket	(struct ati_remote *ati_remote, u16 cmd, unsigned char *data);
+@@ -307,15 +306,16 @@ static struct usb_driver ati_remote_driv
+ /*
+  *	ati_remote_dump_input
+  */
+-static void ati_remote_dump(unsigned char *data, unsigned int len)
++static void ati_remote_dump(struct device *dev, unsigned char *data,
++			    unsigned int len)
+ {
+ 	if ((len == 1) && (data[0] != (unsigned char)0xff) && (data[0] != 0x00))
+-		warn("Weird byte 0x%02x", data[0]);
++		dev_warn(dev, "Weird byte 0x%02x\n", data[0]);
+ 	else if (len == 4)
+-		warn("Weird key %02x %02x %02x %02x",
++		dev_warn(dev, "Weird key %02x %02x %02x %02x\n",
+ 		     data[0], data[1], data[2], data[3]);
+ 	else
+-		warn("Weird data, len=%d %02x %02x %02x %02x %02x %02x ...",
++		dev_warn(dev, "Weird data, len=%d %02x %02x %02x %02x %02x %02x ...\n",
+ 		     len, data[0], data[1], data[2], data[3], data[4], data[5]);
+ }
+ 
+@@ -470,7 +470,7 @@ static void ati_remote_input_report(stru
+ 	/* Deal with strange looking inputs */
+ 	if ( (urb->actual_length != 4) || (data[0] != 0x14) ||
+ 		((data[3] & 0x0f) != 0x00) ) {
+-		ati_remote_dump(data, urb->actual_length);
++		ati_remote_dump(&urb->dev->dev, data, urb->actual_length);
+ 		return;
+ 	}
+ 
+@@ -814,7 +814,7 @@ static void ati_remote_disconnect(struct
+ 	ati_remote = usb_get_intfdata(interface);
+ 	usb_set_intfdata(interface, NULL);
+ 	if (!ati_remote) {
+-		warn("%s - null device?\n", __func__);
++		dev_warn(&interface->dev, "%s - null device?\n", __func__);
+ 		return;
+ 	}
+ 
+--- a/drivers/input/tablet/aiptek.c
++++ b/drivers/input/tablet/aiptek.c
+@@ -1683,20 +1683,21 @@ aiptek_probe(struct usb_interface *intf,
+ 	aiptek = kzalloc(sizeof(struct aiptek), GFP_KERNEL);
+ 	inputdev = input_allocate_device();
+ 	if (!aiptek || !inputdev) {
+-		warn("aiptek: cannot allocate memory or input device");
++		dev_warn(&intf->dev,
++			 "cannot allocate memory or input device\n");
+ 		goto fail1;
+         }
+ 
+ 	aiptek->data = usb_buffer_alloc(usbdev, AIPTEK_PACKET_LENGTH,
+ 					GFP_ATOMIC, &aiptek->data_dma);
+         if (!aiptek->data) {
+-		warn("aiptek: cannot allocate usb buffer");
++		dev_warn(&intf->dev, "cannot allocate usb buffer\n");
+ 		goto fail1;
+ 	}
+ 
+ 	aiptek->urb = usb_alloc_urb(0, GFP_KERNEL);
+ 	if (!aiptek->urb) {
+-	        warn("aiptek: cannot allocate urb");
++	        dev_warn(&intf->dev, "cannot allocate urb\n");
+ 		goto fail2;
+ 	}
+ 
+@@ -1841,7 +1842,8 @@ aiptek_probe(struct usb_interface *intf,
+ 	 */
+ 	err = sysfs_create_group(&intf->dev.kobj, &aiptek_attribute_group);
+ 	if (err) {
+-		warn("aiptek: cannot create sysfs group err: %d", err);
++		dev_warn(&intf->dev, "cannot create sysfs group err: %d\n",
++			 err);
+ 		goto fail3;
+         }
+ 
+@@ -1849,7 +1851,8 @@ aiptek_probe(struct usb_interface *intf,
+ 	 */
+ 	err = input_register_device(aiptek->inputdev);
+ 	if (err) {
+-		warn("aiptek: input_register_device returned err: %d", err);
++		dev_warn(&intf->dev,
++			 "input_register_device returned err: %d\n", err);
+ 		goto fail4;
+         }
+ 	return 0;
+--- a/drivers/media/dvb/cinergyT2/cinergyT2.c
++++ b/drivers/media/dvb/cinergyT2/cinergyT2.c
+@@ -548,7 +548,8 @@ static int cinergyt2_release (struct ino
+ 	mutex_unlock(&cinergyt2->wq_sem);
+ 
+ 	if (atomic_dec_and_test(&cinergyt2->inuse) && cinergyt2->disconnect_pending) {
+-		warn("delayed unregister in release");
++		dev_warn(&cinergyt2->udev->dev,
++			 "delayed unregister in release\n");
+ 		cinergyt2_unregister(cinergyt2);
+ 	}
+ 
+--- a/drivers/media/radio/dsbr100.c
++++ b/drivers/media/radio/dsbr100.c
+@@ -310,7 +310,7 @@ static int vidioc_s_frequency(struct fil
+ 
+ 	radio->curfreq = f->frequency;
+ 	if (dsbr100_setfreq(radio, radio->curfreq)==-1)
+-		warn("Set frequency failed");
++		dev_warn(&radio->usbdev->dev, "Set frequency failed\n");
+ 	return 0;
+ }
+ 
+@@ -361,10 +361,12 @@ static int vidioc_s_ctrl(struct file *fi
+ 	case V4L2_CID_AUDIO_MUTE:
+ 		if (ctrl->value) {
+ 			if (dsbr100_stop(radio)==-1)
+-				warn("Radio did not respond properly");
++				dev_warn(&radio->usbdev->dev,
++					 "Radio did not respond properly\n");
+ 		} else {
+ 			if (dsbr100_start(radio)==-1)
+-				warn("Radio did not respond properly");
++				dev_warn(&radio->usbdev->dev,
++					 "Radio did not respond properly\n");
+ 		}
+ 		return 0;
+ 	}
+@@ -411,7 +413,8 @@ static int usb_dsbr100_open(struct inode
+ 	radio->muted = 1;
+ 
+ 	if (dsbr100_start(radio)<0) {
+-		warn("Radio did not start up properly");
++		dev_warn(&radio->usbdev->dev,
++			 "Radio did not start up properly\n");
+ 		radio->users = 0;
+ 		return -EIO;
+ 	}
+@@ -494,7 +497,7 @@ static int usb_dsbr100_probe(struct usb_
+ 	radio->curfreq = FREQ_MIN*FREQ_MUL;
+ 	video_set_drvdata(radio->videodev, radio);
+ 	if (video_register_device(radio->videodev, VFL_TYPE_RADIO,radio_nr)) {
+-		warn("Could not register video device");
++		dev_warn(&intf->dev, "Could not register video device\n");
+ 		video_device_release(radio->videodev);
+ 		kfree(radio->transfer_buffer);
+ 		kfree(radio);
+--- a/drivers/media/video/dabusb.c
++++ b/drivers/media/video/dabusb.c
+@@ -192,7 +192,7 @@ static void dabusb_iso_complete (struct 
+ 					err("dabusb_iso_complete: invalid len %d", len);
+ 			}
+ 			else
+-				warn("dabusb_iso_complete: corrupted packet status: %d", purb->iso_frame_desc[i].status);
++				dev_warn(&purb->dev->dev, "dabusb_iso_complete: corrupted packet status: %d\n", purb->iso_frame_desc[i].status);
+ 		if (dst != purb->actual_length)
+ 			err("dst!=purb->actual_length:%d!=%d", dst, purb->actual_length);
+ 	}
+@@ -289,7 +289,7 @@ static int dabusb_bulk (pdabusb_t s, pbu
+ 	}
+ 
+ 	if( ret == -EPIPE ) {
+-		warn("CLEAR_FEATURE request to remove STALL condition.");
++		dev_warn(&s->usbdev->dev, "CLEAR_FEATURE request to remove STALL condition.\n");
+ 		if(usb_clear_halt(s->usbdev, usb_pipeendpoint(pipe)))
+ 			err("request failed");
+ 	}
+--- a/drivers/media/video/ov511.c
++++ b/drivers/media/video/ov511.c
+@@ -1098,9 +1098,10 @@ ov51x_clear_snapshot(struct usb_ov511 *o
+ 		reg_w(ov, R51x_SYS_SNAP, 0x02);
+ 		reg_w(ov, R51x_SYS_SNAP, 0x00);
+ 	} else if (ov->bclass == BCL_OV518) {
+-		warn("snapshot reset not supported yet on OV518(+)");
++		dev_warn(&ov->dev->dev,
++			 "snapshot reset not supported yet on OV518(+)\n");
+ 	} else {
+-		err("clear snap: invalid bridge type");
++		dev_err(&ov->dev->dev, "clear snap: invalid bridge type\n");
+ 	}
+ }
+ 
+@@ -1115,14 +1116,16 @@ ov51x_check_snapshot(struct usb_ov511 *o
+ 	if (ov->bclass == BCL_OV511) {
+ 		ret = reg_r(ov, R51x_SYS_SNAP);
+ 		if (ret < 0) {
+-			err("Error checking snspshot status (%d)", ret);
++			dev_err(&ov->dev->dev,
++				"Error checking snspshot status (%d)\n", ret);
+ 		} else if (ret & 0x08) {
+ 			status = 1;
+ 		}
+ 	} else if (ov->bclass == BCL_OV518) {
+-		warn("snapshot check not supported yet on OV518(+)");
++		dev_warn(&ov->dev->dev,
++			 "snapshot check not supported yet on OV518(+)\n");
+ 	} else {
+-		err("check snap: invalid bridge type");
++		dev_err(&ov->dev->dev, "clear snap: invalid bridge type\n");
+ 	}
+ 
+ 	return status;
+@@ -5208,7 +5211,8 @@ saa7111a_configure(struct usb_ov511 *ov)
+ 	if (ov->bclass == BCL_OV511)
+ 		reg_w(ov, 0x11, 0x00);
+ 	else
+-		warn("SAA7111A not yet supported with OV518/OV518+");
++		dev_warn(&ov->dev->dev,
++			 "SAA7111A not yet supported with OV518/OV518+\n");
+ 
+ 	return 0;
+ }
+@@ -5446,7 +5450,8 @@ ov518_configure(struct usb_ov511 *ov)
+ 	 * required. OV518 has no uncompressed mode, to save RAM. */
+ 	if (!dumppix && !ov->compress) {
+ 		ov->compress = 1;
+-		warn("Compression required with OV518...enabling");
++		dev_warn(&ov->dev->dev,
++			 "Compression required with OV518...enabling\n");
+ 	}
+ 
+ 	if (ov->bridge == BRG_OV518) {
+--- a/drivers/media/video/usbvideo/konicawc.c
++++ b/drivers/media/video/usbvideo/konicawc.c
+@@ -229,7 +229,8 @@ static void konicawc_register_input(stru
+ 
+ 	cam->input = input_dev = input_allocate_device();
+ 	if (!input_dev) {
+-		warn("Not enough memory for camera's input device\n");
++		dev_warn(&dev->dev,
++			 "Not enough memory for camera's input device\n");
+ 		return;
+ 	}
+ 
+@@ -243,8 +244,9 @@ static void konicawc_register_input(stru
+ 
+ 	error = input_register_device(cam->input);
+ 	if (error) {
+-		warn("Failed to register camera's input device, err: %d\n",
+-		     error);
++		dev_warn(&dev->dev,
++			 "Failed to register camera's input device, err: %d\n",
++			 error);
+ 		input_free_device(cam->input);
+ 		cam->input = NULL;
+ 	}
+--- a/drivers/media/video/usbvideo/quickcam_messenger.c
++++ b/drivers/media/video/usbvideo/quickcam_messenger.c
+@@ -93,7 +93,7 @@ static void qcm_register_input(struct qc
+ 
+ 	cam->input = input_dev = input_allocate_device();
+ 	if (!input_dev) {
+-		warn("insufficient mem for cam input device");
++		dev_warn(&dev->dev, "insufficient mem for cam input device\n");
+ 		return;
+ 	}
+ 
+@@ -107,8 +107,9 @@ static void qcm_register_input(struct qc
+ 
+ 	error = input_register_device(cam->input);
+ 	if (error) {
+-		warn("Failed to register camera's input device, err: %d\n",
+-		     error);
++		dev_warn(&dev->dev,
++			 "Failed to register camera's input device, err: %d\n",
++			 error);
+ 		input_free_device(cam->input);
+ 		cam->input = NULL;
+ 	}
+@@ -587,8 +588,9 @@ static int qcm_compress_iso(struct uvd *
+ 			dataurb->iso_frame_desc[i].offset;
+ 
+ 		if (st < 0) {
+-			warn("Data error: packet=%d. len=%d. status=%d.",
+-			      i, n, st);
++			dev_warn(&uvd->dev->dev,
++				 "Data error: packet=%d. len=%d. status=%d.\n",
++				 i, n, st);
+ 			uvd->stats.iso_err_count++;
+ 			continue;
+ 		}
+@@ -699,7 +701,7 @@ static void qcm_stop_data(struct uvd *uv
+ 
+ 	ret = qcm_camera_off(uvd);
+ 	if (ret)
+-		warn("couldn't turn the cam off.");
++		dev_warn(&uvd->dev->dev, "couldn't turn the cam off.\n");
+ 
+ 	uvd->streaming = 0;
+ 
+--- a/drivers/net/irda/stir4200.c
++++ b/drivers/net/irda/stir4200.c
+@@ -506,7 +506,7 @@ static int change_speed(struct stir_cb *
+ 			goto found;
+ 	}
+ 
+-	warn("%s: invalid speed %d", stir->netdev->name, speed);
++	dev_warn(&stir->netdev->dev, "invalid speed %d\n", speed);
+ 	return -EINVAL;
+ 
+  found:
+@@ -598,8 +598,8 @@ static int fifo_txwait(struct stir_cb *s
+ 		err = read_reg(stir, REG_FIFOCTL, stir->fifo_status, 
+ 				   FIFO_REGS_SIZE);
+ 		if (unlikely(err != FIFO_REGS_SIZE)) {
+-			warn("%s: FIFO register read error: %d", 
+-			     stir->netdev->name, err);
++			dev_warn(&stir->netdev->dev,
++				 "FIFO register read error: %d\n", err);
+ 
+ 			return err;
+ 		}
+@@ -836,8 +836,8 @@ static void stir_rcv_irq(struct urb *urb
+ 
+ 	/* in case of error, the kernel thread will restart us */
+ 	if (err) {
+-		warn("%s: usb receive submit error: %d",
+-			stir->netdev->name, err);
++		dev_warn(&stir->netdev->dev, "usb receive submit error: %d\n",
++			 err);
+ 		stir->receiving = 0;
+ 		wake_up_process(stir->thread);
+ 	}
+--- a/drivers/net/usb/catc.c
++++ b/drivers/net/usb/catc.c
+@@ -456,7 +456,7 @@ static void catc_tx_timeout(struct net_d
+ {
+ 	struct catc *catc = netdev_priv(netdev);
+ 
+-	warn("Transmit timed out.");
++	dev_warn(&netdev->dev, "Transmit timed out.\n");
+ 	usb_unlink_urb(catc->tx_urb);
+ }
+ 
+@@ -847,7 +847,8 @@ static int catc_probe(struct usb_interfa
+ 			dbg("64k Memory\n");
+ 			break;
+ 		default:
+-			warn("Couldn't detect memory size, assuming 32k");
++			dev_warn(&intf->dev,
++				 "Couldn't detect memory size, assuming 32k\n");
+ 		case 0x87654321:
+ 			catc_set_reg(catc, TxBufCount, 4);
+ 			catc_set_reg(catc, RxBufCount, 16);
+--- a/drivers/net/usb/kaweth.c
++++ b/drivers/net/usb/kaweth.c
+@@ -832,7 +832,7 @@ static int kaweth_start_xmit(struct sk_b
+ 
+ 	if((res = usb_submit_urb(kaweth->tx_urb, GFP_ATOMIC)))
+ 	{
+-		warn("kaweth failed tx_urb %d", res);
++		dev_warn(&net->dev, "kaweth failed tx_urb %d\n", res);
+ skip:
+ 		kaweth->stats.tx_errors++;
+ 
+@@ -924,7 +924,7 @@ static void kaweth_tx_timeout(struct net
+ {
+ 	struct kaweth_device *kaweth = netdev_priv(net);
+ 
+-	warn("%s: Tx timed out. Resetting.", net->name);
++	dev_warn(&net->dev, "%s: Tx timed out. Resetting.\n", net->name);
+ 	kaweth->stats.tx_errors++;
+ 	net->trans_start = jiffies;
+ 
+@@ -1209,7 +1209,7 @@ static void kaweth_disconnect(struct usb
+ 
+ 	usb_set_intfdata(intf, NULL);
+ 	if (!kaweth) {
+-		warn("unregistering non-existant device");
++		dev_warn(&intf->dev, "unregistering non-existant device\n");
+ 		return;
+ 	}
+ 	netdev = kaweth->net;
+@@ -1269,7 +1269,7 @@ static int usb_start_wait_urb(struct urb
+ 
+ 	if (!wait_event_timeout(awd.wqh, awd.done, timeout)) {
+                 // timeout
+-                warn("usb_control/bulk_msg: timeout");
++                dev_warn(&urb->dev->dev, "usb_control/bulk_msg: timeout\n");
+                 usb_kill_urb(urb);  // remove urb safely
+                 status = -ETIMEDOUT;
+         }
+--- a/drivers/net/usb/rtl8150.c
++++ b/drivers/net/usb/rtl8150.c
+@@ -221,7 +221,7 @@ static void ctrl_callback(struct urb *ur
+ 	case -ENOENT:
+ 		break;
+ 	default:
+-		warn("ctrl urb status %d", urb->status);
++		dev_warn(&urb->dev->dev, "ctrl urb status %d\n", urb->status);
+ 	}
+ 	dev = urb->context;
+ 	clear_bit(RX_REG_SET, &dev->flags);
+@@ -441,10 +441,10 @@ static void read_bulk_callback(struct ur
+ 	case -ENOENT:
+ 		return;	/* the urb is in unlink state */
+ 	case -ETIME:
+-		warn("may be reset is needed?..");
++		dev_warn(&urb->dev->dev, "may be reset is needed?..\n");
+ 		goto goon;
+ 	default:
+-		warn("Rx status %d", urb->status);
++		dev_warn(&urb->dev->dev, "Rx status %d\n", urb->status);
+ 		goto goon;
+ 	}
+ 
+@@ -665,7 +665,7 @@ static int enable_net_traffic(rtl8150_t 
+ 	u8 cr, tcr, rcr, msr;
+ 
+ 	if (!rtl8150_reset(dev)) {
+-		warn("%s - device reset failed", __FUNCTION__);
++		dev_warn(&dev->udev->dev, "device reset failed\n");
+ 	}
+ 	/* RCR bit7=1 attach Rx info at the end;  =0 HW CRC (which is broken) */
+ 	rcr = 0x9e;
+@@ -699,7 +699,7 @@ static struct net_device_stats *rtl8150_
+ static void rtl8150_tx_timeout(struct net_device *netdev)
+ {
+ 	rtl8150_t *dev = netdev_priv(netdev);
+-	warn("%s: Tx timeout.", netdev->name);
++	dev_warn(&netdev->dev, "Tx timeout.\n");
+ 	usb_unlink_urb(dev->tx_urb);
+ 	dev->stats.tx_errors++;
+ }
+@@ -740,7 +740,7 @@ static int rtl8150_start_xmit(struct sk_
+ 		if (res == -ENODEV)
+ 			netif_device_detach(dev->netdev);
+ 		else {
+-			warn("failed tx_urb %d\n", res);
++			dev_warn(&netdev->dev, "failed tx_urb %d\n", res);
+ 			dev->stats.tx_errors++;
+ 			netif_start_queue(netdev);
+ 		}
+@@ -783,7 +783,7 @@ static int rtl8150_open(struct net_devic
+ 	if ((res = usb_submit_urb(dev->rx_urb, GFP_KERNEL))) {
+ 		if (res == -ENODEV)
+ 			netif_device_detach(dev->netdev);
+-		warn("%s: rx_urb submit failed: %d", __FUNCTION__, res);
++		dev_warn(&netdev->dev, "rx_urb submit failed: %d\n", res);
+ 		return res;
+ 	}
+ 	usb_fill_int_urb(dev->intr_urb, dev->udev, usb_rcvintpipe(dev->udev, 3),
+@@ -792,7 +792,7 @@ static int rtl8150_open(struct net_devic
+ 	if ((res = usb_submit_urb(dev->intr_urb, GFP_KERNEL))) {
+ 		if (res == -ENODEV)
+ 			netif_device_detach(dev->netdev);
+-		warn("%s: intr_urb submit failed: %d", __FUNCTION__, res);
++		dev_warn(&netdev->dev, "intr_urb submit failed: %d\n", res);
+ 		usb_kill_urb(dev->rx_urb);
+ 		return res;
+ 	}
+--- a/drivers/usb/atm/xusbatm.c
++++ b/drivers/usb/atm/xusbatm.c
+@@ -193,7 +193,7 @@ static int __init xusbatm_init(void)
+ 	    num_vendor != num_product ||
+ 	    num_vendor != num_rx_endpoint ||
+ 	    num_vendor != num_tx_endpoint) {
+-		warn("malformed module parameters");
++		printk(KERN_WARNING "xusbatm: malformed module parameters\n");
+ 		return -EINVAL;
+ 	}
+ 
+--- a/drivers/usb/core/devio.c
++++ b/drivers/usb/core/devio.c
+@@ -413,7 +413,8 @@ static void driver_disconnect(struct usb
+ 	if (likely(ifnum < 8*sizeof(ps->ifclaimed)))
+ 		clear_bit(ifnum, &ps->ifclaimed);
+ 	else
+-		warn("interface number %u out of range", ifnum);
++		dev_warn(&intf->dev, "interface number %u out of range\n",
++			 ifnum);
+ 
+ 	usb_set_intfdata(intf, NULL);
+ 
+--- a/drivers/usb/core/inode.c
++++ b/drivers/usb/core/inode.c
+@@ -240,7 +240,9 @@ static void update_sb(struct super_block
+ 				update_special(bus);
+ 				break;
+ 			default:
+-				warn("Unknown node %s mode %x found on remount!\n",bus->d_name.name,bus->d_inode->i_mode);
++				printk(KERN_WARNING "usbfs: Unknown node %s "
++				       "mode %x found on remount!\n",
++				       bus->d_name.name, bus->d_inode->i_mode);
+ 				break;
+ 			}
+ 		}
+@@ -259,7 +261,7 @@ static int remount(struct super_block *s
+ 		return 0;
+ 
+ 	if (parse_options(sb, data)) {
+-		warn("usbfs: mount parameter error:");
++		printk(KERN_WARNING "usbfs: mount parameter error.\n");
+ 		return -EINVAL;
+ 	}
+ 
+--- a/drivers/usb/core/message.c
++++ b/drivers/usb/core/message.c
+@@ -1204,7 +1204,8 @@ int usb_set_interface(struct usb_device 
+ 
+ 	alt = usb_altnum_to_altsetting(iface, alternate);
+ 	if (!alt) {
+-		warn("selecting invalid altsetting %d", alternate);
++		dev_warn(&dev->dev, "selecting invalid altsetting %d",
++			 alternate);
+ 		return -EINVAL;
+ 	}
+ 
+--- a/drivers/usb/image/mdc800.c
++++ b/drivers/usb/image/mdc800.c
+@@ -361,7 +361,8 @@ static int mdc800_usb_waitForIRQ (int mo
+ 	
+ 	if (mdc800->state == NOT_CONNECTED)
+ 	{
+-		warn ("Camera gets disconnected during waiting for irq.");
++		printk(KERN_WARNING "mdc800: Camera gets disconnected "
++		       "during waiting for irq.\n");
+ 		mdc800->camera_request_ready=0;
+ 		return -2;
+ 	}
+@@ -443,7 +444,7 @@ static int mdc800_usb_probe (struct usb_
+ 
+ 	if (mdc800->dev != NULL)
+ 	{
+-		warn ("only one Mustek MDC800 is supported.");
++		dev_warn(&intf->dev, "only one Mustek MDC800 is supported.\n");
+ 		return -ENODEV;
+ 	}
+ 
+@@ -701,7 +702,8 @@ static ssize_t mdc800_device_read (struc
+ 	}
+ 	if (mdc800->state == WORKING)
+ 	{
+-		warn ("Illegal State \"working\" reached during read ?!");
++		printk(KERN_WARNING "mdc800: Illegal State \"working\""
++		       "reached during read ?!\n");
+ 		mutex_unlock(&mdc800->io_lock);
+ 		return -EBUSY;
+ 	}
+--- a/drivers/usb/misc/usblcd.c
++++ b/drivers/usb/misc/usblcd.c
+@@ -311,7 +311,7 @@ static int lcd_probe(struct usb_interfac
+ 	dev->interface = interface;
+ 
+ 	if (le16_to_cpu(dev->udev->descriptor.idProduct) != 0x0001) {
+-		warn(KERN_INFO "USBLCD model not supported.");
++		dev_warn(&interface->dev, "USBLCD model not supported.\n");
+ 		return -ENODEV;
+ 	}
+ 	
+--- a/drivers/usb/misc/uss720.c
++++ b/drivers/usb/misc/uss720.c
+@@ -228,11 +228,12 @@ static int get_1284_register(struct parp
+ 		ret = rq->urb->status;
+ 		*val = priv->reg[(reg >= 9) ? 0 : regindex[reg]];
+ 		if (ret)
+-			warn("get_1284_register: usb error %d", ret);
++			printk(KERN_WARNING "get_1284_register: "
++			       "usb error %d\n", ret);
+ 		kref_put(&rq->ref_count, destroy_async);
+ 		return ret;
+ 	}
+-	warn("get_1284_register timeout");
++	printk(KERN_WARNING "get_1284_register timeout\n");
+ 	kill_all_async_requests_priv(priv);
+ 	return -EIO;
+ }
+@@ -716,7 +717,7 @@ static int uss720_probe(struct usb_inter
+ 	spin_lock_init(&priv->asynclock);
+ 	INIT_LIST_HEAD(&priv->asynclist);
+ 	if (!(pp = parport_register_port(0, PARPORT_IRQ_NONE, PARPORT_DMA_NONE, &parport_uss720_ops))) {
+-		warn("could not register parport");
++		printk(KERN_WARNING "uss720: could not register parport\n");
+ 		goto probe_abort;
+ 	}
+ 
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -1716,8 +1716,6 @@ extern void usb_unregister_notify(struct
+ 	format "\n" , ## arg)
+ #define info(format, arg...) printk(KERN_INFO KBUILD_MODNAME ": " \
+ 	format "\n" , ## arg)
+-#define warn(format, arg...) printk(KERN_WARNING KBUILD_MODNAME ": " \
+-	format "\n" , ## arg)
+ 
+ #endif  /* __KERNEL__ */
+ 
