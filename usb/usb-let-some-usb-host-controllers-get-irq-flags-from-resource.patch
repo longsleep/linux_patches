@@ -1,0 +1,199 @@
+From maz@misterjones.org Mon Aug 18 04:08:57 2008
+From: Marc Zyngier <maz@misterjones.org>
+Date: Mon, 18 Aug 2008 13:08:42 +0200
+Subject: USB: Let some USB host controllers get IRQ flags from resource
+To: linux-usb@vger.kernel.org
+Cc: David Brownell <david-b@pacbell.net>, Greg KH <gregkh@suse.de>
+Message-ID: <20080818130842.640f9f68@not-of-this-earth.wild-wind.fr.eu.org>
+
+
+[This version fixes a thinko in the r8a66597 driver]
+
+This patch let a few discrete USB host controllers drivers (isp116x-hcd,
+r8a66597-hcd and sl811-hcd) obtain IRQ flags from their IORESOURCE_IRQ
+resource if configured as such, much like it's been done for the smc91x
+driver.
+
+It spares people writing support for specific boards the burden to
+configure the interrupt controller independantly, and keeps all IRQ
+related information in a single resource.
+
+HCD that are integrally part of a SoC have been left aside, as there
+is probably no "wiring" options...
+
+Tested on an Xscale PXA-255 based platform with isp116x-hcd.
+
+Signed-off-by: Marc Zyngier <marc.zyngier@altran.com>
+Cc: David Brownell <david-b@pacbell.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/isp116x-hcd.c  |   13 ++++++++----
+ drivers/usb/host/r8a66597-hcd.c |   41 +++++++++++++++++++++++++++++++---------
+ drivers/usb/host/sl811-hcd.c    |   15 ++++++++++----
+ 3 files changed, 52 insertions(+), 17 deletions(-)
+
+--- a/drivers/usb/host/isp116x-hcd.c
++++ b/drivers/usb/host/isp116x-hcd.c
+@@ -1562,11 +1562,12 @@ static int __devinit isp116x_probe(struc
+ {
+ 	struct usb_hcd *hcd;
+ 	struct isp116x *isp116x;
+-	struct resource *addr, *data;
++	struct resource *addr, *data, *ires;
+ 	void __iomem *addr_reg;
+ 	void __iomem *data_reg;
+ 	int irq;
+ 	int ret = 0;
++	unsigned long irqflags;
+ 
+ 	if (pdev->num_resources < 3) {
+ 		ret = -ENODEV;
+@@ -1575,12 +1576,16 @@ static int __devinit isp116x_probe(struc
+ 
+ 	data = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+ 	addr = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+-	irq = platform_get_irq(pdev, 0);
+-	if (!addr || !data || irq < 0) {
++	ires = platform_get_resource(pdev, IORESOURCE_IRQ, 0);
++
++	if (!addr || !data || !ires) {
+ 		ret = -ENODEV;
+ 		goto err1;
+ 	}
+ 
++	irq = ires->start;
++	irqflags = ires->flags & IRQF_TRIGGER_MASK;
++
+ 	if (pdev->dev.dma_mask) {
+ 		DBG("DMA not supported\n");
+ 		ret = -EINVAL;
+@@ -1634,7 +1639,7 @@ static int __devinit isp116x_probe(struc
+ 		goto err6;
+ 	}
+ 
+-	ret = usb_add_hcd(hcd, irq, IRQF_DISABLED);
++	ret = usb_add_hcd(hcd, irq, irqflags | IRQF_DISABLED);
+ 	if (ret)
+ 		goto err6;
+ 
+--- a/drivers/usb/host/r8a66597-hcd.c
++++ b/drivers/usb/host/r8a66597-hcd.c
+@@ -66,7 +66,7 @@ static unsigned short endian;
+ module_param(endian, ushort, 0644);
+ MODULE_PARM_DESC(endian, "data endian: big=256, little=0 (default=0)");
+ 
+-static unsigned short irq_sense = INTL;
++static unsigned short irq_sense = 0xff;
+ module_param(irq_sense, ushort, 0644);
+ MODULE_PARM_DESC(irq_sense, "IRQ sense: low level=32, falling edge=0 "
+ 		"(default=32)");
+@@ -2263,7 +2263,7 @@ static int __init_or_module r8a66597_rem
+ #define resource_len(r) (((r)->end - (r)->start) + 1)
+ static int __init r8a66597_probe(struct platform_device *pdev)
+ {
+-	struct resource *res = NULL;
++	struct resource *res = NULL, *ires;
+ 	int irq = -1;
+ 	void __iomem *reg = NULL;
+ 	struct usb_hcd *hcd = NULL;
+@@ -2286,13 +2286,16 @@ static int __init r8a66597_probe(struct 
+ 		goto clean_up;
+ 	}
+ 
+-	irq = platform_get_irq(pdev, 0);
+-	if (irq < 0) {
++	ires = platform_get_resource(pdev, IORESOURCE_IRQ, 0);
++	if (!ires) {
+ 		ret = -ENODEV;
+-		err("platform_get_irq error.");
++		err("platform_get_resource IORESOURCE_IRQ error.");
+ 		goto clean_up;
+ 	}
+ 
++	irq = ires->start;
++	irq_trigger = ires->flags & IRQF_TRIGGER_MASK;
++
+ 	reg = ioremap(res->start, resource_len(res));
+ 	if (reg == NULL) {
+ 		ret = -ENOMEM;
+@@ -2329,10 +2332,30 @@ static int __init r8a66597_probe(struct 
+ 	INIT_LIST_HEAD(&r8a66597->child_device);
+ 
+ 	hcd->rsrc_start = res->start;
+-	if (irq_sense == INTL)
+-		irq_trigger = IRQF_TRIGGER_LOW;
+-	else
+-		irq_trigger = IRQF_TRIGGER_FALLING;
++
++	/* irq_sense setting on cmdline takes precedence over resource
++	 * settings, so the introduction of irqflags in IRQ resourse
++	 * won't disturb existing setups */
++	switch (irq_sense) {
++		case INTL:
++			irq_trigger = IRQF_TRIGGER_LOW;
++			break;
++		case 0:
++			irq_trigger = IRQF_TRIGGER_FALLING;
++			break;
++		case 0xff:
++			if (irq_trigger)
++				irq_sense = (irq_trigger & IRQF_TRIGGER_LOW) ?
++					    INTL : 0;
++			else {
++				irq_sense = INTL;
++				irq_trigger = IRQF_TRIGGER_LOW;
++			}
++			break;
++		default:
++			err("Unknown irq_sense value.");
++	}
++
+ 	ret = usb_add_hcd(hcd, irq, IRQF_DISABLED | irq_trigger);
+ 	if (ret != 0) {
+ 		err("Failed to add hcd");
+--- a/drivers/usb/host/sl811-hcd.c
++++ b/drivers/usb/host/sl811-hcd.c
+@@ -1620,22 +1620,26 @@ sl811h_probe(struct platform_device *dev
+ {
+ 	struct usb_hcd		*hcd;
+ 	struct sl811		*sl811;
+-	struct resource		*addr, *data;
++	struct resource		*addr, *data, *ires;
+ 	int			irq;
+ 	void __iomem		*addr_reg;
+ 	void __iomem		*data_reg;
+ 	int			retval;
+ 	u8			tmp, ioaddr = 0;
++	unsigned long		irqflags;
+ 
+ 	/* basic sanity checks first.  board-specific init logic should
+ 	 * have initialized these three resources and probably board
+ 	 * specific platform_data.  we don't probe for IRQs, and do only
+ 	 * minimal sanity checking.
+ 	 */
+-	irq = platform_get_irq(dev, 0);
+-	if (dev->num_resources < 3 || irq < 0)
++	ires = platform_get_resource(dev, IORESOURCE_IRQ, 0);
++	if (dev->num_resources < 3 || !ires)
+ 		return -ENODEV;
+ 
++	irq = ires->start;
++	irqflags = ires->flags & IRQF_TRIGGER_MASK;
++
+ 	/* refuse to confuse usbcore */
+ 	if (dev->dev.dma_mask) {
+ 		DBG("no we won't dma\n");
+@@ -1717,8 +1721,11 @@ sl811h_probe(struct platform_device *dev
+ 	 * triggers (e.g. most ARM CPUs).  Initial driver stress testing
+ 	 * was on a system with single edge triggering, so most sorts of
+ 	 * triggering arrangement should work.
++	 *
++	 * Use resource IRQ flags if set by platform device setup.
+ 	 */
+-	retval = usb_add_hcd(hcd, irq, IRQF_DISABLED | IRQF_SHARED);
++	irqflags |= IRQF_SHARED;
++	retval = usb_add_hcd(hcd, irq, IRQF_DISABLED | irqflags);
+ 	if (retval != 0)
+ 		goto err6;
+ 

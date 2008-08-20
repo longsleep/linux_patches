@@ -1,0 +1,184 @@
+From stern+48acf28e@rowland.harvard.edu Tue Aug 12 11:34:16 2008
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Tue, 12 Aug 2008 14:34:10 -0400 (EDT)
+Subject: USB: Add new PM callback methods for USB
+To: Greg KH <greg@kroah.com>
+Cc: USB list <linux-usb@vger.kernel.org>
+Message-ID: <Pine.LNX.4.44L0.0808121430520.2248-100000@iolanthe.rowland.org>
+
+
+This patch (as1129) adds support for the new PM callbacks to usbcore.
+The new callbacks merely invoke the same old USB power management
+routines as the old ones did.
+
+A minor improvement is that the callbacks are present only in the
+"USB-device" device_type structure, rather than in the bus_type
+structure.  This way they will be invoked only for USB devices, not
+for USB interfaces.  The core USB PM routines automatically handle
+suspending and resuming interfaces along with their devices.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/driver.c |   15 +--------
+ drivers/usb/core/usb.c    |   73 ++++++++++++++++++++++++++++++++++++++++++----
+ drivers/usb/core/usb.h    |    3 +
+ 3 files changed, 72 insertions(+), 19 deletions(-)
+
+--- a/drivers/usb/core/driver.c
++++ b/drivers/usb/core/driver.c
+@@ -1630,12 +1630,10 @@ int usb_external_resume_device(struct us
+ 	return status;
+ }
+ 
+-static int usb_suspend(struct device *dev, pm_message_t message)
++int usb_suspend(struct device *dev, pm_message_t message)
+ {
+ 	struct usb_device	*udev;
+ 
+-	if (!is_usb_device(dev))	/* Ignore PM for interfaces */
+-		return 0;
+ 	udev = to_usb_device(dev);
+ 
+ 	/* If udev is already suspended, we can skip this suspend and
+@@ -1654,12 +1652,10 @@ static int usb_suspend(struct device *de
+ 	return usb_external_suspend_device(udev, message);
+ }
+ 
+-static int usb_resume(struct device *dev)
++int usb_resume(struct device *dev)
+ {
+ 	struct usb_device	*udev;
+ 
+-	if (!is_usb_device(dev))	/* Ignore PM for interfaces */
+-		return 0;
+ 	udev = to_usb_device(dev);
+ 
+ 	/* If udev->skip_sys_resume is set then udev was already suspended
+@@ -1671,17 +1667,10 @@ static int usb_resume(struct device *dev
+ 	return usb_external_resume_device(udev);
+ }
+ 
+-#else
+-
+-#define usb_suspend	NULL
+-#define usb_resume	NULL
+-
+ #endif /* CONFIG_PM */
+ 
+ struct bus_type usb_bus_type = {
+ 	.name =		"usb",
+ 	.match =	usb_device_match,
+ 	.uevent =	usb_uevent,
+-	.suspend =	usb_suspend,
+-	.resume =	usb_resume,
+ };
+--- a/drivers/usb/core/usb.c
++++ b/drivers/usb/core/usb.c
+@@ -219,12 +219,6 @@ static int usb_dev_uevent(struct device 
+ }
+ #endif	/* CONFIG_HOTPLUG */
+ 
+-struct device_type usb_device_type = {
+-	.name =		"usb_device",
+-	.release =	usb_release_dev,
+-	.uevent =	usb_dev_uevent,
+-};
+-
+ #ifdef	CONFIG_PM
+ 
+ static int ksuspend_usb_init(void)
+@@ -244,13 +238,80 @@ static void ksuspend_usb_cleanup(void)
+ 	destroy_workqueue(ksuspend_usb_wq);
+ }
+ 
++/* USB device Power-Management thunks.
++ * There's no need to distinguish here between quiescing a USB device
++ * and powering it down; the generic_suspend() routine takes care of
++ * it by skipping the usb_port_suspend() call for a quiesce.  And for
++ * USB interfaces there's no difference at all.
++ */
++
++static int usb_dev_prepare(struct device *dev)
++{
++	return 0;		/* Implement eventually? */
++}
++
++static void usb_dev_complete(struct device *dev)
++{
++	/* Currently used only for rebinding interfaces */
++	usb_resume(dev);	/* Implement eventually? */
++}
++
++static int usb_dev_suspend(struct device *dev)
++{
++	return usb_suspend(dev, PMSG_SUSPEND);
++}
++
++static int usb_dev_resume(struct device *dev)
++{
++	return usb_resume(dev);
++}
++
++static int usb_dev_freeze(struct device *dev)
++{
++	return usb_suspend(dev, PMSG_FREEZE);
++}
++
++static int usb_dev_thaw(struct device *dev)
++{
++	return usb_resume(dev);
++}
++
++static int usb_dev_poweroff(struct device *dev)
++{
++	return usb_suspend(dev, PMSG_HIBERNATE);
++}
++
++static int usb_dev_restore(struct device *dev)
++{
++	return usb_resume(dev);
++}
++
++static struct pm_ops usb_device_pm_ops = {
++	.prepare =	usb_dev_prepare,
++	.complete =	usb_dev_complete,
++	.suspend =	usb_dev_suspend,
++	.resume =	usb_dev_resume,
++	.freeze =	usb_dev_freeze,
++	.thaw =		usb_dev_thaw,
++	.poweroff =	usb_dev_poweroff,
++	.restore =	usb_dev_restore,
++};
++
+ #else
+ 
+ #define ksuspend_usb_init()	0
+ #define ksuspend_usb_cleanup()	do {} while (0)
++#define usb_device_pm_ops	(* (struct pm_ops *) 0)
+ 
+ #endif	/* CONFIG_PM */
+ 
++struct device_type usb_device_type = {
++	.name =		"usb_device",
++	.release =	usb_release_dev,
++	.uevent =	usb_dev_uevent,
++	.pm =		&usb_device_pm_ops,
++};
++
+ 
+ /* Returns 1 if @usb_bus is WUSB, 0 otherwise */
+ static unsigned usb_bus_is_wusb(struct usb_bus *bus)
+--- a/drivers/usb/core/usb.h
++++ b/drivers/usb/core/usb.h
+@@ -41,6 +41,9 @@ extern void usb_host_cleanup(void);
+ 
+ #ifdef	CONFIG_PM
+ 
++extern int usb_suspend(struct device *dev, pm_message_t msg);
++extern int usb_resume(struct device *dev);
++
+ extern void usb_autosuspend_work(struct work_struct *work);
+ extern int usb_port_suspend(struct usb_device *dev);
+ extern int usb_port_resume(struct usb_device *dev);

@@ -1,0 +1,92 @@
+From linux-usb-owner@vger.kernel.org Tue Aug 12 11:34:22 2008
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Tue, 12 Aug 2008 14:34:14 -0400 (EDT)
+Subject: USB: Don't rebind before "complete" callback
+To: Greg KH <greg@kroah.com>
+Cc: USB list <linux-usb@vger.kernel.org>
+Message-ID: <Pine.LNX.4.44L0.0808121431290.2248-100000@iolanthe.rowland.org>
+
+
+This patch (as1130) fixes an incompatibility between the new PM
+infrastructure and USB power management.  We are not allowed to call
+drivers' probe routines during a system sleep transition between the
+"prepare" and "complete" callbacks, but that's exactly what we do when
+a driver doesn't have full suspend/resume support.  Such drivers are
+unbound during the "suspend" call and reprobed during the "resume" call.
+
+The patch causes the reprobe step to be skipped if the "complete"
+callback hasn't been issued yet, i.e., if the interface's
+dev.power.status field is not equal to DPM_ON.  Thus during the
+"resume" callback nothing bad will happen, and during the final
+"complete" callback the reprobing will occur as desired.
+
+This fixes the problem reported in Bugzilla #11263.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/driver.c |   30 +++++++++---------------------
+ 1 file changed, 9 insertions(+), 21 deletions(-)
+
+--- a/drivers/usb/core/driver.c
++++ b/drivers/usb/core/driver.c
+@@ -814,7 +814,8 @@ void usb_forced_unbind_intf(struct usb_i
+  * The caller must hold @intf's device's lock, but not its pm_mutex
+  * and not @intf->dev.sem.
+  *
+- * FIXME: The caller must block system sleep transitions.
++ * Note: Rebinds will be skipped if a system sleep transition is in
++ * progress and the PM "complete" callback hasn't occurred yet.
+  */
+ void usb_rebind_intf(struct usb_interface *intf)
+ {
+@@ -830,10 +831,12 @@ void usb_rebind_intf(struct usb_interfac
+ 	}
+ 
+ 	/* Try to rebind the interface */
+-	intf->needs_binding = 0;
+-	rc = device_attach(&intf->dev);
+-	if (rc < 0)
+-		dev_warn(&intf->dev, "rebind failed: %d\n", rc);
++	if (intf->dev.power.status == DPM_ON) {
++		intf->needs_binding = 0;
++		rc = device_attach(&intf->dev);
++		if (rc < 0)
++			dev_warn(&intf->dev, "rebind failed: %d\n", rc);
++	}
+ }
+ 
+ #ifdef CONFIG_PM
+@@ -845,7 +848,6 @@ void usb_rebind_intf(struct usb_interfac
+  * or rebind interfaces that have been unbound, according to @action.
+  *
+  * The caller must hold @udev's device lock.
+- * FIXME: For rebinds, the caller must block system sleep transitions.
+  */
+ static void do_unbind_rebind(struct usb_device *udev, int action)
+ {
+@@ -867,22 +869,8 @@ static void do_unbind_rebind(struct usb_
+ 				}
+ 				break;
+ 			case DO_REBIND:
+-				if (intf->needs_binding) {
+-
+-	/* FIXME: The next line is needed because we are going to probe
+-	 * the interface, but as far as the PM core is concerned the
+-	 * interface is still suspended.  The problem wouldn't exist
+-	 * if we could rebind the interface during the interface's own
+-	 * resume() call, but at the time the usb_device isn't locked!
+-	 *
+-	 * The real solution will be to carry this out during the device's
+-	 * complete() callback.  Until that is implemented, we have to
+-	 * use this hack.
+-	 */
+-//					intf->dev.power.sleeping = 0;
+-
++				if (intf->needs_binding)
+ 					usb_rebind_intf(intf);
+-				}
+ 				break;
+ 			}
+ 		}

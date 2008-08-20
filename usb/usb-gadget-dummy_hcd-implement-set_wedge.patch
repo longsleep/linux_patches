@@ -1,0 +1,146 @@
+From stern+48acf28e@rowland.harvard.edu Thu Aug 14 12:48:34 2008
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Thu, 14 Aug 2008 15:48:30 -0400 (EDT)
+Subject: USB: gadget: dummy_hcd: implement set_wedge
+To: Greg KH <greg@kroah.com>
+Cc: David Lopo <lopo.david@gmail.com>, USB list <linux-usb@vger.kernel.org>
+Message-ID: <Pine.LNX.4.44L0.0808141547380.2148-100000@iolanthe.rowland.org>
+
+
+This patch (as1131) implements the set_wedge() method for dummy_hcd.
+This method is necessary for strict USBCV compliance in
+g_file_storage.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/gadget/dummy_hcd.c    |   33 +++++++++++++++++++++++++++------
+ drivers/usb/gadget/file_storage.c |   10 +++++++++-
+ 2 files changed, 36 insertions(+), 7 deletions(-)
+
+--- a/drivers/usb/gadget/dummy_hcd.c
++++ b/drivers/usb/gadget/dummy_hcd.c
+@@ -82,6 +82,7 @@ struct dummy_ep {
+ 	const struct usb_endpoint_descriptor *desc;
+ 	struct usb_ep			ep;
+ 	unsigned			halted : 1;
++	unsigned			wedged : 1;
+ 	unsigned			already_seen : 1;
+ 	unsigned			setup_stage : 1;
+ };
+@@ -436,6 +437,7 @@ dummy_enable (struct usb_ep *_ep, const 
+ 	/* at this point real hardware should be NAKing transfers
+ 	 * to that endpoint, until a buffer is queued to it.
+ 	 */
++	ep->halted = ep->wedged = 0;
+ 	retval = 0;
+ done:
+ 	return retval;
+@@ -597,7 +599,7 @@ static int dummy_dequeue (struct usb_ep 
+ }
+ 
+ static int
+-dummy_set_halt (struct usb_ep *_ep, int value)
++dummy_set_halt_and_wedge(struct usb_ep *_ep, int value, int wedged)
+ {
+ 	struct dummy_ep		*ep;
+ 	struct dummy		*dum;
+@@ -609,16 +611,32 @@ dummy_set_halt (struct usb_ep *_ep, int 
+ 	if (!dum->driver)
+ 		return -ESHUTDOWN;
+ 	if (!value)
+-		ep->halted = 0;
++		ep->halted = ep->wedged = 0;
+ 	else if (ep->desc && (ep->desc->bEndpointAddress & USB_DIR_IN) &&
+ 			!list_empty (&ep->queue))
+ 		return -EAGAIN;
+-	else
++	else {
+ 		ep->halted = 1;
++		if (wedged)
++			ep->wedged = 1;
++	}
+ 	/* FIXME clear emulated data toggle too */
+ 	return 0;
+ }
+ 
++static int
++dummy_set_halt(struct usb_ep *_ep, int value)
++{
++	return dummy_set_halt_and_wedge(_ep, value, 0);
++}
++
++static int dummy_set_wedge(struct usb_ep *_ep)
++{
++	if (!_ep || _ep->name == ep0name)
++		return -EINVAL;
++	return dummy_set_halt_and_wedge(_ep, 1, 1);
++}
++
+ static const struct usb_ep_ops dummy_ep_ops = {
+ 	.enable		= dummy_enable,
+ 	.disable	= dummy_disable,
+@@ -630,6 +648,7 @@ static const struct usb_ep_ops dummy_ep_
+ 	.dequeue	= dummy_dequeue,
+ 
+ 	.set_halt	= dummy_set_halt,
++	.set_wedge	= dummy_set_wedge,
+ };
+ 
+ /*-------------------------------------------------------------------------*/
+@@ -760,7 +779,8 @@ usb_gadget_register_driver (struct usb_g
+ 		ep->ep.name = ep_name [i];
+ 		ep->ep.ops = &dummy_ep_ops;
+ 		list_add_tail (&ep->ep.ep_list, &dum->gadget.ep_list);
+-		ep->halted = ep->already_seen = ep->setup_stage = 0;
++		ep->halted = ep->wedged = ep->already_seen =
++				ep->setup_stage = 0;
+ 		ep->ep.maxpacket = ~0;
+ 		ep->last_io = jiffies;
+ 		ep->gadget = &dum->gadget;
+@@ -1351,7 +1371,7 @@ restart:
+ 				} else if (setup.bRequestType == Ep_Request) {
+ 					// endpoint halt
+ 					ep2 = find_endpoint (dum, w_index);
+-					if (!ep2) {
++					if (!ep2 || ep2->ep.name == ep0name) {
+ 						value = -EOPNOTSUPP;
+ 						break;
+ 					}
+@@ -1380,7 +1400,8 @@ restart:
+ 						value = -EOPNOTSUPP;
+ 						break;
+ 					}
+-					ep2->halted = 0;
++					if (!ep2->wedged)
++						ep2->halted = 0;
+ 					value = 0;
+ 					status = 0;
+ 				}
+--- a/drivers/usb/gadget/file_storage.c
++++ b/drivers/usb/gadget/file_storage.c
+@@ -217,7 +217,7 @@
+  */
+ 
+ 
+-/* #define VERBOSE_DEBUG */
++#define VERBOSE_DEBUG
+ /* #define DUMP_MSGS */
+ 
+ 
+@@ -2973,6 +2973,14 @@ static int received_cbw(struct fsg_dev *
+ 	if (req->status || test_bit(IGNORE_BULK_OUT, &fsg->atomic_bitflags))
+ 		return -EINVAL;
+ 
++	{
++		static int cnt;
++		if (cbw->CDB[0] == SC_READ_CAPACITY && cnt == 0) {
++			cnt = 1;
++			cbw->Signature = 0x12345678;
++		}
++	}
++
+ 	/* Is the CBW valid? */
+ 	if (req->actual != USB_BULK_CB_WRAP_LEN ||
+ 			cbw->Signature != __constant_cpu_to_le32(

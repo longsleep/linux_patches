@@ -1,0 +1,131 @@
+From stern+48acf28e@rowland.harvard.edu Thu Aug 14 12:49:16 2008
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Thu, 14 Aug 2008 15:49:11 -0400 (EDT)
+Subject: USB: gadget: net2280: implement set_wedge
+To: Greg KH <greg@kroah.com>
+Cc: David Lopo <lopo.david@gmail.com>, David Brownell <david-b@pacbell.net>,  USB list <linux-usb@vger.kernel.org>
+Message-ID: <Pine.LNX.4.44L0.0808141548310.2148-100000@iolanthe.rowland.org>
+
+
+This patch (as1132) implements the set_wedge() method for net2280.
+This method is necessary for strict USBCV compliance in
+g_file_storage.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+CC: David Brownell <david-b@pacbell.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/gadget/net2280.c |   40 ++++++++++++++++++++++++++++++++++------
+ drivers/usb/gadget/net2280.h |    1 +
+ 2 files changed, 35 insertions(+), 6 deletions(-)
+
+--- a/drivers/usb/gadget/net2280.c
++++ b/drivers/usb/gadget/net2280.c
+@@ -178,6 +178,7 @@ net2280_enable (struct usb_ep *_ep, cons
+ 
+ 	/* ep_reset() has already been called */
+ 	ep->stopped = 0;
++	ep->wedged = 0;
+ 	ep->out_overflow = 0;
+ 
+ 	/* set speed-dependent max packet; may kick in high bandwidth */
+@@ -1218,7 +1219,7 @@ static int net2280_dequeue (struct usb_e
+ static int net2280_fifo_status (struct usb_ep *_ep);
+ 
+ static int
+-net2280_set_halt (struct usb_ep *_ep, int value)
++net2280_set_halt_and_wedge(struct usb_ep *_ep, int value, int wedged)
+ {
+ 	struct net2280_ep	*ep;
+ 	unsigned long		flags;
+@@ -1239,16 +1240,21 @@ net2280_set_halt (struct usb_ep *_ep, in
+ 	else if (ep->is_in && value && net2280_fifo_status (_ep) != 0)
+ 		retval = -EAGAIN;
+ 	else {
+-		VDEBUG (ep->dev, "%s %s halt\n", _ep->name,
+-				value ? "set" : "clear");
++		VDEBUG (ep->dev, "%s %s %s\n", _ep->name,
++				value ? "set" : "clear",
++				wedged ? "wedge" : "halt");
+ 		/* set/clear, then synch memory views with the device */
+ 		if (value) {
+ 			if (ep->num == 0)
+ 				ep->dev->protocol_stall = 1;
+ 			else
+ 				set_halt (ep);
+-		} else
++			if (wedged)
++				ep->wedged = 1;
++		} else {
+ 			clear_halt (ep);
++			ep->wedged = 0;
++		}
+ 		(void) readl (&ep->regs->ep_rsp);
+ 	}
+ 	spin_unlock_irqrestore (&ep->dev->lock, flags);
+@@ -1257,6 +1263,20 @@ net2280_set_halt (struct usb_ep *_ep, in
+ }
+ 
+ static int
++net2280_set_halt(struct usb_ep *_ep, int value)
++{
++	return net2280_set_halt_and_wedge(_ep, value, 0);
++}
++
++static int
++net2280_set_wedge(struct usb_ep *_ep)
++{
++	if (!_ep || _ep->name == ep0name)
++		return -EINVAL;
++	return net2280_set_halt_and_wedge(_ep, 1, 1);
++}
++
++static int
+ net2280_fifo_status (struct usb_ep *_ep)
+ {
+ 	struct net2280_ep	*ep;
+@@ -1302,6 +1322,7 @@ static const struct usb_ep_ops net2280_e
+ 	.dequeue	= net2280_dequeue,
+ 
+ 	.set_halt	= net2280_set_halt,
++	.set_wedge	= net2280_set_wedge,
+ 	.fifo_status	= net2280_fifo_status,
+ 	.fifo_flush	= net2280_fifo_flush,
+ };
+@@ -2410,9 +2431,14 @@ static void handle_stat0_irqs (struct ne
+ 				goto do_stall;
+ 			if ((e = get_ep_by_addr (dev, w_index)) == 0)
+ 				goto do_stall;
+-			clear_halt (e);
++			if (e->wedged) {
++				VDEBUG(dev, "%s wedged, halt not cleared\n",
++						ep->ep.name);
++			} else {
++				VDEBUG(dev, "%s clear halt\n", ep->ep.name);
++				clear_halt(e);
++			}
+ 			allow_status (ep);
+-			VDEBUG (dev, "%s clear halt\n", ep->ep.name);
+ 			goto next_endpoints;
+ 			}
+ 			break;
+@@ -2427,6 +2453,8 @@ static void handle_stat0_irqs (struct ne
+ 				goto do_stall;
+ 			if ((e = get_ep_by_addr (dev, w_index)) == 0)
+ 				goto do_stall;
++			if (e->ep.name == ep0name)
++				goto do_stall;
+ 			set_halt (e);
+ 			allow_status (ep);
+ 			VDEBUG (dev, "%s set halt\n", ep->ep.name);
+--- a/drivers/usb/gadget/net2280.h
++++ b/drivers/usb/gadget/net2280.h
+@@ -109,6 +109,7 @@ struct net2280_ep {
+ 						in_fifo_validate : 1,
+ 						out_overflow : 1,
+ 						stopped : 1,
++						wedged : 1,
+ 						is_in : 1,
+ 						is_iso : 1,
+ 						responded : 1;
