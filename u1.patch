@@ -1,0 +1,965 @@
+---
+ drivers/usb/class/cdc-acm.c     |   23 ++++++++++--------
+ drivers/usb/class/cdc-wdm.c     |   48 +++++++++++++++++++++++--------------
+ drivers/usb/class/usblp.c       |    7 +++--
+ drivers/usb/core/devio.c        |    7 +++--
+ drivers/usb/core/endpoint.c     |    3 +-
+ drivers/usb/core/file.c         |    5 ++-
+ drivers/usb/core/inode.c        |   12 ++++-----
+ drivers/usb/core/urb.c          |    4 +--
+ drivers/usb/host/isp1760-if.c   |    2 -
+ drivers/usb/host/r8a66597-hcd.c |   51 +++++++++++++++++++++-------------------
+ drivers/usb/image/mdc800.c      |   46 +++++++++++++++++++++++-------------
+ drivers/usb/misc/adutux.c       |   17 +++++++------
+ drivers/usb/serial/aircable.c   |   11 ++++----
+ drivers/usb/serial/ezusb.c      |    3 +-
+ drivers/usb/serial/usb-serial.c |   19 +++++++++-----
+ include/linux/usb.h             |    3 --
+ 16 files changed, 153 insertions(+), 108 deletions(-)
+
+--- a/drivers/usb/class/cdc-acm.c
++++ b/drivers/usb/class/cdc-acm.c
+@@ -326,8 +326,8 @@ exit:
+ 	usb_mark_last_busy(acm->dev);
+ 	retval = usb_submit_urb (urb, GFP_ATOMIC);
+ 	if (retval)
+-		err ("%s - usb_submit_urb failed with result %d",
+-		     __func__, retval);
++		dev_err(&urb->dev->dev, "%s - usb_submit_urb failed with "
++			"result %d", __func__, retval);
+ }
+ 
+ /* data interface returns incoming bytes, or we got unthrottled */
+@@ -514,7 +514,7 @@ static void acm_waker(struct work_struct
+ 
+ 	rv = usb_autopm_get_interface(acm->control);
+ 	if (rv < 0) {
+-		err("Autopm failure in %s", __func__);
++		dev_err(&acm->dev->dev, "Autopm failure in %s\n", __func__);
+ 		return;
+ 	}
+ 	if (acm->delayed_wb) {
+@@ -924,7 +924,7 @@ static int acm_probe (struct usb_interfa
+ 	
+ 	/* normal probing*/
+ 	if (!buffer) {
+-		err("Weird descriptor references\n");
++		dev_err(&intf->dev, "Weird descriptor references\n");
+ 		return -EINVAL;
+ 	}
+ 
+@@ -934,21 +934,24 @@ static int acm_probe (struct usb_interfa
+ 			buflen = intf->cur_altsetting->endpoint->extralen;
+ 			buffer = intf->cur_altsetting->endpoint->extra;
+ 		} else {
+-			err("Zero length descriptor references\n");
++			dev_err(&intf->dev,
++				"Zero length descriptor references\n");
+ 			return -EINVAL;
+ 		}
+ 	}
+ 
+ 	while (buflen > 0) {
+ 		if (buffer [1] != USB_DT_CS_INTERFACE) {
+-			err("skipping garbage\n");
++			dev_err(&intf->dev, "skipping garbage\n");
+ 			goto next_desc;
+ 		}
+ 
+ 		switch (buffer [2]) {
+ 			case USB_CDC_UNION_TYPE: /* we've found it */
+ 				if (union_header) {
+-					err("More than one union descriptor, skipping ...");
++					dev_err(&intf->dev, "More than one "
++						"union descriptor, "
++						"skipping ...\n");
+ 					goto next_desc;
+ 				}
+ 				union_header = (struct usb_cdc_union_desc *)
+@@ -966,7 +969,9 @@ static int acm_probe (struct usb_interfa
+ 				call_management_function = buffer[3];
+ 				call_interface_num = buffer[4];
+ 				if ((call_management_function & 3) != 3)
+-					err("This device cannot do calls on its own. It is no modem.");
++					dev_err(&intf->dev, "This device "
++						"cannot do calls on its own. "
++						"It is no modem.\n");
+ 				break;
+ 			default:
+ 				/* there are LOTS more CDC descriptors that
+@@ -1051,7 +1056,7 @@ skip_normal_probe:
+ 	for (minor = 0; minor < ACM_TTY_MINORS && acm_table[minor]; minor++);
+ 
+ 	if (minor == ACM_TTY_MINORS) {
+-		err("no more free acm devices");
++		dev_err(&intf->dev, "no more free acm devices\n");
+ 		return -ENODEV;
+ 	}
+ 
+--- a/drivers/usb/class/cdc-wdm.c
++++ b/drivers/usb/class/cdc-wdm.c
+@@ -132,10 +132,12 @@ static void wdm_in_callback(struct urb *
+ 				"nonzero urb status received: -ESHUTDOWN");
+ 			break;
+ 		case -EPIPE:
+-			err("nonzero urb status received: -EPIPE");
++			dev_err(&desc->intf->dev,
++				"nonzero urb status received: -EPIPE\n");
+ 			break;
+ 		default:
+-			err("Unexpected error %d", status);
++			dev_err(&desc->intf->dev,
++				"Unexpected error %d\n", status);
+ 			break;
+ 		}
+ 	}
+@@ -170,16 +172,18 @@ static void wdm_int_callback(struct urb 
+ 			return; /* unplug */
+ 		case -EPIPE:
+ 			set_bit(WDM_INT_STALL, &desc->flags);
+-			err("Stall on int endpoint");
++			dev_err(&desc->intf->dev, "Stall on int endpoint\n");
+ 			goto sw; /* halt is cleared in work */
+ 		default:
+-			err("nonzero urb status received: %d", status);
++			dev_err(&desc->intf->dev,
++				"nonzero urb status received: %d\n", status);
+ 			break;
+ 		}
+ 	}
+ 
+ 	if (urb->actual_length < sizeof(struct usb_cdc_notification)) {
+-		err("wdm_int_callback - %d bytes", urb->actual_length);
++		dev_err(&desc->intf->dev, "wdm_int_callback - %d bytes\n",
++			urb->actual_length);
+ 		goto exit;
+ 	}
+ 
+@@ -198,7 +202,8 @@ static void wdm_int_callback(struct urb 
+ 		goto exit;
+ 	default:
+ 		clear_bit(WDM_POLL_RUNNING, &desc->flags);
+-		err("unknown notification %d received: index %d len %d",
++		dev_err(&desc->intf->dev,
++			"unknown notification %d received: index %d len %d\n",
+ 			dr->bNotificationType, dr->wIndex, dr->wLength);
+ 		goto exit;
+ 	}
+@@ -236,14 +241,16 @@ static void wdm_int_callback(struct urb 
+ sw:
+ 			rv = schedule_work(&desc->rxwork);
+ 			if (rv)
+-				err("Cannot schedule work");
++				dev_err(&desc->intf->dev,
++					"Cannot schedule work\n");
+ 		}
+ 	}
+ exit:
+ 	rv = usb_submit_urb(urb, GFP_ATOMIC);
+ 	if (rv)
+-		err("%s - usb_submit_urb failed with result %d",
+-		     __func__, rv);
++		dev_err(&desc->intf->dev,
++			"%s - usb_submit_urb failed with result %d\n",
++			__func__, rv);
+ 
+ }
+ 
+@@ -353,7 +360,7 @@ static ssize_t wdm_write
+ 	if (rv < 0) {
+ 		kfree(buf);
+ 		clear_bit(WDM_IN_USE, &desc->flags);
+-		err("Tx URB error: %d", rv);
++		dev_err(&desc->intf->dev, "Tx URB error: %d\n", rv);
+ 	} else {
+ 		dev_dbg(&desc->intf->dev, "Tx URB has been submitted index=%d",
+ 			req->wIndex);
+@@ -401,7 +408,8 @@ retry:
+ 			int t = desc->rerr;
+ 			desc->rerr = 0;
+ 			spin_unlock_irq(&desc->iuspin);
+-			err("reading had resulted in %d", t);
++			dev_err(&desc->intf->dev,
++				"reading had resulted in %d\n", t);
+ 			rv = -EIO;
+ 			goto err;
+ 		}
+@@ -440,7 +448,7 @@ retry:
+ err:
+ 	mutex_unlock(&desc->rlock);
+ 	if (rv < 0)
+-		err("wdm_read: exit error");
++		dev_err(&desc->intf->dev, "wdm_read: exit error\n");
+ 	return rv;
+ }
+ 
+@@ -450,7 +458,8 @@ static int wdm_flush(struct file *file, 
+ 
+ 	wait_event(desc->wait, !test_bit(WDM_IN_USE, &desc->flags));
+ 	if (desc->werr < 0)
+-		err("Error in flush path: %d", desc->werr);
++		dev_err(&desc->intf->dev, "Error in flush path: %d\n",
++			desc->werr);
+ 
+ 	return desc->werr;
+ }
+@@ -502,7 +511,7 @@ static int wdm_open(struct inode *inode,
+ 
+ 	rv = usb_autopm_get_interface(desc->intf);
+ 	if (rv < 0) {
+-		err("Error autopm - %d", rv);
++		dev_err(&desc->intf->dev, "Error autopm - %d\n", rv);
+ 		goto out;
+ 	}
+ 	intf->needs_remote_wakeup = 1;
+@@ -512,7 +521,8 @@ static int wdm_open(struct inode *inode,
+ 		rv = usb_submit_urb(desc->validity, GFP_KERNEL);
+ 		if (rv < 0) {
+ 			desc->count--;
+-			err("Error submitting int urb - %d", rv);
++			dev_err(&desc->intf->dev,
++				"Error submitting int urb - %d\n", rv);
+ 		}
+ 	} else {
+ 		rv = 0;
+@@ -600,7 +610,7 @@ static int wdm_probe(struct usb_interfac
+ 
+ 	while (buflen > 0) {
+ 		if (buffer [1] != USB_DT_CS_INTERFACE) {
+-			err("skipping garbage");
++			dev_err(&intf->dev, "skipping garbage\n");
+ 			goto next_desc;
+ 		}
+ 
+@@ -614,7 +624,8 @@ static int wdm_probe(struct usb_interfac
+ 				"Finding maximum buffer length: %d", maxcom);
+ 			break;
+ 		default:
+-			err("Ignoring extra header, type %d, length %d",
++			dev_err(&intf->dev,
++				"Ignoring extra header, type %d, length %d\n",
+ 				buffer[2], buffer[0]);
+ 			break;
+ 		}
+@@ -772,7 +783,8 @@ static int recover_from_urb_loss(struct 
+ 	if (desc->count) {
+ 		rv = usb_submit_urb(desc->validity, GFP_NOIO);
+ 		if (rv < 0)
+-			err("Error resume submitting int urb - %d", rv);
++			dev_err(&desc->intf->dev,
++				"Error resume submitting int urb - %d\n", rv);
+ 	}
+ 	return rv;
+ }
+--- a/drivers/usb/class/usblp.c
++++ b/drivers/usb/class/usblp.c
+@@ -593,8 +593,9 @@ static long usblp_ioctl(struct file *fil
+ 				err = usblp_hp_channel_change_request(usblp,
+ 					arg, &newChannel);
+ 				if (err < 0) {
+-					err("usblp%d: error = %d setting "
+-						"HP channel",
++					dev_err(&usblp->dev->dev,
++						"usblp%d: error = %d setting "
++						"HP channel\n",
+ 						usblp->minor, err);
+ 					retval = -EIO;
+ 					goto done;
+@@ -1345,7 +1346,7 @@ static void usblp_disconnect(struct usb_
+ 	usb_deregister_dev(intf, &usblp_class);
+ 
+ 	if (!usblp || !usblp->dev) {
+-		err("bogus disconnect");
++		dev_err(&intf->dev, "bogus disconnect\n");
+ 		BUG ();
+ 	}
+ 
+--- a/drivers/usb/core/devio.c
++++ b/drivers/usb/core/devio.c
+@@ -1775,19 +1775,20 @@ int __init usb_devio_init(void)
+ 	retval = register_chrdev_region(USB_DEVICE_DEV, USB_DEVICE_MAX,
+ 					"usb_device");
+ 	if (retval) {
+-		err("unable to register minors for usb_device");
++		printk(KERN_ERR "Unable to register minors for usb_device\n");
+ 		goto out;
+ 	}
+ 	cdev_init(&usb_device_cdev, &usbdev_file_operations);
+ 	retval = cdev_add(&usb_device_cdev, USB_DEVICE_DEV, USB_DEVICE_MAX);
+ 	if (retval) {
+-		err("unable to get usb_device major %d", USB_DEVICE_MAJOR);
++		printk(KERN_ERR "Unable to get usb_device major %d\n",
++		       USB_DEVICE_MAJOR);
+ 		goto error_cdev;
+ 	}
+ #ifdef CONFIG_USB_DEVICE_CLASS
+ 	usb_classdev_class = class_create(THIS_MODULE, "usb_device");
+ 	if (IS_ERR(usb_classdev_class)) {
+-		err("unable to register usb_device class");
++		printk(KERN_ERR "Unable to register usb_device class\n");
+ 		retval = PTR_ERR(usb_classdev_class);
+ 		cdev_del(&usb_device_cdev);
+ 		usb_classdev_class = NULL;
+--- a/drivers/usb/core/endpoint.c
++++ b/drivers/usb/core/endpoint.c
+@@ -169,7 +169,8 @@ static int usb_endpoint_major_init(void)
+ 	error = alloc_chrdev_region(&dev, 0, MAX_ENDPOINT_MINORS,
+ 				    "usb_endpoint");
+ 	if (error) {
+-		err("unable to get a dynamic major for usb endpoints");
++		printk(KERN_ERR "Unable to get a dynamic major for "
++		       "usb endpoints.\n");
+ 		return error;
+ 	}
+ 	usb_endpoint_major = MAJOR(dev);
+--- a/drivers/usb/core/file.c
++++ b/drivers/usb/core/file.c
+@@ -86,7 +86,7 @@ static int init_usb_class(void)
+ 	usb_class->class = class_create(THIS_MODULE, "usb");
+ 	if (IS_ERR(usb_class->class)) {
+ 		result = IS_ERR(usb_class->class);
+-		err("class_create failed for usb devices");
++		printk(KERN_ERR "class_create failed for usb devices\n");
+ 		kfree(usb_class);
+ 		usb_class = NULL;
+ 	}
+@@ -115,7 +115,8 @@ int usb_major_init(void)
+ 
+ 	error = register_chrdev(USB_MAJOR, "usb", &usb_fops);
+ 	if (error)
+-		err("unable to get major %d for usb devices", USB_MAJOR);
++		printk(KERN_ERR "Unable to get major %d for usb devices\n",
++		       USB_MAJOR);
+ 
+ 	return error;
+ }
+--- a/drivers/usb/core/inode.c
++++ b/drivers/usb/core/inode.c
+@@ -180,8 +180,8 @@ static int parse_options(struct super_bl
+ 			listmode = option & S_IRWXUGO;
+ 			break;
+ 		default:
+-			err("usbfs: unrecognised mount option \"%s\" "
+-			    "or missing value\n", p);
++			printk(KERN_ERR "usbfs: unrecognised mount option "
++			       "\"%s\" or missing value\n", p);
+ 			return -EINVAL;
+ 		}
+ 	}
+@@ -601,7 +601,7 @@ static int create_special_files (void)
+ 	/* create the devices special file */
+ 	retval = simple_pin_fs(&usb_fs_type, &usbfs_mount, &usbfs_mount_count);
+ 	if (retval) {
+-		err ("Unable to get usbfs mount");
++		printk(KERN_ERR "Unable to get usbfs mount\n");
+ 		goto exit;
+ 	}
+ 
+@@ -613,7 +613,7 @@ static int create_special_files (void)
+ 					       NULL, &usbfs_devices_fops,
+ 					       listuid, listgid);
+ 	if (devices_usbfs_dentry == NULL) {
+-		err ("Unable to create devices usbfs file");
++		printk(KERN_ERR "Unable to create devices usbfs file\n");
+ 		retval = -ENODEV;
+ 		goto error_clean_mounts;
+ 	}
+@@ -665,7 +665,7 @@ static void usbfs_add_bus(struct usb_bus
+ 	bus->usbfs_dentry = fs_create_file (name, busmode | S_IFDIR, parent,
+ 					    bus, NULL, busuid, busgid);
+ 	if (bus->usbfs_dentry == NULL) {
+-		err ("error creating usbfs bus entry");
++		printk(KERN_ERR "Error creating usbfs bus entry\n");
+ 		return;
+ 	}
+ }
+@@ -696,7 +696,7 @@ static void usbfs_add_device(struct usb_
+ 					    &usbdev_file_operations,
+ 					    devuid, devgid);
+ 	if (dev->usbfs_dentry == NULL) {
+-		err ("error creating usbfs device entry");
++		printk(KERN_ERR "Error creating usbfs device entry\n");
+ 		return;
+ 	}
+ 
+--- a/drivers/usb/core/urb.c
++++ b/drivers/usb/core/urb.c
+@@ -70,7 +70,7 @@ struct urb *usb_alloc_urb(int iso_packet
+ 		iso_packets * sizeof(struct usb_iso_packet_descriptor),
+ 		mem_flags);
+ 	if (!urb) {
+-		err("alloc_urb: kmalloc failed");
++		printk(KERN_ERR "alloc_urb: kmalloc failed\n");
+ 		return NULL;
+ 	}
+ 	usb_init_urb(urb);
+@@ -407,7 +407,7 @@ int usb_submit_urb(struct urb *urb, gfp_
+ 
+ 	/* fail if submitter gave bogus flags */
+ 	if (urb->transfer_flags != orig_flags) {
+-		err("BOGUS urb flags, %x --> %x",
++		dev_err(&dev->dev, "BOGUS urb flags, %x --> %x\n",
+ 			orig_flags, urb->transfer_flags);
+ 		return -EINVAL;
+ 	}
+--- a/drivers/usb/host/isp1760-if.c
++++ b/drivers/usb/host/isp1760-if.c
+@@ -218,7 +218,7 @@ static int __devinit isp1761_pci_probe(s
+ 	 * and reading back and checking the contents are same or not
+ 	 */
+ 	if (reg_data != 0xFACE) {
+-		err("scratch register mismatch %x", reg_data);
++		dev_err(&dev->dev, "scratch register mismatch %x\n", reg_data);
+ 		goto clean;
+ 	}
+ 
+--- a/drivers/usb/host/r8a66597-hcd.c
++++ b/drivers/usb/host/r8a66597-hcd.c
+@@ -118,7 +118,7 @@ static int r8a66597_clock_enable(struct 
+ 		r8a66597_write(r8a66597, SCKE, SYSCFG0);
+ 		tmp = r8a66597_read(r8a66597, SYSCFG0);
+ 		if (i++ > 1000) {
+-			err("register access fail.");
++			printk(KERN_ERR "r8a66597: register access fail.\n");
+ 			return -ENXIO;
+ 		}
+ 	} while ((tmp & SCKE) != SCKE);
+@@ -128,7 +128,7 @@ static int r8a66597_clock_enable(struct 
+ 		r8a66597_write(r8a66597, USBE, SYSCFG0);
+ 		tmp = r8a66597_read(r8a66597, SYSCFG0);
+ 		if (i++ > 1000) {
+-			err("register access fail.");
++			printk(KERN_ERR "r8a66597: register access fail.\n");
+ 			return -ENXIO;
+ 		}
+ 	} while ((tmp & USBE) != USBE);
+@@ -141,7 +141,7 @@ static int r8a66597_clock_enable(struct 
+ 		msleep(1);
+ 		tmp = r8a66597_read(r8a66597, SYSCFG0);
+ 		if (i++ > 500) {
+-			err("register access fail.");
++			printk(KERN_ERR "r8a66597: register access fail.\n");
+ 			return -ENXIO;
+ 		}
+ 	} while ((tmp & SCKE) != SCKE);
+@@ -265,7 +265,7 @@ static void get_port_number(char *devpat
+ 	if (root_port) {
+ 		*root_port = (devpath[0] & 0x0F) - 1;
+ 		if (*root_port >= R8A66597_MAX_ROOT_HUB)
+-			err("illegal root port number");
++			printk(KERN_ERR "r8a66597: Illegal root port number.\n");
+ 	}
+ 	if (hub_port)
+ 		*hub_port = devpath[2] & 0x0F;
+@@ -286,7 +286,7 @@ static u16 get_r8a66597_usb_speed(enum u
+ 		usbspd = HSMODE;
+ 		break;
+ 	default:
+-		err("unknown speed");
++		printk(KERN_ERR "r8a66597: unknown speed\n");
+ 		break;
+ 	}
+ 
+@@ -385,7 +385,7 @@ static u8 alloc_usb_address(struct r8a66
+ 	struct r8a66597_device *dev;
+ 
+ 	if (is_hub_limit(urb->dev->devpath)) {
+-		err("Externel hub limit reached.");
++		dev_err(&urb->dev->dev, "External hub limit reached.\n");
+ 		return 0;
+ 	}
+ 
+@@ -406,8 +406,9 @@ static u8 alloc_usb_address(struct r8a66
+ 		return addr;
+ 	}
+ 
+-	err("cannot communicate with a USB device more than 10.(%x)",
+-	    r8a66597->address_map);
++	dev_err(&urb->dev->dev,
++		"cannot communicate with a USB device more than 10.(%x)\n",
++		r8a66597->address_map);
+ 
+ 	return 0;
+ }
+@@ -447,7 +448,8 @@ static void r8a66597_reg_wait(struct r8a
+ 	do {
+ 		tmp = r8a66597_read(r8a66597, reg);
+ 		if (i++ > 1000000) {
+-			err("register%lx, loop %x is timeout", reg, loop);
++			printk(KERN_ERR "r8a66597: register%lx, loop %x "
++			       "is timeout\n", reg, loop);
+ 			break;
+ 		}
+ 		ndelay(1);
+@@ -675,7 +677,7 @@ static u16 get_empty_pipenum(struct r8a6
+ 			array[i++] = 1;
+ 		break;
+ 	default:
+-		err("Illegal type");
++		printk(KERN_ERR "r8a66597: Illegal type\n");
+ 		return 0;
+ 	}
+ 
+@@ -705,7 +707,7 @@ static u16 get_r8a66597_type(__u8 type)
+ 		r8a66597_type = R8A66597_ISO;
+ 		break;
+ 	default:
+-		err("Illegal type");
++		printk(KERN_ERR "r8a66597: Illegal type\n");
+ 		r8a66597_type = 0x0000;
+ 		break;
+ 	}
+@@ -724,7 +726,7 @@ static u16 get_bufnum(u16 pipenum)
+ 	else if (check_interrupt(pipenum))
+ 		bufnum = 4 + (pipenum - 6);
+ 	else
+-		err("Illegal pipenum (%d)", pipenum);
++		printk(KERN_ERR "r8a66597: Illegal pipenum (%d)\n", pipenum);
+ 
+ 	return bufnum;
+ }
+@@ -740,7 +742,7 @@ static u16 get_buf_bsize(u16 pipenum)
+ 	else if (check_interrupt(pipenum))
+ 		buf_bsize = 0;
+ 	else
+-		err("Illegal pipenum (%d)", pipenum);
++		printk(KERN_ERR "r8a66597: Illegal pipenum (%d)\n", pipenum);
+ 
+ 	return buf_bsize;
+ }
+@@ -1189,7 +1191,7 @@ static int start_transfer(struct r8a6659
+ 		prepare_status_packet(r8a66597, td);
+ 		break;
+ 	default:
+-		err("invalid type.");
++		printk(KERN_ERR "r8a66597: invalid type.\n");
+ 		break;
+ 	}
+ 
+@@ -1297,7 +1299,7 @@ static void packet_read(struct r8a66597 
+ 	if (unlikely((tmp & FRDY) == 0)) {
+ 		pipe_stop(r8a66597, td->pipe);
+ 		pipe_irq_disable(r8a66597, pipenum);
+-		err("in fifo not ready (%d)", pipenum);
++		printk(KERN_ERR "r8a66597: in fifo not ready (%d)\n", pipenum);
+ 		finish_request(r8a66597, td, pipenum, td->urb, -EPIPE);
+ 		return;
+ 	}
+@@ -1372,7 +1374,7 @@ static void packet_write(struct r8a66597
+ 	if (unlikely((tmp & FRDY) == 0)) {
+ 		pipe_stop(r8a66597, td->pipe);
+ 		pipe_irq_disable(r8a66597, pipenum);
+-		err("out write fifo not ready. (%d)", pipenum);
++		printk(KERN_ERR "r8a66597: out fifo not ready (%d)\n", pipenum);
+ 		finish_request(r8a66597, td, pipenum, urb, -EPIPE);
+ 		return;
+ 	}
+@@ -2007,7 +2009,7 @@ static struct r8a66597_device *get_r8a66
+ 		return dev;
+ 	}
+ 
+-	err("get_r8a66597_device fail.(%d)\n", addr);
++	printk(KERN_ERR "r8a66597: get_r8a66597_device fail.(%d)\n", addr);
+ 	return NULL;
+ }
+ 
+@@ -2276,7 +2278,7 @@ static int __init r8a66597_probe(struct 
+ 
+ 	if (pdev->dev.dma_mask) {
+ 		ret = -EINVAL;
+-		err("dma not support");
++		dev_err(&pdev->dev, "dma not supported\n");
+ 		goto clean_up;
+ 	}
+ 
+@@ -2284,14 +2286,15 @@ static int __init r8a66597_probe(struct 
+ 					   (char *)hcd_name);
+ 	if (!res) {
+ 		ret = -ENODEV;
+-		err("platform_get_resource_byname error.");
++		dev_err(&pdev->dev, "platform_get_resource_byname error.\n");
+ 		goto clean_up;
+ 	}
+ 
+ 	ires = platform_get_resource(pdev, IORESOURCE_IRQ, 0);
+ 	if (!ires) {
+ 		ret = -ENODEV;
+-		err("platform_get_resource IORESOURCE_IRQ error.");
++		dev_err(&pdev->dev,
++			"platform_get_resource IORESOURCE_IRQ error.\n");
+ 		goto clean_up;
+ 	}
+ 
+@@ -2301,7 +2304,7 @@ static int __init r8a66597_probe(struct 
+ 	reg = ioremap(res->start, resource_len(res));
+ 	if (reg == NULL) {
+ 		ret = -ENOMEM;
+-		err("ioremap error.");
++		dev_err(&pdev->dev, "ioremap error.\n");
+ 		goto clean_up;
+ 	}
+ 
+@@ -2309,7 +2312,7 @@ static int __init r8a66597_probe(struct 
+ 	hcd = usb_create_hcd(&r8a66597_hc_driver, &pdev->dev, (char *)hcd_name);
+ 	if (!hcd) {
+ 		ret = -ENOMEM;
+-		err("Failed to create hcd");
++		dev_err(&pdev->dev, "Failed to create hcd\n");
+ 		goto clean_up;
+ 	}
+ 	r8a66597 = hcd_to_r8a66597(hcd);
+@@ -2355,12 +2358,12 @@ static int __init r8a66597_probe(struct 
+ 			}
+ 			break;
+ 		default:
+-			err("Unknown irq_sense value.");
++			dev_err(&pdev->dev, "Unknown irq_sense value.\n");
+ 	}
+ 
+ 	ret = usb_add_hcd(hcd, irq, IRQF_DISABLED | irq_trigger);
+ 	if (ret != 0) {
+-		err("Failed to add hcd");
++		dev_err(&pdev->dev, "Failed to add hcd\n");
+ 		goto clean_up;
+ 	}
+ 
+--- a/drivers/usb/image/mdc800.c
++++ b/drivers/usb/image/mdc800.c
+@@ -355,7 +355,7 @@ static int mdc800_usb_waitForIRQ (int mo
+ 	if (mdc800->camera_request_ready>0)
+ 	{
+ 		mdc800->camera_request_ready=0;
+-		err ("timeout waiting for camera.");
++		dev_err(&mdc800->dev->dev, "timeout waiting for camera.\n");
+ 		return -1;
+ 	}
+ 	
+@@ -380,7 +380,8 @@ static void mdc800_usb_write_notify (str
+ 	int status = urb->status;
+ 
+ 	if (status != 0)
+-		err ("writing command fails (status=%i)", status);
++		dev_err(&mdc800->dev->dev,
++			"writing command fails (status=%i)\n", status);
+ 	else
+ 		mdc800->state=READY;
+ 	mdc800->written = 1;
+@@ -407,7 +408,8 @@ static void mdc800_usb_download_notify (
+ 			mdc800->state=READY;
+ 		}
+ 	} else {
+-		err ("request bytes fails (status:%i)", status);
++		dev_err(&mdc800->dev->dev,
++			"request bytes fails (status:%i)\n", status);
+ 	}
+ 	mdc800->downloaded = 1;
+ 	wake_up (&mdc800->download_wait);
+@@ -450,7 +452,8 @@ static int mdc800_usb_probe (struct usb_
+ 
+ 	if (dev->descriptor.bNumConfigurations != 1)
+ 	{
+-		err ("probe fails -> wrong Number of Configuration");
++		dev_err(&intf->dev,
++			"probe fails -> wrong Number of Configuration\n");
+ 		return -ENODEV;
+ 	}
+ 	intf_desc = intf->cur_altsetting;
+@@ -462,7 +465,7 @@ static int mdc800_usb_probe (struct usb_
+ 		|| ( intf_desc->desc.bNumEndpoints != 4)
+ 	)
+ 	{
+-		err ("probe fails -> wrong Interface");
++		dev_err(&intf->dev, "probe fails -> wrong Interface\n");
+ 		return -ENODEV;
+ 	}
+ 
+@@ -483,7 +486,7 @@ static int mdc800_usb_probe (struct usb_
+ 		}
+ 		if (mdc800->endpoint[i] == -1)
+ 		{
+-			err ("probe fails -> Wrong Endpoints.");
++			dev_err(&intf->dev, "probe fails -> Wrong Endpoints.\n");
+ 			return -ENODEV;
+ 		}
+ 	}
+@@ -495,7 +498,7 @@ static int mdc800_usb_probe (struct usb_
+ 
+ 	retval = usb_register_dev(intf, &mdc800_class);
+ 	if (retval) {
+-		err ("Not able to get a minor for this device.");
++		dev_err(&intf->dev, "Not able to get a minor for this device.\n");
+ 		return -ENODEV;
+ 	}
+ 
+@@ -645,7 +648,8 @@ static int mdc800_device_open (struct in
+ 	mdc800->irq_urb->dev = mdc800->dev;
+ 	retval = usb_submit_urb (mdc800->irq_urb, GFP_KERNEL);
+ 	if (retval) {
+-		err ("request USB irq fails (submit_retval=%i).", retval);
++		dev_err(&mdc800->dev->dev,
++			"request USB irq fails (submit_retval=%i).\n", retval);
+ 		errn = -EIO;
+ 		goto error_out;
+ 	}
+@@ -735,7 +739,9 @@ static ssize_t mdc800_device_read (struc
+ 				mdc800->download_urb->dev = mdc800->dev;
+ 				retval = usb_submit_urb (mdc800->download_urb, GFP_KERNEL);
+ 				if (retval) {
+-					err ("Can't submit download urb (retval=%i)",retval);
++					dev_err(&mdc800->dev->dev,
++						"Can't submit download urb "
++						"(retval=%i)\n", retval);
+ 					mutex_unlock(&mdc800->io_lock);
+ 					return len-left;
+ 				}
+@@ -744,7 +750,10 @@ static ssize_t mdc800_device_read (struc
+ 				mdc800->downloaded = 0;
+ 				if (mdc800->download_urb->status != 0)
+ 				{
+-					err ("request download-bytes fails (status=%i)",mdc800->download_urb->status);
++					dev_err(&mdc800->dev->dev,
++						"request download-bytes fails "
++						"(status=%i)\n",
++						mdc800->download_urb->status);
+ 					mutex_unlock(&mdc800->io_lock);
+ 					return len-left;
+ 				}
+@@ -841,7 +850,8 @@ static ssize_t mdc800_device_write (stru
+ 
+ 			if (mdc800_usb_waitForIRQ (0,TO_GET_READY))
+ 			{
+-				err ("Camera didn't get ready.\n");
++				dev_err(&mdc800->dev->dev,
++					"Camera didn't get ready.\n");
+ 				mutex_unlock(&mdc800->io_lock);
+ 				return -EIO;
+ 			}
+@@ -853,7 +863,9 @@ static ssize_t mdc800_device_write (stru
+ 			mdc800->write_urb->dev = mdc800->dev;
+ 			retval = usb_submit_urb (mdc800->write_urb, GFP_KERNEL);
+ 			if (retval) {
+-				err ("submitting write urb fails (retval=%i)", retval);
++				dev_err(&mdc800->dev->dev,
++					"submitting write urb fails "
++					"(retval=%i)\n", retval);
+ 				mutex_unlock(&mdc800->io_lock);
+ 				return -EIO;
+ 			}
+@@ -872,7 +884,9 @@ static ssize_t mdc800_device_write (stru
+ 				case 0x3e: /* Take shot in Fine Mode (WCam Mode) */
+ 					if (mdc800->pic_len < 0)
+ 					{
+-						err ("call 0x07 before 0x05,0x3e");
++						dev_err(&mdc800->dev->dev,
++							"call 0x07 before "
++							"0x05,0x3e\n");
+ 						mdc800->state=READY;
+ 						mutex_unlock(&mdc800->io_lock);
+ 						return -EIO;
+@@ -892,7 +906,7 @@ static ssize_t mdc800_device_write (stru
+ 
+ 						if (mdc800_usb_waitForIRQ (1,TO_READ_FROM_IRQ))
+ 						{
+-							err ("requesting answer from irq fails");
++							dev_err(&mdc800->dev->dev, "requesting answer from irq fails\n");
+ 							mutex_unlock(&mdc800->io_lock);
+ 							return -EIO;
+ 						}
+@@ -920,7 +934,7 @@ static ssize_t mdc800_device_write (stru
+ 					{
+ 						if (mdc800_usb_waitForIRQ (0,TO_DEFAULT_COMMAND))
+ 						{
+-							err ("Command Timeout.");
++							dev_err(&mdc800->dev->dev, "Command Timeout.\n");
+ 							mutex_unlock(&mdc800->io_lock);
+ 							return -EIO;
+ 						}
+@@ -1031,7 +1045,7 @@ cleanup_on_fail:
+ 
+ 	if (mdc800 != NULL)
+ 	{
+-		err ("can't alloc memory!");
++		printk(KERN_ERR "mdc800: can't alloc memory!\n");
+ 
+ 		kfree(mdc800->download_urb_buffer);
+ 		kfree(mdc800->write_urb_buffer);
+--- a/drivers/usb/misc/adutux.c
++++ b/drivers/usb/misc/adutux.c
+@@ -283,8 +283,8 @@ static int adu_open(struct inode *inode,
+ 
+ 	interface = usb_find_interface(&adu_driver, subminor);
+ 	if (!interface) {
+-		err("%s - error, can't find device for minor %d",
+-		    __func__, subminor);
++		printk(KERN_ERR "adutux: %s - error, can't find device for "
++		       "minor %d\n", __func__, subminor);
+ 		retval = -ENODEV;
+ 		goto exit_no_device;
+ 	}
+@@ -416,7 +416,8 @@ static ssize_t adu_read(struct file *fil
+ 	/* verify that the device wasn't unplugged */
+ 	if (dev->udev == NULL) {
+ 		retval = -ENODEV;
+-		err("No device or device unplugged %d", retval);
++		printk(KERN_ERR "adutux: No device or device unplugged %d\n",
++		       retval);
+ 		goto exit;
+ 	}
+ 
+@@ -576,7 +577,8 @@ static ssize_t adu_write(struct file *fi
+ 	/* verify that the device wasn't unplugged */
+ 	if (dev->udev == NULL) {
+ 		retval = -ENODEV;
+-		err("No device or device unplugged %d", retval);
++		printk(KERN_ERR "adutux: No device or device unplugged %d\n",
++		       retval);
+ 		goto exit;
+ 	}
+ 
+@@ -645,7 +647,8 @@ static ssize_t adu_write(struct file *fi
+ 			retval = usb_submit_urb(dev->interrupt_out_urb, GFP_KERNEL);
+ 			if (retval < 0) {
+ 				dev->out_urb_finished = 1;
+-				err("Couldn't submit interrupt_out_urb %d", retval);
++				dev_err(&dev->udev->dev, "Couldn't submit "
++					"interrupt_out_urb %d\n", retval);
+ 				goto exit;
+ 			}
+ 
+@@ -890,8 +893,8 @@ static int __init adu_init(void)
+ 	/* register this driver with the USB subsystem */
+ 	result = usb_register(&adu_driver);
+ 	if (result < 0) {
+-		err("usb_register failed for the "__FILE__" driver. "
+-		    "Error number %d", result);
++		printk(KERN_ERR "usb_register failed for the "__FILE__
++		       " driver. Error number %d\n", result);
+ 		goto exit;
+ 	}
+ 
+--- a/drivers/usb/serial/aircable.c
++++ b/drivers/usb/serial/aircable.c
+@@ -220,8 +220,8 @@ static void aircable_send(struct usb_ser
+ 
+ 	buf = kzalloc(count + HCI_HEADER_LENGTH, GFP_ATOMIC);
+ 	if (!buf) {
+-		err("%s- kzalloc(%d) failed.", __func__,
+-		    count + HCI_HEADER_LENGTH);
++		dev_err(&port->dev, "%s- kzalloc(%d) failed.\n",
++			__func__, count + HCI_HEADER_LENGTH);
+ 		return;
+ 	}
+ 
+@@ -276,7 +276,7 @@ static void aircable_read(struct work_st
+ 
+ 	if (!tty) {
+ 		schedule_work(&priv->rx_work);
+-		err("%s - No tty available", __func__);
++		dev_err(&port->dev, "%s - No tty available\n", __func__);
+ 		return ;
+ 	}
+ 
+@@ -287,7 +287,8 @@ static void aircable_read(struct work_st
+ 
+ 	tty_prepare_flip_string(tty, &data, count);
+ 	if (!data) {
+-		err("%s- kzalloc(%d) failed.", __func__, count);
++		dev_err(&port->dev, "%s- kzalloc(%d) failed.\n",
++			__func__, count);
+ 		return;
+ 	}
+ 
+@@ -334,7 +335,7 @@ static int aircable_attach(struct usb_se
+ 
+ 	priv = kzalloc(sizeof(struct aircable_private), GFP_KERNEL);
+ 	if (!priv) {
+-		err("%s- kmalloc(%Zd) failed.", __func__,
++		dev_err(&port->dev, "%s- kmalloc(%Zd) failed.\n", __func__,
+ 			sizeof(struct aircable_private));
+ 		return -ENOMEM;
+ 	}
+--- a/drivers/usb/serial/ezusb.c
++++ b/drivers/usb/serial/ezusb.c
+@@ -28,7 +28,8 @@ int ezusb_writememory(struct usb_serial 
+ 
+ 	/* dbg("ezusb_writememory %x, %d", address, length); */
+ 	if (!serial->dev) {
+-		err("%s - no physical device present, failing.", __func__);
++		printk(KERN_ERR "ezusb: %s - no physical device present, "
++		       "failing.\n", __func__);
+ 		return -ENODEV;
+ 	}
+ 
+--- a/drivers/usb/serial/usb-serial.c
++++ b/drivers/usb/serial/usb-serial.c
+@@ -1113,7 +1113,8 @@ static int __init usb_serial_init(void)
+ 
+ 	result = bus_register(&usb_serial_bus_type);
+ 	if (result) {
+-		err("%s - registering bus driver failed", __func__);
++		printk(KERN_ERR "usb-serial: %s - registering bus driver "
++		       "failed\n", __func__);
+ 		goto exit_bus;
+ 	}
+ 
+@@ -1134,21 +1135,24 @@ static int __init usb_serial_init(void)
+ 	tty_set_operations(usb_serial_tty_driver, &serial_ops);
+ 	result = tty_register_driver(usb_serial_tty_driver);
+ 	if (result) {
+-		err("%s - tty_register_driver failed", __func__);
++		printk(KERN_ERR "usb-serial: %s - tty_register_driver failed\n",
++		       __func__);
+ 		goto exit_reg_driver;
+ 	}
+ 
+ 	/* register the USB driver */
+ 	result = usb_register(&usb_serial_driver);
+ 	if (result < 0) {
+-		err("%s - usb_register failed", __func__);
++		printk(KERN_ERR "usb-serial: %s - usb_register failed\n",
++		       __func__);
+ 		goto exit_tty;
+ 	}
+ 
+ 	/* register the generic driver, if we should */
+ 	result = usb_serial_generic_register(debug);
+ 	if (result < 0) {
+-		err("%s - registering generic driver failed", __func__);
++		printk(KERN_ERR "usb-serial: %s - registering generic "
++		       "driver failed\n", __func__);
+ 		goto exit_generic;
+ 	}
+ 
+@@ -1166,7 +1170,8 @@ exit_reg_driver:
+ 	bus_unregister(&usb_serial_bus_type);
+ 
+ exit_bus:
+-	err("%s - returning with error %d", __func__, result);
++	printk(KERN_ERR "usb-serial: %s - returning with error %d\n",
++	       __func__, result);
+ 	put_tty_driver(usb_serial_tty_driver);
+ 	return result;
+ }
+@@ -1225,8 +1230,8 @@ int usb_serial_register(struct usb_seria
+ 
+ 	retval = usb_serial_bus_register(driver);
+ 	if (retval) {
+-		err("problem %d when registering driver %s",
+-						retval, driver->description);
++		printk(KERN_ERR "usb-serial: problem %d when registering "
++		       "driver %s\n", retval, driver->description);
+ 		list_del(&driver->driver_list);
+ 	} else
+ 		printk(KERN_INFO "USB Serial support registered for %s\n",
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -1715,9 +1715,6 @@ extern void usb_unregister_notify(struct
+ #define dbg(format, arg...) do {} while (0)
+ #endif
+ 
+-#define err(format, arg...) printk(KERN_ERR KBUILD_MODNAME ": " \
+-	format "\n" , ## arg)
+-
+ #endif  /* __KERNEL__ */
+ 
+ #endif
