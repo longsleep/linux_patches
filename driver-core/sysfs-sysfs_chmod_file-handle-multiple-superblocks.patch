@@ -1,0 +1,92 @@
+From ebiederm@xmission.com Thu Jul  3 18:21:56 2008
+From: Eric W. Biederman <ebiederm@xmission.com>
+Date: Thu, 03 Jul 2008 18:13:05 -0700
+Subject: sysfs: sysfs_chmod_file handle multiple superblocks
+To: Greg Kroah-Hartman <gregkh@suse.de>, Andrew Morton <akpm@linux-foundation.org>
+Cc: Tejun Heo <htejun@gmail.com>, Daniel Lezcano <dlezcano@fr.ibm.com>, linux-kernel@vger.kernel.org, Al Viro <viro@ftp.linux.org.uk>, Linux Containers <containers@lists.osdl.org>, Benjamin Thery <benjamin.thery@bull.net>, <netdev@vger.kernel.org>
+Message-ID: <m14p76ih9a.fsf_-_@frodo.ebiederm.org>
+
+
+From: Eric W. Biederman <ebiederm@xmission.com>
+
+Teach sysfs_chmod_file how to handle multiple sysfs superblocks.
+Since we only have one inode per sd the only thing we have to deal
+with is multiple dentries for sending fs notifications.  This might
+dup the inode notifications oh well.
+
+Signed-off-by: Eric W. Biederman <ebiederm@xmission.com>
+Acked-by: Tejun Heo <tj@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ fs/sysfs/file.c |   39 +++++++++++++++++++++++++--------------
+ 1 file changed, 25 insertions(+), 14 deletions(-)
+
+--- a/fs/sysfs/file.c
++++ b/fs/sysfs/file.c
+@@ -578,8 +578,8 @@ EXPORT_SYMBOL_GPL(sysfs_add_file_to_grou
+ int sysfs_chmod_file(struct kobject *kobj, struct attribute *attr, mode_t mode)
+ {
+ 	struct sysfs_dirent *victim_sd = NULL;
+-	struct dentry *victim = NULL;
+-	struct inode * inode;
++	struct super_block *sb;
++	struct inode * inode = NULL;
+ 	struct iattr newattrs;
+ 	int rc;
+ 
+@@ -588,31 +588,42 @@ int sysfs_chmod_file(struct kobject *kob
+ 	if (!victim_sd)
+ 		goto out;
+ 
+-	mutex_lock(&sysfs_rename_mutex);
+-	victim = sysfs_get_dentry(sysfs_sb, victim_sd);
+-	mutex_unlock(&sysfs_rename_mutex);
+-	if (IS_ERR(victim)) {
+-		rc = PTR_ERR(victim);
+-		victim = NULL;
+-		goto out;
+-	}
+-
+-	inode = victim->d_inode;
++	rc = -ENOENT;
++	mutex_lock(&sysfs_mutex);
++	inode = sysfs_get_inode(victim_sd);
++	mutex_unlock(&sysfs_mutex);
++	if (!inode)
++ 		goto out;
+ 
++	mutex_lock(&sysfs_rename_mutex);
++	sysfs_grab_supers();
+ 	mutex_lock(&inode->i_mutex);
+ 
+ 	newattrs.ia_mode = (mode & S_IALLUGO) | (inode->i_mode & ~S_IALLUGO);
+ 	newattrs.ia_valid = ATTR_MODE | ATTR_CTIME;
+ 	newattrs.ia_ctime = current_fs_time(inode->i_sb);
+ 	rc = sysfs_sd_setattr(victim_sd, inode, &newattrs);
++	if (rc)
++		goto out_unlock;
++
++	list_for_each_entry(sb, &sysfs_fs_type.fs_supers, s_instances) {
++		/* Ignore it when the dentry does not exist on the
++		 * target superblock.
++		 */
++		struct dentry *	victim = sysfs_get_dentry(sb, victim_sd);
++		if (IS_ERR(victim))
++			continue;
+ 
+-	if (rc == 0) {
+ 		fsnotify_change(victim, newattrs.ia_valid);
++		dput(victim);
+ 	}
+ 
++ out_unlock:
+ 	mutex_unlock(&inode->i_mutex);
++	sysfs_release_supers();
++	mutex_unlock(&sysfs_rename_mutex);
+  out:
+-	dput(victim);
++	iput(inode);
+ 	sysfs_put(victim_sd);
+ 	return rc;
+ }
