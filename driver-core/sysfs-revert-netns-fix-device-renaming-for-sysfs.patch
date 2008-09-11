@@ -1,0 +1,97 @@
+From ebiederm@xmission.com  Thu Sep 11 04:23:39 2008
+From: Eric W. Biederman <ebiederm@xmission.com>
+Date: Wed, 20 Aug 2008 23:38:31 -0700
+Subject: sysfs: Revert "netns: Fix device renaming for sysfs"
+To: Greg KH <greg@kroah.com>
+Cc: Greg Kroah-Hartman <gregkh@suse.de>, Andrew Morton <akpm@linux-foundation.org>, Tejun Heo <htejun@gmail.com>, Daniel Lezcano <dlezcano@fr.ibm.com>, Al Viro <viro@ftp.linux.org.uk>, Benjamin Thery <benjamin.thery@bull.net>
+Message-ID: <m1vdxuzxco.fsf_-_@frodo.ebiederm.org>
+
+From: Eric W. Biederman <ebiederm@xmission.com>
+
+This reverts commit aaf8cdc34ddba08122f02217d9d684e2f9f5d575.
+
+Drivers like the ipw2100 call device_create_group when they
+are initialized and device_remove_group when they are shutdown.
+Moving them between namespaces deletes their sysfs groups early.
+
+In particular the following call chain results.
+netdev_unregister_kobject -> device_del -> kobject_del -> sysfs_remove_dir
+With sysfs_remove_dir recursively deleting all of it's subdirectories,
+and nothing adding them back.
+
+Ouch!
+
+Therefore we need to call something that ultimate calls sysfs_mv_dir
+as that sysfs function can move sysfs directories between namespaces
+without deleting their subdirectories or their contents.   Allowing
+us to avoid placing extra boiler plate into every driver that does
+something interesting with sysfs.
+
+Currently the function that provides that capability is device_rename.
+That is the code works without nasty side effects as originally written.
+
+So remove the misguided fix for moving devices between namespaces.  The
+bug in the kobject layer that inspired it has now been recognized and
+fixed.
+
+Signed-off-by: Eric W. Biederman <ebiederm@xmission.com>
+Acked-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ net/core/dev.c       |    4 +---
+ net/core/net-sysfs.c |    7 +------
+ net/core/net-sysfs.h |    1 -
+ 3 files changed, 2 insertions(+), 10 deletions(-)
+
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -4005,7 +4005,6 @@ int register_netdevice(struct net_device
+ 	if (dev->features & NETIF_F_SG)
+ 		dev->features |= NETIF_F_GSO;
+ 
+-	netdev_initialize_kobject(dev);
+ 	ret = netdev_register_kobject(dev);
+ 	if (ret)
+ 		goto err_uninit;
+@@ -4467,8 +4466,7 @@ int dev_change_net_namespace(struct net_
+ 	}
+ 
+ 	/* Fixup kobjects */
+-	netdev_unregister_kobject(dev);
+-	err = netdev_register_kobject(dev);
++	err = device_rename(&dev->dev, dev->name);
+ 	WARN_ON(err);
+ 
+ 	/* Add the device back in the hashes */
+--- a/net/core/net-sysfs.c
++++ b/net/core/net-sysfs.c
+@@ -449,6 +449,7 @@ int netdev_register_kobject(struct net_d
+ 	struct device *dev = &(net->dev);
+ 	struct attribute_group **groups = net->sysfs_groups;
+ 
++	device_initialize(dev);
+ 	dev->class = &net_class;
+ 	dev->platform_data = net;
+ 	dev->groups = groups;
+@@ -481,12 +482,6 @@ void netdev_class_remove_file(struct cla
+ EXPORT_SYMBOL(netdev_class_create_file);
+ EXPORT_SYMBOL(netdev_class_remove_file);
+ 
+-void netdev_initialize_kobject(struct net_device *net)
+-{
+-	struct device *device = &(net->dev);
+-	device_initialize(device);
+-}
+-
+ int netdev_kobject_init(void)
+ {
+ 	return class_register(&net_class);
+--- a/net/core/net-sysfs.h
++++ b/net/core/net-sysfs.h
+@@ -4,5 +4,4 @@
+ int netdev_kobject_init(void);
+ int netdev_register_kobject(struct net_device *);
+ void netdev_unregister_kobject(struct net_device *);
+-void netdev_initialize_kobject(struct net_device *);
+ #endif

@@ -1,0 +1,205 @@
+From ebiederm@xmission.com  Thu Sep 11 04:21:54 2008
+From: Eric W. Biederman <ebiederm@xmission.com>
+Date: Wed, 20 Aug 2008 23:37:55 -0700
+Subject: driver core: Implement tagged directory support for device classes.
+To: Greg KH <greg@kroah.com>
+Cc: Greg Kroah-Hartman <gregkh@suse.de>, Andrew Morton <akpm@linux-foundation.org>, Tejun Heo <htejun@gmail.com>, Daniel Lezcano <dlezcano@fr.ibm.com>, Al Viro <viro@ftp.linux.org.uk>, Benjamin Thery <benjamin.thery@bull.net>
+Message-ID: <m1zln6zxdo.fsf_-_@frodo.ebiederm.org>
+
+From: Eric W. Biederman <ebiederm@xmission.com>
+
+This patch enables tagging on every class directory if struct class
+has a tag_type.
+
+In addition device_del and device_rename were modified to use
+sysfs_delete_link and sysfs_rename_link respectively to ensure
+when these operations happen on devices whose classes have
+tag_ops that they work properly.
+
+Signed-off-by: Eric W. Biederman <ebiederm@xmission.com>
+Signed-off-by: Benjamin Thery <benjamin.thery@bull.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/base/class.c   |   30 ++++++++++++++++++++++----
+ drivers/base/core.c    |   56 ++++++++++++++++++++++++++++++-------------------
+ include/linux/device.h |    3 ++
+ 3 files changed, 64 insertions(+), 25 deletions(-)
+
+--- a/drivers/base/class.c
++++ b/drivers/base/class.c
+@@ -135,6 +135,17 @@ static void remove_class_attrs(struct cl
+ 	}
+ }
+ 
++static int class_setup_tagging(struct class *cls)
++{
++	enum sysfs_tag_type type;
++
++	type = cls->tag_type;
++	if (type == SYSFS_TAG_TYPE_NONE)
++		return 0;
++
++	return sysfs_make_tagged_dir(&cls->p->class_subsys.kobj, type);
++}
++
+ int __class_register(struct class *cls, struct lock_class_key *key)
+ {
+ 	struct class_private *cp;
+@@ -171,13 +182,24 @@ int __class_register(struct class *cls, 
+ 	cls->p = cp;
+ 
+ 	error = kset_register(&cp->class_subsys);
+-	if (error) {
+-		kfree(cp);
+-		return error;
+-	}
++	if (error)
++		goto out_free_cp;
++
++	error = class_setup_tagging(cls);
++	if (error)
++		goto out_unregister;
++
+ 	error = add_class_attrs(class_get(cls));
+ 	class_put(cls);
++	if (error)
++		goto out_unregister;
++out:
+ 	return error;
++out_unregister:
++	kset_unregister(&cp->class_subsys);
++out_free_cp:
++	kfree(cp);
++	goto out;
+ }
+ EXPORT_SYMBOL_GPL(__class_register);
+ 
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@ -122,9 +122,21 @@ static void device_release(struct kobjec
+ 			dev->bus_id);
+ }
+ 
++static const void *device_sysfs_tag(struct kobject *kobj)
++{
++	struct device *dev = to_dev(kobj);
++	const void *tag = NULL;
++
++	if (dev->class && dev->class->tag_type)
++		tag = dev->class->sysfs_tag(dev);
++
++	return tag;
++}
++
+ static struct kobj_type device_ktype = {
+ 	.release	= device_release,
+ 	.sysfs_ops	= &dev_sysfs_ops,
++	.sysfs_tag	= device_sysfs_tag,
+ };
+ 
+ 
+@@ -622,6 +634,10 @@ static struct kobject *get_device_parent
+ 			kobject_put(k);
+ 			return NULL;
+ 		}
++		/* If we created a new class-directory setup tagging */
++		if (dev->class->tag_type)
++			sysfs_make_tagged_dir(k, dev->class->tag_type);
++
+ 		/* do not emit an uevent for this simple "glue" directory */
+ 		return k;
+ 	}
+@@ -712,7 +728,7 @@ out_device:
+ out_busid:
+ 	if (dev->kobj.parent != &dev->class->p->class_subsys.kobj &&
+ 	    device_is_not_partition(dev))
+-		sysfs_remove_link(&dev->class->p->class_subsys.kobj,
++		sysfs_delete_link(&dev->class->p->class_subsys.kobj, &dev->kobj,
+ 				  dev->bus_id);
+ #else
+ 	/* link in the class directory pointing to the device */
+@@ -730,7 +746,7 @@ out_busid:
+ 	return 0;
+ 
+ out_busid:
+-	sysfs_remove_link(&dev->class->p->class_subsys.kobj, dev->bus_id);
++	sysfs_delete_link(&dev->class->p->class_subsys.kobj, &dev->kobj, dev->bus_id);
+ #endif
+ 
+ out_subsys:
+@@ -758,13 +774,13 @@ static void device_remove_class_symlinks
+ 
+ 	if (dev->kobj.parent != &dev->class->p->class_subsys.kobj &&
+ 	    device_is_not_partition(dev))
+-		sysfs_remove_link(&dev->class->p->class_subsys.kobj,
++		sysfs_delete_link(&dev->class->p->class_subsys.kobj, &dev->kobj,
+ 				  dev->bus_id);
+ #else
+ 	if (dev->parent && device_is_not_partition(dev))
+ 		sysfs_remove_link(&dev->kobj, "device");
+ 
+-	sysfs_remove_link(&dev->class->p->class_subsys.kobj, dev->bus_id);
++	sysfs_delete_link(&dev->class->p->class_subsys.kobj, &dev->kobj, dev->bus_id);
+ #endif
+ 
+ 	sysfs_remove_link(&dev->kobj, "subsystem");
+@@ -1360,6 +1376,15 @@ int device_rename(struct device *dev, ch
+ 	strlcpy(old_device_name, dev->bus_id, BUS_ID_SIZE);
+ 	strlcpy(dev->bus_id, new_name, BUS_ID_SIZE);
+ 
++#ifndef CONFIG_SYSFS_DEPRECATED
++	if (dev->class) {
++		error = sysfs_rename_link(&dev->class->p->class_subsys.kobj,
++			&dev->kobj, old_device_name, new_name);
++		if (error)
++			goto out;
++	}
++#endif
++
+ 	error = kobject_rename(&dev->kobj, new_name);
+ 	if (error) {
+ 		strlcpy(dev->bus_id, old_device_name, BUS_ID_SIZE);
+@@ -1368,24 +1393,13 @@ int device_rename(struct device *dev, ch
+ 
+ #ifdef CONFIG_SYSFS_DEPRECATED
+ 	if (old_class_name) {
++		error = -ENOMEM;
+ 		new_class_name = make_class_name(dev->class->name, &dev->kobj);
+-		if (new_class_name) {
+-			error = sysfs_create_link_nowarn(&dev->parent->kobj,
+-							 &dev->kobj,
+-							 new_class_name);
+-			if (error)
+-				goto out;
+-			sysfs_remove_link(&dev->parent->kobj, old_class_name);
+-		}
+-	}
+-#else
+-	if (dev->class) {
+-		error = sysfs_create_link_nowarn(&dev->class->p->class_subsys.kobj,
+-						 &dev->kobj, dev->bus_id);
+-		if (error)
+-			goto out;
+-		sysfs_remove_link(&dev->class->p->class_subsys.kobj,
+-				  old_device_name);
++		if (new_class_name)
++			error = sysfs_rename_link(&dev->parent->kobj,
++						  &dev->kobj,
++						  old_class_name,
++						  new_class_name);
+ 	}
+ #endif
+ 
+--- a/include/linux/device.h
++++ b/include/linux/device.h
+@@ -195,6 +195,9 @@ struct class {
+ 	int (*suspend)(struct device *dev, pm_message_t state);
+ 	int (*resume)(struct device *dev);
+ 
++	enum sysfs_tag_type tag_type;
++	const void *(*sysfs_tag)(struct device *dev);
++
+ 	struct pm_ops *pm;
+ 	struct class_private *p;
+ };
