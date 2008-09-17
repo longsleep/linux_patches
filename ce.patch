@@ -1,0 +1,105 @@
+commit 63c301eabc7324e7587425305c256995dac8fa11
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Tue Sep 16 11:32:50 2008 -0700
+
+    clockevents: make device shutdown robust
+    
+    The device shut down does not cleanup the next_event variable of the
+    clock event device. So when the device is reactivated the possible
+    stale next_event value can prevent the device to be reprogrammed as it
+    claims to wait on a event already.
+    
+    This is the root cause of the resurfacing suspend/resume problem,
+    where systems need key press to come back to life.
+    
+    Fix this by setting next_event to KTIME_MAX when the device is shut
+    down. Use a separate function for shutdown which takes care of that
+    and only keep the direct set mode call in the broadcast code, where we
+    can not touch the next_event value.
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+---
+ kernel/time/clockevents.c    |   12 +++++++++++-
+ kernel/time/tick-broadcast.c |    9 ++++-----
+ kernel/time/tick-internal.h  |    2 ++
+ 3 files changed, 17 insertions(+), 6 deletions(-)
+
+--- a/kernel/time/clockevents.c
++++ b/kernel/time/clockevents.c
+@@ -72,6 +72,16 @@ void clockevents_set_mode(struct clock_e
+ }
+ 
+ /**
++ * clockevents_shutdown - shutdown the device and clear next_event
++ * @dev:	device to shutdown
++ */
++void clockevents_shutdown(struct clock_event_device *dev)
++{
++	clockevents_set_mode(dev, CLOCK_EVT_MODE_SHUTDOWN);
++	dev->next_event.tv64 = KTIME_MAX;
++}
++
++/**
+  * clockevents_program_event - Reprogram the clock event device.
+  * @expires:	absolute expiry time (monotonic clock)
+  *
+@@ -206,7 +216,7 @@ void clockevents_exchange_device(struct 
+ 
+ 	if (new) {
+ 		BUG_ON(new->mode != CLOCK_EVT_MODE_UNUSED);
+-		clockevents_set_mode(new, CLOCK_EVT_MODE_SHUTDOWN);
++		clockevents_shutdown(new);
+ 	}
+ 	local_irq_restore(flags);
+ }
+--- a/kernel/time/tick-broadcast.c
++++ b/kernel/time/tick-broadcast.c
+@@ -236,8 +236,7 @@ static void tick_do_broadcast_on_off(voi
+ 		if (!cpu_isset(cpu, tick_broadcast_mask)) {
+ 			cpu_set(cpu, tick_broadcast_mask);
+ 			if (td->mode == TICKDEV_MODE_PERIODIC)
+-				clockevents_set_mode(dev,
+-						     CLOCK_EVT_MODE_SHUTDOWN);
++				clockevents_shutdown(dev);
+ 		}
+ 		if (*reason == CLOCK_EVT_NOTIFY_BROADCAST_FORCE)
+ 			tick_broadcast_force = 1;
+@@ -254,7 +253,7 @@ static void tick_do_broadcast_on_off(voi
+ 
+ 	if (cpus_empty(tick_broadcast_mask)) {
+ 		if (!bc_stopped)
+-			clockevents_set_mode(bc, CLOCK_EVT_MODE_SHUTDOWN);
++			clockevents_shutdown(bc);
+ 	} else if (bc_stopped) {
+ 		if (tick_broadcast_device.mode == TICKDEV_MODE_PERIODIC)
+ 			tick_broadcast_start_periodic(bc);
+@@ -306,7 +305,7 @@ void tick_shutdown_broadcast(unsigned in
+ 
+ 	if (tick_broadcast_device.mode == TICKDEV_MODE_PERIODIC) {
+ 		if (bc && cpus_empty(tick_broadcast_mask))
+-			clockevents_set_mode(bc, CLOCK_EVT_MODE_SHUTDOWN);
++			clockevents_shutdown(bc);
+ 	}
+ 
+ 	spin_unlock_irqrestore(&tick_broadcast_lock, flags);
+@@ -321,7 +320,7 @@ void tick_suspend_broadcast(void)
+ 
+ 	bc = tick_broadcast_device.evtdev;
+ 	if (bc)
+-		clockevents_set_mode(bc, CLOCK_EVT_MODE_SHUTDOWN);
++		clockevents_shutdown(bc);
+ 
+ 	spin_unlock_irqrestore(&tick_broadcast_lock, flags);
+ }
+--- a/kernel/time/tick-internal.h
++++ b/kernel/time/tick-internal.h
+@@ -10,6 +10,8 @@ extern int tick_do_timer_cpu __read_most
+ extern void tick_setup_periodic(struct clock_event_device *dev, int broadcast);
+ extern void tick_handle_periodic(struct clock_event_device *dev);
+ 
++extern void clockevents_shutdown(struct clock_event_device *dev);
++
+ /*
+  * NO_HZ / high resolution timer shared code
+  */
