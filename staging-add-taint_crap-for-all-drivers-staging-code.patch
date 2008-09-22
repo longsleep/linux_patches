@@ -1,0 +1,232 @@
+From: Greg Kroah-Hartman <gregkh@suse.de>
+Subject: Staging: add TAINT_CRAP for all drivers/staging code
+
+We need to add a flag for all code that is in the drivers/staging/
+directory to prevent all other kernel developers from worrying about
+issues here, and to notify users that the drivers might not be as good
+as they are normally used to.
+
+Based on code from Andreas Gruenbacher and Jeff Mahoney to provide a
+TAINT flag for the support level of a kernel module in the Novell
+enterprise kernel release.
+
+
+
+Cc: Andreas Gruenbacher <agruen@suse.de>
+Cc: Jeff Mahoney <jeffm@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+
+ Documentation/sysctl/kernel.txt |    1 
+ include/linux/kernel.h          |    1 
+ kernel/module.c                 |    9 +++++
+ kernel/panic.c                  |    6 ++-
+ scripts/Makefile.modpost        |    4 +-
+ scripts/mod/modpost.c           |   65 +++++++++++++++++++++++++++++++++++++++-
+ 6 files changed, 82 insertions(+), 4 deletions(-)
+
+--- a/Documentation/sysctl/kernel.txt
++++ b/Documentation/sysctl/kernel.txt
+@@ -368,4 +368,5 @@ can be ORed together:
+   2 - A module was force loaded by insmod -f.
+       Set by modutils >= 2.4.9 and module-init-tools.
+   4 - Unsafe SMP processors: SMP with CPUs not designed for SMP.
++ 64 - A module from drivers/staging was loaded.
+ 
+--- a/include/linux/kernel.h
++++ b/include/linux/kernel.h
+@@ -261,6 +261,7 @@ extern enum system_states {
+ #define TAINT_DIE			(1<<7)
+ #define TAINT_OVERRIDDEN_ACPI_TABLE	(1<<8)
+ #define TAINT_WARN			(1<<9)
++#define TAINT_CRAP			(1<<10)
+ 
+ extern void dump_stack(void) __cold;
+ 
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@ -1834,6 +1834,7 @@ static noinline struct module *load_modu
+ 	Elf_Ehdr *hdr;
+ 	Elf_Shdr *sechdrs;
+ 	char *secstrings, *args, *modmagic, *strtab = NULL;
++	char *staging;
+ 	unsigned int i;
+ 	unsigned int symindex = 0;
+ 	unsigned int strindex = 0;
+@@ -1989,6 +1990,14 @@ static noinline struct module *load_modu
+ 		goto free_hdr;
+ 	}
+ 
++	staging = get_modinfo(sechdrs, infoindex, "staging");
++	if (staging) {
++		add_taint_module(mod, TAINT_CRAP);
++		printk(KERN_WARNING "%s: module is from the staging directory,"
++		       " the quality is unknown, you have been warned.\n",
++		       mod->name);
++	}
++
+ 	/* Now copy in args */
+ 	args = strndup_user(uargs, ~0UL >> 1);
+ 	if (IS_ERR(args)) {
+--- a/kernel/panic.c
++++ b/kernel/panic.c
+@@ -155,6 +155,7 @@ EXPORT_SYMBOL(panic);
+  *  'U' - Userspace-defined naughtiness.
+  *  'A' - ACPI table overridden.
+  *  'W' - Taint on warning.
++ *  'C' - modules from drivers/staging are loaded.
+  *
+  *	The string is overwritten by the next call to print_taint().
+  */
+@@ -163,7 +164,7 @@ const char *print_tainted(void)
+ {
+ 	static char buf[20];
+ 	if (tainted) {
+-		snprintf(buf, sizeof(buf), "Tainted: %c%c%c%c%c%c%c%c%c%c",
++		snprintf(buf, sizeof(buf), "Tainted: %c%c%c%c%c%c%c%c%c%c%c",
+ 			tainted & TAINT_PROPRIETARY_MODULE ? 'P' : 'G',
+ 			tainted & TAINT_FORCED_MODULE ? 'F' : ' ',
+ 			tainted & TAINT_UNSAFE_SMP ? 'S' : ' ',
+@@ -173,7 +174,8 @@ const char *print_tainted(void)
+ 			tainted & TAINT_USER ? 'U' : ' ',
+ 			tainted & TAINT_DIE ? 'D' : ' ',
+ 			tainted & TAINT_OVERRIDDEN_ACPI_TABLE ? 'A' : ' ',
+-			tainted & TAINT_WARN ? 'W' : ' ');
++			tainted & TAINT_WARN ? 'W' : ' ',
++			tainted & TAINT_CRAP ? 'C' : ' ');
+ 	}
+ 	else
+ 		snprintf(buf, sizeof(buf), "Not tainted");
+--- a/scripts/Makefile.modpost
++++ b/scripts/Makefile.modpost
+@@ -88,7 +88,9 @@ modpost = scripts/mod/modpost           
+  $(if $(CONFIG_MARKERS),-K $(kernelmarkersfile)) \
+  $(if $(CONFIG_MARKERS),-M $(markersfile))	 \
+  $(if $(KBUILD_EXTMOD)$(KBUILD_MODPOST_WARN),-w) \
+- $(if $(cross_build),-c)
++ $(if $(cross_build),-c)			 \
++ -N $(firstword $(wildcard $(dir $(MODVERDIR))/Module.supported \
++				  $(objtree)/Module.supported /dev/null))
+ 
+ quiet_cmd_modpost = MODPOST $(words $(filter-out vmlinux FORCE, $^)) modules
+       cmd_modpost = $(modpost) -s
+--- a/scripts/mod/modpost.c
++++ b/scripts/mod/modpost.c
+@@ -1545,6 +1545,48 @@ static void get_markers(struct elf_info 
+ 		}
+ }
+ 
++void *supported_file;
++unsigned long supported_size;
++
++const char *supported(struct module *mod)
++{
++	unsigned long pos = 0;
++	char *line;
++
++	/* In a first shot, do a simple linear scan. */
++	while ((line = get_next_line(&pos, supported_file,
++				     supported_size))) {
++		const char *basename, *how = "yes";
++		char *l = line;
++
++		/* optional type-of-support flag */
++		for (l = line; *l != '\0'; l++) {
++			if (*l == ' ' || *l == '\t') {
++				*l = '\0';
++				how = l + 1;
++				break;
++			}
++		}
++
++		/* skip directory components */
++		if ((l = strrchr(line, '/')))
++			line = l + 1;
++		/* strip .ko extension */
++		l = line + strlen(line);
++		if (l - line > 3 && !strcmp(l-3, ".ko"))
++			*(l-3) = '\0';
++
++		/* skip directory components */
++		if ((basename = strrchr(mod->name, '/')))
++			basename++;
++		else
++			basename = mod->name;
++		if (!strcmp(basename, line))
++			return how;
++	}
++	return NULL;
++}
++
+ static void read_symbols(char *modname)
+ {
+ 	const char *symname;
+@@ -1726,6 +1768,13 @@ static void add_header(struct buffer *b,
+ 	buf_printf(b, "};\n");
+ }
+ 
++void add_supported_flag(struct buffer *b, struct module *mod)
++{
++	const char *how = supported(mod);
++	if (how)
++		buf_printf(b, "\nMODULE_INFO(supported, \"%s\");\n", how);
++}
++
+ /**
+  * Record CRCs for unresolved symbols
+  **/
+@@ -1866,6 +1915,13 @@ static void write_if_changed(struct buff
+ 	fclose(file);
+ }
+ 
++void read_supported(const char *fname)
++{
++	supported_file = grab_file(fname, &supported_size);
++	if (!supported_file)
++		; /* ignore error */
++}
++
+ /* parse Module.symvers file. line format:
+  * 0x12345678<tab>symbol<tab>module[[<tab>export]<tab>something]
+  **/
+@@ -2048,12 +2104,13 @@ int main(int argc, char **argv)
+ 	char *dump_write = NULL;
+ 	char *markers_read = NULL;
+ 	char *markers_write = NULL;
++	const char *supported = NULL;
+ 	int opt;
+ 	int err;
+ 	struct ext_sym_list *extsym_iter;
+ 	struct ext_sym_list *extsym_start = NULL;
+ 
+-	while ((opt = getopt(argc, argv, "i:I:e:cmsSo:awM:K:")) != -1) {
++	while ((opt = getopt(argc, argv, "i:I:e:cmsSo:awM:K:N:")) != -1) {
+ 		switch (opt) {
+ 		case 'i':
+ 			kernel_read = optarg;
+@@ -2097,11 +2154,16 @@ int main(int argc, char **argv)
+ 			case 'K':
+ 				markers_read = optarg;
+ 				break;
++		case 'N':
++			supported = optarg;
++			break;
+ 		default:
+ 			exit(1);
+ 		}
+ 	}
+ 
++	if (supported)
++		read_supported(supported);
+ 	if (kernel_read)
+ 		read_dump(kernel_read, 1);
+ 	if (module_read)
+@@ -2133,6 +2195,7 @@ int main(int argc, char **argv)
+ 		buf.pos = 0;
+ 
+ 		add_header(&buf, mod);
++		add_supported_flag(&buf, mod);
+ 		err |= add_versions(&buf, mod);
+ 		add_depends(&buf, mod, modules);
+ 		add_moddevtable(&buf, mod);
