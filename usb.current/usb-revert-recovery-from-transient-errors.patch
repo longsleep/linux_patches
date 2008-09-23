@@ -1,0 +1,109 @@
+From stern@rowland.harvard.edu  Tue Sep 23 13:20:45 2008
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Mon, 22 Sep 2008 14:43:08 -0400 (EDT)
+Subject: USB: revert recovery from transient errors
+To: Greg KH <greg@kroah.com>
+Cc: Frans Pop <elendil@planet.nl>, USB list <linux-usb@vger.kernel.org>
+Message-ID: <Pine.LNX.4.44L0.0809221429350.2361-100000@iolanthe.rowland.org>
+
+
+This patch (as1135) essentially reverts the major parts of two earlier
+patches to usbcore, because they ended up causing a regression.
+
+Trying to recover from transient communication errors can lead to
+other problems, because operations that failed during the error period
+are not always retried.  The simplest example is the initial
+Set-Config request sent after device enumeration; if it gets lost then
+it will not be retried and the device will remain unconfigured.
+
+This patch restores the old behavior in which any port disconnect or
+port disable causes the entire device structure to be removed, fixing a
+reported regression.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Tested-by: Frans Pop <elendil@planet.nl>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ drivers/usb/core/hub.c |   39 +++++++++++++++++----------------------
+ 1 file changed, 17 insertions(+), 22 deletions(-)
+
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -2683,35 +2683,17 @@ static void hub_port_connect_change(stru
+ 				USB_PORT_STAT_C_ENABLE);
+ #endif
+ 
+-	/* Try to use the debounce delay for protection against
+-	 * port-enable changes caused, for example, by EMI.
+-	 */
+-	if (portchange & (USB_PORT_STAT_C_CONNECTION |
+-				USB_PORT_STAT_C_ENABLE)) {
+-		status = hub_port_debounce(hub, port1);
+-		if (status < 0) {
+-			if (printk_ratelimit())
+-				dev_err (hub_dev, "connect-debounce failed, "
+-						"port %d disabled\n", port1);
+-			portstatus &= ~USB_PORT_STAT_CONNECTION;
+-		} else {
+-			portstatus = status;
+-		}
+-	}
+-
+ 	/* Try to resuscitate an existing device */
+ 	udev = hdev->children[port1-1];
+ 	if ((portstatus & USB_PORT_STAT_CONNECTION) && udev &&
+ 			udev->state != USB_STATE_NOTATTACHED) {
+-
+ 		usb_lock_device(udev);
+ 		if (portstatus & USB_PORT_STAT_ENABLE) {
+ 			status = 0;		/* Nothing to do */
+-		} else if (!udev->persist_enabled) {
+-			status = -ENODEV;	/* Mustn't resuscitate */
+ 
+ #ifdef CONFIG_USB_SUSPEND
+-		} else if (udev->state == USB_STATE_SUSPENDED) {
++		} else if (udev->state == USB_STATE_SUSPENDED &&
++				udev->persist_enabled) {
+ 			/* For a suspended device, treat this as a
+ 			 * remote wakeup event.
+ 			 */
+@@ -2726,7 +2708,7 @@ static void hub_port_connect_change(stru
+ #endif
+ 
+ 		} else {
+-			status = usb_reset_device(udev);
++			status = -ENODEV;	/* Don't resuscitate */
+ 		}
+ 		usb_unlock_device(udev);
+ 
+@@ -2741,6 +2723,19 @@ static void hub_port_connect_change(stru
+ 		usb_disconnect(&hdev->children[port1-1]);
+ 	clear_bit(port1, hub->change_bits);
+ 
++	if (portchange & (USB_PORT_STAT_C_CONNECTION |
++				USB_PORT_STAT_C_ENABLE)) {
++		status = hub_port_debounce(hub, port1);
++		if (status < 0) {
++			if (printk_ratelimit())
++				dev_err(hub_dev, "connect-debounce failed, "
++						"port %d disabled\n", port1);
++			portstatus &= ~USB_PORT_STAT_CONNECTION;
++		} else {
++			portstatus = status;
++		}
++	}
++
+ 	/* Return now if debouncing failed or nothing is connected */
+ 	if (!(portstatus & USB_PORT_STAT_CONNECTION)) {
+ 
+@@ -2748,7 +2743,7 @@ static void hub_port_connect_change(stru
+ 		if ((wHubCharacteristics & HUB_CHAR_LPSM) < 2
+ 				&& !(portstatus & (1 << USB_PORT_FEAT_POWER)))
+ 			set_port_feature(hdev, port1, USB_PORT_FEAT_POWER);
+- 
++
+ 		if (portstatus & USB_PORT_STAT_ENABLE)
+   			goto done;
+ 		return;
