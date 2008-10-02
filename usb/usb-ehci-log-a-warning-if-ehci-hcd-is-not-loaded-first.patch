@@ -1,0 +1,148 @@
+From stern@rowland.harvard.edu  Thu Oct  2 09:09:47 2008
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Thu, 2 Oct 2008 11:48:13 -0400 (EDT)
+Subject: USB: EHCI: log a warning if ehci-hcd is not loaded first
+To: Greg KH <greg@kroah.com>
+Message-ID: <Pine.LNX.4.44L0.0810021147160.2363-100000@iolanthe.rowland.org>
+
+
+This patch (as1139) adds a warning to the system log whenever ehci-hcd
+is loaded after ohci-hcd or uhci-hcd.  Nowadays most distributions are
+pretty good about not doing this; maybe the warning will help convince
+anyone still doing it wrong.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Cc: stable <stable@kernel.org>  [2.6.27]
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/hcd.c      |    4 ++++
+ drivers/usb/core/hcd.h      |    6 ++++++
+ drivers/usb/host/ehci-hcd.c |   15 +++++++++++++--
+ drivers/usb/host/ohci-hcd.c |    3 +++
+ drivers/usb/host/uhci-hcd.c |    3 +++
+ 5 files changed, 29 insertions(+), 2 deletions(-)
+
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -81,6 +81,10 @@
+ 
+ /*-------------------------------------------------------------------------*/
+ 
++/* Keep track of which host controller drivers are loaded */
++unsigned long usb_hcds_loaded;
++EXPORT_SYMBOL_GPL(usb_hcds_loaded);
++
+ /* host controllers we manage */
+ LIST_HEAD (usb_bus_list);
+ EXPORT_SYMBOL_GPL (usb_bus_list);
+--- a/drivers/usb/core/hcd.h
++++ b/drivers/usb/core/hcd.h
+@@ -482,4 +482,10 @@ static inline void usbmon_urb_complete(s
+  */
+ extern struct rw_semaphore ehci_cf_port_reset_rwsem;
+ 
++/* Keep track of which host controller drivers are loaded */
++#define USB_UHCI_LOADED		0
++#define USB_OHCI_LOADED		1
++#define USB_EHCI_LOADED		2
++extern unsigned long usb_hcds_loaded;
++
+ #endif /* __KERNEL__ */
+--- a/drivers/usb/host/ehci-hcd.c
++++ b/drivers/usb/host/ehci-hcd.c
+@@ -1045,6 +1045,12 @@ static int __init ehci_hcd_init(void)
+ 		return -ENODEV;
+ 
+ 	printk(KERN_INFO "%s: " DRIVER_DESC "\n", hcd_name);
++	set_bit(USB_EHCI_LOADED, &usb_hcds_loaded);
++	if (test_bit(USB_UHCI_LOADED, &usb_hcds_loaded) ||
++			test_bit(USB_OHCI_LOADED, &usb_hcds_loaded))
++		printk(KERN_WARNING "Warning! ehci_hcd should always be loaded"
++				" before uhci_hcd and ohci_hcd, not after\n");
++
+ 	pr_debug("%s: block sizes: qh %Zd qtd %Zd itd %Zd sitd %Zd\n",
+ 		 hcd_name,
+ 		 sizeof(struct ehci_qh), sizeof(struct ehci_qtd),
+@@ -1052,8 +1058,10 @@ static int __init ehci_hcd_init(void)
+ 
+ #ifdef DEBUG
+ 	ehci_debug_root = debugfs_create_dir("ehci", NULL);
+-	if (!ehci_debug_root)
+-		return -ENOENT;
++	if (!ehci_debug_root) {
++		retval = -ENOENT;
++		goto err_debug;
++	}
+ #endif
+ 
+ #ifdef PLATFORM_DRIVER
+@@ -1101,6 +1109,8 @@ clean0:
+ 	debugfs_remove(ehci_debug_root);
+ 	ehci_debug_root = NULL;
+ #endif
++err_debug:
++	clear_bit(USB_EHCI_LOADED, &usb_hcds_loaded);
+ 	return retval;
+ }
+ module_init(ehci_hcd_init);
+@@ -1122,6 +1132,7 @@ static void __exit ehci_hcd_cleanup(void
+ #ifdef DEBUG
+ 	debugfs_remove(ehci_debug_root);
+ #endif
++	clear_bit(USB_EHCI_LOADED, &usb_hcds_loaded);
+ }
+ module_exit(ehci_hcd_cleanup);
+ 
+--- a/drivers/usb/host/ohci-hcd.c
++++ b/drivers/usb/host/ohci-hcd.c
+@@ -1095,6 +1095,7 @@ static int __init ohci_hcd_mod_init(void
+ 	printk(KERN_INFO "%s: " DRIVER_DESC "\n", hcd_name);
+ 	pr_debug ("%s: block sizes: ed %Zd td %Zd\n", hcd_name,
+ 		sizeof (struct ed), sizeof (struct td));
++	set_bit(USB_OHCI_LOADED, &usb_hcds_loaded);
+ 
+ #ifdef DEBUG
+ 	ohci_debug_root = debugfs_create_dir("ohci", NULL);
+@@ -1181,6 +1182,7 @@ static int __init ohci_hcd_mod_init(void
+  error_debug:
+ #endif
+ 
++	clear_bit(USB_OHCI_LOADED, &usb_hcds_loaded);
+ 	return retval;
+ }
+ module_init(ohci_hcd_mod_init);
+@@ -1211,6 +1213,7 @@ static void __exit ohci_hcd_mod_exit(voi
+ #ifdef DEBUG
+ 	debugfs_remove(ohci_debug_root);
+ #endif
++	clear_bit(USB_OHCI_LOADED, &usb_hcds_loaded);
+ }
+ module_exit(ohci_hcd_mod_exit);
+ 
+--- a/drivers/usb/host/uhci-hcd.c
++++ b/drivers/usb/host/uhci-hcd.c
+@@ -955,6 +955,7 @@ static int __init uhci_hcd_init(void)
+ 
+ 	printk(KERN_INFO "uhci_hcd: " DRIVER_DESC "%s\n",
+ 			ignore_oc ? ", overcurrent ignored" : "");
++	set_bit(USB_UHCI_LOADED, &usb_hcds_loaded);
+ 
+ 	if (DEBUG_CONFIGURED) {
+ 		errbuf = kmalloc(ERRBUF_LEN, GFP_KERNEL);
+@@ -987,6 +988,7 @@ debug_failed:
+ 
+ errbuf_failed:
+ 
++	clear_bit(USB_UHCI_LOADED, &usb_hcds_loaded);
+ 	return retval;
+ }
+ 
+@@ -996,6 +998,7 @@ static void __exit uhci_hcd_cleanup(void
+ 	kmem_cache_destroy(uhci_up_cachep);
+ 	debugfs_remove(uhci_debugfs_root);
+ 	kfree(errbuf);
++	clear_bit(USB_UHCI_LOADED, &usb_hcds_loaded);
+ }
+ 
+ module_init(uhci_hcd_init);
