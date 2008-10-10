@@ -1,0 +1,216 @@
+From foo@baz Tue Apr  9 12:12:43 2002
+Date: Thu, 14 Aug 2008 09:37:34 -0700
+To: Greg KH <greg@kroah.com>
+From: Greg Kroah-Hartman <gregkh@suse.de>
+Subject: USB: remove warn() macro from usb drivers
+
+USB should not be having it's own printk macros, so remove warn() and
+use the system-wide standard of dev_warn() wherever possible.  In the
+few places that will not work out, use a basic printk().
+
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/atm/usbatm.c   |   10 +++++-----
+ drivers/usb/atm/usbatm.h   |   10 ++++++++--
+ drivers/usb/atm/xusbatm.c  |    2 +-
+ drivers/usb/core/devio.c   |    3 ++-
+ drivers/usb/core/inode.c   |    6 ++++--
+ drivers/usb/core/message.c |    3 ++-
+ drivers/usb/image/mdc800.c |    8 +++++---
+ drivers/usb/misc/usblcd.c  |    2 +-
+ drivers/usb/misc/uss720.c  |    7 ++++---
+ 9 files changed, 32 insertions(+), 19 deletions(-)
+
+--- a/drivers/usb/atm/usbatm.c
++++ b/drivers/usb/atm/usbatm.c
+@@ -344,7 +344,7 @@ static void usbatm_extract_one_cell(stru
+ 				__func__, sarb->len, vcc);
+ 		/* discard cells already received */
+ 		skb_trim(sarb, 0);
+-		UDSL_ASSERT(sarb->tail + ATM_CELL_PAYLOAD <= sarb->end);
++		UDSL_ASSERT(instance, sarb->tail + ATM_CELL_PAYLOAD <= sarb->end);
+ 	}
+ 
+ 	memcpy(skb_tail_pointer(sarb), source + ATM_CELL_HEADER, ATM_CELL_PAYLOAD);
+@@ -432,7 +432,7 @@ static void usbatm_extract_cells(struct 
+ 		unsigned char *cell_buf = instance->cell_buf;
+ 		unsigned int space_left = stride - buf_usage;
+ 
+-		UDSL_ASSERT(buf_usage <= stride);
++		UDSL_ASSERT(instance, buf_usage <= stride);
+ 
+ 		if (avail_data >= space_left) {
+ 			/* add new data and process cell */
+@@ -475,7 +475,7 @@ static unsigned int usbatm_write_cells(s
+ 	unsigned int stride = instance->tx_channel.stride;
+ 
+ 	vdbg("%s: skb->len=%d, avail_space=%u", __func__, skb->len, avail_space);
+-	UDSL_ASSERT(!(avail_space % stride));
++	UDSL_ASSERT(instance, !(avail_space % stride));
+ 
+ 	for (bytes_written = 0; bytes_written < avail_space && ctrl->len;
+ 	     bytes_written += stride, target += stride) {
+@@ -547,7 +547,7 @@ static void usbatm_rx_process(unsigned l
+ 				if (!urb->iso_frame_desc[i].status) {
+ 					unsigned int actual_length = urb->iso_frame_desc[i].actual_length;
+ 
+-					UDSL_ASSERT(actual_length <= packet_size);
++					UDSL_ASSERT(instance, actual_length <= packet_size);
+ 
+ 					if (!merge_length)
+ 						merge_start = (unsigned char *)urb->transfer_buffer + urb->iso_frame_desc[i].offset;
+@@ -1189,7 +1189,7 @@ int usbatm_usb_probe(struct usb_interfac
+ 		struct urb *urb;
+ 		unsigned int iso_packets = usb_pipeisoc(channel->endpoint) ? channel->buf_size / channel->packet_size : 0;
+ 
+-		UDSL_ASSERT(!usb_pipeisoc(channel->endpoint) || usb_pipein(channel->endpoint));
++		UDSL_ASSERT(instance, !usb_pipeisoc(channel->endpoint) || usb_pipein(channel->endpoint));
+ 
+ 		urb = usb_alloc_urb(iso_packets, GFP_KERNEL);
+ 		if (!urb) {
+--- a/drivers/usb/atm/usbatm.h
++++ b/drivers/usb/atm/usbatm.h
+@@ -40,9 +40,15 @@
+ */
+ 
+ #ifdef DEBUG
+-#define UDSL_ASSERT(x)	BUG_ON(!(x))
++#define UDSL_ASSERT(instance, x)	BUG_ON(!(x))
+ #else
+-#define UDSL_ASSERT(x)	do { if (!(x)) warn("failed assertion '%s' at line %d", __stringify(x), __LINE__); } while(0)
++#define UDSL_ASSERT(instance, x)					\
++	do {	\
++		if (!(x))						\
++			dev_warn(&(instance)->usb_intf->dev,		\
++				 "failed assertion '%s' at line %d",	\
++				 __stringify(x), __LINE__);		\
++	} while(0)
+ #endif
+ 
+ #define usb_err(instance, format, arg...)	\
+--- a/drivers/usb/atm/xusbatm.c
++++ b/drivers/usb/atm/xusbatm.c
+@@ -193,7 +193,7 @@ static int __init xusbatm_init(void)
+ 	    num_vendor != num_product ||
+ 	    num_vendor != num_rx_endpoint ||
+ 	    num_vendor != num_tx_endpoint) {
+-		warn("malformed module parameters");
++		printk(KERN_WARNING "xusbatm: malformed module parameters\n");
+ 		return -EINVAL;
+ 	}
+ 
+--- a/drivers/usb/core/devio.c
++++ b/drivers/usb/core/devio.c
+@@ -413,7 +413,8 @@ static void driver_disconnect(struct usb
+ 	if (likely(ifnum < 8*sizeof(ps->ifclaimed)))
+ 		clear_bit(ifnum, &ps->ifclaimed);
+ 	else
+-		warn("interface number %u out of range", ifnum);
++		dev_warn(&intf->dev, "interface number %u out of range\n",
++			 ifnum);
+ 
+ 	usb_set_intfdata(intf, NULL);
+ 
+--- a/drivers/usb/core/inode.c
++++ b/drivers/usb/core/inode.c
+@@ -240,7 +240,9 @@ static void update_sb(struct super_block
+ 				update_special(bus);
+ 				break;
+ 			default:
+-				warn("Unknown node %s mode %x found on remount!\n",bus->d_name.name,bus->d_inode->i_mode);
++				printk(KERN_WARNING "usbfs: Unknown node %s "
++				       "mode %x found on remount!\n",
++				       bus->d_name.name, bus->d_inode->i_mode);
+ 				break;
+ 			}
+ 		}
+@@ -259,7 +261,7 @@ static int remount(struct super_block *s
+ 		return 0;
+ 
+ 	if (parse_options(sb, data)) {
+-		warn("usbfs: mount parameter error:");
++		printk(KERN_WARNING "usbfs: mount parameter error.\n");
+ 		return -EINVAL;
+ 	}
+ 
+--- a/drivers/usb/core/message.c
++++ b/drivers/usb/core/message.c
+@@ -1204,7 +1204,8 @@ int usb_set_interface(struct usb_device 
+ 
+ 	alt = usb_altnum_to_altsetting(iface, alternate);
+ 	if (!alt) {
+-		warn("selecting invalid altsetting %d", alternate);
++		dev_warn(&dev->dev, "selecting invalid altsetting %d",
++			 alternate);
+ 		return -EINVAL;
+ 	}
+ 
+--- a/drivers/usb/image/mdc800.c
++++ b/drivers/usb/image/mdc800.c
+@@ -361,7 +361,8 @@ static int mdc800_usb_waitForIRQ (int mo
+ 	
+ 	if (mdc800->state == NOT_CONNECTED)
+ 	{
+-		warn ("Camera gets disconnected during waiting for irq.");
++		printk(KERN_WARNING "mdc800: Camera gets disconnected "
++		       "during waiting for irq.\n");
+ 		mdc800->camera_request_ready=0;
+ 		return -2;
+ 	}
+@@ -443,7 +444,7 @@ static int mdc800_usb_probe (struct usb_
+ 
+ 	if (mdc800->dev != NULL)
+ 	{
+-		warn ("only one Mustek MDC800 is supported.");
++		dev_warn(&intf->dev, "only one Mustek MDC800 is supported.\n");
+ 		return -ENODEV;
+ 	}
+ 
+@@ -701,7 +702,8 @@ static ssize_t mdc800_device_read (struc
+ 	}
+ 	if (mdc800->state == WORKING)
+ 	{
+-		warn ("Illegal State \"working\" reached during read ?!");
++		printk(KERN_WARNING "mdc800: Illegal State \"working\""
++		       "reached during read ?!\n");
+ 		mutex_unlock(&mdc800->io_lock);
+ 		return -EBUSY;
+ 	}
+--- a/drivers/usb/misc/usblcd.c
++++ b/drivers/usb/misc/usblcd.c
+@@ -311,7 +311,7 @@ static int lcd_probe(struct usb_interfac
+ 	dev->interface = interface;
+ 
+ 	if (le16_to_cpu(dev->udev->descriptor.idProduct) != 0x0001) {
+-		warn(KERN_INFO "USBLCD model not supported.");
++		dev_warn(&interface->dev, "USBLCD model not supported.\n");
+ 		return -ENODEV;
+ 	}
+ 	
+--- a/drivers/usb/misc/uss720.c
++++ b/drivers/usb/misc/uss720.c
+@@ -228,11 +228,12 @@ static int get_1284_register(struct parp
+ 		ret = rq->urb->status;
+ 		*val = priv->reg[(reg >= 9) ? 0 : regindex[reg]];
+ 		if (ret)
+-			warn("get_1284_register: usb error %d", ret);
++			printk(KERN_WARNING "get_1284_register: "
++			       "usb error %d\n", ret);
+ 		kref_put(&rq->ref_count, destroy_async);
+ 		return ret;
+ 	}
+-	warn("get_1284_register timeout");
++	printk(KERN_WARNING "get_1284_register timeout\n");
+ 	kill_all_async_requests_priv(priv);
+ 	return -EIO;
+ }
+@@ -716,7 +717,7 @@ static int uss720_probe(struct usb_inter
+ 	spin_lock_init(&priv->asynclock);
+ 	INIT_LIST_HEAD(&priv->asynclist);
+ 	if (!(pp = parport_register_port(0, PARPORT_IRQ_NONE, PARPORT_DMA_NONE, &parport_uss720_ops))) {
+-		warn("could not register parport");
++		printk(KERN_WARNING "uss720: could not register parport\n");
+ 		goto probe_abort;
+ 	}
+ 
