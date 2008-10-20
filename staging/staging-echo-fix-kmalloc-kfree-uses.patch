@@ -1,0 +1,142 @@
+From penberg@cs.helsinki.fi  Mon Oct 20 14:26:12 2008
+From: Pekka J Enberg <penberg@cs.helsinki.fi>
+Date: Fri, 17 Oct 2008 20:55:03 +0300 (EEST)
+Subject: Staging: echo: fix kmalloc()/kfree() uses
+To: greg@kroah.com
+Cc: david@rowetel.com, steveu@coppice.org, linux-kernel@vger.kernel.org
+Message-ID: <Pine.LNX.4.64.0810172053490.23852@melkki.cs.Helsinki.FI>
+
+From: Pekka Enberg <penberg@cs.helsinki.fi>
+
+This patch removes the malloc()/free() macro wrappers and converts
+call-sites to use kcalloc() and kzalloc() where appropriate. I also
+fixed up out-of-memory error handling in couple of places where it was
+broken.
+
+Cc: David Rowe <david@rowetel.com>
+Cc: Steve Underwood <steveu@coppice.org>
+Signed-off-by: Pekka Enberg <penberg@cs.helsinki.fi>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/staging/echo/echo.c |   36 +++++++++++++++++-------------------
+ drivers/staging/echo/fir.h  |   14 +++++---------
+ 2 files changed, 22 insertions(+), 28 deletions(-)
+
+--- a/drivers/staging/echo/echo.c
++++ b/drivers/staging/echo/echo.c
+@@ -109,8 +109,6 @@
+ #include <linux/module.h>
+ #include <linux/kernel.h>
+ #include <linux/slab.h>
+-#define malloc(a) kmalloc((a), GFP_KERNEL)
+-#define free(a) kfree(a)
+ 
+ #include "bit_operations.h"
+ #include "echo.h"
+@@ -238,27 +236,19 @@ struct oslec_state *oslec_create(int len
+ {
+     struct oslec_state *ec;
+     int i;
+-    int j;
+ 
+-    ec = kmalloc(sizeof(*ec), GFP_KERNEL);
+-    if (ec == NULL)
+-        return  NULL;
+-    memset(ec, 0, sizeof(*ec));
++    ec = kzalloc(sizeof(*ec), GFP_KERNEL);
++    if (!ec)
++        return NULL;
+ 
+     ec->taps = len;
+     ec->log2taps = top_bit(len);
+     ec->curr_pos = ec->taps - 1;
+ 
+-    for (i = 0;  i < 2;  i++)
+-    {
+-        if ((ec->fir_taps16[i] = (int16_t *) malloc((ec->taps)*sizeof(int16_t))) == NULL)
+-        {
+-            for (j = 0;  j < i;  j++)
+-                kfree(ec->fir_taps16[j]);
+-            kfree(ec);
+-            return  NULL;
+-        }
+-        memset(ec->fir_taps16[i], 0, (ec->taps)*sizeof(int16_t));
++    for (i = 0; i < 2; i++) {
++        ec->fir_taps16[i] = kcalloc(ec->taps, sizeof(int16_t), GFP_KERNEL);
++        if (!ec->fir_taps16[i])
++	    goto error_oom;
+     }
+ 
+     fir16_create(&ec->fir_state,
+@@ -275,8 +265,9 @@ struct oslec_state *oslec_create(int len
+     ec->cng_level = 1000;
+     oslec_adaption_mode(ec, adaption_mode);
+ 
+-    ec->snapshot = (int16_t*)malloc(ec->taps*sizeof(int16_t));
+-    memset(ec->snapshot, 0, sizeof(int16_t)*ec->taps);
++    ec->snapshot = kcalloc(ec->taps, sizeof(int16_t), GFP_KERNEL);
++    if (!ec->snapshot)
++        goto error_oom;
+ 
+     ec->cond_met = 0;
+     ec->Pstates = 0;
+@@ -288,6 +279,13 @@ struct oslec_state *oslec_create(int len
+     ec->Lbgn_upper_acc = ec->Lbgn_upper << 13;
+ 
+     return  ec;
++
++error_oom:
++    for (i = 0; i < 2; i++)
++        kfree(ec->fir_taps16[i]);
++
++    kfree(ec);
++    return NULL;
+ }
+ EXPORT_SYMBOL_GPL(oslec_create);
+ /*- End of function --------------------------------------------------------*/
+--- a/drivers/staging/echo/fir.h
++++ b/drivers/staging/echo/fir.h
+@@ -117,11 +117,9 @@ static __inline__ const int16_t *fir16_c
+ 	fir->curr_pos = taps - 1;
+ 	fir->coeffs = coeffs;
+ #if defined(USE_MMX)  ||  defined(USE_SSE2) || defined(__bfin__)
+-	if ((fir->history = malloc(2*taps*sizeof(int16_t))))
+-		memset(fir->history, 0, 2*taps*sizeof(int16_t));
++	fir->history = kcalloc(2*taps, sizeof(int16_t), GFP_KERNEL);
+ #else
+-	if ((fir->history = (int16_t *) malloc(taps*sizeof(int16_t))))
+-		memset(fir->history, 0, taps*sizeof(int16_t));
++	fir->history = kcalloc(taps, sizeof(int16_t), GFP_KERNEL);
+ #endif
+ 	return fir->history;
+ }
+@@ -139,7 +137,7 @@ static __inline__ void fir16_flush(fir16
+ 
+ static __inline__ void fir16_free(fir16_state_t *fir)
+ {
+-	free(fir->history);
++	kfree(fir->history);
+ }
+ /*- End of function --------------------------------------------------------*/
+ 
+@@ -275,9 +273,7 @@ static __inline__ const int16_t *fir32_c
+     fir->taps = taps;
+     fir->curr_pos = taps - 1;
+     fir->coeffs = coeffs;
+-    fir->history = (int16_t *) malloc(taps*sizeof(int16_t));
+-    if (fir->history)
+-    	memset(fir->history, '\0', taps*sizeof(int16_t));
++    fir->history = kcalloc(taps, sizeof(int16_t), GFP_KERNEL);
+     return fir->history;
+ }
+ /*- End of function --------------------------------------------------------*/
+@@ -290,7 +286,7 @@ static __inline__ void fir32_flush(fir32
+ 
+ static __inline__ void fir32_free(fir32_state_t *fir)
+ {
+-    free(fir->history);
++    kfree(fir->history);
+ }
+ /*- End of function --------------------------------------------------------*/
+ 
