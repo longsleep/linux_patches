@@ -1,0 +1,71 @@
+From vikram.pandita@ti.com  Mon Oct 27 11:43:00 2008
+From: Vikram Pandita <vikram.pandita@ti.com>
+Date: Fri, 24 Oct 2008 23:41:30 +0530
+Subject: USB: Avoid 20ms delay in EHCI resume
+To: Alan Stern <stern@rowland.harvard.edu>, "linux-usb@vger.kernel.org" <linux-usb@vger.kernel.org>
+Message-ID: <FCCFB4CDC6E5564B9182F639FC35608702396F8A93@dbde02.ent.ti.com>
+
+
+From: Vikram Pandita <vikram.pandita@ti.com>
+
+For function ehci_bus_resume()
+- Added flag resume_needed
+  No need to wait for 20ms if no port was suspended
+
+- Change mdelay to msleep
+
+- release and reacquire the spinlock around mdelay
+
+Signed-off-by: vikram pandita <vikram.pandita@ti.com>
+Acked-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/ehci-hub.c |   18 +++++++++++++++---
+ 1 file changed, 15 insertions(+), 3 deletions(-)
+
+--- a/drivers/usb/host/ehci-hub.c
++++ b/drivers/usb/host/ehci-hub.c
+@@ -194,6 +194,7 @@ static int ehci_bus_resume (struct usb_h
+ 	u32			temp;
+ 	u32			power_okay;
+ 	int			i;
++	u8			resume_needed = 0;
+ 
+ 	if (time_before (jiffies, ehci->next_statechange))
+ 		msleep(5);
+@@ -228,7 +229,9 @@ static int ehci_bus_resume (struct usb_h
+ 
+ 	/* Some controller/firmware combinations need a delay during which
+ 	 * they set up the port statuses.  See Bugzilla #8190. */
+-	mdelay(8);
++	spin_unlock_irq(&ehci->lock);
++	msleep(8);
++	spin_lock_irq(&ehci->lock);
+ 
+ 	/* manually resume the ports we suspended during bus_suspend() */
+ 	i = HCS_N_PORTS (ehci->hcs_params);
+@@ -236,12 +239,21 @@ static int ehci_bus_resume (struct usb_h
+ 		temp = ehci_readl(ehci, &ehci->regs->port_status [i]);
+ 		temp &= ~(PORT_RWC_BITS | PORT_WAKE_BITS);
+ 		if (test_bit(i, &ehci->bus_suspended) &&
+-				(temp & PORT_SUSPEND))
++				(temp & PORT_SUSPEND)) {
+ 			temp |= PORT_RESUME;
++			resume_needed = 1;
++		}
+ 		ehci_writel(ehci, temp, &ehci->regs->port_status [i]);
+ 	}
++
++	/* msleep for 20ms only if code is trying to resume port */
++	if (resume_needed) {
++		spin_unlock_irq(&ehci->lock);
++		msleep(20);
++		spin_lock_irq(&ehci->lock);
++	}
++
+ 	i = HCS_N_PORTS (ehci->hcs_params);
+-	mdelay (20);
+ 	while (i--) {
+ 		temp = ehci_readl(ehci, &ehci->regs->port_status [i]);
+ 		if (test_bit(i, &ehci->bus_suspended) &&
