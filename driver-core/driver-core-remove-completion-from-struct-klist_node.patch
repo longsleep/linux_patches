@@ -1,0 +1,118 @@
+From matthew@wil.cx  Fri Oct 31 09:48:55 2008
+From: Matthew Wilcox <matthew@wil.cx>
+Date: Thu, 16 Oct 2008 14:57:54 -0600
+Subject: driver core: Remove completion from struct klist_node
+To: Greg KH <greg@kroah.com>
+Message-ID: <20081016205754.GR15064@parisc-linux.org>
+
+
+Removing the completion from klist_node reduces its size from 64 bytes
+to 28 on x86-64.  To maintain the semantics of klist_remove(), we add
+a single list of klist nodes which are pending deletion and scan them.
+
+Signed-off-by: Matthew Wilcox <willy@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ include/linux/klist.h |    2 --
+ lib/klist.c           |   43 ++++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 40 insertions(+), 5 deletions(-)
+
+--- a/include/linux/klist.h
++++ b/include/linux/klist.h
+@@ -13,7 +13,6 @@
+ #define _LINUX_KLIST_H
+ 
+ #include <linux/spinlock.h>
+-#include <linux/completion.h>
+ #include <linux/kref.h>
+ #include <linux/list.h>
+ 
+@@ -41,7 +40,6 @@ struct klist_node {
+ 	void			*n_klist;	/* never access directly */
+ 	struct list_head	n_node;
+ 	struct kref		n_ref;
+-	struct completion	n_removed;
+ };
+ 
+ extern void klist_add_tail(struct klist_node *n, struct klist *k);
+--- a/lib/klist.c
++++ b/lib/klist.c
+@@ -36,6 +36,7 @@
+ 
+ #include <linux/klist.h>
+ #include <linux/module.h>
++#include <linux/sched.h>
+ 
+ /*
+  * Use the lowest bit of n_klist to mark deleted nodes and exclude
+@@ -108,7 +109,6 @@ static void add_tail(struct klist *k, st
+ static void klist_node_init(struct klist *k, struct klist_node *n)
+ {
+ 	INIT_LIST_HEAD(&n->n_node);
+-	init_completion(&n->n_removed);
+ 	kref_init(&n->n_ref);
+ 	knode_set_klist(n, k);
+ 	if (k->get)
+@@ -171,13 +171,34 @@ void klist_add_before(struct klist_node 
+ }
+ EXPORT_SYMBOL_GPL(klist_add_before);
+ 
++struct klist_waiter {
++	struct list_head list;
++	struct klist_node *node;
++	struct task_struct *process;
++	int woken;
++};
++
++static DEFINE_SPINLOCK(klist_remove_lock);
++static LIST_HEAD(klist_remove_waiters);
++
+ static void klist_release(struct kref *kref)
+ {
++	struct klist_waiter *waiter, *tmp;
+ 	struct klist_node *n = container_of(kref, struct klist_node, n_ref);
+ 
+ 	WARN_ON(!knode_dead(n));
+ 	list_del(&n->n_node);
+-	complete(&n->n_removed);
++	spin_lock(&klist_remove_lock);
++	list_for_each_entry_safe(waiter, tmp, &klist_remove_waiters, list) {
++		if (waiter->node != n)
++			continue;
++
++		waiter->woken = 1;
++		mb();
++		wake_up_process(waiter->process);
++		list_del(&waiter->list);
++	}
++	spin_unlock(&klist_remove_lock);
+ 	knode_set_klist(n, NULL);
+ }
+ 
+@@ -217,8 +238,24 @@ EXPORT_SYMBOL_GPL(klist_del);
+  */
+ void klist_remove(struct klist_node *n)
+ {
++	struct klist_waiter waiter;
++
++	waiter.node = n;
++	waiter.process = current;
++	waiter.woken = 0;
++	spin_lock(&klist_remove_lock);
++	list_add(&waiter.list, &klist_remove_waiters);
++	spin_unlock(&klist_remove_lock);
++
+ 	klist_del(n);
+-	wait_for_completion(&n->n_removed);
++
++	for (;;) {
++		set_current_state(TASK_UNINTERRUPTIBLE);
++		if (waiter.woken)
++			break;
++		schedule();
++	}
++	__set_current_state(TASK_RUNNING);
+ }
+ EXPORT_SYMBOL_GPL(klist_remove);
+ 
