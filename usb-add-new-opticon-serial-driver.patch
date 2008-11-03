@@ -1,0 +1,218 @@
+From foo@baz Mon Nov  3 13:27:03 PST 2008
+Date: Mon, 03 Nov 2008 13:27:03 -0800
+To: Greg KH <greg@kroah.com>
+From: Greg Kroah-Hartman <gregkh@suse.de>
+Subject: USB: add new opticon serial driver
+
+This is for the serial mode of the Opticon barcode scanner.
+
+Cc: Kees Stoop <kees.stoop@opticon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/serial/Kconfig   |    9 ++
+ drivers/usb/serial/Makefile  |    1 
+ drivers/usb/serial/opticon.c |  170 +++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 180 insertions(+)
+
+--- a/drivers/usb/serial/Kconfig
++++ b/drivers/usb/serial/Kconfig
+@@ -565,6 +565,15 @@ config USB_SERIAL_OMNINET
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called omninet.
+ 
++config USB_SERIAL_OPTICON
++	tristate "USB Opticon Barcode driver (serial mode)"
++	help
++	  Say Y here if you want to use a Opticon USB Barcode device
++	  in serial emulation mode.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called opticon.
++
+ config USB_SERIAL_DEBUG
+ 	tristate "USB Debugging Device"
+ 	help
+--- a/drivers/usb/serial/Makefile
++++ b/drivers/usb/serial/Makefile
+@@ -41,6 +41,7 @@ obj-$(CONFIG_USB_SERIAL_MOS7840)		+= mos
+ obj-$(CONFIG_USB_SERIAL_MOTOROLA)		+= moto_modem.o
+ obj-$(CONFIG_USB_SERIAL_NAVMAN)			+= navman.o
+ obj-$(CONFIG_USB_SERIAL_OMNINET)		+= omninet.o
++obj-$(CONFIG_USB_SERIAL_OPTICON)		+= opticon.o
+ obj-$(CONFIG_USB_SERIAL_OPTION)			+= option.o
+ obj-$(CONFIG_USB_SERIAL_OTI6858)		+= oti6858.o
+ obj-$(CONFIG_USB_SERIAL_PL2303)			+= pl2303.o
+--- /dev/null
++++ b/drivers/usb/serial/opticon.c
+@@ -0,0 +1,170 @@
++/*
++ * Opticon USB barcode to serial driver
++ *
++ * Copyright (C) 2008 Greg Kroah-Hartman <gregkh@suse.de>
++ * Copyright (C) 2008 Novell Inc.
++ *
++ *	This program is free software; you can redistribute it and/or
++ *	modify it under the terms of the GNU General Public License version
++ *	2 as published by the Free Software Foundation.
++ */
++
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/tty.h>
++#include <linux/module.h>
++#include <linux/usb.h>
++#include <linux/usb/serial.h>
++#include <linux/uaccess.h>
++
++static int debug;
++
++static struct usb_device_id id_table [] = {
++	{ USB_DEVICE(0x065a, 0x0009) },
++	{ },
++};
++MODULE_DEVICE_TABLE(usb, id_table);
++
++/* This structure holds all of the individual device information */
++struct opticon_serial {
++	__u8			interrupt_in_endpoint;		/* the interrupt endpoint handle */
++	unsigned char		*interrupt_in_buffer;		/* the buffer we use for the interrupt endpoint */
++	struct urb		*interrupt_read_urb;		/* our interrupt urb */
++
++	__u8			bulk_in_endpoint;		/* the bulk in endpoint handle */
++	unsigned char		*bulk_in_buffer;		/* the buffer we use for the bulk in endpoint */
++	struct urb		*read_urb;			/* our bulk read urb */
++	bool			read_in_progress;
++
++	__u8			bulk_out_endpoint;		/* the bulk out endpoint handle */
++
++	__s16			rxBytesAvail;			/* the number of bytes that we need to read from this device */
++
++	struct usb_serial	*serial;			/* loop back to the owner of this object */
++};
++
++static void opticon_interrupt_callback(struct urb *urb)
++{
++}
++
++static int opticon_startup(struct usb_serial *serial)
++{
++	struct opticon_serial *opticon_serial;
++	struct usb_device *dev;
++	int i;
++	bool interrupt_in_found = false;
++
++	dev = serial->dev;
++
++	/* create our private serial structure */
++	opticon_serial = kzalloc(sizeof(struct opticon_serial), GFP_KERNEL);
++	if (opticon_serial == NULL) {
++		dev_err(&serial->dev->dev, "%s - Out of memory\n", __func__);
++		return -ENOMEM;
++	}
++	opticon_serial->serial = serial;
++	usb_set_serial_data(serial, opticon_serial);
++
++	/* find our interrupt endpoint */
++	for (i = 0; i < serial->interface->altsetting[0].desc.bNumEndpoints; ++i) {
++		struct usb_endpoint_descriptor *endpoint;
++		int buffer_size;
++
++		endpoint = &serial->interface->altsetting[0].endpoint[i].desc;
++		if (!usb_endpoint_is_int_in(endpoint))
++			continue;
++
++		opticon_serial->interrupt_read_urb = usb_alloc_urb(0, GFP_KERNEL);
++		if (!opticon_serial->interrupt_read_urb) {
++			dev_err(&dev->dev, "out of memory\n");
++			return -ENOMEM;
++		}
++
++		buffer_size = le16_to_cpu(endpoint->wMaxPacketSize) * 2;
++		opticon_serial->interrupt_in_buffer = kmalloc(buffer_size, GFP_KERNEL);
++		if (!opticon_serial->interrupt_in_buffer) {
++			dev_err(&dev->dev, "out of memory\n");
++			usb_free_urb(opticon_serial->interrupt_read_urb);
++			return -ENOMEM;
++		}
++		opticon_serial->interrupt_in_endpoint = endpoint->bEndpointAddress;
++
++		/* set up our interrupt urb */
++		usb_fill_int_urb(opticon_serial->interrupt_read_urb, dev,
++				 usb_rcvintpipe(dev,
++				 		endpoint->bEndpointAddress),
++				 opticon_serial->interrupt_in_buffer,
++				 buffer_size, opticon_interrupt_callback,
++				 opticon_serial, endpoint->bInterval);
++
++		interrupt_in_found = true;
++		}
++
++	if (!interrupt_in_found) {
++		dev_err(&dev->dev,
++			"Error - the proper endpoints were not found!\n");
++		return -ENODEV;
++	}
++
++	return 0;
++}
++
++static void opticon_shutdown(struct usb_serial *serial)
++{
++	struct opticon_serial *opticon_serial = usb_get_serial_data(serial);
++
++	dbg("%s", __func__);
++
++	usb_kill_urb(opticon_serial->interrupt_read_urb);
++	usb_free_urb(opticon_serial->interrupt_read_urb);
++	kfree(opticon_serial->interrupt_in_buffer);
++	kfree(opticon_serial);
++	usb_set_serial_data(serial, NULL);
++}
++
++
++static struct usb_driver opticon_driver = {
++	.name =		"opticon",
++	.probe =	usb_serial_probe,
++	.disconnect =	usb_serial_disconnect,
++	.id_table =	id_table,
++	.no_dynamic_id = 	1,
++};
++
++static struct usb_serial_driver opticon_device = {
++	.driver = {
++		.owner =	THIS_MODULE,
++		.name =		"opticon",
++	},
++	.id_table =		id_table,
++	.usb_driver = 		&opticon_driver,
++	.num_ports =		1,
++	.attach =		opticon_startup,
++	.shutdown =		opticon_shutdown,
++};
++
++static int __init opticon_init(void)
++{
++	int retval;
++
++	retval = usb_serial_register(&opticon_device);
++	if (retval)
++		return retval;
++	retval = usb_register(&opticon_driver);
++	if (retval)
++		usb_serial_deregister(&opticon_device);
++	return retval;
++}
++
++static void __exit opticon_exit(void)
++{
++	usb_deregister(&opticon_driver);
++	usb_serial_deregister(&opticon_device);
++}
++
++module_init(opticon_init);
++module_exit(opticon_exit);
++MODULE_LICENSE("GPL");
++
++module_param(debug, bool, S_IRUGO | S_IWUSR);
++MODULE_PARM_DESC(debug, "Debug enabled or not");
