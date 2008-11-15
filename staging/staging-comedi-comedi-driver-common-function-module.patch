@@ -1,0 +1,320 @@
+From 00fbe36d84874d90a12d5f10e450571e984a13a4 Mon Sep 17 00:00:00 2001
+From: David Schleef <ds@schleef.org>
+Date: Fri, 14 Nov 2008 14:42:01 -0800
+Subject: Staging: comedi: comedi driver common function module
+
+From: David Schleef <ds@schleef.org>
+
+This module is shared by many comedi drivers.
+
+From: David Schleef <ds@schleef.org>
+Cc: Frank Mori Hess <fmhess@users.sourceforge.net>
+Cc: Ian Abbott <abbotti@mev.co.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/staging/comedi/drivers/Makefile     |    3 
+ drivers/staging/comedi/drivers/comedi_fc.c  |  118 ++++++++++++++++++++++++++++
+ drivers/staging/comedi/drivers/comedi_fc.h  |   75 +++++++++++++++++
+ drivers/staging/comedi/drivers/comedi_pci.h |   89 +++++++++++++++++++++
+ 4 files changed, 285 insertions(+)
+
+--- /dev/null
++++ b/drivers/staging/comedi/drivers/comedi_fc.c
+@@ -0,0 +1,118 @@
++/*
++    comedi/drivers/comedi_fc.c
++
++    This is a place for code driver writers wish to share between
++    two or more drivers.  fc is short
++    for frank-common.
++
++    Author:  Frank Mori Hess <fmhess@users.sourceforge.net>
++    Copyright (C) 2002 Frank Mori Hess
++
++    This program is free software; you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation; either version 2 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program; if not, write to the Free Software
++    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++
++************************************************************************/
++
++#include "../comedidev.h"
++
++#include "comedi_fc.h"
++
++static void increment_scan_progress(comedi_subdevice * subd,
++	unsigned int num_bytes)
++{
++	comedi_async *async = subd->async;
++	unsigned int scan_length = cfc_bytes_per_scan(subd);
++
++	async->scan_progress += num_bytes;
++	if (async->scan_progress >= scan_length) {
++		async->scan_progress %= scan_length;
++		async->events |= COMEDI_CB_EOS;
++	}
++}
++
++/* Writes an array of data points to comedi's buffer */
++unsigned int cfc_write_array_to_buffer(comedi_subdevice * subd, void *data,
++	unsigned int num_bytes)
++{
++	comedi_async *async = subd->async;
++	unsigned int retval;
++
++	if (num_bytes == 0)
++		return 0;
++
++	retval = comedi_buf_write_alloc(async, num_bytes);
++	if (retval != num_bytes) {
++		rt_printk("comedi: buffer overrun\n");
++		async->events |= COMEDI_CB_OVERFLOW;
++		return 0;
++	}
++
++	comedi_buf_memcpy_to(async, 0, data, num_bytes);
++	comedi_buf_write_free(async, num_bytes);
++	increment_scan_progress(subd, num_bytes);
++	async->events |= COMEDI_CB_BLOCK;
++
++	return num_bytes;
++}
++
++unsigned int cfc_read_array_from_buffer(comedi_subdevice * subd, void *data,
++	unsigned int num_bytes)
++{
++	comedi_async *async = subd->async;
++
++	if (num_bytes == 0)
++		return 0;
++
++	num_bytes = comedi_buf_read_alloc(async, num_bytes);
++	comedi_buf_memcpy_from(async, 0, data, num_bytes);
++	comedi_buf_read_free(async, num_bytes);
++	increment_scan_progress(subd, num_bytes);
++	async->events |= COMEDI_CB_BLOCK;
++
++	return num_bytes;
++}
++
++unsigned int cfc_handle_events(comedi_device * dev, comedi_subdevice * subd)
++{
++	unsigned int events = subd->async->events;
++
++	if (events == 0)
++		return events;
++
++	if (events & (COMEDI_CB_EOA | COMEDI_CB_ERROR | COMEDI_CB_OVERFLOW))
++		subd->cancel(dev, subd);
++
++	comedi_event(dev, subd);
++
++	return events;
++}
++
++MODULE_AUTHOR("Frank Mori Hess <fmhess@users.sourceforge.net>");
++MODULE_DESCRIPTION("Shared functions for Comedi low-level drivers");
++MODULE_LICENSE("GPL");
++
++static int __init comedi_fc_init_module(void)
++{
++	return 0;
++}
++static void __exit comedi_fc_cleanup_module(void)
++{
++}
++
++module_init(comedi_fc_init_module);
++module_exit(comedi_fc_cleanup_module);
++
++EXPORT_SYMBOL(cfc_write_array_to_buffer);
++EXPORT_SYMBOL(cfc_read_array_from_buffer);
++EXPORT_SYMBOL(cfc_handle_events);
+--- /dev/null
++++ b/drivers/staging/comedi/drivers/comedi_fc.h
+@@ -0,0 +1,75 @@
++/*
++    comedi_fc.h
++
++    This is a place for code driver writers wish to share between
++    two or more drivers. These functions are meant to be used only
++    by drivers, they are NOT part of the kcomedilib API!
++
++    Author:  Frank Mori Hess <fmhess@users.sourceforge.net>
++    Copyright (C) 2002 Frank Mori Hess
++
++    This program is free software; you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation; either version 2 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program; if not, write to the Free Software
++    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++
++************************************************************************/
++
++#ifndef _COMEDI_FC_H
++#define _COMEDI_FC_H
++
++#include "../comedidev.h"
++
++/* Writes an array of data points to comedi's buffer */
++extern unsigned int cfc_write_array_to_buffer(comedi_subdevice * subd,
++	void *data, unsigned int num_bytes);
++
++static inline unsigned int cfc_write_to_buffer(comedi_subdevice * subd,
++	sampl_t data)
++{
++	return cfc_write_array_to_buffer(subd, &data, sizeof(data));
++};
++
++static inline unsigned int cfc_write_long_to_buffer(comedi_subdevice * subd,
++	lsampl_t data)
++{
++	return cfc_write_array_to_buffer(subd, &data, sizeof(data));
++};
++
++extern unsigned int cfc_read_array_from_buffer(comedi_subdevice * subd,
++	void *data, unsigned int num_bytes);
++
++extern unsigned int cfc_handle_events(comedi_device * dev,
++	comedi_subdevice * subd);
++
++static inline unsigned int cfc_bytes_per_scan(comedi_subdevice * subd)
++{
++	int num_samples;
++	int bits_per_sample;
++
++	switch (subd->type) {
++	case COMEDI_SUBD_DI:
++	case COMEDI_SUBD_DO:
++	case COMEDI_SUBD_DIO:
++		bits_per_sample = 8 * bytes_per_sample(subd);
++		num_samples =
++			(subd->async->cmd.chanlist_len + bits_per_sample -
++			1) / bits_per_sample;
++		break;
++	default:
++		num_samples = subd->async->cmd.chanlist_len;
++		break;
++	}
++	return num_samples * bytes_per_sample(subd);
++}
++
++#endif /* _COMEDI_FC_H */
+--- /dev/null
++++ b/drivers/staging/comedi/drivers/comedi_pci.h
+@@ -0,0 +1,89 @@
++/*
++    comedi/drivers/comedi_pci.h
++    Various PCI functions for drivers.
++
++    Copyright (C) 2007 MEV Ltd. <http://www.mev.co.uk/>
++
++    COMEDI - Linux Control and Measurement Device Interface
++    Copyright (C) 2000 David A. Schleef <ds@schleef.org>
++
++    This program is free software; you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation; either version 2 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program; if not, write to the Free Software
++    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++
++*/
++
++#ifndef _COMEDI_PCI_H_
++#define _COMEDI_PCI_H_
++
++#include <linux/version.h>
++#include <linux/pci.h>
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,20)
++#define PCI_ENABLE_IS_REFCOUNTED
++#endif
++
++/*
++ * Enables PCI device without requesting regions.  Just a simple wrapper
++ * for pci_enable_device().
++ */
++static inline int comedi_pci_enable_no_regions(struct pci_dev *pdev)
++{
++	return pci_enable_device(pdev);
++}
++
++/*
++ * Called to disable PCI device if PCI device has been enabled, but
++ * PCI regions have not been reserved.
++ *
++ * It only disables the PCI device if the kernel supports reference
++ * counting of PCI enables, otherwise it might stop the device working
++ * in another driver instance.
++ */
++static inline void comedi_pci_disable_no_regions(struct pci_dev *pdev)
++{
++#ifdef PCI_ENABLE_IS_REFCOUNTED
++	pci_disable_device(pdev);
++#endif
++}
++
++/*
++ * Enable the PCI device and request the regions.
++ */
++static inline int comedi_pci_enable(struct pci_dev *pdev, const char *res_name)
++{
++	int rc;
++
++	rc = pci_enable_device(pdev);
++	if (rc < 0) {
++		return rc;
++	}
++	rc = pci_request_regions(pdev, res_name);
++	if (rc < 0) {
++		comedi_pci_disable_no_regions(pdev);
++	}
++	return rc;
++}
++
++/*
++ * Release the regions and disable the PCI device.
++ *
++ * This must be matched with a previous successful call to comedi_pci_enable().
++ */
++static inline void comedi_pci_disable(struct pci_dev *pdev)
++{
++	pci_release_regions(pdev);
++	pci_disable_device(pdev);
++}
++
++#endif
+--- a/drivers/staging/comedi/drivers/Makefile
++++ b/drivers/staging/comedi/drivers/Makefile
+@@ -1,2 +1,5 @@
+ # Makefile for individual comedi drivers
+ #
++
++# Comedi "helper" modules
++obj-$(CONFIG_COMEDI)			+= comedi_fc.o
