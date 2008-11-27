@@ -12,8 +12,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 ---
  drivers/usb/serial/Kconfig   |    9 +
  drivers/usb/serial/Makefile  |    1 
- drivers/usb/serial/opticon.c |  363 +++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 373 insertions(+)
+ drivers/usb/serial/opticon.c |  358 +++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 368 insertions(+)
 
 --- a/drivers/usb/serial/Kconfig
 +++ b/drivers/usb/serial/Kconfig
@@ -45,7 +45,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  obj-$(CONFIG_USB_SERIAL_PL2303)			+= pl2303.o
 --- /dev/null
 +++ b/drivers/usb/serial/opticon.c
-@@ -0,0 +1,363 @@
+@@ -0,0 +1,358 @@
 +/*
 + * Opticon USB barcode to serial driver
 + *
@@ -77,21 +77,20 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +/* This structure holds all of the individual device information */
 +struct opticon_private {
-+	spinlock_t lock;
 +	struct usb_device *udev;
 +	struct usb_serial *serial;
 +	struct usb_serial_port *port;
-+	unsigned char *interrupt_in_buffer;
-+	struct urb *interrupt_read_urb;
++	unsigned char *bulk_in_buffer;
++	struct urb *bulk_read_urb;
 +	int buffer_size;
-+	u8 interrupt_bInterval;
-+	u8 interrupt_address;
++	u8 bulk_address;
++	spinlock_t lock;	/* protects the following flags */
 +	bool throttled;
 +	bool actually_throttled;
 +	bool rts;
 +};
 +
-+static void opticon_interrupt_callback(struct urb *urb)
++static void opticon_bulk_callback(struct urb *urb)
 +{
 +	struct opticon_private *priv = urb->context;
 +	unsigned char *data = urb->transfer_buffer;
@@ -174,12 +173,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	/* Continue trying to always read if we should */
 +	if (!priv->throttled) {
-+		usb_fill_int_urb(priv->interrupt_read_urb, priv->udev,
-+				 usb_rcvintpipe(priv->udev,
-+						priv->interrupt_address),
-+				 priv->interrupt_in_buffer, priv->buffer_size,
-+				 opticon_interrupt_callback, priv,
-+				 priv->interrupt_bInterval);
++		usb_fill_bulk_urb(priv->bulk_read_urb, priv->udev,
++				  usb_rcvbulkpipe(priv->udev,
++						  priv->bulk_address),
++				  priv->bulk_in_buffer, priv->buffer_size,
++				  opticon_bulk_callback, priv);
 +		result = usb_submit_urb(port->read_urb, GFP_ATOMIC);
 +		if (result)
 +			dev_err(&port->dev,
@@ -193,7 +191,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static int opticon_open(struct tty_struct *tty, struct usb_serial_port *port,
 +			struct file *filp)
 +{
-+	struct opticon_private *priv = usb_get_serial_port_data(port);
++	struct opticon_private *priv = usb_get_serial_data(port->serial);
 +	unsigned long flags;
 +	int result = 0;
 +
@@ -202,6 +200,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	spin_lock_irqsave(&priv->lock, flags);
 +	priv->throttled = false;
 +	priv->actually_throttled = false;
++	priv->port = port;
 +	spin_unlock_irqrestore(&priv->lock, flags);
 +
 +	/*
@@ -213,13 +212,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		tty->low_latency = 1;
 +
 +	/* Start reading from the device */
-+	usb_fill_int_urb(priv->interrupt_read_urb, priv->udev,
-+			 usb_rcvintpipe(priv->udev,
-+					priv->interrupt_address),
-+			 priv->interrupt_in_buffer, priv->buffer_size,
-+			 opticon_interrupt_callback, priv,
-+			 priv->interrupt_bInterval);
-+	result = usb_submit_urb(priv->interrupt_read_urb, GFP_KERNEL);
++	usb_fill_bulk_urb(priv->bulk_read_urb, priv->udev,
++			  usb_rcvbulkpipe(priv->udev,
++					  priv->bulk_address),
++			  priv->bulk_in_buffer, priv->buffer_size,
++			  opticon_bulk_callback, priv);
++	result = usb_submit_urb(priv->bulk_read_urb, GFP_KERNEL);
 +	if (result)
 +		dev_err(&port->dev,
 +			"%s - failed resubmitting read urb, error %d\n",
@@ -230,13 +228,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static void opticon_close(struct tty_struct *tty, struct usb_serial_port *port,
 +			  struct file *filp)
 +{
-+	struct opticon_private *priv = usb_get_serial_port_data(port);
++	struct opticon_private *priv = usb_get_serial_data(port->serial);
 +
 +	dbg("%s - port %d", __func__, port->number);
 +
 +	/* shutdown our urbs */
-+	usb_kill_urb(priv->interrupt_read_urb);
-+
++	usb_kill_urb(priv->bulk_read_urb);
 +}
 +
 +static void opticon_throttle(struct tty_struct *tty)
@@ -260,13 +257,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	int result;
 +
 +	dbg("%s - port %d", __func__, port->number);
++
 +	spin_lock_irqsave(&priv->lock, flags);
 +	priv->throttled = false;
 +	priv->actually_throttled = false;
 +	spin_unlock_irqrestore(&priv->lock, flags);
 +
-+	priv->interrupt_read_urb->dev = port->serial->dev;
-+	result = usb_submit_urb(priv->interrupt_read_urb, GFP_ATOMIC);
++	priv->bulk_read_urb->dev = port->serial->dev;
++	result = usb_submit_urb(priv->bulk_read_urb, GFP_ATOMIC);
 +	if (result)
 +		dev_err(&port->dev,
 +			"%s - failed submitting read urb, error %d\n",
@@ -279,7 +277,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	struct usb_host_interface *intf;
 +	int i;
 +	int retval = -ENOMEM;
-+	bool interrupt_in_found = false;
++	bool bulk_in_found = false;
 +
 +	/* create our private serial structure */
 +	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
@@ -289,59 +287,56 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	}
 +	spin_lock_init(&priv->lock);
 +	priv->serial = serial;
-+	priv->port = serial->port[1];
++	priv->port = serial->port[0];
 +	priv->udev = serial->dev;
 +
-+	/* find our interrupt endpoint */
++	/* find our bulk endpoint */
 +	intf = serial->interface->altsetting;
 +	for (i = 0; i < intf->desc.bNumEndpoints; ++i) {
 +		struct usb_endpoint_descriptor *endpoint;
 +
 +		endpoint = &intf->endpoint[i].desc;
-+		if (!usb_endpoint_is_int_in(endpoint))
++		if (!usb_endpoint_is_bulk_in(endpoint))
 +			continue;
 +
-+		priv->interrupt_read_urb = usb_alloc_urb(0, GFP_KERNEL);
-+		if (!priv->interrupt_read_urb) {
++		priv->bulk_read_urb = usb_alloc_urb(0, GFP_KERNEL);
++		if (!priv->bulk_read_urb) {
 +			dev_err(&priv->udev->dev, "out of memory\n");
 +			goto error;
 +		}
 +
 +		priv->buffer_size = le16_to_cpu(endpoint->wMaxPacketSize) * 2;
-+		priv->interrupt_in_buffer = kmalloc(priv->buffer_size,
-+					    GFP_KERNEL);
-+		if (!priv->interrupt_in_buffer) {
++		priv->bulk_in_buffer = kmalloc(priv->buffer_size, GFP_KERNEL);
++		if (!priv->bulk_in_buffer) {
 +			dev_err(&priv->udev->dev, "out of memory\n");
 +			goto error;
 +		}
 +
-+		priv->interrupt_bInterval = endpoint->bInterval;
-+		priv->interrupt_address = endpoint->bEndpointAddress;
++		priv->bulk_address = endpoint->bEndpointAddress;
 +
-+		/* set up our interrupt urb */
-+		usb_fill_int_urb(priv->interrupt_read_urb, priv->udev,
-+				 usb_rcvintpipe(priv->udev,
-+						endpoint->bEndpointAddress),
-+				 priv->interrupt_in_buffer, priv->buffer_size,
-+				 opticon_interrupt_callback, priv,
-+				 endpoint->bInterval);
++		/* set up our bulk urb */
++		usb_fill_bulk_urb(priv->bulk_read_urb, priv->udev,
++				  usb_rcvbulkpipe(priv->udev,
++						  endpoint->bEndpointAddress),
++				  priv->bulk_in_buffer, priv->buffer_size,
++				  opticon_bulk_callback, priv);
 +
-+		interrupt_in_found = true;
++		bulk_in_found = true;
 +		break;
 +		}
 +
-+	if (!interrupt_in_found) {
++	if (!bulk_in_found) {
 +		dev_err(&priv->udev->dev,
 +			"Error - the proper endpoints were not found!\n");
-+		return -ENODEV;
++		goto error;
 +	}
 +
 +	usb_set_serial_data(serial, priv);
 +	return 0;
 +
 +error:
-+	usb_free_urb(priv->interrupt_read_urb);
-+	kfree(priv->interrupt_in_buffer);
++	usb_free_urb(priv->bulk_read_urb);
++	kfree(priv->bulk_in_buffer);
 +	kfree(priv);
 +	return retval;
 +}
@@ -352,9 +347,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	dbg("%s", __func__);
 +
-+	usb_kill_urb(priv->interrupt_read_urb);
-+	usb_free_urb(priv->interrupt_read_urb);
-+	kfree(priv->interrupt_in_buffer);
++	usb_kill_urb(priv->bulk_read_urb);
++	usb_free_urb(priv->bulk_read_urb);
++	kfree(priv->bulk_in_buffer);
 +	kfree(priv);
 +	usb_set_serial_data(serial, NULL);
 +}
