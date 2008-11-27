@@ -1,0 +1,125 @@
+From mdharm-usb@one-eyed-alien.net  Tue Nov 25 10:58:22 2008
+From: Ben Efros <ben@pc-doctor.com>
+Date: Tue, 18 Nov 2008 13:31:13 -0800
+Subject: USB: storage devices and SAT
+To: Greg KH <greg@kroah.com>
+Message-ID: <20081118213113.GX6633@one-eyed-alien.net>
+Content-Disposition: inline
+
+From: Ben Efros <ben@pc-doctor.com>
+
+Add the SANE SENSE flag to indicate that a device is capable of handling
+more than 18-bytes of sense data.  This functionality is required for
+USB-ATA bridges implementing SAT.  A future patch will actually enable this
+function for several devices.
+
+The logic behind this is that we can detect support for SANE_SENSE in a few ways:
+ 1) ATA PASS THROUGH (12) or (16) execute successfully
+ 2) SPC-3 or higher is in use
+ 3) A previous CHECK CONDITION occurred with sense format 70-73 and had
+    a length greater than 18-bytes total
+
+Signed-off-by: Ben Efros <ben@pc-doctor.com>
+Signed-off-by: Matthew Dharm <mdharm-usb@one-eyed-alien.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ drivers/usb/storage/scsiglue.c  |    4 ++++
+ drivers/usb/storage/transport.c |   40 +++++++++++++++++++++++++++++++++++++++-
+ include/linux/usb_usual.h       |    5 +++--
+ 3 files changed, 46 insertions(+), 3 deletions(-)
+
+--- a/drivers/usb/storage/scsiglue.c
++++ b/drivers/usb/storage/scsiglue.c
+@@ -170,6 +170,10 @@ static int slave_configure(struct scsi_d
+ 		if (us->fflags & US_FL_CAPACITY_HEURISTICS)
+ 			sdev->guess_capacity = 1;
+ 
++		/* assume SPC3 or latter devices support sense size > 18 */
++		if (sdev->scsi_level > SCSI_SPC_2)
++			us->fflags |= US_FL_SANE_SENSE;
++
+ 		/* Some devices report a SCSI revision level above 2 but are
+ 		 * unable to handle the REPORT LUNS command (for which
+ 		 * support is mandatory at level 3).  Since we already have
+--- a/drivers/usb/storage/transport.c
++++ b/drivers/usb/storage/transport.c
+@@ -579,6 +579,20 @@ void usb_stor_invoke_transport(struct sc
+ 	}
+ 
+ 	/*
++	 * Determine if this device is SAT by seeing if the
++	 * command executed successfully.  Otherwise we'll have
++	 * to wait for at least one CHECK_CONDITION to determine
++	 * SANE_SENSE support
++	 */
++	if ((srb->cmnd[0] == ATA_16 || srb->cmnd[0] == ATA_12) &&
++	    result == USB_STOR_TRANSPORT_GOOD &&
++	    !(us->fflags & US_FL_SANE_SENSE) &&
++	    !(srb->cmnd[2] & 0x20)) {
++		US_DEBUGP("-- SAT supported, increasing auto-sense\n");
++		us->fflags |= US_FL_SANE_SENSE;
++	}
++
++	/*
+ 	 * A short transfer on a command where we don't expect it
+ 	 * is unusual, but it doesn't mean we need to auto-sense.
+ 	 */
+@@ -595,10 +609,15 @@ void usb_stor_invoke_transport(struct sc
+ 	if (need_auto_sense) {
+ 		int temp_result;
+ 		struct scsi_eh_save ses;
++		int sense_size = US_SENSE_SIZE;
++
++		/* device supports and needs bigger sense buffer */
++		if (us->fflags & US_FL_SANE_SENSE)
++			sense_size = ~0;
+ 
+ 		US_DEBUGP("Issuing auto-REQUEST_SENSE\n");
+ 
+-		scsi_eh_prep_cmnd(srb, &ses, NULL, 0, US_SENSE_SIZE);
++		scsi_eh_prep_cmnd(srb, &ses, NULL, 0, sense_size);
+ 
+ 		/* FIXME: we must do the protocol translation here */
+ 		if (us->subclass == US_SC_RBC || us->subclass == US_SC_SCSI ||
+@@ -632,6 +651,25 @@ void usb_stor_invoke_transport(struct sc
+ 			return;
+ 		}
+ 
++		/* If the sense data returned is larger than 18-bytes then we
++		 * assume this device supports requesting more in the future.
++		 * The response code must be 70h through 73h inclusive.
++		 */
++		if (srb->sense_buffer[7] > (US_SENSE_SIZE - 8) &&
++		    !(us->fflags & US_FL_SANE_SENSE) &&
++		    (srb->sense_buffer[0] & 0x7C) == 0x70) {
++			US_DEBUGP("-- SANE_SENSE support enabled\n");
++			us->fflags |= US_FL_SANE_SENSE;
++
++			/* Indicate to the user that we truncated their sense
++			 * because we didn't know it supported larger sense.
++			 */
++			US_DEBUGP("-- Sense data truncated to %i from %i\n",
++			          US_SENSE_SIZE,
++			          srb->sense_buffer[7] + 8);
++			srb->sense_buffer[7] = (US_SENSE_SIZE - 8);
++		}
++
+ 		US_DEBUGP("-- Result from auto-sense is %d\n", temp_result);
+ 		US_DEBUGP("-- code: 0x%x, key: 0x%x, ASC: 0x%x, ASCQ: 0x%x\n",
+ 			  srb->sense_buffer[0],
+--- a/include/linux/usb_usual.h
++++ b/include/linux/usb_usual.h
+@@ -52,8 +52,9 @@
+ 	US_FLAG(MAX_SECTORS_MIN,0x00002000)			\
+ 		/* Sets max_sectors to arch min */		\
+ 	US_FLAG(BULK_IGNORE_TAG,0x00004000)			\
+-		/* Ignore tag mismatch in bulk operations */
+-
++		/* Ignore tag mismatch in bulk operations */    \
++	US_FLAG(SANE_SENSE,     0x00008000)
++		/* Sane Sense (> 18 bytes) */
+ 
+ #define US_FLAG(name, value)	US_FL_##name = value ,
+ enum { US_DO_ALL_FLAGS };
