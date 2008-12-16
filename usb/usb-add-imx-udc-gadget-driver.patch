@@ -6,9 +6,12 @@ Subject: USB: add imx udc gadget driver
 
 From: Darius Augulis <augulis.darius@gmail.com>
 
+Implementation of USB device driver integrated in Freescale's i.MXL
+processor.
+
 Adds USB device driver for i.MXL.
 
-From: Darius Augulis <augulis.darius@gmail.com>
+Signed-off-by: Darius Augulis <augulis.darius@gmail.com>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
@@ -16,9 +19,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  drivers/usb/gadget/Kconfig           |   21 
  drivers/usb/gadget/Makefile          |    1 
  drivers/usb/gadget/gadget_chips.h    |    1 
- drivers/usb/gadget/imx_udc.c         | 1494 +++++++++++++++++++++++++++++++++++
- drivers/usb/gadget/imx_udc.h         |  327 +++++++
- 6 files changed, 1866 insertions(+), 1 deletion(-)
+ drivers/usb/gadget/imx_udc.c         | 1516 +++++++++++++++++++++++++++++++++++
+ drivers/usb/gadget/imx_udc.h         |  344 +++++++
+ 6 files changed, 1905 insertions(+), 1 deletion(-)
 
 --- /dev/null
 +++ b/arch/arm/plat-mxc/include/mach/usb.h
@@ -58,7 +61,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  #else
 --- /dev/null
 +++ b/drivers/usb/gadget/imx_udc.c
-@@ -0,0 +1,1494 @@
+@@ -0,0 +1,1516 @@
 +/*
 + *	driver/usb/gadget/imx_udc.c
 + *
@@ -213,8 +216,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	__raw_writel(INTR_MSOF | INTR_FRAME_MATCH, imx_usb->base + USB_MASK);
 +
 +	/* Enable EP0 irqs */
-+	__raw_writel(0x1FF & ~(EPINTR_DEVREQ | EPINTR_EOT | EPINTR_EOF
-+		| EPINTR_FIFO_EMPTY | EPINTR_FIFO_FULL),
++	__raw_writel(0x1FF & ~(EPINTR_DEVREQ | EPINTR_MDEVREQ | EPINTR_EOT
++		| EPINTR_EOF | EPINTR_FIFO_EMPTY | EPINTR_FIFO_FULL),
 +		imx_usb->base + USB_EP_MASK(0));
 +}
 +
@@ -296,8 +299,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	__raw_writel(0x1FF, imx_ep->imx_usb->base + USB_EP_MASK(i));
 +	__raw_writel(0x1FF, imx_ep->imx_usb->base + USB_EP_INTR(i));
-+	__raw_writel(0x1FF & ~(EPINTR_EOT | EPINTR_EOF | EPINTR_FIFO_EMPTY
-+		| EPINTR_FIFO_FULL), imx_ep->imx_usb->base + USB_EP_MASK(i));
++	__raw_writel(0x1FF & ~(EPINTR_EOT | EPINTR_EOF),
++		imx_ep->imx_usb->base + USB_EP_MASK(i));
 +}
 +
 +void imx_ep_irq_disable(struct imx_ep_struct *imx_ep)
@@ -334,15 +337,38 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		imx_usb->base + USB_EP_STAT(EP_NO(imx_ep)));
 +}
 +
-+void imx_force_stall(struct imx_ep_struct *imx_ep)
++void imx_ep_stall(struct imx_ep_struct *imx_ep)
 +{
 +	struct imx_udc_struct *imx_usb = imx_ep->imx_usb;
-+	int temp;
++	int temp, i;
++
++	D_ERR(imx_usb->dev, "<%s> Forced stall on %s\n", __func__, imx_ep->ep.name);
 +
 +	imx_flush(imx_ep);
-+	temp = __raw_readl(imx_usb->base + USB_EP_STAT(EP_NO(imx_ep)));
-+	__raw_writel(temp | EPSTAT_STALL,
-+		imx_usb->base + USB_EP_STAT(EP_NO(imx_ep)));
++
++	/* Special care for ep0 */
++	if (EP_NO(imx_ep)) {
++		temp = __raw_readl(imx_usb->base + USB_CTRL);
++		__raw_writel(temp | CTRL_CMDOVER | CTRL_CMDERROR, imx_usb->base + USB_CTRL);
++		do { } while (__raw_readl(imx_usb->base + USB_CTRL) & CTRL_CMDOVER);
++		temp = __raw_readl(imx_usb->base + USB_CTRL);
++		__raw_writel(temp & ~CTRL_CMDERROR, imx_usb->base + USB_CTRL);
++	}
++	else {
++		temp = __raw_readl(imx_usb->base + USB_EP_STAT(EP_NO(imx_ep)));
++		__raw_writel(temp | EPSTAT_STALL,
++			imx_usb->base + USB_EP_STAT(EP_NO(imx_ep)));
++
++		for (i = 0; i < 100; i ++) {
++			temp = __raw_readl(imx_usb->base + USB_EP_STAT(EP_NO(imx_ep)));
++	 		if (!temp & EPSTAT_STALL)
++	 			break;
++	 		udelay(20);
++	 	}
++		if (i == 50)
++			D_ERR(imx_usb->dev, "<%s> Non finished stall on %s\n",
++				__func__, imx_ep->ep.name);
++	}
 +}
 +
 +static int imx_udc_get_frame(struct usb_gadget *_gadget)
@@ -391,7 +417,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		status = req->req.status;
 +
 +	if (status && status != -ESHUTDOWN)
-+		D_REQ(imx_ep->imx_usb->dev,
++		D_ERR(imx_ep->imx_usb->dev,
 +			"<%s> complete %s req %p stat %d len %u/%u\n", __func__,
 +			imx_ep->ep.name, &req->req, status,
 +			req->req.actual, req->req.length);
@@ -483,7 +509,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +{
 +	int 	bytes = 0,
 +		count,
-+		is_short,
 +		completed = 0;
 +
 +	while (__raw_readl(imx_ep->imx_usb->base + USB_EP_FSTAT(EP_NO(imx_ep)))
@@ -491,8 +516,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			count = read_packet(imx_ep, req);
 +			bytes += count;
 +
-+			is_short = (count != imx_ep->fifosize);
-+			if (is_short || req->req.actual == req->req.length) {
++			completed = (count != imx_ep->fifosize);
++			if (completed || req->req.actual == req->req.length) {
 +				completed = 1;
 +				break;
 +			}
@@ -500,6 +525,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	if (completed || !req->req.length) {
 +		done(imx_ep, req, 0);
++		D_REQ(imx_ep->imx_usb->dev, "<%s> %s req<%p> %s\n",
++			__func__, imx_ep->ep.name, req,
++			completed ? "completed" : "not completed");
 +		if (!EP_NO(imx_ep))
 +			ep0_chg_stat(__func__, imx_ep->imx_usb, EP0_IDLE);
 +	}
@@ -513,19 +541,22 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +{
 +	int	bytes = 0,
 +		count,
-+		is_short = 0;
++		completed = 0;
 +
-+	while (!is_short) {
++	while (!completed) {
 +		count = write_packet(imx_ep, req);
 +		if (count < 0)
 +			break; /* busy */
 +		bytes += count;
 +
 +		/* last packet "must be" short (or a zlp) */
-+		is_short = (count != imx_ep->fifosize);
++		completed = (count != imx_ep->fifosize);
 +
-+		if (unlikely(is_short)) {
++		if (unlikely(completed)) {
 +			done(imx_ep, req, 0);
++			D_REQ(imx_ep->imx_usb->dev, "<%s> %s req<%p> %s\n",
++				__func__, imx_ep->ep.name, req,
++				completed ? "completed" : "not completed");
 +			if (!EP_NO(imx_ep))
 +				ep0_chg_stat(__func__, imx_ep->imx_usb, EP0_IDLE);
 +		}
@@ -533,7 +564,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	D_TRX(imx_ep->imx_usb->dev, "<%s> bytes sent: %d\n", __func__, bytes);
 +
-+	return is_short;
++	return completed;
 +}
 +
 +/*******************************************************************************
@@ -559,10 +590,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			completed = write_fifo(imx_ep, req);
 +		else			/* to device */
 +			completed = read_fifo(imx_ep, req);
-+
-+		D_REQ(imx_ep->imx_usb->dev, "<%s> %s req<%p> %s\n",
-+			__func__, imx_ep->ep.name, req,
-+			completed ? "completed" : "not completed");
 +
 +		dump_ep_stat(__func__, imx_ep);
 +
@@ -616,7 +643,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	/* read SETUP packet */
 +	for (i = 0; i < 2; i++) {
 +		if (imx_ep_empty(imx_ep)) {
-+			D_EP0(imx_usb->dev,
++			D_ERR(imx_usb->dev,
 +				"<%s> no setup packet received\n", __func__);
 +			goto stall;
 +		}
@@ -626,7 +653,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	temp = imx_ep_empty(imx_ep);
 +	while (!imx_ep_empty(imx_ep)) {
 +		i = __raw_readl(imx_usb->base +	USB_EP_FDAT(EP_NO(imx_ep)));
-+		D_EP0(imx_usb->dev,
++		D_ERR(imx_usb->dev,
 +			"<%s> wrong to have extra bytes for setup : 0x%08x\n",
 +			__func__, i);
 +	}
@@ -637,7 +664,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	le16_to_cpus(&u.r.wIndex);
 +	le16_to_cpus(&u.r.wLength);
 +
-+	D_EP0(imx_usb->dev, "<%s> SETUP %02x.%02x v%04x i%04x l%04x\n",
++	D_REQ(imx_usb->dev, "<%s> SETUP %02x.%02x v%04x i%04x l%04x\n",
 +		__func__, u.r.bRequestType, u.r.bRequest,
 +		u.r.wValue, u.r.wIndex, u.r.wLength);
 +
@@ -646,7 +673,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		temp = __raw_readl(imx_usb->base + USB_CTRL);
 +		__raw_writel(temp | CTRL_CMDOVER, imx_usb->base + USB_CTRL);
 +
-+		D_EP0(imx_usb->dev,
++		D_ERR(imx_usb->dev,
 +			"<%s> set config req is pending, NACK the host\n",
 +			__func__);
 +		return;
@@ -659,14 +686,15 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	i = imx_usb->driver->setup(&imx_usb->gadget, &u.r);
 +	if (i < 0) {
-+		D_EP0(imx_usb->dev, "<%s> protocol STALL, ep0 err %d\n",
++		D_ERR(imx_usb->dev, "<%s> device setup error %d\n",
 +			__func__, i);
 +		goto stall;
 +	}
 +
 +	return;
 +stall:
-+	imx_force_stall(imx_ep);
++	D_ERR(imx_usb->dev, "<%s> protocol STALL\n", __func__);
++	imx_ep_stall(imx_ep);
 +	ep0_chg_stat(__func__, imx_usb, EP0_STALL);
 +	return;
 +}
@@ -689,35 +717,35 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		|| !EP_NO(imx_ep)
 +		|| desc->bDescriptorType != USB_DT_ENDPOINT
 +		|| imx_ep->bEndpointAddress != desc->bEndpointAddress) {
-+			D_EPX(imx_usb->dev,
++			D_ERR(imx_usb->dev,
 +				"<%s> bad ep or descriptor\n", __func__);
 +			return -EINVAL;
 +	}
 +
 +	if (imx_ep->bmAttributes != desc->bmAttributes) {
-+		D_EPX(imx_usb->dev,
++		D_ERR(imx_usb->dev,
 +			"<%s> %s type mismatch\n", __func__, usb_ep->name);
 +		return -EINVAL;
 +	}
 +
 +	if (imx_ep->fifosize < le16_to_cpu(desc->wMaxPacketSize)) {
-+		D_EPX(imx_usb->dev,
++		D_ERR(imx_usb->dev,
 +			"<%s> bad %s maxpacket\n", __func__, usb_ep->name);
 +		return -ERANGE;
 +	}
 +
 +	if (!imx_usb->driver || imx_usb->gadget.speed == USB_SPEED_UNKNOWN) {
-+		D_EPX(imx_usb->dev, "<%s> bogus device state\n", __func__);
++		D_ERR(imx_usb->dev, "<%s> bogus device state\n", __func__);
 +		return -ESHUTDOWN;
 +	}
 +
-+	spin_lock_irqsave(&imx_ep->lock, flags);
++	local_irq_save(flags);
 +
 +	imx_ep->stopped = 0;
 +	imx_flush(imx_ep);
 +	imx_ep_irq_enable(imx_ep);
 +
-+	spin_unlock_irqrestore(&imx_ep->lock, flags);
++	local_irq_restore(flags);
 +
 +	D_EPX(imx_usb->dev, "<%s> ENABLED %s\n", __func__, usb_ep->name);
 +	return 0;
@@ -730,19 +758,19 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	unsigned long flags;
 +
 +	if (!usb_ep || !EP_NO(imx_ep) || !list_empty(&imx_ep->queue)) {
-+		D_EPX(imx_ep->imx_usb->dev, "<%s> %s can not be disabled\n",
++		D_ERR(imx_ep->imx_usb->dev, "<%s> %s can not be disabled\n",
 +			__func__, usb_ep ? imx_ep->ep.name : NULL);
 +		return -EINVAL;
 +	}
 +
-+	spin_lock_irqsave(&imx_ep->lock, flags);
++	local_irq_save(flags);
 +
 +	imx_ep->stopped = 1;
 +	nuke(imx_ep, -ESHUTDOWN);
 +	imx_flush(imx_ep);
 +	imx_ep_irq_disable(imx_ep);
 +
-+	spin_unlock_irqrestore(&imx_ep->lock, flags);
++	local_irq_restore(flags);
 +
 +	D_EPX(imx_ep->imx_usb->dev,
 +		"<%s> DISABLED %s\n", __func__, usb_ep->name);
@@ -777,21 +805,23 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static int imx_ep_queue
 +	(struct usb_ep *usb_ep, struct usb_request *usb_req, gfp_t gfp_flags)
 +{
-+	struct imx_ep_struct	*imx_ep = container_of
-+					(usb_ep, struct imx_ep_struct, ep);
-+	struct imx_request	*req = container_of
-+					(usb_req, struct imx_request, req);
-+	struct imx_udc_struct	*imx_usb = imx_ep->imx_usb;
++	struct imx_ep_struct	*imx_ep;
++	struct imx_udc_struct	*imx_usb;
++	struct imx_request	*req;
 +	unsigned long		flags;
 +	int			ret = 0;
 +
++	imx_ep = container_of(usb_ep, struct imx_ep_struct, ep);
++	imx_usb = imx_ep->imx_usb;
++	req = container_of(usb_req, struct imx_request, req);
++
++	/*
++	  Special care on IMX udc.
++	  Ignore enqueue when after set configuration from the
++	  host. This assume all gadget drivers reply set
++	  configuration with the next ep0 req enqueue.
++	*/
 +	if (imx_usb->set_config && !EP_NO(imx_ep)) {
-+		/*
-+		  Special care on IMX udc.
-+		  Ignore enqueue when after set configuration from the
-+		  host. This assume all gadget drivers reply set
-+		  configuration with the next ep0 req enqueue.
-+		*/
 +		imx_usb->set_config = 0;
 +		D_EPX(imx_usb->dev,
 +			"<%s> gadget reply set config\n", __func__);
@@ -799,24 +829,27 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	}
 +
 +	if (unlikely(!usb_req || !req || !usb_req->complete || !usb_req->buf)) {
-+		D_EPX(imx_usb->dev, "<%s> bad params\n", __func__);
++		D_ERR(imx_usb->dev, "<%s> bad params\n", __func__);
 +		return -EINVAL;
 +	}
 +
 +	if (unlikely(!usb_ep || !imx_ep)) {
-+		D_EPX(imx_usb->dev, "<%s> bad ep\n", __func__);
++		D_ERR(imx_usb->dev, "<%s> bad ep\n", __func__);
 +		return -EINVAL;
 +	}
 +
 +	if (!imx_usb->driver || imx_usb->gadget.speed == USB_SPEED_UNKNOWN) {
-+		D_EPX(imx_usb->dev, "<%s> bogus device state\n", __func__);
++		D_ERR(imx_usb->dev, "<%s> bogus device state\n", __func__);
 +		return -ESHUTDOWN;
 +	}
 +
-+	spin_lock_irqsave(&imx_ep->lock, flags);
++	local_irq_save(flags);
 +
 +	/* Debug */
-+	dump_usb_stat(__func__, imx_usb);
++	D_REQ(imx_usb->dev, "<%s> ep%d %s request for [%d] bytes\n",
++		__func__, EP_NO(imx_ep),
++		((!EP_NO(imx_ep) && imx_ep->imx_usb->ep0state == EP0_IN_DATA_PHASE)
++		|| (EP_NO(imx_ep) && EP_DIR(imx_ep))) ? "IN" : "OUT", usb_req->length);
 +	dump_req(__func__, imx_ep, usb_req);
 +
 +	if (imx_ep->stopped) {
@@ -826,7 +859,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	}
 +
 +	if (req->in_use) {
-+		D_REQ(imx_usb->dev,
++		D_ERR(imx_usb->dev,
 +			"<%s> refusing to queue req %p (already queued)\n",
 +			__func__, req);
 +		goto out;
@@ -837,12 +870,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	ep_add_request(imx_ep, req);
 +
-+	if (!EP_NO(imx_ep))	/* ep0 */
++	if (!EP_NO(imx_ep))
 +		ret = handle_ep0(imx_ep);
 +	else
 +		ret = handle_ep(imx_ep);
 +out:
-+	spin_unlock_irqrestore(&imx_ep->lock, flags);
++	local_irq_restore(flags);
 +	return ret;
 +}
 +
@@ -855,11 +888,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	unsigned long flags;
 +
 +	if (unlikely(!usb_ep || !EP_NO(imx_ep))) {
-+		D_EPX(imx_ep->imx_usb->dev, "<%s> bad ep\n", __func__);
++		D_ERR(imx_ep->imx_usb->dev, "<%s> bad ep\n", __func__);
 +		return -EINVAL;
 +	}
 +
-+	spin_lock_irqsave(&imx_ep->lock, flags);
++	local_irq_save(flags);
 +
 +	/* make sure it's actually queued on this endpoint */
 +	list_for_each_entry(req, &imx_ep->queue, queue) {
@@ -867,13 +900,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			break;
 +	}
 +	if (&req->req != usb_req) {
-+		spin_unlock_irqrestore(&imx_ep->lock, flags);
++		local_irq_restore(flags);
 +		return -EINVAL;
 +	}
 +
 +	done(imx_ep, req, -ECONNRESET);
 +
-+	spin_unlock_irqrestore(&imx_ep->lock, flags);
++	local_irq_restore(flags);
 +	return 0;
 +}
 +
@@ -884,21 +917,21 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	unsigned long flags;
 +
 +	if (unlikely(!usb_ep || !EP_NO(imx_ep))) {
-+		D_EPX(imx_ep->imx_usb->dev, "<%s> bad ep\n", __func__);
++		D_ERR(imx_ep->imx_usb->dev, "<%s> bad ep\n", __func__);
 +		return -EINVAL;
 +	}
 +
-+	spin_lock_irqsave(&imx_ep->lock, flags);
++	local_irq_save(flags);
 +
 +	if ((imx_ep->bEndpointAddress & USB_DIR_IN)
 +		&& !list_empty(&imx_ep->queue)) {
-+			spin_unlock_irqrestore(&imx_ep->lock, flags);
++			local_irq_restore(flags);
 +			return -EAGAIN;
 +	}
 +
-+	imx_force_stall(imx_ep);
++	imx_ep_stall(imx_ep);
 +
-+	spin_unlock_irqrestore(&imx_ep->lock, flags);
++	local_irq_restore(flags);
 +
 +	D_EPX(imx_ep->imx_usb->dev, "<%s> %s halt\n", __func__, usb_ep->name);
 +	return 0;
@@ -910,7 +943,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +					(usb_ep, struct imx_ep_struct, ep);
 +
 +	if (!usb_ep) {
-+		D_EPX(imx_ep->imx_usb->dev, "<%s> bad ep\n", __func__);
++		D_ERR(imx_ep->imx_usb->dev, "<%s> bad ep\n", __func__);
 +		return -ENODEV;
 +	}
 +
@@ -926,18 +959,18 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +					(usb_ep, struct imx_ep_struct, ep);
 +	unsigned long flags;
 +
-+	spin_lock_irqsave(&imx_ep->lock, flags);
++	local_irq_save(flags);
 +
 +	if (!usb_ep || !EP_NO(imx_ep) || !list_empty(&imx_ep->queue)) {
-+		D_EPX(imx_ep->imx_usb->dev, "<%s> bad ep\n", __func__);
-+		spin_unlock_irqrestore(&imx_ep->lock, flags);
++		D_ERR(imx_ep->imx_usb->dev, "<%s> bad ep\n", __func__);
++		local_irq_restore(flags);
 +		return;
 +	}
 +
 +	/* toggle and halt bits stay unchanged */
 +	imx_flush(imx_ep);
 +
-+	spin_unlock_irqrestore(&imx_ep->lock, flags);
++	local_irq_restore(flags);
 +}
 +
 +static struct usb_ep_ops imx_ep_ops = {
@@ -963,7 +996,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +void ep0_chg_stat(const char *label,
 +			struct imx_udc_struct *imx_usb, enum ep0_state stat)
 +{
-+	D_STT(imx_usb->dev, "<%s> from %15s to %15s\n",
++	D_EP0(imx_usb->dev, "<%s> from %15s to %15s\n",
 +		label, state_name[imx_usb->ep0state], state_name[stat]);
 +
 +	if (imx_usb->ep0state == stat)
@@ -994,7 +1027,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			imx_ep->stopped = 0;
 +
 +		INIT_LIST_HEAD(&imx_ep->queue);
-+		spin_lock_init(&imx_ep->lock);
 +	}
 +}
 +
@@ -1004,23 +1036,24 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	struct imx_ep_struct *imx_ep;
 +	int i;
 +
-+
 +	if (imx_usb->gadget.speed == USB_SPEED_UNKNOWN)
-+		driver = 0;
++		driver = NULL;
++
 +	/* prevent new request submissions, kill any outstanding requests  */
 +	for (i = 1; i < IMX_USB_NB_EP; i++) {
 +		imx_ep = &imx_usb->imx_ep[i];
 +		imx_flush(imx_ep);
 +		imx_ep->stopped = 1;
++		imx_ep_irq_disable(imx_ep);
 +		nuke(imx_ep, -ESHUTDOWN);
 +	}
-+	imx_usb->gadget.speed = USB_SPEED_UNKNOWN;
-+	if (driver) {
-+		imx_usb->cfg = 0;
-+		imx_usb->intf = 0;
-+		imx_usb->alt = 0;
++
++	imx_usb->cfg = 0;
++	imx_usb->intf = 0;
++	imx_usb->alt = 0;
++
++	if (driver)
 +		driver->disconnect(&imx_usb->gadget);
-+	}
 +}
 +
 +/*******************************************************************************
@@ -1032,10 +1065,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +{
 +	struct imx_udc_struct *imx_usb = dev;
 +	struct usb_ctrlrequest u;
-+	int intr, temp, cfg, intf, alt;
-+
-+
-+	intr = __raw_readl(imx_usb->base + USB_INTR);
++	int temp, cfg, intf, alt;
++	int intr = __raw_readl(imx_usb->base + USB_INTR);
 +
 +	if (intr & (INTR_WAKEUP | INTR_SUSPEND | INTR_RESUME | INTR_RESET_START
 +			| INTR_RESET_STOP | INTR_CFG_CHG)) {
@@ -1052,7 +1083,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		if (imx_usb->gadget.speed == USB_SPEED_UNKNOWN
 +			&& imx_usb->driver && imx_usb->driver->resume)
 +				imx_usb->driver->resume(&imx_usb->gadget);
-+		__raw_writel(intr, imx_usb->base + USB_INTR);
 +		imx_usb->set_config = 0;
 +		imx_usb->gadget.speed = USB_SPEED_FULL;
 +	}
@@ -1061,38 +1091,41 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		if (imx_usb->gadget.speed != USB_SPEED_UNKNOWN
 +			&& imx_usb->driver && imx_usb->driver->suspend)
 +				imx_usb->driver->suspend(&imx_usb->gadget);
++		imx_usb->set_config = 0;
 +		imx_usb->gadget.speed = USB_SPEED_UNKNOWN;
 +	}
 +
 +	if (intr & INTR_RESET_START) {
-+		udc_stop_activity(imx_usb, imx_usb->driver);
 +		__raw_writel(intr, imx_usb->base + USB_INTR);
++		udc_stop_activity(imx_usb, imx_usb->driver);
 +		imx_usb->set_config = 0;
-+		imx_usb->gadget.speed = USB_SPEED_FULL;
++		imx_usb->gadget.speed = USB_SPEED_UNKNOWN;
 +	}
 +
 +	if (intr & INTR_RESET_STOP)
 +		imx_usb->gadget.speed = USB_SPEED_FULL;
 +
 +	if (intr & INTR_CFG_CHG) {
++		__raw_writel(INTR_CFG_CHG, imx_usb->base + USB_INTR);
 +		temp = __raw_readl(imx_usb->base + USB_STAT);
 +		cfg  = (temp & STAT_CFG) >> 5;
 +		intf = (temp & STAT_INTF) >> 3;
 +		alt  =  temp & STAT_ALTSET;
 +
-+		D_IRQ(imx_usb->dev,
++		D_REQ(imx_usb->dev,
 +			"<%s> orig config C=%d, I=%d, A=%d / "
 +			"req config C=%d, I=%d, A=%d\n",
 +			__func__, imx_usb->cfg, imx_usb->intf, imx_usb->alt,
 +			cfg, intf, alt);
 +
 +		if (cfg != 1 && cfg != 2)
-+			goto end_irq; /* can not happen */
++			goto end_irq;
 +
 +		imx_usb->set_config = 0;
 +
 +		/* Config setup */
 +		if (imx_usb->cfg != cfg) {
++			D_REQ(imx_usb->dev, "<%s> Change config start\n",__func__);
 +			u.bRequest = USB_REQ_SET_CONFIGURATION;
 +			u.bRequestType = USB_DIR_OUT |
 +					USB_TYPE_STANDARD |
@@ -1103,10 +1136,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			imx_usb->cfg = cfg;
 +			imx_usb->set_config = 1;
 +			imx_usb->driver->setup(&imx_usb->gadget, &u);
++			imx_usb->set_config = 0;
++			D_REQ(imx_usb->dev, "<%s> Change config done\n",__func__);
++
 +		}
-+
 +		if (imx_usb->intf != intf || imx_usb->alt != alt) {
-+
++			D_REQ(imx_usb->dev, "<%s> Change interface start\n",__func__);
 +			u.bRequest = USB_REQ_SET_INTERFACE;
 +			u.bRequestType = USB_DIR_OUT |
 +					  USB_TYPE_STANDARD |
@@ -1118,15 +1153,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			imx_usb->alt = alt;
 +			imx_usb->set_config = 1;
 +			imx_usb->driver->setup(&imx_usb->gadget, &u);
++			imx_usb->set_config = 0;
++			D_REQ(imx_usb->dev, "<%s> Change interface done\n",__func__);
 +		}
 +	}
 +
 +	if (intr & INTR_SOF) {
-+		/* copy from motorola bsp.
-+		   We must enable SOF intr and signal CMDOVER.
-+		   Datasheet don't specifiy this action, but it
-+		   is done in motorola bsp, so just copy it
-+		*/
 +		if (imx_usb->ep0state == EP0_IDLE) {
 +			temp = __raw_readl(imx_usb->base + USB_CTRL);
 +			__raw_writel(temp | CTRL_CMDOVER, imx_usb->base + USB_CTRL);
@@ -1151,7 +1183,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	}
 +
 +	/* DEVREQ IRQ has highest priority */
-+	if (intr & EPINTR_DEVREQ)
++	if (intr & (EPINTR_DEVREQ | EPINTR_MDEVREQ))
 +		handle_ep0_devreq(imx_usb);
 +	/* Seem i.MX is missing EOF interrupt sometimes.
 +	 * Therefore we monitor both EOF and FIFO_EMPTY interrups
@@ -1233,7 +1265,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		.bEndpointAddress	= 0,
 +		.bmAttributes		= USB_ENDPOINT_XFER_CONTROL,
 +	 },
-+
 +	.imx_ep[1] = {
 +		.ep = {
 +			.name		= "ep1in-bulk",
@@ -1271,10 +1302,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		.ep = {
 +			.name		= "ep4in-int",
 +			.ops		= &imx_ep_ops,
-+			.maxpacket	= 16,
++			.maxpacket	= 32,
 +		 },
 +		.imx_usb		= &controller,
-+		.fifosize		= 16,
++		.fifosize		= 32,
 +		.bEndpointAddress 	= USB_DIR_IN | 4,
 +		.bmAttributes		= USB_ENDPOINT_XFER_INT,
 +	 },
@@ -1282,10 +1313,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		.ep = {
 +			.name		= "ep5out-int",
 +			.ops		= &imx_ep_ops,
-+			.maxpacket	= 16,
++			.maxpacket	= 32,
 +		},
 +		.imx_usb		= &controller,
-+		.fifosize		= 16,
++		.fifosize		= 32,
 +		.bEndpointAddress 	= USB_DIR_OUT | 5,
 +		.bmAttributes		= USB_ENDPOINT_XFER_INT,
 +	 },
@@ -1320,7 +1351,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		goto fail;
 +	retval = driver->bind(&imx_usb->gadget);
 +	if (retval) {
-+		D_INI(imx_usb->dev, "<%s> bind to driver %s --> error %d\n",
++		D_ERR(imx_usb->dev, "<%s> bind to driver %s --> error %d\n",
 +			__func__, driver->driver.name, retval);
 +		device_del(&imx_usb->gadget.dev);
 +
@@ -1329,10 +1360,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	D_INI(imx_usb->dev, "<%s> registered gadget driver '%s'\n",
 +		__func__, driver->driver.name);
++
 +	imx_udc_enable(imx_usb);
-+	imx_usb->cfg = 0;
-+	imx_usb->intf = 0;
-+	imx_usb->alt = 0;
 +
 +	return 0;
 +fail:
@@ -1467,12 +1496,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	platform_set_drvdata(pdev, imx_usb);
 +
-+	dump_usb_stat(__func__, imx_usb);
-+
 +	usb_init_data(imx_usb);
 +	imx_udc_init(imx_usb);
-+
-+	dump_usb_stat(__func__, imx_usb);
 +
 +	return 0;
 +
@@ -1555,7 +1580,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +MODULE_ALIAS("platform:imx_udc");
 --- /dev/null
 +++ b/drivers/usb/gadget/imx_udc.h
-@@ -0,0 +1,327 @@
+@@ -0,0 +1,344 @@
 +/*
 + *	Copyright (C) 2005 Mike Lee(eemike@gmail.com)
 + *
@@ -1596,7 +1621,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	EP0_IDLE,
 +	EP0_IN_DATA_PHASE,
 +	EP0_OUT_DATA_PHASE,
-+	EP0_END_XFER,
++	EP0_CONFIG,
 +	EP0_STALL,
 +};
 +
@@ -1604,7 +1629,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	struct usb_ep				ep;
 +	struct imx_udc_struct			*imx_usb;
 +	struct list_head			queue;
-+	spinlock_t				lock;
 +	unsigned char				stopped;
 +	unsigned char				fifosize;
 +	unsigned char				bEndpointAddress;
@@ -1620,7 +1644,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	enum ep0_state				ep0state;
 +	struct resource				*res;
 +	void __iomem				*base;
-+	spinlock_t				lock;
 +	unsigned char				set_config;
 +	int					cfg,
 +						intf,
@@ -1722,29 +1745,54 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +/* Debug macros */
 +#ifdef DEBUG
 +
-+//#define DEBUG_IRQ
-+//#define DEBUG_REQ
-+//#define DEBUG_STATES
-+//#define DEBUG_TRX
-+//#define DEBUG_INIT
-+//#define DEBUG_EP0
-+#define DEBUG_EPX
++/* #define DEBUG_REQ */
++/* #define DEBUG_TRX */
++/* #define DEBUG_INIT */
++/* #define DEBUG_EP0 */
++/* #define DEBUG_EPX */
++/* #define DEBUG_IRQ */
++/* #define DEBUG_EPIRQ */
++/* #define DEBUG_DUMP */
++#define DEBUG_ERR
++
++#ifdef DEBUG_REQ
++	#define D_REQ(dev, args...)	dev_dbg(dev, ## args)
++#else
++	#define D_REQ(dev, args...)	do {} while (0)
++#endif /* DEBUG_REQ */
++
++#ifdef DEBUG_TRX
++	#define D_TRX(dev, args...)	dev_dbg(dev, ## args)
++#else
++	#define D_TRX(dev, args...)	do {} while (0)
++#endif /* DEBUG_TRX */
++
++#ifdef DEBUG_INIT
++	#define D_INI(dev, args...)	dev_dbg(dev, ## args)
++#else
++	#define D_INI(dev, args...)	do {} while (0)
++#endif /* DEBUG_INIT */
++
++#ifdef DEBUG_EP0
++	static const char *state_name[] = {
++		"EP0_IDLE",
++		"EP0_IN_DATA_PHASE",
++		"EP0_OUT_DATA_PHASE",
++		"EP0_CONFIG",
++		"EP0_STALL"
++	};
++	#define D_EP0(dev, args...)	dev_dbg(dev, ## args)
++#else
++	#define D_EP0(dev, args...)	do {} while (0)
++#endif /* DEBUG_EP0 */
++
++#ifdef DEBUG_EPX
++	#define D_EPX(dev, args...)	dev_dbg(dev, ## args)
++#else
++	#define D_EPX(dev, args...)	do {} while (0)
++#endif /* DEBUG_EP0 */
 +
 +#ifdef DEBUG_IRQ
-+	static void dump_ep_intr(const char *label, int nr, int irqreg, struct device *dev)
-+	{
-+		dev_dbg(dev, "<%s> EP%d_INTR=[%s%s%s%s%s%s%s%s%s]\n", label, nr,
-+			(irqreg & EPINTR_FIFO_FULL) ? " full" : "",
-+			(irqreg & EPINTR_FIFO_EMPTY) ? " fempty" : "",
-+			(irqreg & EPINTR_FIFO_ERROR) ? " ferr" : "",
-+			(irqreg & EPINTR_FIFO_HIGH) ? " fhigh" : "",
-+			(irqreg & EPINTR_FIFO_LOW) ? " flow" : "",
-+			(irqreg & EPINTR_MDEVREQ) ? " mreq" : "",
-+			(irqreg & EPINTR_EOF) ? " eof" : "",
-+			(irqreg & EPINTR_DEVREQ) ? " devreq" : "",
-+			(irqreg & EPINTR_EOT) ? " eot" : "");
-+	}
-+
 +	static void dump_intr(const char *label, int irqreg, struct device *dev)
 +	{
 +		dev_dbg(dev, "<%s> USB_INTR=[%s%s%s%s%s%s%s%s%s]\n", label,
@@ -1758,48 +1806,29 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			(irqreg & INTR_FRAME_MATCH) ? " fmatch" : "",
 +			(irqreg & INTR_CFG_CHG) ? " config" : "");
 +	}
-+	#define D_IRQ(dev, args...)		dev_dbg(dev, ## args)
 +#else
-+	#define dump_ep_intr(x, y, z, i)	do {} while (0)
 +	#define dump_intr(x, y, z)		do {} while (0)
-+	#define D_IRQ(dev, args...)		do {} while (0)
 +#endif /* DEBUG_IRQ */
 +
-+#ifdef DEBUG_REQ
-+	static void dump_req(const char *label, struct imx_ep_struct *imx_ep, struct usb_request *req)
++#ifdef DEBUG_EPIRQ
++	static void dump_ep_intr(const char *label, int nr, int irqreg, struct device *dev)
 +	{
-+		int i;
-+
-+		if (!req || !req->buf) {
-+			dev_dbg(imx_ep->imx_usb->dev, "<%s> req or req buf is free\n", label);
-+			return;
-+		}
-+
-+		if ((!EP_NO(imx_ep) && imx_ep->imx_usb->ep0state == EP0_IN_DATA_PHASE)
-+			|| (EP_NO(imx_ep) && EP_DIR(imx_ep))) {
-+
-+			dev_dbg(imx_ep->imx_usb->dev, "<%s> ep%d IN request for [%d] bytes; dump <", label, EP_NO(imx_ep), req->length);
-+			for (i = 0; i < req->length; i++)
-+				printk("%02x-", *((u8 *)req->buf + i));
-+			printk(">\n");
-+		} else
-+			dev_dbg(imx_ep->imx_usb->dev, "<%s> ep%d OUT request for [%d] bytes\n", label, EP_NO(imx_ep), req->length);
++		dev_dbg(dev, "<%s> EP%d_INTR=[%s%s%s%s%s%s%s%s%s]\n", label, nr,
++			(irqreg & EPINTR_FIFO_FULL) ? " full" : "",
++			(irqreg & EPINTR_FIFO_EMPTY) ? " fempty" : "",
++			(irqreg & EPINTR_FIFO_ERROR) ? " ferr" : "",
++			(irqreg & EPINTR_FIFO_HIGH) ? " fhigh" : "",
++			(irqreg & EPINTR_FIFO_LOW) ? " flow" : "",
++			(irqreg & EPINTR_MDEVREQ) ? " mreq" : "",
++			(irqreg & EPINTR_EOF) ? " eof" : "",
++			(irqreg & EPINTR_DEVREQ) ? " devreq" : "",
++			(irqreg & EPINTR_EOT) ? " eot" : "");
 +	}
-+	#define D_REQ(dev, args...)	dev_dbg(dev, ## args)
 +#else
-+	#define dump_req(x, y, z)	do {} while (0)
-+	#define D_REQ(dev, args...)	do {} while (0)
-+#endif /* DEBUG_REQ */
++	#define dump_ep_intr(x, y, z, i)	do {} while (0)
++#endif /* DEBUG_IRQ */
 +
-+#ifdef DEBUG_STATES
-+	static const char *state_name[] = {
-+		"EP0_IDLE",
-+		"EP0_IN_DATA_PHASE",
-+		"EP0_OUT_DATA_PHASE",
-+		"EP0_END_XFER",
-+		"EP0_STALL"
-+	};
-+
++#ifdef DEBUG_DUMP
 +	static void dump_usb_stat(const char *label, struct imx_udc_struct *imx_usb)
 +	{
 +		int temp = __raw_readl(imx_usb->base + USB_STAT);
@@ -1849,37 +1878,50 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			(temp & FSTAT_ALRM) ? " falarm" : "",
 +			(temp & FSTAT_EMPTY) ? " fempty" : "");
 +	}
-+	#define D_STT(dev, args...)	dev_dbg(dev, ## args)
-+#else
-+	#define dump_ep_stat(x, y)	do {} while (0)
-+	#define dump_usb_stat(x, y)	do {} while (0)
-+	#define D_STT(dev, args...)	do {} while (0)
-+#endif /* DEBUG_STATES */
 +
-+#ifdef DEBUG_TRX
-+	#define D_TRX(dev, args...)	dev_dbg(dev, ## args)
-+#else
-+	#define D_TRX(dev, args...)	do {} while (0)
-+#endif /* DEBUG_TRX */
++	static void dump_req(const char *label, struct imx_ep_struct *imx_ep, struct usb_request *req)
++	{
++		int i;
 +
-+#ifdef DEBUG_INIT
-+	#define D_INI(dev, args...)	dev_dbg(dev, ## args)
-+#else
-+	#define D_INI(dev, args...)	do {} while (0)
-+#endif /* DEBUG_INIT */
++		if (!req || !req->buf) {
++			dev_dbg(imx_ep->imx_usb->dev, "<%s> req or req buf is free\n", label);
++			return;
++		}
 +
-+#ifdef DEBUG_EP0
-+	#define D_EP0(dev, args...)	dev_dbg(dev, ## args)
-+#else
-+	#define D_EP0(dev, args...)	do {} while (0)
-+#endif /* DEBUG_EP0 */
++		if ((!EP_NO(imx_ep) && imx_ep->imx_usb->ep0state == EP0_IN_DATA_PHASE)
++			|| (EP_NO(imx_ep) && EP_DIR(imx_ep))) {
 +
-+#ifdef DEBUG_EPX
-+	#define D_EPX(dev, args...)	dev_dbg(dev, ## args)
-+#else
-+	#define D_EPX(dev, args...)	do {} while (0)
-+#endif /* DEBUG_EP0 */
++			dev_dbg(imx_ep->imx_usb->dev, "<%s> request dump <", label);
++			for (i = 0; i < req->length; i++)
++				printk("%02x-", *((u8 *)req->buf + i));
++			printk(">\n");
++		}
++	}
 +
++#else
++	#define dump_ep_stat(x, y)		do {} while (0)
++	#define dump_usb_stat(x, y)		do {} while (0)
++	#define dump_req(x, y, z)		do {} while (0)
++#endif /* DEBUG_DUMP */
++
++#ifdef DEBUG_ERR
++	#define D_ERR(dev, args...)	dev_dbg(dev, ## args)
++#else
++	#define D_ERR(dev, args...)	do {} while (0)
++#endif
++
++#else
++	#define D_REQ(dev, args...)		do {} while (0)
++	#define D_TRX(dev, args...)		do {} while (0)
++	#define D_INI(dev, args...)		do {} while (0)
++	#define D_EP0(dev, args...)		do {} while (0)
++	#define D_EPX(dev, args...)		do {} while (0)
++	#define dump_ep_intr(x, y, z, i)	do {} while (0)
++	#define dump_intr(x, y, z)		do {} while (0)
++	#define dump_ep_stat(x, y)		do {} while (0)
++	#define dump_usb_stat(x, y)		do {} while (0)
++	#define dump_req(x, y, z)		do {} while (0)
++	#define D_ERR(dev, args...)		do {} while (0)
 +#endif /* DEBUG */
 +
 +#endif /* __LINUX_USB_GADGET_IMX_H */
