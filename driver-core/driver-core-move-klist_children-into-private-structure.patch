@@ -1,0 +1,163 @@
+From foo@baz Tue Dec 16 12:24:56 PST 2008
+Date: Tue, 16 Dec 2008 12:24:56 -0800
+To: Greg KH <greg@kroah.com>
+From: Greg Kroah-Hartman <gregkh@suse.de>
+Subject: driver core: move klist_children into private structure
+
+Nothing outside of the driver core should ever touch klist_children, or
+knode_parent, so move them out of the public eye.
+
+Cc: Kay Sievers <kay.sievers@vrfy.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/base/base.h    |    6 ++++++
+ drivers/base/core.c    |   37 ++++++++++++++++++++++++-------------
+ include/linux/device.h |    2 --
+ 3 files changed, 30 insertions(+), 15 deletions(-)
+
+--- a/drivers/base/base.h
++++ b/drivers/base/base.h
+@@ -66,14 +66,20 @@ struct class_private {
+ /**
+  * struct device_private - structure to hold the private to the driver core portions of the device structure.
+  *
++ * @klist_children - klist containing all children of this device
++ * @knode_parent - node in sibling list
+  * @device - pointer back to the struct class that this structure is
+  * associated with.
+  *
+  * Nothing outside of the driver core should ever touch these fields.
+  */
+ struct device_private {
++	struct klist klist_children;
++	struct klist_node knode_parent;
+ 	struct device *device;
+ };
++#define to_device_private_parent(obj)	\
++	container_of(obj, struct device_private, knode_parent)
+ 
+ /* initialisation functions */
+ extern int devices_init(void);
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@ -508,14 +508,16 @@ EXPORT_SYMBOL_GPL(device_schedule_callba
+ 
+ static void klist_children_get(struct klist_node *n)
+ {
+-	struct device *dev = container_of(n, struct device, knode_parent);
++	struct device_private *p = to_device_private_parent(n);
++	struct device *dev = p->device;
+ 
+ 	get_device(dev);
+ }
+ 
+ static void klist_children_put(struct klist_node *n)
+ {
+-	struct device *dev = container_of(n, struct device, knode_parent);
++	struct device_private *p = to_device_private_parent(n);
++	struct device *dev = p->device;
+ 
+ 	put_device(dev);
+ }
+@@ -545,7 +547,7 @@ void device_initialize(struct device *de
+ 	dev->p->device = dev;
+ 	dev->kobj.kset = devices_kset;
+ 	kobject_init(&dev->kobj, &device_ktype);
+-	klist_init(&dev->klist_children, klist_children_get,
++	klist_init(&dev->p->klist_children, klist_children_get,
+ 		   klist_children_put);
+ 	INIT_LIST_HEAD(&dev->dma_pools);
+ 	init_MUTEX(&dev->sem);
+@@ -926,7 +928,8 @@ int device_add(struct device *dev)
+ 	kobject_uevent(&dev->kobj, KOBJ_ADD);
+ 	bus_attach_device(dev);
+ 	if (parent)
+-		klist_add_tail(&dev->knode_parent, &parent->klist_children);
++		klist_add_tail(&dev->p->knode_parent,
++			       &parent->p->klist_children);
+ 
+ 	if (dev->class) {
+ 		mutex_lock(&dev->class->p->class_mutex);
+@@ -1037,7 +1040,7 @@ void device_del(struct device *dev)
+ 	device_pm_remove(dev);
+ 	dpm_sysfs_remove(dev);
+ 	if (parent)
+-		klist_del(&dev->knode_parent);
++		klist_del(&dev->p->knode_parent);
+ 	if (MAJOR(dev->devt)) {
+ 		device_remove_sys_dev_entry(dev);
+ 		device_remove_file(dev, &devt_attr);
+@@ -1101,7 +1104,14 @@ void device_unregister(struct device *de
+ static struct device *next_device(struct klist_iter *i)
+ {
+ 	struct klist_node *n = klist_next(i);
+-	return n ? container_of(n, struct device, knode_parent) : NULL;
++	struct device *dev = NULL;
++	struct device_private *p;
++
++	if (n) {
++		p = to_device_private_parent(n);
++		dev = p->device;
++	}
++	return dev;
+ }
+ 
+ /**
+@@ -1123,7 +1133,7 @@ int device_for_each_child(struct device 
+ 	struct device *child;
+ 	int error = 0;
+ 
+-	klist_iter_init(&parent->klist_children, &i);
++	klist_iter_init(&parent->p->klist_children, &i);
+ 	while ((child = next_device(&i)) && !error)
+ 		error = fn(child, data);
+ 	klist_iter_exit(&i);
+@@ -1154,7 +1164,7 @@ struct device *device_find_child(struct 
+ 	if (!parent)
+ 		return NULL;
+ 
+-	klist_iter_init(&parent->klist_children, &i);
++	klist_iter_init(&parent->p->klist_children, &i);
+ 	while ((child = next_device(&i)))
+ 		if (match(child, data) && get_device(child))
+ 			break;
+@@ -1477,9 +1487,10 @@ int device_move(struct device *dev, stru
+ 	old_parent = dev->parent;
+ 	dev->parent = new_parent;
+ 	if (old_parent)
+-		klist_remove(&dev->knode_parent);
++		klist_remove(&dev->p->knode_parent);
+ 	if (new_parent) {
+-		klist_add_tail(&dev->knode_parent, &new_parent->klist_children);
++		klist_add_tail(&dev->p->knode_parent,
++			       &new_parent->p->klist_children);
+ 		set_dev_node(dev, dev_to_node(new_parent));
+ 	}
+ 
+@@ -1491,11 +1502,11 @@ int device_move(struct device *dev, stru
+ 		device_move_class_links(dev, new_parent, old_parent);
+ 		if (!kobject_move(&dev->kobj, &old_parent->kobj)) {
+ 			if (new_parent)
+-				klist_remove(&dev->knode_parent);
++				klist_remove(&dev->p->knode_parent);
+ 			dev->parent = old_parent;
+ 			if (old_parent) {
+-				klist_add_tail(&dev->knode_parent,
+-					       &old_parent->klist_children);
++				klist_add_tail(&dev->p->knode_parent,
++					       &old_parent->p->klist_children);
+ 				set_dev_node(dev, dev_to_node(old_parent));
+ 			}
+ 		}
+--- a/include/linux/device.h
++++ b/include/linux/device.h
+@@ -366,8 +366,6 @@ struct device_dma_parameters {
+ };
+ 
+ struct device {
+-	struct klist		klist_children;
+-	struct klist_node	knode_parent;	/* node in sibling list */
+ 	struct klist_node	knode_driver;
+ 	struct klist_node	knode_bus;
+ 	struct device		*parent;
