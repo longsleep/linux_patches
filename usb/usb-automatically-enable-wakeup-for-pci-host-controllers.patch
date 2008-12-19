@@ -1,0 +1,99 @@
+From stern@rowland.harvard.edu  Thu Dec 18 16:10:28 2008
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Wed, 17 Dec 2008 17:20:38 -0500 (EST)
+Subject: USB: automatically enable wakeup for PCI host controllers
+To: Greg KH <greg@kroah.com>
+Cc: David Brownell <david-b@pacbell.net>,  <JosephChan@via.com.tw>,  Jesse Barnes <jbarnes@virtuousgeek.org>
+Message-ID: <Pine.LNX.4.44L0.0812171717190.3769-100000@iolanthe.rowland.org>
+
+
+This patch (as1193b) enables wakeup during initialization for all PCI
+host controllers, and it removes some code (and comments!) that are no
+longer needed now that the PCI core automatically initializes wakeup
+settings for all new devices.
+
+The idea is that the bus should initialize wakeup, and the bus glue
+or controller driver should enable it.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/hcd-pci.c  |    1 +
+ drivers/usb/host/ehci-pci.c |   10 +++++++---
+ drivers/usb/host/ohci-hcd.c |   12 +++++++-----
+ drivers/usb/host/ohci-pci.c |    4 ++--
+ 4 files changed, 17 insertions(+), 10 deletions(-)
+
+--- a/drivers/usb/core/hcd-pci.c
++++ b/drivers/usb/core/hcd-pci.c
+@@ -128,6 +128,7 @@ int usb_hcd_pci_probe(struct pci_dev *de
+ 	}
+ 
+ 	pci_set_master(dev);
++	device_set_wakeup_enable(&dev->dev, 1);
+ 
+ 	retval = usb_add_hcd(hcd, dev->irq, IRQF_DISABLED | IRQF_SHARED);
+ 	if (retval != 0)
+--- a/drivers/usb/host/ehci-pci.c
++++ b/drivers/usb/host/ehci-pci.c
+@@ -219,15 +219,19 @@ static int ehci_pci_setup(struct usb_hcd
+ 	/* Serial Bus Release Number is at PCI 0x60 offset */
+ 	pci_read_config_byte(pdev, 0x60, &ehci->sbrn);
+ 
+-	/* Workaround current PCI init glitch:  wakeup bits aren't
+-	 * being set from PCI PM capability.
++	/* Keep this around for a while just in case some EHCI
++	 * implementation uses legacy PCI PM support.  This test
++	 * can be removed on 17 Dec 2009 if the dev_warn() hasn't
++	 * been triggered by then.
+ 	 */
+ 	if (!device_can_wakeup(&pdev->dev)) {
+ 		u16	port_wake;
+ 
+ 		pci_read_config_word(pdev, 0x62, &port_wake);
+-		if (port_wake & 0x0001)
++		if (port_wake & 0x0001) {
++			dev_warn(&pdev->dev, "Enabling legacy PCI PM\n");
+ 			device_init_wakeup(&pdev->dev, 1);
++		}
+ 	}
+ 
+ #ifdef	CONFIG_USB_SUSPEND
+--- a/drivers/usb/host/ohci-hcd.c
++++ b/drivers/usb/host/ohci-hcd.c
+@@ -589,13 +589,15 @@ static int ohci_run (struct ohci_hcd *oh
+ 		/* also: power/overcurrent flags in roothub.a */
+ 	}
+ 
+-	/* Reset USB nearly "by the book".  RemoteWakeupConnected was
+-	 * saved if boot firmware (BIOS/SMM/...) told us it's connected,
+-	 * or if bus glue did the same (e.g. for PCI add-in cards with
+-	 * PCI PM support).
++	/* Reset USB nearly "by the book".  RemoteWakeupConnected has
++	 * to be checked in case boot firmware (BIOS/SMM/...) has set up
++	 * wakeup in a way the bus isn't aware of (e.g., legacy PCI PM).
++	 * If the bus glue detected wakeup capability then it should
++	 * already be enabled.  Either way, if wakeup should be enabled
++	 * but isn't, we'll enable it now.
+ 	 */
+ 	if ((ohci->hc_control & OHCI_CTRL_RWC) != 0
+-			&& !device_may_wakeup(hcd->self.controller))
++			&& !device_can_wakeup(hcd->self.controller))
+ 		device_init_wakeup(hcd->self.controller, 1);
+ 
+ 	switch (ohci->hc_control & OHCI_CTRL_HCFS) {
+--- a/drivers/usb/host/ohci-pci.c
++++ b/drivers/usb/host/ohci-pci.c
+@@ -355,9 +355,9 @@ static int __devinit ohci_pci_start (str
+ 
+ 		/* RWC may not be set for add-in PCI cards, since boot
+ 		 * firmware probably ignored them.  This transfers PCI
+-		 * PM wakeup capabilities (once the PCI layer is fixed).
++		 * PM wakeup capabilities.
+ 		 */
+-		if (device_may_wakeup(&pdev->dev))
++		if (device_can_wakeup(&pdev->dev))
+ 			ohci->hc_control |= OHCI_CTRL_RWC;
+ 	}
+ #endif /* CONFIG_PM */

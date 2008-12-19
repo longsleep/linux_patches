@@ -1,0 +1,252 @@
+From stern@rowland.harvard.edu  Thu Dec 18 16:05:54 2008
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Mon, 15 Dec 2008 10:40:06 -0500 (EST)
+Subject: USB: storage: make the "quirks=" module parameter writable
+To: Greg KH <greg@kroah.com>, Matthew Dharm <mdharm-usb@one-eyed-alien.net>
+Cc: USB list <linux-usb@vger.kernel.org>,  USB Storage list <usb-storage@lists.one-eyed-alien.net>
+Message-ID: <Pine.LNX.4.44L0.0812151038450.2525-100000@iolanthe.rowland.org>
+
+
+This patch (as1190) makes usb-storage's "quirks=" module parameter
+writable, so that users can add entries for their devices at runtime
+with no need to reboot or reload usb-storage.
+
+New codes are added for the SANE_SENSE, CAPACITY_HEURISTICS, and
+CAPACITY_OK flags.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ Documentation/kernel-parameters.txt |    7 +
+ drivers/usb/storage/usb.c           |  165 ++++++++++++++----------------------
+ 2 files changed, 74 insertions(+), 98 deletions(-)
+
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@ -2324,14 +2324,21 @@ and is between 256 and 4096 characters. 
+ 			and Product ID values (4-digit hex numbers) and
+ 			Flags is a set of characters, each corresponding
+ 			to a common usb-storage quirk flag as follows:
++				a = SANE_SENSE (collect more than 18 bytes
++					of sense data);
+ 				c = FIX_CAPACITY (decrease the reported
+ 					device capacity by one sector);
++				h = CAPACITY_HEURISTICS (decrease the
++					reported device capacity by one
++					sector if the number is odd);
+ 				i = IGNORE_DEVICE (don't bind to this
+ 					device);
+ 				l = NOT_LOCKABLE (don't try to lock and
+ 					unlock ejectable media);
+ 				m = MAX_SECTORS_64 (don't transfer more
+ 					than 64 sectors = 32 KB at a time);
++				o = CAPACITY_OK (accept the capacity
++					reported by the device);
+ 				r = IGNORE_RESIDUE (the device reports
+ 					bogus residue values);
+ 				s = SINGLE_LUN (the device has only one
+--- a/drivers/usb/storage/usb.c
++++ b/drivers/usb/storage/usb.c
+@@ -111,16 +111,10 @@ static unsigned int delay_use = 5;
+ module_param(delay_use, uint, S_IRUGO | S_IWUSR);
+ MODULE_PARM_DESC(delay_use, "seconds to delay before using a new device");
+ 
+-static char *quirks;
+-module_param(quirks, charp, S_IRUGO);
++static char quirks[128];
++module_param_string(quirks, quirks, sizeof(quirks), S_IRUGO | S_IWUSR);
+ MODULE_PARM_DESC(quirks, "supplemental list of device IDs and their quirks");
+ 
+-struct quirks_entry {
+-	u16	vid, pid;
+-	u32	fflags;
+-};
+-static struct quirks_entry *quirks_list, *quirks_end;
+-
+ 
+ /*
+  * The entries in this table correspond, line for line,
+@@ -481,28 +475,80 @@ static int associate_dev(struct us_data 
+ 	return 0;
+ }
+ 
++/* Works only for digits and letters, but small and fast */
++#define TOLOWER(x) ((x) | 0x20)
++
+ /* Adjust device flags based on the "quirks=" module parameter */
+ static void adjust_quirks(struct us_data *us)
+ {
+-	u16 vid, pid;
+-	struct quirks_entry *q;
+-	unsigned int mask = (US_FL_FIX_CAPACITY | US_FL_IGNORE_DEVICE |
++	char *p;
++	u16 vid = le16_to_cpu(us->pusb_dev->descriptor.idVendor);
++	u16 pid = le16_to_cpu(us->pusb_dev->descriptor.idProduct);
++	unsigned f = 0;
++	unsigned int mask = (US_FL_SANE_SENSE | US_FL_FIX_CAPACITY |
++			US_FL_CAPACITY_HEURISTICS | US_FL_IGNORE_DEVICE |
+ 			US_FL_NOT_LOCKABLE | US_FL_MAX_SECTORS_64 |
+-			US_FL_IGNORE_RESIDUE | US_FL_SINGLE_LUN |
+-			US_FL_NO_WP_DETECT);
++			US_FL_CAPACITY_OK | US_FL_IGNORE_RESIDUE |
++			US_FL_SINGLE_LUN | US_FL_NO_WP_DETECT);
++
++	p = quirks;
++	while (*p) {
++		/* Each entry consists of VID:PID:flags */
++		if (vid == simple_strtoul(p, &p, 16) &&
++				*p == ':' &&
++				pid == simple_strtoul(p+1, &p, 16) &&
++				*p == ':')
++			break;
+ 
+-	vid = le16_to_cpu(us->pusb_dev->descriptor.idVendor);
+-	pid = le16_to_cpu(us->pusb_dev->descriptor.idProduct);
++		/* Move forward to the next entry */
++		while (*p) {
++			if (*p++ == ',')
++				break;
++		}
++	}
++	if (!*p)	/* No match */
++		return;
+ 
+-	for (q = quirks_list; q != quirks_end; ++q) {
+-		if (q->vid == vid && q->pid == pid) {
+-			us->fflags = (us->fflags & ~mask) | q->fflags;
+-			dev_info(&us->pusb_intf->dev, "Quirks match for "
+-					"vid %04x pid %04x: %x\n",
+-					vid, pid, q->fflags);
++	/* Collect the flags */
++	while (*++p && *p != ',') {
++		switch (TOLOWER(*p)) {
++		case 'a':
++			f |= US_FL_SANE_SENSE;
++			break;
++		case 'c':
++			f |= US_FL_FIX_CAPACITY;
++			break;
++		case 'h':
++			f |= US_FL_CAPACITY_HEURISTICS;
++			break;
++		case 'i':
++			f |= US_FL_IGNORE_DEVICE;
++			break;
++		case 'l':
++			f |= US_FL_NOT_LOCKABLE;
++			break;
++		case 'm':
++			f |= US_FL_MAX_SECTORS_64;
+ 			break;
++		case 'o':
++			f |= US_FL_CAPACITY_OK;
++			break;
++		case 'r':
++			f |= US_FL_IGNORE_RESIDUE;
++			break;
++		case 's':
++			f |= US_FL_SINGLE_LUN;
++			break;
++		case 'w':
++			f |= US_FL_NO_WP_DETECT;
++			break;
++		/* Ignore unrecognized flag characters */
+ 		}
+ 	}
++	us->fflags = (us->fflags & ~mask) | f;
++	dev_info(&us->pusb_intf->dev, "Quirks match for "
++			"vid %04x pid %04x: %x\n",
++			vid, pid, f);
+ }
+ 
+ /* Find an unusual_dev descriptor (always succeeds in the current code) */
+@@ -1092,88 +1138,11 @@ static struct usb_driver usb_storage_dri
+ 	.soft_unbind =	1,
+ };
+ 
+-/* Works only for digits and letters, but small and fast */
+-#define TOLOWER(x) ((x) | 0x20)
+-
+-static void __init parse_quirks(void)
+-{
+-	int n, i;
+-	char *p;
+-
+-	if (!quirks)
+-		return;
+-
+-	/* Count the ':' characters to get 2 * the number of entries */
+-	n = 0;
+-	for (p = quirks; *p; ++p) {
+-		if (*p == ':')
+-			++n;
+-	}
+-	n /= 2;
+-	if (n == 0)
+-		return;		/* Don't allocate 0 bytes */
+-
+-	quirks_list = kmalloc(n * sizeof(*quirks_list), GFP_KERNEL);
+-	if (!quirks_list)
+-		return;
+-
+-	p = quirks;
+-	quirks_end = quirks_list;
+-	for (i = 0; i < n && *p; ++i) {
+-		unsigned f = 0;
+-
+-		/* Each entry consists of VID:PID:flags */
+-		quirks_end->vid = simple_strtoul(p, &p, 16);
+-		if (*p != ':')
+-			goto skip_to_next;
+-		quirks_end->pid = simple_strtoul(p+1, &p, 16);
+-		if (*p != ':')
+-			goto skip_to_next;
+-
+-		while (*++p && *p != ',') {
+-			switch (TOLOWER(*p)) {
+-			case 'c':
+-				f |= US_FL_FIX_CAPACITY;
+-				break;
+-			case 'i':
+-				f |= US_FL_IGNORE_DEVICE;
+-				break;
+-			case 'l':
+-				f |= US_FL_NOT_LOCKABLE;
+-				break;
+-			case 'm':
+-				f |= US_FL_MAX_SECTORS_64;
+-				break;
+-			case 'r':
+-				f |= US_FL_IGNORE_RESIDUE;
+-				break;
+-			case 's':
+-				f |= US_FL_SINGLE_LUN;
+-				break;
+-			case 'w':
+-				f |= US_FL_NO_WP_DETECT;
+-				break;
+-			/* Ignore unrecognized flag characters */
+-			}
+-		}
+-		quirks_end->fflags = f;
+-		++quirks_end;
+-
+- skip_to_next:
+-		/* Entries are separated by commas */
+-		while (*p) {
+-			if (*p++ == ',')
+-				break;
+-		}
+-	} /* for (i = 0; ...) */
+-}
+-
+ static int __init usb_stor_init(void)
+ {
+ 	int retval;
+ 
+ 	printk(KERN_INFO "Initializing USB Mass Storage driver...\n");
+-	parse_quirks();
+ 
+ 	/* register the driver, return usb_register return code if error */
+ 	retval = usb_register(&usb_storage_driver);
