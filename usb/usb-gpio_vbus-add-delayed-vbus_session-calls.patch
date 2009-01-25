@@ -1,0 +1,197 @@
+From david-b@pacbell.net  Sun Jan 25 12:56:37 2009
+From: Robert Jarzmik <robert.jarzmik@free.fr>
+Date: Sat, 24 Jan 2009 23:54:31 -0800
+Subject: USB: gpio_vbus: add delayed vbus_session calls
+To: Greg KH <greg@kroah.com>
+Cc: linux-usb@vger.kernel.org, Robert Jarzmik <robert.jarzmik@free.fr>
+Message-ID: <200901242354.31639.david-b@pacbell.net>
+Content-Disposition: inline
+
+
+From: Robert Jarzmik <robert.jarzmik@free.fr>
+
+Call usb_gadget_vbus_connect() and ...disconnect() from a
+workqueue rather than from an irq handler, allowing msleep()
+calls in vbus_session.  Update kerneldoc to match.
+
+[ dbrownell@users.sourceforge.net: more kerneldoc updates ]
+
+Signed-off-by: Robert Jarzmik <robert.jarzmik@free.fr>
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/otg/gpio_vbus.c |   42 +++++++++++++++++++++++++++++++-----------
+ include/linux/usb/gadget.h  |    6 ++++--
+ include/linux/usb/otg.h     |    4 ++++
+ 3 files changed, 39 insertions(+), 13 deletions(-)
+
+--- a/drivers/usb/otg/gpio_vbus.c
++++ b/drivers/usb/otg/gpio_vbus.c
+@@ -13,6 +13,7 @@
+ #include <linux/gpio.h>
+ #include <linux/interrupt.h>
+ #include <linux/usb.h>
++#include <linux/workqueue.h>
+ 
+ #include <linux/regulator/consumer.h>
+ 
+@@ -34,6 +35,7 @@ struct gpio_vbus_data {
+ 	struct regulator       *vbus_draw;
+ 	int			vbus_draw_enabled;
+ 	unsigned		mA;
++	struct work_struct	work;
+ };
+ 
+ 
+@@ -76,24 +78,26 @@ static void set_vbus_draw(struct gpio_vb
+ 	gpio_vbus->mA = mA;
+ }
+ 
+-/* VBUS change IRQ handler */
+-static irqreturn_t gpio_vbus_irq(int irq, void *data)
++static int is_vbus_powered(struct gpio_vbus_mach_info *pdata)
+ {
+-	struct platform_device *pdev = data;
+-	struct gpio_vbus_mach_info *pdata = pdev->dev.platform_data;
+-	struct gpio_vbus_data *gpio_vbus = platform_get_drvdata(pdev);
+-	int gpio, vbus;
++	int vbus;
+ 
+ 	vbus = gpio_get_value(pdata->gpio_vbus);
+ 	if (pdata->gpio_vbus_inverted)
+ 		vbus = !vbus;
+ 
+-	dev_dbg(&pdev->dev, "VBUS %s (gadget: %s)\n",
+-		vbus ? "supplied" : "inactive",
+-		gpio_vbus->otg.gadget ? gpio_vbus->otg.gadget->name : "none");
++	return vbus;
++}
++
++static void gpio_vbus_work(struct work_struct *work)
++{
++	struct gpio_vbus_data *gpio_vbus =
++		container_of(work, struct gpio_vbus_data, work);
++	struct gpio_vbus_mach_info *pdata = gpio_vbus->dev->platform_data;
++	int gpio;
+ 
+ 	if (!gpio_vbus->otg.gadget)
+-		return IRQ_HANDLED;
++		return;
+ 
+ 	/* Peripheral controllers which manage the pullup themselves won't have
+ 	 * gpio_pullup configured here.  If it's configured here, we'll do what
+@@ -101,7 +105,7 @@ static irqreturn_t gpio_vbus_irq(int irq
+ 	 * that may complicate usb_gadget_{,dis}connect() support.
+ 	 */
+ 	gpio = pdata->gpio_pullup;
+-	if (vbus) {
++	if (is_vbus_powered(pdata)) {
+ 		gpio_vbus->otg.state = OTG_STATE_B_PERIPHERAL;
+ 		usb_gadget_vbus_connect(gpio_vbus->otg.gadget);
+ 
+@@ -121,6 +125,21 @@ static irqreturn_t gpio_vbus_irq(int irq
+ 		usb_gadget_vbus_disconnect(gpio_vbus->otg.gadget);
+ 		gpio_vbus->otg.state = OTG_STATE_B_IDLE;
+ 	}
++}
++
++/* VBUS change IRQ handler */
++static irqreturn_t gpio_vbus_irq(int irq, void *data)
++{
++	struct platform_device *pdev = data;
++	struct gpio_vbus_mach_info *pdata = pdev->dev.platform_data;
++	struct gpio_vbus_data *gpio_vbus = platform_get_drvdata(pdev);
++
++	dev_dbg(&pdev->dev, "VBUS %s (gadget: %s)\n",
++		is_vbus_powered(pdata) ? "supplied" : "inactive",
++		gpio_vbus->otg.gadget ? gpio_vbus->otg.gadget->name : "none");
++
++	if (gpio_vbus->otg.gadget)
++		schedule_work(&gpio_vbus->work);
+ 
+ 	return IRQ_HANDLED;
+ }
+@@ -257,6 +276,7 @@ static int __init gpio_vbus_probe(struct
+ 			irq, err);
+ 		goto err_irq;
+ 	}
++	INIT_WORK(&gpio_vbus->work, gpio_vbus_work);
+ 
+ 	/* only active when a gadget is registered */
+ 	err = otg_set_transceiver(&gpio_vbus->otg);
+--- a/include/linux/usb/gadget.h
++++ b/include/linux/usb/gadget.h
+@@ -598,6 +598,7 @@ static inline int usb_gadget_clear_selfp
+ /**
+  * usb_gadget_vbus_connect - Notify controller that VBUS is powered
+  * @gadget:The device which now has VBUS power.
++ * Context: can sleep
+  *
+  * This call is used by a driver for an external transceiver (or GPIO)
+  * that detects a VBUS power session starting.  Common responses include
+@@ -636,6 +637,7 @@ static inline int usb_gadget_vbus_draw(s
+ /**
+  * usb_gadget_vbus_disconnect - notify controller about VBUS session end
+  * @gadget:the device whose VBUS supply is being described
++ * Context: can sleep
+  *
+  * This call is used by a driver for an external transceiver (or GPIO)
+  * that detects a VBUS power session ending.  Common responses include
+@@ -792,19 +794,20 @@ struct usb_gadget_driver {
+ /**
+  * usb_gadget_register_driver - register a gadget driver
+  * @driver:the driver being registered
++ * Context: can sleep
+  *
+  * Call this in your gadget driver's module initialization function,
+  * to tell the underlying usb controller driver about your driver.
+  * The driver's bind() function will be called to bind it to a
+  * gadget before this registration call returns.  It's expected that
+  * the bind() functions will be in init sections.
+- * This function must be called in a context that can sleep.
+  */
+ int usb_gadget_register_driver(struct usb_gadget_driver *driver);
+ 
+ /**
+  * usb_gadget_unregister_driver - unregister a gadget driver
+  * @driver:the driver being unregistered
++ * Context: can sleep
+  *
+  * Call this in your gadget driver's module cleanup function,
+  * to tell the underlying usb controller that your driver is
+@@ -813,7 +816,6 @@ int usb_gadget_register_driver(struct us
+  * to unbind() and clean up any device state, before this procedure
+  * finally returns.  It's expected that the unbind() functions
+  * will in in exit sections, so may not be linked in some kernels.
+- * This function must be called in a context that can sleep.
+  */
+ int usb_gadget_unregister_driver(struct usb_gadget_driver *driver);
+ 
+--- a/include/linux/usb/otg.h
++++ b/include/linux/usb/otg.h
+@@ -86,6 +86,7 @@ extern int otg_set_transceiver(struct ot
+ extern struct otg_transceiver *otg_get_transceiver(void);
+ extern void otg_put_transceiver(struct otg_transceiver *);
+ 
++/* Context: can sleep */
+ static inline int
+ otg_start_hnp(struct otg_transceiver *otg)
+ {
+@@ -102,6 +103,8 @@ otg_set_host(struct otg_transceiver *otg
+ 
+ 
+ /* for usb peripheral controller drivers */
++
++/* Context: can sleep */
+ static inline int
+ otg_set_peripheral(struct otg_transceiver *otg, struct usb_gadget *periph)
+ {
+@@ -114,6 +117,7 @@ otg_set_power(struct otg_transceiver *ot
+ 	return otg->set_power(otg, mA);
+ }
+ 
++/* Context: can sleep */
+ static inline int
+ otg_set_suspend(struct otg_transceiver *otg, int suspend)
+ {

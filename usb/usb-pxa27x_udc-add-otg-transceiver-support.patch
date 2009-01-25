@@ -1,0 +1,122 @@
+From david-b@pacbell.net  Sun Jan 25 12:57:27 2009
+From: Robert Jarzmik <robert.jarzmik@free.fr>
+Date: Sat, 24 Jan 2009 23:57:30 -0800
+Subject: USB: pxa27x_udc: add otg transceiver support
+To: Greg KH <greg@kroah.com>
+Cc: linux-usb@vger.kernel.org, Robert Jarzmik <robert.jarzmik@free.fr>
+Message-ID: <200901242357.30720.david-b@pacbell.net>
+Content-Disposition: inline
+
+
+From: Robert Jarzmik <robert.jarzmik@free.fr>
+
+When a transceiver driver is used, no automatic udc enable
+is done. The transceiver (OTG or not) should :
+ - take care of VBus sensing
+ - call usb_gadget_vbus_connect()
+ - call usb_gadget_vbus_disconnect()
+
+The pullup should remain within this driver's management,
+either by gpio_pullup of udc_command() fields.
+
+Signed-off-by: Robert Jarzmik <robert.jarzmik@free.fr>
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/gadget/Kconfig      |    1 +
+ drivers/usb/gadget/pxa27x_udc.c |   19 ++++++++++++++++++-
+ drivers/usb/gadget/pxa27x_udc.h |    3 +++
+ 3 files changed, 22 insertions(+), 1 deletion(-)
+
+--- a/drivers/usb/gadget/Kconfig
++++ b/drivers/usb/gadget/Kconfig
+@@ -253,6 +253,7 @@ config USB_PXA25X_SMALL
+ config USB_GADGET_PXA27X
+ 	boolean "PXA 27x"
+ 	depends on ARCH_PXA && PXA27x
++	select USB_OTG_UTILS
+ 	help
+ 	   Intel's PXA 27x series XScale ARM v5TE processors include
+ 	   an integrated full speed USB 1.1 device controller.
+--- a/drivers/usb/gadget/pxa27x_udc.c
++++ b/drivers/usb/gadget/pxa27x_udc.c
+@@ -1779,10 +1779,21 @@ int usb_gadget_register_driver(struct us
+ 	dev_dbg(udc->dev, "registered gadget driver '%s'\n",
+ 		driver->driver.name);
+ 
++	if (udc->transceiver) {
++		retval = otg_set_peripheral(udc->transceiver, &udc->gadget);
++		if (retval) {
++			dev_err(udc->dev, "can't bind to transceiver\n");
++			goto transceiver_fail;
++		}
++	}
++
+ 	if (should_enable_udc(udc))
+ 		udc_enable(udc);
+ 	return 0;
+ 
++transceiver_fail:
++	if (driver->unbind)
++		driver->unbind(&udc->gadget);
+ bind_fail:
+ 	device_del(&udc->gadget.dev);
+ add_fail:
+@@ -1840,9 +1851,11 @@ int usb_gadget_unregister_driver(struct 
+ 	udc->driver = NULL;
+ 
+ 	device_del(&udc->gadget.dev);
+-
+ 	dev_info(udc->dev, "unregistered gadget driver '%s'\n",
+ 		 driver->driver.name);
++
++	if (udc->transceiver)
++		return otg_set_peripheral(udc->transceiver, NULL);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(usb_gadget_unregister_driver);
+@@ -2359,6 +2372,7 @@ static int __init pxa_udc_probe(struct p
+ 
+ 	udc->dev = &pdev->dev;
+ 	udc->mach = pdev->dev.platform_data;
++	udc->transceiver = otg_get_transceiver();
+ 
+ 	gpio = udc->mach->gpio_pullup;
+ 	if (gpio_is_valid(gpio)) {
+@@ -2431,6 +2445,9 @@ static int __exit pxa_udc_remove(struct 
+ 	if (gpio_is_valid(gpio))
+ 		gpio_free(gpio);
+ 
++	otg_put_transceiver(udc->transceiver);
++
++	udc->transceiver = NULL;
+ 	platform_set_drvdata(_dev, NULL);
+ 	the_controller = NULL;
+ 	clk_put(udc->clk);
+--- a/drivers/usb/gadget/pxa27x_udc.h
++++ b/drivers/usb/gadget/pxa27x_udc.h
+@@ -26,6 +26,7 @@
+ #include <linux/types.h>
+ #include <linux/spinlock.h>
+ #include <linux/io.h>
++#include <linux/usb/otg.h>
+ 
+ /*
+  * Register definitions
+@@ -421,6 +422,7 @@ struct udc_stats {
+  * @driver: bound gadget (zero, g_ether, g_file_storage, ...)
+  * @dev: device
+  * @mach: machine info, used to activate specific GPIO
++ * @transceiver: external transceiver to handle vbus sense and D+ pullup
+  * @ep0state: control endpoint state machine state
+  * @stats: statistics on udc usage
+  * @udc_usb_ep: array of usb endpoints offered by the gadget
+@@ -446,6 +448,7 @@ struct pxa_udc {
+ 	struct usb_gadget_driver		*driver;
+ 	struct device				*dev;
+ 	struct pxa2xx_udc_mach_info		*mach;
++	struct otg_transceiver			*transceiver;
+ 
+ 	enum ep0_state				ep0state;
+ 	struct udc_stats			stats;
