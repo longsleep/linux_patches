@@ -1,0 +1,434 @@
+---
+ drivers/spi/spi.c                   |    8 +++++++-
+ drivers/usb/core/message.c          |    8 +++++++-
+ drivers/usb/core/usb.c              |    7 ++++++-
+ drivers/usb/gadget/atmel_usba_udc.c |    4 +++-
+ drivers/usb/gadget/fsl_qe_udc.c     |    4 +++-
+ drivers/usb/gadget/imx_udc.c        |    4 +++-
+ drivers/usb/gadget/lh7a40x_udc.c    |    4 +++-
+ drivers/usb/gadget/m66592-udc.c     |    4 +++-
+ drivers/usb/gadget/omap_udc.c       |    7 ++++++-
+ drivers/usb/gadget/pxa25x_udc.c     |    4 +++-
+ drivers/usb/gadget/pxa27x_udc.c     |    4 +++-
+ drivers/usb/gadget/s3c2410_udc.c    |    4 +++-
+ drivers/uwb/lc-dev.c                |   15 ++++++++++++---
+ drivers/uwb/lc-rc.c                 |   14 +++++++++++---
+ drivers/uwb/uwb-internal.h          |    2 +-
+ fs/partitions/check.c               |    4 +++-
+ include/linux/uwb.h                 |    2 +-
+ net/bluetooth/hci_sysfs.c           |    3 ++-
+ net/core/dev.c                      |    4 +++-
+ net/core/net-sysfs.c                |    4 ++--
+ net/core/net-sysfs.h                |    2 +-
+ net/rfkill/rfkill.c                 |   10 ++++++++--
+ net/wireless/core.c                 |    9 ++++++++-
+ 23 files changed, 102 insertions(+), 29 deletions(-)
+
+--- a/drivers/spi/spi.c
++++ b/drivers/spi/spi.c
+@@ -199,6 +199,7 @@ struct spi_device *spi_alloc_device(stru
+ {
+ 	struct spi_device	*spi;
+ 	struct device		*dev = master->dev.parent;
++	int			retval;
+ 
+ 	if (!spi_master_get(master))
+ 		return NULL;
+@@ -214,7 +215,12 @@ struct spi_device *spi_alloc_device(stru
+ 	spi->dev.parent = dev;
+ 	spi->dev.bus = &spi_bus_type;
+ 	spi->dev.release = spidev_release;
+-	device_initialize(&spi->dev);
++	retval = device_initialize(&spi->dev);
++	if (retval) {
++		spi_master_put(master);
++		kfree(spi);
++		spi = NULL;
++	}
+ 	return spi;
+ }
+ EXPORT_SYMBOL_GPL(spi_alloc_device);
+--- a/drivers/usb/core/message.c
++++ b/drivers/usb/core/message.c
+@@ -1706,7 +1706,13 @@ free_interfaces:
+ 		intf->dev.groups = usb_interface_groups;
+ 		intf->dev.dma_mask = dev->dev.dma_mask;
+ 		INIT_WORK(&intf->reset_ws, __usb_queue_reset_device);
+-		device_initialize(&intf->dev);
++		ret = device_initialize(&intf->dev);
++		if (ret) {
++			printk(KERN_ERR
++			       "USB: something bad happened in device_initialize(): %d\n",
++			       ret);
++			goto free_interfaces;
++		}
+ 		mark_quiesced(intf);
+ 		dev_set_name(&intf->dev, "%d-%s:%d.%d",
+ 			dev->bus->busnum, dev->devpath,
+--- a/drivers/usb/core/usb.c
++++ b/drivers/usb/core/usb.c
+@@ -339,6 +339,7 @@ struct usb_device *usb_alloc_dev(struct 
+ 	struct usb_device *dev;
+ 	struct usb_hcd *usb_hcd = container_of(bus, struct usb_hcd, self);
+ 	unsigned root_hub = 0;
++	int ret;
+ 
+ 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+ 	if (!dev)
+@@ -349,7 +350,11 @@ struct usb_device *usb_alloc_dev(struct 
+ 		return NULL;
+ 	}
+ 
+-	device_initialize(&dev->dev);
++	ret = device_initialize(&dev->dev);
++	if (ret) {
++		kfree(dev);
++		return NULL;
++	}
+ 	dev->dev.bus = &usb_bus_type;
+ 	dev->dev.type = &usb_device_type;
+ 	dev->dev.groups = usb_device_groups;
+--- a/drivers/usb/gadget/atmel_usba_udc.c
++++ b/drivers/usb/gadget/atmel_usba_udc.c
+@@ -1928,7 +1928,9 @@ static int __init usba_udc_probe(struct 
+ 	dev_info(&pdev->dev, "FIFO at 0x%08lx mapped at %p\n",
+ 		 (unsigned long)fifo->start, udc->fifo);
+ 
+-	device_initialize(&udc->gadget.dev);
++	ret = device_initialize(&udc->gadget.dev);
++	if (ret)
++		goto err_alloc_ep;
+ 	udc->gadget.dev.parent = &pdev->dev;
+ 	udc->gadget.dev.dma_mask = pdev->dev.dma_mask;
+ 
+--- a/drivers/usb/gadget/fsl_qe_udc.c
++++ b/drivers/usb/gadget/fsl_qe_udc.c
+@@ -2549,7 +2549,9 @@ static int __devinit qe_udc_probe(struct
+ 	/* name: Identifies the controller hardware type. */
+ 	udc_controller->gadget.name = driver_name;
+ 
+-	device_initialize(&udc_controller->gadget.dev);
++	ret = device_initialize(&udc_controller->gadget.dev);
++	if (ret)
++		goto err2;
+ 
+ 	dev_set_name(&udc_controller->gadget.dev, "gadget");
+ 
+--- a/drivers/usb/gadget/imx_udc.c
++++ b/drivers/usb/gadget/imx_udc.c
+@@ -1472,7 +1472,9 @@ static int __init imx_udc_probe(struct p
+ 	imx_usb->clk = clk;
+ 	imx_usb->dev = &pdev->dev;
+ 
+-	device_initialize(&imx_usb->gadget.dev);
++	ret = device_initialize(&imx_usb->gadget.dev);
++	if (ret)
++		goto fail3;
+ 
+ 	imx_usb->gadget.dev.parent = &pdev->dev;
+ 	imx_usb->gadget.dev.dma_mask = pdev->dev.dma_mask;
+--- a/drivers/usb/gadget/lh7a40x_udc.c
++++ b/drivers/usb/gadget/lh7a40x_udc.c
+@@ -2070,7 +2070,9 @@ static int lh7a40x_udc_probe(struct plat
+ 	spin_lock_init(&dev->lock);
+ 	dev->dev = &pdev->dev;
+ 
+-	device_initialize(&dev->gadget.dev);
++	retval = device_initialize(&dev->gadget.dev);
++	if (retval)
++		return retval;
+ 	dev->gadget.dev.parent = &pdev->dev;
+ 
+ 	the_controller = dev;
+--- a/drivers/usb/gadget/m66592-udc.c
++++ b/drivers/usb/gadget/m66592-udc.c
+@@ -1590,7 +1590,9 @@ static int __init m66592_probe(struct pl
+ 	dev_set_drvdata(&pdev->dev, m66592);
+ 
+ 	m66592->gadget.ops = &m66592_gadget_ops;
+-	device_initialize(&m66592->gadget.dev);
++	ret = device_initialize(&m66592->gadget.dev);
++	if (ret)
++		goto clean_up;
+ 	dev_set_name(&m66592->gadget.dev, "gadget");
+ 	m66592->gadget.is_dualspeed = 1;
+ 	m66592->gadget.dev.parent = &pdev->dev;
+--- a/drivers/usb/gadget/omap_udc.c
++++ b/drivers/usb/gadget/omap_udc.c
+@@ -2668,6 +2668,7 @@ static int __init
+ omap_udc_setup(struct platform_device *odev, struct otg_transceiver *xceiv)
+ {
+ 	unsigned	tmp, buf;
++	int ret;
+ 
+ 	/* abolish any previous hardware state */
+ 	omap_writew(0, UDC_SYSCON1);
+@@ -2693,7 +2694,11 @@ omap_udc_setup(struct platform_device *o
+ 	udc->gadget.speed = USB_SPEED_UNKNOWN;
+ 	udc->gadget.name = driver_name;
+ 
+-	device_initialize(&udc->gadget.dev);
++	ret = device_initialize(&udc->gadget.dev);
++	if (ret) {
++		kfree(udc)
++		return ret;
++	}
+ 	dev_set_name(&udc->gadget.dev, "gadget");
+ 	udc->gadget.dev.release = omap_udc_release;
+ 	udc->gadget.dev.parent = &odev->dev;
+--- a/drivers/usb/gadget/pxa25x_udc.c
++++ b/drivers/usb/gadget/pxa25x_udc.c
+@@ -2188,7 +2188,9 @@ static int __init pxa25x_udc_probe(struc
+ 	dev->timer.function = udc_watchdog;
+ 	dev->timer.data = (unsigned long) dev;
+ 
+-	device_initialize(&dev->gadget.dev);
++	retval = device_initialize(&dev->gadget.dev);
++	if (retval)
++		goto err_irq1;
+ 	dev->gadget.dev.parent = &pdev->dev;
+ 	dev->gadget.dev.dma_mask = pdev->dev.dma_mask;
+ 
+--- a/drivers/usb/gadget/pxa27x_udc.c
++++ b/drivers/usb/gadget/pxa27x_udc.c
+@@ -2422,7 +2422,9 @@ static int __init pxa_udc_probe(struct p
+ 		goto err_map;
+ 	}
+ 
+-	device_initialize(&udc->gadget.dev);
++	retval = device_initialize(&udc->gadget.dev);
++	if (retval)
++		goto err_irq;
+ 	udc->gadget.dev.parent = &pdev->dev;
+ 	udc->gadget.dev.dma_mask = NULL;
+ 	udc->vbus_sensed = 0;
+--- a/drivers/usb/gadget/s3c2410_udc.c
++++ b/drivers/usb/gadget/s3c2410_udc.c
+@@ -1845,7 +1845,9 @@ static int s3c2410_udc_probe(struct plat
+ 		goto err_mem;
+ 	}
+ 
+-	device_initialize(&udc->gadget.dev);
++	retval = device_initialize(&udc->gadget.dev);
++	if (retval)
++		goto err_map;
+ 	udc->gadget.dev.parent = &pdev->dev;
+ 	udc->gadget.dev.dma_mask = pdev->dev.dma_mask;
+ 
+--- a/drivers/uwb/lc-dev.c
++++ b/drivers/uwb/lc-dev.c
+@@ -109,14 +109,19 @@ static void uwb_dev_sys_release(struct d
+  *
+  * Alloc, zero and call this function.
+  */
+-void uwb_dev_init(struct uwb_dev *uwb_dev)
++int uwb_dev_init(struct uwb_dev *uwb_dev)
+ {
++	int ret;
++
+ 	mutex_init(&uwb_dev->mutex);
+-	device_initialize(&uwb_dev->dev);
++	ret = device_initialize(&uwb_dev->dev);
++	if (ret)
++		return ret;
+ 	uwb_dev->dev.release = uwb_dev_sys_release;
+ 	uwb_dev_addr_init(&uwb_dev->dev_addr);
+ 	uwb_mac_addr_init(&uwb_dev->mac_addr);
+ 	bitmap_fill(uwb_dev->streams, UWB_NUM_GLOBAL_STREAMS);
++	return 0;
+ }
+ 
+ static ssize_t uwb_dev_EUI_48_show(struct device *dev,
+@@ -434,7 +439,11 @@ void uwbd_dev_onair(struct uwb_rc *rc, s
+ 			macbuf);
+ 		return;
+ 	}
+-	uwb_dev_init(uwb_dev);		/* This sets refcnt to one, we own it */
++	/* This sets refcnt to one, we own it */
++	result = uwb_dev_init(uwb_dev);
++	if (result)
++		goto error_dev_add;
++
+ 	uwb_dev->mac_addr = *bce->mac_addr;
+ 	uwb_dev->dev_addr = bce->dev_addr;
+ 	dev_set_name(&uwb_dev->dev, macbuf);
+--- a/drivers/uwb/lc-rc.c
++++ b/drivers/uwb/lc-rc.c
+@@ -84,11 +84,14 @@ static void uwb_rc_sys_release(struct de
+ }
+ 
+ 
+-void uwb_rc_init(struct uwb_rc *rc)
++int uwb_rc_init(struct uwb_rc *rc)
+ {
+ 	struct uwb_dev *uwb_dev = &rc->uwb_dev;
++	int result;
+ 
+-	uwb_dev_init(uwb_dev);
++	result = uwb_dev_init(uwb_dev);
++	if (result)
++		return result;
+ 	rc->uwb_dev.dev.class = &uwb_rc_class;
+ 	rc->uwb_dev.dev.release = uwb_rc_sys_release;
+ 	uwb_rc_neh_create(rc);
+@@ -109,10 +112,15 @@ EXPORT_SYMBOL_GPL(uwb_rc_init);
+ struct uwb_rc *uwb_rc_alloc(void)
+ {
+ 	struct uwb_rc *rc;
++	int result;
++
+ 	rc = kzalloc(sizeof(*rc), GFP_KERNEL);
+ 	if (rc == NULL)
+ 		return NULL;
+-	uwb_rc_init(rc);
++	if (uwb_rc_init(rc)) {
++		kfree(rc);
++		rc = NULL;
++	}
+ 	return rc;
+ }
+ EXPORT_SYMBOL_GPL(uwb_rc_alloc);
+--- a/drivers/uwb/uwb-internal.h
++++ b/drivers/uwb/uwb-internal.h
+@@ -37,7 +37,7 @@
+ struct uwb_beca_e;
+ 
+ /* General device API */
+-extern void uwb_dev_init(struct uwb_dev *uwb_dev);
++extern int uwb_dev_init(struct uwb_dev *uwb_dev);
+ extern int __uwb_dev_offair(struct uwb_dev *, struct uwb_rc *);
+ extern int uwb_dev_add(struct uwb_dev *uwb_dev, struct device *parent_dev,
+ 		       struct uwb_rc *parent_rc);
+--- a/fs/partitions/check.c
++++ b/fs/partitions/check.c
+@@ -389,7 +389,9 @@ struct hd_struct *add_partition(struct g
+ 	else
+ 		dev_set_name(pdev, "%s%d", dname, partno);
+ 
+-	device_initialize(pdev);
++	err = device_initialize(pdev);
++	if (err)
++		goto out_free_stats;
+ 	pdev->class = &block_class;
+ 	pdev->type = &part_type;
+ 	pdev->parent = ddev;
+--- a/include/linux/uwb.h
++++ b/include/linux/uwb.h
+@@ -590,7 +590,7 @@ static inline unsigned __uwb_dev_addr_as
+  * This API is used (in addition to the general API) to implement UWB
+  * Radio Controllers.
+  */
+-void uwb_rc_init(struct uwb_rc *);
++int uwb_rc_init(struct uwb_rc *);
+ int uwb_rc_add(struct uwb_rc *, struct device *dev, void *rc_priv);
+ void uwb_rc_rm(struct uwb_rc *);
+ void uwb_rc_neh_grok(struct uwb_rc *, void *, size_t);
+--- a/net/bluetooth/hci_sysfs.c
++++ b/net/bluetooth/hci_sysfs.c
+@@ -101,6 +101,7 @@ static void add_conn(struct work_struct 
+ void hci_conn_add_sysfs(struct hci_conn *conn)
+ {
+ 	struct hci_dev *hdev = conn->hdev;
++	int retval;
+ 
+ 	BT_DBG("conn %p", conn);
+ 
+@@ -112,7 +113,7 @@ void hci_conn_add_sysfs(struct hci_conn 
+ 
+ 	dev_set_drvdata(&conn->dev, conn);
+ 
+-	device_initialize(&conn->dev);
++	retval = device_initialize(&conn->dev);
+ 
+ 	INIT_WORK(&conn->work, add_conn);
+ 
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -4396,7 +4396,9 @@ int register_netdevice(struct net_device
+ 	if (dev->features & NETIF_F_SG)
+ 		dev->features |= NETIF_F_GSO;
+ 
+-	netdev_initialize_kobject(dev);
++	ret = netdev_initialize_kobject(dev);
++	if (ret)
++		goto err_uninit;
+ 	ret = netdev_register_kobject(dev);
+ 	if (ret)
+ 		goto err_uninit;
+--- a/net/core/net-sysfs.c
++++ b/net/core/net-sysfs.c
+@@ -526,10 +526,10 @@ void netdev_class_remove_file(struct cla
+ EXPORT_SYMBOL(netdev_class_create_file);
+ EXPORT_SYMBOL(netdev_class_remove_file);
+ 
+-void netdev_initialize_kobject(struct net_device *net)
++int netdev_initialize_kobject(struct net_device *net)
+ {
+ 	struct device *device = &(net->dev);
+-	device_initialize(device);
++	return device_initialize(device);
+ }
+ 
+ int netdev_kobject_init(void)
+--- a/net/core/net-sysfs.h
++++ b/net/core/net-sysfs.h
+@@ -4,5 +4,5 @@
+ int netdev_kobject_init(void);
+ int netdev_register_kobject(struct net_device *);
+ void netdev_unregister_kobject(struct net_device *);
+-void netdev_initialize_kobject(struct net_device *);
++int netdev_initialize_kobject(struct net_device *);
+ #endif
+--- a/net/rfkill/rfkill.c
++++ b/net/rfkill/rfkill.c
+@@ -671,6 +671,7 @@ struct rfkill * __must_check rfkill_allo
+ {
+ 	struct rfkill *rfkill;
+ 	struct device *dev;
++	int retval;
+ 
+ 	if (WARN((type >= RFKILL_TYPE_MAX),
+ 			KERN_WARNING
+@@ -689,10 +690,15 @@ struct rfkill * __must_check rfkill_allo
+ 	dev = &rfkill->dev;
+ 	dev->class = &rfkill_class;
+ 	dev->parent = parent;
+-	device_initialize(dev);
++	retval = device_initialize(dev);
++	if (retval) {
++		kfree(rfkill);
++		rfkill = NULL;
++		goto exit;
++	}
+ 
+ 	__module_get(THIS_MODULE);
+-
++exit:
+ 	return rfkill;
+ }
+ EXPORT_SYMBOL(rfkill_allocate);
+--- a/net/wireless/core.c
++++ b/net/wireless/core.c
+@@ -208,6 +208,7 @@ struct wiphy *wiphy_new(struct cfg80211_
+ 
+ 	struct cfg80211_registered_device *drv;
+ 	int alloc_size;
++	int retval;
+ 
+ 	WARN_ON(!ops->add_key && ops->del_key);
+ 	WARN_ON(ops->add_key && !ops->del_key);
+@@ -241,7 +242,13 @@ struct wiphy *wiphy_new(struct cfg80211_
+ 	mutex_init(&drv->devlist_mtx);
+ 	INIT_LIST_HEAD(&drv->netdev_list);
+ 
+-	device_initialize(&drv->wiphy.dev);
++	retval = device_initialize(&drv->wiphy.dev);
++	if (retval) {
++		wiphy_counter--;
++		kfree(drv);
++		return NULL;
++	}
++
+ 	drv->wiphy.dev.class = &ieee80211_class;
+ 	drv->wiphy.dev.platform_data = drv;
+ 
