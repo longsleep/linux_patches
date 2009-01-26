@@ -1,0 +1,92 @@
+From foo@baz Sun Jan 25 20:47:00 PST 2009
+Date: Sun, 25 Jan 2009 20:47:00 -0800
+To: Greg KH <greg@kroah.com>
+From: Greg Kroah-Hartman <gregkh@suse.de>
+Subject: Driver core: device_initialize can return a value
+
+Make device_initialize return a value if everything went well or not.
+This allows us in the future to change the function to allocate memory
+and properly handle error conditions.
+
+It is not marked __must_check yet, as the rest of the kernel tree has
+not been fixed to check the value yet.  That will be in future patches.
+
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+---
+ drivers/base/core.c     |    9 +++++++--
+ drivers/base/platform.c |   13 ++++++++++---
+ include/linux/device.h  |    2 +-
+ 3 files changed, 18 insertions(+), 6 deletions(-)
+
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@ -534,7 +534,7 @@ static void klist_children_put(struct kl
+  * NOTE: Use put_device() to give up your reference instead of freeing
+  * @dev directly once you have called this function.
+  */
+-void device_initialize(struct device *dev)
++int device_initialize(struct device *dev)
+ {
+ 	dev->kobj.kset = devices_kset;
+ 	kobject_init(&dev->kobj, &device_ktype);
+@@ -547,6 +547,7 @@ void device_initialize(struct device *de
+ 	device_init_wakeup(dev, 0);
+ 	device_pm_init(dev);
+ 	set_dev_node(dev, -1);
++	return 0;
+ }
+ 
+ #ifdef CONFIG_SYSFS_DEPRECATED
+@@ -987,7 +988,11 @@ done:
+  */
+ int device_register(struct device *dev)
+ {
+-	device_initialize(dev);
++	int retval;
++
++	retval = device_initialize(dev);
++	if (retval)
++		return retval;
+ 	return device_add(dev);
+ }
+ 
+--- a/drivers/base/platform.c
++++ b/drivers/base/platform.c
+@@ -165,8 +165,11 @@ struct platform_device *platform_device_
+ 		strcpy(pa->name, name);
+ 		pa->pdev.name = pa->name;
+ 		pa->pdev.id = id;
+-		device_initialize(&pa->pdev.dev);
+-		pa->pdev.dev.release = platform_device_release;
++		if (device_initialize(&pa->pdev.dev)) {
++			kfree(pa);
++			pa = NULL;
++		} else
++			pa->pdev.dev.release = platform_device_release;
+ 	}
+ 
+ 	return pa ? &pa->pdev : NULL;
+@@ -321,7 +324,11 @@ EXPORT_SYMBOL_GPL(platform_device_del);
+  */
+ int platform_device_register(struct platform_device *pdev)
+ {
+-	device_initialize(&pdev->dev);
++	int retval;
++
++	retval = device_initialize(&pdev->dev);
++	if (retval)
++		return retval;
+ 	return platform_device_add(pdev);
+ }
+ EXPORT_SYMBOL_GPL(platform_device_register);
+--- a/include/linux/device.h
++++ b/include/linux/device.h
+@@ -471,7 +471,7 @@ void driver_init(void);
+  */
+ extern int __must_check device_register(struct device *dev);
+ extern void device_unregister(struct device *dev);
+-extern void device_initialize(struct device *dev);
++extern int device_initialize(struct device *dev);
+ extern int __must_check device_add(struct device *dev);
+ extern void device_del(struct device *dev);
+ extern int device_for_each_child(struct device *dev, void *data,
