@@ -1,0 +1,219 @@
+---
+ drivers/char/agp/parisc-agp.c |   24 ++++++---------
+ drivers/parisc/gsc.c          |   40 +++++++++++++++-----------
+ drivers/parisc/sba_iommu.c    |   64 ++++++++++++++++++++++++------------------
+ 3 files changed, 71 insertions(+), 57 deletions(-)
+
+--- a/drivers/char/agp/parisc-agp.c
++++ b/drivers/char/agp/parisc-agp.c
+@@ -16,7 +16,6 @@
+ #include <linux/module.h>
+ #include <linux/pci.h>
+ #include <linux/init.h>
+-#include <linux/klist.h>
+ #include <linux/agp_backend.h>
+ #include <linux/log2.h>
+ 
+@@ -359,9 +358,12 @@ fail:
+ 	return error;
+ }
+ 
+-static struct device *next_device(struct klist_iter *i) {
+-	struct klist_node * n = klist_next(i);
+-	return n ? container_of(n, struct device, knode_parent) : NULL;
++static int match_quicksilver(struct device *dev, void *data)
++{
++	struct parisc_device *padev = to_parisc_device(dev);
++
++	if (IS_QUICKSILVER(padev))
++		return 1;
+ }
+ 
+ static int
+@@ -372,8 +374,7 @@ parisc_agp_init(void)
+ 	int err = -1;
+ 	struct parisc_device *sba = NULL, *lba = NULL;
+ 	struct lba_device *lbadev = NULL;
+-	struct device *dev = NULL;
+-	struct klist_iter i;
++	struct device *dev;
+ 
+ 	if (!sba_list)
+ 		goto out;
+@@ -386,14 +387,9 @@ parisc_agp_init(void)
+ 	}
+ 
+ 	/* Now search our Pluto for our precious AGP device... */
+-	klist_iter_init(&sba->dev.klist_children, &i);
+-	while ((dev = next_device(&i))) {
+-		struct parisc_device *padev = to_parisc_device(dev);
+-		if (IS_QUICKSILVER(padev))
+-			lba = padev;
+-	}
+-	klist_iter_exit(&i);
+-
++	dev = device_find_child(&sba->dev, NULL, match_quicksilver);
++	if (dev)
++		lba = to_parisc_device(dev);
+ 	if (!lba) {
+ 		printk(KERN_INFO DRVPFX "No AGP devices found.\n");
+ 		goto out;
+--- a/drivers/parisc/gsc.c
++++ b/drivers/parisc/gsc.c
+@@ -186,29 +186,37 @@ void gsc_asic_assign_irq(struct gsc_asic
+ 	*irqp = irq;
+ }
+ 
+-static struct device *next_device(struct klist_iter *i)
++struct fixup_irq_struct {
++	void *ctrl;
++	void (*choose_irq)(struct parisc_device *, void *);
++}
++
++static int fixup_irq(struct device *dev, void *data)
+ {
+-	struct klist_node * n = klist_next(i);
+-	return n ? container_of(n, struct device, knode_parent) : NULL;
++	struct fixup_irq_struct *fixup = data;
++	void (*choose_irq)(struct parisc_device *, void *) = fixup->choose_irq;
++	void *ctrl = fixup->ctrl;
++	struct parisc_device *padev = to_parisc_device(dev);
++
++	/* work-around for 715/64 and others which have parent
++	   at path [5] and children at path [5/0/x] */
++	if (padev->id.hw_type == HPHW_FAULTY) {
++		gsc_fixup_irqs(padev, ctrl, choose_irq);
++		return -1;
++	}
++	choose_irq(padev, ctrl);
++	return 0;
+ }
+ 
+ void gsc_fixup_irqs(struct parisc_device *parent, void *ctrl,
+ 			void (*choose_irq)(struct parisc_device *, void *))
+ {
+-	struct device *dev;
+-	struct klist_iter i;
++	struct fixup_irq_struct fixup;
+ 
+-	klist_iter_init(&parent->dev.klist_children, &i);
+-	while ((dev = next_device(&i))) {
+-		struct parisc_device *padev = to_parisc_device(dev);
+-
+-		/* work-around for 715/64 and others which have parent 
+-		   at path [5] and children at path [5/0/x] */
+-		if (padev->id.hw_type == HPHW_FAULTY)
+-			return gsc_fixup_irqs(padev, ctrl, choose_irq);
+-		choose_irq(padev, ctrl);
+-	}
+-	klist_iter_exit(&i);
++	fixup.ctrl = ctrl;
++	fixup.choose_irq = choose_irq;
++
++	device_for_each_child(&parent->dev, &fixup, fixup_irq);
+ }
+ 
+ int gsc_common_setup(struct parisc_device *parent, struct gsc_asic *gsc_asic)
+--- a/drivers/parisc/sba_iommu.c
++++ b/drivers/parisc/sba_iommu.c
+@@ -1206,30 +1206,46 @@ sba_alloc_pdir(unsigned int pdir_size)
+ 	return (void *) pdir_base;
+ }
+ 
+-static struct device *next_device(struct klist_iter *i)
++struct setup_ibase_imask {
++	struct ioc *ioc;
++	int ioc_num;
++}
++
++static int setup_ibase_imask_dev(struct device *dev, void *data)
+ {
+-        struct klist_node * n = klist_next(i);
+-        return n ? container_of(n, struct device, knode_parent) : NULL;
++	/* lba_set_iregs() is in drivers/parisc/lba_pci.c */
++        extern void lba_set_iregs(struct parisc_device *, u32, u32);
++	struct setup_ibase_imask *imask = data;
++	struct ioc *ioc = data->ioc;
++	struct parisc_device *lba = to_parisc_device(dev);
++	int rope_num = (lba->hpa.start >> 13) & 0xf;
++
++	if (rope_num >> 3 == data->ioc_num)
++		lba_set_iregs(lba, ioc->ibase, ioc->imask);
++	return 0;
+ }
+ 
+ /* setup Mercury or Elroy IBASE/IMASK registers. */
+ static void 
+ setup_ibase_imask(struct parisc_device *sba, struct ioc *ioc, int ioc_num)
+ {
+-	/* lba_set_iregs() is in drivers/parisc/lba_pci.c */
+-        extern void lba_set_iregs(struct parisc_device *, u32, u32);
+-	struct device *dev;
+-	struct klist_iter i;
++	struct setup_ibase_imask *data;
+ 
+-	klist_iter_init(&sba->dev.klist_children, &i);
+-	while ((dev = next_device(&i))) {
+-		struct parisc_device *lba = to_parisc_device(dev);
+-		int rope_num = (lba->hpa.start >> 13) & 0xf;
+-		if (rope_num >> 3 == ioc_num)
+-			lba_set_iregs(lba, ioc->ibase, ioc->imask);
+-	}
+-	klist_iter_exit(&i);
++	data.ioc = ioc;
++	data.ioc_num = ioc_num;
++
++	device_for_each_child(&sba->dev, &data, setup_ibase_imask_dev);
++}
++
++#ifdef SBA_AGP_SUPPORT
++static int match_quicksilver(struct device *dev, void *data)
++{
++	struct parisc_device *padev = to_parisc_device(dev);
++
++	if (IS_QUICKSILVER(padev))
++		return 1;
+ }
++#endif
+ 
+ static void
+ sba_ioc_init_pluto(struct parisc_device *sba, struct ioc *ioc, int ioc_num)
+@@ -1237,9 +1253,7 @@ sba_ioc_init_pluto(struct parisc_device 
+ 	u32 iova_space_mask;
+ 	u32 iova_space_size;
+ 	int iov_order, tcnfg;
+-#ifdef SBA_AGP_SUPPORT
+-	int agp_found = 0;
+-#endif
++
+ 	/*
+ 	** Firmware programs the base and size of a "safe IOVA space"
+ 	** (one that doesn't overlap memory or LMMIO space) in the
+@@ -1333,8 +1347,8 @@ sba_ioc_init_pluto(struct parisc_device 
+ 
+ #ifdef SBA_AGP_SUPPORT
+ {
+-	struct klist_iter i;
+-	struct device *dev = NULL;
++	struct device *dev;
++	int agp_found = 0;
+ 
+ 	/*
+ 	** If an AGP device is present, only use half of the IOV space
+@@ -1344,13 +1358,9 @@ sba_ioc_init_pluto(struct parisc_device 
+ 	** We program the next pdir index after we stop w/ a key for
+ 	** the GART code to handshake on.
+ 	*/
+-	klist_iter_init(&sba->dev.klist_children, &i);
+-	while ((dev = next_device(&i))) {
+-		struct parisc_device *lba = to_parisc_device(dev);
+-		if (IS_QUICKSILVER(lba))
+-			agp_found = 1;
+-	}
+-	klist_iter_exit(&i);
++	dev = device_find_child(&sba->dev, NULL, match_quicksilver);
++	if (dev)
++		agp_found = 1;
+ 
+ 	if (agp_found && sba_reserve_agpgart) {
+ 		printk(KERN_INFO "%s: reserving %dMb of IOVA space for agpgart\n",

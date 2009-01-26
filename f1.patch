@@ -1,5 +1,21 @@
 ---
- drivers/spi/spi.c                   |    8 +++++++-
+ arch/mips/kernel/vpe.c              |    6 +++++-
+ block/genhd.c                       |    6 +++++-
+ drivers/base/attribute_container.c  |    6 +++++-
+ drivers/firewire/fw-device.c        |    4 +++-
+ drivers/hid/hid-core.c              |    6 +++++-
+ drivers/scsi/hosts.c                |    8 ++++++--
+ drivers/scsi/libfc/fc_rport.c       |    6 +++++-
+ drivers/scsi/raid_class.c           |    6 +++++-
+ drivers/scsi/scsi_priv.h            |    2 +-
+ drivers/scsi/scsi_scan.c            |   14 ++++++++++++--
+ drivers/scsi/scsi_sysfs.c           |   12 +++++++++---
+ drivers/scsi/scsi_transport_fc.c    |   12 ++++++++++--
+ drivers/scsi/scsi_transport_iscsi.c |    5 ++++-
+ drivers/scsi/scsi_transport_sas.c   |   22 ++++++++++++++++++----
+ drivers/scsi/scsi_transport_srp.c   |    6 +++++-
+ drivers/scsi/sd.c                   |    3 ++-
+ drivers/spi/spi.c                   |   13 +++++++++++--
  drivers/usb/core/message.c          |    8 +++++++-
  drivers/usb/core/usb.c              |    7 ++++++-
  drivers/usb/gadget/atmel_usba_udc.c |    4 +++-
@@ -22,8 +38,334 @@
  net/core/net-sysfs.h                |    2 +-
  net/rfkill/rfkill.c                 |   10 ++++++++--
  net/wireless/core.c                 |    9 ++++++++-
- 23 files changed, 102 insertions(+), 29 deletions(-)
+ 39 files changed, 206 insertions(+), 54 deletions(-)
 
+--- a/arch/mips/kernel/vpe.c
++++ b/arch/mips/kernel/vpe.c
+@@ -1451,7 +1451,11 @@ static int __init vpe_module_init(void)
+ 		goto out_chrdev;
+ 	}
+ 
+-	device_initialize(&vpe_device);
++	err = device_initialize(&vpe_device);
++	if (err) {
++		printk(KERN_ERR "Initializing vpe_device failed\n");
++		goto out_class;
++	}
+ 	vpe_device.class	= &vpe_class,
+ 	vpe_device.parent	= NULL,
+ 	dev_set_name(&vpe_device, "vpe1");
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -1129,7 +1129,11 @@ struct gendisk *alloc_disk_node(int mino
+ 		rand_initialize_disk(disk);
+ 		disk_to_dev(disk)->class = &block_class;
+ 		disk_to_dev(disk)->type = &disk_type;
+-		device_initialize(disk_to_dev(disk));
++		if (device_initialize(disk_to_dev(disk))) {
++			free_part_stats(&disk->part0);
++			kfree(disk);
++			return NULL;
++		}
+ 		INIT_WORK(&disk->async_notify,
+ 			media_change_notify_thread);
+ 	}
+--- a/drivers/base/attribute_container.c
++++ b/drivers/base/attribute_container.c
+@@ -163,7 +163,11 @@ attribute_container_add_device(struct de
+ 		}
+ 
+ 		ic->cont = cont;
+-		device_initialize(&ic->classdev);
++		if (device_initialize(&ic->classdev)) {
++			dev_err(dev, "failed to initialize class container\n");
++			kfree(ic);
++			continue;
++		}
+ 		ic->classdev.parent = get_device(dev);
+ 		ic->classdev.class = cont->class;
+ 		cont->class->dev_release = attribute_container_release;
+--- a/drivers/firewire/fw-device.c
++++ b/drivers/firewire/fw-device.c
+@@ -696,7 +696,9 @@ static void fw_device_init(struct work_s
+ 		return;
+ 	}
+ 
+-	device_initialize(&device->device);
++	err = device_initialize(&device->device);
++	if (err)
++		goto error;
+ 
+ 	fw_device_get(device);
+ 	down_write(&fw_device_rwsem);
+--- a/drivers/hid/hid-core.c
++++ b/drivers/hid/hid-core.c
+@@ -1732,7 +1732,11 @@ struct hid_device *hid_allocate_device(v
+ 	if (hdev == NULL)
+ 		return ERR_PTR(ret);
+ 
+-	device_initialize(&hdev->dev);
++	ret = device_initialize(&hdev->dev);
++	if (ret) {
++		kfree(hdev);
++		return ERR_PTR(ret);
++	}
+ 	hdev->dev.release = hid_device_release;
+ 	hdev->dev.bus = &hid_bus_type;
+ 
+--- a/drivers/scsi/hosts.c
++++ b/drivers/scsi/hosts.c
+@@ -387,14 +387,18 @@ struct Scsi_Host *scsi_host_alloc(struct
+ 	else
+ 		shost->dma_boundary = 0xffffffff;
+ 
+-	device_initialize(&shost->shost_gendev);
++	rval = device_initialize(&shost->shost_gendev);
++	if (rval)
++		goto fail_kfree;
+ 	dev_set_name(&shost->shost_gendev, "host%d", shost->host_no);
+ #ifndef CONFIG_SYSFS_DEPRECATED
+ 	shost->shost_gendev.bus = &scsi_bus_type;
+ #endif
+ 	shost->shost_gendev.type = &scsi_host_type;
+ 
+-	device_initialize(&shost->shost_dev);
++	rval = device_initialize(&shost->shost_dev);
++	if (rval)
++		goto fail_kfree;
+ 	shost->shost_dev.parent = &shost->shost_gendev;
+ 	shost->shost_dev.class = &shost_class;
+ 	dev_set_name(&shost->shost_dev, "host%d", shost->host_no);
+--- a/drivers/scsi/libfc/fc_rport.c
++++ b/drivers/scsi/libfc/fc_rport.c
+@@ -121,7 +121,11 @@ struct fc_rport *fc_rport_rogue_create(s
+ 	 * Note: all this libfc rogue rport code will be removed for
+ 	 * upstream so it fine that this is really ugly and hacky right now.
+ 	 */
+-	device_initialize(&rport->dev);
++	if (device_initialize(&rport->dev)) {
++		kfree(rport);
++		return NULL;
++	}
++
+ 	rport->dev.release = fc_rport_rogue_destroy;
+ 
+ 	mutex_init(&rdata->rp_mutex);
+--- a/drivers/scsi/raid_class.c
++++ b/drivers/scsi/raid_class.c
+@@ -232,7 +232,11 @@ int raid_component_add(struct raid_templ
+ 		return -ENOMEM;
+ 
+ 	INIT_LIST_HEAD(&rc->node);
+-	device_initialize(&rc->dev);
++	err = device_initialize(&rc->dev);
++	if (err) {
++		kfree(rc);
++		return err;
++	}
+ 	rc->dev.release = raid_component_release;
+ 	rc->dev.parent = get_device(component_dev);
+ 	rc->num = rd->component_count++;
+--- a/drivers/scsi/scsi_priv.h
++++ b/drivers/scsi/scsi_priv.h
+@@ -114,7 +114,7 @@ extern int scsi_sysfs_add_sdev(struct sc
+ extern int scsi_sysfs_add_host(struct Scsi_Host *);
+ extern int scsi_sysfs_register(void);
+ extern void scsi_sysfs_unregister(void);
+-extern void scsi_sysfs_device_initialize(struct scsi_device *);
++extern int scsi_sysfs_device_initialize(struct scsi_device *);
+ extern int scsi_sysfs_target_initialize(struct scsi_device *);
+ extern struct scsi_transport_template blank_transport_template;
+ extern void __scsi_remove_device(struct scsi_device *);
+--- a/drivers/scsi/scsi_scan.c
++++ b/drivers/scsi/scsi_scan.c
+@@ -299,7 +299,12 @@ static struct scsi_device *scsi_alloc_sd
+ 	sdev->request_queue->queuedata = sdev;
+ 	scsi_adjust_queue_depth(sdev, 0, sdev->host->cmd_per_lun);
+ 
+-	scsi_sysfs_device_initialize(sdev);
++	ret = scsi_sysfs_device_initialize(sdev);
++	if (ret) {
++		put_device(&starget->dev);
++		kfree(sdev);
++		goto out;
++	}
+ 
+ 	if (shost->hostt->slave_alloc) {
+ 		ret = shost->hostt->slave_alloc(sdev);
+@@ -411,7 +416,12 @@ static struct scsi_target *scsi_alloc_ta
+ 		return NULL;
+ 	}
+ 	dev = &starget->dev;
+-	device_initialize(dev);
++	error = device_initialize(dev);
++	if (error) {
++		printk(KERN_ERR "%s: device_initialize failure\n", __func__);
++		kfree(starget);
++		return NULL;
++	}
+ 	starget->reap_ref = 1;
+ 	dev->parent = get_device(parent);
+ 	dev_set_name(dev, "target%d:%d:%d", shost->host_no, channel, id);
+--- a/drivers/scsi/scsi_sysfs.c
++++ b/drivers/scsi/scsi_sysfs.c
+@@ -1070,19 +1070,24 @@ static struct device_type scsi_dev_type 
+ 	.groups =	scsi_sdev_attr_groups,
+ };
+ 
+-void scsi_sysfs_device_initialize(struct scsi_device *sdev)
++int scsi_sysfs_device_initialize(struct scsi_device *sdev)
+ {
+ 	unsigned long flags;
+ 	struct Scsi_Host *shost = sdev->host;
+ 	struct scsi_target  *starget = sdev->sdev_target;
++	int error;
+ 
+-	device_initialize(&sdev->sdev_gendev);
++	error = device_initialize(&sdev->sdev_gendev);
++	if (error)
++		return error;
+ 	sdev->sdev_gendev.bus = &scsi_bus_type;
+ 	sdev->sdev_gendev.type = &scsi_dev_type;
+ 	dev_set_name(&sdev->sdev_gendev, "%d:%d:%d:%d",
+ 		     sdev->host->host_no, sdev->channel, sdev->id, sdev->lun);
+ 
+-	device_initialize(&sdev->sdev_dev);
++	error = device_initialize(&sdev->sdev_dev);
++	if (error)
++		return error;
+ 	sdev->sdev_dev.parent = &sdev->sdev_gendev;
+ 	sdev->sdev_dev.class = &sdev_class;
+ 	dev_set_name(&sdev->sdev_dev, "%d:%d:%d:%d",
+@@ -1093,6 +1098,7 @@ void scsi_sysfs_device_initialize(struct
+ 	list_add_tail(&sdev->same_target_siblings, &starget->devices);
+ 	list_add_tail(&sdev->siblings, &shost->__devices);
+ 	spin_unlock_irqrestore(shost->host_lock, flags);
++	return 0;
+ }
+ 
+ int scsi_is_sdev_device(const struct device *dev)
+--- a/drivers/scsi/scsi_transport_fc.c
++++ b/drivers/scsi/scsi_transport_fc.c
+@@ -2487,7 +2487,11 @@ fc_rport_create(struct Scsi_Host *shost,
+ 	spin_unlock_irqrestore(shost->host_lock, flags);
+ 
+ 	dev = &rport->dev;
+-	device_initialize(dev);			/* takes self reference */
++	error = device_initialize(dev);		/* takes self reference */
++	if (error) {
++		printk(KERN_ERR "FC Remote Port device_initialize failed\n");
++		goto delete_rport;
++	}
+ 	dev->parent = get_device(&shost->shost_gendev); /* parent reference */
+ 	dev->release = fc_rport_dev_release;
+ 	dev_set_name(dev, "rport-%d:%d-%d",
+@@ -3178,7 +3182,11 @@ fc_vport_setup(struct Scsi_Host *shost, 
+ 	spin_unlock_irqrestore(shost->host_lock, flags);
+ 
+ 	dev = &vport->dev;
+-	device_initialize(dev);			/* takes self reference */
++	error = device_initialize(dev);		/* takes self reference */
++	if (error) {	/* takes self reference */
++		printk(KERN_ERR "FC Virtual Port device_initialize failed\n");
++		goto delete_vport;
++	}
+ 	dev->parent = get_device(pdev);		/* takes parent reference */
+ 	dev->release = fc_vport_dev_release;
+ 	dev_set_name(dev, "vport-%d:%d-%d",
+--- a/drivers/scsi/scsi_transport_iscsi.c
++++ b/drivers/scsi/scsi_transport_iscsi.c
+@@ -670,7 +670,10 @@ iscsi_alloc_session(struct Scsi_Host *sh
+ 	scsi_host_get(shost);
+ 	session->dev.parent = &shost->shost_gendev;
+ 	session->dev.release = iscsi_session_release;
+-	device_initialize(&session->dev);
++	if (device_initialize(&session->dev)) {
++		kfree(session);
++		return NULL;
++	}
+ 	if (dd_size)
+ 		session->dd_data = &session[1];
+ 	return session;
+--- a/drivers/scsi/scsi_transport_sas.c
++++ b/drivers/scsi/scsi_transport_sas.c
+@@ -623,7 +623,10 @@ struct sas_phy *sas_phy_alloc(struct dev
+ 	phy->number = number;
+ 	phy->enabled = 1;
+ 
+-	device_initialize(&phy->dev);
++	if (device_initialize(&phy->dev)) {
++		kfree(phy);
++		return NULL;
++	}
+ 	phy->dev.parent = get_device(parent);
+ 	phy->dev.release = sas_phy_release;
+ 	INIT_LIST_HEAD(&phy->port_siblings);
+@@ -811,7 +814,10 @@ struct sas_port *sas_port_alloc(struct d
+ 
+ 	port->port_identifier = port_id;
+ 
+-	device_initialize(&port->dev);
++	if (device_initialize(&port->dev)) {
++		kfree(port);
++		return NULL;
++	}
+ 
+ 	port->dev.parent = get_device(parent);
+ 	port->dev.release = sas_port_release;
+@@ -1363,7 +1369,11 @@ struct sas_rphy *sas_end_device_alloc(st
+ 		return NULL;
+ 	}
+ 
+-	device_initialize(&rdev->rphy.dev);
++	if (device_initialize(&rdev->rphy.dev)) {
++		kfree(rdev);
++		return NULL;
++	}
++
+ 	rdev->rphy.dev.parent = get_device(&parent->dev);
+ 	rdev->rphy.dev.release = sas_end_device_release;
+ 	if (scsi_is_sas_expander_device(parent->dev.parent)) {
+@@ -1407,7 +1417,11 @@ struct sas_rphy *sas_expander_alloc(stru
+ 		return NULL;
+ 	}
+ 
+-	device_initialize(&rdev->rphy.dev);
++	if (device_initialize(&rdev->rphy.dev)) {
++		kfree(rdev);
++		return NULL;
++	}
++
+ 	rdev->rphy.dev.parent = get_device(&parent->dev);
+ 	rdev->rphy.dev.release = sas_expander_release;
+ 	mutex_lock(&sas_host->lock);
+--- a/drivers/scsi/scsi_transport_srp.c
++++ b/drivers/scsi/scsi_transport_srp.c
+@@ -203,7 +203,11 @@ struct srp_rport *srp_rport_add(struct S
+ 	if (!rport)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	device_initialize(&rport->dev);
++	ret = device_initialize(&rport->dev);
++	if (ret) {
++		kfree(rport);
++		return ERR_PTR(ret);
++	}
+ 
+ 	rport->dev.parent = get_device(parent);
+ 	rport->dev.release = srp_rport_release;
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -1827,7 +1827,8 @@ static void sd_probe_async(void *data, a
+ 					     SD_MOD_TIMEOUT);
+ 	}
+ 
+-	device_initialize(&sdkp->dev);
++	if (device_initialize(&sdkp->dev))
++		goto out_free_index;
+ 	sdkp->dev.parent = &sdp->sdev_gendev;
+ 	sdkp->dev.class = &sd_disk_class;
+ 	dev_set_name(&sdkp->dev, dev_name(&sdp->sdev_gendev));
 --- a/drivers/spi/spi.c
 +++ b/drivers/spi/spi.c
 @@ -199,6 +199,7 @@ struct spi_device *spi_alloc_device(stru
@@ -48,6 +390,18 @@
  	return spi;
  }
  EXPORT_SYMBOL_GPL(spi_alloc_device);
+@@ -446,7 +452,10 @@ struct spi_master *spi_alloc_master(stru
+ 	if (!master)
+ 		return NULL;
+ 
+-	device_initialize(&master->dev);
++	if (device_initialize(&master->dev)) {
++		kfree(master);
++		return NULL;
++	}
+ 	master->dev.class = &spi_master_class;
+ 	master->dev.parent = get_device(dev);
+ 	spi_master_set_devdata(master, &master[1]);
 --- a/drivers/usb/core/message.c
 +++ b/drivers/usb/core/message.c
 @@ -1706,7 +1706,13 @@ free_interfaces:
