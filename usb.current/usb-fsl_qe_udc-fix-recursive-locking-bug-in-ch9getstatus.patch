@@ -1,0 +1,94 @@
+From avorontsov@ru.mvista.com  Tue Feb  3 16:59:11 2009
+From: Anton Vorontsov <avorontsov@ru.mvista.com>
+Date: Thu, 25 Dec 2008 17:15:05 +0300
+Subject: USB: fsl_qe_udc: Fix recursive locking bug in ch9getstatus()
+To: Greg Kroah-Hartman <greg@kroah.com>
+Cc: Andrew Morton <akpm@linux-foundation.org>, Alan Stern <stern@rowland.harvard.edu>, David Brownell <dbrownell@users.sourceforge.net>, Timur Tabi <timur@freescale.com>, Li Yang <leoli@freescale.com>
+Message-ID: <20081225141505.GB6786@oksana.dev.rtsoft.ru>
+
+
+The call chain is this:
+
+qe_udc_irq() <- grabs the udc->lock spinlock
+rx_irq()
+qe_ep0_rx()
+ep0_setup_handle()
+setup_received_handle()
+ch9getstatus()
+qe_ep_queue() <- tries to grab the udc->lock again
+
+It seems unsafe to temporarily drop the lock in the ch9getstatus(),
+so to fix that bug the lock-less __qe_ep_queue() function
+implemented and used by the ch9getstatus().
+
+Signed-off-by: Anton Vorontsov <avorontsov@ru.mvista.com>
+Acked-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/gadget/fsl_qe_udc.c |   26 ++++++++++++++++++--------
+ 1 file changed, 18 insertions(+), 8 deletions(-)
+
+--- a/drivers/usb/gadget/fsl_qe_udc.c
++++ b/drivers/usb/gadget/fsl_qe_udc.c
+@@ -1681,14 +1681,11 @@ static void qe_free_request(struct usb_e
+ 		kfree(req);
+ }
+ 
+-/* queues (submits) an I/O request to an endpoint */
+-static int qe_ep_queue(struct usb_ep *_ep, struct usb_request *_req,
+-				gfp_t gfp_flags)
++static int __qe_ep_queue(struct usb_ep *_ep, struct usb_request *_req)
+ {
+ 	struct qe_ep *ep = container_of(_ep, struct qe_ep, ep);
+ 	struct qe_req *req = container_of(_req, struct qe_req, req);
+ 	struct qe_udc *udc;
+-	unsigned long flags;
+ 	int reval;
+ 
+ 	udc = ep->udc;
+@@ -1732,7 +1729,7 @@ static int qe_ep_queue(struct usb_ep *_e
+ 	list_add_tail(&req->queue, &ep->queue);
+ 	dev_vdbg(udc->dev, "gadget have request in %s! %d\n",
+ 			ep->name, req->req.length);
+-	spin_lock_irqsave(&udc->lock, flags);
++
+ 	/* push the request to device */
+ 	if (ep_is_in(ep))
+ 		reval = ep_req_send(ep, req);
+@@ -1748,11 +1745,24 @@ static int qe_ep_queue(struct usb_ep *_e
+ 	if (ep->dir == USB_DIR_OUT)
+ 		reval = ep_req_receive(ep, req);
+ 
+-	spin_unlock_irqrestore(&udc->lock, flags);
+-
+ 	return 0;
+ }
+ 
++/* queues (submits) an I/O request to an endpoint */
++static int qe_ep_queue(struct usb_ep *_ep, struct usb_request *_req,
++		       gfp_t gfp_flags)
++{
++	struct qe_ep *ep = container_of(_ep, struct qe_ep, ep);
++	struct qe_udc *udc = ep->udc;
++	unsigned long flags;
++	int ret;
++
++	spin_lock_irqsave(&udc->lock, flags);
++	ret = __qe_ep_queue(_ep, _req);
++	spin_unlock_irqrestore(&udc->lock, flags);
++	return ret;
++}
++
+ /* dequeues (cancels, unlinks) an I/O request from an endpoint */
+ static int qe_ep_dequeue(struct usb_ep *_ep, struct usb_request *_req)
+ {
+@@ -2008,7 +2018,7 @@ static void ch9getstatus(struct qe_udc *
+ 	udc->ep0_dir = USB_DIR_IN;
+ 
+ 	/* data phase */
+-	status = qe_ep_queue(&ep->ep, &req->req, GFP_ATOMIC);
++	status = __qe_ep_queue(&ep->ep, &req->req);
+ 
+ 	if (status == 0)
+ 		return;
