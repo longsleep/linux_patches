@@ -1,0 +1,90 @@
+From sshtylyov@ru.mvista.com  Wed Feb  4 15:22:58 2009
+From: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+Date: Wed, 4 Feb 2009 23:37:21 +0300
+Subject: USB: musb_host: fix endpoint_disable() method
+To: felipe.balbi@nokia.com, gregkh@suse.de
+Cc: linux-usb@vger.kernel.org, davinci-linux-open-source@linux.davincidsp.com, david-b@pacbell.net
+Message-ID: <200902042337.21940.sshtylyov@ru.mvista.com>
+Content-Disposition: inline
+
+
+The end of musb_h_disable() is totally insane: list_for_each_entry_safe_from()
+will obviously cause a kernel oops given a NULL pointer and otherwise it'd be
+too late to give back the first URB in the list as musb_cleanup_urb() called
+beforehand would have already done that, unlinking it from the URB list and
+thus causing the interator to loop on this URB forever. The list interator is
+not safe to use either as URBs may be explicitly dequeued by upper layers while
+it's running. As if that was not enough, musb_giveback() is not safe to call
+from here either because:
+- when we're disabling an endpoint with an URB being currently active, once
+  URB list empties, we must immediately switch to serving the next endpoint
+  (represented by 'struct musb_qh') or risk the schedule list being stalled;
+- when we're disabling an endpoint not being currently active, musb_giveback()
+  may e.g. spoil the saved data toggle since it'll be reading it while another
+  logical endpoint ('struct musb_qh') is active.
+Finally, it doesn't seem to be safe to read 'hep->hcpriv' before taking hold of
+'musb->lock'... phew. :-)
+
+Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+Cc: Felipe Balbi <felipe.balbi@nokia.com>
+Cc: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ drivers/usb/musb/musb_host.c |   32 +++++++++++++++++++++-----------
+ 1 file changed, 21 insertions(+), 11 deletions(-)
+
+--- a/drivers/usb/musb/musb_host.c
++++ b/drivers/usb/musb/musb_host.c
+@@ -2099,15 +2099,16 @@ musb_h_disable(struct usb_hcd *hcd, stru
+ 	unsigned long		flags;
+ 	struct musb		*musb = hcd_to_musb(hcd);
+ 	u8			is_in = epnum & USB_DIR_IN;
+-	struct musb_qh		*qh = hep->hcpriv;
+-	struct urb		*urb, *tmp;
++	struct musb_qh		*qh;
++	struct urb		*urb;
+ 	struct list_head	*sched;
+ 
+-	if (!qh)
+-		return;
+-
+ 	spin_lock_irqsave(&musb->lock, flags);
+ 
++	qh = hep->hcpriv;
++	if (qh == NULL)
++		goto exit;
++
+ 	switch (qh->type) {
+ 	case USB_ENDPOINT_XFER_CONTROL:
+ 		sched = &musb->control;
+@@ -2141,13 +2142,22 @@ musb_h_disable(struct usb_hcd *hcd, stru
+ 
+ 		/* cleanup */
+ 		musb_cleanup_urb(urb, qh, urb->pipe & USB_DIR_IN);
+-	} else
+-		urb = NULL;
+-
+-	/* then just nuke all the others */
+-	list_for_each_entry_safe_from(urb, tmp, &hep->urb_list, urb_list)
+-		musb_giveback(qh, urb, -ESHUTDOWN);
+ 
++		/* Then just nuke all the others */
++		while (!list_empty(&hep->urb_list)) {
++			urb = next_urb(qh);
++			urb->status = -ESHUTDOWN;
++			musb_advance_schedule(musb, urb, qh->hw_ep, is_in);
++		}
++	} else {
++		while (!list_empty(&hep->urb_list))
++			__musb_giveback(musb, next_urb(qh), -ESHUTDOWN);
++
++		hep->hcpriv = NULL;
++		list_del(&qh->ring);
++		kfree(qh);
++	}
++exit:
+ 	spin_unlock_irqrestore(&musb->lock, flags);
+ }
+ 

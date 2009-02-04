@@ -1,0 +1,63 @@
+From sshtylyov@ru.mvista.com  Wed Feb  4 15:23:42 2009
+From: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+Date: Wed, 4 Feb 2009 23:39:32 +0300
+Subject: USB: musb_host: fix premature PIO transfer end
+To: felipe.balbi@nokia.com, gregkh@suse.de
+Cc: linux-usb@vger.kernel.org, davinci-linux-open-source@linux.davincidsp.com, david-b@pacbell.net
+Message-ID: <200902042339.32987.sshtylyov@ru.mvista.com>
+Content-Disposition: inline
+
+
+Feeding 32-bit length cast down to 'u16' to min() to calculate the FIFO count
+in musb_host_tx() risks sending a short packet prematurely for transfer sizes
+over 64 KB. And although data transfer size shouldn't exceed 65535 bytes for
+the control endpoint, making musb_h_ep0_continue() more robust WRT URBs with
+possibly oversized buffer will not hurt either...
+
+Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+Cc: Felipe Balbi <felipe.balbi@nokia.com>
+Cc: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ drivers/usb/musb/musb_host.c |   14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
+
+--- a/drivers/usb/musb/musb_host.c
++++ b/drivers/usb/musb/musb_host.c
+@@ -936,8 +936,8 @@ static bool musb_h_ep0_continue(struct m
+ 	switch (musb->ep0_stage) {
+ 	case MUSB_EP0_IN:
+ 		fifo_dest = urb->transfer_buffer + urb->actual_length;
+-		fifo_count = min(len, ((u16) (urb->transfer_buffer_length
+-					- urb->actual_length)));
++		fifo_count = min_t(size_t, len, urb->transfer_buffer_length -
++				   urb->actual_length);
+ 		if (fifo_count < len)
+ 			urb->status = -EOVERFLOW;
+ 
+@@ -970,10 +970,9 @@ static bool musb_h_ep0_continue(struct m
+ 		}
+ 		/* FALLTHROUGH */
+ 	case MUSB_EP0_OUT:
+-		fifo_count = min(qh->maxpacket, ((u16)
+-				(urb->transfer_buffer_length
+-				- urb->actual_length)));
+-
++		fifo_count = min_t(size_t, qh->maxpacket,
++				   urb->transfer_buffer_length -
++				   urb->actual_length);
+ 		if (fifo_count) {
+ 			fifo_dest = (u8 *) (urb->transfer_buffer
+ 					+ urb->actual_length);
+@@ -1303,7 +1302,8 @@ void musb_host_tx(struct musb *musb, u8 
+ 		 * packets before updating TXCSR ... other docs disagree ...
+ 		 */
+ 		/* PIO:  start next packet in this URB */
+-		wLength = min(qh->maxpacket, (u16) wLength);
++		if (wLength > qh->maxpacket)
++			wLength = qh->maxpacket;
+ 		musb_write_fifo(hw_ep, wLength, buf);
+ 		qh->segsize = wLength;
+ 

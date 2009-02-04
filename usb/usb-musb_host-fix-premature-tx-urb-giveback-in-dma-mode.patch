@@ -1,0 +1,208 @@
+From sshtylyov@ru.mvista.com  Wed Feb  4 15:24:22 2009
+From: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+Date: Wed, 4 Feb 2009 23:49:30 +0300
+Subject: USB: musb_host: fix premature Tx URB giveback in DMA mode
+To: felipe.balbi@nokia.com, gregkh@suse.de
+Cc: linux-usb@vger.kernel.org, davinci-linux-open-source@linux.davincidsp.com, david-b@pacbell.net, dkrivoschekov@ru.mvista.com
+Message-ID: <200902042349.31093.sshtylyov@ru.mvista.com>
+Content-Disposition: inline
+
+
+When using DMA for host Tx transfers with any DMA controller that can transfer
+several packets in one transfer, we really want to use the DMA request mode 1
+to suppress interrupts on TxPktRdy bit being cleared.  This is currently done
+only for the Inventra DMA controller -- however, there is a caveat that was not
+addressed: if a multi-packet transfer ends with a full-size packet, the driver
+will call musb_dma_completion() immediately which will lead to the current URB
+being completed with the FIFO possibly still containing an unsent packet and
+the next URB likely flushing it from there without being sent.  The CPPI DMA
+driver, on the other hand, still uses the DMA request mode 0 (resulting in the
+"parasitic" TxPktRdy interrupts -- which the host driver logs and then ignores)
+and does not call musb_dma_completion() on the host Tx path at all in order to
+defer the URB completion until the next interrupt on TxPktRdy bit being cleared;
+still, this scheme fails too because of the stale TxPktRdy interrupts often
+being handled after DMA has already completed which results in a premature URB
+completion anyway...
+
+Since this issue is common to almost all DMA contollers, I'm solving it in a
+generic way -- by adding a sort of the "interrupt filter" into musb_host_tx()
+which upon seeing that an interrupt happened while TXCSR indicates DMA request
+mode 1, resets to mode 0 (it *tries* to do that after clearing DMAReqEnab bit
+as the programming guide forbids clearing DMAReqMode bit before or at the same
+cycle as that one) and either defers the USB processing to the next TxPktRdy
+interrupt or, seeing that FIFO is already empty, proceeds with handling this
+interrupt. Since it should be competely safe now to use the DMA request mode 1
+for the CPPI DMA controller, set it in the former cppi_host_txdma_start() (that
+I've renamed as it's used not only in the CPPI case); and since musb_host_tx()
+should now be able to filter out the "unwanted" DMA completion interrupts, stop
+filtering them out in the Inventra and CPPI DMA drivers...
+
+Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+Cc: Felipe Balbi <felipe.balbi@nokia.com>
+Cc: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/musb/cppi_dma.c  |   22 ------------
+ drivers/usb/musb/musb_host.c |   75 ++++++++++++++++++++++++++++++++++++++++---
+ drivers/usb/musb/musbhsdma.c |    7 +---
+ 3 files changed, 74 insertions(+), 30 deletions(-)
+
+--- a/drivers/usb/musb/cppi_dma.c
++++ b/drivers/usb/musb/cppi_dma.c
+@@ -1228,27 +1228,7 @@ void cppi_completion(struct musb *musb, 
+ 
+ 				hw_ep = tx_ch->hw_ep;
+ 
+-				/* Peripheral role never repurposes the
+-				 * endpoint, so immediate completion is
+-				 * safe.  Host role waits for the fifo
+-				 * to empty (TXPKTRDY irq) before going
+-				 * to the next queued bulk transfer.
+-				 */
+-				if (is_host_active(cppi->musb)) {
+-#if 0
+-					/* WORKAROUND because we may
+-					 * not always get TXKPTRDY ...
+-					 */
+-					int	csr;
+-
+-					csr = musb_readw(hw_ep->regs,
+-						MUSB_TXCSR);
+-					if (csr & MUSB_TXCSR_TXPKTRDY)
+-#endif
+-						completed = false;
+-				}
+-				if (completed)
+-					musb_dma_completion(musb, index + 1, 1);
++				musb_dma_completion(musb, index + 1, 1);
+ 
+ 			} else {
+ 				/* Bigger transfer than we could fit in
+--- a/drivers/usb/musb/musb_host.c
++++ b/drivers/usb/musb/musb_host.c
+@@ -4,6 +4,7 @@
+  * Copyright 2005 Mentor Graphics Corporation
+  * Copyright (C) 2005-2006 by Texas Instruments
+  * Copyright (C) 2006-2007 Nokia Corporation
++ * Copyright (C) 2008-2009 MontaVista Software, Inc. <source@mvista.com>
+  *
+  * This program is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU General Public License
+@@ -151,14 +152,16 @@ static inline void musb_h_tx_start(struc
+ 
+ }
+ 
+-static inline void cppi_host_txdma_start(struct musb_hw_ep *ep)
++static inline void musb_h_tx_dma_start(struct musb_hw_ep *ep)
+ {
+ 	u16	txcsr;
+ 
+ 	/* NOTE: no locks here; caller should lock and select EP */
+ 	txcsr = musb_readw(ep->regs, MUSB_TXCSR);
+-	txcsr |= MUSB_TXCSR_DMAENAB | MUSB_TXCSR_H_WZC_BITS;
+-	musb_writew(ep->regs, MUSB_TXCSR, txcsr);
++	txcsr |= MUSB_TXCSR_DMAENAB;
++	if (is_cppi_enabled())
++		txcsr |= MUSB_TXCSR_DMAMODE;
++	musb_writew(ep->regs, MUSB_TXCSR, txcsr | MUSB_TXCSR_H_WZC_BITS);
+ }
+ 
+ /*
+@@ -261,7 +264,7 @@ start:
+ 		if (!hw_ep->tx_channel)
+ 			musb_h_tx_start(hw_ep);
+ 		else if (is_cppi_enabled() || tusb_dma_omap())
+-			cppi_host_txdma_start(hw_ep);
++			musb_h_tx_dma_start(hw_ep);
+ 	}
+ }
+ 
+@@ -1240,6 +1243,70 @@ void musb_host_tx(struct musb *musb, u8 
+ 
+ 	}
+ 
++	if (is_dma_capable() && dma && !status) {
++		/*
++		 * OK, DMA has completed. However, if we're using DMA request
++		 * mode 1 (which any sane DMA implementation would want to use),
++		 * we still need to receive the final TxPktRdy interrupt before
++		 * considering the transfer completed, or risk the last packet
++		 * being flushed from FIFO by the next URB.  We therefore have
++		 * to switch back to the mode 0 to re-enable the interrupt on
++		 * TxPktRdy being cleared; we'll re-enter here once it happens.
++		 */
++		if (tx_csr & MUSB_TXCSR_DMAMODE) {
++			/*
++			 * Well, it would have been too simple if we could just
++			 * clear DMAReqMode and then move on -- the programming
++			 * guide forbids doing that while the DMAReqEnab bit is
++			 * set, so we need to clear it first.  That should be
++			 * safe to do once TxPktRdy has been set (and I've never
++			 * seen it being 0 at this moment -- the DMA interrupt
++			 * latency is really significant) but if it hasn't been
++			 * then we have no choice but to stop being polite and
++			 * ignore the programming guide... :-)
++			 *
++			 * Note that we must write TXCSR with TxPktRdy cleared
++			 * in order not to re-trigger the packet send (this bit
++			 * can't be cleared by CPU), and there's another caveat:
++			 * TXPktRdy may be set shortly and then cleared in the
++			 * double-buffered FIFO mode, so we do an extra TXCSR
++			 * read for debouncing...
++			 */
++			tx_csr &= musb_readw(epio, MUSB_TXCSR);
++			if (tx_csr & MUSB_TXCSR_TXPKTRDY) {
++				tx_csr &= ~(MUSB_TXCSR_DMAENAB |
++					    MUSB_TXCSR_TXPKTRDY);
++				musb_writew(epio, MUSB_TXCSR,
++					    tx_csr | MUSB_TXCSR_H_WZC_BITS);
++			}
++			tx_csr &= ~(MUSB_TXCSR_DMAMODE |
++				    MUSB_TXCSR_TXPKTRDY);
++			musb_writew(epio, MUSB_TXCSR,
++				    tx_csr | MUSB_TXCSR_H_WZC_BITS);
++
++			/*
++			 * There is no guarantee that we'll get an interrupt
++			 * after clearing DMAReqMode as we might have done this
++			 * too late (after TxPktRdy was cleared by controller).
++			 * Re-read TXCSR as we have spoiled its previous value.
++			 */
++			tx_csr = musb_readw(epio, MUSB_TXCSR);
++		}
++
++		/*
++		 * We may get here from a DMA completion or TxPktRdy interrupt.
++		 * In any case, we must check the FIFO status here and bail out
++		 * only if the FIFO still has data -- that should prevent the
++		 * "missed" TxPktRdy interrupts and deal with double-buffered
++		 * FIFO mode too...
++		 */
++		if (tx_csr & (MUSB_TXCSR_FIFONOTEMPTY | MUSB_TXCSR_TXPKTRDY)) {
++			DBG(2, "DMA complete but packet still in FIFO, "
++			    "CSR %04x\n", tx_csr);
++			return;
++		}
++	}
++
+ 	/* REVISIT this looks wrong... */
+ 	if (!status || dma || usb_pipeisoc(pipe)) {
+ 		if (dma)
+--- a/drivers/usb/musb/musbhsdma.c
++++ b/drivers/usb/musb/musbhsdma.c
+@@ -304,12 +304,9 @@ static irqreturn_t dma_controller_irq(in
+ 							musb_channel->epnum,
+ 							MUSB_TXCSR),
+ 						MUSB_TXCSR_TXPKTRDY);
+-				} else {
+-					musb_dma_completion(
+-						musb,
+-						musb_channel->epnum,
+-						musb_channel->transmit);
+ 				}
++				musb_dma_completion(musb, musb_channel->epnum,
++						    musb_channel->transmit);
+ 			}
+ 		}
+ 	}
