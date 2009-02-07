@@ -1,0 +1,1650 @@
+From tom.leiming@gmail.com  Fri Feb  6 16:52:06 2009
+From: tom.leiming@gmail.com
+Date: Fri,  6 Feb 2009 23:40:12 +0800
+Subject: platform driver: fix incorrect use of 'platform_bus_type' with 'struct device_driver'
+To: greg@kroah.com, dbrownell@users.sourceforge.net, <kay.sievers@vrfy.org>
+Cc: <LW@KARO-electronics.de>, <hmh@hmh.eng.br>, Ming Lei <tom.leiming@gmail.com>
+Message-ID: <1233934812-20628-1-git-send-email-tom.leiming@gmail.com>
+
+
+From: Ming Lei <tom.leiming@gmail.com>
+
+This patch fixes the bug reported in
+	http://bugzilla.kernel.org/show_bug.cgi?id=11681.
+
+"Lots of device drivers register a 'struct device_driver' with
+the '.bus' member set to '&platform_bus_type'. This is wrong,
+since the platform_bus functions expect the 'struct device_driver'
+to be wrapped up in a 'struct platform_driver' which provides
+some additional callbacks (like suspend_late, resume_early).
+The effect may be that platform_suspend_late() uses bogus data
+outside the device_driver struct as a pointer pointer to the
+device driver's suspend_late() function or other hard to
+reproduce failures."(Lothar Wassmann)
+
+Signed-off-by: Ming Lei <tom.leiming@gmail.com>
+Acked-by: Henrique de Moraes Holschuh <hmh@hmh.eng.br>
+Acked-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+---
+ arch/mips/basler/excite/excite_iodev.c |   27 +++++++++++------------
+ drivers/char/tpm/tpm_atmel.c           |   28 ++++++++++++++++--------
+ drivers/char/tpm/tpm_tis.c             |   28 ++++++++++++++++--------
+ drivers/ide/au1xxx-ide.c               |   36 +++++++++++++++----------------
+ drivers/mtd/maps/pxa2xx-flash.c        |   37 ++++++++++++++++----------------
+ drivers/mtd/nand/excite_nandflash.c    |   25 +++++++++++----------
+ drivers/mtd/onenand/generic.c          |   26 +++++++++++-----------
+ drivers/net/mipsnet.c                  |   26 ++++++++++++----------
+ drivers/pcmcia/au1000_generic.c        |   37 ++++++++++++++++++++------------
+ drivers/pcmcia/i82365.c                |   28 +++++++++++++++++-------
+ drivers/pcmcia/m32r_cfc.c              |   30 ++++++++++++++++++--------
+ drivers/pcmcia/m32r_pcc.c              |   30 ++++++++++++++++++--------
+ drivers/pcmcia/sa1100_generic.c        |   38 ++++++++++++++++++++++++---------
+ drivers/pcmcia/tcic.c                  |   30 ++++++++++++++++++--------
+ drivers/pcmcia/vrc4171_card.c          |   34 ++++++++++++++++++++---------
+ drivers/scsi/a4000t.c                  |   26 ++++++++++++----------
+ drivers/scsi/bvme6000_scsi.c           |   26 ++++++++++++----------
+ drivers/scsi/mvme16x_scsi.c            |   26 ++++++++++++----------
+ drivers/video/au1100fb.c               |   31 +++++++++++++-------------
+ drivers/video/au1200fb.c               |   25 ++++++++++++---------
+ drivers/watchdog/rm9k_wdt.c            |   27 ++++++++++-------------
+ 21 files changed, 371 insertions(+), 250 deletions(-)
+
+--- a/arch/mips/basler/excite/excite_iodev.c
++++ b/arch/mips/basler/excite/excite_iodev.c
+@@ -33,8 +33,8 @@
+ 
+ 
+ static const struct resource *iodev_get_resource(struct platform_device *, const char *, unsigned int);
+-static int __init iodev_probe(struct device *);
+-static int __exit iodev_remove(struct device *);
++static int __init iodev_probe(struct platform_device *);
++static int __exit iodev_remove(struct platform_device *);
+ static int iodev_open(struct inode *, struct file *);
+ static int iodev_release(struct inode *, struct file *);
+ static ssize_t iodev_read(struct file *, char __user *, size_t s, loff_t *);
+@@ -65,13 +65,13 @@ static struct miscdevice miscdev =
+ 	.fops		= &fops
+ };
+ 
+-static struct device_driver iodev_driver =
+-{
+-	.name		= (char *) iodev_name,
+-	.bus		= &platform_bus_type,
+-	.owner		= THIS_MODULE,
++static struct platform_driver iodev_driver = {
++	.driver = {
++		.name		= iodev_name,
++		.owner		= THIS_MODULE,
++	},
+ 	.probe		= iodev_probe,
+-	.remove		= __exit_p(iodev_remove)
++	.remove		= __devexit_p(iodev_remove),
+ };
+ 
+ 
+@@ -89,11 +89,10 @@ iodev_get_resource(struct platform_devic
+ 
+ 
+ /* No hotplugging on the platform bus - use __init */
+-static int __init iodev_probe(struct device *dev)
++static int __init iodev_probe(struct platform_device *dev)
+ {
+-	struct platform_device * const pdv = to_platform_device(dev);
+ 	const struct resource * const ri =
+-		iodev_get_resource(pdv, IODEV_RESOURCE_IRQ, IORESOURCE_IRQ);
++		iodev_get_resource(dev, IODEV_RESOURCE_IRQ, IORESOURCE_IRQ);
+ 
+ 	if (unlikely(!ri))
+ 		return -ENXIO;
+@@ -104,7 +103,7 @@ static int __init iodev_probe(struct dev
+ 
+ 
+ 
+-static int __exit iodev_remove(struct device *dev)
++static int __exit iodev_remove(struct platform_device *dev)
+ {
+ 	return misc_deregister(&miscdev);
+ }
+@@ -160,14 +159,14 @@ static irqreturn_t iodev_irqhdl(int irq,
+ 
+ static int __init iodev_init_module(void)
+ {
+-	return driver_register(&iodev_driver);
++	return platform_driver_register(&iodev_driver);
+ }
+ 
+ 
+ 
+ static void __exit iodev_cleanup_module(void)
+ {
+-	driver_unregister(&iodev_driver);
++	platform_driver_unregister(&iodev_driver);
+ }
+ 
+ module_init(iodev_init_module);
+--- a/drivers/char/tpm/tpm_atmel.c
++++ b/drivers/char/tpm/tpm_atmel.c
+@@ -168,12 +168,22 @@ static void atml_plat_remove(void)
+ 	}
+ }
+ 
+-static struct device_driver atml_drv = {
+-	.name = "tpm_atmel",
+-	.bus = &platform_bus_type,
+-	.owner = THIS_MODULE,
+-	.suspend = tpm_pm_suspend,
+-	.resume = tpm_pm_resume,
++static int tpm_atml_suspend(struct platform_device *dev, pm_message_t msg)
++{
++	return tpm_pm_suspend(&dev->dev, msg);
++}
++
++static int tpm_atml_resume(struct platform_device *dev)
++{
++	return tpm_pm_resume(&dev->dev);
++}
++static struct platform_driver atml_drv = {
++	.driver = {
++		.name = "tpm_atmel",
++		.owner		= THIS_MODULE,
++	},
++	.suspend = tpm_atml_suspend,
++	.resume = tpm_atml_resume,
+ };
+ 
+ static int __init init_atmel(void)
+@@ -184,7 +194,7 @@ static int __init init_atmel(void)
+ 	unsigned long base;
+ 	struct  tpm_chip *chip;
+ 
+-	rc = driver_register(&atml_drv);
++	rc = platform_driver_register(&atml_drv);
+ 	if (rc)
+ 		return rc;
+ 
+@@ -223,13 +233,13 @@ err_rel_reg:
+ 		atmel_release_region(base,
+ 				     region_size);
+ err_unreg_drv:
+-	driver_unregister(&atml_drv);
++	platform_driver_unregister(&atml_drv);
+ 	return rc;
+ }
+ 
+ static void __exit cleanup_atmel(void)
+ {
+-	driver_unregister(&atml_drv);
++	platform_driver_unregister(&atml_drv);
+ 	atml_plat_remove();
+ }
+ 
+--- a/drivers/char/tpm/tpm_tis.c
++++ b/drivers/char/tpm/tpm_tis.c
+@@ -654,12 +654,22 @@ module_param_string(hid, tpm_pnp_tbl[TIS
+ 		    sizeof(tpm_pnp_tbl[TIS_HID_USR_IDX].id), 0444);
+ MODULE_PARM_DESC(hid, "Set additional specific HID for this driver to probe");
+ 
+-static struct device_driver tis_drv = {
+-	.name = "tpm_tis",
+-	.bus = &platform_bus_type,
+-	.owner = THIS_MODULE,
+-	.suspend = tpm_pm_suspend,
+-	.resume = tpm_pm_resume,
++static int tpm_tis_suspend(struct platform_device *dev, pm_message_t msg)
++{
++	return tpm_pm_suspend(&dev->dev, msg);
++}
++
++static int tpm_tis_resume(struct platform_device *dev)
++{
++	return tpm_pm_resume(&dev->dev);
++}
++static struct platform_driver tis_drv = {
++	.driver = {
++		.name = "tpm_tis",
++		.owner		= THIS_MODULE,
++	},
++	.suspend = tpm_tis_suspend,
++	.resume = tpm_tis_resume,
+ };
+ 
+ static struct platform_device *pdev;
+@@ -672,14 +682,14 @@ static int __init init_tis(void)
+ 	int rc;
+ 
+ 	if (force) {
+-		rc = driver_register(&tis_drv);
++		rc = platform_driver_register(&tis_drv);
+ 		if (rc < 0)
+ 			return rc;
+ 		if (IS_ERR(pdev=platform_device_register_simple("tpm_tis", -1, NULL, 0)))
+ 			return PTR_ERR(pdev);
+ 		if((rc=tpm_tis_init(&pdev->dev, TIS_MEM_BASE, TIS_MEM_LEN, 0)) != 0) {
+ 			platform_device_unregister(pdev);
+-			driver_unregister(&tis_drv);
++			platform_driver_unregister(&tis_drv);
+ 		}
+ 		return rc;
+ 	}
+@@ -711,7 +721,7 @@ static void __exit cleanup_tis(void)
+ 
+ 	if (force) {
+ 		platform_device_unregister(pdev);
+-		driver_unregister(&tis_drv);
++		platform_driver_unregister(&tis_drv);
+ 	} else
+ 		pnp_unregister_driver(&tis_pnp_driver);
+ }
+--- a/drivers/ide/au1xxx-ide.c
++++ b/drivers/ide/au1xxx-ide.c
+@@ -536,9 +536,8 @@ static const struct ide_port_info au1xxx
+ #endif
+ };
+ 
+-static int au_ide_probe(struct device *dev)
++static int au_ide_probe(struct platform_device *dev)
+ {
+-	struct platform_device *pdev = to_platform_device(dev);
+ 	_auide_hwif *ahwif = &auide_hwif;
+ 	struct resource *res;
+ 	struct ide_host *host;
+@@ -552,23 +551,23 @@ static int au_ide_probe(struct device *d
+ #endif
+ 
+ 	memset(&auide_hwif, 0, sizeof(_auide_hwif));
+-	ahwif->irq = platform_get_irq(pdev, 0);
++	ahwif->irq = platform_get_irq(dev, 0);
+ 
+-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	res = platform_get_resource(dev, IORESOURCE_MEM, 0);
+ 
+ 	if (res == NULL) {
+-		pr_debug("%s %d: no base address\n", DRV_NAME, pdev->id);
++		pr_debug("%s %d: no base address\n", DRV_NAME, dev->id);
+ 		ret = -ENODEV;
+ 		goto out;
+ 	}
+ 	if (ahwif->irq < 0) {
+-		pr_debug("%s %d: no IRQ\n", DRV_NAME, pdev->id);
++		pr_debug("%s %d: no IRQ\n", DRV_NAME, dev->id);
+ 		ret = -ENODEV;
+ 		goto out;
+ 	}
+ 
+ 	if (!request_mem_region(res->start, res->end - res->start + 1,
+-				pdev->name)) {
++				dev->name)) {
+ 		pr_debug("%s: request_mem_region failed\n", DRV_NAME);
+ 		ret =  -EBUSY;
+ 		goto out;
+@@ -583,7 +582,7 @@ static int au_ide_probe(struct device *d
+ 	memset(&hw, 0, sizeof(hw));
+ 	auide_setup_ports(&hw, ahwif);
+ 	hw.irq = ahwif->irq;
+-	hw.dev = dev;
++	hw.dev = &dev->dev;
+ 	hw.chipset = ide_au1xxx;
+ 
+ 	ret = ide_host_add(&au1xxx_port_info, hws, &host);
+@@ -592,7 +591,7 @@ static int au_ide_probe(struct device *d
+ 
+ 	auide_hwif.hwif = host->ports[0];
+ 
+-	dev_set_drvdata(dev, host);
++	platform_set_drvdata(dev, host);
+ 
+ 	printk(KERN_INFO "Au1xxx IDE(builtin) configured for %s\n", mode );
+ 
+@@ -600,38 +599,39 @@ static int au_ide_probe(struct device *d
+ 	return ret;
+ }
+ 
+-static int au_ide_remove(struct device *dev)
++static int au_ide_remove(struct platform_device *dev)
+ {
+-	struct platform_device *pdev = to_platform_device(dev);
+ 	struct resource *res;
+-	struct ide_host *host = dev_get_drvdata(dev);
++	struct ide_host *host = platform_get_drvdata(dev);
+ 	_auide_hwif *ahwif = &auide_hwif;
+ 
+ 	ide_host_remove(host);
+ 
+ 	iounmap((void *)ahwif->regbase);
+ 
+-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	res = platform_get_resource(dev, IORESOURCE_MEM, 0);
+ 	release_mem_region(res->start, res->end - res->start + 1);
+ 
+ 	return 0;
+ }
+ 
+-static struct device_driver au1200_ide_driver = {
+-	.name		= "au1200-ide",
+-	.bus		= &platform_bus_type,
++static struct platform_driver au1200_ide_driver = {
++	.driver = {
++		.name		= "au1200-ide",
++		.owner		= THIS_MODULE,
++	},
+ 	.probe 		= au_ide_probe,
+ 	.remove		= au_ide_remove,
+ };
+ 
+ static int __init au_ide_init(void)
+ {
+-	return driver_register(&au1200_ide_driver);
++	return platform_driver_register(&au1200_ide_driver);
+ }
+ 
+ static void __exit au_ide_exit(void)
+ {
+-	driver_unregister(&au1200_ide_driver);
++	platform_driver_unregister(&au1200_ide_driver);
+ }
+ 
+ MODULE_LICENSE("GPL");
+--- a/drivers/mtd/maps/pxa2xx-flash.c
++++ b/drivers/mtd/maps/pxa2xx-flash.c
+@@ -41,9 +41,8 @@ struct pxa2xx_flash_info {
+ static const char *probes[] = { "RedBoot", "cmdlinepart", NULL };
+ 
+ 
+-static int __init pxa2xx_flash_probe(struct device *dev)
++static int __init pxa2xx_flash_probe(struct platform_device *pdev)
+ {
+-	struct platform_device *pdev = to_platform_device(dev);
+ 	struct flash_platform_data *flash = pdev->dev.platform_data;
+ 	struct pxa2xx_flash_info *info;
+ 	struct mtd_partition *parts;
+@@ -114,15 +113,15 @@ static int __init pxa2xx_flash_probe(str
+ 		add_mtd_device(info->mtd);
+ 	}
+ 
+-	dev_set_drvdata(dev, info);
++	platform_set_drvdata(pdev, info);
+ 	return 0;
+ }
+ 
+-static int __exit pxa2xx_flash_remove(struct device *dev)
++static int __exit pxa2xx_flash_remove(struct platform_device *dev)
+ {
+-	struct pxa2xx_flash_info *info = dev_get_drvdata(dev);
++	struct pxa2xx_flash_info *info = platform_get_drvdata(dev);
+ 
+-	dev_set_drvdata(dev, NULL);
++	platform_set_drvdata(dev, NULL);
+ 
+ #ifdef CONFIG_MTD_PARTITIONS
+ 	if (info->nr_parts)
+@@ -141,9 +140,9 @@ static int __exit pxa2xx_flash_remove(st
+ }
+ 
+ #ifdef CONFIG_PM
+-static int pxa2xx_flash_suspend(struct device *dev, pm_message_t state)
++static int pxa2xx_flash_suspend(struct platform_device *dev, pm_message_t state)
+ {
+-	struct pxa2xx_flash_info *info = dev_get_drvdata(dev);
++	struct pxa2xx_flash_info *info = platform_get_drvdata(dev);
+ 	int ret = 0;
+ 
+ 	if (info->mtd && info->mtd->suspend)
+@@ -151,17 +150,17 @@ static int pxa2xx_flash_suspend(struct d
+ 	return ret;
+ }
+ 
+-static int pxa2xx_flash_resume(struct device *dev)
++static int pxa2xx_flash_resume(struct platform_device *dev)
+ {
+-	struct pxa2xx_flash_info *info = dev_get_drvdata(dev);
++	struct pxa2xx_flash_info *info = platform_get_drvdata(dev);
+ 
+ 	if (info->mtd && info->mtd->resume)
+ 		info->mtd->resume(info->mtd);
+ 	return 0;
+ }
+-static void pxa2xx_flash_shutdown(struct device *dev)
++static void pxa2xx_flash_shutdown(struct platform_device *dev)
+ {
+-	struct pxa2xx_flash_info *info = dev_get_drvdata(dev);
++	struct pxa2xx_flash_info *info = platform_get_drvdata(dev);
+ 
+ 	if (info && info->mtd->suspend(info->mtd) == 0)
+ 		info->mtd->resume(info->mtd);
+@@ -172,11 +171,13 @@ static void pxa2xx_flash_shutdown(struct
+ #define pxa2xx_flash_shutdown NULL
+ #endif
+ 
+-static struct device_driver pxa2xx_flash_driver = {
+-	.name		= "pxa2xx-flash",
+-	.bus		= &platform_bus_type,
++static struct platform_driver pxa2xx_flash_driver = {
++	.driver = {
++		.name		= "pxa2xx-flash",
++		.owner		= THIS_MODULE,
++	},
+ 	.probe		= pxa2xx_flash_probe,
+-	.remove		= __exit_p(pxa2xx_flash_remove),
++	.remove		= __devexit_p(pxa2xx_flash_remove),
+ 	.suspend	= pxa2xx_flash_suspend,
+ 	.resume		= pxa2xx_flash_resume,
+ 	.shutdown	= pxa2xx_flash_shutdown,
+@@ -184,12 +185,12 @@ static struct device_driver pxa2xx_flash
+ 
+ static int __init init_pxa2xx_flash(void)
+ {
+-	return driver_register(&pxa2xx_flash_driver);
++	return platform_driver_register(&pxa2xx_flash_driver);
+ }
+ 
+ static void __exit cleanup_pxa2xx_flash(void)
+ {
+-	driver_unregister(&pxa2xx_flash_driver);
++	platform_driver_unregister(&pxa2xx_flash_driver);
+ }
+ 
+ module_init(init_pxa2xx_flash);
+--- a/drivers/mtd/nand/excite_nandflash.c
++++ b/drivers/mtd/nand/excite_nandflash.c
+@@ -128,11 +128,11 @@ static int excite_nand_devready(struct m
+  * The binding to the mtd and all allocated
+  * resources are released.
+  */
+-static int __exit excite_nand_remove(struct device *dev)
++static int __exit excite_nand_remove(struct platform_device *dev)
+ {
+-	struct excite_nand_drvdata * const this = dev_get_drvdata(dev);
++	struct excite_nand_drvdata * const this = platform_get_drvdata(dev);
+ 
+-	dev_set_drvdata(dev, NULL);
++	platform_set_drvdata(dev, NULL);
+ 
+ 	if (unlikely(!this)) {
+ 		printk(KERN_ERR "%s: called %s without private data!!",
+@@ -159,9 +159,8 @@ static int __exit excite_nand_remove(str
+  * it can allocate all necessary resources then calls the
+  * nand layer to look for devices.
+ */
+-static int __init excite_nand_probe(struct device *dev)
++static int __init excite_nand_probe(struct platform_device *pdev)
+ {
+-	struct platform_device * const pdev = to_platform_device(dev);
+ 	struct excite_nand_drvdata *drvdata;	/* private driver data */
+ 	struct nand_chip *board_chip;	/* private flash chip data */
+ 	struct mtd_info *board_mtd;	/* mtd info for this board */
+@@ -175,7 +174,7 @@ static int __init excite_nand_probe(stru
+ 	}
+ 
+ 	/* bind private data into driver */
+-	dev_set_drvdata(dev, drvdata);
++	platform_set_drvdata(pdev, drvdata);
+ 
+ 	/* allocate and map the resource */
+ 	drvdata->regs =
+@@ -219,23 +218,25 @@ static int __init excite_nand_probe(stru
+ 	return 0;
+ }
+ 
+-static struct device_driver excite_nand_driver = {
+-	.name = "excite_nand",
+-	.bus = &platform_bus_type,
++static struct platform_driver excite_nand_driver = {
++	.driver = {
++		.name = "excite_nand",
++		.owner		= THIS_MODULE,
++	},
+ 	.probe = excite_nand_probe,
+-	.remove = __exit_p(excite_nand_remove)
++	.remove = __devexit_p(excite_nand_remove)
+ };
+ 
+ static int __init excite_nand_init(void)
+ {
+ 	pr_info("Basler eXcite nand flash driver Version "
+ 		EXCITE_NANDFLASH_VERSION "\n");
+-	return driver_register(&excite_nand_driver);
++	return platform_driver_register(&excite_nand_driver);
+ }
+ 
+ static void __exit excite_nand_exit(void)
+ {
+-	driver_unregister(&excite_nand_driver);
++	platform_driver_unregister(&excite_nand_driver);
+ }
+ 
+ module_init(excite_nand_init);
+--- a/drivers/mtd/onenand/generic.c
++++ b/drivers/mtd/onenand/generic.c
+@@ -36,10 +36,9 @@ struct onenand_info {
+ 	struct onenand_chip	onenand;
+ };
+ 
+-static int __devinit generic_onenand_probe(struct device *dev)
++static int __devinit generic_onenand_probe(struct platform_device *pdev)
+ {
+ 	struct onenand_info *info;
+-	struct platform_device *pdev = to_platform_device(dev);
+ 	struct flash_platform_data *pdata = pdev->dev.platform_data;
+ 	struct resource *res = pdev->resource;
+ 	unsigned long size = res->end - res->start + 1;
+@@ -49,7 +48,7 @@ static int __devinit generic_onenand_pro
+ 	if (!info)
+ 		return -ENOMEM;
+ 
+-	if (!request_mem_region(res->start, size, dev->driver->name)) {
++	if (!request_mem_region(res->start, size, pdev->dev.driver->name)) {
+ 		err = -EBUSY;
+ 		goto out_free_info;
+ 	}
+@@ -82,7 +81,7 @@ static int __devinit generic_onenand_pro
+ #endif
+ 		err = add_mtd_device(&info->mtd);
+ 
+-	dev_set_drvdata(&pdev->dev, info);
++	platform_set_drvdata(pdev, info);
+ 
+ 	return 0;
+ 
+@@ -96,14 +95,13 @@ out_free_info:
+ 	return err;
+ }
+ 
+-static int __devexit generic_onenand_remove(struct device *dev)
++static int __devexit generic_onenand_remove(struct platform_device *pdev)
+ {
+-	struct platform_device *pdev = to_platform_device(dev);
+-	struct onenand_info *info = dev_get_drvdata(&pdev->dev);
++	struct onenand_info *info = platform_get_drvdata(pdev);
+ 	struct resource *res = pdev->resource;
+ 	unsigned long size = res->end - res->start + 1;
+ 
+-	dev_set_drvdata(&pdev->dev, NULL);
++	platform_set_drvdata(pdev, NULL);
+ 
+ 	if (info) {
+ 		if (info->parts)
+@@ -120,9 +118,11 @@ static int __devexit generic_onenand_rem
+ 	return 0;
+ }
+ 
+-static struct device_driver generic_onenand_driver = {
+-	.name		= DRIVER_NAME,
+-	.bus		= &platform_bus_type,
++static struct platform_driver generic_onenand_driver = {
++	.driver = {
++		.name		= DRIVER_NAME,
++		.owner		= THIS_MODULE,
++	},
+ 	.probe		= generic_onenand_probe,
+ 	.remove		= __devexit_p(generic_onenand_remove),
+ };
+@@ -131,12 +131,12 @@ MODULE_ALIAS(DRIVER_NAME);
+ 
+ static int __init generic_onenand_init(void)
+ {
+-	return driver_register(&generic_onenand_driver);
++	return platform_driver_register(&generic_onenand_driver);
+ }
+ 
+ static void __exit generic_onenand_exit(void)
+ {
+-	driver_unregister(&generic_onenand_driver);
++	platform_driver_unregister(&generic_onenand_driver);
+ }
+ 
+ module_init(generic_onenand_init);
+--- a/drivers/net/mipsnet.c
++++ b/drivers/net/mipsnet.c
+@@ -237,7 +237,7 @@ static void mipsnet_set_mclist(struct ne
+ {
+ }
+ 
+-static int __init mipsnet_probe(struct device *dev)
++static int __init mipsnet_probe(struct platform_device *dev)
+ {
+ 	struct net_device *netdev;
+ 	int err;
+@@ -248,7 +248,7 @@ static int __init mipsnet_probe(struct d
+ 		goto out;
+ 	}
+ 
+-	dev_set_drvdata(dev, netdev);
++	platform_set_drvdata(dev, netdev);
+ 
+ 	netdev->open			= mipsnet_open;
+ 	netdev->stop			= mipsnet_close;
+@@ -293,23 +293,25 @@ out:
+ 	return err;
+ }
+ 
+-static int __devexit mipsnet_device_remove(struct device *device)
++static int __devexit mipsnet_device_remove(struct platform_device *device)
+ {
+-	struct net_device *dev = dev_get_drvdata(device);
++	struct net_device *dev = platform_get_drvdata(device);
+ 
+ 	unregister_netdev(dev);
+ 	release_region(dev->base_addr, sizeof(struct mipsnet_regs));
+ 	free_netdev(dev);
+-	dev_set_drvdata(device, NULL);
++	platform_set_drvdata(device, NULL);
+ 
+ 	return 0;
+ }
+ 
+-static struct device_driver mipsnet_driver = {
+-	.name	= mipsnet_string,
+-	.bus	= &platform_bus_type,
+-	.probe	= mipsnet_probe,
+-	.remove	= __devexit_p(mipsnet_device_remove),
++static struct platform_driver mipsnet_driver = {
++	.driver = {
++		.name		= mipsnet_string,
++		.owner		= THIS_MODULE,
++	},
++	.probe		= mipsnet_probe,
++	.remove		= __devexit_p(mipsnet_device_remove),
+ };
+ 
+ static int __init mipsnet_init_module(void)
+@@ -319,7 +321,7 @@ static int __init mipsnet_init_module(vo
+ 	printk(KERN_INFO "MIPSNet Ethernet driver. Version: %s. "
+ 	       "(c)2005 MIPS Technologies, Inc.\n", MIPSNET_VERSION);
+ 
+-	err = driver_register(&mipsnet_driver);
++	err = platform_driver_register(&mipsnet_driver);
+ 	if (err)
+ 		printk(KERN_ERR "Driver registration failed\n");
+ 
+@@ -328,7 +330,7 @@ static int __init mipsnet_init_module(vo
+ 
+ static void __exit mipsnet_exit_module(void)
+ {
+-	driver_unregister(&mipsnet_driver);
++	platform_driver_unregister(&mipsnet_driver);
+ }
+ 
+ module_init(mipsnet_init_module);
+--- a/drivers/pcmcia/au1000_generic.c
++++ b/drivers/pcmcia/au1000_generic.c
+@@ -468,13 +468,13 @@ out:
+ 	return ret;
+ }
+ 
+-int au1x00_drv_pcmcia_remove(struct device *dev)
++int au1x00_drv_pcmcia_remove(struct platform_device *dev)
+ {
+-	struct skt_dev_info *sinfo = dev_get_drvdata(dev);
++	struct skt_dev_info *sinfo = platform_get_drvdata(dev);
+ 	int i;
+ 
+ 	mutex_lock(&pcmcia_sockets_lock);
+-	dev_set_drvdata(dev, NULL);
++	platform_set_drvdata(dev, NULL);
+ 
+ 	for (i = 0; i < sinfo->nskt; i++) {
+ 		struct au1000_pcmcia_socket *skt = PCMCIA_SOCKET(i);
+@@ -498,13 +498,13 @@ int au1x00_drv_pcmcia_remove(struct devi
+  * PCMCIA "Driver" API
+  */
+ 
+-static int au1x00_drv_pcmcia_probe(struct device *dev)
++static int au1x00_drv_pcmcia_probe(struct platform_device *dev)
+ {
+ 	int i, ret = -ENODEV;
+ 
+ 	mutex_lock(&pcmcia_sockets_lock);
+ 	for (i=0; i < ARRAY_SIZE(au1x00_pcmcia_hw_init); i++) {
+-		ret = au1x00_pcmcia_hw_init[i](dev);
++		ret = au1x00_pcmcia_hw_init[i](&dev->dev);
+ 		if (ret == 0)
+ 			break;
+ 	}
+@@ -512,14 +512,26 @@ static int au1x00_drv_pcmcia_probe(struc
+ 	return ret;
+ }
+ 
++static int au1x00_drv_pcmcia_suspend(struct platform_device *dev,
++				     pm_message_t state)
++{
++	return pcmcia_socket_dev_suspend(&dev->dev, state);
++}
++
++static int au1x00_drv_pcmcia_resume(struct platform_device *dev)
++{
++	return pcmcia_socket_dev_resume(&dev->dev);
++}
+ 
+-static struct device_driver au1x00_pcmcia_driver = {
++static struct platform_driver au1x00_pcmcia_driver = {
++	.driver = {
++		.name		= "au1x00-pcmcia",
++		.owner		= THIS_MODULE,
++	},
+ 	.probe		= au1x00_drv_pcmcia_probe,
+ 	.remove		= au1x00_drv_pcmcia_remove,
+-	.name		= "au1x00-pcmcia",
+-	.bus		= &platform_bus_type,
+-	.suspend	= pcmcia_socket_dev_suspend,
+-	.resume		= pcmcia_socket_dev_resume,
++	.suspend 	= au1x00_drv_pcmcia_suspend,
++	.resume 	= au1x00_drv_pcmcia_resume,
+ };
+ 
+ 
+@@ -533,8 +545,7 @@ static struct device_driver au1x00_pcmci
+ static int __init au1x00_pcmcia_init(void)
+ {
+ 	int error = 0;
+-	if ((error = driver_register(&au1x00_pcmcia_driver)))
+-		return error;
++	error = platform_driver_register(&au1x00_pcmcia_driver);
+ 	return error;
+ }
+ 
+@@ -544,7 +555,7 @@ static int __init au1x00_pcmcia_init(voi
+  */
+ static void __exit au1x00_pcmcia_exit(void)
+ {
+-	driver_unregister(&au1x00_pcmcia_driver);
++	platform_driver_unregister(&au1x00_pcmcia_driver);
+ }
+ 
+ module_init(au1x00_pcmcia_init);
+--- a/drivers/pcmcia/i82365.c
++++ b/drivers/pcmcia/i82365.c
+@@ -1238,6 +1238,16 @@ static int pcic_init(struct pcmcia_socke
+ 	return 0;
+ }
+ 
++static int i82365_drv_pcmcia_suspend(struct platform_device *dev,
++				     pm_message_t state)
++{
++	return pcmcia_socket_dev_suspend(&dev->dev, state);
++}
++
++static int i82365_drv_pcmcia_resume(struct platform_device *dev)
++{
++	return pcmcia_socket_dev_resume(&dev->dev);
++}
+ static struct pccard_operations pcic_operations = {
+ 	.init			= pcic_init,
+ 	.get_status		= pcic_get_status,
+@@ -1248,11 +1258,13 @@ static struct pccard_operations pcic_ope
+ 
+ /*====================================================================*/
+ 
+-static struct device_driver i82365_driver = {
+-	.name = "i82365",
+-	.bus = &platform_bus_type,
+-	.suspend = pcmcia_socket_dev_suspend,
+-	.resume = pcmcia_socket_dev_resume,
++static struct platform_driver i82365_driver = {
++	.driver = {
++		.name = "i82365",
++		.owner		= THIS_MODULE,
++	},
++	.suspend 	= i82365_drv_pcmcia_suspend,
++	.resume 	= i82365_drv_pcmcia_resume,
+ };
+ 
+ static struct platform_device *i82365_device;
+@@ -1261,7 +1273,7 @@ static int __init init_i82365(void)
+ {
+     int i, ret;
+ 
+-    ret = driver_register(&i82365_driver);
++    ret = platform_driver_register(&i82365_driver);
+     if (ret)
+ 	goto err_out;
+ 
+@@ -1337,7 +1349,7 @@ err_dev_unregister:
+ 	pnp_disable_dev(i82365_pnpdev);
+ #endif
+ err_driver_unregister:
+-    driver_unregister(&i82365_driver);
++    platform_driver_unregister(&i82365_driver);
+ err_out:
+     return ret;
+ } /* init_i82365 */
+@@ -1365,7 +1377,7 @@ static void __exit exit_i82365(void)
+     if (i82365_pnpdev)
+     		pnp_disable_dev(i82365_pnpdev);
+ #endif
+-    driver_unregister(&i82365_driver);
++    platform_driver_unregister(&i82365_driver);
+ } /* exit_i82365 */
+ 
+ module_init(init_i82365);
+--- a/drivers/pcmcia/m32r_cfc.c
++++ b/drivers/pcmcia/m32r_cfc.c
+@@ -696,13 +696,25 @@ static struct pccard_operations pcc_oper
+ 	.set_mem_map		= pcc_set_mem_map,
+ };
+ 
++static int cfc_drv_pcmcia_suspend(struct platform_device *dev,
++				     pm_message_t state)
++{
++	return pcmcia_socket_dev_suspend(&dev->dev, state);
++}
++
++static int cfc_drv_pcmcia_resume(struct platform_device *dev)
++{
++	return pcmcia_socket_dev_resume(&dev->dev);
++}
+ /*====================================================================*/
+ 
+-static struct device_driver pcc_driver = {
+-	.name = "cfc",
+-	.bus = &platform_bus_type,
+-	.suspend = pcmcia_socket_dev_suspend,
+-	.resume = pcmcia_socket_dev_resume,
++static struct platform_driver pcc_driver = {
++	.driver = {
++		.name		= "cfc",
++		.owner		= THIS_MODULE,
++	},
++	.suspend 	= cfc_drv_pcmcia_suspend,
++	.resume 	= cfc_drv_pcmcia_resume,
+ };
+ 
+ static struct platform_device pcc_device = {
+@@ -716,13 +728,13 @@ static int __init init_m32r_pcc(void)
+ {
+ 	int i, ret;
+ 
+-	ret = driver_register(&pcc_driver);
++	ret = platform_driver_register(&pcc_driver);
+ 	if (ret)
+ 		return ret;
+ 
+ 	ret = platform_device_register(&pcc_device);
+ 	if (ret){
+-		driver_unregister(&pcc_driver);
++		platform_driver_unregister(&pcc_driver);
+ 		return ret;
+ 	}
+ 
+@@ -754,7 +766,7 @@ static int __init init_m32r_pcc(void)
+ 	if (pcc_sockets == 0) {
+ 		printk("socket is not found.\n");
+ 		platform_device_unregister(&pcc_device);
+-		driver_unregister(&pcc_driver);
++		platform_driver_unregister(&pcc_driver);
+ 		return -ENODEV;
+ 	}
+ 
+@@ -802,7 +814,7 @@ static void __exit exit_m32r_pcc(void)
+ 	if (poll_interval != 0)
+ 		del_timer_sync(&poll_timer);
+ 
+-	driver_unregister(&pcc_driver);
++	platform_driver_unregister(&pcc_driver);
+ } /* exit_m32r_pcc */
+ 
+ module_init(init_m32r_pcc);
+--- a/drivers/pcmcia/m32r_pcc.c
++++ b/drivers/pcmcia/m32r_pcc.c
+@@ -672,13 +672,25 @@ static struct pccard_operations pcc_oper
+ 	.set_mem_map		= pcc_set_mem_map,
+ };
+ 
++static int pcc_drv_pcmcia_suspend(struct platform_device *dev,
++				     pm_message_t state)
++{
++	return pcmcia_socket_dev_suspend(&dev->dev, state);
++}
++
++static int pcc_drv_pcmcia_resume(struct platform_device *dev)
++{
++	return pcmcia_socket_dev_resume(&dev->dev);
++}
+ /*====================================================================*/
+ 
+-static struct device_driver pcc_driver = {
+-	.name = "pcc",
+-	.bus = &platform_bus_type,
+-	.suspend = pcmcia_socket_dev_suspend,
+-	.resume = pcmcia_socket_dev_resume,
++static struct platform_driver pcc_driver = {
++	.driver = {
++		.name		= "pcc",
++		.owner		= THIS_MODULE,
++	},
++	.suspend 	= pcc_drv_pcmcia_suspend,
++	.resume 	= pcc_drv_pcmcia_resume,
+ };
+ 
+ static struct platform_device pcc_device = {
+@@ -692,13 +704,13 @@ static int __init init_m32r_pcc(void)
+ {
+ 	int i, ret;
+ 
+-	ret = driver_register(&pcc_driver);
++	ret = platform_driver_register(&pcc_driver);
+ 	if (ret)
+ 		return ret;
+ 
+ 	ret = platform_device_register(&pcc_device);
+ 	if (ret){
+-		driver_unregister(&pcc_driver);
++		platform_driver_unregister(&pcc_driver);
+ 		return ret;
+ 	}
+ 
+@@ -715,7 +727,7 @@ static int __init init_m32r_pcc(void)
+ 	if (pcc_sockets == 0) {
+ 		printk("socket is not found.\n");
+ 		platform_device_unregister(&pcc_device);
+-		driver_unregister(&pcc_driver);
++		platform_driver_unregister(&pcc_driver);
+ 		return -ENODEV;
+ 	}
+ 
+@@ -763,7 +775,7 @@ static void __exit exit_m32r_pcc(void)
+ 	if (poll_interval != 0)
+ 		del_timer_sync(&poll_timer);
+ 
+-	driver_unregister(&pcc_driver);
++	platform_driver_unregister(&pcc_driver);
+ } /* exit_m32r_pcc */
+ 
+ module_init(init_m32r_pcc);
+--- a/drivers/pcmcia/sa1100_generic.c
++++ b/drivers/pcmcia/sa1100_generic.c
+@@ -65,7 +65,7 @@ static int (*sa11x0_pcmcia_hw_init[])(st
+ #endif
+ };
+ 
+-static int sa11x0_drv_pcmcia_probe(struct device *dev)
++static int sa11x0_drv_pcmcia_probe(struct platform_device *dev)
+ {
+ 	int i, ret = -ENODEV;
+ 
+@@ -73,7 +73,7 @@ static int sa11x0_drv_pcmcia_probe(struc
+ 	 * Initialise any "on-board" PCMCIA sockets.
+ 	 */
+ 	for (i = 0; i < ARRAY_SIZE(sa11x0_pcmcia_hw_init); i++) {
+-		ret = sa11x0_pcmcia_hw_init[i](dev);
++		ret = sa11x0_pcmcia_hw_init[i](&dev->dev);
+ 		if (ret == 0)
+ 			break;
+ 	}
+@@ -81,13 +81,31 @@ static int sa11x0_drv_pcmcia_probe(struc
+ 	return ret;
+ }
+ 
+-static struct device_driver sa11x0_pcmcia_driver = {
++static int sa11x0_drv_pcmcia_remove(struct platform_device *dev)
++{
++	return soc_common_drv_pcmcia_remove(&dev->dev);
++}
++
++static int sa11x0_drv_pcmcia_suspend(struct platform_device *dev,
++				     pm_message_t state)
++{
++	return pcmcia_socket_dev_suspend(&dev->dev, state);
++}
++
++static int sa11x0_drv_pcmcia_resume(struct platform_device *dev)
++{
++	return pcmcia_socket_dev_resume(&dev->dev);
++}
++
++static struct platform_driver sa11x0_pcmcia_driver = {
++	.driver = {
++		.name		= "sa11x0-pcmcia",
++		.owner		= THIS_MODULE,
++	},
+ 	.probe		= sa11x0_drv_pcmcia_probe,
+-	.remove		= soc_common_drv_pcmcia_remove,
+-	.name		= "sa11x0-pcmcia",
+-	.bus		= &platform_bus_type,
+-	.suspend 	= pcmcia_socket_dev_suspend,
+-	.resume 	= pcmcia_socket_dev_resume,
++	.remove		= sa11x0_drv_pcmcia_remove,
++	.suspend 	= sa11x0_drv_pcmcia_suspend,
++	.resume 	= sa11x0_drv_pcmcia_resume,
+ };
+ 
+ /* sa11x0_pcmcia_init()
+@@ -100,7 +118,7 @@ static struct device_driver sa11x0_pcmci
+  */
+ static int __init sa11x0_pcmcia_init(void)
+ {
+-	return driver_register(&sa11x0_pcmcia_driver);
++	return platform_driver_register(&sa11x0_pcmcia_driver);
+ }
+ 
+ /* sa11x0_pcmcia_exit()
+@@ -110,7 +128,7 @@ static int __init sa11x0_pcmcia_init(voi
+  */
+ static void __exit sa11x0_pcmcia_exit(void)
+ {
+-	driver_unregister(&sa11x0_pcmcia_driver);
++	platform_driver_unregister(&sa11x0_pcmcia_driver);
+ }
+ 
+ MODULE_AUTHOR("John Dorsey <john+@cs.cmu.edu>");
+--- a/drivers/pcmcia/tcic.c
++++ b/drivers/pcmcia/tcic.c
+@@ -363,13 +363,25 @@ static int __init get_tcic_id(void)
+     return id;
+ }
+ 
++static int tcic_drv_pcmcia_suspend(struct platform_device *dev,
++				     pm_message_t state)
++{
++	return pcmcia_socket_dev_suspend(&dev->dev, state);
++}
++
++static int tcic_drv_pcmcia_resume(struct platform_device *dev)
++{
++	return pcmcia_socket_dev_resume(&dev->dev);
++}
+ /*====================================================================*/
+ 
+-static struct device_driver tcic_driver = {
+-	.name = "tcic-pcmcia",
+-	.bus = &platform_bus_type,
+-	.suspend = pcmcia_socket_dev_suspend,
+-	.resume = pcmcia_socket_dev_resume,
++static struct platform_driver tcic_driver = {
++	.driver = {
++		.name = "tcic-pcmcia",
++		.owner		= THIS_MODULE,
++	},
++	.suspend 	= tcic_drv_pcmcia_suspend,
++	.resume 	= tcic_drv_pcmcia_resume,
+ };
+ 
+ static struct platform_device tcic_device = {
+@@ -383,7 +395,7 @@ static int __init init_tcic(void)
+     int i, sock, ret = 0;
+     u_int mask, scan;
+ 
+-    if (driver_register(&tcic_driver))
++    if (platform_driver_register(&tcic_driver))
+ 	return -1;
+     
+     printk(KERN_INFO "Databook TCIC-2 PCMCIA probe: ");
+@@ -391,7 +403,7 @@ static int __init init_tcic(void)
+ 
+     if (!request_region(tcic_base, 16, "tcic-2")) {
+ 	printk("could not allocate ports,\n ");
+-	driver_unregister(&tcic_driver);
++	platform_driver_unregister(&tcic_driver);
+ 	return -ENODEV;
+     }
+     else {
+@@ -414,7 +426,7 @@ static int __init init_tcic(void)
+     if (sock == 0) {
+ 	printk("not found.\n");
+ 	release_region(tcic_base, 16);
+-	driver_unregister(&tcic_driver);
++	platform_driver_unregister(&tcic_driver);
+ 	return -ENODEV;
+     }
+ 
+@@ -542,7 +554,7 @@ static void __exit exit_tcic(void)
+     }
+ 
+     platform_device_unregister(&tcic_device);
+-    driver_unregister(&tcic_driver);
++    platform_driver_unregister(&tcic_driver);
+ } /* exit_tcic */
+ 
+ /*====================================================================*/
+--- a/drivers/pcmcia/vrc4171_card.c
++++ b/drivers/pcmcia/vrc4171_card.c
+@@ -704,24 +704,37 @@ static int __devinit vrc4171_card_setup(
+ 
+ __setup("vrc4171_card=", vrc4171_card_setup);
+ 
+-static struct device_driver vrc4171_card_driver = {
+-	.name		= vrc4171_card_name,
+-	.bus		= &platform_bus_type,
+-	.suspend	= pcmcia_socket_dev_suspend,
+-	.resume		= pcmcia_socket_dev_resume,
++static int vrc4171_card_suspend(struct platform_device *dev,
++				     pm_message_t state)
++{
++	return pcmcia_socket_dev_suspend(&dev->dev, state);
++}
++
++static int vrc4171_card_resume(struct platform_device *dev)
++{
++	return pcmcia_socket_dev_resume(&dev->dev);
++}
++
++static struct platform_driver vrc4171_card_driver = {
++	.driver = {
++		.name		= vrc4171_card_name,
++		.owner		= THIS_MODULE,
++	},
++	.suspend	= vrc4171_card_suspend,
++	.resume		= vrc4171_card_resume,
+ };
+ 
+ static int __devinit vrc4171_card_init(void)
+ {
+ 	int retval;
+ 
+-	retval = driver_register(&vrc4171_card_driver);
++	retval = platform_driver_register(&vrc4171_card_driver);
+ 	if (retval < 0)
+ 		return retval;
+ 
+ 	retval = platform_device_register(&vrc4171_card_device);
+ 	if (retval < 0) {
+-		driver_unregister(&vrc4171_card_driver);
++		platform_driver_unregister(&vrc4171_card_driver);
+ 		return retval;
+ 	}
+ 
+@@ -735,11 +748,12 @@ static int __devinit vrc4171_card_init(v
+ 	if (retval < 0) {
+ 		vrc4171_remove_sockets();
+ 		platform_device_unregister(&vrc4171_card_device);
+-		driver_unregister(&vrc4171_card_driver);
++		platform_driver_unregister(&vrc4171_card_driver);
+ 		return retval;
+ 	}
+ 
+-	printk(KERN_INFO "%s, connected to IRQ %d\n", vrc4171_card_driver.name, vrc4171_irq);
++	printk(KERN_INFO "%s, connected to IRQ %d\n",
++		vrc4171_card_driver.driver.name, vrc4171_irq);
+ 
+ 	return 0;
+ }
+@@ -749,7 +763,7 @@ static void __devexit vrc4171_card_exit(
+ 	free_irq(vrc4171_irq, vrc4171_sockets);
+ 	vrc4171_remove_sockets();
+ 	platform_device_unregister(&vrc4171_card_device);
+-	driver_unregister(&vrc4171_card_driver);
++	platform_driver_unregister(&vrc4171_card_driver);
+ }
+ 
+ module_init(vrc4171_card_init);
+--- a/drivers/scsi/a4000t.c
++++ b/drivers/scsi/a4000t.c
+@@ -35,7 +35,7 @@ static struct platform_device *a4000t_sc
+ 
+ #define A4000T_SCSI_ADDR 0xdd0040
+ 
+-static int __devinit a4000t_probe(struct device *dev)
++static int __devinit a4000t_probe(struct platform_device *dev)
+ {
+ 	struct Scsi_Host *host;
+ 	struct NCR_700_Host_Parameters *hostdata;
+@@ -78,7 +78,7 @@ static int __devinit a4000t_probe(struct
+ 		goto out_put_host;
+ 	}
+ 
+-	dev_set_drvdata(dev, host);
++	platform_set_drvdata(dev, host);
+ 	scsi_scan_host(host);
+ 
+ 	return 0;
+@@ -93,9 +93,9 @@ static int __devinit a4000t_probe(struct
+ 	return -ENODEV;
+ }
+ 
+-static __devexit int a4000t_device_remove(struct device *dev)
++static __devexit int a4000t_device_remove(struct platform_device *dev)
+ {
+-	struct Scsi_Host *host = dev_get_drvdata(dev);
++	struct Scsi_Host *host = platform_get_drvdata(dev);
+ 	struct NCR_700_Host_Parameters *hostdata = shost_priv(host);
+ 
+ 	scsi_remove_host(host);
+@@ -108,25 +108,27 @@ static __devexit int a4000t_device_remov
+ 	return 0;
+ }
+ 
+-static struct device_driver a4000t_scsi_driver = {
+-	.name	= "a4000t-scsi",
+-	.bus	= &platform_bus_type,
+-	.probe	= a4000t_probe,
+-	.remove	= __devexit_p(a4000t_device_remove),
++static struct platform_driver a4000t_scsi_driver = {
++	.driver = {
++		.name           = "a4000t-scsi",
++		.owner          = THIS_MODULE,
++	},
++	.probe          = a4000t_probe,
++	.remove         = __devexit_p(a4000t_device_remove),
+ };
+ 
+ static int __init a4000t_scsi_init(void)
+ {
+ 	int err;
+ 
+-	err = driver_register(&a4000t_scsi_driver);
++	err = platform_driver_register(&a4000t_scsi_driver);
+ 	if (err)
+ 		return err;
+ 
+ 	a4000t_scsi_device = platform_device_register_simple("a4000t-scsi",
+ 			-1, NULL, 0);
+ 	if (IS_ERR(a4000t_scsi_device)) {
+-		driver_unregister(&a4000t_scsi_driver);
++		platform_driver_register(&a4000t_scsi_driver);
+ 		return PTR_ERR(a4000t_scsi_device);
+ 	}
+ 
+@@ -136,7 +138,7 @@ static int __init a4000t_scsi_init(void)
+ static void __exit a4000t_scsi_exit(void)
+ {
+ 	platform_device_unregister(a4000t_scsi_device);
+-	driver_unregister(&a4000t_scsi_driver);
++	platform_driver_unregister(&a4000t_scsi_driver);
+ }
+ 
+ module_init(a4000t_scsi_init);
+--- a/drivers/scsi/bvme6000_scsi.c
++++ b/drivers/scsi/bvme6000_scsi.c
+@@ -34,7 +34,7 @@ static struct scsi_host_template bvme600
+ static struct platform_device *bvme6000_scsi_device;
+ 
+ static __devinit int
+-bvme6000_probe(struct device *dev)
++bvme6000_probe(struct platform_device *dev)
+ {
+ 	struct Scsi_Host *host;
+ 	struct NCR_700_Host_Parameters *hostdata;
+@@ -73,7 +73,7 @@ bvme6000_probe(struct device *dev)
+ 		goto out_put_host;
+ 	}
+ 
+-	dev_set_drvdata(dev, host);
++	platform_set_drvdata(dev, host);
+ 	scsi_scan_host(host);
+ 
+ 	return 0;
+@@ -87,9 +87,9 @@ bvme6000_probe(struct device *dev)
+ }
+ 
+ static __devexit int
+-bvme6000_device_remove(struct device *dev)
++bvme6000_device_remove(struct platform_device *dev)
+ {
+-	struct Scsi_Host *host = dev_get_drvdata(dev);
++	struct Scsi_Host *host = platform_get_drvdata(dev);
+ 	struct NCR_700_Host_Parameters *hostdata = shost_priv(host);
+ 
+ 	scsi_remove_host(host);
+@@ -100,25 +100,27 @@ bvme6000_device_remove(struct device *de
+ 	return 0;
+ }
+ 
+-static struct device_driver bvme6000_scsi_driver = {
+-	.name	= "bvme6000-scsi",
+-	.bus	= &platform_bus_type,
+-	.probe	= bvme6000_probe,
+-	.remove	= __devexit_p(bvme6000_device_remove),
++static struct platform_driver bvme6000_scsi_driver = {
++	.driver = {
++		.name		= "bvme6000-scsi",
++		.owner		= THIS_MODULE,
++	},
++	.probe		= bvme6000_probe,
++	.remove		= __devexit_p(bvme6000_device_remove),
+ };
+ 
+ static int __init bvme6000_scsi_init(void)
+ {
+ 	int err;
+ 
+-	err = driver_register(&bvme6000_scsi_driver);
++	err = platform_driver_register(&bvme6000_scsi_driver);
+ 	if (err)
+ 		return err;
+ 
+ 	bvme6000_scsi_device = platform_device_register_simple("bvme6000-scsi",
+ 							       -1, NULL, 0);
+ 	if (IS_ERR(bvme6000_scsi_device)) {
+-		driver_unregister(&bvme6000_scsi_driver);
++		platform_driver_unregister(&bvme6000_scsi_driver);
+ 		return PTR_ERR(bvme6000_scsi_device);
+ 	}
+ 
+@@ -128,7 +130,7 @@ static int __init bvme6000_scsi_init(voi
+ static void __exit bvme6000_scsi_exit(void)
+ {
+ 	platform_device_unregister(bvme6000_scsi_device);
+-	driver_unregister(&bvme6000_scsi_driver);
++	platform_driver_unregister(&bvme6000_scsi_driver);
+ }
+ 
+ module_init(bvme6000_scsi_init);
+--- a/drivers/scsi/mvme16x_scsi.c
++++ b/drivers/scsi/mvme16x_scsi.c
+@@ -34,7 +34,7 @@ static struct scsi_host_template mvme16x
+ static struct platform_device *mvme16x_scsi_device;
+ 
+ static __devinit int
+-mvme16x_probe(struct device *dev)
++mvme16x_probe(struct platform_device *dev)
+ {
+ 	struct Scsi_Host * host = NULL;
+ 	struct NCR_700_Host_Parameters *hostdata;
+@@ -88,7 +88,7 @@ mvme16x_probe(struct device *dev)
+ 		out_be32(0xfff4202c, v);
+ 	}
+ 
+-	dev_set_drvdata(dev, host);
++	platform_set_drvdata(dev, host);
+ 	scsi_scan_host(host);
+ 
+ 	return 0;
+@@ -102,9 +102,9 @@ mvme16x_probe(struct device *dev)
+ }
+ 
+ static __devexit int
+-mvme16x_device_remove(struct device *dev)
++mvme16x_device_remove(struct platform_device *dev)
+ {
+-	struct Scsi_Host *host = dev_get_drvdata(dev);
++	struct Scsi_Host *host = platform_get_drvdata(dev);
+ 	struct NCR_700_Host_Parameters *hostdata = shost_priv(host);
+ 
+ 	/* Disable scsi chip ints */
+@@ -123,25 +123,27 @@ mvme16x_device_remove(struct device *dev
+ 	return 0;
+ }
+ 
+-static struct device_driver mvme16x_scsi_driver = {
+-	.name	= "mvme16x-scsi",
+-	.bus	= &platform_bus_type,
+-	.probe	= mvme16x_probe,
+-	.remove	= __devexit_p(mvme16x_device_remove),
++static struct platform_driver mvme16x_scsi_driver = {
++	.driver = {
++		.name           = "mvme16x-scsi",
++		.owner          = THIS_MODULE,
++	},
++	.probe          = mvme16x_probe,
++	.remove         = __devexit_p(mvme16x_device_remove),
+ };
+ 
+ static int __init mvme16x_scsi_init(void)
+ {
+ 	int err;
+ 
+-	err = driver_register(&mvme16x_scsi_driver);
++	err = platform_driver_register(&mvme16x_scsi_driver);
+ 	if (err)
+ 		return err;
+ 
+ 	mvme16x_scsi_device = platform_device_register_simple("mvme16x-scsi",
+ 							      -1, NULL, 0);
+ 	if (IS_ERR(mvme16x_scsi_device)) {
+-		driver_unregister(&mvme16x_scsi_driver);
++		platform_driver_unregister(&mvme16x_scsi_driver);
+ 		return PTR_ERR(mvme16x_scsi_device);
+ 	}
+ 
+@@ -151,7 +153,7 @@ static int __init mvme16x_scsi_init(void
+ static void __exit mvme16x_scsi_exit(void)
+ {
+ 	platform_device_unregister(mvme16x_scsi_device);
+-	driver_unregister(&mvme16x_scsi_driver);
++	platform_driver_unregister(&mvme16x_scsi_driver);
+ }
+ 
+ module_init(mvme16x_scsi_init);
+--- a/drivers/video/au1100fb.c
++++ b/drivers/video/au1100fb.c
+@@ -457,7 +457,7 @@ static struct fb_ops au1100fb_ops =
+ 
+ /* AU1100 LCD controller device driver */
+ 
+-static int __init au1100fb_drv_probe(struct device *dev)
++static int __init au1100fb_drv_probe(struct platform_device *dev)
+ {
+ 	struct au1100fb_device *fbdev = NULL;
+ 	struct resource *regs_res;
+@@ -475,7 +475,7 @@ static int __init au1100fb_drv_probe(str
+ 
+ 	fbdev->panel = &known_lcd_panels[drv_info.panel_idx];
+ 
+-	dev_set_drvdata(dev, (void*)fbdev);
++	platform_set_drvdata(dev, (void *)fbdev);
+ 
+ 	/* Allocate region for our registers and map them */
+ 	if (!(regs_res = platform_get_resource(to_platform_device(dev),
+@@ -583,19 +583,19 @@ failed:
+ 		fb_dealloc_cmap(&fbdev->info.cmap);
+ 	}
+ 	kfree(fbdev);
+-	dev_set_drvdata(dev, NULL);
++	platform_set_drvdata(dev, NULL);
+ 
+ 	return 0;
+ }
+ 
+-int au1100fb_drv_remove(struct device *dev)
++int au1100fb_drv_remove(struct platform_device *dev)
+ {
+ 	struct au1100fb_device *fbdev = NULL;
+ 
+ 	if (!dev)
+ 		return -ENODEV;
+ 
+-	fbdev = (struct au1100fb_device*) dev_get_drvdata(dev);
++	fbdev = (struct au1100fb_device *) platform_get_drvdata(dev);
+ 
+ #if !defined(CONFIG_FRAMEBUFFER_CONSOLE) && defined(CONFIG_LOGO)
+ 	au1100fb_fb_blank(VESA_POWERDOWN, &fbdev->info);
+@@ -620,9 +620,9 @@ int au1100fb_drv_remove(struct device *d
+ static u32 sys_clksrc;
+ static struct au1100fb_regs fbregs;
+ 
+-int au1100fb_drv_suspend(struct device *dev, pm_message_t state)
++int au1100fb_drv_suspend(struct platform_device *dev, pm_message_t state)
+ {
+-	struct au1100fb_device *fbdev = dev_get_drvdata(dev);
++	struct au1100fb_device *fbdev = platform_get_drvdata(dev);
+ 
+ 	if (!fbdev)
+ 		return 0;
+@@ -641,9 +641,9 @@ int au1100fb_drv_suspend(struct device *
+ 	return 0;
+ }
+ 
+-int au1100fb_drv_resume(struct device *dev)
++int au1100fb_drv_resume(struct platform_device *dev)
+ {
+-	struct au1100fb_device *fbdev = dev_get_drvdata(dev);
++	struct au1100fb_device *fbdev = platform_get_drvdata(dev);
+ 
+ 	if (!fbdev)
+ 		return 0;
+@@ -663,10 +663,11 @@ int au1100fb_drv_resume(struct device *d
+ #define au1100fb_drv_resume NULL
+ #endif
+ 
+-static struct device_driver au1100fb_driver = {
+-	.name		= "au1100-lcd",
+-	.bus		= &platform_bus_type,
+-
++static struct platform_driver au1100fb_driver = {
++	.driver = {
++		.name		= "au1100-lcd",
++		.owner          = THIS_MODULE,
++	},
+ 	.probe		= au1100fb_drv_probe,
+         .remove		= au1100fb_drv_remove,
+ 	.suspend	= au1100fb_drv_suspend,
+@@ -753,12 +754,12 @@ int __init au1100fb_init(void)
+ 		return ret;
+ 	}
+ 
+-	return driver_register(&au1100fb_driver);
++	return platform_driver_register(&au1100fb_driver);
+ }
+ 
+ void __exit au1100fb_cleanup(void)
+ {
+-	driver_unregister(&au1100fb_driver);
++	platform_driver_unregister(&au1100fb_driver);
+ 
+ 	kfree(drv_info.opt_mode);
+ }
+--- a/drivers/video/au1200fb.c
++++ b/drivers/video/au1200fb.c
+@@ -1622,7 +1622,7 @@ static int au1200fb_init_fbinfo(struct a
+ 
+ /* AU1200 LCD controller device driver */
+ 
+-static int au1200fb_drv_probe(struct device *dev)
++static int au1200fb_drv_probe(struct platform_device *dev)
+ {
+ 	struct au1200fb_device *fbdev;
+ 	unsigned long page;
+@@ -1645,7 +1645,7 @@ static int au1200fb_drv_probe(struct dev
+ 		/* Allocate the framebuffer to the maximum screen size */
+ 		fbdev->fb_len = (win->w[plane].xres * win->w[plane].yres * bpp) / 8;
+ 
+-		fbdev->fb_mem = dma_alloc_noncoherent(dev,
++		fbdev->fb_mem = dma_alloc_noncoherent(&dev->dev,
+ 				PAGE_ALIGN(fbdev->fb_len),
+ 				&fbdev->fb_phys, GFP_KERNEL);
+ 		if (!fbdev->fb_mem) {
+@@ -1715,7 +1715,7 @@ failed:
+ 	return ret;
+ }
+ 
+-static int au1200fb_drv_remove(struct device *dev)
++static int au1200fb_drv_remove(struct platform_device *dev)
+ {
+ 	struct au1200fb_device *fbdev;
+ 	int plane;
+@@ -1733,7 +1733,8 @@ static int au1200fb_drv_remove(struct de
+ 		/* Clean up all probe data */
+ 		unregister_framebuffer(&fbdev->fb_info);
+ 		if (fbdev->fb_mem)
+-			dma_free_noncoherent(dev, PAGE_ALIGN(fbdev->fb_len),
++			dma_free_noncoherent(&dev->dev,
++					PAGE_ALIGN(fbdev->fb_len),
+ 					fbdev->fb_mem, fbdev->fb_phys);
+ 		if (fbdev->fb_info.cmap.len != 0)
+ 			fb_dealloc_cmap(&fbdev->fb_info.cmap);
+@@ -1747,22 +1748,24 @@ static int au1200fb_drv_remove(struct de
+ }
+ 
+ #ifdef CONFIG_PM
+-static int au1200fb_drv_suspend(struct device *dev, u32 state, u32 level)
++static int au1200fb_drv_suspend(struct platform_device *dev, u32 state)
+ {
+ 	/* TODO */
+ 	return 0;
+ }
+ 
+-static int au1200fb_drv_resume(struct device *dev, u32 level)
++static int au1200fb_drv_resume(struct platform_device *dev)
+ {
+ 	/* TODO */
+ 	return 0;
+ }
+ #endif /* CONFIG_PM */
+ 
+-static struct device_driver au1200fb_driver = {
+-	.name		= "au1200-lcd",
+-	.bus		= &platform_bus_type,
++static struct platform_driver au1200fb_driver = {
++	.driver = {
++		.name		= "au1200-lcd",
++		.owner          = THIS_MODULE,
++	},
+ 	.probe		= au1200fb_drv_probe,
+ 	.remove		= au1200fb_drv_remove,
+ #ifdef CONFIG_PM
+@@ -1906,12 +1909,12 @@ static int __init au1200fb_init(void)
+ 		printk(KERN_INFO "Power management device entry for the au1200fb loaded.\n");
+ 	#endif
+ 
+-	return driver_register(&au1200fb_driver);
++	return platform_driver_register(&au1200fb_driver);
+ }
+ 
+ static void __exit au1200fb_cleanup(void)
+ {
+-	driver_unregister(&au1200fb_driver);
++	platform_driver_unregister(&au1200fb_driver);
+ }
+ 
+ module_init(au1200fb_init);
+--- a/drivers/watchdog/rm9k_wdt.c
++++ b/drivers/watchdog/rm9k_wdt.c
+@@ -59,8 +59,8 @@ static long wdt_gpi_ioctl(struct file *,
+ static int wdt_gpi_notify(struct notifier_block *, unsigned long, void *);
+ static const struct resource *wdt_gpi_get_resource(struct platform_device *,
+ 						const char *, unsigned int);
+-static int __init wdt_gpi_probe(struct device *);
+-static int __exit wdt_gpi_remove(struct device *);
++static int __init wdt_gpi_probe(struct platform_device *);
++static int __exit wdt_gpi_remove(struct platform_device *);
+ 
+ 
+ static const char wdt_gpi_name[] = "wdt_gpi";
+@@ -346,10 +346,9 @@ static const struct resource *wdt_gpi_ge
+ }
+ 
+ /* No hotplugging on the platform bus - use __init */
+-static int __init wdt_gpi_probe(struct device *dev)
++static int __init wdt_gpi_probe(struct platform_device *pdv)
+ {
+ 	int res;
+-	struct platform_device * const pdv = to_platform_device(dev);
+ 	const struct resource
+ 		* const rr = wdt_gpi_get_resource(pdv, WDT_RESOURCE_REGS,
+ 						  IORESOURCE_MEM),
+@@ -374,7 +373,7 @@ static int __init wdt_gpi_probe(struct d
+ 	return res;
+ }
+ 
+-static int __exit wdt_gpi_remove(struct device *dev)
++static int __exit wdt_gpi_remove(struct platform_device *dev)
+ {
+ 	int res;
+ 
+@@ -387,15 +386,13 @@ static int __exit wdt_gpi_remove(struct 
+ 
+ 
+ /* Device driver init & exit */
+-static struct device_driver wdt_gpi_driver = {
+-	.name		= (char *) wdt_gpi_name,
+-	.bus		= &platform_bus_type,
+-	.owner		= THIS_MODULE,
++static struct platform_driver wgt_gpi_driver = {
++	.driver = {
++		.name		= wdt_gpi_name,
++		.owner		= THIS_MODULE,
++	},
+ 	.probe		= wdt_gpi_probe,
+-	.remove		= __exit_p(wdt_gpi_remove),
+-	.shutdown	= NULL,
+-	.suspend	= NULL,
+-	.resume		= NULL,
++	.remove		= __devexit_p(wdt_gpi_remove),
+ };
+ 
+ static int __init wdt_gpi_init_module(void)
+@@ -403,12 +400,12 @@ static int __init wdt_gpi_init_module(vo
+ 	atomic_set(&opencnt, 1);
+ 	if (timeout > MAX_TIMEOUT_SECONDS)
+ 		timeout = MAX_TIMEOUT_SECONDS;
+-	return driver_register(&wdt_gpi_driver);
++	return platform_driver_register(&wdt_gpi_driver);
+ }
+ 
+ static void __exit wdt_gpi_cleanup_module(void)
+ {
+-	driver_unregister(&wdt_gpi_driver);
++	platform_driver_unregister(&wdt_gpi_driver);
+ }
+ 
+ module_init(wdt_gpi_init_module);
