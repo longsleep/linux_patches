@@ -1,0 +1,307 @@
+From stern@rowland.harvard.edu  Tue Feb 17 19:21:46 2009
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Thu, 12 Feb 2009 14:48:26 -0500 (EST)
+Subject: usb-storage: make karma a separate module
+To: Greg KH <greg@kroah.com>
+Cc: USB Storage list <usb-storage@lists.one-eyed-alien.net>
+Message-ID: <Pine.LNX.4.44L0.0902121437450.3705-100000@iolanthe.rowland.org>
+
+
+This patch (as1216) converts usb-storage's karma subdriver into a
+separate module.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/storage/Kconfig         |    4 +
+ drivers/usb/storage/Makefile        |    3 -
+ drivers/usb/storage/karma.c         |   96 ++++++++++++++++++++++++++++++++++--
+ drivers/usb/storage/karma.h         |    7 --
+ drivers/usb/storage/unusual_devs.h  |    7 --
+ drivers/usb/storage/unusual_karma.h |   26 +++++++++
+ drivers/usb/storage/usb.c           |   12 ----
+ drivers/usb/storage/usual-tables.c  |    1 
+ 8 files changed, 123 insertions(+), 33 deletions(-)
+
+--- a/drivers/usb/storage/karma.c
++++ b/drivers/usb/storage/karma.c
+@@ -18,6 +18,8 @@
+  * 675 Mass Ave, Cambridge, MA 02139, USA.
+  */
+ 
++#include <linux/module.h>
++
+ #include <scsi/scsi.h>
+ #include <scsi/scsi_cmnd.h>
+ #include <scsi/scsi_device.h>
+@@ -25,7 +27,6 @@
+ #include "usb.h"
+ #include "transport.h"
+ #include "debug.h"
+-#include "karma.h"
+ 
+ #define RIO_PREFIX "RIOP\x00"
+ #define RIO_PREFIX_LEN 5
+@@ -36,13 +37,53 @@
+ #define RIO_LEAVE_STORAGE 0x2
+ #define RIO_RESET 0xC
+ 
+-extern int usb_stor_Bulk_transport(struct scsi_cmnd *, struct us_data *);
+-
+ struct karma_data {
+ 	int in_storage;
+ 	char *recv;
+ };
+ 
++static int rio_karma_init(struct us_data *us);
++
++
++/*
++ * The table of devices
++ */
++#define UNUSUAL_DEV(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax, \
++		    vendorName, productName, useProtocol, useTransport, \
++		    initFunction, flags) \
++{ USB_DEVICE_VER(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax), \
++  .driver_info = (flags)|(USB_US_TYPE_STOR<<24) }
++
++struct usb_device_id karma_usb_ids[] = {
++#	include "unusual_karma.h"
++	{ }		/* Terminating entry */
++};
++MODULE_DEVICE_TABLE(usb, karma_usb_ids);
++
++#undef UNUSUAL_DEV
++
++/*
++ * The flags table
++ */
++#define UNUSUAL_DEV(idVendor, idProduct, bcdDeviceMin, bcdDeviceMax, \
++		    vendor_name, product_name, use_protocol, use_transport, \
++		    init_function, Flags) \
++{ \
++	.vendorName = vendor_name,	\
++	.productName = product_name,	\
++	.useProtocol = use_protocol,	\
++	.useTransport = use_transport,	\
++	.initFunction = init_function,	\
++}
++
++static struct us_unusual_dev karma_unusual_dev_list[] = {
++#	include "unusual_karma.h"
++	{ }		/* Terminating entry */
++};
++
++#undef UNUSUAL_DEV
++
++
+ /*
+  * Send commands to Rio Karma.
+  *
+@@ -104,7 +145,7 @@ err:
+  * Trap START_STOP and READ_10 to leave/re-enter storage mode.
+  * Everything else is propagated to the normal bulk layer.
+  */
+-int rio_karma_transport(struct scsi_cmnd *srb, struct us_data *us)
++static int rio_karma_transport(struct scsi_cmnd *srb, struct us_data *us)
+ {
+ 	int ret;
+ 	struct karma_data *data = (struct karma_data *) us->extra;
+@@ -133,7 +174,7 @@ static void rio_karma_destructor(void *e
+ 	kfree(data->recv);
+ }
+ 
+-int rio_karma_init(struct us_data *us)
++static int rio_karma_init(struct us_data *us)
+ {
+ 	int ret = 0;
+ 	struct karma_data *data = kzalloc(sizeof(struct karma_data), GFP_NOIO);
+@@ -153,3 +194,48 @@ int rio_karma_init(struct us_data *us)
+ out:
+ 	return ret;
+ }
++
++static int karma_probe(struct usb_interface *intf,
++			 const struct usb_device_id *id)
++{
++	struct us_data *us;
++	int result;
++
++	result = usb_stor_probe1(&us, intf, id,
++			(id - karma_usb_ids) + karma_unusual_dev_list);
++	if (result)
++		return result;
++
++	us->transport_name = "Rio Karma/Bulk";
++	us->transport = rio_karma_transport;
++	us->transport_reset = usb_stor_Bulk_reset;
++
++	result = usb_stor_probe2(us);
++	return result;
++}
++
++static struct usb_driver karma_driver = {
++	.name =		"ums-karma",
++	.probe =	karma_probe,
++	.disconnect =	usb_stor_disconnect,
++	.suspend =	usb_stor_suspend,
++	.resume =	usb_stor_resume,
++	.reset_resume =	usb_stor_reset_resume,
++	.pre_reset =	usb_stor_pre_reset,
++	.post_reset =	usb_stor_post_reset,
++	.id_table =	karma_usb_ids,
++	.soft_unbind =	1,
++};
++
++static int __init karma_init(void)
++{
++	return usb_register(&karma_driver);
++}
++
++static void __exit karma_exit(void)
++{
++	usb_deregister(&karma_driver);
++}
++
++module_init(karma_init);
++module_exit(karma_exit);
+--- a/drivers/usb/storage/karma.h
++++ /dev/null
+@@ -1,7 +0,0 @@
+-#ifndef _KARMA_USB_H
+-#define _KARMA_USB_H
+-
+-extern int rio_karma_init(struct us_data *us);
+-extern int rio_karma_transport(struct scsi_cmnd *srb, struct us_data *us);
+-
+-#endif
+--- a/drivers/usb/storage/Kconfig
++++ b/drivers/usb/storage/Kconfig
+@@ -144,7 +144,7 @@ config USB_STORAGE_ONETOUCH
+ 	  cuts)
+ 
+ config USB_STORAGE_KARMA
+-	bool "Support for Rio Karma music player"
++	tristate "Support for Rio Karma music player"
+ 	depends on USB_STORAGE
+ 	help
+ 	  Say Y here to include additional code to support the Rio Karma
+@@ -155,6 +155,8 @@ config USB_STORAGE_KARMA
+ 	  on the resulting scsi device node returns the Karma to normal
+ 	  operation.
+ 
++	  If this driver is compiled as a module, it will be named ums-karma.
++
+ config USB_STORAGE_CYPRESS_ATACB
+ 	tristate "SAT emulation on Cypress USB/ATA Bridge with ATACB"
+ 	depends on USB_STORAGE
+--- a/drivers/usb/storage/Makefile
++++ b/drivers/usb/storage/Makefile
+@@ -11,7 +11,6 @@ obj-$(CONFIG_USB_STORAGE)	+= usb-storage
+ 
+ usb-storage-obj-$(CONFIG_USB_STORAGE_DEBUG)	+= debug.o
+ usb-storage-obj-$(CONFIG_USB_STORAGE_ONETOUCH)	+= onetouch.o
+-usb-storage-obj-$(CONFIG_USB_STORAGE_KARMA)	+= karma.o
+ 
+ usb-storage-objs :=	scsiglue.o protocol.o transport.o usb.o \
+ 			initializers.o sierra_ms.o option_ms.o $(usb-storage-obj-y)
+@@ -28,6 +27,7 @@ obj-$(CONFIG_USB_STORAGE_DATAFAB)	+= ums
+ obj-$(CONFIG_USB_STORAGE_FREECOM)	+= ums-freecom.o
+ obj-$(CONFIG_USB_STORAGE_ISD200)	+= ums-isd200.o
+ obj-$(CONFIG_USB_STORAGE_JUMPSHOT)	+= ums-jumpshot.o
++obj-$(CONFIG_USB_STORAGE_KARMA)		+= ums-karma.o
+ obj-$(CONFIG_USB_STORAGE_SDDR09)	+= ums-sddr09.o
+ obj-$(CONFIG_USB_STORAGE_SDDR55)	+= ums-sddr55.o
+ obj-$(CONFIG_USB_STORAGE_USBAT)		+= ums-usbat.o
+@@ -38,6 +38,7 @@ ums-datafab-objs	:= datafab.o
+ ums-freecom-objs	:= freecom.o
+ ums-isd200-objs		:= isd200.o
+ ums-jumpshot-objs	:= jumpshot.o
++ums-karma-objs		:= karma.o
+ ums-sddr09-objs		:= sddr09.o
+ ums-sddr55-objs		:= sddr55.o
+ ums-usbat-objs		:= shuttle_usbat.o
+--- a/drivers/usb/storage/unusual_devs.h
++++ b/drivers/usb/storage/unusual_devs.h
+@@ -276,13 +276,6 @@ UNUSUAL_DEV(  0x0457, 0x0151, 0x0100, 0x
+ 		US_SC_DEVICE, US_PR_DEVICE, NULL,
+ 		US_FL_NOT_LOCKABLE ),
+ 
+-#ifdef CONFIG_USB_STORAGE_KARMA
+-UNUSUAL_DEV(  0x045a, 0x5210, 0x0101, 0x0101,
+-		"Rio",
+-		"Rio Karma",
+-		US_SC_SCSI, US_PR_KARMA, rio_karma_init, 0),
+-#endif
+-
+ /* Reported by Tamas Kerecsen <kerecsen@bigfoot.com>
+  * Obviously the PROM has not been customized by the VAR;
+  * the Vendor and Product string descriptors are:
+--- /dev/null
++++ b/drivers/usb/storage/unusual_karma.h
+@@ -0,0 +1,26 @@
++/* Unusual Devices File for the Rio Karma
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2, or (at your option) any
++ * later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation, Inc.,
++ * 675 Mass Ave, Cambridge, MA 02139, USA.
++ */
++
++#if defined(CONFIG_USB_STORAGE_KARMA) || \
++		defined(CONFIG_USB_STORAGE_KARMA_MODULE)
++
++UNUSUAL_DEV(  0x045a, 0x5210, 0x0101, 0x0101,
++		"Rio",
++		"Rio Karma",
++		US_SC_SCSI, US_PR_KARMA, rio_karma_init, 0),
++
++#endif /* defined(CONFIG_USB_STORAGE_KARMA) || ... */
+--- a/drivers/usb/storage/usb.c
++++ b/drivers/usb/storage/usb.c
+@@ -69,9 +69,6 @@
+ #ifdef CONFIG_USB_STORAGE_ONETOUCH
+ #include "onetouch.h"
+ #endif
+-#ifdef CONFIG_USB_STORAGE_KARMA
+-#include "karma.h"
+-#endif
+ #include "sierra_ms.h"
+ #include "option_ms.h"
+ 
+@@ -594,15 +591,6 @@ static void get_transport(struct us_data
+ 		us->transport = usb_stor_Bulk_transport;
+ 		us->transport_reset = usb_stor_Bulk_reset;
+ 		break;
+-
+-#ifdef CONFIG_USB_STORAGE_KARMA
+-	case US_PR_KARMA:
+-		us->transport_name = "Rio Karma/Bulk";
+-		us->transport = rio_karma_transport;
+-		us->transport_reset = usb_stor_Bulk_reset;
+-		break;
+-#endif
+-
+ 	}
+ }
+ 
+--- a/drivers/usb/storage/usual-tables.c
++++ b/drivers/usb/storage/usual-tables.c
+@@ -83,6 +83,7 @@ static struct ignore_entry ignore_ids[] 
+ #	include "unusual_freecom.h"
+ #	include "unusual_isd200.h"
+ #	include "unusual_jumpshot.h"
++#	include "unusual_karma.h"
+ #	include "unusual_sddr09.h"
+ #	include "unusual_sddr55.h"
+ #	include "unusual_usbat.h"

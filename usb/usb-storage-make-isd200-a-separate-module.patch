@@ -1,0 +1,388 @@
+From stern@rowland.harvard.edu  Tue Feb 17 18:54:27 2009
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Thu, 12 Feb 2009 14:47:54 -0500 (EST)
+Subject: usb-storage: make isd200 a separate module
+To: Greg KH <greg@kroah.com>
+Cc: USB Storage list <usb-storage@lists.one-eyed-alien.net>
+Message-ID: <Pine.LNX.4.44L0.0902121430150.3705-100000@iolanthe.rowland.org>
+
+
+This patch (as1208) converts usb-storage's isd200 subdriver into a
+separate module.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/storage/Kconfig          |    4 +
+ drivers/usb/storage/Makefile         |    3 -
+ drivers/usb/storage/isd200.c         |   94 +++++++++++++++++++++++++++++++++--
+ drivers/usb/storage/isd200.h         |   31 -----------
+ drivers/usb/storage/unusual_devs.h   |   42 ---------------
+ drivers/usb/storage/unusual_isd200.h |   57 +++++++++++++++++++++
+ drivers/usb/storage/usb.c            |   10 ---
+ drivers/usb/storage/usual-tables.c   |    1 
+ 8 files changed, 154 insertions(+), 88 deletions(-)
+
+--- a/drivers/usb/storage/isd200.c
++++ b/drivers/usb/storage/isd200.c
+@@ -44,6 +44,7 @@
+ 
+ #include <linux/jiffies.h>
+ #include <linux/errno.h>
++#include <linux/module.h>
+ #include <linux/slab.h>
+ #include <linux/hdreg.h>
+ #include <linux/scatterlist.h>
+@@ -57,7 +58,50 @@
+ #include "protocol.h"
+ #include "debug.h"
+ #include "scsiglue.h"
+-#include "isd200.h"
++
++
++static int isd200_Initialization(struct us_data *us);
++
++
++/*
++ * The table of devices
++ */
++#define UNUSUAL_DEV(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax, \
++		    vendorName, productName, useProtocol, useTransport, \
++		    initFunction, flags) \
++{ USB_DEVICE_VER(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax), \
++  .driver_info = (flags)|(USB_US_TYPE_STOR<<24) }
++
++struct usb_device_id isd200_usb_ids[] = {
++#	include "unusual_isd200.h"
++	{ }		/* Terminating entry */
++};
++MODULE_DEVICE_TABLE(usb, isd200_usb_ids);
++
++#undef UNUSUAL_DEV
++#undef USUAL_DEV
++
++/*
++ * The flags table
++ */
++#define UNUSUAL_DEV(idVendor, idProduct, bcdDeviceMin, bcdDeviceMax, \
++		    vendor_name, product_name, use_protocol, use_transport, \
++		    init_function, Flags) \
++{ \
++	.vendorName = vendor_name,	\
++	.productName = product_name,	\
++	.useProtocol = use_protocol,	\
++	.useTransport = use_transport,	\
++	.initFunction = init_function,	\
++}
++
++static struct us_unusual_dev isd200_unusual_dev_list[] = {
++#	include "unusual_isd200.h"
++	{ }		/* Terminating entry */
++};
++
++#undef UNUSUAL_DEV
++#undef USUAL_DEV
+ 
+ 
+ /* Timeout defines (in Seconds) */
+@@ -1518,7 +1562,7 @@ static int isd200_init_info(struct us_da
+  * Initialization for the ISD200 
+  */
+ 
+-int isd200_Initialization(struct us_data *us)
++static int isd200_Initialization(struct us_data *us)
+ {
+ 	US_DEBUGP("ISD200 Initialization...\n");
+ 
+@@ -1549,7 +1593,7 @@ int isd200_Initialization(struct us_data
+  *
+  */
+ 
+-void isd200_ata_command(struct scsi_cmnd *srb, struct us_data *us)
++static void isd200_ata_command(struct scsi_cmnd *srb, struct us_data *us)
+ {
+ 	int sendToTransport = 1, orig_bufflen;
+ 	union ata_cdb ataCdb;
+@@ -1570,3 +1614,47 @@ void isd200_ata_command(struct scsi_cmnd
+ 
+ 	isd200_srb_set_bufflen(srb, orig_bufflen);
+ }
++
++static int isd200_probe(struct usb_interface *intf,
++			 const struct usb_device_id *id)
++{
++	struct us_data *us;
++	int result;
++
++	result = usb_stor_probe1(&us, intf, id,
++			(id - isd200_usb_ids) + isd200_unusual_dev_list);
++	if (result)
++		return result;
++
++	us->protocol_name = "ISD200 ATA/ATAPI";
++	us->proto_handler = isd200_ata_command;
++
++	result = usb_stor_probe2(us);
++	return result;
++}
++
++static struct usb_driver isd200_driver = {
++	.name =		"ums-isd200",
++	.probe =	isd200_probe,
++	.disconnect =	usb_stor_disconnect,
++	.suspend =	usb_stor_suspend,
++	.resume =	usb_stor_resume,
++	.reset_resume =	usb_stor_reset_resume,
++	.pre_reset =	usb_stor_pre_reset,
++	.post_reset =	usb_stor_post_reset,
++	.id_table =	isd200_usb_ids,
++	.soft_unbind =	1,
++};
++
++static int __init isd200_init(void)
++{
++	return usb_register(&isd200_driver);
++}
++
++static void __exit isd200_exit(void)
++{
++	usb_deregister(&isd200_driver);
++}
++
++module_init(isd200_init);
++module_exit(isd200_exit);
+--- a/drivers/usb/storage/isd200.h
++++ /dev/null
+@@ -1,31 +0,0 @@
+-/* Header File for In-System Design, Inc. ISD200 ASIC
+- *
+- * First release
+- *
+- * Current development and maintenance by:
+- *   (c) 2000 In-System Design, Inc. (support@in-system.com)
+- *
+- * See isd200.c for more information.
+- *
+- * This program is free software; you can redistribute it and/or modify it
+- * under the terms of the GNU General Public License as published by the
+- * Free Software Foundation; either version 2, or (at your option) any
+- * later version.
+- *
+- * This program is distributed in the hope that it will be useful, but
+- * WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+- * General Public License for more details.
+- *
+- * You should have received a copy of the GNU General Public License along
+- * with this program; if not, write to the Free Software Foundation, Inc.,
+- * 675 Mass Ave, Cambridge, MA 02139, USA.
+- */
+-
+-#ifndef _USB_ISD200_H
+-#define _USB_ISD200_H
+-
+-extern void isd200_ata_command(struct scsi_cmnd *srb, struct us_data *us);
+-extern int isd200_Initialization(struct us_data *us);
+-
+-#endif
+--- a/drivers/usb/storage/Kconfig
++++ b/drivers/usb/storage/Kconfig
+@@ -46,7 +46,7 @@ config USB_STORAGE_FREECOM
+ 	  Freecom has a web page at <http://www.freecom.de/>.
+ 
+ config USB_STORAGE_ISD200
+-	bool "ISD-200 USB/ATA Bridge support"
++	tristate "ISD-200 USB/ATA Bridge support"
+ 	depends on USB_STORAGE
+ 	---help---
+ 	  Say Y here if you want to use USB Mass Store devices based
+@@ -61,6 +61,8 @@ config USB_STORAGE_ISD200
+ 	  - CyQ've CQ8060A CDRW drive
+ 	  - Planex eXtreme Drive RX-25HU USB-IDE cable (not model RX-25U)
+ 
++	  If this driver is compiled as a module, it will be named ums-isd200.
++
+ config USB_STORAGE_USBAT
+ 	bool "USBAT/USBAT02-based storage support"
+ 	depends on USB_STORAGE
+--- a/drivers/usb/storage/Makefile
++++ b/drivers/usb/storage/Makefile
+@@ -13,7 +13,6 @@ usb-storage-obj-$(CONFIG_USB_STORAGE_DEB
+ usb-storage-obj-$(CONFIG_USB_STORAGE_USBAT)	+= shuttle_usbat.o
+ usb-storage-obj-$(CONFIG_USB_STORAGE_SDDR55)	+= sddr55.o
+ usb-storage-obj-$(CONFIG_USB_STORAGE_FREECOM)	+= freecom.o
+-usb-storage-obj-$(CONFIG_USB_STORAGE_ISD200)	+= isd200.o
+ usb-storage-obj-$(CONFIG_USB_STORAGE_DATAFAB)	+= datafab.o
+ usb-storage-obj-$(CONFIG_USB_STORAGE_JUMPSHOT)	+= jumpshot.o
+ usb-storage-obj-$(CONFIG_USB_STORAGE_ALAUDA)	+= alauda.o
+@@ -30,6 +29,8 @@ else
+ 	obj-$(CONFIG_USB)	+= libusual.o usual-tables.o
+ endif
+ 
++obj-$(CONFIG_USB_STORAGE_ISD200)	+= ums-isd200.o
+ obj-$(CONFIG_USB_STORAGE_SDDR09)	+= ums-sddr09.o
+ 
++ums-isd200-objs		:= isd200.o
+ ums-sddr09-objs		:= sddr09.o
+--- a/drivers/usb/storage/unusual_devs.h
++++ b/drivers/usb/storage/unusual_devs.h
+@@ -632,14 +632,6 @@ UNUSUAL_DEV(  0x054c, 0x0025, 0x0100, 0x
+ 		US_SC_DEVICE, US_PR_DEVICE, NULL,
+ 		US_FL_SINGLE_LUN ),
+ 
+-#ifdef CONFIG_USB_STORAGE_ISD200
+-UNUSUAL_DEV(  0x054c, 0x002b, 0x0100, 0x0110,
+-		"Sony",
+-		"Portable USB Harddrive V2",
+-		US_SC_ISD200, US_PR_BULK, isd200_Initialization,
+-		0 ),
+-#endif
+-
+ /* Submitted by Olaf Hering, <olh@suse.de> SuSE Bugzilla #49049 */
+ UNUSUAL_DEV(  0x054c, 0x002c, 0x0501, 0x2000,
+ 		"Sony",
+@@ -785,32 +777,6 @@ UNUSUAL_DEV(  0x05ab, 0x0060, 0x1104, 0x
+ 		US_SC_SCSI, US_PR_BULK, NULL,
+ 		US_FL_NEED_OVERRIDE ),
+ 
+-#ifdef CONFIG_USB_STORAGE_ISD200
+-UNUSUAL_DEV(  0x05ab, 0x0031, 0x0100, 0x0110,
+-		"In-System",
+-		"USB/IDE Bridge (ATA/ATAPI)",
+-		US_SC_ISD200, US_PR_BULK, isd200_Initialization,
+-		0 ),
+-
+-UNUSUAL_DEV(  0x05ab, 0x0301, 0x0100, 0x0110,
+-		"In-System",
+-		"Portable USB Harddrive V2",
+-		US_SC_ISD200, US_PR_BULK, isd200_Initialization,
+-		0 ),
+-
+-UNUSUAL_DEV(  0x05ab, 0x0351, 0x0100, 0x0110,
+-		"In-System",
+-		"Portable USB Harddrive V2",
+-		US_SC_ISD200, US_PR_BULK, isd200_Initialization,
+-		0 ),
+-
+-UNUSUAL_DEV(  0x05ab, 0x5701, 0x0100, 0x0110,
+-		"In-System",
+-		"USB Storage Adapter V2",
+-		US_SC_ISD200, US_PR_BULK, isd200_Initialization,
+-		0 ),
+-#endif
+-
+ /* Submitted by Sven Anderson <sven-linux@anderson.de>
+  * There are at least four ProductIDs used for iPods, so I added 0x1202 and
+  * 0x1204. They just need the US_FL_FIX_CAPACITY. As the bcdDevice appears
+@@ -1363,14 +1329,6 @@ UNUSUAL_DEV( 0x0bc2, 0x3010, 0x0000, 0x0
+ 		US_SC_DEVICE, US_PR_DEVICE, NULL,
+ 		US_FL_SANE_SENSE ),
+ 
+-#ifdef CONFIG_USB_STORAGE_ISD200
+-UNUSUAL_DEV(  0x0bf6, 0xa001, 0x0100, 0x0110,
+-		"ATI",
+-		"USB Cable 205",
+-		US_SC_ISD200, US_PR_BULK, isd200_Initialization,
+-		0 ),
+-#endif
+-
+ #ifdef CONFIG_USB_STORAGE_DATAFAB
+ UNUSUAL_DEV( 0x0c0b, 0xa109, 0x0000, 0xffff,
+ 		"Acomdata",
+--- /dev/null
++++ b/drivers/usb/storage/unusual_isd200.h
+@@ -0,0 +1,57 @@
++/* Unusual Devices File for In-System Design, Inc. ISD200 ASIC
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2, or (at your option) any
++ * later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation, Inc.,
++ * 675 Mass Ave, Cambridge, MA 02139, USA.
++ */
++
++#if defined(CONFIG_USB_STORAGE_ISD200) || \
++		defined(CONFIG_USB_STORAGE_ISD200_MODULE)
++
++UNUSUAL_DEV(  0x054c, 0x002b, 0x0100, 0x0110,
++		"Sony",
++		"Portable USB Harddrive V2",
++		US_SC_ISD200, US_PR_BULK, isd200_Initialization,
++		0),
++
++UNUSUAL_DEV(  0x05ab, 0x0031, 0x0100, 0x0110,
++		"In-System",
++		"USB/IDE Bridge (ATA/ATAPI)",
++		US_SC_ISD200, US_PR_BULK, isd200_Initialization,
++		0),
++
++UNUSUAL_DEV(  0x05ab, 0x0301, 0x0100, 0x0110,
++		"In-System",
++		"Portable USB Harddrive V2",
++		US_SC_ISD200, US_PR_BULK, isd200_Initialization,
++		0),
++
++UNUSUAL_DEV(  0x05ab, 0x0351, 0x0100, 0x0110,
++		"In-System",
++		"Portable USB Harddrive V2",
++		US_SC_ISD200, US_PR_BULK, isd200_Initialization,
++		0),
++
++UNUSUAL_DEV(  0x05ab, 0x5701, 0x0100, 0x0110,
++		"In-System",
++		"USB Storage Adapter V2",
++		US_SC_ISD200, US_PR_BULK, isd200_Initialization,
++		0),
++
++UNUSUAL_DEV(  0x0bf6, 0xa001, 0x0100, 0x0110,
++		"ATI",
++		"USB Cable 205",
++		US_SC_ISD200, US_PR_BULK, isd200_Initialization,
++		0),
++
++#endif /* defined(CONFIG_USB_STORAGE_ISD200) || ... */
+--- a/drivers/usb/storage/usb.c
++++ b/drivers/usb/storage/usb.c
+@@ -75,9 +75,6 @@
+ #ifdef CONFIG_USB_STORAGE_FREECOM
+ #include "freecom.h"
+ #endif
+-#ifdef CONFIG_USB_STORAGE_ISD200
+-#include "isd200.h"
+-#endif
+ #ifdef CONFIG_USB_STORAGE_DATAFAB
+ #include "datafab.h"
+ #endif
+@@ -721,13 +718,6 @@ static void get_protocol(struct us_data 
+ 		us->proto_handler = usb_stor_ufi_command;
+ 		break;
+ 
+-#ifdef CONFIG_USB_STORAGE_ISD200
+-	case US_SC_ISD200:
+-		us->protocol_name = "ISD200 ATA/ATAPI";
+-		us->proto_handler = isd200_ata_command;
+-		break;
+-#endif
+-
+ #ifdef CONFIG_USB_STORAGE_CYPRESS_ATACB
+ 	case US_SC_CYP_ATACB:
+ 		us->protocol_name = "Transparent SCSI with Cypress ATACB";
+--- a/drivers/usb/storage/usual-tables.c
++++ b/drivers/usb/storage/usual-tables.c
+@@ -77,6 +77,7 @@ struct ignore_entry {
+ }
+ 
+ static struct ignore_entry ignore_ids[] = {
++#	include "unusual_isd200.h"
+ #	include "unusual_sddr09.h"
+ 	{ }		/* Terminating entry */
+ };

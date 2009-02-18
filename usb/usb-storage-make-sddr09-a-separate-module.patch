@@ -1,0 +1,470 @@
+From stern@rowland.harvard.edu  Tue Feb 17 18:49:40 2009
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Thu, 12 Feb 2009 14:47:49 -0500 (EST)
+Subject: usb-storage: make sddr09 a separate module
+To: Greg KH <greg@kroah.com>
+Cc: USB Storage list <usb-storage@lists.one-eyed-alien.net>
+Message-ID: <Pine.LNX.4.44L0.0902121429080.3705-100000@iolanthe.rowland.org>
+
+
+This patch (as1207) converts usb-storage's sddr09 subdriver into a
+separate module.
+
+An unexpected complication arises because of DPCM devices, in which
+one LUN uses the sddr09 transport and one uses the standard CB
+transport.  Since these devices can be used even when
+USB_STORAGE_SDDR09 isn't configured, their entries in unusual_devs.h
+require special treatment.  If SDDR09 isn't configured then the
+entries remain in unusual_devs.h; if it is then the entries are
+present in unusual_sddr09.h instead.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/storage/Kconfig          |    4 -
+ drivers/usb/storage/Makefile         |    5 +
+ drivers/usb/storage/sddr09.c         |  107 +++++++++++++++++++++++++++++++++--
+ drivers/usb/storage/sddr09.h         |   38 ------------
+ drivers/usb/storage/unusual_devs.h   |   50 ++--------------
+ drivers/usb/storage/unusual_sddr09.h |   56 ++++++++++++++++++
+ drivers/usb/storage/usb.c            |   21 ------
+ drivers/usb/storage/usual-tables.c   |    1 
+ 8 files changed, 174 insertions(+), 108 deletions(-)
+
+--- a/drivers/usb/storage/Kconfig
++++ b/drivers/usb/storage/Kconfig
+@@ -83,13 +83,15 @@ config USB_STORAGE_USBAT
+ 	  - Sandisk ImageMate SDDR-05b
+ 
+ config USB_STORAGE_SDDR09
+-	bool "SanDisk SDDR-09 (and other SmartMedia, including DPCM) support"
++	tristate "SanDisk SDDR-09 (and other SmartMedia, including DPCM) support"
+ 	depends on USB_STORAGE
+ 	help
+ 	  Say Y here to include additional code to support the Sandisk SDDR-09
+ 	  SmartMedia reader in the USB Mass Storage driver.
+ 	  Also works for the Microtech Zio! CompactFlash/SmartMedia reader.
+ 
++	  If this driver is compiled as a module, it will be named ums-sddr09.
++
+ config USB_STORAGE_SDDR55
+ 	bool "SanDisk SDDR-55 SmartMedia support"
+ 	depends on USB_STORAGE
+--- a/drivers/usb/storage/Makefile
++++ b/drivers/usb/storage/Makefile
+@@ -11,7 +11,6 @@ obj-$(CONFIG_USB_STORAGE)	+= usb-storage
+ 
+ usb-storage-obj-$(CONFIG_USB_STORAGE_DEBUG)	+= debug.o
+ usb-storage-obj-$(CONFIG_USB_STORAGE_USBAT)	+= shuttle_usbat.o
+-usb-storage-obj-$(CONFIG_USB_STORAGE_SDDR09)	+= sddr09.o
+ usb-storage-obj-$(CONFIG_USB_STORAGE_SDDR55)	+= sddr55.o
+ usb-storage-obj-$(CONFIG_USB_STORAGE_FREECOM)	+= freecom.o
+ usb-storage-obj-$(CONFIG_USB_STORAGE_ISD200)	+= isd200.o
+@@ -30,3 +29,7 @@ ifeq ($(CONFIG_USB_LIBUSUAL),)
+ else
+ 	obj-$(CONFIG_USB)	+= libusual.o usual-tables.o
+ endif
++
++obj-$(CONFIG_USB_STORAGE_SDDR09)	+= ums-sddr09.o
++
++ums-sddr09-objs		:= sddr09.o
+--- a/drivers/usb/storage/sddr09.c
++++ b/drivers/usb/storage/sddr09.c
+@@ -41,6 +41,7 @@
+  */
+ 
+ #include <linux/errno.h>
++#include <linux/module.h>
+ #include <linux/slab.h>
+ 
+ #include <scsi/scsi.h>
+@@ -51,7 +52,50 @@
+ #include "transport.h"
+ #include "protocol.h"
+ #include "debug.h"
+-#include "sddr09.h"
++
++
++static int usb_stor_sddr09_dpcm_init(struct us_data *us);
++static int sddr09_transport(struct scsi_cmnd *srb, struct us_data *us);
++static int usb_stor_sddr09_init(struct us_data *us);
++
++
++/*
++ * The table of devices
++ */
++#define UNUSUAL_DEV(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax, \
++		    vendorName, productName, useProtocol, useTransport, \
++		    initFunction, flags) \
++{ USB_DEVICE_VER(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax), \
++  .driver_info = (flags)|(USB_US_TYPE_STOR<<24) }
++
++struct usb_device_id sddr09_usb_ids[] = {
++#	include "unusual_sddr09.h"
++	{ }		/* Terminating entry */
++};
++MODULE_DEVICE_TABLE(usb, sddr09_usb_ids);
++
++#undef UNUSUAL_DEV
++
++/*
++ * The flags table
++ */
++#define UNUSUAL_DEV(idVendor, idProduct, bcdDeviceMin, bcdDeviceMax, \
++		    vendor_name, product_name, use_protocol, use_transport, \
++		    init_function, Flags) \
++{ \
++	.vendorName = vendor_name,	\
++	.productName = product_name,	\
++	.useProtocol = use_protocol,	\
++	.useTransport = use_transport,	\
++	.initFunction = init_function,	\
++}
++
++static struct us_unusual_dev sddr09_unusual_dev_list[] = {
++#	include "unusual_sddr09.h"
++	{ }		/* Terminating entry */
++};
++
++#undef UNUSUAL_DEV
+ 
+ 
+ #define short_pack(lsb,msb) ( ((u16)(lsb)) | ( ((u16)(msb))<<8 ) )
+@@ -1406,7 +1450,7 @@ sddr09_common_init(struct us_data *us) {
+  * unusual devices list but called from here then LUN 0 of the combo reader
+  * is not recognized. But I do not know what precisely these calls do.
+  */
+-int
++static int
+ usb_stor_sddr09_dpcm_init(struct us_data *us) {
+ 	int result;
+ 	unsigned char *data = us->iobuf;
+@@ -1456,7 +1500,7 @@ usb_stor_sddr09_dpcm_init(struct us_data
+ /*
+  * Transport for the Microtech DPCM-USB
+  */
+-int dpcm_transport(struct scsi_cmnd *srb, struct us_data *us)
++static int dpcm_transport(struct scsi_cmnd *srb, struct us_data *us)
+ {
+ 	int ret;
+ 
+@@ -1498,7 +1542,7 @@ int dpcm_transport(struct scsi_cmnd *srb
+ /*
+  * Transport for the Sandisk SDDR-09
+  */
+-int sddr09_transport(struct scsi_cmnd *srb, struct us_data *us)
++static int sddr09_transport(struct scsi_cmnd *srb, struct us_data *us)
+ {
+ 	static unsigned char sensekey = 0, sensecode = 0;
+ 	static unsigned char havefakesense = 0;
+@@ -1697,7 +1741,60 @@ int sddr09_transport(struct scsi_cmnd *s
+ /*
+  * Initialization routine for the sddr09 subdriver
+  */
+-int
++static int
+ usb_stor_sddr09_init(struct us_data *us) {
+ 	return sddr09_common_init(us);
+ }
++
++static int sddr09_probe(struct usb_interface *intf,
++			 const struct usb_device_id *id)
++{
++	struct us_data *us;
++	int result;
++
++	result = usb_stor_probe1(&us, intf, id,
++			(id - sddr09_usb_ids) + sddr09_unusual_dev_list);
++	if (result)
++		return result;
++
++	if (us->protocol == US_PR_DPCM_USB) {
++		us->transport_name = "Control/Bulk-EUSB/SDDR09";
++		us->transport = dpcm_transport;
++		us->transport_reset = usb_stor_CB_reset;
++		us->max_lun = 1;
++	} else {
++		us->transport_name = "EUSB/SDDR09";
++		us->transport = sddr09_transport;
++		us->transport_reset = usb_stor_CB_reset;
++		us->max_lun = 0;
++	}
++
++	result = usb_stor_probe2(us);
++	return result;
++}
++
++static struct usb_driver sddr09_driver = {
++	.name =		"ums-sddr09",
++	.probe =	sddr09_probe,
++	.disconnect =	usb_stor_disconnect,
++	.suspend =	usb_stor_suspend,
++	.resume =	usb_stor_resume,
++	.reset_resume =	usb_stor_reset_resume,
++	.pre_reset =	usb_stor_pre_reset,
++	.post_reset =	usb_stor_post_reset,
++	.id_table =	sddr09_usb_ids,
++	.soft_unbind =	1,
++};
++
++static int __init sddr09_init(void)
++{
++	return usb_register(&sddr09_driver);
++}
++
++static void __exit sddr09_exit(void)
++{
++	usb_deregister(&sddr09_driver);
++}
++
++module_init(sddr09_init);
++module_exit(sddr09_exit);
+--- a/drivers/usb/storage/sddr09.h
++++ /dev/null
+@@ -1,38 +0,0 @@
+-/* Driver for SanDisk SDDR-09 SmartMedia reader
+- * Header File
+- *
+- * Current development and maintenance by:
+- *   (c) 2000 Robert Baruch (autophile@dol.net)
+- *   (c) 2002 Andries Brouwer (aeb@cwi.nl)
+- *
+- * See sddr09.c for more explanation
+- *
+- * This program is free software; you can redistribute it and/or modify it
+- * under the terms of the GNU General Public License as published by the
+- * Free Software Foundation; either version 2, or (at your option) any
+- * later version.
+- *
+- * This program is distributed in the hope that it will be useful, but
+- * WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+- * General Public License for more details.
+- *
+- * You should have received a copy of the GNU General Public License along
+- * with this program; if not, write to the Free Software Foundation, Inc.,
+- * 675 Mass Ave, Cambridge, MA 02139, USA.
+- */
+-
+-#ifndef _USB_SHUTTLE_EUSB_SDDR09_H
+-#define _USB_SHUTTLE_EUSB_SDDR09_H
+-
+-/* Sandisk SDDR-09 stuff */
+-
+-extern int sddr09_transport(struct scsi_cmnd *srb, struct us_data *us);
+-extern int usb_stor_sddr09_init(struct us_data *us);
+-
+-/* Microtech DPCM-USB stuff */
+-
+-extern int dpcm_transport(struct scsi_cmnd *srb, struct us_data *us);
+-extern int usb_stor_sddr09_dpcm_init(struct us_data *us);
+-
+-#endif
+--- a/drivers/usb/storage/unusual_devs.h
++++ b/drivers/usb/storage/unusual_devs.h
+@@ -53,6 +53,11 @@
+  * as opposed to devices that do something strangely or wrongly.
+  */
+ 
++#if !defined(CONFIG_USB_STORAGE_SDDR09) && \
++		!defined(CONFIG_USB_STORAGE_SDDR09_MODULE)
++#define NO_SDDR09
++#endif
++
+ /* patch submitted by Vivian Bregier <Vivian.Bregier@imag.fr>
+  */
+ UNUSUAL_DEV(  0x03eb, 0x2002, 0x0100, 0x0100,
+@@ -246,12 +251,7 @@ UNUSUAL_DEV(  0x0424, 0x0fdc, 0x0210, 0x
+ 		US_SC_DEVICE, US_PR_DEVICE, NULL,
+ 		US_FL_SINGLE_LUN ),
+ 
+-#ifdef CONFIG_USB_STORAGE_SDDR09
+-UNUSUAL_DEV(  0x0436, 0x0005, 0x0100, 0x0100,
+-		"Microtech",
+-		"CameraMate (DPCM_USB)",
+- 		US_SC_SCSI, US_PR_DPCM_USB, NULL, 0 ),
+-#else
++#ifdef NO_SDDR09
+ UNUSUAL_DEV(  0x0436, 0x0005, 0x0100, 0x0100,
+ 		"Microtech",
+ 		"CameraMate",
+@@ -467,20 +467,7 @@ UNUSUAL_DEV(  0x04e6, 0x0002, 0x0100, 0x
+ 		US_SC_DEVICE, US_PR_DEVICE, usb_stor_euscsi_init, 
+ 		US_FL_SCM_MULT_TARG ),
+ 
+-#ifdef CONFIG_USB_STORAGE_SDDR09
+-UNUSUAL_DEV(  0x04e6, 0x0003, 0x0000, 0x9999,
+-		"Sandisk",
+-		"ImageMate SDDR09",
+-		US_SC_SCSI, US_PR_EUSB_SDDR09, usb_stor_sddr09_init,
+-		0),
+-
+-/* This entry is from Andries.Brouwer@cwi.nl */
+-UNUSUAL_DEV(  0x04e6, 0x0005, 0x0100, 0x0208,
+-		"SCM Microsystems",
+-		"eUSB SmartMedia / CompactFlash Adapter",
+-		US_SC_SCSI, US_PR_DPCM_USB, usb_stor_sddr09_dpcm_init,
+-		0),
+-#else
++#ifdef NO_SDDR09
+ UNUSUAL_DEV(  0x04e6, 0x0005, 0x0100, 0x0208,
+ 		"SCM Microsystems",
+ 		"eUSB CompactFlash Adapter",
+@@ -935,14 +922,6 @@ UNUSUAL_DEV(  0x0644, 0x0000, 0x0100, 0x
+ 		"Floppy Drive",
+ 		US_SC_UFI, US_PR_CB, NULL, 0 ),
+ 
+-#ifdef CONFIG_USB_STORAGE_SDDR09
+-UNUSUAL_DEV(  0x066b, 0x0105, 0x0100, 0x0100,
+-		"Olympus",
+-		"Camedia MAUSB-2",
+-		US_SC_SCSI, US_PR_EUSB_SDDR09, usb_stor_sddr09_init,
+-		0),
+-#endif
+-
+ /* Reported by Darsen Lu <darsen@micro.ee.nthu.edu.tw> */
+ UNUSUAL_DEV( 0x066f, 0x8000, 0x0001, 0x0001,
+ 		"SigmaTel",
+@@ -1055,14 +1034,6 @@ UNUSUAL_DEV(  0x0781, 0x0100, 0x0100, 0x
+ 		US_SC_SCSI, US_PR_CB, NULL,
+ 		US_FL_SINGLE_LUN ),
+ 
+-#ifdef CONFIG_USB_STORAGE_SDDR09
+-UNUSUAL_DEV(  0x0781, 0x0200, 0x0000, 0x9999,
+-		"Sandisk",
+-		"ImageMate SDDR-09",
+-		US_SC_SCSI, US_PR_EUSB_SDDR09, usb_stor_sddr09_init,
+-		0),
+-#endif
+-
+ #ifdef CONFIG_USB_STORAGE_FREECOM
+ UNUSUAL_DEV(  0x07ab, 0xfc01, 0x0000, 0x9999,
+ 		"Freecom",
+@@ -1089,12 +1060,7 @@ UNUSUAL_DEV(  0x07af, 0x0005, 0x0100, 0x
+ 		US_SC_DEVICE, US_PR_DEVICE, usb_stor_euscsi_init,
+ 		US_FL_SCM_MULT_TARG ),
+ 
+-#ifdef CONFIG_USB_STORAGE_SDDR09
+-UNUSUAL_DEV(  0x07af, 0x0006, 0x0100, 0x0100,
+-		"Microtech",
+-		"CameraMate (DPCM_USB)",
+- 		US_SC_SCSI, US_PR_DPCM_USB, NULL, 0 ),
+-#else
++#ifdef NO_SDDR09
+ UNUSUAL_DEV(  0x07af, 0x0006, 0x0100, 0x0100,
+ 		"Microtech",
+ 		"CameraMate",
+--- /dev/null
++++ b/drivers/usb/storage/unusual_sddr09.h
+@@ -0,0 +1,56 @@
++/* Unusual Devices File for SanDisk SDDR-09 SmartMedia reader
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2, or (at your option) any
++ * later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation, Inc.,
++ * 675 Mass Ave, Cambridge, MA 02139, USA.
++ */
++
++#if defined(CONFIG_USB_STORAGE_SDDR09) || \
++		defined(CONFIG_USB_STORAGE_SDDR09_MODULE)
++
++UNUSUAL_DEV(  0x0436, 0x0005, 0x0100, 0x0100,
++		"Microtech",
++		"CameraMate (DPCM_USB)",
++		US_SC_SCSI, US_PR_DPCM_USB, NULL, 0),
++
++UNUSUAL_DEV(  0x04e6, 0x0003, 0x0000, 0x9999,
++		"Sandisk",
++		"ImageMate SDDR09",
++		US_SC_SCSI, US_PR_EUSB_SDDR09, usb_stor_sddr09_init,
++		0),
++
++/* This entry is from Andries.Brouwer@cwi.nl */
++UNUSUAL_DEV(  0x04e6, 0x0005, 0x0100, 0x0208,
++		"SCM Microsystems",
++		"eUSB SmartMedia / CompactFlash Adapter",
++		US_SC_SCSI, US_PR_DPCM_USB, usb_stor_sddr09_dpcm_init,
++		0),
++
++UNUSUAL_DEV(  0x066b, 0x0105, 0x0100, 0x0100,
++		"Olympus",
++		"Camedia MAUSB-2",
++		US_SC_SCSI, US_PR_EUSB_SDDR09, usb_stor_sddr09_init,
++		0),
++
++UNUSUAL_DEV(  0x0781, 0x0200, 0x0000, 0x9999,
++		"Sandisk",
++		"ImageMate SDDR-09",
++		US_SC_SCSI, US_PR_EUSB_SDDR09, usb_stor_sddr09_init,
++		0),
++
++UNUSUAL_DEV(  0x07af, 0x0006, 0x0100, 0x0100,
++		"Microtech",
++		"CameraMate (DPCM_USB)",
++		US_SC_SCSI, US_PR_DPCM_USB, NULL, 0),
++
++#endif /* defined(CONFIG_USB_STORAGE_SDDR09) || ... */
+--- a/drivers/usb/storage/usb.c
++++ b/drivers/usb/storage/usb.c
+@@ -69,9 +69,6 @@
+ #ifdef CONFIG_USB_STORAGE_USBAT
+ #include "shuttle_usbat.h"
+ #endif
+-#ifdef CONFIG_USB_STORAGE_SDDR09
+-#include "sddr09.h"
+-#endif
+ #ifdef CONFIG_USB_STORAGE_SDDR55
+ #include "sddr55.h"
+ #endif
+@@ -631,15 +628,6 @@ static void get_transport(struct us_data
+ 		break;
+ #endif
+ 
+-#ifdef CONFIG_USB_STORAGE_SDDR09
+-	case US_PR_EUSB_SDDR09:
+-		us->transport_name = "EUSB/SDDR09";
+-		us->transport = sddr09_transport;
+-		us->transport_reset = usb_stor_CB_reset;
+-		us->max_lun = 0;
+-		break;
+-#endif
+-
+ #ifdef CONFIG_USB_STORAGE_SDDR55
+ 	case US_PR_SDDR55:
+ 		us->transport_name = "SDDR55";
+@@ -649,15 +637,6 @@ static void get_transport(struct us_data
+ 		break;
+ #endif
+ 
+-#ifdef CONFIG_USB_STORAGE_DPCM
+-	case US_PR_DPCM_USB:
+-		us->transport_name = "Control/Bulk-EUSB/SDDR09";
+-		us->transport = dpcm_transport;
+-		us->transport_reset = usb_stor_CB_reset;
+-		us->max_lun = 1;
+-		break;
+-#endif
+-
+ #ifdef CONFIG_USB_STORAGE_FREECOM
+ 	case US_PR_FREECOM:
+ 		us->transport_name = "Freecom";
+--- a/drivers/usb/storage/usual-tables.c
++++ b/drivers/usb/storage/usual-tables.c
+@@ -77,6 +77,7 @@ struct ignore_entry {
+ }
+ 
+ static struct ignore_entry ignore_ids[] = {
++#	include "unusual_sddr09.h"
+ 	{ }		/* Terminating entry */
+ };
+ 

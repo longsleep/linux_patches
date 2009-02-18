@@ -1,0 +1,819 @@
+From stern@rowland.harvard.edu  Tue Feb 17 18:49:16 2009
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Thu, 12 Feb 2009 14:47:44 -0500 (EST)
+Subject: usb-storage: prepare for subdriver separation
+To: Greg KH <greg@kroah.com>, Matthew Dharm <mdharm-usb@one-eyed-alien.net>
+Cc: USB Storage list <usb-storage@lists.one-eyed-alien.net>
+Message-ID: <Pine.LNX.4.44L0.0902121427400.3705-100000@iolanthe.rowland.org>
+
+
+This patch (as1206) is the first step in converting usb-storage's
+subdrivers into separate modules.  It makes the following large-scale
+changes:
+
+	Remove a bunch of unnecessary #ifdef's from usb_usual.h.
+	Not truly necessary, but it does clean things up.
+
+	Move the USB device-ID table (which is duplicated between
+	libusual and usb-storage) into its own source file,
+	usual-tables.c, and arrange for this to be linked with
+	either libusual or usb-storage according to whether
+	USB_LIBUSUAL is configured.
+
+	Add to usual-tables.c a new usb_usual_ignore_device()
+	function to detect whether a particular device needs to be
+	managed by a subdriver and not by the standard handlers
+	in usb-storage.
+
+	Export a whole bunch of functions in usb-storage, renaming
+	some of them because their names don't already begin with
+	"usb_stor_".  These functions will be needed by the new
+	subdriver modules.
+
+	Split usb-storage's probe routine into two functions.
+	The subdrivers will call the probe1 routine, then fill in
+	their transport and protocol settings, and then call the
+	probe2 routine.
+
+	Take the default cases and error checking out of
+	get_transport() and get_protocol(), which run during
+	probe1, and instead put a check for invalid transport
+	or protocol values into the probe2 function.
+
+	Add a new probe routine to be used for standard devices,
+	i.e., those that don't need a subdriver.  This new routine
+	checks whether the device should be ignored (because it
+	should be handled by ub or by a subdriver), and if not,
+	calls the probe1 and probe2 functions.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+CC: Matthew Dharm <mdharm-usb@one-eyed-alien.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/block/ub.c                 |    2 
+ drivers/usb/storage/Makefile       |    6 -
+ drivers/usb/storage/libusual.c     |   33 -----
+ drivers/usb/storage/protocol.c     |    3 
+ drivers/usb/storage/scsiglue.c     |    2 
+ drivers/usb/storage/transport.c    |   10 +
+ drivers/usb/storage/usb.c          |  209 +++++++++++++++++++------------------
+ drivers/usb/storage/usb.h          |   21 +++
+ drivers/usb/storage/usual-tables.c |  105 ++++++++++++++++++
+ include/linux/usb_usual.h          |   21 ---
+ 10 files changed, 261 insertions(+), 151 deletions(-)
+
+--- a/drivers/block/ub.c
++++ b/drivers/block/ub.c
+@@ -391,7 +391,7 @@ static int ub_probe_lun(struct ub_dev *s
+  */
+ #ifdef CONFIG_USB_LIBUSUAL
+ 
+-#define ub_usb_ids  storage_usb_ids
++#define ub_usb_ids  usb_storage_usb_ids
+ #else
+ 
+ static struct usb_device_id ub_usb_ids[] = {
+--- a/drivers/usb/storage/libusual.c
++++ b/drivers/usb/storage/libusual.c
+@@ -38,37 +38,6 @@ static atomic_t total_threads = ATOMIC_I
+ static int usu_probe_thread(void *arg);
+ 
+ /*
+- * The table.
+- */
+-#define UNUSUAL_DEV(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax, \
+-		    vendorName, productName,useProtocol, useTransport, \
+-		    initFunction, flags) \
+-{ USB_DEVICE_VER(id_vendor, id_product, bcdDeviceMin,bcdDeviceMax), \
+-  .driver_info = (flags)|(USB_US_TYPE_STOR<<24) }
+-
+-#define COMPLIANT_DEV(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax, \
+-		    vendorName, productName, useProtocol, useTransport, \
+-		    initFunction, flags) \
+-{ USB_DEVICE_VER(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax), \
+-  .driver_info = (flags) }
+-
+-#define USUAL_DEV(useProto, useTrans, useType) \
+-{ USB_INTERFACE_INFO(USB_CLASS_MASS_STORAGE, useProto, useTrans), \
+-  .driver_info = ((useType)<<24) }
+-
+-struct usb_device_id storage_usb_ids [] = {
+-#	include "unusual_devs.h"
+-	{ } /* Terminating entry */
+-};
+-
+-#undef USUAL_DEV
+-#undef UNUSUAL_DEV
+-#undef COMPLIANT_DEV
+-
+-MODULE_DEVICE_TABLE(usb, storage_usb_ids);
+-EXPORT_SYMBOL_GPL(storage_usb_ids);
+-
+-/*
+  * @type: the module type as an integer
+  */
+ void usb_usual_set_present(int type)
+@@ -167,7 +136,7 @@ static struct usb_driver usu_driver = {
+ 	.name =		"libusual",
+ 	.probe =	usu_probe,
+ 	.disconnect =	usu_disconnect,
+-	.id_table =	storage_usb_ids,
++	.id_table =	usb_storage_usb_ids,
+ };
+ 
+ /*
+--- a/drivers/usb/storage/Makefile
++++ b/drivers/usb/storage/Makefile
+@@ -25,6 +25,8 @@ usb-storage-obj-$(CONFIG_USB_STORAGE_CYP
+ usb-storage-objs :=	scsiglue.o protocol.o transport.o usb.o \
+ 			initializers.o sierra_ms.o option_ms.o $(usb-storage-obj-y)
+ 
+-ifneq ($(CONFIG_USB_LIBUSUAL),)
+-	obj-$(CONFIG_USB)	+= libusual.o
++ifeq ($(CONFIG_USB_LIBUSUAL),)
++	usb-storage-objs	+= usual-tables.o
++else
++	obj-$(CONFIG_USB)	+= libusual.o usual-tables.o
+ endif
+--- a/drivers/usb/storage/protocol.c
++++ b/drivers/usb/storage/protocol.c
+@@ -121,6 +121,7 @@ void usb_stor_transparent_scsi_command(s
+ 	/* send the command to the transport layer */
+ 	usb_stor_invoke_transport(srb, us);
+ }
++EXPORT_SYMBOL_GPL(usb_stor_transparent_scsi_command);
+ 
+ /***********************************************************************
+  * Scatter-gather transfer buffer access routines
+@@ -199,6 +200,7 @@ unsigned int usb_stor_access_xfer_buf(un
+ 	/* Return the amount actually transferred */
+ 	return cnt;
+ }
++EXPORT_SYMBOL_GPL(usb_stor_access_xfer_buf);
+ 
+ /* Store the contents of buffer into srb's transfer buffer and set the
+  * SCSI residue.
+@@ -215,3 +217,4 @@ void usb_stor_set_xfer_buf(unsigned char
+ 	if (buflen < scsi_bufflen(srb))
+ 		scsi_set_resid(srb, scsi_bufflen(srb) - buflen);
+ }
++EXPORT_SYMBOL_GPL(usb_stor_set_xfer_buf);
+--- a/drivers/usb/storage/scsiglue.c
++++ b/drivers/usb/storage/scsiglue.c
+@@ -563,4 +563,4 @@ unsigned char usb_stor_sense_invalidCDB[
+ 	[7]	= 0x0a,			    /* additional length */
+ 	[12]	= 0x24			    /* Invalid Field in CDB */
+ };
+-
++EXPORT_SYMBOL_GPL(usb_stor_sense_invalidCDB);
+--- a/drivers/usb/storage/transport.c
++++ b/drivers/usb/storage/transport.c
+@@ -220,6 +220,7 @@ int usb_stor_control_msg(struct us_data 
+ 		status = us->current_urb->actual_length;
+ 	return status;
+ }
++EXPORT_SYMBOL_GPL(usb_stor_control_msg);
+ 
+ /* This is a version of usb_clear_halt() that allows early termination and
+  * doesn't read the status from the device -- this is because some devices
+@@ -254,6 +255,7 @@ int usb_stor_clear_halt(struct us_data *
+ 	US_DEBUGP("%s: result = %d\n", __func__, result);
+ 	return result;
+ }
++EXPORT_SYMBOL_GPL(usb_stor_clear_halt);
+ 
+ 
+ /*
+@@ -352,6 +354,7 @@ int usb_stor_ctrl_transfer(struct us_dat
+ 	return interpret_urb_result(us, pipe, size, result,
+ 			us->current_urb->actual_length);
+ }
++EXPORT_SYMBOL_GPL(usb_stor_ctrl_transfer);
+ 
+ /*
+  * Receive one interrupt buffer, without timeouts, but allowing early
+@@ -407,6 +410,7 @@ int usb_stor_bulk_transfer_buf(struct us
+ 	return interpret_urb_result(us, pipe, length, result, 
+ 			us->current_urb->actual_length);
+ }
++EXPORT_SYMBOL_GPL(usb_stor_bulk_transfer_buf);
+ 
+ /*
+  * Transfer a scatter-gather list via bulk transfer
+@@ -474,6 +478,7 @@ int usb_stor_bulk_srb(struct us_data* us
+ 	scsi_set_resid(srb, scsi_bufflen(srb) - partial);
+ 	return result;
+ }
++EXPORT_SYMBOL_GPL(usb_stor_bulk_srb);
+ 
+ /*
+  * Transfer an entire SCSI command's worth of data payload over the bulk
+@@ -509,6 +514,7 @@ int usb_stor_bulk_transfer_sg(struct us_
+ 		*residual = length_left;
+ 	return result;
+ }
++EXPORT_SYMBOL_GPL(usb_stor_bulk_transfer_sg);
+ 
+ /***********************************************************************
+  * Transport routines
+@@ -940,6 +946,7 @@ int usb_stor_CB_transport(struct scsi_cm
+ 		usb_stor_clear_halt(us, pipe);
+ 	return USB_STOR_TRANSPORT_FAILED;
+ }
++EXPORT_SYMBOL_GPL(usb_stor_CB_transport);
+ 
+ /*
+  * Bulk only transport
+@@ -1156,6 +1163,7 @@ int usb_stor_Bulk_transport(struct scsi_
+ 	/* we should never get here, but if we do, we're in trouble */
+ 	return USB_STOR_TRANSPORT_ERROR;
+ }
++EXPORT_SYMBOL_GPL(usb_stor_Bulk_transport);
+ 
+ /***********************************************************************
+  * Reset routines
+@@ -1230,6 +1238,7 @@ int usb_stor_CB_reset(struct us_data *us
+ 				 USB_TYPE_CLASS | USB_RECIP_INTERFACE,
+ 				 0, us->ifnum, us->iobuf, CB_RESET_CMD_SIZE);
+ }
++EXPORT_SYMBOL_GPL(usb_stor_CB_reset);
+ 
+ /* This issues a Bulk-only Reset to the device in question, including
+  * clearing the subsequent endpoint halts that may occur.
+@@ -1242,6 +1251,7 @@ int usb_stor_Bulk_reset(struct us_data *
+ 				 USB_TYPE_CLASS | USB_RECIP_INTERFACE,
+ 				 0, us->ifnum, NULL, 0);
+ }
++EXPORT_SYMBOL_GPL(usb_stor_Bulk_reset);
+ 
+ /* Issue a USB port reset to the device.  The caller must not hold
+  * us->dev_mutex.
+--- a/drivers/usb/storage/usb.c
++++ b/drivers/usb/storage/usb.c
+@@ -5,7 +5,7 @@
+  *
+  * Developed with the assistance of:
+  *   (c) 2000 David L. Brown, Jr. (usb-storage@davidb.org)
+- *   (c) 2003 Alan Stern (stern@rowland.harvard.edu)
++ *   (c) 2003-2009 Alan Stern (stern@rowland.harvard.edu)
+  *
+  * Initial work by:
+  *   (c) 1999 Michael Gee (michael@linuxspecific.com)
+@@ -118,36 +118,8 @@ MODULE_PARM_DESC(quirks, "supplemental l
+ 
+ /*
+  * The entries in this table correspond, line for line,
+- * with the entries of us_unusual_dev_list[].
++ * with the entries in usb_storage_usb_ids[], defined in usual-tables.c.
+  */
+-#ifndef CONFIG_USB_LIBUSUAL
+-
+-#define UNUSUAL_DEV(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax, \
+-		    vendorName, productName,useProtocol, useTransport, \
+-		    initFunction, flags) \
+-{ USB_DEVICE_VER(id_vendor, id_product, bcdDeviceMin,bcdDeviceMax), \
+-  .driver_info = (flags)|(USB_US_TYPE_STOR<<24) }
+-
+-#define COMPLIANT_DEV	UNUSUAL_DEV
+-
+-#define USUAL_DEV(useProto, useTrans, useType) \
+-{ USB_INTERFACE_INFO(USB_CLASS_MASS_STORAGE, useProto, useTrans), \
+-  .driver_info = (USB_US_TYPE_STOR<<24) }
+-
+-static struct usb_device_id storage_usb_ids [] = {
+-
+-#	include "unusual_devs.h"
+-#undef UNUSUAL_DEV
+-#undef COMPLIANT_DEV
+-#undef USUAL_DEV
+-	/* Terminating entry */
+-	{ }
+-};
+-
+-MODULE_DEVICE_TABLE (usb, storage_usb_ids);
+-#endif /* CONFIG_USB_LIBUSUAL */
+-
+-/* This is the list of devices we recognize, along with their flag data */
+ 
+ /* The vendor name should be kept at eight characters or less, and
+  * the product name should be kept at 16 characters or less. If a device
+@@ -179,18 +151,17 @@ MODULE_DEVICE_TABLE (usb, storage_usb_id
+ 
+ static struct us_unusual_dev us_unusual_dev_list[] = {
+ #	include "unusual_devs.h" 
+-#	undef UNUSUAL_DEV
+-#	undef COMPLIANT_DEV
+-#	undef USUAL_DEV
+-
+-	/* Terminating entry */
+-	{ NULL }
++	{ }		/* Terminating entry */
+ };
+ 
++#undef UNUSUAL_DEV
++#undef COMPLIANT_DEV
++#undef USUAL_DEV
++
+ 
+ #ifdef CONFIG_PM	/* Minimal support for suspend and resume */
+ 
+-static int storage_suspend(struct usb_interface *iface, pm_message_t message)
++int usb_stor_suspend(struct usb_interface *iface, pm_message_t message)
+ {
+ 	struct us_data *us = usb_get_intfdata(iface);
+ 
+@@ -207,8 +178,9 @@ static int storage_suspend(struct usb_in
+ 	mutex_unlock(&us->dev_mutex);
+ 	return 0;
+ }
++EXPORT_SYMBOL_GPL(usb_stor_suspend);
+ 
+-static int storage_resume(struct usb_interface *iface)
++int usb_stor_resume(struct usb_interface *iface)
+ {
+ 	struct us_data *us = usb_get_intfdata(iface);
+ 
+@@ -221,8 +193,9 @@ static int storage_resume(struct usb_int
+ 	mutex_unlock(&us->dev_mutex);
+ 	return 0;
+ }
++EXPORT_SYMBOL_GPL(usb_stor_resume);
+ 
+-static int storage_reset_resume(struct usb_interface *iface)
++int usb_stor_reset_resume(struct usb_interface *iface)
+ {
+ 	struct us_data *us = usb_get_intfdata(iface);
+ 
+@@ -235,6 +208,7 @@ static int storage_reset_resume(struct u
+ 	 * the device */
+ 	return 0;
+ }
++EXPORT_SYMBOL_GPL(usb_stor_reset_resume);
+ 
+ #endif /* CONFIG_PM */
+ 
+@@ -243,7 +217,7 @@ static int storage_reset_resume(struct u
+  * a USB port reset, whether from this driver or a different one.
+  */
+ 
+-static int storage_pre_reset(struct usb_interface *iface)
++int usb_stor_pre_reset(struct usb_interface *iface)
+ {
+ 	struct us_data *us = usb_get_intfdata(iface);
+ 
+@@ -253,8 +227,9 @@ static int storage_pre_reset(struct usb_
+ 	mutex_lock(&us->dev_mutex);
+ 	return 0;
+ }
++EXPORT_SYMBOL_GPL(usb_stor_pre_reset);
+ 
+-static int storage_post_reset(struct usb_interface *iface)
++int usb_stor_post_reset(struct usb_interface *iface)
+ {
+ 	struct us_data *us = usb_get_intfdata(iface);
+ 
+@@ -269,6 +244,7 @@ static int storage_post_reset(struct usb
+ 	mutex_unlock(&us->dev_mutex);
+ 	return 0;
+ }
++EXPORT_SYMBOL_GPL(usb_stor_post_reset);
+ 
+ /*
+  * fill_inquiry_response takes an unsigned char array (which must
+@@ -311,6 +287,7 @@ void fill_inquiry_response(struct us_dat
+ 
+ 	usb_stor_set_xfer_buf(data, data_len, us->srb);
+ }
++EXPORT_SYMBOL_GPL(fill_inquiry_response);
+ 
+ static int usb_stor_control_thread(void * __us)
+ {
+@@ -551,20 +528,13 @@ static void adjust_quirks(struct us_data
+ 			vid, pid, f);
+ }
+ 
+-/* Find an unusual_dev descriptor (always succeeds in the current code) */
+-static struct us_unusual_dev *find_unusual(const struct usb_device_id *id)
+-{
+-	const int id_index = id - storage_usb_ids;
+-	return &us_unusual_dev_list[id_index];
+-}
+-
+ /* Get the unusual_devs entries and the string descriptors */
+-static int get_device_info(struct us_data *us, const struct usb_device_id *id)
++static int get_device_info(struct us_data *us, const struct usb_device_id *id,
++		struct us_unusual_dev *unusual_dev)
+ {
+ 	struct usb_device *dev = us->pusb_dev;
+ 	struct usb_interface_descriptor *idesc =
+ 		&us->pusb_intf->cur_altsetting->desc;
+-	struct us_unusual_dev *unusual_dev = find_unusual(id);
+ 
+ 	/* Store the entries */
+ 	us->unusual_dev = unusual_dev;
+@@ -629,7 +599,7 @@ static int get_device_info(struct us_dat
+ }
+ 
+ /* Get the transport settings */
+-static int get_transport(struct us_data *us)
++static void get_transport(struct us_data *us)
+ {
+ 	switch (us->protocol) {
+ 	case US_PR_CB:
+@@ -732,19 +702,11 @@ static int get_transport(struct us_data 
+ 		break;
+ #endif
+ 
+-	default:
+-		return -EIO;
+ 	}
+-	US_DEBUGP("Transport: %s\n", us->transport_name);
+-
+-	/* fix for single-lun devices */
+-	if (us->fflags & US_FL_SINGLE_LUN)
+-		us->max_lun = 0;
+-	return 0;
+ }
+ 
+ /* Get the protocol settings */
+-static int get_protocol(struct us_data *us)
++static void get_protocol(struct us_data *us)
+ {
+ 	switch (us->subclass) {
+ 	case US_SC_RBC:
+@@ -794,11 +756,7 @@ static int get_protocol(struct us_data *
+ 		break;
+ #endif
+ 
+-	default:
+-		return -EIO;
+ 	}
+-	US_DEBUGP("Protocol: %s\n", us->protocol_name);
+-	return 0;
+ }
+ 
+ /* Get the pipe settings */
+@@ -1012,17 +970,15 @@ static int usb_stor_scan_thread(void * _
+ }
+ 
+ 
+-/* Probe to see if we can drive a newly-connected USB device */
+-static int storage_probe(struct usb_interface *intf,
+-			 const struct usb_device_id *id)
++/* First part of general USB mass-storage probing */
++int usb_stor_probe1(struct us_data **pus,
++		struct usb_interface *intf,
++		const struct usb_device_id *id,
++		struct us_unusual_dev *unusual_dev)
+ {
+ 	struct Scsi_Host *host;
+ 	struct us_data *us;
+ 	int result;
+-	struct task_struct *th;
+-
+-	if (usb_usual_check_type(id, USB_US_TYPE_STOR))
+-		return -ENXIO;
+ 
+ 	US_DEBUGP("USB Mass Storage device detected\n");
+ 
+@@ -1041,7 +997,7 @@ static int storage_probe(struct usb_inte
+ 	 * Allow 16-byte CDBs and thus > 2TB
+ 	 */
+ 	host->max_cmd_len = 16;
+-	us = host_to_us(host);
++	*pus = us = host_to_us(host);
+ 	memset(us, 0, sizeof(struct us_data));
+ 	mutex_init(&(us->dev_mutex));
+ 	init_completion(&us->cmnd_ready);
+@@ -1054,24 +1010,46 @@ static int storage_probe(struct usb_inte
+ 	if (result)
+ 		goto BadDevice;
+ 
+-	/*
+-	 * Get the unusual_devs entries and the descriptors
+-	 *
+-	 * id_index is calculated in the declaration to be the index number
+-	 * of the match from the usb_device_id table, so we can find the
+-	 * corresponding entry in the private table.
+-	 */
+-	result = get_device_info(us, id);
++	/* Get the unusual_devs entries and the descriptors */
++	result = get_device_info(us, id, unusual_dev);
+ 	if (result)
+ 		goto BadDevice;
+ 
+-	/* Get the transport, protocol, and pipe settings */
+-	result = get_transport(us);
+-	if (result)
+-		goto BadDevice;
+-	result = get_protocol(us);
+-	if (result)
++	/* Get standard transport and protocol settings */
++	get_transport(us);
++	get_protocol(us);
++
++	/* Give the caller a chance to fill in specialized transport
++	 * or protocol settings.
++	 */
++	return 0;
++
++BadDevice:
++	US_DEBUGP("storage_probe() failed\n");
++	release_everything(us);
++	return result;
++}
++EXPORT_SYMBOL_GPL(usb_stor_probe1);
++
++/* Second part of general USB mass-storage probing */
++int usb_stor_probe2(struct us_data *us)
++{
++	struct task_struct *th;
++	int result;
++
++	/* Make sure the transport and protocol have both been set */
++	if (!us->transport || !us->proto_handler) {
++		result = -ENXIO;
+ 		goto BadDevice;
++	}
++	US_DEBUGP("Transport: %s\n", us->transport_name);
++	US_DEBUGP("Protocol: %s\n", us->protocol_name);
++
++	/* fix for single-lun devices */
++	if (us->fflags & US_FL_SINGLE_LUN)
++		us->max_lun = 0;
++
++	/* Find the endpoints and calculate pipe values */
+ 	result = get_pipes(us);
+ 	if (result)
+ 		goto BadDevice;
+@@ -1080,7 +1058,7 @@ static int storage_probe(struct usb_inte
+ 	result = usb_stor_acquire_resources(us);
+ 	if (result)
+ 		goto BadDevice;
+-	result = scsi_add_host(host, &intf->dev);
++	result = scsi_add_host(us_to_host(us), &us->pusb_intf->dev);
+ 	if (result) {
+ 		printk(KERN_WARNING USB_STORAGE
+ 			"Unable to add the scsi host\n");
+@@ -1108,9 +1086,10 @@ BadDevice:
+ 	release_everything(us);
+ 	return result;
+ }
++EXPORT_SYMBOL_GPL(usb_stor_probe2);
+ 
+-/* Handle a disconnect event from the USB core */
+-static void storage_disconnect(struct usb_interface *intf)
++/* Handle a USB mass-storage disconnect */
++void usb_stor_disconnect(struct usb_interface *intf)
+ {
+ 	struct us_data *us = usb_get_intfdata(intf);
+ 
+@@ -1118,6 +1097,42 @@ static void storage_disconnect(struct us
+ 	quiesce_and_remove_host(us);
+ 	release_everything(us);
+ }
++EXPORT_SYMBOL_GPL(usb_stor_disconnect);
++
++/* The main probe routine for standard devices */
++static int storage_probe(struct usb_interface *intf,
++			 const struct usb_device_id *id)
++{
++	struct us_data *us;
++	int result;
++
++	/*
++	 * If libusual is configured, let it decide whether a standard
++	 * device should be handled by usb-storage or by ub.
++	 * If the device isn't standard (is handled by a subdriver
++	 * module) then don't accept it.
++	 */
++	if (usb_usual_check_type(id, USB_US_TYPE_STOR) ||
++			usb_usual_ignore_device(intf))
++		return -ENXIO;
++
++	/*
++	 * Call the general probe procedures.
++	 *
++	 * The unusual_dev_list array is parallel to the usb_storage_usb_ids
++	 * table, so we use the index of the id entry to find the
++	 * corresponding unusual_devs entry.
++	 */
++	result = usb_stor_probe1(&us, intf, id,
++			(id - usb_storage_usb_ids) + us_unusual_dev_list);
++	if (result)
++		return result;
++
++	/* No special transport or protocol settings in the main module */
++
++	result = usb_stor_probe2(us);
++	return result;
++}
+ 
+ /***********************************************************************
+  * Initialization and registration
+@@ -1126,15 +1141,13 @@ static void storage_disconnect(struct us
+ static struct usb_driver usb_storage_driver = {
+ 	.name =		"usb-storage",
+ 	.probe =	storage_probe,
+-	.disconnect =	storage_disconnect,
+-#ifdef CONFIG_PM
+-	.suspend =	storage_suspend,
+-	.resume =	storage_resume,
+-	.reset_resume =	storage_reset_resume,
+-#endif
+-	.pre_reset =	storage_pre_reset,
+-	.post_reset =	storage_post_reset,
+-	.id_table =	storage_usb_ids,
++	.disconnect =	usb_stor_disconnect,
++	.suspend =	usb_stor_suspend,
++	.resume =	usb_stor_resume,
++	.reset_resume =	usb_stor_reset_resume,
++	.pre_reset =	usb_stor_pre_reset,
++	.post_reset =	usb_stor_post_reset,
++	.id_table =	usb_storage_usb_ids,
+ 	.soft_unbind =	1,
+ };
+ 
+--- a/drivers/usb/storage/usb.h
++++ b/drivers/usb/storage/usb.h
+@@ -177,4 +177,25 @@ extern void fill_inquiry_response(struct
+ #define scsi_unlock(host)	spin_unlock_irq(host->host_lock)
+ #define scsi_lock(host)		spin_lock_irq(host->host_lock)
+ 
++/* General routines provided by the usb-storage standard core */
++#ifdef CONFIG_PM
++extern int usb_stor_suspend(struct usb_interface *iface, pm_message_t message);
++extern int usb_stor_resume(struct usb_interface *iface);
++extern int usb_stor_reset_resume(struct usb_interface *iface);
++#else
++#define usb_stor_suspend	NULL
++#define usb_stor_resume		NULL
++#define usb_stor_reset_resume	NULL
++#endif
++
++extern int usb_stor_pre_reset(struct usb_interface *iface);
++extern int usb_stor_post_reset(struct usb_interface *iface);
++
++extern int usb_stor_probe1(struct us_data **pus,
++		struct usb_interface *intf,
++		const struct usb_device_id *id,
++		struct us_unusual_dev *unusual_dev);
++extern int usb_stor_probe2(struct us_data *us);
++extern void usb_stor_disconnect(struct usb_interface *intf);
++
+ #endif
+--- /dev/null
++++ b/drivers/usb/storage/usual-tables.c
+@@ -0,0 +1,105 @@
++/* Driver for USB Mass Storage devices
++ * Usual Tables File for usb-storage and libusual
++ *
++ * Copyright (C) 2009 Alan Stern (stern@rowland.harvard.edu)
++ *
++ * Please see http://www.one-eyed-alien.net/~mdharm/linux-usb for more
++ * information about this driver.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2, or (at your option) any
++ * later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation, Inc.,
++ * 675 Mass Ave, Cambridge, MA 02139, USA.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/usb.h>
++#include <linux/usb_usual.h>
++
++
++/*
++ * The table of devices
++ */
++#define UNUSUAL_DEV(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax, \
++		    vendorName, productName, useProtocol, useTransport, \
++		    initFunction, flags) \
++{ USB_DEVICE_VER(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax), \
++  .driver_info = (flags)|(USB_US_TYPE_STOR<<24) }
++
++#define COMPLIANT_DEV(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax, \
++		    vendorName, productName, useProtocol, useTransport, \
++		    initFunction, flags) \
++{ USB_DEVICE_VER(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax), \
++  .driver_info = (flags) }
++
++#define USUAL_DEV(useProto, useTrans, useType) \
++{ USB_INTERFACE_INFO(USB_CLASS_MASS_STORAGE, useProto, useTrans), \
++  .driver_info = ((useType)<<24) }
++
++struct usb_device_id usb_storage_usb_ids[] = {
++#	include "unusual_devs.h"
++	{ }		/* Terminating entry */
++};
++EXPORT_SYMBOL_GPL(usb_storage_usb_ids);
++
++MODULE_DEVICE_TABLE(usb, usb_storage_usb_ids);
++
++#undef UNUSUAL_DEV
++#undef COMPLIANT_DEV
++#undef USUAL_DEV
++
++
++/*
++ * The table of devices to ignore
++ */
++struct ignore_entry {
++	u16	vid, pid, bcdmin, bcdmax;
++};
++
++#define UNUSUAL_DEV(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax, \
++		    vendorName, productName, useProtocol, useTransport, \
++		    initFunction, flags) \
++{					\
++	.vid	= id_vendor,		\
++	.pid 	= id_product,		\
++	.bcdmin	= bcdDeviceMin,		\
++	.bcdmax = bcdDeviceMax,		\
++}
++
++static struct ignore_entry ignore_ids[] = {
++	{ }		/* Terminating entry */
++};
++
++#undef UNUSUAL_DEV
++
++
++/* Return an error if a device is in the ignore_ids list */
++int usb_usual_ignore_device(struct usb_interface *intf)
++{
++	struct usb_device *udev;
++	unsigned vid, pid, bcd;
++	struct ignore_entry *p;
++
++	udev = interface_to_usbdev(intf);
++	vid = le16_to_cpu(udev->descriptor.idVendor);
++	pid = le16_to_cpu(udev->descriptor.idProduct);
++	bcd = le16_to_cpu(udev->descriptor.bcdDevice);
++
++	for (p = ignore_ids; p->vid; ++p) {
++		if (p->vid == vid && p->pid == pid &&
++				p->bcdmin <= bcd && p->bcdmax >= bcd)
++			return -ENXIO;
++	}
++	return 0;
++}
++EXPORT_SYMBOL_GPL(usb_usual_ignore_device);
+--- a/include/linux/usb_usual.h
++++ b/include/linux/usb_usual.h
+@@ -96,39 +96,26 @@ enum { US_DO_ALL_FLAGS };
+ #define US_PR_CBI	0x00		/* Control/Bulk/Interrupt */
+ #define US_PR_CB	0x01		/* Control/Bulk w/o interrupt */
+ #define US_PR_BULK	0x50		/* bulk only */
+-#ifdef CONFIG_USB_STORAGE_USBAT
++
+ #define US_PR_USBAT	0x80		/* SCM-ATAPI bridge */
+-#endif
+-#ifdef CONFIG_USB_STORAGE_SDDR09
+ #define US_PR_EUSB_SDDR09	0x81	/* SCM-SCSI bridge for SDDR-09 */
+-#endif
+-#ifdef CONFIG_USB_STORAGE_SDDR55
+ #define US_PR_SDDR55	0x82		/* SDDR-55 (made up) */
+-#endif
+ #define US_PR_DPCM_USB  0xf0		/* Combination CB/SDDR09 */
+-#ifdef CONFIG_USB_STORAGE_FREECOM
+ #define US_PR_FREECOM   0xf1		/* Freecom */
+-#endif
+-#ifdef CONFIG_USB_STORAGE_DATAFAB
+ #define US_PR_DATAFAB   0xf2		/* Datafab chipsets */
+-#endif
+-#ifdef CONFIG_USB_STORAGE_JUMPSHOT
+ #define US_PR_JUMPSHOT  0xf3		/* Lexar Jumpshot */
+-#endif
+-#ifdef CONFIG_USB_STORAGE_ALAUDA
+ #define US_PR_ALAUDA    0xf4		/* Alauda chipsets */
+-#endif
+-#ifdef CONFIG_USB_STORAGE_KARMA
+ #define US_PR_KARMA     0xf5		/* Rio Karma */
+-#endif
+ 
+ #define US_PR_DEVICE	0xff		/* Use device's value */
+ 
+ /*
+  */
++extern int usb_usual_ignore_device(struct usb_interface *intf);
++extern struct usb_device_id usb_storage_usb_ids[];
++
+ #ifdef CONFIG_USB_LIBUSUAL
+ 
+-extern struct usb_device_id storage_usb_ids[];
+ extern void usb_usual_set_present(int type);
+ extern void usb_usual_clear_present(int type);
+ extern int usb_usual_check_type(const struct usb_device_id *, int type);
