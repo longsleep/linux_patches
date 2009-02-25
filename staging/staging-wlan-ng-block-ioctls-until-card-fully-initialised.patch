@@ -1,0 +1,98 @@
+From richard@rsk.demon.co.uk  Tue Feb 24 22:33:31 2009
+From: Richard Kennedy <richard@rsk.demon.co.uk>
+Date: Fri, 20 Feb 2009 12:09:12 +0000
+Subject: Staging: wlan-ng: block ioctls until card fully initialised
+To: Greg KH <greg@kroah.com>
+Cc: Karl Relton <karllinuxtest.relton@ntlworld.com>
+Message-ID: <1235131752.2822.7.camel@localhost.localdomain>
+
+
+Add a mutex to block ioctls before the card is fully initialised and
+only allow one ioctl at a time.
+This stops udev trying to load the firmware before to card is fully up.
+
+patch ported from wlan-ng-devel
+
+Karl Relton <karllinuxtest.relton@ntlworld.com> spotted that this was
+missing from the staging version,
+http://lists.linux-wlan.com/pipermail/linux-wlan-devel/2009-February/003890.html
+
+Signed-off-by: Richard Kennedy <richard@rsk.demon.co.uk>
+Cc: Karl Relton <karllinuxtest.relton@ntlworld.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/staging/wlan-ng/p80211netdev.c |   14 ++++++++++++++
+ drivers/staging/wlan-ng/p80211netdev.h |    4 +++-
+ drivers/staging/wlan-ng/prism2usb.c    |    1 +
+ 3 files changed, 18 insertions(+), 1 deletion(-)
+
+--- a/drivers/staging/wlan-ng/p80211netdev.c
++++ b/drivers/staging/wlan-ng/p80211netdev.c
+@@ -563,6 +563,8 @@ static int p80211knetdev_do_ioctl(netdev
+ 
+ 	pr_debug("rx'd ioctl, cmd=%d, len=%d\n", cmd, req->len);
+ 
++	mutex_lock(&wlandev->ioctl_lock);
++
+ #ifdef SIOCETHTOOL
+ 	if (cmd == SIOCETHTOOL) {
+ 		result =
+@@ -603,6 +605,8 @@ static int p80211knetdev_do_ioctl(netdev
+ 		result = -ENOMEM;
+ 	}
+ bail:
++	mutex_unlock(&wlandev->ioctl_lock);
++
+ 	return result;		/* If allocate,copyfrom or copyto fails, return errno */
+ }
+ 
+@@ -754,6 +758,11 @@ int wlan_setup(wlandevice_t *wlandev)
+ 		dev->open = p80211knetdev_open;
+ 		dev->stop = p80211knetdev_stop;
+ 
++		mutex_init(&wlandev->ioctl_lock);
++		/* block ioctls until fully initialised. Don't forget to call
++		   allow_ioctls at some point!*/
++		mutex_lock(&wlandev->ioctl_lock);
++
+ #if (WIRELESS_EXT < 21)
+ 		dev->get_wireless_stats = p80211wext_get_wireless_stats;
+ #endif
+@@ -1094,3 +1103,8 @@ static void p80211knetdev_tx_timeout(net
+ 		netif_wake_queue(wlandev->netdev);
+ 	}
+ }
++
++void p80211_allow_ioctls(wlandevice_t *wlandev)
++{
++	mutex_unlock(&wlandev->ioctl_lock);
++}
+--- a/drivers/staging/wlan-ng/p80211netdev.h
++++ b/drivers/staging/wlan-ng/p80211netdev.h
+@@ -227,6 +227,8 @@ typedef struct wlandevice {
+ 	u8 spy_number;
+ 	char spy_address[IW_MAX_SPY][ETH_ALEN];
+ 	struct iw_quality spy_stat[IW_MAX_SPY];
++
++	struct mutex ioctl_lock;
+ } wlandevice_t;
+ 
+ /* WEP stuff */
+@@ -242,5 +244,5 @@ int register_wlandev(wlandevice_t *wland
+ int unregister_wlandev(wlandevice_t *wlandev);
+ void p80211netdev_rx(wlandevice_t *wlandev, struct sk_buff *skb);
+ void p80211netdev_hwremoved(wlandevice_t *wlandev);
+-
++void p80211_allow_ioctls(wlandevice_t *wlandev);
+ #endif
+--- a/drivers/staging/wlan-ng/prism2usb.c
++++ b/drivers/staging/wlan-ng/prism2usb.c
+@@ -170,6 +170,7 @@ failed:
+ 	wlandev = NULL;
+ 
+ done:
++	p80211_allow_ioctls(wlandev);
+ 	usb_set_intfdata(interface, wlandev);
+ 	return result;
+ }
