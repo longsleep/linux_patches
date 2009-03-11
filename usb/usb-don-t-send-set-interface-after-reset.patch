@@ -1,0 +1,83 @@
+From stern+49a57ae6@rowland.harvard.edu  Tue Mar 10 21:02:40 2009
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Thu, 26 Feb 2009 10:21:02 -0500 (EST)
+Subject: USB: don't send Set-Interface after reset
+To: Greg KH <greg@kroah.com>
+Message-ID: <Pine.LNX.4.44L0.0902261016550.2880-100000@iolanthe.rowland.org>
+
+
+This patch (as1221) changes the way usbcore reinitializes a device
+following a reset or a reset-resume.  Currently we call
+usb_set_interface() for every interface in the active configuration;
+this is to put the interface into the same altsetting as before the
+reset and to make sure that the host's endpoint state matches the
+device's endpoint state.
+
+However, sending a Set-Interface request is a waste of time if an
+interface was already in altsetting 0 before the reset, since it is
+certainly in altsetting 0 afterward.  In addition, many devices can't
+handle Set-Interface requests -- they crash when they receive them.
+
+So instead, the patch adds code to check each interface.  If the
+interface wasn't in altsetting 0 before the reset, we go head with the
+Set-Interface request as before.  But if it was then we skip sending
+the Set-Interface request, and we clear out the host-side endpoint
+state by calling usb_disable_interface() followed by
+usb_enable_interface().
+
+The patch also adds a couple of new comments to explain what's going
+on.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/hub.c |   23 ++++++++++++++++-------
+ 1 file changed, 16 insertions(+), 7 deletions(-)
+
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -3393,10 +3393,10 @@ static int usb_reset_and_verify_device(s
+ 		udev->descriptor = descriptor;	/* for disconnect() calls */
+ 		goto re_enumerate;
+   	}
+-  
++
++	/* Restore the device's previous configuration */
+ 	if (!udev->actconfig)
+ 		goto done;
+-
+ 	ret = usb_control_msg(udev, usb_sndctrlpipe(udev, 0),
+ 			USB_REQ_SET_CONFIGURATION, 0,
+ 			udev->actconfig->desc.bConfigurationValue, 0,
+@@ -3409,16 +3409,25 @@ static int usb_reset_and_verify_device(s
+   	}
+ 	usb_set_device_state(udev, USB_STATE_CONFIGURED);
+ 
++	/* Put interfaces back into the same altsettings as before.
++	 * Don't bother to send the Set-Interface request for interfaces
++	 * that were already in altsetting 0; besides being unnecessary,
++	 * many devices can't handle it.  Instead just reset the host-side
++	 * endpoint state.
++	 */
+ 	for (i = 0; i < udev->actconfig->desc.bNumInterfaces; i++) {
+ 		struct usb_interface *intf = udev->actconfig->interface[i];
+ 		struct usb_interface_descriptor *desc;
+ 
+-		/* set_interface resets host side toggle even
+-		 * for altsetting zero.  the interface may have no driver.
+-		 */
+ 		desc = &intf->cur_altsetting->desc;
+-		ret = usb_set_interface(udev, desc->bInterfaceNumber,
+-			desc->bAlternateSetting);
++		if (desc->bAlternateSetting == 0) {
++			usb_disable_interface(udev, intf, true);
++			usb_enable_interface(udev, intf, true);
++			ret = 0;
++		} else {
++			ret = usb_set_interface(udev, desc->bInterfaceNumber,
++					desc->bAlternateSetting);
++		}
+ 		if (ret < 0) {
+ 			dev_err(&udev->dev, "failed to restore interface %d "
+ 				"altsetting %d (error=%d)\n",
