@@ -1,0 +1,172 @@
+From roel.kluin@gmail.com  Tue Mar 17 15:59:32 2009
+From: Roel Kluin <roel.kluin@gmail.com>
+Date: Fri, 13 Mar 2009 12:19:18 +0100
+Subject: USB: more u32 conversion after transfer_buffer_length and actual_length
+To: Alan Stern <stern@rowland.harvard.edu>
+Cc: Greg KH <greg@kroah.com>, avorontsov@ru.mvista.com, Andrew Morton <akpm@linux-foundation.org>
+Message-ID: <49BA4136.7010601@gmail.com>
+
+
+transfer_buffer_length and actual_length have become unsigned, therefore some
+additional conversion of local variables, function arguments and print
+specifications is desired.
+
+A test for a negative urb->transfer_buffer_length became obsolete; instead
+we ensure that it does not exceed INT_MAX. Also, urb->actual_length is always
+less than urb->transfer_buffer_length.
+
+rh_string() does no longer return -EPIPE in the case of an unsupported ID.
+Instead its only caller, rh_call_control() does the check.
+
+Signed-off-by: Roel Kluin <roel.kluin@gmail.com>
+Acked-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/devio.c   |    6 +++---
+ drivers/usb/core/hcd.c     |   31 ++++++++++++-------------------
+ drivers/usb/core/hub.c     |    2 +-
+ drivers/usb/core/message.c |    2 +-
+ drivers/usb/core/urb.c     |    2 +-
+ 5 files changed, 18 insertions(+), 25 deletions(-)
+
+--- a/drivers/usb/core/devio.c
++++ b/drivers/usb/core/devio.c
+@@ -302,7 +302,7 @@ static struct async *async_getpending(st
+ 
+ static void snoop_urb(struct urb *urb, void __user *userurb)
+ {
+-	int j;
++	unsigned j;
+ 	unsigned char *data = urb->transfer_buffer;
+ 
+ 	if (!usbfs_snoop)
+@@ -311,9 +311,9 @@ static void snoop_urb(struct urb *urb, v
+ 	dev_info(&urb->dev->dev, "direction=%s\n",
+ 			usb_urb_dir_in(urb) ? "IN" : "OUT");
+ 	dev_info(&urb->dev->dev, "userurb=%p\n", userurb);
+-	dev_info(&urb->dev->dev, "transfer_buffer_length=%d\n",
++	dev_info(&urb->dev->dev, "transfer_buffer_length=%u\n",
+ 		 urb->transfer_buffer_length);
+-	dev_info(&urb->dev->dev, "actual_length=%d\n", urb->actual_length);
++	dev_info(&urb->dev->dev, "actual_length=%u\n", urb->actual_length);
+ 	dev_info(&urb->dev->dev, "data: ");
+ 	for (j = 0; j < urb->transfer_buffer_length; ++j)
+ 		printk("%02x ", data[j]);
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -279,9 +279,9 @@ static const u8 hs_rh_config_descriptor 
+  * helper routine for returning string descriptors in UTF-16LE
+  * input can actually be ISO-8859-1; ASCII is its 7-bit subset
+  */
+-static int ascii2utf (char *s, u8 *utf, int utfmax)
++static unsigned ascii2utf(char *s, u8 *utf, int utfmax)
+ {
+-	int retval;
++	unsigned retval;
+ 
+ 	for (retval = 0; *s && utfmax > 1; utfmax -= 2, retval += 2) {
+ 		*utf++ = *s++;
+@@ -304,19 +304,15 @@ static int ascii2utf (char *s, u8 *utf, 
+  * Produces either a manufacturer, product or serial number string for the
+  * virtual root hub device.
+  */
+-static int rh_string (
+-	int		id,
+-	struct usb_hcd	*hcd,
+-	u8		*data,
+-	int		len
+-) {
++static unsigned rh_string(int id, struct usb_hcd *hcd, u8 *data, unsigned len)
++{
+ 	char buf [100];
+ 
+ 	// language ids
+ 	if (id == 0) {
+ 		buf[0] = 4;    buf[1] = 3;	/* 4 bytes string data */
+ 		buf[2] = 0x09; buf[3] = 0x04;	/* MSFT-speak for "en-us" */
+-		len = min (len, 4);
++		len = min_t(unsigned, len, 4);
+ 		memcpy (data, buf, len);
+ 		return len;
+ 
+@@ -332,10 +328,7 @@ static int rh_string (
+ 	} else if (id == 3) {
+ 		snprintf (buf, sizeof buf, "%s %s %s", init_utsname()->sysname,
+ 			init_utsname()->release, hcd->driver->description);
+-
+-	// unsupported IDs --> "protocol stall"
+-	} else
+-		return -EPIPE;
++	}
+ 
+ 	switch (len) {		/* All cases fall through */
+ 	default:
+@@ -360,9 +353,8 @@ static int rh_call_control (struct usb_h
+ 	u8		tbuf [sizeof (struct usb_hub_descriptor)]
+ 		__attribute__((aligned(4)));
+ 	const u8	*bufp = tbuf;
+-	int		len = 0;
++	unsigned	len = 0;
+ 	int		status;
+-	int		n;
+ 	u8		patch_wakeup = 0;
+ 	u8		patch_protocol = 0;
+ 
+@@ -456,10 +448,11 @@ static int rh_call_control (struct usb_h
+ 				patch_wakeup = 1;
+ 			break;
+ 		case USB_DT_STRING << 8:
+-			n = rh_string (wValue & 0xff, hcd, ubuf, wLength);
+-			if (n < 0)
++			if ((wValue & 0xff) < 4)
++				urb->actual_length = rh_string(wValue & 0xff,
++						hcd, ubuf, wLength);
++			else /* unsupported IDs --> "protocol stall" */
+ 				goto error;
+-			urb->actual_length = n;
+ 			break;
+ 		default:
+ 			goto error;
+@@ -629,7 +622,7 @@ static int rh_queue_status (struct usb_h
+ {
+ 	int		retval;
+ 	unsigned long	flags;
+-	int		len = 1 + (urb->dev->maxchild / 8);
++	unsigned	len = 1 + (urb->dev->maxchild / 8);
+ 
+ 	spin_lock_irqsave (&hcd_root_hub_lock, flags);
+ 	if (hcd->status_urb || urb->transfer_buffer_length < len) {
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -392,7 +392,7 @@ static void hub_irq(struct urb *urb)
+ {
+ 	struct usb_hub *hub = urb->context;
+ 	int status = urb->status;
+-	int i;
++	unsigned i;
+ 	unsigned long bits;
+ 
+ 	switch (status) {
+--- a/drivers/usb/core/message.c
++++ b/drivers/usb/core/message.c
+@@ -59,7 +59,7 @@ static int usb_start_wait_urb(struct urb
+ 		retval = (ctx.status == -ENOENT ? -ETIMEDOUT : ctx.status);
+ 
+ 		dev_dbg(&urb->dev->dev,
+-			"%s timed out on ep%d%s len=%d/%d\n",
++			"%s timed out on ep%d%s len=%u/%u\n",
+ 			current->comm,
+ 			usb_endpoint_num(&urb->ep->desc),
+ 			usb_urb_dir_in(urb) ? "in" : "out",
+--- a/drivers/usb/core/urb.c
++++ b/drivers/usb/core/urb.c
+@@ -370,7 +370,7 @@ int usb_submit_urb(struct urb *urb, gfp_
+ 	}
+ 
+ 	/* the I/O buffer must be mapped/unmapped, except when length=0 */
+-	if (urb->transfer_buffer_length < 0)
++	if (urb->transfer_buffer_length > INT_MAX)
+ 		return -EMSGSIZE;
+ 
+ #ifdef DEBUG
