@@ -1,0 +1,184 @@
+From david-b@pacbell.net  Thu Apr 16 10:26:09 2009
+From: Ajay Kumar Gupta <ajay.gupta@ti.com>
+Date: Fri, 3 Apr 2009 16:16:17 -0700
+Subject: musb: add high bandwidth ISO support
+To: Greg KH <greg@kroah.com>
+Cc: Ajay Kumar Gupta <ajay.gupta@ti.com>, felipe.balbi@nokia.com
+Message-ID: <200904031616.18127.david-b@pacbell.net>
+Content-Disposition: inline
+
+
+From: Ajay Kumar Gupta <ajay.gupta@ti.com>
+
+Tested on OMAP3 host side with Creative (Live! Cam Optia) USB camera
+which uses high bandwidth isochronous IN endpoints.  FIFO mode 4 is
+updated to provide the needed 4K endpoint buffer without breaking
+the g_nokia composite gadget configuration.  (This is the only
+gadget driver known to use enough endpoints to notice the change.)
+
+Signed-off-by: Ajay Kumar Gupta <ajay.gupta@ti.com>
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+
+---
+ drivers/usb/musb/musb_core.c |   19 ++++++++---------
+ drivers/usb/musb/musb_core.h |    3 ++
+ drivers/usb/musb/musb_host.c |   47 ++++++++++++++++++++++++++++++++-----------
+ drivers/usb/musb/musb_host.h |    1 
+ 4 files changed, 48 insertions(+), 22 deletions(-)
+
+--- a/drivers/usb/musb/musb_core.c
++++ b/drivers/usb/musb/musb_core.c
+@@ -1084,14 +1084,13 @@ static struct fifo_cfg __initdata mode_4
+ { .hw_ep_num =  8, .style = FIFO_RX,   .maxpacket = 512, },
+ { .hw_ep_num =  9, .style = FIFO_TX,   .maxpacket = 512, },
+ { .hw_ep_num =  9, .style = FIFO_RX,   .maxpacket = 512, },
+-{ .hw_ep_num = 10, .style = FIFO_TX,   .maxpacket = 512, },
+-{ .hw_ep_num = 10, .style = FIFO_RX,   .maxpacket = 512, },
+-{ .hw_ep_num = 11, .style = FIFO_TX,   .maxpacket = 512, },
+-{ .hw_ep_num = 11, .style = FIFO_RX,   .maxpacket = 512, },
+-{ .hw_ep_num = 12, .style = FIFO_TX,   .maxpacket = 512, },
+-{ .hw_ep_num = 12, .style = FIFO_RX,   .maxpacket = 512, },
+-{ .hw_ep_num = 13, .style = FIFO_TX,   .maxpacket = 512, },
+-{ .hw_ep_num = 13, .style = FIFO_RX,   .maxpacket = 512, },
++{ .hw_ep_num = 10, .style = FIFO_TX,   .maxpacket = 256, },
++{ .hw_ep_num = 10, .style = FIFO_RX,   .maxpacket = 64, },
++{ .hw_ep_num = 11, .style = FIFO_TX,   .maxpacket = 256, },
++{ .hw_ep_num = 11, .style = FIFO_RX,   .maxpacket = 64, },
++{ .hw_ep_num = 12, .style = FIFO_TX,   .maxpacket = 256, },
++{ .hw_ep_num = 12, .style = FIFO_RX,   .maxpacket = 64, },
++{ .hw_ep_num = 13, .style = FIFO_RXTX, .maxpacket = 4096, },
+ { .hw_ep_num = 14, .style = FIFO_RXTX, .maxpacket = 1024, },
+ { .hw_ep_num = 15, .style = FIFO_RXTX, .maxpacket = 1024, },
+ };
+@@ -1351,11 +1350,11 @@ static int __init musb_core_init(u16 mus
+ 	}
+ 	if (reg & MUSB_CONFIGDATA_HBRXE) {
+ 		strcat(aInfo, ", HB-ISO Rx");
+-		strcat(aInfo, " (X)");		/* no driver support */
++		musb->hb_iso_rx = true;
+ 	}
+ 	if (reg & MUSB_CONFIGDATA_HBTXE) {
+ 		strcat(aInfo, ", HB-ISO Tx");
+-		strcat(aInfo, " (X)");		/* no driver support */
++		musb->hb_iso_tx = true;
+ 	}
+ 	if (reg & MUSB_CONFIGDATA_SOFTCONE)
+ 		strcat(aInfo, ", SoftConn");
+--- a/drivers/usb/musb/musb_core.h
++++ b/drivers/usb/musb/musb_core.h
+@@ -395,6 +395,9 @@ struct musb {
+ 	unsigned is_multipoint:1;
+ 	unsigned ignore_disconnect:1;	/* during bus resets */
+ 
++	unsigned		hb_iso_rx:1;	/* high bandwidth iso rx? */
++	unsigned		hb_iso_tx:1;	/* high bandwidth iso tx? */
++
+ #ifdef C_MP_TX
+ 	unsigned bulk_split:1;
+ #define	can_bulk_split(musb,type) \
+--- a/drivers/usb/musb/musb_host.c
++++ b/drivers/usb/musb/musb_host.c
+@@ -605,7 +605,8 @@ musb_rx_reinit(struct musb *musb, struct
+ 	musb_writeb(ep->regs, MUSB_RXTYPE, qh->type_reg);
+ 	musb_writeb(ep->regs, MUSB_RXINTERVAL, qh->intv_reg);
+ 	/* NOTE: bulk combining rewrites high bits of maxpacket */
+-	musb_writew(ep->regs, MUSB_RXMAXP, qh->maxpacket);
++	musb_writew(ep->regs, MUSB_RXMAXP,
++			qh->maxpacket | ((qh->hb_mult - 1) << 11));
+ 
+ 	ep->rx_reinit = 0;
+ }
+@@ -627,9 +628,10 @@ static bool musb_tx_dma_program(struct d
+ 	csr = musb_readw(epio, MUSB_TXCSR);
+ 	if (length > pkt_size) {
+ 		mode = 1;
+-		csr |= MUSB_TXCSR_AUTOSET
+-			| MUSB_TXCSR_DMAMODE
+-			| MUSB_TXCSR_DMAENAB;
++		csr |= MUSB_TXCSR_DMAMODE | MUSB_TXCSR_DMAENAB;
++		/* autoset shouldn't be set in high bandwidth */
++		if (qh->hb_mult == 1)
++			csr |= MUSB_TXCSR_AUTOSET;
+ 	} else {
+ 		mode = 0;
+ 		csr &= ~(MUSB_TXCSR_AUTOSET | MUSB_TXCSR_DMAMODE);
+@@ -1497,6 +1499,10 @@ void musb_host_rx(struct musb *musb, u8 
+ 			/* packet error reported later */
+ 			iso_err = true;
+ 		}
++	} else if (rx_csr & MUSB_RXCSR_INCOMPRX) {
++		DBG(3, "end %d high bandwidth incomplete ISO packet RX\n",
++				epnum);
++		status = -EPROTO;
+ 	}
+ 
+ 	/* faults abort the transfer */
+@@ -1704,7 +1710,11 @@ void musb_host_rx(struct musb *musb, u8 
+ 				val &= ~MUSB_RXCSR_H_AUTOREQ;
+ 			else
+ 				val |= MUSB_RXCSR_H_AUTOREQ;
+-			val |= MUSB_RXCSR_AUTOCLEAR | MUSB_RXCSR_DMAENAB;
++			val |= MUSB_RXCSR_DMAENAB;
++
++			/* autoclear shouldn't be set in high bandwidth */
++			if (qh->hb_mult == 1)
++				val |= MUSB_RXCSR_AUTOCLEAR;
+ 
+ 			musb_writew(epio, MUSB_RXCSR,
+ 				MUSB_RXCSR_H_WZC_BITS | val);
+@@ -1790,9 +1800,10 @@ static int musb_schedule(
+ 			continue;
+ 
+ 		if (is_in)
+-			diff = hw_ep->max_packet_sz_rx - qh->maxpacket;
++			diff = hw_ep->max_packet_sz_rx;
+ 		else
+-			diff = hw_ep->max_packet_sz_tx - qh->maxpacket;
++			diff = hw_ep->max_packet_sz_tx;
++		diff -= (qh->maxpacket * qh->hb_mult);
+ 
+ 		if (diff >= 0 && best_diff > diff) {
+ 			best_diff = diff;
+@@ -1895,15 +1906,27 @@ static int musb_urb_enqueue(
+ 	qh->is_ready = 1;
+ 
+ 	qh->maxpacket = le16_to_cpu(epd->wMaxPacketSize);
++	qh->type = usb_endpoint_type(epd);
+ 
+-	/* no high bandwidth support yet */
+-	if (qh->maxpacket & ~0x7ff) {
+-		ret = -EMSGSIZE;
+-		goto done;
++	/* Bits 11 & 12 of wMaxPacketSize encode high bandwidth multiplier.
++	 * Some musb cores don't support high bandwidth ISO transfers; and
++	 * we don't (yet!) support high bandwidth interrupt transfers.
++	 */
++	qh->hb_mult = 1 + ((qh->maxpacket >> 11) & 0x03);
++	if (qh->hb_mult > 1) {
++		int ok = (qh->type == USB_ENDPOINT_XFER_ISOC);
++
++		if (ok)
++			ok = (usb_pipein(urb->pipe) && musb->hb_iso_rx)
++				|| (usb_pipeout(urb->pipe) && musb->hb_iso_tx);
++		if (!ok) {
++			ret = -EMSGSIZE;
++			goto done;
++		}
++		qh->maxpacket &= 0x7ff;
+ 	}
+ 
+ 	qh->epnum = usb_endpoint_num(epd);
+-	qh->type = usb_endpoint_type(epd);
+ 
+ 	/* NOTE: urb->dev->devnum is wrong during SET_ADDRESS */
+ 	qh->addr_reg = (u8) usb_pipedevice(urb->pipe);
+--- a/drivers/usb/musb/musb_host.h
++++ b/drivers/usb/musb/musb_host.h
+@@ -67,6 +67,7 @@ struct musb_qh {
+ 	u8			is_ready;	/* safe to modify hw_ep */
+ 	u8			type;		/* XFERTYPE_* */
+ 	u8			epnum;
++	u8			hb_mult;	/* high bandwidth pkts per uf */
+ 	u16			maxpacket;
+ 	u16			frame;		/* for periodic schedule */
+ 	unsigned		iso_idx;	/* in urb->iso_frame_desc[] */
