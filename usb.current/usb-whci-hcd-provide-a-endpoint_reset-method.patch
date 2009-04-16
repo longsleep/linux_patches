@@ -1,0 +1,167 @@
+From dvrabel@hera.kernel.org  Wed Apr 15 21:01:59 2009
+From: David Vrabel <david.vrabel@csr.com>
+Date: Wed,  8 Apr 2009 17:36:29 +0000
+Subject: USB: whci-hcd: provide a endpoint_reset method
+To: Greg KH <gregkh@suse.de>
+Cc: David Vrabel <david.vrabel@csr.com>
+Message-ID: <1239212193-27618-3-git-send-email-david.vrabel@csr.com>
+
+
+Provide a endpoint_reset method to reset sequence number and current
+window.  This QHead information can only be changed while the qset is
+not in a schedule.
+
+Signed-off-by: David Vrabel <david.vrabel@csr.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+---
+ drivers/usb/host/whci/asl.c     |    3 ++-
+ drivers/usb/host/whci/hcd.c     |   23 +++++++++++++++++++++++
+ drivers/usb/host/whci/pzl.c     |    4 ++--
+ drivers/usb/host/whci/qset.c    |   24 +++++++++++++++++++++---
+ drivers/usb/host/whci/whcd.h    |    1 +
+ drivers/usb/host/whci/whci-hc.h |    1 +
+ 6 files changed, 50 insertions(+), 6 deletions(-)
+
+--- a/drivers/usb/host/whci/asl.c
++++ b/drivers/usb/host/whci/asl.c
+@@ -122,7 +122,8 @@ static uint32_t process_qset(struct whc 
+ 		process_inactive_qtd(whc, qset, td);
+ 	}
+ 
+-	update |= qset_add_qtds(whc, qset);
++	if (!qset->remove)
++		update |= qset_add_qtds(whc, qset);
+ 
+ done:
+ 	/*
+--- a/drivers/usb/host/whci/hcd.c
++++ b/drivers/usb/host/whci/hcd.c
+@@ -186,6 +186,28 @@ static void whc_endpoint_disable(struct 
+ 	}
+ }
+ 
++static void whc_endpoint_reset(struct usb_hcd *usb_hcd,
++			       struct usb_host_endpoint *ep)
++{
++	struct wusbhc *wusbhc = usb_hcd_to_wusbhc(usb_hcd);
++	struct whc *whc = wusbhc_to_whc(wusbhc);
++	struct whc_qset *qset;
++
++	qset = ep->hcpriv;
++	if (qset) {
++		qset->remove = 1;
++
++		if (usb_endpoint_xfer_bulk(&ep->desc)
++		    || usb_endpoint_xfer_control(&ep->desc))
++			queue_work(whc->workqueue, &whc->async_work);
++		else
++			queue_work(whc->workqueue, &whc->periodic_work);
++
++		qset_reset(whc, qset);
++	}
++}
++
++
+ static struct hc_driver whc_hc_driver = {
+ 	.description = "whci-hcd",
+ 	.product_desc = "Wireless host controller",
+@@ -200,6 +222,7 @@ static struct hc_driver whc_hc_driver = 
+ 	.urb_enqueue = whc_urb_enqueue,
+ 	.urb_dequeue = whc_urb_dequeue,
+ 	.endpoint_disable = whc_endpoint_disable,
++	.endpoint_reset = whc_endpoint_reset,
+ 
+ 	.hub_status_data = wusbhc_rh_status_data,
+ 	.hub_control = wusbhc_rh_control,
+--- a/drivers/usb/host/whci/pzl.c
++++ b/drivers/usb/host/whci/pzl.c
+@@ -128,7 +128,8 @@ static enum whc_update pzl_process_qset(
+ 		process_inactive_qtd(whc, qset, td);
+ 	}
+ 
+-	update |= qset_add_qtds(whc, qset);
++	if (!qset->remove)
++		update |= qset_add_qtds(whc, qset);
+ 
+ done:
+ 	/*
+@@ -353,7 +354,6 @@ void pzl_qset_delete(struct whc *whc, st
+ 	qset_delete(whc, qset);
+ }
+ 
+-
+ /**
+  * pzl_init - initialize the periodic zone list
+  * @whc: the WHCI host controller
+--- a/drivers/usb/host/whci/qset.c
++++ b/drivers/usb/host/whci/qset.c
+@@ -89,11 +89,16 @@ static void qset_fill_qh(struct whc_qset
+ 		QH_INFO3_TX_RATE_53_3
+ 		| QH_INFO3_TX_PWR(0) /* 0 == max power */
+ 		);
++
++	qset->qh.cur_window = cpu_to_le32((1 << qset->max_burst) - 1);
+ }
+ 
+ /**
+  * qset_clear - clear fields in a qset so it may be reinserted into a
+- * schedule
++ * schedule.
++ *
++ * The sequence number and current window are not cleared (see
++ * qset_reset()).
+  */
+ void qset_clear(struct whc *whc, struct whc_qset *qset)
+ {
+@@ -101,9 +106,8 @@ void qset_clear(struct whc *whc, struct 
+ 	qset->remove = 0;
+ 
+ 	qset->qh.link = cpu_to_le32(QH_LINK_NTDS(8) | QH_LINK_T);
+-	qset->qh.status = cpu_to_le16(QH_STATUS_ICUR(qset->td_start));
++	qset->qh.status = qset->qh.status & QH_STATUS_SEQ_MASK;
+ 	qset->qh.err_count = 0;
+-	qset->qh.cur_window = cpu_to_le32((1 << qset->max_burst) - 1);
+ 	qset->qh.scratch[0] = 0;
+ 	qset->qh.scratch[1] = 0;
+ 	qset->qh.scratch[2] = 0;
+@@ -114,6 +118,20 @@ void qset_clear(struct whc *whc, struct 
+ }
+ 
+ /**
++ * qset_reset - reset endpoint state in a qset.
++ *
++ * Clears the sequence number and current window.  This qset must not
++ * be in the ASL or PZL.
++ */
++void qset_reset(struct whc *whc, struct whc_qset *qset)
++{
++	wait_for_completion(&qset->remove_complete);
++
++	qset->qh.status &= ~QH_STATUS_SEQ_MASK;
++	qset->qh.cur_window = cpu_to_le32((1 << qset->max_burst) - 1);
++}
++
++/**
+  * get_qset - get the qset for an async endpoint
+  *
+  * A new qset is created if one does not already exist.
+--- a/drivers/usb/host/whci/whcd.h
++++ b/drivers/usb/host/whci/whcd.h
+@@ -184,6 +184,7 @@ void qset_free(struct whc *whc, struct w
+ struct whc_qset *get_qset(struct whc *whc, struct urb *urb, gfp_t mem_flags);
+ void qset_delete(struct whc *whc, struct whc_qset *qset);
+ void qset_clear(struct whc *whc, struct whc_qset *qset);
++void qset_reset(struct whc *whc, struct whc_qset *qset);
+ int qset_add_urb(struct whc *whc, struct whc_qset *qset, struct urb *urb,
+ 		 gfp_t mem_flags);
+ void qset_free_std(struct whc *whc, struct whc_std *std);
+--- a/drivers/usb/host/whci/whci-hc.h
++++ b/drivers/usb/host/whci/whci-hc.h
+@@ -185,6 +185,7 @@ struct whc_qhead {
+ #define QH_STATUS_FLOW_CTRL      (1 << 15)
+ #define QH_STATUS_ICUR(i)        ((i) << 5)
+ #define QH_STATUS_TO_ICUR(s)     (((s) >> 5) & 0x7)
++#define QH_STATUS_SEQ_MASK       0x1f
+ 
+ /**
+  * usb_pipe_to_qh_type - USB core pipe type to QH transfer type
