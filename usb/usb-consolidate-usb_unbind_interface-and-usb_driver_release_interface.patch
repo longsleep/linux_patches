@@ -1,0 +1,71 @@
+From stern@rowland.harvard.edu  Tue Apr 21 17:08:39 2009
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Thu, 16 Apr 2009 15:35:09 -0400 (EDT)
+Subject: USB: consolidate usb_unbind_interface and usb_driver_release_interface
+To: Greg KH <greg@kroah.com>
+Message-ID: <Pine.LNX.4.44L0.0904161532160.2718-100000@iolanthe.rowland.org>
+
+
+This patch (as1230) consolidates code in usb_unbind_interface() and
+usb_driver_release_interface().  In fact, it makes release_interface
+call unbind_interface, thereby removing the need for duplicated code.
+
+It works like this: If the interface has already been registered with
+the driver core when a driver releases it, then the usual driver-core
+mechanism will call unbind_interface.  If it hasn't been unregistered
+then we will make the call ourselves.
+
+As a nice bonus, drivers now don't have to worry about whether their
+disconnect method will get called when they release an interface -- it
+always will.  Previously it would be called only if the interface was
+registered.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/driver.c |   21 ++++++++-------------
+ 1 file changed, 8 insertions(+), 13 deletions(-)
+
+--- a/drivers/usb/core/driver.c
++++ b/drivers/usb/core/driver.c
+@@ -385,7 +385,6 @@ void usb_driver_release_interface(struct
+ 					struct usb_interface *iface)
+ {
+ 	struct device *dev = &iface->dev;
+-	struct usb_device *udev = interface_to_usbdev(iface);
+ 
+ 	/* this should never happen, don't release something that's not ours */
+ 	if (!dev->driver || dev->driver != &driver->drvwrap.driver)
+@@ -394,23 +393,19 @@ void usb_driver_release_interface(struct
+ 	/* don't release from within disconnect() */
+ 	if (iface->condition != USB_INTERFACE_BOUND)
+ 		return;
++	iface->condition = USB_INTERFACE_UNBINDING;
+ 
+-	/* don't release if the interface hasn't been added yet */
++	/* Release via the driver core only if the interface
++	 * has already been registered
++	 */
+ 	if (device_is_registered(dev)) {
+-		iface->condition = USB_INTERFACE_UNBINDING;
+ 		device_release_driver(dev);
+ 	} else {
+-		iface->condition = USB_INTERFACE_UNBOUND;
+-		usb_cancel_queued_reset(iface);
++		down(&dev->sem);
++		usb_unbind_interface(dev);
++		dev->driver = NULL;
++		up(&dev->sem);
+ 	}
+-	dev->driver = NULL;
+-	usb_set_intfdata(iface, NULL);
+-
+-	usb_pm_lock(udev);
+-	iface->condition = USB_INTERFACE_UNBOUND;
+-	mark_quiesced(iface);
+-	iface->needs_remote_wakeup = 0;
+-	usb_pm_unlock(udev);
+ }
+ EXPORT_SYMBOL_GPL(usb_driver_release_interface);
+ 

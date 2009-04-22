@@ -1,0 +1,92 @@
+From stern@rowland.harvard.edu  Tue Apr 21 17:09:05 2009
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Thu, 16 Apr 2009 15:37:28 -0400 (EDT)
+Subject: USB: g_file_storage: fix use-after-free bug when closing files
+To: Greg KH <greg@kroah.com>
+Cc: USB list <linux-usb@vger.kernel.org>, <stable@kernel.org>
+Message-ID: <Pine.LNX.4.44L0.0904161535110.2718-100000@iolanthe.rowland.org>
+
+
+This patch (as1231) fixes a use-after-free bug in g_file_storage.  A
+device's name may not be available after the device is unregistered,
+even if the device structure itself is still allocated.  Since
+close_backing_file() prints a LUN's name for debugging, it shouldn't
+be called after the LUN has been unregistered.
+
+That whole area needed to be cleaned up; the backing files were
+getting closed in a couple of different places.  The patch fixes
+things so that they get closed in just one place, as part of the
+unbind procedure, immediately before the LUN is unregistered.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/gadget/file_storage.c |   20 ++++----------------
+ 1 file changed, 4 insertions(+), 16 deletions(-)
+
+--- a/drivers/usb/gadget/file_storage.c
++++ b/drivers/usb/gadget/file_storage.c
+@@ -738,7 +738,6 @@ static struct fsg_dev			*the_fsg;
+ static struct usb_gadget_driver		fsg_driver;
+ 
+ static void	close_backing_file(struct lun *curlun);
+-static void	close_all_backing_files(struct fsg_dev *fsg);
+ 
+ 
+ /*-------------------------------------------------------------------------*/
+@@ -3593,12 +3592,10 @@ static int fsg_main_thread(void *fsg_)
+ 	fsg->thread_task = NULL;
+ 	spin_unlock_irq(&fsg->lock);
+ 
+-	/* In case we are exiting because of a signal, unregister the
+-	 * gadget driver and close the backing file. */
+-	if (test_and_clear_bit(REGISTERED, &fsg->atomic_bitflags)) {
++	/* If we are exiting because of a signal, unregister the
++	 * gadget driver. */
++	if (test_and_clear_bit(REGISTERED, &fsg->atomic_bitflags))
+ 		usb_gadget_unregister_driver(&fsg_driver);
+-		close_all_backing_files(fsg);
+-	}
+ 
+ 	/* Let the unbind and cleanup routines know the thread has exited */
+ 	complete_and_exit(&fsg->thread_notifier, 0);
+@@ -3703,14 +3700,6 @@ static void close_backing_file(struct lu
+ 	}
+ }
+ 
+-static void close_all_backing_files(struct fsg_dev *fsg)
+-{
+-	int	i;
+-
+-	for (i = 0; i < fsg->nluns; ++i)
+-		close_backing_file(&fsg->luns[i]);
+-}
+-
+ 
+ static ssize_t show_ro(struct device *dev, struct device_attribute *attr, char *buf)
+ {
+@@ -3845,6 +3834,7 @@ static void /* __init_or_exit */ fsg_unb
+ 		if (curlun->registered) {
+ 			device_remove_file(&curlun->dev, &dev_attr_ro);
+ 			device_remove_file(&curlun->dev, &dev_attr_file);
++			close_backing_file(curlun);
+ 			device_unregister(&curlun->dev);
+ 			curlun->registered = 0;
+ 		}
+@@ -4190,7 +4180,6 @@ autoconf_fail:
+ out:
+ 	fsg->state = FSG_STATE_TERMINATED;	// The thread is dead
+ 	fsg_unbind(gadget);
+-	close_all_backing_files(fsg);
+ 	complete(&fsg->thread_notifier);
+ 	return rc;
+ }
+@@ -4284,7 +4273,6 @@ static void __exit fsg_cleanup(void)
+ 	/* Wait for the thread to finish up */
+ 	wait_for_completion(&fsg->thread_notifier);
+ 
+-	close_all_backing_files(fsg);
+ 	kref_put(&fsg->ref, fsg_release);
+ }
+ module_exit(fsg_cleanup);
