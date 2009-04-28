@@ -1,0 +1,149 @@
+From sarah.a.sharp@linux.intel.com  Tue Apr 28 16:02:35 2009
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Date: Mon, 27 Apr 2009 19:54:10 -0700
+Subject: USB: Add SuperSpeed to the list of USB device speeds.
+To: Greg KH <greg@kroah.com>
+Message-ID: <20090428025410.GA18007@gamba.jf.intel.com>
+Content-Disposition: inline
+
+
+Modify the USB core to handle the new USB 3.0 speed, "SuperSpeed".  This
+is 5.0 Gbps (wire speed).  There are probably more places that check for
+speed that I've missed.
+
+SuperSpeed devices have a 512 byte endpoint 0 max packet size.  This shows
+up as a bMaxPacketSize0 set to 0x09 (see table 9-8 of the USB 3.0 bus
+spec).
+
+xHCI spec says that the xHC can handle intervals up to 2^15 microframes.  That
+might change when real silicon becomes available.
+
+Add FIXME note for SuperSpeed isochronous endpoints.  They can transmit up
+to 16 packets in one "burst" before they wait for an acknowledgment of the
+packets.  They can do up to 3 bursts per microframe (determined by the
+mult value in the endpoint companion descriptor).  The xHCI driver doesn't
+have support for isoc yet, so fix this later.
+
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/config.c |    1 +
+ drivers/usb/core/hcd.c    |   16 ++++++++++++++--
+ drivers/usb/core/hcd.h    |    1 +
+ drivers/usb/core/hub.c    |   11 +++++++++--
+ drivers/usb/core/urb.c    |    6 ++++++
+ include/linux/usb/ch9.h   |    1 +
+ 6 files changed, 32 insertions(+), 4 deletions(-)
+
+--- a/drivers/usb/core/config.c
++++ b/drivers/usb/core/config.c
+@@ -92,6 +92,7 @@ static int usb_parse_endpoint(struct dev
+ 	if (usb_endpoint_xfer_int(d)) {
+ 		i = 1;
+ 		switch (to_usb_device(ddev)->speed) {
++		case USB_SPEED_SUPER:
+ 		case USB_SPEED_HIGH:
+ 			/* Many device manufacturers are using full-speed
+ 			 * bInterval values in high-speed interrupt endpoint
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -1870,8 +1870,20 @@ int usb_add_hcd(struct usb_hcd *hcd,
+ 		retval = -ENOMEM;
+ 		goto err_allocate_root_hub;
+ 	}
+-	rhdev->speed = (hcd->driver->flags & HCD_USB2) ? USB_SPEED_HIGH :
+-			USB_SPEED_FULL;
++
++	switch (hcd->driver->flags & HCD_MASK) {
++	case HCD_USB11:
++		rhdev->speed = USB_SPEED_FULL;
++		break;
++	case HCD_USB2:
++		rhdev->speed = USB_SPEED_HIGH;
++		break;
++	case HCD_USB3:
++		rhdev->speed = USB_SPEED_SUPER;
++		break;
++	default:
++		goto err_allocate_root_hub;
++	}
+ 	hcd->self.root_hub = rhdev;
+ 
+ 	/* wakeup flag init defaults to "everything works" for root hubs,
+--- a/drivers/usb/core/hcd.h
++++ b/drivers/usb/core/hcd.h
+@@ -174,6 +174,7 @@ struct hc_driver {
+ #define	HCD_USB11	0x0010		/* USB 1.1 */
+ #define	HCD_USB2	0x0020		/* USB 2.0 */
+ #define	HCD_USB3	0x0040		/* USB 3.0 */
++#define	HCD_MASK	0x0070
+ 
+ 	/* called to init HCD and root hub */
+ 	int	(*reset) (struct usb_hcd *hcd);
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -2471,6 +2471,7 @@ hub_port_init (struct usb_hub *hub, stru
+ 	 * reported as 0xff in the device descriptor). WUSB1.0[4.8.1].
+ 	 */
+ 	switch (udev->speed) {
++	case USB_SPEED_SUPER:
+ 	case USB_SPEED_VARIABLE:	/* fixed at 512 */
+ 		udev->ep0.desc.wMaxPacketSize = cpu_to_le16(512);
+ 		break;
+@@ -2496,6 +2497,9 @@ hub_port_init (struct usb_hub *hub, stru
+ 	case USB_SPEED_LOW:	speed = "low";	break;
+ 	case USB_SPEED_FULL:	speed = "full";	break;
+ 	case USB_SPEED_HIGH:	speed = "high";	break;
++	case USB_SPEED_SUPER:
++				speed = "super";
++				break;
+ 	case USB_SPEED_VARIABLE:
+ 				speed = "variable";
+ 				type = "Wireless ";
+@@ -2634,8 +2638,11 @@ hub_port_init (struct usb_hub *hub, stru
+ 	if (retval)
+ 		goto fail;
+ 
+-	i = udev->descriptor.bMaxPacketSize0 == 0xff?	/* wusb device? */
+-	    512 : udev->descriptor.bMaxPacketSize0;
++	if (udev->descriptor.bMaxPacketSize0 == 0xff ||
++			udev->speed == USB_SPEED_SUPER)
++		i = 512;
++	else
++		i = udev->descriptor.bMaxPacketSize0;
+ 	if (le16_to_cpu(udev->ep0.desc.wMaxPacketSize) != i) {
+ 		if (udev->speed != USB_SPEED_FULL ||
+ 				!(i == 8 || i == 16 || i == 32 || i == 64)) {
+--- a/drivers/usb/core/urb.c
++++ b/drivers/usb/core/urb.c
+@@ -351,6 +351,7 @@ int usb_submit_urb(struct urb *urb, gfp_
+ 	if (xfertype == USB_ENDPOINT_XFER_ISOC) {
+ 		int	n, len;
+ 
++		/* FIXME SuperSpeed isoc endpoints have up to 16 bursts */
+ 		/* "high bandwidth" mode, 1-3 packets/uframe? */
+ 		if (dev->speed == USB_SPEED_HIGH) {
+ 			int	mult = 1 + ((max >> 11) & 0x03);
+@@ -426,6 +427,11 @@ int usb_submit_urb(struct urb *urb, gfp_
+ 			return -EINVAL;
+ 		/* too big? */
+ 		switch (dev->speed) {
++		case USB_SPEED_SUPER:	/* units are 125us */
++			/* Handle up to 2^(16-1) microframes */
++			if (urb->interval > (1 << 15))
++				return -EINVAL;
++			max = 1 << 15;
+ 		case USB_SPEED_HIGH:	/* units are microframes */
+ 			/* NOTE usb handles 2^15 */
+ 			if (urb->interval > (1024 * 8))
+--- a/include/linux/usb/ch9.h
++++ b/include/linux/usb/ch9.h
+@@ -752,6 +752,7 @@ enum usb_device_speed {
+ 	USB_SPEED_LOW, USB_SPEED_FULL,		/* usb 1.1 */
+ 	USB_SPEED_HIGH,				/* usb 2.0 */
+ 	USB_SPEED_VARIABLE,			/* wireless (usb 2.5) */
++	USB_SPEED_SUPER,			/* usb 3.0 */
+ };
+ 
+ enum usb_device_state {

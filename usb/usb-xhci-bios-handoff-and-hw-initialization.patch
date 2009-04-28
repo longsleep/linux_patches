@@ -1,0 +1,910 @@
+From sarah.a.sharp@linux.intel.com  Tue Apr 28 16:01:01 2009
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Date: Mon, 27 Apr 2009 19:52:28 -0700
+Subject: USB: xhci: BIOS handoff and HW initialization.
+To: Greg KH <greg@kroah.com>
+Message-ID: <20090428025228.GA17746@gamba.jf.intel.com>
+Content-Disposition: inline
+
+
+Add PCI initialization code to take control of the xHCI host controller
+away from the BIOS, halt, and reset the host controller.  The xHCI spec
+says that BIOSes must give up the host controller within 5 seconds.
+
+Add some host controller glue functions to handle hardware initialization
+and memory allocation for the host controller.  The current xHCI
+prototypes use PCI interrupts, but the xHCI spec requires MSI-X
+interrupts.  Add code to support MSI-X interrupts, but use the PCI
+interrupts for now.
+
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/hcd.h        |    1 
+ drivers/usb/host/pci-quirks.c |  123 +++++++++++++
+ drivers/usb/host/xhci-hcd.c   |  377 ++++++++++++++++++++++++++++++++++++++++++
+ drivers/usb/host/xhci-mem.c   |   75 ++++++++
+ drivers/usb/host/xhci-pci.c   |  150 ++++++++++++++++
+ drivers/usb/host/xhci.h       |   63 ++++++-
+ include/linux/pci_ids.h       |    1 
+ 7 files changed, 788 insertions(+), 2 deletions(-)
+
+--- a/drivers/usb/core/hcd.h
++++ b/drivers/usb/core/hcd.h
+@@ -173,6 +173,7 @@ struct hc_driver {
+ #define	HCD_LOCAL_MEM	0x0002		/* HC needs local memory */
+ #define	HCD_USB11	0x0010		/* USB 1.1 */
+ #define	HCD_USB2	0x0020		/* USB 2.0 */
++#define	HCD_USB3	0x0040		/* USB 3.0 */
+ 
+ 	/* called to init HCD and root hub */
+ 	int	(*reset) (struct usb_hcd *hcd);
+--- a/drivers/usb/host/pci-quirks.c
++++ b/drivers/usb/host/pci-quirks.c
+@@ -15,6 +15,7 @@
+ #include <linux/delay.h>
+ #include <linux/acpi.h>
+ #include "pci-quirks.h"
++#include "xhci-ext-caps.h"
+ 
+ 
+ #define UHCI_USBLEGSUP		0xc0		/* legacy support */
+@@ -341,7 +342,127 @@ static void __devinit quirk_usb_disable_
+ 	return;
+ }
+ 
++/*
++ * handshake - spin reading a register until handshake completes
++ * @ptr: address of hc register to be read
++ * @mask: bits to look at in result of read
++ * @done: value of those bits when handshake succeeds
++ * @wait_usec: timeout in microseconds
++ * @delay_usec: delay in microseconds to wait between polling
++ *
++ * Polls a register every delay_usec microseconds.
++ * Returns 0 when the mask bits have the value done.
++ * Returns -ETIMEDOUT if this condition is not true after
++ * wait_usec microseconds have passed.
++ */
++static int handshake(void __iomem *ptr, u32 mask, u32 done,
++		int wait_usec, int delay_usec)
++{
++	u32	result;
++
++	do {
++		result = readl(ptr);
++		result &= mask;
++		if (result == done)
++			return 0;
++		udelay(delay_usec);
++		wait_usec -= delay_usec;
++	} while (wait_usec > 0);
++	return -ETIMEDOUT;
++}
++
++/**
++ * PCI Quirks for xHCI.
++ *
++ * Takes care of the handoff between the Pre-OS (i.e. BIOS) and the OS.
++ * It signals to the BIOS that the OS wants control of the host controller,
++ * and then waits 5 seconds for the BIOS to hand over control.
++ * If we timeout, assume the BIOS is broken and take control anyway.
++ */
++static void __devinit quirk_usb_handoff_xhci(struct pci_dev *pdev)
++{
++	void __iomem *base;
++	int ext_cap_offset;
++	void __iomem *op_reg_base;
++	u32 val;
++	int timeout;
++
++	if (!mmio_resource_enabled(pdev, 0))
++		return;
++
++	base = ioremap_nocache(pci_resource_start(pdev, 0),
++				pci_resource_len(pdev, 0));
++	if (base == NULL)
++		return;
+ 
++	/*
++	 * Find the Legacy Support Capability register -
++	 * this is optional for xHCI host controllers.
++	 */
++	ext_cap_offset = xhci_find_next_cap_offset(base, XHCI_HCC_PARAMS_OFFSET);
++	do {
++		if (!ext_cap_offset)
++			/* We've reached the end of the extended capabilities */
++			goto hc_init;
++		val = readl(base + ext_cap_offset);
++		if (XHCI_EXT_CAPS_ID(val) == XHCI_EXT_CAPS_LEGACY)
++			break;
++		ext_cap_offset = xhci_find_next_cap_offset(base, ext_cap_offset);
++	} while (1);
++
++	/* If the BIOS owns the HC, signal that the OS wants it, and wait */
++	if (val & XHCI_HC_BIOS_OWNED) {
++		writel(val & XHCI_HC_OS_OWNED, base + ext_cap_offset);
++
++		/* Wait for 5 seconds with 10 microsecond polling interval */
++		timeout = handshake(base + ext_cap_offset, XHCI_HC_BIOS_OWNED,
++				0, 5000, 10);
++
++		/* Assume a buggy BIOS and take HC ownership anyway */
++		if (timeout) {
++			dev_warn(&pdev->dev, "xHCI BIOS handoff failed"
++					" (BIOS bug ?) %08x\n", val);
++			writel(val & ~XHCI_HC_BIOS_OWNED, base + ext_cap_offset);
++		}
++	}
++
++	/* Disable any BIOS SMIs */
++	writel(XHCI_LEGACY_DISABLE_SMI,
++			base + ext_cap_offset + XHCI_LEGACY_CONTROL_OFFSET);
++
++hc_init:
++	op_reg_base = base + XHCI_HC_LENGTH(readl(base));
++
++	/* Wait for the host controller to be ready before writing any
++	 * operational or runtime registers.  Wait 5 seconds and no more.
++	 */
++	timeout = handshake(op_reg_base + XHCI_STS_OFFSET, XHCI_STS_CNR, 0,
++			5000, 10);
++	/* Assume a buggy HC and start HC initialization anyway */
++	if (timeout) {
++		val = readl(op_reg_base + XHCI_STS_OFFSET);
++		dev_warn(&pdev->dev,
++				"xHCI HW not ready after 5 sec (HC bug?) "
++				"status = 0x%x\n", val);
++	}
++
++	/* Send the halt and disable interrupts command */
++	val = readl(op_reg_base + XHCI_CMD_OFFSET);
++	val &= ~(XHCI_CMD_RUN | XHCI_IRQS);
++	writel(val, op_reg_base + XHCI_CMD_OFFSET);
++
++	/* Wait for the HC to halt - poll every 125 usec (one microframe). */
++	timeout = handshake(op_reg_base + XHCI_STS_OFFSET, XHCI_STS_HALT, 1,
++			XHCI_MAX_HALT_USEC, 125);
++	if (timeout) {
++		val = readl(op_reg_base + XHCI_STS_OFFSET);
++		dev_warn(&pdev->dev,
++				"xHCI HW did not halt within %d usec "
++				"status = 0x%x\n", XHCI_MAX_HALT_USEC, val);
++	}
++
++	iounmap(base);
++}
+ 
+ static void __devinit quirk_usb_early_handoff(struct pci_dev *pdev)
+ {
+@@ -351,5 +472,7 @@ static void __devinit quirk_usb_early_ha
+ 		quirk_usb_handoff_ohci(pdev);
+ 	else if (pdev->class == PCI_CLASS_SERIAL_USB_EHCI)
+ 		quirk_usb_disable_ehci(pdev);
++	else if (pdev->class == PCI_CLASS_SERIAL_USB_XHCI)
++		quirk_usb_handoff_xhci(pdev);
+ }
+ DECLARE_PCI_FIXUP_FINAL(PCI_ANY_ID, PCI_ANY_ID, quirk_usb_early_handoff);
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -32,6 +32,9 @@
+ /* xHCI PCI Configuration Registers */
+ #define XHCI_SBRN_OFFSET	(0x60)
+ 
++/* Max number of USB devices for any host controller - limit in section 6.1 */
++#define MAX_HC_SLOTS		256
++
+ /*
+  * xHCI register interface.
+  * This corresponds to the eXtensible Host Controller Interface (xHCI)
+@@ -359,10 +362,35 @@ struct intr_reg {
+ 	u32	erst_dequeue[2];
+ } __attribute__ ((packed));
+ 
++/* irq_pending bitmasks */
+ #define	ER_IRQ_PENDING(p)	((p) & 0x1)
+-#define	ER_IRQ_ENABLE(p)	((p) | 0x2)
++/* bits 2:31 need to be preserved */
++#define	ER_IRQ_CLEAR(p)		((p) & 0xfffffffe)
++#define	ER_IRQ_ENABLE(p)	((ER_IRQ_CLEAR(p)) | 0x2)
++#define	ER_IRQ_DISABLE(p)	((ER_IRQ_CLEAR(p)) & ~(0x2))
++
++/* irq_control bitmasks */
++/* Minimum interval between interrupts (in 250ns intervals).  The interval
++ * between interrupts will be longer if there are no events on the event ring.
++ * Default is 4000 (1 ms).
++ */
++#define ER_IRQ_INTERVAL_MASK	(0xffff)
++/* Counter used to count down the time to the next interrupt - HW use only */
++#define ER_IRQ_COUNTER_MASK	(0xffff << 16)
++
++/* erst_size bitmasks */
+ /* Preserve bits 16:31 of erst_size */
+-#define	ERST_SIZE_MASK	(0xffff<<16)
++#define	ERST_SIZE_MASK		(0xffff << 16)
++
++/* erst_dequeue bitmasks */
++/* Dequeue ERST Segment Index (DESI) - Segment number (or alias)
++ * where the current dequeue pointer lies.  This is an optional HW hint.
++ */
++#define ERST_DESI_MASK		(0x7)
++/* Event Handler Busy (EHB) - is the event ring scheduled to be serviced by
++ * a work queue (or delayed service routine)?
++ */
++#define ERST_EHB		(1 << 3)
+ 
+ /**
+  * struct xhci_run_regs
+@@ -386,6 +414,8 @@ struct xhci_hcd {
+ 	struct xhci_cap_regs __iomem *cap_regs;
+ 	struct xhci_op_regs __iomem *op_regs;
+ 	struct xhci_run_regs __iomem *run_regs;
++	/* Our HCD's current interrupter register set */
++	struct	intr_reg __iomem *ir_set;
+ 
+ 	/* Cached register copies of read-only HC data */
+ 	__u32		hcs_params1;
+@@ -404,7 +434,13 @@ struct xhci_hcd {
+ 	u8		isoc_threshold;
+ 	int		event_ring_max;
+ 	int		addr_64;
++	/* 4KB min, 128MB max */
+ 	int		page_size;
++	/* Valid values are 12 to 20, inclusive */
++	int		page_shift;
++	/* only one MSI vector for now, but might need more later */
++	int		msix_count;
++	struct msix_entry	*msix_entries;
+ };
+ 
+ /* convert between an HCD pointer and the corresponding EHCI_HCD */
+@@ -449,4 +485,27 @@ static inline void xhci_writel(const str
+ 	writel(val, regs);
+ }
+ 
++/* xHCI debugging */
++void xhci_print_ir_set(struct xhci_hcd *xhci, struct intr_reg *ir_set, int set_num);
++void xhci_print_registers(struct xhci_hcd *xhci);
++
++/* xHCI memory managment */
++void xhci_mem_cleanup(struct xhci_hcd *xhci);
++int xhci_mem_init(struct xhci_hcd *xhci, gfp_t flags);
++
++#ifdef CONFIG_PCI
++/* xHCI PCI glue */
++int xhci_register_pci(void);
++void xhci_unregister_pci(void);
++#endif
++
++/* xHCI host controller glue */
++int xhci_halt(struct xhci_hcd *xhci);
++int xhci_reset(struct xhci_hcd *xhci);
++int xhci_init(struct usb_hcd *hcd);
++int xhci_run(struct usb_hcd *hcd);
++void xhci_stop(struct usb_hcd *hcd);
++void xhci_shutdown(struct usb_hcd *hcd);
++int xhci_get_frame(struct usb_hcd *hcd);
++
+ #endif /* __LINUX_XHCI_HCD_H */
+--- /dev/null
++++ b/drivers/usb/host/xhci-hcd.c
+@@ -0,0 +1,377 @@
++/*
++ * xHCI host controller driver
++ *
++ * Copyright (C) 2008 Intel Corp.
++ *
++ * Author: Sarah Sharp
++ * Some code borrowed from the Linux EHCI driver.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software Foundation,
++ * Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ */
++
++#include <linux/irq.h>
++#include <linux/module.h>
++
++#include "xhci.h"
++
++#define DRIVER_AUTHOR "Sarah Sharp"
++#define DRIVER_DESC "'eXtensible' Host Controller (xHC) Driver"
++
++/* TODO: copied from ehci-hcd.c - can this be refactored? */
++/*
++ * handshake - spin reading hc until handshake completes or fails
++ * @ptr: address of hc register to be read
++ * @mask: bits to look at in result of read
++ * @done: value of those bits when handshake succeeds
++ * @usec: timeout in microseconds
++ *
++ * Returns negative errno, or zero on success
++ *
++ * Success happens when the "mask" bits have the specified value (hardware
++ * handshake done).  There are two failure modes:  "usec" have passed (major
++ * hardware flakeout), or the register reads as all-ones (hardware removed).
++ */
++static int handshake(struct xhci_hcd *xhci, void __iomem *ptr,
++		      u32 mask, u32 done, int usec)
++{
++	u32	result;
++
++	do {
++		result = xhci_readl(xhci, ptr);
++		if (result == ~(u32)0)		/* card removed */
++			return -ENODEV;
++		result &= mask;
++		if (result == done)
++			return 0;
++		udelay(1);
++		usec--;
++	} while (usec > 0);
++	return -ETIMEDOUT;
++}
++
++/*
++ * Force HC into halt state.
++ *
++ * Disable any IRQs and clear the run/stop bit.
++ * HC will complete any current and actively pipelined transactions, and
++ * should halt within 16 microframes of the run/stop bit being cleared.
++ * Read HC Halted bit in the status register to see when the HC is finished.
++ * XXX: shouldn't we set HC_STATE_HALT here somewhere?
++ */
++int xhci_halt(struct xhci_hcd *xhci)
++{
++	u32 halted;
++	u32 cmd;
++	u32 mask;
++
++	xhci_dbg(xhci, "// Halt the HC\n");
++	/* Disable all interrupts from the host controller */
++	mask = ~(XHCI_IRQS);
++	halted = xhci_readl(xhci, &xhci->op_regs->status) & STS_HALT;
++	if (!halted)
++		mask &= ~CMD_RUN;
++
++	cmd = xhci_readl(xhci, &xhci->op_regs->command);
++	cmd &= mask;
++	xhci_writel(xhci, cmd, &xhci->op_regs->command);
++
++	return handshake(xhci, &xhci->op_regs->status,
++			STS_HALT, STS_HALT, XHCI_MAX_HALT_USEC);
++}
++
++/*
++ * Reset a halted HC, and set the internal HC state to HC_STATE_HALT.
++ *
++ * This resets pipelines, timers, counters, state machines, etc.
++ * Transactions will be terminated immediately, and operational registers
++ * will be set to their defaults.
++ */
++int xhci_reset(struct xhci_hcd *xhci)
++{
++	u32 command;
++	u32 state;
++
++	state = xhci_readl(xhci, &xhci->op_regs->status);
++	BUG_ON((state & STS_HALT) == 0);
++
++	xhci_dbg(xhci, "// Reset the HC\n");
++	command = xhci_readl(xhci, &xhci->op_regs->command);
++	command |= CMD_RESET;
++	xhci_writel(xhci, command, &xhci->op_regs->command);
++	/* XXX: Why does EHCI set this here?  Shouldn't other code do this? */
++	xhci_to_hcd(xhci)->state = HC_STATE_HALT;
++
++	return handshake(xhci, &xhci->op_regs->command, CMD_RESET, 0, 250 * 1000);
++}
++
++/*
++ * Stop the HC from processing the endpoint queues.
++ */
++static void xhci_quiesce(struct xhci_hcd *xhci)
++{
++	/*
++	 * Queues are per endpoint, so we need to disable an endpoint or slot.
++	 *
++	 * To disable a slot, we need to insert a disable slot command on the
++	 * command ring and ring the doorbell.  This will also free any internal
++	 * resources associated with the slot (which might not be what we want).
++	 *
++	 * A Release Endpoint command sounds better - doesn't free internal HC
++	 * memory, but removes the endpoints from the schedule and releases the
++	 * bandwidth, disables the doorbells, and clears the endpoint enable
++	 * flag.  Usually used prior to a set interface command.
++	 *
++	 * TODO: Implement after command ring code is done.
++	 */
++	BUG_ON(!HC_IS_RUNNING(xhci_to_hcd(xhci)->state));
++	xhci_dbg(xhci, "Finished quiescing -- code not written yet\n");
++}
++
++#if 0
++/* Set up MSI-X table for entry 0 (may claim other entries later) */
++static int xhci_setup_msix(struct xhci_hcd *xhci)
++{
++	int ret;
++	struct pci_dev *pdev = to_pci_dev(xhci_to_hcd(xhci)->self.controller);
++
++	xhci->msix_count = 0;
++	/* XXX: did I do this right?  ixgbe does kcalloc for more than one */
++	xhci->msix_entries = kmalloc(sizeof(struct msix_entry), GFP_KERNEL);
++	if (!xhci->msix_entries) {
++		xhci_err(xhci, "Failed to allocate MSI-X entries\n");
++		return -ENOMEM;
++	}
++	xhci->msix_entries[0].entry = 0;
++
++	ret = pci_enable_msix(pdev, xhci->msix_entries, xhci->msix_count);
++	if (ret) {
++		xhci_err(xhci, "Failed to enable MSI-X\n");
++		goto free_entries;
++	}
++
++	/*
++	 * Pass the xhci pointer value as the request_irq "cookie".
++	 * If more irqs are added, this will need to be unique for each one.
++	 */
++	ret = request_irq(xhci->msix_entries[0].vector, &xhci_irq, 0,
++			"xHCI", xhci_to_hcd(xhci));
++	if (ret) {
++		xhci_err(xhci, "Failed to allocate MSI-X interrupt\n");
++		goto disable_msix;
++	}
++	xhci_dbg(xhci, "Finished setting up MSI-X\n");
++	return 0;
++
++disable_msix:
++	pci_disable_msix(pdev);
++free_entries:
++	kfree(xhci->msix_entries);
++	xhci->msix_entries = NULL;
++	return ret;
++}
++
++/* XXX: code duplication; can xhci_setup_msix call this? */
++/* Free any IRQs and disable MSI-X */
++static void xhci_cleanup_msix(struct xhci_hcd *xhci)
++{
++	struct pci_dev *pdev = to_pci_dev(xhci_to_hcd(xhci)->self.controller);
++	if (!xhci->msix_entries)
++		return;
++
++	free_irq(xhci->msix_entries[0].vector, xhci);
++	pci_disable_msix(pdev);
++	kfree(xhci->msix_entries);
++	xhci->msix_entries = NULL;
++	xhci_dbg(xhci, "Finished cleaning up MSI-X\n");
++}
++#endif
++
++/*
++ * Initialize memory for HCD and xHC (one-time init).
++ *
++ * Program the PAGESIZE register, initialize the device context array, create
++ * device contexts (?), set up a command ring segment (or two?), create event
++ * ring (one for now).
++ */
++int xhci_init(struct usb_hcd *hcd)
++{
++	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
++	int retval = 0;
++
++	xhci_dbg(xhci, "xhci_init\n");
++	spin_lock_init(&xhci->lock);
++	retval = xhci_mem_init(xhci, GFP_KERNEL);
++	xhci_dbg(xhci, "Finished xhci_init\n");
++
++	return retval;
++}
++
++/*
++ * Start the HC after it was halted.
++ *
++ * This function is called by the USB core when the HC driver is added.
++ * Its opposite is xhci_stop().
++ *
++ * xhci_init() must be called once before this function can be called.
++ * Reset the HC, enable device slot contexts, program DCBAAP, and
++ * set command ring pointer and event ring pointer.
++ *
++ * Setup MSI-X vectors and enable interrupts.
++ */
++int xhci_run(struct usb_hcd *hcd)
++{
++	u32 temp;
++	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
++	xhci_dbg(xhci, "xhci_run\n");
++
++#if 0	/* FIXME: MSI not setup yet */
++	/* Do this at the very last minute */
++	ret = xhci_setup_msix(xhci);
++	if (!ret)
++		return ret;
++
++	return -ENOSYS;
++#endif
++	xhci_dbg(xhci, "// Set the interrupt modulation register\n");
++	temp = xhci_readl(xhci, &xhci->ir_set->irq_control);
++	temp &= 0xffff;
++	temp |= (u32) 160;
++	xhci_writel(xhci, temp, &xhci->ir_set->irq_control);
++
++	/* Set the HCD state before we enable the irqs */
++	hcd->state = HC_STATE_RUNNING;
++	temp = xhci_readl(xhci, &xhci->op_regs->command);
++	temp |= (CMD_EIE);
++	xhci_dbg(xhci, "// Enable interrupts, cmd = 0x%x.\n",
++			temp);
++	xhci_writel(xhci, temp, &xhci->op_regs->command);
++
++	temp = xhci_readl(xhci, &xhci->ir_set->irq_pending);
++	xhci_dbg(xhci, "// Enabling event ring interrupter 0x%x"
++			" by writing 0x%x to irq_pending\n",
++			(unsigned int) xhci->ir_set,
++			(unsigned int) ER_IRQ_ENABLE(temp));
++	xhci_writel(xhci, ER_IRQ_ENABLE(temp),
++			&xhci->ir_set->irq_pending);
++	xhci_print_ir_set(xhci, xhci->ir_set, 0);
++
++	temp = xhci_readl(xhci, &xhci->op_regs->command);
++	temp |= (CMD_RUN);
++	xhci_dbg(xhci, "// Turn on HC, cmd = 0x%x.\n",
++			temp);
++	xhci_writel(xhci, temp, &xhci->op_regs->command);
++	/* Flush PCI posted writes */
++	temp = xhci_readl(xhci, &xhci->op_regs->command);
++	xhci_dbg(xhci, "// @%x = 0x%x\n",
++			(unsigned int) &xhci->op_regs->command, temp);
++
++	xhci_dbg(xhci, "Finished xhci_run\n");
++	return 0;
++}
++
++/*
++ * Stop xHCI driver.
++ *
++ * This function is called by the USB core when the HC driver is removed.
++ * Its opposite is xhci_run().
++ *
++ * Disable device contexts, disable IRQs, and quiesce the HC.
++ * Reset the HC, finish any completed transactions, and cleanup memory.
++ */
++void xhci_stop(struct usb_hcd *hcd)
++{
++	u32 temp;
++	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
++
++	spin_lock_irq(&xhci->lock);
++	if (HC_IS_RUNNING(hcd->state))
++		xhci_quiesce(xhci);
++	xhci_halt(xhci);
++	xhci_reset(xhci);
++	spin_unlock_irq(&xhci->lock);
++
++#if 0	/* No MSI yet */
++	xhci_cleanup_msix(xhci);
++#endif
++	xhci_dbg(xhci, "// Disabling event ring interrupts\n");
++	temp = xhci_readl(xhci, &xhci->op_regs->status);
++	xhci_writel(xhci, temp & ~STS_EINT, &xhci->op_regs->status);
++	temp = xhci_readl(xhci, &xhci->ir_set->irq_pending);
++	xhci_writel(xhci, ER_IRQ_DISABLE(temp),
++			&xhci->ir_set->irq_pending);
++	xhci_print_ir_set(xhci, xhci->ir_set, 0);
++
++	xhci_dbg(xhci, "cleaning up memory\n");
++	xhci_mem_cleanup(xhci);
++	xhci_dbg(xhci, "xhci_stop completed - status = %x\n",
++		    xhci_readl(xhci, &xhci->op_regs->status));
++}
++
++/*
++ * Shutdown HC (not bus-specific)
++ *
++ * This is called when the machine is rebooting or halting.  We assume that the
++ * machine will be powered off, and the HC's internal state will be reset.
++ * Don't bother to free memory.
++ */
++void xhci_shutdown(struct usb_hcd *hcd)
++{
++	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
++
++	spin_lock_irq(&xhci->lock);
++	xhci_halt(xhci);
++	spin_unlock_irq(&xhci->lock);
++
++#if 0
++	xhci_cleanup_msix(xhci);
++#endif
++
++	xhci_dbg(xhci, "xhci_shutdown completed - status = %x\n",
++		    xhci_readl(xhci, &xhci->op_regs->status));
++}
++
++int xhci_get_frame(struct usb_hcd *hcd)
++{
++	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
++	/* EHCI mods by the periodic size.  Why? */
++	return xhci_readl(xhci, &xhci->run_regs->microframe_index) >> 3;
++}
++
++MODULE_DESCRIPTION(DRIVER_DESC);
++MODULE_AUTHOR(DRIVER_AUTHOR);
++MODULE_LICENSE("GPL");
++
++static int __init xhci_hcd_init(void)
++{
++#ifdef CONFIG_PCI
++	int retval = 0;
++
++	retval = xhci_register_pci();
++
++	if (retval < 0) {
++		printk(KERN_DEBUG "Problem registering PCI driver.");
++		return retval;
++	}
++#endif
++	return 0;
++}
++module_init(xhci_hcd_init);
++
++static void __exit xhci_hcd_cleanup(void)
++{
++#ifdef CONFIG_PCI
++	xhci_unregister_pci();
++#endif
++}
++module_exit(xhci_hcd_cleanup);
+--- /dev/null
++++ b/drivers/usb/host/xhci-mem.c
+@@ -0,0 +1,75 @@
++/*
++ * xHCI host controller driver
++ *
++ * Copyright (C) 2008 Intel Corp.
++ *
++ * Author: Sarah Sharp
++ * Some code borrowed from the Linux EHCI driver.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software Foundation,
++ * Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ */
++
++#include <linux/usb.h>
++
++#include "xhci.h"
++
++void xhci_mem_cleanup(struct xhci_hcd *xhci)
++{
++	xhci->page_size = 0;
++	xhci->page_shift = 0;
++}
++
++int xhci_mem_init(struct xhci_hcd *xhci, gfp_t flags)
++{
++	unsigned int	val, val2;
++	u32 page_size;
++	int i;
++
++	page_size = xhci_readl(xhci, &xhci->op_regs->page_size);
++	xhci_dbg(xhci, "Supported page size register = 0x%x\n", page_size);
++	for (i = 0; i < 16; i++) {
++		if ((0x1 & page_size) != 0)
++			break;
++		page_size = page_size >> 1;
++	}
++	if (i < 16)
++		xhci_dbg(xhci, "Supported page size of %iK\n", (1 << (i+12)) / 1024);
++	else
++		xhci_warn(xhci, "WARN: no supported page size\n");
++	/* Use 4K pages, since that's common and the minimum the HC supports */
++	xhci->page_shift = 12;
++	xhci->page_size = 1 << xhci->page_shift;
++	xhci_dbg(xhci, "HCD page size set to %iK\n", xhci->page_size / 1024);
++
++	/*
++	 * Program the Number of Device Slots Enabled field in the CONFIG
++	 * register with the max value of slots the HC can handle.
++	 */
++	val = HCS_MAX_SLOTS(xhci_readl(xhci, &xhci->cap_regs->hcs_params1));
++	xhci_dbg(xhci, "// xHC can handle at most %d device slots.\n",
++			(unsigned int) val);
++	val2 = xhci_readl(xhci, &xhci->op_regs->config_reg);
++	val |= (val2 & ~HCS_SLOTS_MASK);
++	xhci_dbg(xhci, "// Setting Max device slots reg = 0x%x.\n",
++			(unsigned int) val);
++	xhci_writel(xhci, val, &xhci->op_regs->config_reg);
++
++	xhci->ir_set = &xhci->run_regs->ir_set[0];
++
++	return 0;
++fail:
++	xhci_warn(xhci, "Couldn't initialize memory\n");
++	xhci_mem_cleanup(xhci);
++	return -ENOMEM;
++}
+--- /dev/null
++++ b/drivers/usb/host/xhci-pci.c
+@@ -0,0 +1,150 @@
++/*
++ * xHCI host controller driver PCI Bus Glue.
++ *
++ * Copyright (C) 2008 Intel Corp.
++ *
++ * Author: Sarah Sharp
++ * Some code borrowed from the Linux EHCI driver.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software Foundation,
++ * Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ */
++
++#include <linux/pci.h>
++
++#include "xhci.h"
++
++static const char hcd_name[] = "xhci_hcd";
++
++/* called after powerup, by probe or system-pm "wakeup" */
++static int xhci_pci_reinit(struct xhci_hcd *xhci, struct pci_dev *pdev)
++{
++	/*
++	 * TODO: Implement finding debug ports later.
++	 * TODO: see if there are any quirks that need to be added to handle
++	 * new extended capabilities.
++	 */
++
++	/* PCI Memory-Write-Invalidate cycle support is optional (uncommon) */
++	if (!pci_set_mwi(pdev))
++		xhci_dbg(xhci, "MWI active\n");
++
++	xhci_dbg(xhci, "Finished xhci_pci_reinit\n");
++	return 0;
++}
++
++/* called during probe() after chip reset completes */
++static int xhci_pci_setup(struct usb_hcd *hcd)
++{
++	struct xhci_hcd		*xhci = hcd_to_xhci(hcd);
++	struct pci_dev		*pdev = to_pci_dev(hcd->self.controller);
++	int			retval;
++
++	xhci->cap_regs = hcd->regs;
++	xhci->op_regs = hcd->regs +
++		HC_LENGTH(xhci_readl(xhci, &xhci->cap_regs->hc_capbase));
++	xhci->run_regs = hcd->regs +
++		(xhci_readl(xhci, &xhci->cap_regs->run_regs_off) & RTSOFF_MASK);
++	/* Cache read-only capability registers */
++	xhci->hcs_params1 = xhci_readl(xhci, &xhci->cap_regs->hcs_params1);
++	xhci->hcs_params2 = xhci_readl(xhci, &xhci->cap_regs->hcs_params2);
++	xhci->hcs_params3 = xhci_readl(xhci, &xhci->cap_regs->hcs_params3);
++	xhci->hcc_params = xhci_readl(xhci, &xhci->cap_regs->hcc_params);
++	xhci_print_registers(xhci);
++
++	/* Make sure the HC is halted. */
++	retval = xhci_halt(xhci);
++	if (retval)
++		return retval;
++
++	xhci_dbg(xhci, "Resetting HCD\n");
++	/* Reset the internal HC memory state and registers. */
++	retval = xhci_reset(xhci);
++	if (retval)
++		return retval;
++	xhci_dbg(xhci, "Reset complete\n");
++
++	xhci_dbg(xhci, "Calling HCD init\n");
++	/* Initialize HCD and host controller data structures. */
++	retval = xhci_init(hcd);
++	if (retval)
++		return retval;
++	xhci_dbg(xhci, "Called HCD init\n");
++
++	pci_read_config_byte(pdev, XHCI_SBRN_OFFSET, &xhci->sbrn);
++	xhci_dbg(xhci, "Got SBRN %u\n", (unsigned int) xhci->sbrn);
++
++	/* Find any debug ports */
++	return xhci_pci_reinit(xhci, pdev);
++}
++
++static const struct hc_driver xhci_pci_hc_driver = {
++	.description =		hcd_name,
++	.product_desc =		"xHCI Host Controller",
++	.hcd_priv_size =	sizeof(struct xhci_hcd),
++
++	/*
++	 * generic hardware linkage
++	 */
++	.flags =		HCD_MEMORY | HCD_USB3,
++
++	/*
++	 * basic lifecycle operations
++	 */
++	.reset =		xhci_pci_setup,
++	.start =		xhci_run,
++	/* suspend and resume implemented later */
++	.stop =			xhci_stop,
++	.shutdown =		xhci_shutdown,
++
++	/*
++	 * scheduling support
++	 */
++	.get_frame_number =	xhci_get_frame,
++
++	/* Implement root hub support later. */
++};
++
++/*-------------------------------------------------------------------------*/
++
++/* PCI driver selection metadata; PCI hotplugging uses this */
++static const struct pci_device_id pci_ids[] = { {
++	/* handle any USB 3.0 xHCI controller */
++	PCI_DEVICE_CLASS(PCI_CLASS_SERIAL_USB_XHCI, ~0),
++	.driver_data =	(unsigned long) &xhci_pci_hc_driver,
++	},
++	{ /* end: all zeroes */ }
++};
++MODULE_DEVICE_TABLE(pci, pci_ids);
++
++/* pci driver glue; this is a "new style" PCI driver module */
++static struct pci_driver xhci_pci_driver = {
++	.name =		(char *) hcd_name,
++	.id_table =	pci_ids,
++
++	.probe =	usb_hcd_pci_probe,
++	.remove =	usb_hcd_pci_remove,
++	/* suspend and resume implemented later */
++
++	.shutdown = 	usb_hcd_pci_shutdown,
++};
++
++int xhci_register_pci()
++{
++	return pci_register_driver(&xhci_pci_driver);
++}
++
++void xhci_unregister_pci()
++{
++	pci_unregister_driver(&xhci_pci_driver);
++}
+--- a/include/linux/pci_ids.h
++++ b/include/linux/pci_ids.h
+@@ -104,6 +104,7 @@
+ #define PCI_CLASS_SERIAL_USB_UHCI	0x0c0300
+ #define PCI_CLASS_SERIAL_USB_OHCI	0x0c0310
+ #define PCI_CLASS_SERIAL_USB_EHCI	0x0c0320
++#define PCI_CLASS_SERIAL_USB_XHCI	0x0c0330
+ #define PCI_CLASS_SERIAL_FIBER		0x0c04
+ #define PCI_CLASS_SERIAL_SMBUS		0x0c05
+ 

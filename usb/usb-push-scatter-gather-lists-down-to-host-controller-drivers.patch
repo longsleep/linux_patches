@@ -1,0 +1,238 @@
+From sarah.a.sharp@linux.intel.com  Tue Apr 28 16:13:34 2009
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Date: Mon, 27 Apr 2009 19:59:01 -0700
+Subject: USB: Push scatter gather lists down to host controller drivers.
+To: Greg KH <greg@kroah.com>
+Message-ID: <20090428025901.GA18165@gamba.jf.intel.com>
+Content-Disposition: inline
+
+
+This is the original patch I created before David Vrabel posted a better
+patch (http://marc.info/?l=linux-usb&m=123377477209109&w=2) that does
+basically the same thing.  This patch will get replaced with his
+(modified) patch later.
+
+Allow USB device drivers that use usb_sg_init() and usb_sg_wait() to push
+bulk endpoint scatter gather lists down to the host controller drivers.
+This allows host controller drivers to more efficiently enqueue these
+transfers, and allows the xHCI host controller to better take advantage of
+USB 3.0 "bursts" for bulk endpoints.
+
+This patch currently only enables scatter gather lists for bulk endpoints.
+Other endpoint types that use the usb_sg_* functions will not have their
+scatter gather lists pushed down to the host controller.  For periodic
+endpoints, we want each scatterlist entry to be a separate transfer.
+Eventually, HCDs could parse these scatter-gather lists for periodic
+endpoints also.  For now, we use the old code and call usb_submit_urb()
+for each scatterlist entry.
+
+The caller of usb_sg_init() can request that all bytes in the scatter
+gather list be transferred by passing in a length of zero.  Handle that
+request for a bulk endpoint under xHCI by walking the scatter gather list
+and calculating the length.  We could let the HCD handle a zero length in
+this case, but I'm not sure if the core layers in between will get
+confused by this.
+
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/hcd.c     |    3 
+ drivers/usb/core/message.c |  139 +++++++++++++++++++++++++++++----------------
+ include/linux/usb.h        |    2 
+ 3 files changed, 95 insertions(+), 49 deletions(-)
+
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -1239,7 +1239,8 @@ static int map_urb_for_dma(struct usb_hc
+ 
+ 	/* Map the URB's buffers for DMA access.
+ 	 * Lower level HCD code should use *_dma exclusively,
+-	 * unless it uses pio or talks to another transport.
++	 * unless it uses pio or talks to another transport,
++	 * or uses the provided scatter gather list for bulk.
+ 	 */
+ 	if (is_root_hub(urb->dev))
+ 		return 0;
+--- a/drivers/usb/core/message.c
++++ b/drivers/usb/core/message.c
+@@ -365,6 +365,7 @@ int usb_sg_init(struct usb_sg_request *i
+ 	int i;
+ 	int urb_flags;
+ 	int dma;
++	int use_sg;
+ 
+ 	if (!io || !dev || !sg
+ 			|| usb_pipecontrol(pipe)
+@@ -392,7 +393,19 @@ int usb_sg_init(struct usb_sg_request *i
+ 	if (io->entries <= 0)
+ 		return io->entries;
+ 
+-	io->urbs = kmalloc(io->entries * sizeof *io->urbs, mem_flags);
++	/* If we're running on an xHCI host controller, queue the whole scatter
++	 * gather list with one call to urb_enqueue().  This is only for bulk,
++	 * as that endpoint type does not care how the data gets broken up
++	 * across frames.
++	 */
++	if (usb_pipebulk(pipe) &&
++			bus_to_hcd(dev->bus)->driver->flags & HCD_USB3) {
++		io->urbs = kmalloc(sizeof *io->urbs, mem_flags);
++		use_sg = true;
++	} else {
++		io->urbs = kmalloc(io->entries * sizeof *io->urbs, mem_flags);
++		use_sg = false;
++	}
+ 	if (!io->urbs)
+ 		goto nomem;
+ 
+@@ -402,62 +415,92 @@ int usb_sg_init(struct usb_sg_request *i
+ 	if (usb_pipein(pipe))
+ 		urb_flags |= URB_SHORT_NOT_OK;
+ 
+-	for_each_sg(sg, sg, io->entries, i) {
+-		unsigned len;
+-
+-		io->urbs[i] = usb_alloc_urb(0, mem_flags);
+-		if (!io->urbs[i]) {
+-			io->entries = i;
++	if (use_sg) {
++		io->urbs[0] = usb_alloc_urb(0, mem_flags);
++		if (!io->urbs[0]) {
++			io->entries = 0;
+ 			goto nomem;
+ 		}
+ 
+-		io->urbs[i]->dev = NULL;
+-		io->urbs[i]->pipe = pipe;
+-		io->urbs[i]->interval = period;
+-		io->urbs[i]->transfer_flags = urb_flags;
+-
+-		io->urbs[i]->complete = sg_complete;
+-		io->urbs[i]->context = io;
+-
+-		/*
+-		 * Some systems need to revert to PIO when DMA is temporarily
+-		 * unavailable.  For their sakes, both transfer_buffer and
+-		 * transfer_dma are set when possible.  However this can only
+-		 * work on systems without:
+-		 *
+-		 *  - HIGHMEM, since DMA buffers located in high memory are
+-		 *    not directly addressable by the CPU for PIO;
+-		 *
+-		 *  - IOMMU, since dma_map_sg() is allowed to use an IOMMU to
+-		 *    make virtually discontiguous buffers be "dma-contiguous"
+-		 *    so that PIO and DMA need diferent numbers of URBs.
+-		 *
+-		 * So when HIGHMEM or IOMMU are in use, transfer_buffer is NULL
+-		 * to prevent stale pointers and to help spot bugs.
+-		 */
+-		if (dma) {
+-			io->urbs[i]->transfer_dma = sg_dma_address(sg);
+-			len = sg_dma_len(sg);
++		io->urbs[0]->dev = NULL;
++		io->urbs[0]->pipe = pipe;
++		io->urbs[0]->interval = period;
++		io->urbs[0]->transfer_flags = urb_flags;
++
++		io->urbs[0]->complete = sg_complete;
++		io->urbs[0]->context = io;
++		/* A length of zero means transfer the whole sg list */
++		io->urbs[0]->transfer_buffer_length = length;
++		if (length == 0) {
++			for_each_sg(sg, sg, io->entries, i) {
++				io->urbs[0]->transfer_buffer_length +=
++					sg_dma_len(sg);
++			}
++		}
++		io->urbs[0]->sg = io;
++		io->urbs[0]->num_sgs = io->entries;
++		io->entries = 1;
++	} else {
++		for_each_sg(sg, sg, io->entries, i) {
++			unsigned len;
++
++			io->urbs[i] = usb_alloc_urb(0, mem_flags);
++			if (!io->urbs[i]) {
++				io->entries = i;
++				goto nomem;
++			}
++
++			io->urbs[i]->dev = NULL;
++			io->urbs[i]->pipe = pipe;
++			io->urbs[i]->interval = period;
++			io->urbs[i]->transfer_flags = urb_flags;
++
++			io->urbs[i]->complete = sg_complete;
++			io->urbs[i]->context = io;
++
++			/*
++			 * Some systems need to revert to PIO when DMA is
++			 * temporarily unavailable.  For their sakes, both
++			 * transfer_buffer and transfer_dma are set when
++			 * possible.  However this can only work on systems
++			 * without:
++			 *
++			 *  - HIGHMEM, since DMA buffers located in high memory
++			 *    are not directly addressable by the CPU for PIO;
++			 *
++			 *  - IOMMU, since dma_map_sg() is allowed to use an
++			 *    IOMMU to make virtually discontiguous buffers be
++			 *    "dma-contiguous" so that PIO and DMA need diferent
++			 *    numbers of URBs.
++			 *
++			 * So when HIGHMEM or IOMMU are in use, transfer_buffer
++			 * is NULL to prevent stale pointers and to help spot
++			 * bugs.
++			 */
++			if (dma) {
++				io->urbs[i]->transfer_dma = sg_dma_address(sg);
++				len = sg_dma_len(sg);
+ #if defined(CONFIG_HIGHMEM) || defined(CONFIG_GART_IOMMU)
+-			io->urbs[i]->transfer_buffer = NULL;
++				io->urbs[i]->transfer_buffer = NULL;
+ #else
+-			io->urbs[i]->transfer_buffer = sg_virt(sg);
++				io->urbs[i]->transfer_buffer = sg_virt(sg);
+ #endif
+-		} else {
+-			/* hc may use _only_ transfer_buffer */
+-			io->urbs[i]->transfer_buffer = sg_virt(sg);
+-			len = sg->length;
+-		}
++			} else {
++				/* hc may use _only_ transfer_buffer */
++				io->urbs[i]->transfer_buffer = sg_virt(sg);
++				len = sg->length;
++			}
+ 
+-		if (length) {
+-			len = min_t(unsigned, len, length);
+-			length -= len;
+-			if (length == 0)
+-				io->entries = i + 1;
++			if (length) {
++				len = min_t(unsigned, len, length);
++				length -= len;
++				if (length == 0)
++					io->entries = i + 1;
++			}
++			io->urbs[i]->transfer_buffer_length = len;
+ 		}
+-		io->urbs[i]->transfer_buffer_length = len;
++		io->urbs[--i]->transfer_flags &= ~URB_NO_INTERRUPT;
+ 	}
+-	io->urbs[--i]->transfer_flags &= ~URB_NO_INTERRUPT;
+ 
+ 	/* transaction state */
+ 	io->count = io->entries;
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -1198,6 +1198,8 @@ struct urb {
+ 	unsigned int transfer_flags;	/* (in) URB_SHORT_NOT_OK | ...*/
+ 	void *transfer_buffer;		/* (in) associated data buffer */
+ 	dma_addr_t transfer_dma;	/* (in) dma addr for transfer_buffer */
++	struct usb_sg_request *sg;	/* (in) scatter gather buffer list */
++	int num_sgs;			/* (in) number of entries in the sg list */
+ 	u32 transfer_buffer_length;	/* (in) data buffer length */
+ 	u32 actual_length;		/* (return) actual transfer length */
+ 	unsigned char *setup_packet;	/* (in) setup packet (control only) */
