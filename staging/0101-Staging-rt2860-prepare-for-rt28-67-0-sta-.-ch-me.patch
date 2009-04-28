@@ -1,0 +1,1279 @@
+From 4fe50ad4ddd8d687ced4a4210be98925db749591 Mon Sep 17 00:00:00 2001
+From: Bartlomiej Zolnierkiewicz <bzolnier@gmail.com>
+Date: Sun, 26 Apr 2009 16:06:29 +0200
+Subject: [PATCH 101/102] Staging: rt2860: prepare for rt28[67]0/sta/*.[ch] merge
+
+Signed-off-by: Bartlomiej Zolnierkiewicz <bzolnier@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+---
+ drivers/staging/rt2860/sta/assoc.c     |  268 +++++++++++++++++++++++++++++++++
+ drivers/staging/rt2860/sta/connect.c   |  198 ++++++++++++++++++++++++
+ drivers/staging/rt2860/sta/rtmp_data.c |  119 ++++++++++++++
+ drivers/staging/rt2860/sta/sync.c      |  100 ++++++++++++
+ drivers/staging/rt2860/sta/wpa.c       |    9 +
+ 5 files changed, 694 insertions(+)
+
+--- a/drivers/staging/rt2860/sta/assoc.c
++++ b/drivers/staging/rt2860/sta/assoc.c
+@@ -454,6 +454,11 @@ VOID MlmeAssocReqAction(
+ 				RSNIe = IE_WPA2;
+ 			}
+ 
++#ifdef RT30xx
++#ifdef SIOCSIWGENIE
++			if (pAd->StaCfg.WpaSupplicantUP != 1)
++#endif // SIOCSIWGENIE //
++#endif
+             RTMPMakeRSNIE(pAd, pAd->StaCfg.AuthMode, pAd->StaCfg.WepStatus, BSS0);
+ 
+             // Check for WPA PMK cache list
+@@ -480,6 +485,17 @@ VOID MlmeAssocReqAction(
+ 				}
+ 			}
+ 
++#ifdef RT30xx
++#ifdef SIOCSIWGENIE
++			if (pAd->StaCfg.WpaSupplicantUP == 1)
++			{
++				MakeOutgoingFrame(pOutBuffer + FrameLen,    		&tmp,
++		                        	pAd->StaCfg.RSNIE_Len,			pAd->StaCfg.RSN_IE,
++		                        	END_OF_ARGS);
++			}
++			else
++#endif
++#endif
+ 			{
+ 				MakeOutgoingFrame(pOutBuffer + FrameLen,    		&tmp,
+ 				              		1,                              &RSNIe,
+@@ -490,6 +506,11 @@ VOID MlmeAssocReqAction(
+ 
+ 			FrameLen += tmp;
+ 
++#ifdef RT30xx
++#ifdef SIOCSIWGENIE
++			if (pAd->StaCfg.WpaSupplicantUP != 1)
++#endif
++#endif
+ 			{
+ 	            // Append Variable IE
+ 	            NdisMoveMemory(pAd->StaCfg.ReqVarIEs + VarIesOffset, &RSNIe, 1);
+@@ -882,6 +903,7 @@ VOID PeerAssocRspAction(
+ 			RTMPCancelTimer(&pAd->MlmeAux.AssocTimer, &TimerCancelled);
+ 			if(Status == MLME_SUCCESS)
+ 			{
++#ifdef RT2860
+ 				// go to procedure listed on page 376
+ 				AssocPostProc(pAd, Addr2, CapabilityInfo, Aid, SupRate, SupRateLen, ExtRate, ExtRateLen,
+ 					&EdcaParm, &HtCapability, HtCapabilityLen, &AddHtInfo);
+@@ -895,7 +917,29 @@ VOID PeerAssocRspAction(
+                     wireless_send_event(pAd->net_dev, SIOCGIWAP, &wrqu, NULL);
+ 
+                 }
++#endif
++#ifdef RT2870
++				UCHAR			MaxSupportedRateIn500Kbps = 0;
++				UCHAR			idx;
++
++				// supported rates array may not be sorted. sort it and find the maximum rate
++			    for (idx=0; idx<SupRateLen; idx++)
++                {
++			        if (MaxSupportedRateIn500Kbps < (SupRate[idx] & 0x7f))
++			            MaxSupportedRateIn500Kbps = SupRate[idx] & 0x7f;
++			    }
++
++				for (idx=0; idx<ExtRateLen; idx++)
++			    {
++			        if (MaxSupportedRateIn500Kbps < (ExtRate[idx] & 0x7f))
++			            MaxSupportedRateIn500Kbps = ExtRate[idx] & 0x7f;
++                }
++				// go to procedure listed on page 376
++				AssocPostProc(pAd, Addr2, CapabilityInfo, Aid, SupRate, SupRateLen, ExtRate, ExtRateLen,
++					&EdcaParm, &HtCapability, HtCapabilityLen, &AddHtInfo);
+ 
++				StaAddMacTableEntry(pAd, &pAd->MacTab.Content[BSSID_WCID], MaxSupportedRateIn500Kbps, &HtCapability, HtCapabilityLen, CapabilityInfo);
++#endif
+ 				pAd->StaCfg.CkipFlag = CkipFlag;
+ 				if (CkipFlag & 0x18)
+ 				{
+@@ -1485,3 +1529,227 @@ int wext_notify_event_assoc(
+ 	return 0;
+ 
+ }
++
++#ifdef RT2870
++BOOLEAN StaAddMacTableEntry(
++	IN  PRTMP_ADAPTER		pAd,
++	IN  PMAC_TABLE_ENTRY	pEntry,
++	IN  UCHAR				MaxSupportedRateIn500Kbps,
++	IN  HT_CAPABILITY_IE	*pHtCapability,
++	IN  UCHAR				HtCapabilityLen,
++	IN  USHORT        		CapabilityInfo)
++{
++	UCHAR            MaxSupportedRate = RATE_11;
++
++	if (ADHOC_ON(pAd))
++		CLIENT_STATUS_CLEAR_FLAG(pEntry, fCLIENT_STATUS_WMM_CAPABLE);
++
++	switch (MaxSupportedRateIn500Kbps)
++    {
++        case 108: MaxSupportedRate = RATE_54;   break;
++        case 96:  MaxSupportedRate = RATE_48;   break;
++        case 72:  MaxSupportedRate = RATE_36;   break;
++        case 48:  MaxSupportedRate = RATE_24;   break;
++        case 36:  MaxSupportedRate = RATE_18;   break;
++        case 24:  MaxSupportedRate = RATE_12;   break;
++        case 18:  MaxSupportedRate = RATE_9;    break;
++        case 12:  MaxSupportedRate = RATE_6;    break;
++        case 22:  MaxSupportedRate = RATE_11;   break;
++        case 11:  MaxSupportedRate = RATE_5_5;  break;
++        case 4:   MaxSupportedRate = RATE_2;    break;
++        case 2:   MaxSupportedRate = RATE_1;    break;
++        default:  MaxSupportedRate = RATE_11;   break;
++    }
++
++    if ((pAd->CommonCfg.PhyMode == PHY_11G) && (MaxSupportedRate < RATE_FIRST_OFDM_RATE))
++        return FALSE;
++
++	// 11n only
++	if (((pAd->CommonCfg.PhyMode == PHY_11N_2_4G) || (pAd->CommonCfg.PhyMode == PHY_11N_5G))&& (HtCapabilityLen == 0))
++		return FALSE;
++
++	if (!pEntry)
++        return FALSE;
++
++	NdisAcquireSpinLock(&pAd->MacTabLock);
++	if (pEntry)
++	{
++		pEntry->PortSecured = WPA_802_1X_PORT_SECURED;
++		if ((MaxSupportedRate < RATE_FIRST_OFDM_RATE) ||
++			(pAd->CommonCfg.PhyMode == PHY_11B))
++		{
++			pEntry->RateLen = 4;
++			if (MaxSupportedRate >= RATE_FIRST_OFDM_RATE)
++				MaxSupportedRate = RATE_11;
++		}
++		else
++			pEntry->RateLen = 12;
++
++		pEntry->MaxHTPhyMode.word = 0;
++		pEntry->MinHTPhyMode.word = 0;
++		pEntry->HTPhyMode.word = 0;
++		pEntry->MaxSupportedRate = MaxSupportedRate;
++		if (pEntry->MaxSupportedRate < RATE_FIRST_OFDM_RATE)
++		{
++			pEntry->MaxHTPhyMode.field.MODE = MODE_CCK;
++			pEntry->MaxHTPhyMode.field.MCS = pEntry->MaxSupportedRate;
++			pEntry->MinHTPhyMode.field.MODE = MODE_CCK;
++			pEntry->MinHTPhyMode.field.MCS = pEntry->MaxSupportedRate;
++			pEntry->HTPhyMode.field.MODE = MODE_CCK;
++			pEntry->HTPhyMode.field.MCS = pEntry->MaxSupportedRate;
++		}
++		else
++		{
++			pEntry->MaxHTPhyMode.field.MODE = MODE_OFDM;
++			pEntry->MaxHTPhyMode.field.MCS = OfdmRateToRxwiMCS[pEntry->MaxSupportedRate];
++			pEntry->MinHTPhyMode.field.MODE = MODE_OFDM;
++			pEntry->MinHTPhyMode.field.MCS = OfdmRateToRxwiMCS[pEntry->MaxSupportedRate];
++			pEntry->HTPhyMode.field.MODE = MODE_OFDM;
++			pEntry->HTPhyMode.field.MCS = OfdmRateToRxwiMCS[pEntry->MaxSupportedRate];
++		}
++		pEntry->CapabilityInfo = CapabilityInfo;
++		CLIENT_STATUS_CLEAR_FLAG(pEntry, fCLIENT_STATUS_AGGREGATION_CAPABLE);
++		CLIENT_STATUS_CLEAR_FLAG(pEntry, fCLIENT_STATUS_PIGGYBACK_CAPABLE);
++	}
++
++	// If this Entry supports 802.11n, upgrade to HT rate.
++	if ((HtCapabilityLen != 0) && (pAd->CommonCfg.PhyMode >= PHY_11ABGN_MIXED))
++	{
++		UCHAR	j, bitmask; //k,bitmask;
++		CHAR    i;
++
++		if (ADHOC_ON(pAd))
++			CLIENT_STATUS_SET_FLAG(pEntry, fCLIENT_STATUS_WMM_CAPABLE);
++		if ((pHtCapability->HtCapInfo.GF) && (pAd->CommonCfg.DesiredHtPhy.GF))
++		{
++			pEntry->MaxHTPhyMode.field.MODE = MODE_HTGREENFIELD;
++		}
++		else
++		{
++			pEntry->MaxHTPhyMode.field.MODE = MODE_HTMIX;
++			pAd->MacTab.fAnyStationNonGF = TRUE;
++			pAd->CommonCfg.AddHTInfo.AddHtInfo2.NonGfPresent = 1;
++		}
++
++		if ((pHtCapability->HtCapInfo.ChannelWidth) && (pAd->CommonCfg.DesiredHtPhy.ChannelWidth))
++		{
++			pEntry->MaxHTPhyMode.field.BW= BW_40;
++			pEntry->MaxHTPhyMode.field.ShortGI = ((pAd->CommonCfg.DesiredHtPhy.ShortGIfor40)&(pHtCapability->HtCapInfo.ShortGIfor40));
++		}
++		else
++		{
++			pEntry->MaxHTPhyMode.field.BW = BW_20;
++			pEntry->MaxHTPhyMode.field.ShortGI = ((pAd->CommonCfg.DesiredHtPhy.ShortGIfor20)&(pHtCapability->HtCapInfo.ShortGIfor20));
++			pAd->MacTab.fAnyStation20Only = TRUE;
++		}
++
++		// 3*3
++		if (pAd->MACVersion >= RALINK_2883_VERSION && pAd->MACVersion < RALINK_3070_VERSION)
++			pEntry->MaxHTPhyMode.field.TxBF = pAd->CommonCfg.RegTransmitSetting.field.TxBF;
++
++		// find max fixed rate
++		for (i=23; i>=0; i--) // 3*3
++		{
++			j = i/8;
++			bitmask = (1<<(i-(j*8)));
++			if ((pAd->StaCfg.DesiredHtPhyInfo.MCSSet[j] & bitmask) && (pHtCapability->MCSSet[j] & bitmask))
++			{
++				pEntry->MaxHTPhyMode.field.MCS = i;
++				break;
++			}
++			if (i==0)
++				break;
++		}
++
++
++		if (pAd->StaCfg.DesiredTransmitSetting.field.MCS != MCS_AUTO)
++		{
++			if (pAd->StaCfg.DesiredTransmitSetting.field.MCS == 32)
++			{
++				// Fix MCS as HT Duplicated Mode
++				pEntry->MaxHTPhyMode.field.BW = 1;
++				pEntry->MaxHTPhyMode.field.MODE = MODE_HTMIX;
++				pEntry->MaxHTPhyMode.field.STBC = 0;
++				pEntry->MaxHTPhyMode.field.ShortGI = 0;
++				pEntry->MaxHTPhyMode.field.MCS = 32;
++			}
++			else if (pEntry->MaxHTPhyMode.field.MCS > pAd->StaCfg.HTPhyMode.field.MCS)
++			{
++				// STA supports fixed MCS
++				pEntry->MaxHTPhyMode.field.MCS = pAd->StaCfg.HTPhyMode.field.MCS;
++			}
++		}
++
++		pEntry->MaxHTPhyMode.field.STBC = (pHtCapability->HtCapInfo.RxSTBC & (pAd->CommonCfg.DesiredHtPhy.TxSTBC));
++		pEntry->MpduDensity = pHtCapability->HtCapParm.MpduDensity;
++		pEntry->MaxRAmpduFactor = pHtCapability->HtCapParm.MaxRAmpduFactor;
++		pEntry->MmpsMode = (UCHAR)pHtCapability->HtCapInfo.MimoPs;
++		pEntry->AMsduSize = (UCHAR)pHtCapability->HtCapInfo.AMsduSize;
++		pEntry->HTPhyMode.word = pEntry->MaxHTPhyMode.word;
++
++		if (pAd->CommonCfg.DesiredHtPhy.AmsduEnable && (pAd->CommonCfg.REGBACapability.field.AutoBA == FALSE))
++			CLIENT_STATUS_SET_FLAG(pEntry, fCLIENT_STATUS_AMSDU_INUSED);
++		if (pHtCapability->HtCapInfo.ShortGIfor20)
++			CLIENT_STATUS_SET_FLAG(pEntry, fCLIENT_STATUS_SGI20_CAPABLE);
++		if (pHtCapability->HtCapInfo.ShortGIfor40)
++			CLIENT_STATUS_SET_FLAG(pEntry, fCLIENT_STATUS_SGI40_CAPABLE);
++		if (pHtCapability->HtCapInfo.TxSTBC)
++			CLIENT_STATUS_SET_FLAG(pEntry, fCLIENT_STATUS_TxSTBC_CAPABLE);
++		if (pHtCapability->HtCapInfo.RxSTBC)
++			CLIENT_STATUS_SET_FLAG(pEntry, fCLIENT_STATUS_RxSTBC_CAPABLE);
++		if (pHtCapability->ExtHtCapInfo.PlusHTC)
++			CLIENT_STATUS_SET_FLAG(pEntry, fCLIENT_STATUS_HTC_CAPABLE);
++		if (pAd->CommonCfg.bRdg && pHtCapability->ExtHtCapInfo.RDGSupport)
++			CLIENT_STATUS_SET_FLAG(pEntry, fCLIENT_STATUS_RDG_CAPABLE);
++		if (pHtCapability->ExtHtCapInfo.MCSFeedback == 0x03)
++			CLIENT_STATUS_SET_FLAG(pEntry, fCLIENT_STATUS_MCSFEEDBACK_CAPABLE);
++	}
++	else
++	{
++		pAd->MacTab.fAnyStationIsLegacy = TRUE;
++	}
++
++	NdisMoveMemory(&pEntry->HTCapability, pHtCapability, sizeof(HT_CAPABILITY_IE));
++
++	pEntry->HTPhyMode.word = pEntry->MaxHTPhyMode.word;
++	pEntry->CurrTxRate = pEntry->MaxSupportedRate;
++
++	// Set asic auto fall back
++	if (pAd->StaCfg.bAutoTxRateSwitch == TRUE)
++	{
++		PUCHAR					pTable;
++		UCHAR					TableSize = 0;
++
++		MlmeSelectTxRateTable(pAd, pEntry, &pTable, &TableSize, &pEntry->CurrTxRateIndex);
++		pEntry->bAutoTxRateSwitch = TRUE;
++	}
++	else
++	{
++		pEntry->HTPhyMode.field.MODE	= pAd->StaCfg.HTPhyMode.field.MODE;
++		pEntry->HTPhyMode.field.MCS	= pAd->StaCfg.HTPhyMode.field.MCS;
++		pEntry->bAutoTxRateSwitch = FALSE;
++
++		// If the legacy mode is set, overwrite the transmit setting of this entry.
++		RTMPUpdateLegacyTxSetting((UCHAR)pAd->StaCfg.DesiredTransmitSetting.field.FixedTxMode, pEntry);
++	}
++
++	pEntry->PortSecured = WPA_802_1X_PORT_SECURED;
++	pEntry->Sst = SST_ASSOC;
++	pEntry->AuthState = AS_AUTH_OPEN;
++	pEntry->AuthMode = pAd->StaCfg.AuthMode;
++	pEntry->WepStatus = pAd->StaCfg.WepStatus;
++
++	NdisReleaseSpinLock(&pAd->MacTabLock);
++
++    {
++        union iwreq_data    wrqu;
++        wext_notify_event_assoc(pAd);
++
++        memset(wrqu.ap_addr.sa_data, 0, MAC_ADDR_LEN);
++        memcpy(wrqu.ap_addr.sa_data, pAd->MlmeAux.Bssid, MAC_ADDR_LEN);
++        wireless_send_event(pAd->net_dev, SIOCGIWAP, &wrqu, NULL);
++
++    }
++	return TRUE;
++}
++#endif /* RT2870 */
+--- a/drivers/staging/rt2860/sta/connect.c
++++ b/drivers/staging/rt2860/sta/connect.c
+@@ -188,6 +188,38 @@ VOID MlmeCntlMachinePerformAction(
+ 				pAd->Mlme.CntlMachine.CurrState = CNTL_IDLE;
+ 			}
+ 			break;
++#ifdef RT2870
++		//
++		// This state is for that we want to connect to an AP but
++		// it didn't find on BSS List table. So we need to scan the air first,
++		// after that we can try to connect to the desired AP if available.
++		//
++		case CNTL_WAIT_SCAN_FOR_CONNECT:
++			if(Elem->MsgType == MT2_SCAN_CONF)
++			{
++				// Resume TxRing after SCANING complete. We hope the out-of-service time
++				// won't be too long to let upper layer time-out the waiting frames
++				RTMPResumeMsduTransmission(pAd);
++#ifdef CCX_SUPPORT
++				if (pAd->StaCfg.CCXReqType != MSRN_TYPE_UNUSED)
++				{
++					// Cisco scan request is finished, prepare beacon report
++					MlmeEnqueue(pAd, AIRONET_STATE_MACHINE, MT2_AIRONET_SCAN_DONE, 0, NULL);
++				}
++#endif // CCX_SUPPORT //
++				pAd->Mlme.CntlMachine.CurrState = CNTL_IDLE;
++
++				//
++				// Check if we can connect to.
++				//
++				BssTableSsidSort(pAd, &pAd->MlmeAux.SsidBssTab, pAd->MlmeAux.AutoReconnectSsid, pAd->MlmeAux.AutoReconnectSsidLen);
++				if (pAd->MlmeAux.SsidBssTab.BssNr > 0)
++				{
++					MlmeAutoReconnectLastSSID(pAd);
++				}
++			}
++			break;
++#endif // RT2870 //
+ 		default:
+ 			DBGPRINT_ERR(("!ERROR! CNTL - Illegal message type(=%ld)", Elem->MsgType));
+ 			break;
+@@ -309,9 +341,11 @@ VOID CntlOidSsidProc(
+ 	MLME_DISASSOC_REQ_STRUCT   DisassocReq;
+ 	ULONG					   Now;
+ 
++#ifdef RT2860
+ 	// BBP and RF are not accessible in PS mode, we has to wake them up first
+ 	if (OPSTATUS_TEST_FLAG(pAd, fOP_STATUS_DOZE))
+ 		AsicForceWakeup(pAd, RTMP_HALT);
++#endif
+ 
+ 	// Step 1. record the desired user settings to MlmeAux
+ 	NdisZeroMemory(pAd->MlmeAux.Ssid, MAX_LEN_OF_SSID);
+@@ -1024,6 +1058,44 @@ VOID CntlWaitReassocProc(
+ 	}
+ }
+ 
++
++#ifdef RT2870
++VOID	AdhocTurnOnQos(
++	IN  PRTMP_ADAPTER pAd)
++{
++#define AC0_DEF_TXOP		0
++#define AC1_DEF_TXOP		0
++#define AC2_DEF_TXOP		94
++#define AC3_DEF_TXOP		47
++
++	// Turn on QOs if use HT rate.
++	if (pAd->CommonCfg.APEdcaParm.bValid == FALSE)
++	{
++		pAd->CommonCfg.APEdcaParm.bValid = TRUE;
++		pAd->CommonCfg.APEdcaParm.Aifsn[0] = 3;
++		pAd->CommonCfg.APEdcaParm.Aifsn[1] = 7;
++		pAd->CommonCfg.APEdcaParm.Aifsn[2] = 1;
++		pAd->CommonCfg.APEdcaParm.Aifsn[3] = 1;
++
++		pAd->CommonCfg.APEdcaParm.Cwmin[0] = 4;
++		pAd->CommonCfg.APEdcaParm.Cwmin[1] = 4;
++		pAd->CommonCfg.APEdcaParm.Cwmin[2] = 3;
++		pAd->CommonCfg.APEdcaParm.Cwmin[3] = 2;
++
++		pAd->CommonCfg.APEdcaParm.Cwmax[0] = 10;
++		pAd->CommonCfg.APEdcaParm.Cwmax[1] = 6;
++		pAd->CommonCfg.APEdcaParm.Cwmax[2] = 4;
++		pAd->CommonCfg.APEdcaParm.Cwmax[3] = 3;
++
++		pAd->CommonCfg.APEdcaParm.Txop[0]  = 0;
++		pAd->CommonCfg.APEdcaParm.Txop[1]  = 0;
++		pAd->CommonCfg.APEdcaParm.Txop[2]  = AC2_DEF_TXOP;
++		pAd->CommonCfg.APEdcaParm.Txop[3]  = AC3_DEF_TXOP;
++	}
++	AsicSetEdcaParm(pAd, &pAd->CommonCfg.APEdcaParm);
++}
++#endif /* RT2870 */
++
+ /*
+ 	==========================================================================
+ 	Description:
+@@ -1042,12 +1114,14 @@ VOID LinkUp(
+ 	UCHAR	Value = 0, idx;
+ 	MAC_TABLE_ENTRY *pEntry = NULL, *pCurrEntry;
+ 
++#ifdef RT2860
+ 	if (RTMP_TEST_PSFLAG(pAd, fRTMP_PS_SET_PCI_CLK_OFF_COMMAND))
+ 	{
+ 		RTMPPCIeLinkCtrlValueRestore(pAd, RESTORE_HALT);
+ 		RTMPusecDelay(6000);
+ 		pAd->bPCIclkOff = FALSE;
+ 	}
++#endif
+ 
+ 	pEntry = &pAd->MacTab.Content[BSSID_WCID];
+ 
+@@ -1072,6 +1146,7 @@ VOID LinkUp(
+ 	//rt2860b. Don't know why need this
+ 	SwitchBetweenWepAndCkip(pAd);
+ 
++#ifdef RT2860
+ 	// Before power save before link up function, We will force use 1R.
+ 	// So after link up, check Rx antenna # again.
+ 	RTMP_BBP_IO_READ8_BY_REG_ID(pAd, BBP_R3, &Value);
+@@ -1089,12 +1164,31 @@ VOID LinkUp(
+ 	}
+ 	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R3, Value);
+ 	pAd->StaCfg.BBPR3 = Value;
++#endif /* RT2860 */
+ 
+ 	if (BssType == BSS_ADHOC)
+ 	{
+ 		OPSTATUS_SET_FLAG(pAd, fOP_STATUS_ADHOC_ON);
+ 		OPSTATUS_CLEAR_FLAG(pAd, fOP_STATUS_INFRA_ON);
+ 
++#ifdef RT30xx
++		if ((pAd->CommonCfg.HtCapability.HtCapInfo.ChannelWidth  == BW_40) &&
++			(pAd->CommonCfg.AddHTInfo.AddHtInfo.ExtChanOffset == EXTCHA_ABOVE))
++		{
++			pAd->CommonCfg.CentralChannel = pAd->CommonCfg.Channel + 2;
++		}
++		else if ((pAd->CommonCfg.Channel > 2) &&
++				 (pAd->CommonCfg.HtCapability.HtCapInfo.ChannelWidth  == BW_40) &&
++				 (pAd->CommonCfg.AddHTInfo.AddHtInfo.ExtChanOffset == EXTCHA_BELOW))
++		{
++			pAd->CommonCfg.CentralChannel = pAd->CommonCfg.Channel - 2;
++		}
++#endif
++#ifdef RT2870
++		if (pAd->CommonCfg.PhyMode >= PHY_11ABGN_MIXED)
++			AdhocTurnOnQos(pAd);
++#endif
++
+ 		DBGPRINT(RT_DEBUG_TRACE, ("!!!Adhoc LINK UP !!! \n" ));
+ 	}
+ 	else
+@@ -1129,7 +1223,9 @@ VOID LinkUp(
+ 		RTMP_BBP_IO_READ8_BY_REG_ID(pAd, BBP_R3, &Value);
+ 		Value &= (~0x20);
+ 		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R3, Value);
++#ifdef RT2860
+         pAd->StaCfg.BBPR3 = Value;
++#endif
+ 
+ 		RTMP_IO_READ32(pAd, TX_BAND_CFG, &Data);
+ 		Data &= 0xfffffffe;
+@@ -1164,7 +1260,9 @@ VOID LinkUp(
+ 		RTMP_BBP_IO_READ8_BY_REG_ID(pAd, BBP_R3, &Value);
+ 	    Value |= (0x20);
+ 		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R3, Value);
++#ifdef RT2860
+         pAd->StaCfg.BBPR3 = Value;
++#endif
+ 
+ 		if (pAd->MACVersion == 0x28600100)
+ 		{
+@@ -1194,7 +1292,9 @@ VOID LinkUp(
+ 		RTMP_BBP_IO_READ8_BY_REG_ID(pAd, BBP_R3, &Value);
+ 		Value &= (~0x20);
+ 		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R3, Value);
++#ifdef RT2860
+         pAd->StaCfg.BBPR3 = Value;
++#endif
+ 
+ 		if (pAd->MACVersion == 0x28600100)
+ 		{
+@@ -1384,7 +1484,9 @@ VOID LinkUp(
+ 			IV |= (pAd->StaCfg.DefaultKeyId << 30);
+ 			AsicUpdateWCIDIVEIV(pAd, BSSID_WCID, IV, 0);
+ 
++#ifdef RT2860
+ 			RTMP_CLEAR_PSFLAG(pAd, fRTMP_PS_CAN_GO_SLEEP);
++#endif
+ 		}
+ 		// NOTE:
+ 		// the decision of using "short slot time" or not may change dynamically due to
+@@ -1465,9 +1567,14 @@ VOID LinkUp(
+ 		{
+ 			pAd->IndicateMediaState = NdisMediaStateConnected;
+ 			pAd->ExtraInfo = GENERAL_LINK_UP;
++#ifdef RT2870
++			RTMP_IndicateMediaState(pAd);
++#endif
+ 		}
+         // --
++#ifdef RT2860
+ 		RTMP_IndicateMediaState(pAd);
++#endif
+ 
+ 		// Add BSSID in my MAC Table.
+         NdisAcquireSpinLock(&pAd->MacTabLock);
+@@ -1478,6 +1585,9 @@ VOID LinkUp(
+ 		pAd->MacTab.Size = 1;	// infra mode always set MACtab size =1.
+ 		pAd->MacTab.Content[BSSID_WCID].Sst = SST_ASSOC;
+ 		pAd->MacTab.Content[BSSID_WCID].AuthState = SST_ASSOC;
++#ifdef RT30xx
++		pAd->MacTab.Content[BSSID_WCID].AuthMode = pAd->StaCfg.AuthMode;
++#endif
+ 		pAd->MacTab.Content[BSSID_WCID].WepStatus = pAd->StaCfg.WepStatus;
+         NdisReleaseSpinLock(&pAd->MacTabLock);
+ 
+@@ -1601,8 +1711,15 @@ VOID LinkUp(
+ 	// Txop can only be modified when RDG is off, WMM is disable and TxBurst is enable
+ 	//
+ 	// if 1. Legacy AP WMM on,  or 2. 11n AP, AMPDU disable.  Force turn off burst no matter what bEnableTxBurst is.
++#ifdef RT30xx
++	if (!((pAd->CommonCfg.RxStream == 1)&&(pAd->CommonCfg.TxStream == 1)) &&
++		(((pAd->StaActive.SupportedPhyInfo.bHtEnable == FALSE) && OPSTATUS_TEST_FLAG(pAd, fOP_STATUS_WMM_INUSED))
++		|| ((pAd->StaActive.SupportedPhyInfo.bHtEnable == TRUE) && (pAd->CommonCfg.BACapability.field.Policy == BA_NOTUSE))))
++#endif
++#ifndef RT30xx
+ 	if (((pAd->StaActive.SupportedPhyInfo.bHtEnable == FALSE) && (OPSTATUS_TEST_FLAG(pAd, fOP_STATUS_WMM_INUSED)))
+ 		|| ((pAd->StaActive.SupportedPhyInfo.bHtEnable == TRUE) && (pAd->CommonCfg.BACapability.field.Policy == BA_NOTUSE)))
++#endif
+ 	{
+ 		RTMP_IO_READ32(pAd, EDCA_AC0_CFG, &Data);
+ 		Data  &= 0xFFFFFF00;
+@@ -1684,7 +1801,9 @@ VOID LinkUp(
+ 	}
+ 
+ 	RTMP_CLEAR_FLAG(pAd, fRTMP_ADAPTER_BSS_SCAN_IN_PROGRESS);
++#ifdef RT2860
+ 	RTMP_CLEAR_PSFLAG(pAd, fRTMP_PS_GO_TO_SLEEP_NOW);
++#endif
+ }
+ 
+ /*
+@@ -1717,17 +1836,21 @@ VOID LinkDown(
+ 	IN  BOOLEAN      IsReqFromAP)
+ {
+ 	UCHAR			    i, ByteValue = 0;
++#ifdef RT2860
+ 	BOOLEAN		Cancelled;
++#endif
+ 
+ 	// Do nothing if monitor mode is on
+ 	if (MONITOR_ON(pAd))
+ 		return;
+ 
++#ifdef RT2860
+ 	RTMP_CLEAR_PSFLAG(pAd, fRTMP_PS_GO_TO_SLEEP_NOW);
+ 	RTMPCancelTimer(&pAd->Mlme.PsPollTimer,		&Cancelled);
+ 
+ 	// Not allow go to sleep within linkdown function.
+ 	RTMP_CLEAR_PSFLAG(pAd, fRTMP_PS_CAN_GO_SLEEP);
++#endif
+ 
+     if (pAd->CommonCfg.bWirelessEvent)
+ 	{
+@@ -1737,6 +1860,7 @@ VOID LinkDown(
+ 	DBGPRINT(RT_DEBUG_TRACE, ("!!! LINK DOWN !!!\n"));
+ 	OPSTATUS_CLEAR_FLAG(pAd, fOP_STATUS_AGGREGATION_INUSED);
+ 
++#ifdef RT2860
+     if (OPSTATUS_TEST_FLAG(pAd, fOP_STATUS_ADVANCE_POWER_SAVE_PCIE_DEVICE))
+     {
+ 	    BOOLEAN Cancelled;
+@@ -1753,6 +1877,7 @@ VOID LinkDown(
+     }
+ 
+     pAd->bPCIclkOff = FALSE;
++#endif
+ 	if (ADHOC_ON(pAd))		// Adhoc mode link down
+ 	{
+ 		DBGPRINT(RT_DEBUG_TRACE, ("!!! LINK DOWN 1!!!\n"));
+@@ -1898,13 +2023,18 @@ VOID LinkDown(
+ 	// Update extra information to link is up
+ 	pAd->ExtraInfo = GENERAL_LINK_DOWN;
+ 
++#ifdef RT2860
+     pAd->StaCfg.AdhocBOnlyJoined = FALSE;
+ 	pAd->StaCfg.AdhocBGJoined = FALSE;
+ 	pAd->StaCfg.Adhoc20NJoined = FALSE;
++#endif
+     pAd->StaActive.SupportedPhyInfo.bHtEnable = FALSE;
+ 
+ 	// Reset the Current AP's IP address
+ 	NdisZeroMemory(pAd->StaCfg.AironetIPAddress, 4);
++#ifdef RT2870
++	pAd->bUsbTxBulkAggre = FALSE;
++#endif // RT2870 //
+ 
+ 	// Clean association information
+ 	NdisZeroMemory(&pAd->StaCfg.AssocInfo, sizeof(NDIS_802_11_ASSOCIATION_INFORMATION));
+@@ -1960,14 +2090,32 @@ VOID LinkDown(
+ 	RTMP_IO_WRITE32(pAd, MAX_LEN_CFG, 0x1fff);
+ 	RTMP_CLEAR_FLAG(pAd, fRTMP_ADAPTER_BSS_SCAN_IN_PROGRESS);
+ 
++#ifdef RT2860
+ 	// Allow go to sleep after linkdown steps.
+ 	RTMP_SET_PSFLAG(pAd, fRTMP_PS_CAN_GO_SLEEP);
++#endif
+ 
+ 	{
+ 		union iwreq_data    wrqu;
+ 		memset(wrqu.ap_addr.sa_data, 0, MAC_ADDR_LEN);
+ 		wireless_send_event(pAd->net_dev, SIOCGIWAP, &wrqu, NULL);
+ 	}
++
++#ifdef RT30xx
++	if (IS_RT3090(pAd))
++	{
++		UINT32				macdata;
++		// disable MMPS BBP control register
++		RTMP_BBP_IO_READ8_BY_REG_ID(pAd, BBP_R3, &ByteValue);
++		ByteValue &= ~(0x04);	//bit 2
++		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R3, ByteValue);
++
++		// disable MMPS MAC control register
++		RTMP_IO_READ32(pAd, 0x1210, &macdata);
++		macdata &= ~(0x09);	//bit 0, 3
++		RTMP_IO_WRITE32(pAd, 0x1210, macdata);
++	}
++#endif // RT30xx //
+ }
+ 
+ /*
+@@ -2173,21 +2321,61 @@ VOID AuthParmFill(
+ 
+ 	==========================================================================
+  */
++
++
++#ifdef RT2870
++
++VOID MlmeCntlConfirm(
++	IN PRTMP_ADAPTER pAd,
++	IN ULONG MsgType,
++	IN USHORT Msg)
++{
++	MlmeEnqueue(pAd, MLME_CNTL_STATE_MACHINE, MsgType, sizeof(USHORT), &Msg);
++}
++#endif
++
+ VOID ComposePsPoll(
+ 	IN PRTMP_ADAPTER pAd)
+ {
++#ifdef RT2870
++	PTXINFO_STRUC		pTxInfo;
++	PTXWI_STRUC		pTxWI;
++
++	DBGPRINT(RT_DEBUG_TRACE, ("ComposePsPoll\n"));
++#endif
+ 	NdisZeroMemory(&pAd->PsPollFrame, sizeof(PSPOLL_FRAME));
++
++#ifdef RT2870
++	pAd->PsPollFrame.FC.PwrMgmt = 0;
++#endif
+ 	pAd->PsPollFrame.FC.Type = BTYPE_CNTL;
+ 	pAd->PsPollFrame.FC.SubType = SUBTYPE_PS_POLL;
+ 	pAd->PsPollFrame.Aid = pAd->StaActive.Aid | 0xC000;
+ 	COPY_MAC_ADDR(pAd->PsPollFrame.Bssid, pAd->CommonCfg.Bssid);
+ 	COPY_MAC_ADDR(pAd->PsPollFrame.Ta, pAd->CurrentAddress);
++
++#ifdef RT2870
++	RTMPZeroMemory(&pAd->PsPollContext.TransferBuffer->field.WirelessPacket[0], 100);
++	pTxInfo = (PTXINFO_STRUC)&pAd->PsPollContext.TransferBuffer->field.WirelessPacket[0];
++	RTMPWriteTxInfo(pAd, pTxInfo, (USHORT)(sizeof(PSPOLL_FRAME)+TXWI_SIZE), TRUE, EpToQueue[MGMTPIPEIDX], FALSE,  FALSE);
++	pTxWI = (PTXWI_STRUC)&pAd->PsPollContext.TransferBuffer->field.WirelessPacket[TXINFO_SIZE];
++	RTMPWriteTxWI(pAd, pTxWI, FALSE, FALSE, FALSE, FALSE, TRUE, FALSE, 0, BSSID_WCID, (sizeof(PSPOLL_FRAME)),
++		0,  0, (UCHAR)pAd->CommonCfg.MlmeTransmit.field.MCS, IFS_BACKOFF, FALSE, &pAd->CommonCfg.MlmeTransmit);
++	RTMPMoveMemory(&pAd->PsPollContext.TransferBuffer->field.WirelessPacket[TXWI_SIZE+TXINFO_SIZE], &pAd->PsPollFrame, sizeof(PSPOLL_FRAME));
++	// Append 4 extra zero bytes.
++	pAd->PsPollContext.BulkOutSize =  TXINFO_SIZE + TXWI_SIZE + sizeof(PSPOLL_FRAME) + 4;
++#endif
+ }
+ 
+ // IRQL = DISPATCH_LEVEL
+ VOID ComposeNullFrame(
+ 	IN PRTMP_ADAPTER pAd)
+ {
++#ifdef RT2870
++	PTXINFO_STRUC		pTxInfo;
++	PTXWI_STRUC		pTxWI;
++#endif
++
+ 	NdisZeroMemory(&pAd->NullFrame, sizeof(HEADER_802_11));
+ 	pAd->NullFrame.FC.Type = BTYPE_DATA;
+ 	pAd->NullFrame.FC.SubType = SUBTYPE_NULL_FUNC;
+@@ -2195,6 +2383,16 @@ VOID ComposeNullFrame(
+ 	COPY_MAC_ADDR(pAd->NullFrame.Addr1, pAd->CommonCfg.Bssid);
+ 	COPY_MAC_ADDR(pAd->NullFrame.Addr2, pAd->CurrentAddress);
+ 	COPY_MAC_ADDR(pAd->NullFrame.Addr3, pAd->CommonCfg.Bssid);
++#ifdef RT2870
++	RTMPZeroMemory(&pAd->NullContext.TransferBuffer->field.WirelessPacket[0], 100);
++	pTxInfo = (PTXINFO_STRUC)&pAd->NullContext.TransferBuffer->field.WirelessPacket[0];
++	RTMPWriteTxInfo(pAd, pTxInfo, (USHORT)(sizeof(HEADER_802_11)+TXWI_SIZE), TRUE, EpToQueue[MGMTPIPEIDX], FALSE,  FALSE);
++	pTxWI = (PTXWI_STRUC)&pAd->NullContext.TransferBuffer->field.WirelessPacket[TXINFO_SIZE];
++	RTMPWriteTxWI(pAd, pTxWI, FALSE, FALSE, FALSE, FALSE, TRUE, FALSE, 0, BSSID_WCID, (sizeof(HEADER_802_11)),
++		0, 0, (UCHAR)pAd->CommonCfg.MlmeTransmit.field.MCS, IFS_BACKOFF, FALSE, &pAd->CommonCfg.MlmeTransmit);
++	RTMPMoveMemory(&pAd->NullContext.TransferBuffer->field.WirelessPacket[TXWI_SIZE+TXINFO_SIZE], &pAd->NullFrame, sizeof(HEADER_802_11));
++	pAd->NullContext.BulkOutSize =  TXINFO_SIZE + TXWI_SIZE + sizeof(pAd->NullFrame) + 4;
++#endif
+ }
+ 
+ 
+--- a/drivers/staging/rt2860/sta/rtmp_data.c
++++ b/drivers/staging/rt2860/sta/rtmp_data.c
+@@ -74,6 +74,7 @@ VOID STARxEAPOLFrameIndicate(
+ 
+                     if (pAd->StaCfg.DesireSharedKey[idx].KeyLen > 0)
+     				{
++#ifdef RT2860
+ 						MAC_TABLE_ENTRY *pEntry = &pAd->MacTab.Content[BSSID_WCID];
+ 
+ 						// Set key material and cipherAlg to Asic
+@@ -87,6 +88,32 @@ VOID STARxEAPOLFrameIndicate(
+ 
+                         pAd->IndicateMediaState = NdisMediaStateConnected;
+                         pAd->ExtraInfo = GENERAL_LINK_UP;
++#endif
++#ifdef RT2870
++						union
++						{
++							char buf[sizeof(NDIS_802_11_WEP)+MAX_LEN_OF_KEY- 1];
++							NDIS_802_11_WEP keyinfo;
++						}  WepKey;
++						int len;
++
++
++						NdisZeroMemory(&WepKey, sizeof(WepKey));
++						len =pAd->StaCfg.DesireSharedKey[idx].KeyLen;
++
++						NdisMoveMemory(WepKey.keyinfo.KeyMaterial,
++							pAd->StaCfg.DesireSharedKey[idx].Key,
++							pAd->StaCfg.DesireSharedKey[idx].KeyLen);
++
++						WepKey.keyinfo.KeyIndex = 0x80000000 + idx;
++						WepKey.keyinfo.KeyLength = len;
++						pAd->SharedKey[BSS0][idx].KeyLen =(UCHAR) (len <= 5 ? 5 : 13);
++
++						pAd->IndicateMediaState = NdisMediaStateConnected;
++						pAd->ExtraInfo = GENERAL_LINK_UP;
++						// need to enqueue cmd to thread
++						RTUSBEnqueueCmdFromNdis(pAd, OID_802_11_ADD_WEP, TRUE, &WepKey, sizeof(WepKey.keyinfo) + len - 1);
++#endif // RT2870 //
+ 						// For Preventing ShardKey Table is cleared by remove key procedure.
+     					pAd->SharedKey[BSS0][idx].CipherAlg = CipherAlg;
+ 						pAd->SharedKey[BSS0][idx].KeyLen = pAd->StaCfg.DesireSharedKey[idx].KeyLen;
+@@ -548,7 +575,13 @@ VOID STAHandleRxMgmtFrame(
+ 	{
+ 
+ 		// We should collect RSSI not only U2M data but also my beacon
++#ifdef RT30xx
++		if ((pHeader->FC.SubType == SUBTYPE_BEACON) && (MAC_ADDR_EQUAL(&pAd->CommonCfg.Bssid, &pHeader->Addr2))
++			&& (pAd->RxAnt.EvaluatePeriod == 0))
++#endif
++#ifndef RT30xx
+ 		if ((pHeader->FC.SubType == SUBTYPE_BEACON) && (MAC_ADDR_EQUAL(&pAd->CommonCfg.Bssid, &pHeader->Addr2)))
++#endif
+ 		{
+ 			Update_Rssi_Sample(pAd, &pAd->StaCfg.RssiSample, pRxWI);
+ 
+@@ -556,6 +589,18 @@ VOID STAHandleRxMgmtFrame(
+ 			pAd->StaCfg.LastSNR1 = (UCHAR)(pRxWI->SNR1);
+ 		}
+ 
++#ifdef RT30xx
++		// collect rssi information for antenna diversity
++		if (pAd->NicConfig2.field.AntDiversity)
++		{
++			if ((pRxD->U2M) || ((pHeader->FC.SubType == SUBTYPE_BEACON) && (MAC_ADDR_EQUAL(&pAd->CommonCfg.Bssid, &pHeader->Addr2))))
++			{
++					COLLECT_RX_ANTENNA_AVERAGE_RSSI(pAd, ConvertToRssi(pAd, (UCHAR)pRxWI->RSSI0, RSSI_0), 0); //Note: RSSI2 not used on RT73
++					pAd->StaCfg.NumOfAvgRssiSample ++;
++			}
++		}
++#endif // RT30xx //
++
+ 		// First check the size, it MUST not exceed the mlme queue size
+ 		if (pRxWI->MPDUtotalByteCount > MGMT_DMA_BUFFER_SIZE)
+ 		{
+@@ -643,12 +688,14 @@ BOOLEAN STARxDoneInterruptHandle(
+ 			break;
+ 		}
+ 
++#ifdef RT2860
+ 		if (RxProcessed++ > MAX_RX_PROCESS_CNT)
+ 		{
+ 			// need to reschedule rx handle
+ 			bReschedule = TRUE;
+ 			break;
+ 		}
++#endif
+ 
+ 		RxProcessed ++; // test
+ 
+@@ -738,6 +785,7 @@ BOOLEAN STARxDoneInterruptHandle(
+ 		}
+ 	}
+ 
++#ifdef RT2860
+ 	// fRTMP_PS_GO_TO_SLEEP_NOW is set if receiving beacon.
+ 	if (RTMP_TEST_PSFLAG(pAd, fRTMP_PS_GO_TO_SLEEP_NOW) && (INFRA_ON(pAd)))
+ 	{
+@@ -745,6 +793,7 @@ BOOLEAN STARxDoneInterruptHandle(
+ 		AsicSleepThenAutoWakeup(pAd, pAd->ThisTbttNumToNextWakeUp);
+ 		bReschedule = FALSE;
+ 	}
++#endif
+ 	return bReschedule;
+ }
+ 
+@@ -762,7 +811,12 @@ BOOLEAN STARxDoneInterruptHandle(
+ VOID	RTMPHandleTwakeupInterrupt(
+ 	IN PRTMP_ADAPTER pAd)
+ {
++#ifdef RT2860
+ 	AsicForceWakeup(pAd, DOT11POWERSAVE);
++#endif
++#ifdef RT2870
++	AsicForceWakeup(pAd, FALSE);
++#endif
+ }
+ 
+ /*
+@@ -1011,7 +1065,13 @@ NDIS_STATUS STASendPacket(
+ 	//
+ 	UserPriority = 0;
+ 	QueIdx		 = QID_AC_BE;
++#ifdef RT2860
+ 	if (OPSTATUS_TEST_FLAG(pAd, fOP_STATUS_WMM_INUSED))
++#endif
++#ifdef RT2870
++	if (OPSTATUS_TEST_FLAG(pAd, fOP_STATUS_WMM_INUSED) &&
++		CLIENT_STATUS_TEST_FLAG(pEntry, fCLIENT_STATUS_WMM_CAPABLE))
++#endif
+ 	{
+ 		USHORT Protocol;
+ 		UCHAR  LlcSnapLen = 0, Byte0, Byte1;
+@@ -1075,7 +1135,12 @@ NDIS_STATUS STASendPacket(
+ 	RTMP_IRQ_UNLOCK(&pAd->irq_lock, IrqFlags);
+ 
+     if ((pAd->CommonCfg.BACapability.field.AutoBA == TRUE)&&
++#ifdef RT2860
+         (pAd->StaActive.SupportedPhyInfo.bHtEnable == TRUE))
++#endif
++#ifdef RT2870
++        IS_HT_STA(pEntry))
++#endif
+ 	{
+ 		if (((pEntry->TXBAbitmap & (1<<UserPriority)) == 0) &&
+             ((pEntry->BADeclineBitmap & (1<<UserPriority)) == 0) &&
+@@ -1119,14 +1184,27 @@ NDIS_STATUS STASendPacket(
+ 
+ 	========================================================================
+ */
++
++#ifdef RT2870
++/*
++	Actually, this function used to check if the TxHardware Queue still has frame need to send.
++	If no frame need to send, go to sleep, else, still wake up.
++*/
++#endif
+ NDIS_STATUS RTMPFreeTXDRequest(
+ 	IN		PRTMP_ADAPTER	pAd,
+ 	IN		UCHAR			QueIdx,
+ 	IN		UCHAR			NumberRequired,
+ 	IN		PUCHAR			FreeNumberIs)
+ {
++#ifdef RT2860
+ 	ULONG		FreeNumber = 0;
++#endif
+ 	NDIS_STATUS 	Status = NDIS_STATUS_FAILURE;
++#ifdef RT2870
++	unsigned long   IrqFlags;
++	HT_TX_CONTEXT	*pHTTXContext;
++#endif
+ 
+ 	switch (QueIdx)
+ 	{
+@@ -1135,6 +1213,7 @@ NDIS_STATUS RTMPFreeTXDRequest(
+ 		case QID_AC_VI:
+ 		case QID_AC_VO:
+ 		case QID_HCCA:
++#ifdef RT2860
+ 			if (pAd->TxRing[QueIdx].TxSwFreeIdx > pAd->TxRing[QueIdx].TxCpuIdx)
+ 				FreeNumber = pAd->TxRing[QueIdx].TxSwFreeIdx - pAd->TxRing[QueIdx].TxCpuIdx - 1;
+ 			else
+@@ -1142,9 +1221,27 @@ NDIS_STATUS RTMPFreeTXDRequest(
+ 
+ 			if (FreeNumber >= NumberRequired)
+ 				Status = NDIS_STATUS_SUCCESS;
++#endif
++#ifdef RT2870
++			{
++				pHTTXContext = &pAd->TxContext[QueIdx];
++				RTMP_IRQ_LOCK(&pAd->TxContextQueueLock[QueIdx], IrqFlags);
++				if ((pHTTXContext->CurWritePosition != pHTTXContext->ENextBulkOutPosition) ||
++					(pHTTXContext->IRPPending == TRUE))
++				{
++					Status = NDIS_STATUS_FAILURE;
++				}
++				else
++				{
++					Status = NDIS_STATUS_SUCCESS;
++				}
++				RTMP_IRQ_UNLOCK(&pAd->TxContextQueueLock[QueIdx], IrqFlags);
++			}
++#endif
+ 			break;
+ 
+ 		case QID_MGMT:
++#ifdef RT2860
+ 			if (pAd->MgmtRing.TxSwFreeIdx > pAd->MgmtRing.TxCpuIdx)
+ 				FreeNumber = pAd->MgmtRing.TxSwFreeIdx - pAd->MgmtRing.TxCpuIdx - 1;
+ 			else
+@@ -1152,13 +1249,22 @@ NDIS_STATUS RTMPFreeTXDRequest(
+ 
+ 			if (FreeNumber >= NumberRequired)
+ 				Status = NDIS_STATUS_SUCCESS;
++#endif
++#ifdef RT2870
++			if (pAd->MgmtRing.TxSwFreeIdx != MGMT_RING_SIZE)
++				Status = NDIS_STATUS_FAILURE;
++			else
++				Status = NDIS_STATUS_SUCCESS;
++#endif
+ 			break;
+ 
+ 		default:
+ 			DBGPRINT(RT_DEBUG_ERROR,("RTMPFreeTXDRequest::Invalid QueIdx(=%d)\n", QueIdx));
+ 			break;
+ 	}
++#ifdef RT2860
+ 	*FreeNumberIs = (UCHAR)FreeNumber;
++#endif
+ 
+ 	return (Status);
+ }
+@@ -1689,7 +1795,9 @@ VOID STA_AMPDU_Frame_Tx(
+ 		//
+ 		// Kick out Tx
+ 		//
++#ifdef RT2860
+ 		if (!RTMP_TEST_PSFLAG(pAd, fRTMP_PS_DISABLE_TX))
++#endif
+ 			HAL_KickOutTx(pAd, pTxBlk, pTxBlk->QueIdx);
+ 
+ 		pAd->RalinkCounters.KickTxCount++;
+@@ -1820,7 +1928,9 @@ VOID STA_AMSDU_Frame_Tx(
+ 	//
+ 	// Kick out Tx
+ 	//
++#ifdef RT2860
+ 	if (!RTMP_TEST_PSFLAG(pAd, fRTMP_PS_DISABLE_TX))
++#endif
+ 		HAL_KickOutTx(pAd, pTxBlk, pTxBlk->QueIdx);
+ }
+ 
+@@ -1940,7 +2050,9 @@ VOID STA_Legacy_Frame_Tx(
+ 	//
+ 	// Kick out Tx
+ 	//
++#ifdef RT2860
+ 	if (!RTMP_TEST_PSFLAG(pAd, fRTMP_PS_DISABLE_TX))
++#endif
+ 		HAL_KickOutTx(pAd, pTxBlk, pTxBlk->QueIdx);
+ }
+ 
+@@ -2051,7 +2163,9 @@ VOID STA_ARalink_Frame_Tx(
+ 	//
+ 	// Kick out Tx
+ 	//
++#ifdef RT2860
+ 	if (!RTMP_TEST_PSFLAG(pAd, fRTMP_PS_DISABLE_TX))
++#endif
+ 		HAL_KickOutTx(pAd, pTxBlk, pTxBlk->QueIdx);
+ 
+ }
+@@ -2320,7 +2434,12 @@ NDIS_STATUS STAHardTransmit(
+ 	if ((pAd->StaCfg.Psm == PWR_SAVE) && OPSTATUS_TEST_FLAG(pAd, fOP_STATUS_DOZE))
+ 	{
+ 	    DBGPRINT_RAW(RT_DEBUG_TRACE, ("AsicForceWakeup At HardTx\n"));
++#ifdef RT2860
+ 		AsicForceWakeup(pAd, FROM_TX);
++#endif
++#ifdef RT2870
++		AsicForceWakeup(pAd, TRUE);
++#endif
+ 	}
+ 
+ 	// It should not change PSM bit, when APSD turn on.
+--- a/drivers/staging/rt2860/sta/sync.c
++++ b/drivers/staging/rt2860/sta/sync.c
+@@ -37,6 +37,7 @@
+ */
+ #include "../rt_config.h"
+ 
++#ifdef RT2860
+ #define AC0_DEF_TXOP		0
+ #define AC1_DEF_TXOP		0
+ #define AC2_DEF_TXOP		94
+@@ -71,6 +72,10 @@ VOID	AdhocTurnOnQos(
+ 	}
+ 	AsicSetEdcaParm(pAd, &pAd->CommonCfg.APEdcaParm);
+ }
++#endif /* RT2860 */
++#ifdef RT2870
++#define ADHOC_ENTRY_BEACON_LOST_TIME	(2*OS_HZ)	// 2 sec
++#endif
+ 
+ /*
+ 	==========================================================================
+@@ -226,6 +231,7 @@ VOID MlmeScanReqAction(
+ 	// Increase the scan retry counters.
+ 	pAd->StaCfg.ScanCnt++;
+ 
++#ifdef RT2860
+     if ((OPSTATUS_TEST_FLAG(pAd, fOP_STATUS_ADVANCE_POWER_SAVE_PCIE_DEVICE)) &&
+         (IDLE_ON(pAd)) &&
+ 		(pAd->StaCfg.bRadio == TRUE) &&
+@@ -233,6 +239,7 @@ VOID MlmeScanReqAction(
+ 	{
+ 		RT28xxPciAsicRadioOn(pAd, GUI_IDLE_POWER_SAVE);
+ 	}
++#endif
+ 
+ 	// first check the parameter sanity
+ 	if (MlmeScanReqSanity(pAd,
+@@ -345,6 +352,7 @@ VOID MlmeJoinReqAction(
+ 
+ 	DBGPRINT(RT_DEBUG_TRACE, ("SYNC - MlmeJoinReqAction(BSS #%ld)\n", pInfo->BssIdx));
+ 
++#ifdef RT2860
+     if ((OPSTATUS_TEST_FLAG(pAd, fOP_STATUS_ADVANCE_POWER_SAVE_PCIE_DEVICE)) &&
+         (IDLE_ON(pAd)) &&
+ 		(pAd->StaCfg.bRadio == TRUE) &&
+@@ -352,6 +360,7 @@ VOID MlmeJoinReqAction(
+ 	{
+ 		RT28xxPciAsicRadioOn(pAd, GUI_IDLE_POWER_SAVE);
+ 	}
++#endif
+ 
+ 	// reset all the timers
+ 	RTMPCancelTimer(&pAd->MlmeAux.ScanTimer, &TimerCancelled);
+@@ -1107,6 +1116,10 @@ VOID PeerBeacon(
+ 			// Add the safeguard against the mismatch of adhoc wep status
+ 			if (pAd->StaCfg.WepStatus != pAd->ScanTab.BssEntry[Bssidx].WepStatus)
+ 			{
++#ifdef RT30xx
++				DBGPRINT(RT_DEBUG_TRACE, ("SYNC - Not matched wep status %d %d\n", pAd->StaCfg.WepStatus, pAd->ScanTab.BssEntry[Bssidx].WepStatus));
++				DBGPRINT(RT_DEBUG_TRACE, ("bssid=%s\n", pAd->ScanTab.BssEntry[Bssidx].Bssid));
++#endif
+ 				return;
+ 			}
+ 
+@@ -1170,11 +1183,14 @@ VOID PeerBeacon(
+ 				pAd->CommonCfg.TxPowerPercentage = pAd->CommonCfg.TxPowerDefault;
+ 			}
+ 
++#ifdef RT2860
+ 			// at least one 11b peer joined. downgrade the MaxTxRate to 11Mbps
+ 			// after last 11b peer left for several seconds, we'll auto switch back to 11G rate
+ 			// in MlmePeriodicExec()
++#endif
+ 			if (ADHOC_ON(pAd) && (CAP_IS_IBSS_ON(CapabilityInfo)))
+ 			{
++#ifdef RT2860
+ 				BOOLEAN	bRestart;
+                 BOOLEAN	bnRestart;
+ 
+@@ -1359,6 +1375,79 @@ VOID PeerBeacon(
+ 						}
+ 					}
+ 				}
++#endif /* RT2860 */
++#ifdef RT2870
++				UCHAR			MaxSupportedRateIn500Kbps = 0;
++				UCHAR			idx;
++				MAC_TABLE_ENTRY *pEntry;
++
++				// supported rates array may not be sorted. sort it and find the maximum rate
++			    for (idx=0; idx<SupRateLen; idx++)
++			    {
++			        if (MaxSupportedRateIn500Kbps < (SupRate[idx] & 0x7f))
++			            MaxSupportedRateIn500Kbps = SupRate[idx] & 0x7f;
++			    }
++
++				for (idx=0; idx<ExtRateLen; idx++)
++			    {
++			        if (MaxSupportedRateIn500Kbps < (ExtRate[idx] & 0x7f))
++			            MaxSupportedRateIn500Kbps = ExtRate[idx] & 0x7f;
++			    }
++
++				// look up the existing table
++				pEntry = MacTableLookup(pAd, Addr2);
++
++				// Ad-hoc mode is using MAC address as BA session. So we need to continuously find newly joined adhoc station by receiving beacon.
++				// To prevent always check this, we use wcid == RESERVED_WCID to recognize it as newly joined adhoc station.
++				if ((ADHOC_ON(pAd) && (Elem->Wcid == RESERVED_WCID)) ||
++					(pEntry && ((pEntry->LastBeaconRxTime + ADHOC_ENTRY_BEACON_LOST_TIME) < Now)))
++				{
++					if (pEntry == NULL)
++						// Another adhoc joining, add to our MAC table.
++						pEntry = MacTableInsertEntry(pAd, Addr2, BSS0, FALSE);
++
++					if (StaAddMacTableEntry(pAd, pEntry, MaxSupportedRateIn500Kbps, &HtCapability, HtCapabilityLen, CapabilityInfo) == FALSE)
++					{
++						DBGPRINT(RT_DEBUG_TRACE, ("ADHOC - Add Entry failed.\n"));
++						return;
++					}
++
++					if (pEntry &&
++						(Elem->Wcid == RESERVED_WCID))
++					{
++						idx = pAd->StaCfg.DefaultKeyId;
++						RT28XX_STA_SECURITY_INFO_ADD(pAd, BSS0, idx, pEntry);
++					}
++				}
++
++				if (pEntry && pEntry->ValidAsCLI)
++					pEntry->LastBeaconRxTime = Now;
++
++				// At least another peer in this IBSS, declare MediaState as CONNECTED
++				if (!OPSTATUS_TEST_FLAG(pAd, fOP_STATUS_MEDIA_STATE_CONNECTED))
++				{
++					OPSTATUS_SET_FLAG(pAd, fOP_STATUS_MEDIA_STATE_CONNECTED);
++
++					pAd->IndicateMediaState = NdisMediaStateConnected;
++					RTMP_IndicateMediaState(pAd);
++	                pAd->ExtraInfo = GENERAL_LINK_UP;
++					AsicSetBssid(pAd, pAd->CommonCfg.Bssid);
++
++					// 2003/03/12 - john
++					// Make sure this entry in "ScanTab" table, thus complies to Microsoft's policy that
++					// "site survey" result should always include the current connected network.
++					//
++					Bssidx = BssTableSearch(&pAd->ScanTab, Bssid, Channel);
++					if (Bssidx == BSS_NOT_FOUND)
++					{
++						Bssidx = BssTableSetEntry(pAd, &pAd->ScanTab, Bssid, Ssid, SsidLen, BssType, BeaconPeriod,
++									&CfParm, AtimWin, CapabilityInfo, SupRate, SupRateLen, ExtRate, ExtRateLen, &HtCapability,
++									&AddHtInfo, HtCapabilityLen, AddHtInfoLen, NewExtChannelOffset, Channel, RealRssi, TimeStamp, 0,
++									&EdcaParm, &QosCapability, &QbssLoad, LenVIE, pVIE);
++					}
++					DBGPRINT(RT_DEBUG_TRACE, ("ADHOC  fOP_STATUS_MEDIA_STATE_CONNECTED.\n"));
++				}
++#endif /* RT2870 */
+ 			}
+ 
+ 			if (INFRA_ON(pAd))
+@@ -1447,10 +1536,12 @@ VOID PeerBeacon(
+ 				//  5. otherwise, put PHY back to sleep to save battery.
+ 				if (MessageToMe)
+ 				{
++#ifdef RT2860
+ 					if (OPSTATUS_TEST_FLAG(pAd, fOP_STATUS_ADVANCE_POWER_SAVE_PCIE_DEVICE))
+ 					{
+ 						RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R3, pAd->StaCfg.BBPR3);
+ 					}
++#endif
+ 					if (pAd->CommonCfg.bAPSDCapable && pAd->CommonCfg.APEdcaParm.bAPSDCapable &&
+ 						pAd->CommonCfg.bAPSDAC_BE && pAd->CommonCfg.bAPSDAC_BK && pAd->CommonCfg.bAPSDAC_VI && pAd->CommonCfg.bAPSDAC_VO)
+ 					{
+@@ -1461,10 +1552,12 @@ VOID PeerBeacon(
+ 				}
+ 				else if (BcastFlag && (DtimCount == 0) && OPSTATUS_TEST_FLAG(pAd, fOP_STATUS_RECEIVE_DTIM))
+ 				{
++#ifdef RT2860
+ 					if (OPSTATUS_TEST_FLAG(pAd, fOP_STATUS_ADVANCE_POWER_SAVE_PCIE_DEVICE))
+ 					{
+ 						RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R3, pAd->StaCfg.BBPR3);
+ 					}
++#endif
+ 				}
+ 				else if ((pAd->TxSwQueue[QID_AC_BK].Number != 0)													||
+ 						(pAd->TxSwQueue[QID_AC_BE].Number != 0)														||
+@@ -1478,10 +1571,12 @@ VOID PeerBeacon(
+ 				{
+ 					// TODO: consider scheduled HCCA. might not be proper to use traditional DTIM-based power-saving scheme
+ 					// can we cheat here (i.e. just check MGMT & AC_BE) for better performance?
++#ifdef RT2860
+ 					if (OPSTATUS_TEST_FLAG(pAd, fOP_STATUS_ADVANCE_POWER_SAVE_PCIE_DEVICE))
+ 					{
+ 						RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R3, pAd->StaCfg.BBPR3);
+ 					}
++#endif
+ 				}
+ 				else
+ 				{
+@@ -1496,9 +1591,14 @@ VOID PeerBeacon(
+ 
+ 					if (!OPSTATUS_TEST_FLAG(pAd, fOP_STATUS_DOZE))
+ 					{
++#ifdef RT2860
+ 						// Set a flag to go to sleep . Then after parse this RxDoneInterrupt, will go to sleep mode.
+ 						RTMP_SET_PSFLAG(pAd, fRTMP_PS_GO_TO_SLEEP_NOW);
+ 						pAd->ThisTbttNumToNextWakeUp = TbttNumToNextWakeUp;
++#endif
++#ifdef RT2870
++						AsicSleepThenAutoWakeup(pAd, TbttNumToNextWakeUp);
++#endif
+ 					}
+ 				}
+ 			}
+--- a/drivers/staging/rt2860/sta/wpa.c
++++ b/drivers/staging/rt2860/sta/wpa.c
+@@ -1384,10 +1384,12 @@ VOID	WpaGroupMsg1Action(
+ 			pAd->SharedKey[BSS0][pAd->StaCfg.DefaultKeyId].CipherAlg = CIPHER_TKIP;
+ 		else if (pAd->StaCfg.GroupCipher == Ndis802_11Encryption3Enabled)
+ 			pAd->SharedKey[BSS0][pAd->StaCfg.DefaultKeyId].CipherAlg = CIPHER_AES;
++#ifndef RT30xx
+ 		else if (pAd->StaCfg.GroupCipher == Ndis802_11GroupWEP40Enabled)
+ 			pAd->SharedKey[BSS0][pAd->StaCfg.DefaultKeyId].CipherAlg = CIPHER_WEP64;
+ 		else if (pAd->StaCfg.GroupCipher == Ndis802_11GroupWEP104Enabled)
+ 			pAd->SharedKey[BSS0][pAd->StaCfg.DefaultKeyId].CipherAlg = CIPHER_WEP128;
++#endif
+ 
+     	//hex_dump("Group Key :", pAd->SharedKey[BSS0][pAd->StaCfg.DefaultKeyId].Key, LEN_TKIP_EK);
+ 	}
+@@ -1764,7 +1766,12 @@ BOOLEAN ParseKeyData(
+ 	// Get GTK length - refer to IEEE 802.11i-2004 p.82
+ 	GTKLEN = pKDE->Len -6;
+ 
++#ifdef RT30xx
++	if (GTKLEN < LEN_AES_KEY)
++#endif
++#ifndef RT30xx
+ 	if (GTKLEN < MIN_LEN_OF_GTK)
++#endif
+ 	{
+ 		DBGPRINT(RT_DEBUG_ERROR, ("ERROR: GTK Key length is too short (%d) \n", GTKLEN));
+         return FALSE;
+@@ -1790,10 +1797,12 @@ BOOLEAN ParseKeyData(
+ 		pAd->SharedKey[BSS0][pAd->StaCfg.DefaultKeyId].CipherAlg = CIPHER_TKIP;
+ 	else if (pAd->StaCfg.GroupCipher == Ndis802_11Encryption3Enabled)
+ 		pAd->SharedKey[BSS0][pAd->StaCfg.DefaultKeyId].CipherAlg = CIPHER_AES;
++#ifndef RT30xx
+ 	else if (pAd->StaCfg.GroupCipher == Ndis802_11GroupWEP40Enabled)
+ 		pAd->SharedKey[BSS0][pAd->StaCfg.DefaultKeyId].CipherAlg = CIPHER_WEP64;
+ 	else if (pAd->StaCfg.GroupCipher == Ndis802_11GroupWEP104Enabled)
+ 		pAd->SharedKey[BSS0][pAd->StaCfg.DefaultKeyId].CipherAlg = CIPHER_WEP128;
++#endif
+ 
+ 	return TRUE;
+ 

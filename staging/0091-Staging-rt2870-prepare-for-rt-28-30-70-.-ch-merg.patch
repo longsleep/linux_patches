@@ -1,0 +1,2009 @@
+From fc3315fc86dddec761afab06a2f73f73d5581776 Mon Sep 17 00:00:00 2001
+From: Bartlomiej Zolnierkiewicz <bzolnier@gmail.com>
+Date: Sun, 26 Apr 2009 16:06:18 +0200
+Subject: [PATCH 091/102] Staging: rt2870: prepare for rt{28,30}70/*.[ch] merge
+
+Signed-off-by: Bartlomiej Zolnierkiewicz <bzolnier@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+---
+ drivers/staging/rt2870/2870_main_dev.c |   91 ++++++
+ drivers/staging/rt2870/chlist.h        |    5 
+ drivers/staging/rt2870/oid.h           |   41 ++
+ drivers/staging/rt2870/rt2870.h        |  138 +++++++++
+ drivers/staging/rt2870/rt28xx.h        |   57 +++
+ drivers/staging/rt2870/rt_linux.c      |    5 
+ drivers/staging/rt2870/rt_linux.h      |   19 +
+ drivers/staging/rt2870/rt_main_dev.c   |    3 
+ drivers/staging/rt2870/rt_profile.c    |   28 +
+ drivers/staging/rt2870/rtmp.h          |  188 ++++++++++++
+ drivers/staging/rt2870/rtmp_def.h      |   21 +
+ drivers/staging/rt2870/sta_ioctl.c     |  480 ++++++++++++++++++++++++++++++++-
+ drivers/staging/rt2870/wpa.h           |    2 
+ 13 files changed, 1064 insertions(+), 14 deletions(-)
+
+--- a/drivers/staging/rt2870/2870_main_dev.c
++++ b/drivers/staging/rt2870/2870_main_dev.c
+@@ -234,7 +234,12 @@ INT MlmeThread(
+ 	 */
+ 	DBGPRINT(RT_DEBUG_TRACE,( "<---%s\n",__func__));
+ 
++#ifndef RT30xx
+ 	pObj->MLMEThr_task = NULL;
++#endif
++#ifdef RT30xx
++	pObj->MLMEThr_pid = NULL;
++#endif
+ 
+ 	complete_and_exit (&pAd->mlmeComplete, 0);
+ 	return 0;
+@@ -342,7 +347,12 @@ INT RTUSBCmdThread(
+ 	 */
+ 	DBGPRINT(RT_DEBUG_TRACE,( "<---RTUSBCmdThread\n"));
+ 
++#ifndef RT30xx
+ 	pObj->RTUSBCmdThr_task = NULL;
++#endif
++#ifdef RT30xx
++	pObj->RTUSBCmdThr_pid = NULL;
++#endif
+ 
+ 	complete_and_exit (&pAd->CmdQComplete, 0);
+ 	return 0;
+@@ -436,8 +446,12 @@ INT TimerQThread(
+ 	 */
+ 	DBGPRINT(RT_DEBUG_TRACE,( "<---%s\n",__func__));
+ 
++#ifndef RT30xx
+ 	pObj->TimerQThr_task = NULL;
+-
++#endif
++#ifdef RT30xx
++	pObj->TimerQThr_pid = NULL;
++#endif
+ 	complete_and_exit(&pAd->TimerQComplete, 0);
+ 	return 0;
+ 
+@@ -605,6 +619,7 @@ VOID RT2870_WatchDog(IN RTMP_ADAPTER *pA
+ 		RTMP_IO_WRITE32(pAd, PBF_CFG, 0xf40006);
+ 	}
+ 
++//PS packets use HCCA queue when dequeue from PS unicast queue (WiFi WPA2 MA9_DT1 for Marvell B STA)
+ 	idx = 0;
+ 	if ((MACValue & 0xff00) !=0 )
+ 	{
+@@ -618,7 +633,6 @@ VOID RT2870_WatchDog(IN RTMP_ADAPTER *pA
+ 		RTMP_IO_WRITE32(pAd, PBF_CFG, 0xf40006);
+ 	}
+ 
+-
+ 	if (pAd->watchDogRxOverFlowCnt >= 2)
+ 	{
+ 		DBGPRINT(RT_DEBUG_TRACE, ("Maybe the Rx Bulk-In hanged! Cancel the pending Rx bulks request!\n"));
+@@ -868,6 +882,7 @@ VOID RT28xxThreadTerminate(
+ 	RTUSBCancelPendingIRPs(pAd);
+ 
+ 	// Terminate Threads
++#ifndef RT30xx
+ 	BUG_ON(pObj->TimerQThr_task == NULL);
+ 	CHECK_PID_LEGALITY(task_pid(pObj->TimerQThr_task))
+ 	{
+@@ -909,7 +924,72 @@ VOID RT28xxThreadTerminate(
+ 		kthread_stop(pObj->RTUSBCmdThr_task);
+ 		pObj->RTUSBCmdThr_task = NULL;
+ 	}
++#endif
++#ifdef RT30xx
++	if (pObj->MLMEThr_pid)
++	{
++		printk("Terminate the MLMEThr_pid=%d!\n", pid_nr(pObj->MLMEThr_pid));
++		mb();
++		pAd->mlme_kill = 1;
++		//RT28XX_MLME_HANDLER(pAd);
++		mb();
++		ret = kill_pid(pObj->MLMEThr_pid, SIGTERM, 1);
++		if (ret)
++		{
++			printk (KERN_WARNING "%s: unable to Mlme thread, pid=%d, ret=%d!\n",
++					pAd->net_dev->name, pid_nr(pObj->MLMEThr_pid), ret);
++		}
++		else
++		{
++			//wait_for_completion (&pAd->notify);
++			wait_for_completion (&pAd->mlmeComplete);
++			pObj->MLMEThr_pid = NULL;
++		}
++	}
+ 
++	if (pObj->RTUSBCmdThr_pid >= 0)
++	{
++		printk("Terminate the RTUSBCmdThr_pid=%d!\n", pid_nr(pObj->RTUSBCmdThr_pid));
++		mb();
++		NdisAcquireSpinLock(&pAd->CmdQLock);
++		pAd->CmdQ.CmdQState = RT2870_THREAD_STOPED;
++		NdisReleaseSpinLock(&pAd->CmdQLock);
++		mb();
++		//RTUSBCMDUp(pAd);
++		ret = kill_pid(pObj->RTUSBCmdThr_pid, SIGTERM, 1);
++		if (ret)
++		{
++			printk(KERN_WARNING "%s: unable to RTUSBCmd thread, pid=%d, ret=%d!\n",
++					pAd->net_dev->name, pid_nr(pObj->RTUSBCmdThr_pid), ret);
++	}
++		else
++		{
++			//wait_for_completion (&pAd->notify);
++			wait_for_completion (&pAd->CmdQComplete);
++			pObj->RTUSBCmdThr_pid = NULL;
++		}
++	}
++	if (pObj->TimerQThr_pid >= 0)
++	{
++		POS_COOKIE pObj = (POS_COOKIE)pAd->OS_Cookie;
++		printk("Terminate the TimerQThr_pid=%d!\n", pid_nr(pObj->TimerQThr_pid));
++		mb();
++		pAd->TimerFunc_kill = 1;
++		mb();
++		ret = kill_pid(pObj->TimerQThr_pid, SIGTERM, 1);
++		if (ret)
++		{
++			printk(KERN_WARNING "%s: unable to stop TimerQThread, pid=%d, ret=%d!\n",
++					pAd->net_dev->name, pid_nr(pObj->TimerQThr_pid), ret);
++		}
++		else
++		{
++			printk("wait_for_completion TimerQThr\n");
++			wait_for_completion(&pAd->TimerQComplete);
++			pObj->TimerQThr_pid = NULL;
++		}
++	}
++#endif
+ 
+ 	// Kill tasklets
+ 	pAd->mlme_kill = 0;
+@@ -964,7 +1044,12 @@ BOOLEAN RT28XXChipsetCheck(
+ 		if (dev_p->descriptor.idVendor == rtusb_usb_id[i].idVendor &&
+ 			dev_p->descriptor.idProduct == rtusb_usb_id[i].idProduct)
+ 		{
++#ifndef RT30xx
+ 			printk(KERN_DEBUG "rt2870: idVendor = 0x%x, idProduct = 0x%x\n",
++#endif
++#ifdef RT30xx
++			printk("rt2870: idVendor = 0x%x, idProduct = 0x%x\n",
++#endif
+ 					dev_p->descriptor.idVendor, dev_p->descriptor.idProduct);
+ 			break;
+ 		}
+@@ -1262,6 +1347,8 @@ VOID RT28xx_UpdateBeaconToAsic(
+ 		}
+ 
+ 		pBeaconSync->BeaconBitMap |= (1 << bcn_idx);
++
++		// For AP interface, set the DtimBitOn so that we can send Bcast/Mcast frame out after this beacon frame.
+ 	}
+ 
+ }
+--- a/drivers/staging/rt2870/chlist.h
++++ b/drivers/staging/rt2870/chlist.h
+@@ -524,7 +524,12 @@ static CH_REGION ChRegion[] =
+ 			JAP,
+ 			{
+ 				{ 1,   14,  20, BOTH, FALSE},	// 2.4 G, ch 1~14
++#ifndef RT30xx
+ 				{ 36, 	4,  23, IDOR, FALSE},	// 5G, ch 36~48
++#endif
++#ifdef RT30xx
++				{ 34, 	4,  23, IDOR, FALSE},	// 5G, ch 34~46
++#endif
+ 				{ 0},							// end
+ 			}
+ 		},
+--- a/drivers/staging/rt2870/oid.h
++++ b/drivers/staging/rt2870/oid.h
+@@ -534,8 +534,10 @@ typedef enum _NDIS_802_11_WEP_STATUS
+     Ndis802_11Encryption3KeyAbsent,
+     Ndis802_11Encryption4Enabled,	// TKIP or AES mix
+     Ndis802_11Encryption4KeyAbsent,
++#ifndef RT30xx
+     Ndis802_11GroupWEP40Enabled,
+ 	Ndis802_11GroupWEP104Enabled,
++#endif
+ } NDIS_802_11_WEP_STATUS, *PNDIS_802_11_WEP_STATUS,
+   NDIS_802_11_ENCRYPTION_STATUS, *PNDIS_802_11_ENCRYPTION_STATUS;
+ 
+@@ -630,11 +632,17 @@ typedef struct _NDIS_802_11_CAPABILITY
+ #define SIOCIWFIRSTPRIV								SIOCDEVPRIVATE
+ #endif
+ 
++#ifdef RT30xx
++#define RT_PRIV_IOCTL_EXT							(SIOCIWFIRSTPRIV + 0x01) // Sync. with AP for wsc upnp daemon
++#endif
+ #define RTPRIV_IOCTL_SET							(SIOCIWFIRSTPRIV + 0x02)
+ 
+ #ifdef DBG
+ #define RTPRIV_IOCTL_BBP                            (SIOCIWFIRSTPRIV + 0x03)
+ #define RTPRIV_IOCTL_MAC                            (SIOCIWFIRSTPRIV + 0x05)
++#ifdef RT30xx
++#define RTPRIV_IOCTL_RF                             (SIOCIWFIRSTPRIV + 0x13)
++#endif
+ #define RTPRIV_IOCTL_E2P                            (SIOCIWFIRSTPRIV + 0x07)
+ #endif
+ 
+@@ -658,7 +666,9 @@ enum {
+     RAIO_OFF = 10,
+     RAIO_ON = 11,
+ 	SHOW_CFG_VALUE = 20,
++#ifndef RT30xx
+ 	SHOW_ADHOC_ENTRY_INFO = 21,
++#endif
+ };
+ 
+ #define OID_802_11_BUILD_CHANNEL_EX				0x0714
+@@ -666,11 +676,42 @@ enum {
+ #define OID_802_11_GET_COUNTRY_CODE				0x0716
+ #define OID_802_11_GET_CHANNEL_GEOGRAPHY		0x0717
+ 
++#ifdef RT30xx
++#define RT_OID_WSC_SET_PASSPHRASE                   0x0740 // passphrase for wpa(2)-psk
++#define RT_OID_WSC_DRIVER_AUTO_CONNECT              0x0741
++#define RT_OID_WSC_QUERY_DEFAULT_PROFILE            0x0742
++#define RT_OID_WSC_SET_CONN_BY_PROFILE_INDEX        0x0743
++#define RT_OID_WSC_SET_ACTION                       0x0744
++#define RT_OID_WSC_SET_SSID                         0x0745
++#define RT_OID_WSC_SET_PIN_CODE                     0x0746
++#define RT_OID_WSC_SET_MODE                         0x0747 // PIN or PBC
++#define RT_OID_WSC_SET_CONF_MODE                    0x0748 // Enrollee or Registrar
++#define RT_OID_WSC_SET_PROFILE                      0x0749
++
++#define RT_OID_802_11_WSC_QUERY_PROFILE				0x0750
++// for consistency with RT61
++#define RT_OID_WSC_QUERY_STATUS						0x0751
++#define RT_OID_WSC_PIN_CODE							0x0752
++#define RT_OID_WSC_UUID								0x0753
++#define RT_OID_WSC_SET_SELECTED_REGISTRAR			0x0754
++#define RT_OID_WSC_EAPMSG							0x0755
++#define RT_OID_WSC_MANUFACTURER						0x0756
++#define RT_OID_WSC_MODEL_NAME						0x0757
++#define RT_OID_WSC_MODEL_NO							0x0758
++#define RT_OID_WSC_SERIAL_NO						0x0759
++#define RT_OID_WSC_MAC_ADDRESS						0x0760
++#endif
++
+ #ifdef LLTD_SUPPORT
+ // for consistency with RT61
+ #define RT_OID_GET_PHY_MODE                         0x761
+ #endif // LLTD_SUPPORT //
+ 
++#ifdef RT30xx
++// New for MeetingHouse Api support
++#define OID_MH_802_1X_SUPPORTED               0xFFEDC100
++#endif
++
+ // MIMO Tx parameter, ShortGI, MCS, STBC, etc.  these are fields in TXWI. Don't change this definition!!!
+ typedef union  _HTTRANSMIT_SETTING {
+ 	struct	{
+--- a/drivers/staging/rt2870/rt2870.h
++++ b/drivers/staging/rt2870/rt2870.h
+@@ -46,7 +46,9 @@
+ #define MAX_TXBULK_SIZE         (LOCAL_TXBUF_SIZE*BULKAGGRE_ZISE)
+ #define MAX_RXBULK_SIZE         (LOCAL_TXBUF_SIZE*RXBULKAGGRE_ZISE)
+ #define MAX_MLME_HANDLER_MEMORY 20
++#ifndef RT30xx
+ #define	RETRY_LIMIT             10
++#endif
+ #define BUFFER_SIZE				2400	//2048
+ #define	TX_RING					0xa
+ #define	PRIO_RING				0xc
+@@ -62,6 +64,9 @@
+ #define	fRTUSB_BULK_OUT_DATA_NORMAL_2			0x00020000
+ #define	fRTUSB_BULK_OUT_DATA_NORMAL_3			0x00040000
+ #define	fRTUSB_BULK_OUT_DATA_NORMAL_4			0x00080000
++#ifdef RT30xx
++#define	fRTUSB_BULK_OUT_DATA_NORMAL_5			0x00100000
++#endif
+ 
+ #define	fRTUSB_BULK_OUT_PSPOLL					0x00000020
+ #define	fRTUSB_BULK_OUT_DATA_FRAG				0x00000040
+@@ -69,6 +74,7 @@
+ #define	fRTUSB_BULK_OUT_DATA_FRAG_3				0x00000100
+ #define	fRTUSB_BULK_OUT_DATA_FRAG_4				0x00000200
+ 
++#ifndef RT30xx
+ #define RT2870_USB_DEVICES	\
+ {	\
+ 	{USB_DEVICE(0x148F,0x2770)}, /* Ralink */		\
+@@ -134,6 +140,84 @@
+ 	{USB_DEVICE(0x7392,0x7717)}, /* Edimax */		\
+ 	{ }/* Terminating entry */                      \
+ }
++#endif
++#ifdef RT30xx
++#define RT2870_USB_DEVICES	\
++{	\
++	{USB_DEVICE(0x148F,0x2770)}, /* Ralink */		\
++	{USB_DEVICE(0x148F,0x2870)}, /* Ralink */		\
++	{USB_DEVICE(0x148F,0x3070)}, /* Ralink 3070 */	\
++	{USB_DEVICE(0x148F,0x3071)}, /* Ralink 3071 */	\
++	{USB_DEVICE(0x148F,0x3072)}, /* Ralink 3072 */	\
++	{USB_DEVICE(0x0B05,0x1731)}, /* Asus */			\
++	{USB_DEVICE(0x0B05,0x1732)}, /* Asus */			\
++	{USB_DEVICE(0x0B05,0x1742)}, /* Asus */			\
++	{USB_DEVICE(0x0DF6,0x0017)}, /* Sitecom */		\
++	{USB_DEVICE(0x0DF6,0x002B)}, /* Sitecom */		\
++	{USB_DEVICE(0x0DF6,0x002C)}, /* Sitecom */		\
++	{USB_DEVICE(0x0DF6,0x003E)}, /* Sitecom 3070 */	\
++	{USB_DEVICE(0x0DF6,0x002D)}, /* Sitecom */		\
++	{USB_DEVICE(0x0DF6,0x0039)}, /* Sitecom 2770 */	\
++	{USB_DEVICE(0x14B2,0x3C06)}, /* Conceptronic */		\
++	{USB_DEVICE(0x14B2,0x3C28)}, /* Conceptronic */		\
++	{USB_DEVICE(0x2019,0xED06)}, /* Planex Communications, Inc. */		\
++	{USB_DEVICE(0x2019,0xAB25)}, /* Planex Communications, Inc. RT3070 */		\
++	{USB_DEVICE(0x07D1,0x3C09)}, /* D-Link */		\
++	{USB_DEVICE(0x07D1,0x3C11)}, /* D-Link */		\
++	{USB_DEVICE(0x2001,0x3C09)}, /* D-Link */		\
++	{USB_DEVICE(0x2001,0x3C0A)}, /* D-Link 3072*/	\
++	{USB_DEVICE(0x14B2,0x3C07)}, /* AL */			\
++	{USB_DEVICE(0x14B2,0x3C12)}, /* AL 3070 */		\
++	{USB_DEVICE(0x050D,0x8053)}, /* Belkin */		\
++	{USB_DEVICE(0x14B2,0x3C23)}, /* Airlink */		\
++	{USB_DEVICE(0x14B2,0x3C27)}, /* Airlink */		\
++	{USB_DEVICE(0x07AA,0x002F)}, /* Corega */		\
++	{USB_DEVICE(0x07AA,0x003C)}, /* Corega */		\
++	{USB_DEVICE(0x07AA,0x003F)}, /* Corega */		\
++	{USB_DEVICE(0x18C5,0x0012)}, /* Corega 3070 */	\
++	{USB_DEVICE(0x1044,0x800B)}, /* Gigabyte */		\
++	{USB_DEVICE(0x1044,0x800D)}, /* Gigabyte GN-WB32L 3070 */		\
++	{USB_DEVICE(0x15A9,0x0006)}, /* Sparklan */		\
++	{USB_DEVICE(0x083A,0xB522)}, /* SMC */			\
++	{USB_DEVICE(0x083A,0xA618)}, /* SMC */			\
++	{USB_DEVICE(0x083A,0x8522)}, /* Arcadyan */		\
++	{USB_DEVICE(0x083A,0x7512)}, /* Arcadyan 2770 */		\
++	{USB_DEVICE(0x083A,0x7522)}, /* Arcadyan */		\
++	{USB_DEVICE(0x083A,0x7511)}, /* Arcadyan 3070 */ \
++	{USB_DEVICE(0x0CDE,0x0022)}, /* ZCOM */			\
++	{USB_DEVICE(0x0586,0x3416)}, /* Zyxel */		\
++	{USB_DEVICE(0x0CDE,0x0025)}, /* Zyxel */		\
++	{USB_DEVICE(0x1740,0x9701)}, /* EnGenius */		\
++	{USB_DEVICE(0x1740,0x9702)}, /* EnGenius */		\
++	{USB_DEVICE(0x1740,0x9703)}, /* EnGenius 3070 */		\
++	{USB_DEVICE(0x0471,0x200f)}, /* Philips */		\
++	{USB_DEVICE(0x14B2,0x3C25)}, /* Draytek */		\
++	{USB_DEVICE(0x13D3,0x3247)}, /* AzureWave */	\
++	{USB_DEVICE(0x13D3,0x3273)}, /* AzureWave 3070*/	\
++	{USB_DEVICE(0x083A,0x6618)}, /* Accton */		\
++	{USB_DEVICE(0x15c5,0x0008)}, /* Amit */			\
++	{USB_DEVICE(0x0E66,0x0001)}, /* Hawking */		\
++	{USB_DEVICE(0x0E66,0x0003)}, /* Hawking */		\
++	{USB_DEVICE(0x129B,0x1828)}, /* Siemens */		\
++	{USB_DEVICE(0x157E,0x300E)},	/* U-Media */	\
++	{USB_DEVICE(0x050d,0x805c)},					\
++	{USB_DEVICE(0x1482,0x3C09)}, /* Abocom*/		\
++	{USB_DEVICE(0x14B2,0x3C09)}, /* Alpha */		\
++	{USB_DEVICE(0x04E8,0x2018)}, /* samsung */  	\
++	{USB_DEVICE(0x07B8,0x3070)}, /* AboCom 3070 */	\
++	{USB_DEVICE(0x07B8,0x3071)}, /* AboCom 3071 */	\
++	{USB_DEVICE(0x07B8,0x3072)}, /* Abocom 3072 */	\
++	{USB_DEVICE(0x7392,0x7711)}, /* Edimax 3070 */	\
++	{USB_DEVICE(0x5A57,0x0280)}, /* Zinwell */		\
++	{USB_DEVICE(0x5A57,0x0282)}, /* Zinwell */		\
++	{USB_DEVICE(0x1A32,0x0304)}, /* Quanta 3070 */		\
++	{USB_DEVICE(0x0789,0x0162)}, /* Logitec 2870 */		\
++	{USB_DEVICE(0x0789,0x0163)}, /* Logitec 2870 */		\
++	{USB_DEVICE(0x0789,0x0164)}, /* Logitec 2870 */		\
++	{USB_DEVICE(0x1EDA,0x2310)}, /* AirTies 3070 */		\
++	{ }/* Terminating entry */                      \
++}
++#endif
+ 
+ #define	FREE_HTTX_RING(_p, _b, _t)			\
+ {										\
+@@ -200,6 +284,23 @@ typedef	struct	_MGMT_STRUC	{
+ 
+ 
+ /* ----------------- EEPROM Related MACRO ----------------- */
++#ifdef RT30xx
++#define RT28xx_EEPROM_READ16(pAd, offset, var)					\
++	do {														\
++		RTUSBReadEEPROM(pAd, offset, (PUCHAR)&(var), 2);		\
++		if(!pAd->bUseEfuse)										\
++		var = le2cpu16(var);									\
++	}while(0)
++
++#define RT28xx_EEPROM_WRITE16(pAd, offset, var)					\
++	do{															\
++		USHORT _tmpVar=var;										\
++		if(!pAd->bUseEfuse)									\
++		_tmpVar = cpu2le16(var);								\
++		RTUSBWriteEEPROM(pAd, offset, (PUCHAR)&(_tmpVar), 2);	\
++	}while(0)
++#endif // RT30xx //
++#ifndef RT30xx
+ #define RT28xx_EEPROM_READ16(pAd, offset, var)					\
+ 	do {														\
+ 		RTUSBReadEEPROM(pAd, offset, (PUCHAR)&(var), 2);		\
+@@ -212,6 +313,7 @@ typedef	struct	_MGMT_STRUC	{
+ 		_tmpVar = cpu2le16(var);								\
+ 		RTUSBWriteEEPROM(pAd, offset, (PUCHAR)&(_tmpVar), 2);	\
+ 	}while(0)
++#endif // RT30xx //
+ 
+ /* ----------------- TASK/THREAD Related MACRO ----------------- */
+ #define RT28XX_TASK_THREAD_INIT(pAd, Status)		\
+@@ -327,6 +429,14 @@ extern UCHAR EpToQueue[6];
+ 	RTUSBEnqueueInternalCmd(pAd, CMDTHREAD_SET_CLIENT_MAC_ENTRY, 	\
+ 							pEntry, sizeof(MAC_TABLE_ENTRY));
+ 
++#ifdef RT30xx
++// add by johnli, fix "in_interrupt" error when call "MacTableDeleteEntry" in Rx tasklet
++// Set MAC register value according operation mode
++#define RT28XX_UPDATE_PROTECT(pAd)	\
++ 	RTUSBEnqueueInternalCmd(pAd, CMDTHREAD_UPDATE_PROTECT, NULL, 0);
++// end johnli
++#endif
++
+ // remove Pair-wise key material from ASIC
+ // yet implement
+ #define RT28XX_STA_ENTRY_KEY_DEL(pAd, BssIdx, Wcid)
+@@ -414,8 +524,10 @@ extern UCHAR EpToQueue[6];
+ 
+ #define RT28xx_CHIP_NAME            "RT2870"
+ #define USB_CYC_CFG                 0x02a4
++#ifndef RT30xx
+ #define STATUS_SUCCESS				0x00
+ #define STATUS_UNSUCCESSFUL 		0x01
++#endif
+ #define NT_SUCCESS(status)			(((status) > 0) ? (1):(0))
+ #define InterlockedIncrement 	 	atomic_inc
+ #define NdisInterlockedIncrement 	atomic_inc
+@@ -440,7 +552,9 @@ extern UCHAR EpToQueue[6];
+ //#undef MlmeAllocateMemory
+ //#undef MlmeFreeMemory
+ 
++#ifndef RT30xx
+ typedef int				NTSTATUS;
++#endif
+ typedef struct usb_device	* PUSB_DEV;
+ 
+ /* MACRO for linux usb */
+@@ -468,7 +582,7 @@ VOID RTUSBBulkOutRTSFrameComplete(purbb_
+ VOID RTUSBBulkOutPsPollComplete(purbb_t pUrb, struct pt_regs *pt_regs);
+ VOID RTUSBBulkRxComplete(purbb_t pUrb, struct pt_regs *pt_regs);
+ 
+-
++#ifndef RT30xx
+ #define RTUSBMlmeUp(pAd)	        \
+ {								    \
+ 	POS_COOKIE pObj = (POS_COOKIE) pAd->OS_Cookie;	\
+@@ -484,7 +598,22 @@ VOID RTUSBBulkRxComplete(purbb_t pUrb, s
+ 	CHECK_PID_LEGALITY(task_pid(pObj->RTUSBCmdThr_task))	    \
+ 	    up(&(pAd->RTUSBCmd_semaphore)); \
+ }
++#endif
++#ifdef RT30xx
++#define RTUSBMlmeUp(pAd)	        \
++{								    \
++	POS_COOKIE pObj = (POS_COOKIE) pAd->OS_Cookie;	\
++	if(pObj->MLMEThr_pid>0)		    \
++        up(&(pAd->mlme_semaphore)); \
++}
+ 
++#define RTUSBCMDUp(pAd)	                \
++{									    \
++	POS_COOKIE pObj = (POS_COOKIE) pAd->OS_Cookie;	\
++	if(pObj->RTUSBCmdThr_pid>0)		    \
++	    up(&(pAd->RTUSBCmd_semaphore)); \
++}
++#endif
+ 
+ static inline NDIS_STATUS RTMPAllocateMemory(
+ 	OUT PVOID *ptr,
+@@ -526,7 +655,9 @@ typedef struct   _RT_SET_ASIC_WCID {
+ 	ULONG WCID;          // mechanism for rekeying: 0:disable, 1: time-based, 2: packet-based
+ 	ULONG SetTid;        // time-based: seconds, packet-based: kilo-packets
+ 	ULONG DeleteTid;        // time-based: seconds, packet-based: kilo-packets
++#ifndef RT30xx
+ 	UCHAR Addr[MAC_ADDR_LEN];	// avoid in interrupt when write key
++#endif
+ } RT_SET_ASIC_WCID,*PRT_SET_ASIC_WCID;
+ 
+ typedef struct   _RT_SET_ASIC_WCID_ATTRI {
+@@ -628,6 +759,11 @@ typedef	struct	_CMDHandler_TLV	{
+ #define CMDTHREAD_802_11_SET_PREAMBLE               0x0D790101	// cmd
+ #define CMDTHREAD_802_11_COUNTER_MEASURE			0x0D790102	// cmd
+ 
++#ifdef RT30xx
++// add by johnli, fix "in_interrupt" error when call "MacTableDeleteEntry" in Rx tasklet
++#define CMDTHREAD_UPDATE_PROTECT					0x0D790103	// cmd
++// end johnli
++#endif
+ 
+ #define WPA1AKMBIT	    0x01
+ #define WPA2AKMBIT	    0x02
+--- a/drivers/staging/rt2870/rt28xx.h
++++ b/drivers/staging/rt2870/rt28xx.h
+@@ -47,6 +47,15 @@
+ #define PCI_EECTRL			0x0004
+ #define PCI_MCUCTRL			0x0008
+ 
++#ifdef RT30xx
++#define	OPT_14			0x114
++
++typedef int				NTSTATUS;
++#define	RETRY_LIMIT             10
++#define STATUS_SUCCESS				0x00
++#define STATUS_UNSUCCESSFUL 		0x01
++#endif
++
+ //
+ // SCH/DMA registers - base address 0x0200
+ //
+@@ -282,6 +291,36 @@ typedef	union	_USB_DMA_CFG_STRUC	{
+ #define 	PBF_DBG 	 	 0x043c
+ #define     PBF_CAP_CTRL     0x0440
+ 
++#ifdef RT30xx
++// eFuse registers
++#define EFUSE_CTRL              0x0580
++#define EFUSE_DATA0             0x0590
++#define EFUSE_DATA1             0x0594
++#define EFUSE_DATA2             0x0598
++#define EFUSE_DATA3             0x059c
++#define EFUSE_USAGE_MAP_START   0x2d0
++#define EFUSE_USAGE_MAP_END     0x2fc
++#define EFUSE_TAG               0x2fe
++#define EFUSE_USAGE_MAP_SIZE    45
++
++typedef	union	_EFUSE_CTRL_STRUC {
++	struct	{
++		UINT32            EFSROM_AOUT:6;
++		UINT32            EFSROM_MODE:2;
++		UINT32            EFSROM_LDO_OFF_TIME:6;
++		UINT32            EFSROM_LDO_ON_TIME:2;
++		UINT32            EFSROM_AIN:10;
++		UINT32            RESERVED:4;
++		UINT32            EFSROM_KICK:1;
++		UINT32            SEL_EFUSE:1;
++	}	field;
++	UINT32			word;
++}	EFUSE_CTRL_STRUC, *PEFUSE_CTRL_STRUC;
++
++#define LDO_CFG0 				0x05d4
++#define GPIO_SWITCH				0x05dc
++#endif /* RT30xx */
++
+ //
+ //  4  MAC  registers
+ //
+@@ -1093,6 +1132,9 @@ typedef struct _HW_WCID_ENTRY {  // 8-by
+ #define BBP_R22                     22
+ #define BBP_R24                     24
+ #define BBP_R25                     25
++#ifdef RT30xx
++#define BBP_R31                     31
++#endif
+ #define BBP_R49                     49 //TSSI
+ #define BBP_R50                     50
+ #define BBP_R51                     51
+@@ -1110,6 +1152,10 @@ typedef struct _HW_WCID_ENTRY {  // 8-by
+ #define BBP_R73                     73
+ #define BBP_R75						75
+ #define BBP_R77                     77
++#ifdef RT30xx
++#define BBP_R79                     79
++#define BBP_R80                     80
++#endif
+ #define BBP_R81                     81
+ #define BBP_R82                     82
+ #define BBP_R83                     83
+@@ -1131,6 +1177,9 @@ typedef struct _HW_WCID_ENTRY {  // 8-by
+ #define BBP_R121                    121
+ #define BBP_R122                    122
+ #define BBP_R123                    123
++#ifdef RT30xx
++#define BBP_R138                    138 // add by johnli, RF power sequence setup, ADC dynamic on/off control
++#endif // RT30xx //
+ 
+ 
+ #define BBPR94_DEFAULT              0x06 // Add 1 value will gain 1db
+@@ -1519,7 +1568,15 @@ typedef	union _EEPROM_NIC_CINFIG2_STRUC	
+ 		USHORT		EnableWPSPBC:1;                 // WPS PBC Control bit
+ 		USHORT		BW40MAvailForG:1;			// 0:enable, 1:disable
+ 		USHORT		BW40MAvailForA:1;			// 0:enable, 1:disable
++#ifndef RT30xx
+ 		USHORT		Rsv2:6;                 // must be 0
++#endif
++#ifdef RT30xx
++		USHORT		Rsv1:1;					// must be 0
++		USHORT		AntDiversity:1;			// Antenna diversity
++		USHORT		Rsv2:3;					// must be 0
++		USHORT		DACTestBit:1;			// control if driver should patch the DAC issue
++#endif
+ 	}	field;
+ 	USHORT			word;
+ }	EEPROM_NIC_CONFIG2_STRUC, *PEEPROM_NIC_CONFIG2_STRUC;
+--- a/drivers/staging/rt2870/rt_linux.c
++++ b/drivers/staging/rt2870/rt_linux.c
+@@ -830,7 +830,12 @@ void send_monitor_packets(
+ 
+     if (pRxBlk->DataSize + sizeof(wlan_ng_prism2_header) > RX_BUFFER_AGGRESIZE)
+     {
++#ifndef RT30xx
+         DBGPRINT(RT_DEBUG_ERROR, ("%s : Size is too large! (%zu)\n", __func__, pRxBlk->DataSize + sizeof(wlan_ng_prism2_header)));
++#endif
++#ifdef RT30xx
++        DBGPRINT(RT_DEBUG_ERROR, ("%s : Size is too large! (%d)\n", __func__, pRxBlk->DataSize + sizeof(wlan_ng_prism2_header)));
++#endif
+ 		goto err_free_sk_buff;
+     }
+ 
+--- a/drivers/staging/rt2870/rt_linux.h
++++ b/drivers/staging/rt2870/rt_linux.h
+@@ -44,7 +44,9 @@
+ #include <linux/module.h>
+ #include <linux/version.h>
+ #include <linux/kernel.h>
++#ifndef RT30xx
+ #include <linux/kthread.h>
++#endif
+ 
+ #include <linux/spinlock.h>
+ #include <linux/init.h>
+@@ -66,6 +68,9 @@
+ #include <linux/vmalloc.h>
+ 
+ 
++#ifdef RT30xx
++#include <linux/wireless.h>
++#endif
+ #include <net/iw_handler.h>
+ 
+ // load firmware
+@@ -93,7 +98,12 @@ typedef int (*HARD_START_XMIT_FUNC)(stru
+ #define STA_PROFILE_PATH			"/etc/Wireless/RT2870STA/RT2870STA.dat"
+ #define STA_RT2870_IMAGE_FILE_NAME  "/etc/Wireless/RT2870STA/rt2870.bin"
+ #define STA_NIC_DEVICE_NAME			"RT2870STA"
++#ifndef RT30xx
+ #define STA_DRIVER_VERSION			"1.4.0.0"
++#endif
++#ifdef RT30xx
++#define STA_DRIVER_VERSION			"2.0.1.0"
++#endif
+ #endif // RT2870 //
+ 
+ #define RTMP_TIME_AFTER(a,b)		\
+@@ -141,11 +151,13 @@ typedef int (*HARD_START_XMIT_FUNC)(stru
+ #define NDIS_PACKET_TYPE_BROADCAST		2
+ #define NDIS_PACKET_TYPE_ALL_MULTICAST	3
+ 
++#ifndef RT30xx
+ typedef	struct pid *	THREAD_PID;
+ #define	GET_PID(_v)	find_get_pid(_v)
+ #define	GET_PID_NUMBER(_v)	pid_nr(_v)
+ #define CHECK_PID_LEGALITY(_pid)	if (pid_nr(_pid) >= 0)
+ #define KILL_THREAD_PID(_A, _B, _C)	kill_pid(_A, _B, _C)
++#endif
+ 
+ struct os_lock  {
+ 	spinlock_t		lock;
+@@ -158,9 +170,16 @@ struct os_cookie {
+ #ifdef RT2870
+ 	struct usb_device	*pUsb_Dev;
+ 
++#ifndef RT30xx
+ 	struct task_struct	*MLMEThr_task;
+ 	struct task_struct	*RTUSBCmdThr_task;
+ 	struct task_struct	*TimerQThr_task;
++#endif
++#ifdef RT30xx
++	struct pid *		MLMEThr_pid;
++	struct pid *		RTUSBCmdThr_pid;
++	struct pid *		TimerQThr_pid;
++#endif
+ #endif // RT2870 //
+ 
+ 	struct tasklet_struct 	rx_done_task;
+--- a/drivers/staging/rt2870/rt_main_dev.c
++++ b/drivers/staging/rt2870/rt_main_dev.c
+@@ -346,6 +346,7 @@ static int rt28xx_init(IN struct net_dev
+ 	} while (index++ < 100);
+ 
+ 	DBGPRINT(RT_DEBUG_TRACE, ("MAC_CSR0  [ Ver:Rev=0x%08x]\n", pAd->MACVersion));
++/*Iverson patch PCIE L1 issue */
+ 
+ 	// Disable DMA
+ 	RT28XXDMADisable(pAd);
+@@ -485,8 +486,10 @@ static int rt28xx_init(IN struct net_dev
+ 	AsicSwitchChannel(pAd, pAd->CommonCfg.Channel, FALSE);
+ 	AsicLockChannel(pAd, pAd->CommonCfg.Channel);
+ 
++#ifndef RT30xx
+ 	// 8051 firmware require the signal during booting time.
+ 	AsicSendCommandToMcu(pAd, 0x72, 0xFF, 0x00, 0x00);
++#endif
+ 
+ 	if (pAd && (Status != NDIS_STATUS_SUCCESS))
+ 	{
+--- a/drivers/staging/rt2870/rtmp_def.h
++++ b/drivers/staging/rt2870/rtmp_def.h
+@@ -140,7 +140,11 @@
+ #define MAX_PACKETS_IN_PS_QUEUE				128	//32
+ #define WMM_NUM_OF_AC                       4  /* AC0, AC1, AC2, and AC3 */
+ 
+-
++#ifdef RT30xx
++//2008/09/11:KH add to support efuse<--
++#define MAX_EEPROM_BIN_FILE_SIZE					1024
++//2008/09/11:KH add to support efuse-->
++#endif
+ 
+ // RxFilter
+ #define STANORMAL	 0x17f97
+@@ -298,6 +302,12 @@
+ #define MAX_APCLI_NUM				0
+ 
+ #define MAX_MBSSID_NUM				1
++#ifdef RT30xx
++#ifdef MBSS_SUPPORT
++#undef	MAX_MBSSID_NUM
++#define MAX_MBSSID_NUM				(8 - MAX_MESH_NUM - MAX_APCLI_NUM)
++#endif // MBSS_SUPPORT //
++#endif
+ 
+ /* sanity check for apidx */
+ #define MBSS_MR_APIDX_SANITY_CHECK(apidx) \
+@@ -589,6 +599,11 @@
+ #define AP_CNTL_STATE_MACHINE           15
+ #define AP_WPA_STATE_MACHINE            16
+ 
++#ifdef RT30xx
++#define WSC_STATE_MACHINE            17
++#define WSC_UPNP_STATE_MACHINE		    18
++#endif
++
+ //
+ // STA's CONTROL/CONNECT state machine: states, events, total function #
+ //
+@@ -1175,6 +1190,10 @@
+ #define RFIC_2750                   4       // 2.4G/5G 1T2R
+ #define RFIC_3020                   5       // 2.4G 1T1R
+ #define RFIC_2020                   6       // 2.4G B/G
++#ifdef RT30xx
++#define RFIC_3021                   7       // 2.4G 1T2R
++#define RFIC_3022                   8       // 2.4G 2T2R
++#endif
+ 
+ // LED Status.
+ #define LED_LINK_DOWN               0
+--- a/drivers/staging/rt2870/rtmp.h
++++ b/drivers/staging/rt2870/rtmp.h
+@@ -234,9 +234,15 @@ extern UCHAR  WpaIe;
+ extern UCHAR  Wpa2Ie;
+ extern UCHAR  IbssIe;
+ extern UCHAR  Ccx2Ie;
++#ifdef RT30xx
++extern UCHAR  WapiIe;
++#endif
+ 
+ extern UCHAR  WPA_OUI[];
+ extern UCHAR  RSN_OUI[];
++#ifdef RT30xx
++extern UCHAR  WAPI_OUI[];
++#endif
+ extern UCHAR  WME_INFO_ELEM[];
+ extern UCHAR  WME_PARM_ELEM[];
+ extern UCHAR  Ccx2QosInfo[];
+@@ -385,7 +391,17 @@ typedef struct  _QUEUE_HEADER   {
+     (_idx) = (_idx+1) % (_RingSize);       \
+ }
+ 
++#ifdef RT30xx
++// We will have a cost down version which mac version is 0x3090xxxx
++#define IS_RT3090(_pAd)				((((_pAd)->MACVersion & 0xffff0000) == 0x30710000) || (((_pAd)->MACVersion & 0xffff0000) == 0x30900000))
++#endif
+ #define IS_RT3070(_pAd)				(((_pAd)->MACVersion & 0xffff0000) == 0x30700000)
++#ifdef RT30xx
++#define IS_RT3071(_pAd)				(((_pAd)->MACVersion & 0xffff0000) == 0x30710000)
++#define IS_RT2070(_pAd)				(((_pAd)->RfIcType == RFIC_2020) || ((_pAd)->EFuseTag == 0x27))
++
++#define IS_RT30xx(_pAd)				(((_pAd)->MACVersion & 0xfff00000) == 0x30700000)
++#endif
+ 
+ #define RING_PACKET_INIT(_TxRing, _idx)    \
+ {                                          \
+@@ -461,6 +477,11 @@ typedef struct  _QUEUE_HEADER   {
+ #define BBP_IO_READ8_BY_REG_ID(_A, _I, _pV)   		RTUSBReadBBPRegister(_A, _I, _pV)
+ #endif // RT2870 //
+ 
++#ifdef RT30xx
++#define RTMP_RF_IO_READ8_BY_REG_ID(_A, _I, _pV)    RT30xxReadRFRegister(_A, _I, _pV)
++#define RTMP_RF_IO_WRITE8_BY_REG_ID(_A, _I, _V)    RT30xxWriteRFRegister(_A, _I, _V)
++#endif // RT30xx //
++
+ #define     MAP_CHANNEL_ID_TO_KHZ(ch, khz)  {               \
+                 switch (ch)                                 \
+                 {                                           \
+@@ -718,6 +739,41 @@ typedef struct _RTMP_SCATTER_GATHER_LIST
+ }
+ #endif // RT2870 //
+ 
++#ifdef RT30xx
++//Need to collect each ant's rssi concurrently
++//rssi1 is report to pair2 Ant and rss2 is reprot to pair1 Ant when 4 Ant
++#define COLLECT_RX_ANTENNA_AVERAGE_RSSI(_pAd, _rssi1, _rssi2)					\
++{																				\
++	SHORT	AvgRssi;															\
++	UCHAR	UsedAnt;															\
++	if (_pAd->RxAnt.EvaluatePeriod == 0)									\
++	{																		\
++		UsedAnt = _pAd->RxAnt.Pair1PrimaryRxAnt;							\
++		AvgRssi = _pAd->RxAnt.Pair1AvgRssi[UsedAnt];						\
++		if (AvgRssi < 0)													\
++			AvgRssi = AvgRssi - (AvgRssi >> 3) + _rssi1;					\
++		else																\
++			AvgRssi = _rssi1 << 3;											\
++		_pAd->RxAnt.Pair1AvgRssi[UsedAnt] = AvgRssi;						\
++	}																		\
++	else																	\
++	{																		\
++		UsedAnt = _pAd->RxAnt.Pair1SecondaryRxAnt;							\
++		AvgRssi = _pAd->RxAnt.Pair1AvgRssi[UsedAnt];						\
++		if ((AvgRssi < 0) && (_pAd->RxAnt.FirstPktArrivedWhenEvaluate))		\
++			AvgRssi = AvgRssi - (AvgRssi >> 3) + _rssi1;					\
++		else																\
++		{																	\
++			_pAd->RxAnt.FirstPktArrivedWhenEvaluate = TRUE;					\
++			AvgRssi = _rssi1 << 3;											\
++		}																	\
++		_pAd->RxAnt.Pair1AvgRssi[UsedAnt] = AvgRssi;						\
++		_pAd->RxAnt.RcvPktNumWhenEvaluate++;								\
++	}																		\
++}
++#endif // RT30xx //
++
++
+ #define NDIS_QUERY_BUFFER(_NdisBuf, _ppVA, _pBufLen)                    \
+     NdisQueryBuffer(_NdisBuf, _ppVA, _pBufLen)
+ 
+@@ -1042,6 +1098,9 @@ typedef struct _BBP_TUNING_STRUCT {
+ 
+ typedef struct _SOFT_RX_ANT_DIVERSITY_STRUCT {
+ 	UCHAR     EvaluatePeriod;		 // 0:not evalute status, 1: evaluate status, 2: switching status
++#ifdef RT30xx
++	UCHAR     EvaluateStableCnt;
++#endif
+ 	UCHAR     Pair1PrimaryRxAnt;     // 0:Ant-E1, 1:Ant-E2
+ 	UCHAR     Pair1SecondaryRxAnt;   // 0:Ant-E1, 1:Ant-E2
+ 	UCHAR     Pair2PrimaryRxAnt;     // 0:Ant-E3, 1:Ant-E4
+@@ -1639,6 +1698,9 @@ typedef struct _COMMON_CONFIG {
+ 
+ 	BOOLEAN				NdisRadioStateOff; //For HCT 12.0, set this flag to TRUE instead of called MlmeRadioOff.
+ 	ABGBAND_STATE		BandState;		// For setting BBP used on B/G or A mode.
++#ifdef RT30xx
++	BOOLEAN				bRxAntDiversity; // 0:disable, 1:enable Software Rx Antenna Diversity.
++#endif
+ 
+ 	// IEEE802.11H--DFS.
+ 	RADAR_DETECT_STRUCT	RadarDetect;
+@@ -2402,6 +2464,10 @@ typedef struct _RTMP_ADAPTER
+ 	ULONG                   EepromVersion;          // byte 0: version, byte 1: revision, byte 2~3: unused
+ 	UCHAR                   EEPROMAddressNum;       // 93c46=6  93c66=8
+ 	USHORT                  EEPROMDefaultValue[NUM_EEPROM_BBP_PARMS];
++#ifdef RT30xx
++	BOOLEAN                 EepromAccess;
++	UCHAR                   EFuseTag;
++#endif
+ 	ULONG                   FirmwareVersion;        // byte 0: Minor version, byte 1: Major version, otherwise unused.
+ 
+ 	// ---------------------------
+@@ -2678,6 +2744,13 @@ typedef struct _RTMP_ADAPTER
+ 
+ 
+ 	UINT8					PM_FlgSuspend;
++
++#ifdef RT30xx
++//======efuse
++	BOOLEAN		bUseEfuse;
++	BOOLEAN		bEEPROMFile;
++#endif // RT30xx //
++
+ } RTMP_ADAPTER, *PRTMP_ADAPTER;
+ 
+ //
+@@ -4532,6 +4605,12 @@ CHAR RTMPMaxRssi(
+ 	IN CHAR				Rssi1,
+ 	IN CHAR				Rssi2);
+ 
++#ifdef RT30xx
++VOID AsicSetRxAnt(
++	IN PRTMP_ADAPTER	pAd,
++	IN UCHAR			Ant);
++#endif
++
+ VOID AsicEvaluateRxAnt(
+ 	IN PRTMP_ADAPTER	pAd);
+ 
+@@ -5205,6 +5284,10 @@ VOID	RTMPSendTriggerFrame(
+ 	IN  UCHAR           TxRate,
+ 	IN	BOOLEAN			bQosNull);
+ 
++#ifdef RT30xx
++VOID RTMPFilterCalibration(
++	IN PRTMP_ADAPTER pAd);
++#endif // RT30xx //
+ 
+ /* timeout -- ms */
+ VOID RTMP_SetPeriodicTimer(
+@@ -6053,6 +6136,109 @@ VOID AsicTurnOnRFClk(
+ 	IN PRTMP_ADAPTER 	pAd,
+ 	IN	UCHAR			Channel);
+ 
++#ifdef RT30xx
++NTSTATUS RT30xxWriteRFRegister(
++	IN	PRTMP_ADAPTER	pAd,
++	IN	UCHAR			RegID,
++	IN	UCHAR			Value);
++
++NTSTATUS RT30xxReadRFRegister(
++	IN	PRTMP_ADAPTER	pAd,
++	IN	UCHAR			RegID,
++	IN	PUCHAR			pValue);
++
++//2008/09/11:KH add to support efuse<--
++UCHAR eFuseReadRegisters(
++	IN	PRTMP_ADAPTER	pAd,
++	IN	USHORT Offset,
++	IN	USHORT Length,
++	OUT	USHORT* pData);
++
++VOID eFuseReadPhysical(
++	IN	PRTMP_ADAPTER	pAd,
++  	IN	PUSHORT lpInBuffer,
++  	IN	ULONG nInBufferSize,
++  	OUT	PUSHORT lpOutBuffer,
++  	IN	ULONG nOutBufferSize
++);
++
++NTSTATUS eFuseRead(
++	IN	PRTMP_ADAPTER	pAd,
++	IN	USHORT			Offset,
++	OUT	PUCHAR			pData,
++	IN	USHORT			Length);
++
++VOID eFusePhysicalWriteRegisters(
++	IN	PRTMP_ADAPTER	pAd,
++	IN	USHORT Offset,
++	IN	USHORT Length,
++	OUT	USHORT* pData);
++
++NTSTATUS eFuseWriteRegisters(
++	IN	PRTMP_ADAPTER	pAd,
++	IN	USHORT Offset,
++	IN	USHORT Length,
++	IN	USHORT* pData);
++
++VOID eFuseWritePhysical(
++	IN	PRTMP_ADAPTER	pAd,
++  	PUSHORT lpInBuffer,
++	ULONG nInBufferSize,
++  	PUCHAR lpOutBuffer,
++  	ULONG nOutBufferSize
++);
++
++NTSTATUS eFuseWrite(
++   	IN	PRTMP_ADAPTER	pAd,
++	IN	USHORT			Offset,
++	IN	PUCHAR			pData,
++	IN	USHORT			length);
++
++INT set_eFuseGetFreeBlockCount_Proc(
++   	IN	PRTMP_ADAPTER	pAd,
++	IN	PUCHAR			arg);
++
++INT set_eFusedump_Proc(
++	IN	PRTMP_ADAPTER	pAd,
++	IN	PUCHAR			arg);
++
++INT set_eFuseLoadFromBin_Proc(
++	IN	PRTMP_ADAPTER	pAd,
++	IN	PUCHAR			arg);
++
++NTSTATUS eFuseWriteRegistersFromBin(
++	IN	PRTMP_ADAPTER	pAd,
++	IN	USHORT Offset,
++	IN	USHORT Length,
++	IN	USHORT* pData);
++
++VOID eFusePhysicalReadRegisters(
++	IN	PRTMP_ADAPTER	pAd,
++	IN	USHORT Offset,
++	IN	USHORT Length,
++	OUT	USHORT* pData);
++
++NDIS_STATUS NICLoadEEPROM(
++	IN PRTMP_ADAPTER pAd);
++
++BOOLEAN bNeedLoadEEPROM(
++	IN	PRTMP_ADAPTER	pAd);
++//2008/09/11:KH add to support efuse-->
++#endif // RT30xx //
++
++#ifdef RT30xx
++// add by johnli, RF power sequence setup
++VOID RT30xxLoadRFNormalModeSetup(
++	IN PRTMP_ADAPTER 	pAd);
++
++VOID RT30xxLoadRFSleepModeSetup(
++	IN PRTMP_ADAPTER 	pAd);
++
++VOID RT30xxReverseRFSleepModeSetup(
++	IN PRTMP_ADAPTER 	pAd);
++// end johnli
++#endif // RT30xx //
++
+ #ifdef RT2870
+ //
+ // Function Prototype in rtusb_bulk.c
+@@ -6157,6 +6343,7 @@ NTSTATUS RTUSBWriteRFRegister(
+ 	IN	PRTMP_ADAPTER	pAd,
+ 	IN	UINT32			Value);
+ 
++#ifndef RT30xx
+ NTSTATUS	RT30xxWriteRFRegister(
+ 	IN	PRTMP_ADAPTER	pAd,
+ 	IN	UCHAR			RegID,
+@@ -6166,6 +6353,7 @@ NTSTATUS	RT30xxReadRFRegister(
+ 	IN	PRTMP_ADAPTER	pAd,
+ 	IN	UCHAR			RegID,
+ 	IN	PUCHAR			pValue);
++#endif
+ 
+ NTSTATUS RTUSB_VendorRequest(
+ 	IN	PRTMP_ADAPTER	pAd,
+--- a/drivers/staging/rt2870/rt_profile.c
++++ b/drivers/staging/rt2870/rt_profile.c
+@@ -886,11 +886,13 @@ NDIS_STATUS	RTMPReadParametersHook(
+ 
+ 	// Save uid and gid used for filesystem access.
+ 	// Set user and group to 0 (root)
++#ifndef RT30xx
+ 	orgfsuid = current_fsuid();
+ 	orgfsgid = current_fsgid();
+ 	/* Hm, can't really do this nicely anymore, so rely on these files
+ 	 * being set to the proper permission to read them... */
+ 	/* current->cred->fsuid = current->cred->fsgid = 0; */
++#endif
+     orgfs = get_fs();
+     set_fs(KERNEL_DS);
+ 
+@@ -1435,6 +1437,23 @@ NDIS_STATUS	RTMPReadParametersHook(
+ 								DBGPRINT(RT_DEBUG_TRACE, ("TGnWifiTest=%d\n", pAd->StaCfg.bTGnWifiTest));
+ 						}
+ 					}
++
++#ifdef RT30xx
++						{
++							if(RTMPGetKeyParameter("AntDiversity", tmpbuf, 10, buffer))
++							{
++								for (i = 0, macptr = rstrtok(tmpbuf,";"); macptr; macptr = rstrtok(NULL,";"), i++)
++								{
++									if(simple_strtol(macptr, 0, 10) != 0)  //Enable
++										pAd->CommonCfg.bRxAntDiversity = TRUE;
++									else //Disable
++										pAd->CommonCfg.bRxAntDiversity = FALSE;
++
++									DBGPRINT(RT_DEBUG_ERROR, ("AntDiversity=%d\n", pAd->CommonCfg.bRxAntDiversity));
++								}
++							}
++						}
++#endif // RT30xx //
+ 				}
+ 			}
+ 			else
+@@ -1547,12 +1566,21 @@ static void	HTParametersHook(
+         if (Value == 0)
+         {
+             pAd->CommonCfg.BACapability.field.AutoBA = FALSE;
++#ifdef RT30xx
++	    pAd->CommonCfg.BACapability.field.Policy = BA_NOTUSE;
++#endif
+         }
+         else
+         {
+             pAd->CommonCfg.BACapability.field.AutoBA = TRUE;
++#ifdef RT30xx
++	    pAd->CommonCfg.BACapability.field.Policy = IMMED_BA;
++#endif
+         }
+         pAd->CommonCfg.REGBACapability.field.AutoBA = pAd->CommonCfg.BACapability.field.AutoBA;
++#ifdef RT30xx
++	pAd->CommonCfg.REGBACapability.field.Policy = pAd->CommonCfg.BACapability.field.Policy;
++#endif
+         DBGPRINT(RT_DEBUG_TRACE, ("HT: Auto BA  = %s\n", (Value==0) ? "Disable" : "Enable"));
+     }
+ 
+--- a/drivers/staging/rt2870/sta_ioctl.c
++++ b/drivers/staging/rt2870/sta_ioctl.c
+@@ -87,9 +87,10 @@ struct iw_priv_args privtab[] = {
+ 	  0, IW_PRIV_TYPE_CHAR | IW_PRIV_SIZE_MASK, "radio_on" },
+ 	{ SHOW_CFG_VALUE,
+ 	  IW_PRIV_TYPE_CHAR | 1024, IW_PRIV_TYPE_CHAR | IW_PRIV_SIZE_MASK, "show" },
++#ifndef RT30xx
+ 	{ SHOW_ADHOC_ENTRY_INFO,
+ 	  0, IW_PRIV_TYPE_CHAR | IW_PRIV_SIZE_MASK, "adhocEntry" },
+-
++#endif
+ /* --- sub-ioctls relations --- */
+ 
+ #ifdef DBG
+@@ -99,6 +100,11 @@ struct iw_priv_args privtab[] = {
+ { RTPRIV_IOCTL_MAC,
+   IW_PRIV_TYPE_CHAR | 1024, IW_PRIV_TYPE_CHAR | 1024,
+   "mac"},
++#ifdef RT30xx
++{ RTPRIV_IOCTL_RF,
++  IW_PRIV_TYPE_CHAR | IW_PRIV_SIZE_MASK, IW_PRIV_TYPE_CHAR | IW_PRIV_SIZE_MASK,
++  "rf"},
++#endif // RT30xx //
+ { RTPRIV_IOCTL_E2P,
+   IW_PRIV_TYPE_CHAR | 1024, IW_PRIV_TYPE_CHAR | 1024,
+   "e2p"},
+@@ -168,9 +174,11 @@ INT Set_Wpa_Support(
+ 	IN	PUCHAR			arg);
+ 
+ #ifdef DBG
++#ifndef RT30xx
+ VOID RTMPIoctlBBP(
+ 	IN	PRTMP_ADAPTER	pAdapter,
+ 	IN	struct iwreq	*wrq);
++#endif
+ 
+ VOID RTMPIoctlMAC(
+ 	IN	PRTMP_ADAPTER	pAdapter,
+@@ -179,6 +187,12 @@ VOID RTMPIoctlMAC(
+ VOID RTMPIoctlE2PROM(
+     IN  PRTMP_ADAPTER   pAdapter,
+     IN  struct iwreq    *wrq);
++
++#ifdef RT30xx
++VOID RTMPIoctlRF(
++    IN  PRTMP_ADAPTER   pAdapter,
++    IN  struct iwreq    *wrq);
++#endif // RT30xx //
+ #endif // DBG //
+ 
+ 
+@@ -202,9 +216,11 @@ INT Set_ShortRetryLimit_Proc(
+ 	IN	PRTMP_ADAPTER	pAdapter,
+ 	IN	PUCHAR			arg);
+ 
++#ifndef RT30xx
+ INT	Show_Adhoc_MacTable_Proc(
+ 	IN	PRTMP_ADAPTER	pAd,
+ 	IN	PCHAR			extra);
++#endif
+ 
+ static struct {
+ 	CHAR *name;
+@@ -263,6 +279,13 @@ static struct {
+     {"ForceGF",		        		Set_ForceGF_Proc},
+ 	{"LongRetry",	        		Set_LongRetryLimit_Proc},
+ 	{"ShortRetry",	        		Set_ShortRetryLimit_Proc},
++//2008/09/11:KH add to support efuse<--
++#ifdef RT30xx
++	{"efuseFreeNumber",				set_eFuseGetFreeBlockCount_Proc},
++	{"efuseDump",					set_eFusedump_Proc},
++	{"efuseLoadFromBin",				set_eFuseLoadFromBin_Proc},
++#endif // RT30xx //
++//2008/09/11:KH add to support efuse-->
+ 	{NULL,}
+ };
+ 
+@@ -533,7 +556,12 @@ int rt_ioctl_giwfreq(struct net_device *
+ 		   struct iw_freq *freq, char *extra)
+ {
+     VIRTUAL_ADAPTER *pVirtualAd = NULL;
++#ifndef RT30xx
+ 	PRTMP_ADAPTER pAdapter = NULL;
++#endif
++#ifdef RT30xx
++	PRTMP_ADAPTER pAdapter;
++#endif
+ 	UCHAR ch;
+ 	ULONG	m;
+ 
+@@ -544,7 +572,9 @@ int rt_ioctl_giwfreq(struct net_device *
+ 	else
+ 	{
+ 		pVirtualAd = dev->ml_priv;
++#ifndef RT30xx
+ 		if (pVirtualAd && pVirtualAd->RtmpDev)
++#endif
+ 			pAdapter = pVirtualAd->RtmpDev->ml_priv;
+ 	}
+ 
+@@ -604,6 +634,7 @@ int rt_ioctl_giwmode(struct net_device *
+ 		   struct iw_request_info *info,
+ 		   __u32 *mode, char *extra)
+ {
++#ifndef RT30xx
+ 	PRTMP_ADAPTER 	pAdapter = NULL;
+ 	VIRTUAL_ADAPTER *pVirtualAd = NULL;
+ 
+@@ -624,6 +655,10 @@ int rt_ioctl_giwmode(struct net_device *
+ 		   So the net_dev->ml_priv will be NULL in 2rd open */
+ 		return -ENETDOWN;
+ 	}
++#endif
++#ifdef RT30xx
++	PRTMP_ADAPTER pAdapter = dev->ml_priv;
++#endif
+ 
+ 	if (ADHOC_ON(pAdapter))
+ 		*mode = IW_MODE_ADHOC;
+@@ -667,12 +702,18 @@ int rt_ioctl_giwrange(struct net_device 
+ 		   struct iw_request_info *info,
+ 		   struct iw_point *data, char *extra)
+ {
++#ifndef RT30xx
+ 	PRTMP_ADAPTER 	pAdapter = NULL;
+ 	VIRTUAL_ADAPTER *pVirtualAd = NULL;
++#endif
++#ifdef RT30xx
++	PRTMP_ADAPTER pAdapter = dev->ml_priv;
++#endif
+ 	struct iw_range *range = (struct iw_range *) extra;
+ 	u16 val;
+ 	int i;
+ 
++#ifndef RT30xx
+ 	if (dev->priv_flags == INT_MAIN)
+ 	{
+ 		pAdapter = dev->ml_priv;
+@@ -690,6 +731,7 @@ int rt_ioctl_giwrange(struct net_device 
+ 		   So the net_dev->ml_priv will be NULL in 2rd open */
+ 		return -ENETDOWN;
+ 	}
++#endif
+ 
+ 	DBGPRINT(RT_DEBUG_TRACE ,("===>rt_ioctl_giwrange\n"));
+ 	data->length = sizeof(struct iw_range);
+@@ -809,6 +851,7 @@ int rt_ioctl_giwap(struct net_device *de
+ 		      struct iw_request_info *info,
+ 		      struct sockaddr *ap_addr, char *extra)
+ {
++#ifndef RT30xx
+ 	PRTMP_ADAPTER 	pAdapter = NULL;
+ 	VIRTUAL_ADAPTER *pVirtualAd = NULL;
+ 
+@@ -829,6 +872,10 @@ int rt_ioctl_giwap(struct net_device *de
+ 		   So the net_dev->ml_priv will be NULL in 2rd open */
+ 		return -ENETDOWN;
+ 	}
++#endif
++#ifdef RT30xx
++	PRTMP_ADAPTER pAdapter = dev->ml_priv;
++#endif
+ 
+ 	if (INFRA_ON(pAdapter) || ADHOC_ON(pAdapter))
+ 	{
+@@ -1066,6 +1113,87 @@ int rt_ioctl_giwscan(struct net_device *
+ 
+         previous_ev = current_ev;
+ 		current_ev = iwe_stream_add_event(info, current_ev,end_buf, &iwe, IW_EV_ADDR_LEN);
++#ifdef RT30xx
++        if (current_ev == previous_ev)
++#if WIRELESS_EXT >= 17
++            return -E2BIG;
++#else
++			break;
++#endif
++
++		/*
++		Protocol:
++			it will show scanned AP's WirelessMode .
++			it might be
++					802.11a
++					802.11a/n
++					802.11g/n
++					802.11b/g/n
++					802.11g
++					802.11b/g
++		*/
++		memset(&iwe, 0, sizeof(iwe));
++		iwe.cmd = SIOCGIWNAME;
++
++
++	{
++		PBSS_ENTRY pBssEntry=&pAdapter->ScanTab.BssEntry[i];
++		BOOLEAN isGonly=FALSE;
++		int rateCnt=0;
++
++		if (pBssEntry->Channel>14)
++		{
++			if (pBssEntry->HtCapabilityLen!=0)
++				strcpy(iwe.u.name,"802.11a/n");
++			else
++				strcpy(iwe.u.name,"802.11a");
++		}
++		else
++		{
++			/*
++				if one of non B mode rate is set supported rate . it mean G only.
++			*/
++			for (rateCnt=0;rateCnt<pBssEntry->SupRateLen;rateCnt++)
++			{
++				/*
++					6Mbps(140) 9Mbps(146) and >=12Mbps(152) are supported rate , it mean G only.
++				*/
++				if (pBssEntry->SupRate[rateCnt]==140 || pBssEntry->SupRate[rateCnt]==146 || pBssEntry->SupRate[rateCnt]>=152)
++					isGonly=TRUE;
++			}
++
++			for (rateCnt=0;rateCnt<pBssEntry->ExtRateLen;rateCnt++)
++			{
++				if (pBssEntry->ExtRate[rateCnt]==140 || pBssEntry->ExtRate[rateCnt]==146 || pBssEntry->ExtRate[rateCnt]>=152)
++					isGonly=TRUE;
++			}
++
++
++			if (pBssEntry->HtCapabilityLen!=0)
++			{
++				if (isGonly==TRUE)
++					strcpy(iwe.u.name,"802.11g/n");
++				else
++					strcpy(iwe.u.name,"802.11b/g/n");
++			}
++			else
++			{
++				if (isGonly==TRUE)
++					strcpy(iwe.u.name,"802.11g");
++				else
++				{
++					if (pBssEntry->SupRateLen==4 && pBssEntry->ExtRateLen==0)
++						strcpy(iwe.u.name,"802.11b");
++					else
++						strcpy(iwe.u.name,"802.11b/g");
++				}
++			}
++		}
++	}
++
++		previous_ev = current_ev;
++		current_ev	 = iwe_stream_add_event(info, current_ev, end_buf, &iwe, IW_EV_ADDR_LEN);
++#endif /* RT30xx */
+         if (current_ev == previous_ev)
+ #if WIRELESS_EXT >= 17
+             return -E2BIG;
+@@ -1335,6 +1463,7 @@ int rt_ioctl_giwessid(struct net_device 
+ 			 struct iw_request_info *info,
+ 			 struct iw_point *data, char *essid)
+ {
++#ifndef RT30xx
+ 	PRTMP_ADAPTER 	pAdapter = NULL;
+ 	VIRTUAL_ADAPTER *pVirtualAd = NULL;
+ 
+@@ -1355,6 +1484,10 @@ int rt_ioctl_giwessid(struct net_device 
+ 		   So the net_dev->ml_priv will be NULL in 2rd open */
+ 		return -ENETDOWN;
+ 	}
++#endif
++#ifdef RT30xx
++	PRTMP_ADAPTER pAdapter = dev->ml_priv;
++#endif
+ 
+ 	data->flags = 1;
+     if (MONITOR_ON(pAdapter))
+@@ -1414,6 +1547,7 @@ int rt_ioctl_giwnickn(struct net_device 
+ 			 struct iw_request_info *info,
+ 			 struct iw_point *data, char *nickname)
+ {
++#ifndef RT30xx
+ 	PRTMP_ADAPTER 	pAdapter = NULL;
+ 	VIRTUAL_ADAPTER *pVirtualAd = NULL;
+ 
+@@ -1434,6 +1568,10 @@ int rt_ioctl_giwnickn(struct net_device 
+ 		   So the net_dev->ml_priv will be NULL in 2rd open */
+ 		return -ENETDOWN;
+ 	}
++#endif
++#ifdef RT30xx
++	PRTMP_ADAPTER pAdapter = dev->ml_priv;
++#endif
+ 
+ 	if (data->length > strlen(pAdapter->nickname) + 1)
+ 		data->length = strlen(pAdapter->nickname) + 1;
+@@ -1477,6 +1615,7 @@ int rt_ioctl_giwrts(struct net_device *d
+ 		       struct iw_request_info *info,
+ 		       struct iw_param *rts, char *extra)
+ {
++#ifndef RT30xx
+ 	PRTMP_ADAPTER 	pAdapter = NULL;
+ 	VIRTUAL_ADAPTER *pVirtualAd = NULL;
+ 
+@@ -1497,6 +1636,10 @@ int rt_ioctl_giwrts(struct net_device *d
+ 		   So the net_dev->ml_priv will be NULL in 2rd open */
+ 		return -ENETDOWN;
+ 	}
++#endif
++#ifdef RT30xx
++	PRTMP_ADAPTER pAdapter = dev->ml_priv;
++#endif
+ 
+ 	//check if the interface is down
+ 	if(!RTMP_TEST_FLAG(pAdapter, fRTMP_ADAPTER_INTERRUPT_IN_USE))
+@@ -1543,6 +1686,7 @@ int rt_ioctl_giwfrag(struct net_device *
+ 			struct iw_request_info *info,
+ 			struct iw_param *frag, char *extra)
+ {
++#ifndef RT30xx
+ 	PRTMP_ADAPTER 	pAdapter = NULL;
+ 	VIRTUAL_ADAPTER *pVirtualAd = NULL;
+ 
+@@ -1563,6 +1707,10 @@ int rt_ioctl_giwfrag(struct net_device *
+ 		   So the net_dev->ml_priv will be NULL in 2rd open */
+ 		return -ENETDOWN;
+ 	}
++#endif
++#ifdef RT30xx
++	PRTMP_ADAPTER pAdapter = dev->ml_priv;
++#endif
+ 
+ 	//check if the interface is down
+ 	if(!RTMP_TEST_FLAG(pAdapter, fRTMP_ADAPTER_INTERRUPT_IN_USE))
+@@ -1603,8 +1751,13 @@ int rt_ioctl_siwencode(struct net_device
+         pAdapter->StaCfg.AuthMode = Ndis802_11AuthModeOpen;
+         goto done;
+ 	}
++#ifndef RT30xx
+ 	else if ((erq->length == 0) &&
+              (erq->flags & IW_ENCODE_RESTRICTED || erq->flags & IW_ENCODE_OPEN))
++#endif
++#ifdef RT30xx
++	else if (erq->flags & IW_ENCODE_RESTRICTED || erq->flags & IW_ENCODE_OPEN)
++#endif
+ 	{
+ 		STA_PORT_SECURED(pAdapter);
+ 		pAdapter->StaCfg.PairCipher = Ndis802_11WEPEnabled;
+@@ -1615,14 +1768,17 @@ int rt_ioctl_siwencode(struct net_device
+ 			pAdapter->StaCfg.AuthMode = Ndis802_11AuthModeShared;
+     	else
+ 			pAdapter->StaCfg.AuthMode = Ndis802_11AuthModeOpen;
++#ifndef RT30xx
+         goto done;
++#endif
+ 	}
+ 
+     if (erq->length > 0)
+ 	{
+ 		int keyIdx = (erq->flags & IW_ENCODE_INDEX) - 1;
+ 		/* Check the size of the key */
+-		if (erq->length > MAX_WEP_KEY_SIZE) {
++		if (erq->length > MAX_WEP_KEY_SIZE)
++		{
+ 			return -EINVAL;
+ 		}
+ 		/* Check key index */
+@@ -1634,6 +1790,12 @@ int rt_ioctl_siwencode(struct net_device
+             //Using default key
+ 			keyIdx = pAdapter->StaCfg.DefaultKeyId;
+         }
++#ifdef RT30xx
++		else
++		{
++			pAdapter->StaCfg.DefaultKeyId=keyIdx;
++		}
++#endif
+ 
+         NdisZeroMemory(pAdapter->SharedKey[BSS0][keyIdx].Key,  16);
+ 
+@@ -1652,7 +1814,8 @@ int rt_ioctl_siwencode(struct net_device
+ 			pAdapter->SharedKey[BSS0][keyIdx].KeyLen = 0;
+ 
+ 		/* Check if the key is not marked as invalid */
+-		if(!(erq->flags & IW_ENCODE_NOKEY)) {
++		if(!(erq->flags & IW_ENCODE_NOKEY))
++		{
+ 			/* Copy the key in the driver */
+ 			NdisMoveMemory(pAdapter->SharedKey[BSS0][keyIdx].Key, extra, erq->length);
+         }
+@@ -1667,7 +1830,8 @@ int rt_ioctl_siwencode(struct net_device
+             }
+         else
+ 			/* Don't complain if only change the mode */
+-			if (!(erq->flags & IW_ENCODE_MODE)) {
++		if (!(erq->flags & IW_ENCODE_MODE))
++		{
+ 				return -EINVAL;
+ 		}
+ 	}
+@@ -1685,7 +1849,11 @@ rt_ioctl_giwencode(struct net_device *de
+ 			  struct iw_request_info *info,
+ 			  struct iw_point *erq, char *key)
+ {
++#ifdef RT30xx
++	PRTMP_ADAPTER pAdapter = dev->ml_priv;
++#endif
+ 	int kid;
++#ifndef RT30xx
+ 	PRTMP_ADAPTER 	pAdapter = NULL;
+ 	VIRTUAL_ADAPTER *pVirtualAd = NULL;
+ 
+@@ -1706,6 +1874,7 @@ rt_ioctl_giwencode(struct net_device *de
+ 		   So the net_dev->ml_priv will be NULL in 2rd open */
+ 		return -ENETDOWN;
+ 	}
++#endif
+ 
+ 	//check if the interface is down
+ 	if(!RTMP_TEST_FLAG(pAdapter, fRTMP_ADAPTER_INTERRUPT_IN_USE))
+@@ -2066,10 +2235,12 @@ rt_private_show(struct net_device *dev, 
+ 					wrq->length = strlen(extra) + 1; // 1: size of '\0'
+ 			}
+ 			break;
++#ifndef RT30xx
+ 		case SHOW_ADHOC_ENTRY_INFO:
+ 			Show_Adhoc_MacTable_Proc(pAd, extra);
+ 			wrq->length = strlen(extra) + 1; // 1: size of '\0'
+ 			break;
++#endif
+         default:
+             DBGPRINT(RT_DEBUG_TRACE, ("%s - unknow subcmd = %d\n", __func__, subcmd));
+             break;
+@@ -2407,7 +2578,7 @@ int rt_ioctl_siwencodeext(struct net_dev
+ 
+                 NdisZeroMemory(pAdapter->SharedKey[BSS0][keyIdx].Key,  16);
+ 			    NdisMoveMemory(pAdapter->SharedKey[BSS0][keyIdx].Key, ext->key, ext->key_len);
+-
++#ifndef RT30xx
+ 				if (pAdapter->StaCfg.GroupCipher == Ndis802_11GroupWEP40Enabled ||
+ 					pAdapter->StaCfg.GroupCipher == Ndis802_11GroupWEP104Enabled)
+ 				{
+@@ -2422,6 +2593,7 @@ int rt_ioctl_siwencodeext(struct net_dev
+     				// Indicate Connected for GUI
+     				pAdapter->IndicateMediaState = NdisMediaStateConnected;
+ 				}
++#endif
+     			break;
+             case IW_ENCODE_ALG_TKIP:
+                 DBGPRINT(RT_DEBUG_TRACE, ("%s::IW_ENCODE_ALG_TKIP - keyIdx = %d, ext->key_len = %d\n", __func__, keyIdx, ext->key_len));
+@@ -2733,7 +2905,12 @@ rt_private_ioctl_bbp(struct net_device *
+ 			DBGPRINT(RT_DEBUG_TRACE, ("this_char=%s, value=%s\n", this_char, value));
+ 			if (sscanf(this_char, "%d", &(bbpId)) == 1)
+ 			{
++#ifndef RT30xx
+ 				if (bbpId <= 136)
++#endif // RT30xx //
++#ifdef RT30xx
++				if (bbpId <= 138)  // edit by johnli, RF power sequence setup, add BBP R138 for ADC dynamic on/off control
++#endif // RT30xx //
+ 				{
+ 					{
+ 					RTMP_BBP_IO_READ8_BY_REG_ID(pAdapter, bbpId, &regBBP);
+@@ -2758,7 +2935,12 @@ rt_private_ioctl_bbp(struct net_device *
+ 		{ //Write
+ 			if ((sscanf(this_char, "%d", &(bbpId)) == 1) && (sscanf(value, "%x", &(bbpValue)) == 1))
+ 			{
++#ifndef RT30xx
+ 				if (bbpId <= 136)
++#endif // RT30xx //
++#ifdef RT30xx
++				if (bbpId <= 138)  // edit by johnli, RF power sequence setup, add BBP R138 for ADC dynamic on/off control
++#endif // RT30xx //
+ 				{
+ 					{
+ 					    RTMP_BBP_IO_WRITE8_BY_REG_ID(pAdapter, bbpId, bbpValue);
+@@ -2790,14 +2972,24 @@ next:
+ 	{
+ 		memset(extra, 0x00, IW_PRIV_SIZE_MASK);
+ 		sprintf(extra, "\n");
++#ifndef RT30xx
+ 		for (bbpId = 0; bbpId <= 136; bbpId++)
++#endif // RT30xx //
++#ifdef RT30xx
++		for (bbpId = 0; bbpId <= 138; bbpId++)  // edit by johnli, RF power sequence setup, add BBP R138 for ADC dynamic on/off control
++#endif // RT30xx //
+ 		{
+ 		    if (strlen(extra) >= (IW_PRIV_SIZE_MASK - 10))
+                 break;
+ 			RTMP_BBP_IO_READ8_BY_REG_ID(pAdapter, bbpId, &regBBP);
++#ifndef RT30xx
+ 			sprintf(extra+strlen(extra), "R%02d[0x%02X]:%02X    ", bbpId, bbpId*2, regBBP);
+ 			if (bbpId%5 == 4)
+ 				sprintf(extra+strlen(extra), "\n");
++#endif
++#ifdef RT30xx
++			sprintf(extra+strlen(extra), "%03d = %02X\n", bbpId, regBBP);  // edit by johnli, change display format
++#endif
+ 		}
+ 
+         wrq->length = strlen(extra) + 1; // 1: size of '\0'
+@@ -3286,9 +3478,14 @@ INT RTMPSetInformation(
+                 {
+                     // allow dynamic change of "USE OFDM rate or not" in ADHOC mode
+                     // if setting changed, need to reset current TX rate as well as BEACON frame format
++#ifdef RT30xx
++                    pAdapter->CommonCfg.PhyMode = StaConfig.AdhocMode;
++#endif
+                     if (pAdapter->StaCfg.BssType == BSS_ADHOC)
+                     {
++#ifndef RT30xx
+ 						pAdapter->CommonCfg.PhyMode = StaConfig.AdhocMode;
++#endif
+                     	RTMPSetPhyMode(pAdapter, PhyMode);
+                         MlmeUpdateTxRates(pAdapter, FALSE, 0);
+                         MakeIbssBeacon(pAdapter);           // re-build BEACON frame
+@@ -4007,7 +4204,7 @@ INT RTMPSetInformation(
+                         pAdapter->StaCfg.DesireSharedKey[KeyIdx].CipherAlg = CipherAlg;
+                         pAdapter->StaCfg.DefaultKeyId = (UCHAR) KeyIdx;
+                     }
+-
++#ifndef RT30xx
+ 					if ((pAdapter->StaCfg.WpaSupplicantUP != WPA_SUPPLICANT_DISABLE) &&
+ 						(pAdapter->StaCfg.AuthMode >= Ndis802_11AuthModeWPA))
+ 					{
+@@ -4025,6 +4222,10 @@ INT RTMPSetInformation(
+         				pAdapter->IndicateMediaState = NdisMediaStateConnected;
+ 					}
+                     else if (pAdapter->StaCfg.PortSecured == WPA_802_1X_PORT_SECURED)
++#endif
++#ifdef RT30xx
++                    if (pAdapter->StaCfg.PortSecured == WPA_802_1X_PORT_SECURED)
++#endif
+                     {
+                         Key = pAdapter->SharedKey[BSS0][KeyIdx].Key;
+ 
+@@ -5049,6 +5250,9 @@ INT rt28xx_sta_ioctl(
+ 			Status = -EOPNOTSUPP;
+ 			break;
+ 		case RT_PRIV_IOCTL:
++#ifdef RT30xx
++        case RT_PRIV_IOCTL_EXT:
++#endif
+ 			subcmd = wrq->u.data.flags;
+ 			if( subcmd & OID_GET_SET_TOGGLE)
+ 				Status = RTMPSetInformation(pAd, rq, subcmd);
+@@ -5080,6 +5284,11 @@ INT rt28xx_sta_ioctl(
+ 		case RTPRIV_IOCTL_E2P:
+ 			RTMPIoctlE2PROM(pAd, wrq);
+ 			break;
++#ifdef RT30xx
++		case RTPRIV_IOCTL_RF:
++			RTMPIoctlRF(pAd, wrq);
++			break;
++#endif // RT30xx //
+ #endif // DBG //
+         case SIOCETHTOOL:
+                 break;
+@@ -6010,7 +6219,9 @@ VOID RTMPIoctlMAC(
+ 	UCHAR				temp[16], temp2[16];
+ 	UINT32				macValue = 0;
+ 	INT					Status;
+-
++#ifdef RT30xx
++	BOOLEAN				bIsPrintAllMAC = FALSE;
++#endif
+ 
+ 	memset(msg, 0x00, 1024);
+ 	if (wrq->u.data.length > 1) //No parameters.
+@@ -6061,7 +6272,13 @@ VOID RTMPIoctlMAC(
+ 					sprintf(msg+strlen(msg), "[0x%08lX]:%08X  ", macAddr , macValue);
+ 				}
+ 				else
++#ifndef RT30xx
+ 				{//Invalid parametes, so default printk all bbp
++#endif
++#ifdef RT30xx
++				{//Invalid parametes, so default printk all mac
++					bIsPrintAllMAC = TRUE;
++#endif
+ 					goto next;
+ 				}
+ 			}
+@@ -6145,7 +6362,52 @@ VOID RTMPIoctlMAC(
+ 			}
+ 		}
+ 	}
++#ifdef RT30xx
++	else
++		bIsPrintAllMAC = TRUE;
++#endif
+ next:
++#ifdef RT30xx
++	if (bIsPrintAllMAC)
++	{
++		struct file		*file_w;
++		PCHAR			fileName = "MacDump.txt";
++		mm_segment_t	orig_fs;
++
++		orig_fs = get_fs();
++		set_fs(KERNEL_DS);
++
++		// open file
++		file_w = filp_open(fileName, O_WRONLY|O_CREAT, 0);
++		if (IS_ERR(file_w))
++		{
++			DBGPRINT(RT_DEBUG_TRACE, ("-->2) %s: Error %ld opening %s\n", __func__, -PTR_ERR(file_w), fileName));
++		}
++		else
++		{
++			if (file_w->f_op && file_w->f_op->write)
++			{
++				file_w->f_pos = 0;
++				macAddr = 0x1000;
++
++				while (macAddr <= 0x1800)
++				{
++					RTMP_IO_READ32(pAdapter, macAddr, &macValue);
++					sprintf(msg, "%08lx = %08X\n", macAddr, macValue);
++
++					// write data to file
++					file_w->f_op->write(file_w, msg, strlen(msg), &file_w->f_pos);
++
++					printk("%s", msg);
++					macAddr += 4;
++				}
++				sprintf(msg, "\nDump all MAC values to %s\n", fileName);
++			}
++			filp_close(file_w, NULL);
++		}
++		set_fs(orig_fs);
++	}
++#endif /* RT30xx */
+ 	if(strlen(msg) == 1)
+ 		sprintf(msg+strlen(msg), "===>Error command format!");
+ 
+@@ -6186,7 +6448,9 @@ VOID RTMPIoctlE2PROM(
+ 	UCHAR				temp[16], temp2[16];
+ 	USHORT				eepValue;
+ 	int					Status;
+-
++#ifdef RT30xx
++	BOOLEAN				bIsPrintAllE2P = FALSE;
++#endif
+ 
+ 	memset(msg, 0x00, 1024);
+ 	if (wrq->u.data.length > 1) //No parameters.
+@@ -6240,6 +6504,9 @@ VOID RTMPIoctlE2PROM(
+ 				}
+ 				else
+ 				{//Invalid parametes, so default printk all bbp
++#ifdef RT30xx
++					bIsPrintAllE2P = TRUE;
++#endif
+ 					goto next;
+ 				}
+ 			}
+@@ -6298,7 +6565,52 @@ VOID RTMPIoctlE2PROM(
+ 			sprintf(msg+strlen(msg), "[0x%02X]:%02X  ", eepAddr, eepValue);
+ 		}
+ 	}
++#ifdef RT30xx
++	else
++		bIsPrintAllE2P = TRUE;
++#endif
+ next:
++#ifdef RT30xx
++	if (bIsPrintAllE2P)
++	{
++		struct file		*file_w;
++		PCHAR			fileName = "EEPROMDump.txt";
++		mm_segment_t	orig_fs;
++
++		orig_fs = get_fs();
++		set_fs(KERNEL_DS);
++
++		// open file
++		file_w = filp_open(fileName, O_WRONLY|O_CREAT, 0);
++		if (IS_ERR(file_w))
++		{
++			DBGPRINT(RT_DEBUG_TRACE, ("-->2) %s: Error %ld opening %s\n", __func__, -PTR_ERR(file_w), fileName));
++		}
++		else
++		{
++			if (file_w->f_op && file_w->f_op->write)
++			{
++				file_w->f_pos = 0;
++				eepAddr = 0x00;
++
++				while (eepAddr <= 0xFE)
++				{
++					RT28xx_EEPROM_READ16(pAdapter, eepAddr, eepValue);
++					sprintf(msg, "%08x = %04x\n", eepAddr , eepValue);
++
++					// write data to file
++					file_w->f_op->write(file_w, msg, strlen(msg), &file_w->f_pos);
++
++					printk("%s", msg);
++					eepAddr += 2;
++				}
++				sprintf(msg, "\nDump all EEPROM values to %s\n", fileName);
++			}
++			filp_close(file_w, NULL);
++		}
++		set_fs(orig_fs);
++	}
++#endif /* RT30xx */
+ 	if(strlen(msg) == 1)
+ 		sprintf(msg+strlen(msg), "===>Error command format!");
+ 
+@@ -6309,6 +6621,154 @@ next:
+ 
+ 	DBGPRINT(RT_DEBUG_TRACE, ("<==RTMPIoctlE2PROM\n"));
+ }
++#ifdef RT30xx
++/*
++    ==========================================================================
++    Description:
++        Read / Write RF register
++Arguments:
++    pAdapter                    Pointer to our adapter
++    wrq                         Pointer to the ioctl argument
++
++    Return Value:
++        None
++
++    Note:
++        Usage:
++               1.) iwpriv ra0 rf                ==> read all RF registers
++               2.) iwpriv ra0 rf 1              ==> read RF where RegID=1
++               3.) iwpriv ra0 rf 1=10		    ==> write RF R1=0x10
++    ==========================================================================
++*/
++VOID RTMPIoctlRF(
++	IN	PRTMP_ADAPTER	pAdapter,
++	IN	struct iwreq	*wrq)
++{
++	CHAR				*this_char;
++	CHAR				*value;
++	UCHAR				regRF = 0;
++	CHAR				msg[2048];
++	CHAR				arg[255];
++	INT					rfId;
++	LONG				rfValue;
++	int					Status;
++	BOOLEAN				bIsPrintAllRF = FALSE;
++
++
++	memset(msg, 0x00, 2048);
++	if (wrq->u.data.length > 1) //No parameters.
++	{
++	    Status = copy_from_user(arg, wrq->u.data.pointer, (wrq->u.data.length > 255) ? 255 : wrq->u.data.length);
++		sprintf(msg, "\n");
++
++	    //Parsing Read or Write
++		this_char = arg;
++		if (!*this_char)
++			goto next;
++
++		if ((value = strchr(this_char, '=')) != NULL)
++			*value++ = 0;
++
++		if (!value || !*value)
++		{ //Read
++			if (sscanf(this_char, "%d", &(rfId)) == 1)
++			{
++				if (rfId <= 31)
++				{
++					// In RT2860 ATE mode, we do not load 8051 firmware.
++                                            //We must access RF directly.
++                    // For RT2870 ATE mode, ATE_RF_IO_WRITE8(/READ8)_BY_REG_ID are redefined.
++					// according to Andy, Gary, David require.
++					// the command rf shall read rf register directly for dubug.
++					// BBP_IO_READ8_BY_REG_ID(pAdapter, bbpId, &regBBP);
++					RT30xxReadRFRegister(pAdapter, rfId, &regRF);
++
++					sprintf(msg+strlen(msg), "R%02d[0x%02x]:%02X  ", rfId, rfId*2, regRF);
++				}
++				else
++				{//Invalid parametes, so default printk all RF
++					bIsPrintAllRF = TRUE;
++					goto next;
++				}
++			}
++			else
++			{ //Invalid parametes, so default printk all RF
++				bIsPrintAllRF = TRUE;
++				goto next;
++			}
++		}
++		else
++		{ //Write
++			if ((sscanf(this_char, "%d", &(rfId)) == 1) && (sscanf(value, "%lx", &(rfValue)) == 1))
++			{
++				if (rfId <= 31)
++				{
++					// In RT2860 ATE mode, we do not load 8051 firmware.
++					// We should access RF registers directly.
++                    // For RT2870 ATE mode, ATE_RF_IO_WRITE8/READ8_BY_REG_ID are redefined.
++						{
++							// according to Andy, Gary, David require.
++							// the command RF shall read/write RF register directly for dubug.
++							//BBP_IO_READ8_BY_REG_ID(pAdapter, bbpId, &regBBP);
++					                //BBP_IO_WRITE8_BY_REG_ID(pAdapter, (UCHAR)bbpId,(UCHAR) bbpValue);
++							RT30xxReadRFRegister(pAdapter, rfId, &regRF);
++							RT30xxWriteRFRegister(pAdapter, (UCHAR)rfId,(UCHAR) rfValue);
++					                //Read it back for showing
++							//BBP_IO_READ8_BY_REG_ID(pAdapter, bbpId, &regBBP);
++							RT30xxReadRFRegister(pAdapter, rfId, &regRF);
++					                sprintf(msg+strlen(msg), "R%02d[0x%02X]:%02X\n", rfId, rfId*2, regRF);
++				                }
++				}
++				else
++				{//Invalid parametes, so default printk all RF
++					bIsPrintAllRF = TRUE;
++				}
++			}
++			else
++			{ //Invalid parametes, so default printk all RF
++				bIsPrintAllRF = TRUE;
++			}
++		}
++	}
++	else
++		bIsPrintAllRF = TRUE;
++next:
++	if (bIsPrintAllRF)
++	{
++		memset(msg, 0x00, 2048);
++		sprintf(msg, "\n");
++		for (rfId = 0; rfId <= 31; rfId++)
++		{
++			// according to Andy, Gary, David require.
++			// the command RF shall read/write RF register directly for dubug.
++			RT30xxReadRFRegister(pAdapter, rfId, &regRF);
++			sprintf(msg+strlen(msg), "%03d = %02X\n", rfId, regRF);
++		}
++		// Copy the information into the user buffer
++		DBGPRINT(RT_DEBUG_TRACE, ("strlen(msg)=%d\n", (UINT32)strlen(msg)));
++		wrq->u.data.length = strlen(msg);
++		if (copy_to_user(wrq->u.data.pointer, msg, wrq->u.data.length))
++		{
++			DBGPRINT(RT_DEBUG_TRACE, ("%s: copy_to_user() fail\n", __func__));
++		}
++	}
++	else
++	{
++		if(strlen(msg) == 1)
++			sprintf(msg+strlen(msg), "===>Error command format!");
++
++		DBGPRINT(RT_DEBUG_TRACE, ("copy to user [msg=%s]\n", msg));
++		// Copy the information into the user buffer
++		DBGPRINT(RT_DEBUG_TRACE, ("strlen(msg) =%d\n", (UINT32)strlen(msg)));
++
++		// Copy the information into the user buffer
++		wrq->u.data.length = strlen(msg);
++		Status = copy_to_user(wrq->u.data.pointer, msg, wrq->u.data.length);
++	}
++
++	DBGPRINT(RT_DEBUG_TRACE, ("<==RTMPIoctlRF\n\n"));
++}
++#endif // RT30xx //
+ #endif // DBG //
+ 
+ 
+@@ -6355,6 +6815,7 @@ INT Set_ShortRetryLimit_Proc(
+ 	return TRUE;
+ }
+ 
++#ifndef RT30xx
+ INT	Show_Adhoc_MacTable_Proc(
+ 	IN	PRTMP_ADAPTER	pAd,
+ 	IN	PCHAR			extra)
+@@ -6397,5 +6858,4 @@ INT	Show_Adhoc_MacTable_Proc(
+ 
+ 	return TRUE;
+ }
+-
+-
++#endif /* RT30xx */
+--- a/drivers/staging/rt2870/wpa.h
++++ b/drivers/staging/rt2870/wpa.h
+@@ -90,7 +90,9 @@
+ #define TKIP_AP_RXMICK_OFFSET		(TKIP_AP_TXMICK_OFFSET+LEN_TKIP_TXMICK)
+ #define TKIP_GTK_LENGTH				((LEN_TKIP_EK)+(LEN_TKIP_RXMICK)+(LEN_TKIP_TXMICK))
+ #define LEN_PTK						((LEN_EAP_KEY)+(LEN_TKIP_KEY))
++#ifndef RT30xx
+ #define MIN_LEN_OF_GTK				5
++#endif
+ 
+ // RSN IE Length definition
+ #define MAX_LEN_OF_RSNIE         	90

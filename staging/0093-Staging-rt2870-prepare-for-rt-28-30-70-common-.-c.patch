@@ -1,0 +1,4047 @@
+From c05c61ee4e4a421d9be4e22b3ad0fa22ae34ad4a Mon Sep 17 00:00:00 2001
+From: Bartlomiej Zolnierkiewicz <bzolnier@gmail.com>
+Date: Sun, 26 Apr 2009 16:06:22 +0200
+Subject: [PATCH 093/102] Staging: rt2870: prepare for rt{28,30}70/common/*.[ch] merge
+
+Signed-off-by: Bartlomiej Zolnierkiewicz <bzolnier@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+---
+ drivers/staging/rt2870/common/2870_rtmp_init.c |   63 +
+ drivers/staging/rt2870/common/action.c         |    5 
+ drivers/staging/rt2870/common/ba_action.c      |   63 +
+ drivers/staging/rt2870/common/cmm_data.c       |  144 ++
+ drivers/staging/rt2870/common/cmm_data_2870.c  |   35 
+ drivers/staging/rt2870/common/cmm_info.c       |   32 
+ drivers/staging/rt2870/common/cmm_wpa.c        |   12 
+ drivers/staging/rt2870/common/eeprom.c         | 1268 ++++++++++++++++++++++++-
+ drivers/staging/rt2870/common/mlme.c           |  810 +++++++++++++++
+ drivers/staging/rt2870/common/rtmp_init.c      |  432 ++++++++
+ drivers/staging/rt2870/common/rtusb_bulk.c     |   14 
+ drivers/staging/rt2870/common/rtusb_io.c       |   74 +
+ drivers/staging/rt2870/common/spectrum.c       |    5 
+ 13 files changed, 2926 insertions(+), 31 deletions(-)
+
+--- a/drivers/staging/rt2870/common/2870_rtmp_init.c
++++ b/drivers/staging/rt2870/common/2870_rtmp_init.c
+@@ -639,7 +639,7 @@ VOID	RTMPFreeTxRxRingMemory(
+ 
+ 
+ 	// Free Tx frame resource
+-	for (acidx = 0; acidx < 4; acidx++)
++		for(acidx=0; acidx<4; acidx++)
+ 		{
+ 		PHT_TX_CONTEXT pHTTXContext = &(pAd->TxContext[acidx]);
+ 			if (pHTTXContext)
+@@ -699,9 +699,14 @@ NDIS_STATUS AdapterBlockAllocateMemory(
+ 
+ 	usb_dev = pObj->pUsb_Dev;
+ 
++#ifndef RT30xx
+ 	pObj->MLMEThr_task		= NULL;
+ 	pObj->RTUSBCmdThr_task	= NULL;
+-
++#endif
++#ifdef RT30xx
++	pObj->MLMEThr_pid	= NULL;
++	pObj->RTUSBCmdThr_pid	= NULL;
++#endif
+ 	*ppAd = (PVOID)vmalloc(sizeof(RTMP_ADAPTER));
+ 
+ 	if (*ppAd)
+@@ -737,7 +742,12 @@ NDIS_STATUS	 CreateThreads(
+ {
+ 	PRTMP_ADAPTER pAd = net_dev->ml_priv;
+ 	POS_COOKIE pObj = (POS_COOKIE) pAd->OS_Cookie;
++#ifndef RT30xx
+ 	struct task_struct *tsk;
++#endif
++#ifdef RT30xx
++	pid_t pid_number;
++#endif
+ 
+ 	//init_MUTEX(&(pAd->usbdev_semaphore));
+ 
+@@ -751,39 +761,76 @@ NDIS_STATUS	 CreateThreads(
+ 	init_completion (&pAd->TimerQComplete);
+ 
+ 	// Creat MLME Thread
++#ifndef RT30xx
+ 	pObj->MLMEThr_task = NULL;
+ 	tsk = kthread_run(MlmeThread, pAd, pAd->net_dev->name);
+ 
+ 	if (IS_ERR(tsk)) {
++#endif
++#ifdef RT30xx
++	pObj->MLMEThr_pid = NULL;
++	pid_number = kernel_thread(MlmeThread, pAd, CLONE_VM);
++	if (pid_number < 0)
++	{
++#endif
+ 		printk (KERN_WARNING "%s: unable to start Mlme thread\n",pAd->net_dev->name);
+ 		return NDIS_STATUS_FAILURE;
+ 	}
+ 
++#ifndef RT30xx
+ 	pObj->MLMEThr_task = tsk;
++#endif
++#ifdef RT30xx
++	pObj->MLMEThr_pid = find_get_pid(pid_number);
++#endif
+ 	// Wait for the thread to start
+ 	wait_for_completion(&(pAd->mlmeComplete));
+ 
+ 	// Creat Command Thread
++#ifndef RT30xx
+ 	pObj->RTUSBCmdThr_task = NULL;
+ 	tsk = kthread_run(RTUSBCmdThread, pAd, pAd->net_dev->name);
+ 
+ 	if (IS_ERR(tsk) < 0)
++#endif
++#ifdef RT30xx
++	pObj->RTUSBCmdThr_pid = NULL;
++	pid_number = kernel_thread(RTUSBCmdThread, pAd, CLONE_VM);
++	if (pid_number < 0)
++#endif
+ 	{
+ 		printk (KERN_WARNING "%s: unable to start RTUSBCmd thread\n",pAd->net_dev->name);
+ 		return NDIS_STATUS_FAILURE;
+ 	}
+ 
++#ifndef RT30xx
+ 	pObj->RTUSBCmdThr_task = tsk;
++#endif
++#ifdef RT30xx
++	pObj->RTUSBCmdThr_pid = find_get_pid(pid_number);
++#endif
+ 	wait_for_completion(&(pAd->CmdQComplete));
+ 
++#ifndef RT30xx
+ 	pObj->TimerQThr_task = NULL;
+ 	tsk = kthread_run(TimerQThread, pAd, pAd->net_dev->name);
+ 	if (IS_ERR(tsk) < 0)
++#endif
++#ifdef RT30xx
++	pObj->TimerQThr_pid = NULL;
++	pid_number = kernel_thread(TimerQThread, pAd, CLONE_VM);
++	if (pid_number < 0)
++#endif
+ 	{
+ 		printk (KERN_WARNING "%s: unable to start TimerQThread\n",pAd->net_dev->name);
+ 		return NDIS_STATUS_FAILURE;
+ 	}
++#ifndef RT30xx
+ 	pObj->TimerQThr_task = tsk;
++#endif
++#ifdef RT30xx
++	pObj->TimerQThr_pid = find_get_pid(pid_number);
++#endif
+ 	// Wait for the thread to start
+ 	wait_for_completion(&(pAd->TimerQComplete));
+ 
+@@ -1260,9 +1307,9 @@ static void rt2870_hcca_dma_done_tasklet
+ 	UCHAR				BulkOutPipeId = 4;
+ 	purbb_t				pUrb;
+ 
+-
++#ifndef RT30xx
+ 	DBGPRINT_RAW(RT_DEBUG_ERROR, ("--->hcca_dma_done_tasklet\n"));
+-
++#endif
+ 
+ 	pUrb			= (purbb_t)data;
+ 	pHTTXContext	= (PHT_TX_CONTEXT)pUrb->context;
+@@ -1292,13 +1339,19 @@ static void rt2870_hcca_dma_done_tasklet
+ 				RTMPDeQueuePacket(pAd, FALSE, BulkOutPipeId, MAX_TX_PROCESS);
+ 			}
+ 
++#ifndef RT30xx
+ 			RTUSB_SET_BULK_FLAG(pAd, fRTUSB_BULK_OUT_DATA_NORMAL);
++#endif
++#ifdef RT30xx
++			RTUSB_SET_BULK_FLAG(pAd, fRTUSB_BULK_OUT_DATA_NORMAL<<4);
++#endif
+ 			RTUSBKickBulkOut(pAd);
+ 		}
+ 	}
+ 
++#ifndef RT30xx
+ 	DBGPRINT_RAW(RT_DEBUG_ERROR, ("<---hcca_dma_done_tasklet\n"));
+-
++#endif
+ 		return;
+ }
+ 
+--- a/drivers/staging/rt2870/common/action.c
++++ b/drivers/staging/rt2870/common/action.c
+@@ -533,7 +533,12 @@ VOID SendRefreshBAR(
+ 
+ 			if (1)	// Now we always send BAR.
+ 			{
++#ifndef RT30xx
+ 				MiniportMMRequest(pAd, 0, pOutBuffer, FrameLen);
++#endif
++#ifdef RT30xx
++				MiniportMMRequest(pAd, QID_AC_BE, pOutBuffer, FrameLen);
++#endif
+ 			}
+ 			MlmeFreeMemory(pAd, pOutBuffer);
+ 		}
+--- a/drivers/staging/rt2870/common/ba_action.c
++++ b/drivers/staging/rt2870/common/ba_action.c
+@@ -532,6 +532,13 @@ VOID BAOriSessionSetUp(
+ 	pBAEntry->TimeOutValue = TimeOut;
+ 	pBAEntry->pAdapter = pAd;
+ 
++#ifdef RT30xx
++	DBGPRINT(RT_DEBUG_TRACE,("Send AddBA to %02x:%02x:%02x:%02x:%02x:%02x Tid:%d isForced:%d Wcid:%d\n"
++		,pEntry->Addr[0],pEntry->Addr[1],pEntry->Addr[2]
++		,pEntry->Addr[3],pEntry->Addr[4],pEntry->Addr[5]
++		,TID,isForced,pEntry->Aid));
++#endif
++
+ 	if (!(pEntry->TXBAbitmap & (1<<TID)))
+ 	{
+ 		RTMPInitTimer(pAd, &pBAEntry->ORIBATimer, GET_TIMER_FUNCTION(BAOriSessionSetupTimeout), pBAEntry, FALSE);
+@@ -1072,8 +1079,16 @@ VOID BAOriSessionSetupTimeout(
+ 		AddbaReq.Token = pBAEntry->Token;
+ 		MlmeEnqueue(pAd, ACTION_STATE_MACHINE, MT2_MLME_ADD_BA_CATE, sizeof(MLME_ADDBA_REQ_STRUCT), (PVOID)&AddbaReq);
+ 		RT28XX_MLME_HANDLER(pAd);
++#ifndef RT30xx
+ 		DBGPRINT(RT_DEBUG_TRACE,("BA Ori Session Timeout(%d) : Send ADD BA again\n", pBAEntry->Token));
+-
++#endif
++#ifdef RT30xx
++		DBGPRINT(RT_DEBUG_TRACE,("BA Ori Session Timeout(%d) to %02x:%02x:%02x:%02x:%02x:%02x Tid:%d Wcid:%d\n"
++		,pBAEntry->Token
++		,pEntry->Addr[0],pEntry->Addr[1],pEntry->Addr[2]
++		,pEntry->Addr[3],pEntry->Addr[4],pEntry->Addr[5]
++		,pBAEntry->TID,pEntry->Aid));
++#endif
+ 		pBAEntry->Token++;
+ 		RTMPSetTimer(&pBAEntry->ORIBATimer, ORI_BA_SESSION_TIMEOUT);
+ 	}
+@@ -1377,6 +1392,10 @@ VOID SendPSMPAction(
+ 	//ULONG           Idx;
+ 	FRAME_PSMP_ACTION   Frame;
+ 	ULONG           FrameLen;
++#ifdef RT30xx
++	UCHAR			bbpdata=0;
++	UINT32			macdata;
++#endif // RT30xx //
+ 
+ 	NStatus = MlmeAllocateMemory(pAd, &pOutBuffer);	 //Get an unused nonpaged memory
+ 	if (NStatus != NDIS_STATUS_SUCCESS)
+@@ -1392,12 +1411,54 @@ VOID SendPSMPAction(
+ 	switch (Psmp)
+ 	{
+ 		case MMPS_ENABLE:
++#ifdef RT30xx
++			if (IS_RT3090(pAd))
++			{
++				// disable MMPS BBP control register
++				RTMP_BBP_IO_READ8_BY_REG_ID(pAd, BBP_R3, &bbpdata);
++				bbpdata &= ~(0x04);	//bit 2
++				RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R3, bbpdata);
++
++				// disable MMPS MAC control register
++				RTMP_IO_READ32(pAd, 0x1210, &macdata);
++				macdata &= ~(0x09);	//bit 0, 3
++				RTMP_IO_WRITE32(pAd, 0x1210, macdata);
++			}
++#endif // RT30xx //
+ 			Frame.Psmp = 0;
+ 			break;
+ 		case MMPS_DYNAMIC:
++#ifdef RT30xx
++			if (IS_RT3090(pAd))
++			{
++				// enable MMPS BBP control register
++				RTMP_BBP_IO_READ8_BY_REG_ID(pAd, BBP_R3, &bbpdata);
++				bbpdata |= 0x04;	//bit 2
++				RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R3, bbpdata);
++
++				// enable MMPS MAC control register
++				RTMP_IO_READ32(pAd, 0x1210, &macdata);
++				macdata |= 0x09;	//bit 0, 3
++				RTMP_IO_WRITE32(pAd, 0x1210, macdata);
++			}
++#endif // RT30xx //
+ 			Frame.Psmp = 3;
+ 			break;
+ 		case MMPS_STATIC:
++#ifdef RT30xx
++			if (IS_RT3090(pAd))
++			{
++				// enable MMPS BBP control register
++				RTMP_BBP_IO_READ8_BY_REG_ID(pAd, BBP_R3, &bbpdata);
++				bbpdata |= 0x04;	//bit 2
++				RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R3, bbpdata);
++
++				// enable MMPS MAC control register
++				RTMP_IO_READ32(pAd, 0x1210, &macdata);
++				macdata |= 0x09;	//bit 0, 3
++				RTMP_IO_WRITE32(pAd, 0x1210, macdata);
++			}
++#endif // RT30xx //
+ 			Frame.Psmp = 1;
+ 			break;
+ 	}
+--- a/drivers/staging/rt2870/common/cmm_data_2870.c
++++ b/drivers/staging/rt2870/common/cmm_data_2870.c
+@@ -292,6 +292,7 @@ USHORT RtmpUSB_WriteSingleTxResource(
+ 		pTxBlk->Priv = (TXINFO_SIZE + USBDMApktLen);
+ 
+ 		// For TxInfo, the length of USBDMApktLen = TXWI_SIZE + 802.11 header + payload
++		//PS packets use HCCA queue when dequeue from PS unicast queue (WiFi WPA2 MA9_DT1 for Marvell B STA)
+ 		RTMPWriteTxInfo(pAd, pTxInfo, (USHORT)(USBDMApktLen), FALSE, FIFO_EDCA, FALSE /*NextValid*/,  FALSE);
+ 
+ 		if ((pHTTXContext->CurWritePosition + 3906 + pTxBlk->Priv) > MAX_TXBULK_LIMIT)
+@@ -809,7 +810,12 @@ VOID RT28xxUsbStaAsicForceWakeup(
+ 	AutoWakeupCfg.word = 0;
+ 	RTMP_IO_WRITE32(pAd, AUTO_WAKEUP_CFG, AutoWakeupCfg.word);
+ 
++#ifndef RT30xx
+ 	AsicSendCommandToMcu(pAd, 0x31, 0xff, 0x00, 0x00);
++#endif
++#ifdef RT30xx
++	AsicSendCommandToMcu(pAd, 0x31, 0xff, 0x00, 0x02);
++#endif
+ 
+ 	OPSTATUS_CLEAR_FLAG(pAd, fOP_STATUS_DOZE);
+ }
+@@ -846,7 +852,12 @@ VOID RT28xxUsbMlmeRadioOn(
+ 	if (!RTMP_TEST_FLAG(pAd, fRTMP_ADAPTER_RADIO_OFF))
+ 		return;
+ 
++#ifndef RT30xx
+     	AsicSendCommandToMcu(pAd, 0x31, 0xff, 0x00, 0x00);
++#endif
++#ifdef RT30xx
++    	AsicSendCommandToMcu(pAd, 0x31, 0xff, 0x00, 0x02);
++#endif
+ 		RTMPusecDelay(10000);
+ 
+ 	NICResetFromError(pAd);
+@@ -854,6 +865,13 @@ VOID RT28xxUsbMlmeRadioOn(
+ 	// Enable Tx/Rx
+ 	RTMPEnableRxTx(pAd);
+ 
++#ifdef RT3070
++	if (IS_RT3071(pAd))
++	{
++		RT30xxReverseRFSleepModeSetup(pAd);
++	}
++#endif // RT3070 //
++
+ 	// Clear Radio off flag
+ 	RTMP_CLEAR_FLAG(pAd, fRTMP_ADAPTER_RADIO_OFF);
+ 
+@@ -890,6 +908,7 @@ VOID RT28xxUsbMlmeRadioOFF(
+ 		BssTableInit(&pAd->ScanTab);
+ 	}
+ 
++#ifndef RT30xx
+ 	// Disable MAC Tx/Rx
+ 	RTMP_IO_READ32(pAd, MAC_SYS_CTRL, &Value);
+ 	Value &= (0xfffffff3);
+@@ -903,6 +922,7 @@ VOID RT28xxUsbMlmeRadioOFF(
+ 
+ 	// TX_PIN_CFG => value = 0x0 => 20mA
+ 	RTMP_IO_WRITE32(pAd, TX_PIN_CFG, 0);
++#endif
+ 
+ 	if (pAd->CommonCfg.BBPCurrentBW == BW_40)
+ 	{
+@@ -915,6 +935,14 @@ VOID RT28xxUsbMlmeRadioOFF(
+ 		AsicTurnOffRFClk(pAd, pAd->CommonCfg.Channel);
+ 	}
+ 
++#ifdef RT30xx
++	// Disable Tx/Rx DMA
++	RTUSBReadMACRegister(pAd, WPDMA_GLO_CFG, &GloCfg.word);	   // disable DMA
++	GloCfg.field.EnableTxDMA = 0;
++	GloCfg.field.EnableRxDMA = 0;
++	RTUSBWriteMACRegister(pAd, WPDMA_GLO_CFG, GloCfg.word);	   // abort all TX rings
++#endif
++
+ 	// Waiting for DMA idle
+ 	i = 0;
+ 	do
+@@ -926,6 +954,13 @@ VOID RT28xxUsbMlmeRadioOFF(
+ 		RTMPusecDelay(1000);
+ 	}while (i++ < 100);
+ 
++#ifdef RT30xx
++	// Disable MAC Tx/Rx
++	RTMP_IO_READ32(pAd, MAC_SYS_CTRL, &Value);
++	Value &= (0xfffffff3);
++	RTMP_IO_WRITE32(pAd, MAC_SYS_CTRL, Value);
++#endif
++
+ 	AsicSendCommandToMcu(pAd, 0x30, 0xff, 0xff, 0x02);
+ }
+ 
+--- a/drivers/staging/rt2870/common/cmm_data.c
++++ b/drivers/staging/rt2870/common/cmm_data.c
+@@ -172,7 +172,114 @@ NDIS_STATUS MiniportMMRequest(
+ 	return Status;
+ }
+ 
++#ifdef RT30xx
++NDIS_STATUS MlmeDataHardTransmit(
++	IN	PRTMP_ADAPTER	pAd,
++	IN	UCHAR	QueIdx,
++	IN	PNDIS_PACKET	pPacket);
++
++#define MAX_DATAMM_RETRY	3
++/*
++	========================================================================
++
++	Routine Description:
++		API for MLME to transmit management frame to AP (BSS Mode)
++	or station (IBSS Mode)
++
++	Arguments:
++		pAd Pointer to our adapter
++		pData		Pointer to the outgoing 802.11 frame
++		Length		Size of outgoing management frame
++
++	Return Value:
++		NDIS_STATUS_FAILURE
++		NDIS_STATUS_PENDING
++		NDIS_STATUS_SUCCESS
++
++	IRQL = PASSIVE_LEVEL
++	IRQL = DISPATCH_LEVEL
++
++	Note:
++
++	========================================================================
++*/
++NDIS_STATUS MiniportDataMMRequest(
++							 IN  PRTMP_ADAPTER   pAd,
++							 IN  UCHAR           QueIdx,
++							 IN  PUCHAR          pData,
++							 IN  UINT            Length)
++{
++	PNDIS_PACKET    pPacket;
++	NDIS_STATUS  Status = NDIS_STATUS_SUCCESS;
++	ULONG    FreeNum;
++	int 	retry = 0;
++	UCHAR           IrqState;
++	UCHAR			rtmpHwHdr[TXINFO_SIZE + TXWI_SIZE]; //RTMP_HW_HDR_LEN];
++
++	ASSERT(Length <= MGMT_DMA_BUFFER_SIZE);
++
++	// 2860C use Tx Ring
++	IrqState = pAd->irq_disabled;
++
++	do
++	{
++		// Reset is in progress, stop immediately
++		if (RTMP_TEST_FLAG(pAd, fRTMP_ADAPTER_RESET_IN_PROGRESS) ||
++			 RTMP_TEST_FLAG(pAd, fRTMP_ADAPTER_HALT_IN_PROGRESS | fRTMP_ADAPTER_NIC_NOT_EXIST)||
++			!RTMP_TEST_FLAG(pAd, fRTMP_ADAPTER_START_UP))
++		{
++			Status = NDIS_STATUS_FAILURE;
++			break;
++		}
+ 
++		// Check Free priority queue
++		// Since we use PBF Queue2 for management frame.  Its corresponding DMA ring should be using TxRing.
++
++		// 2860C use Tx Ring
++
++		// free Tx(QueIdx) resources
++		FreeNum = GET_TXRING_FREENO(pAd, QueIdx);
++
++		if ((FreeNum > 0))
++		{
++			// We need to reserve space for rtmp hardware header. i.e., TxWI for RT2860 and TxInfo+TxWI for RT2870
++			NdisZeroMemory(&rtmpHwHdr, (TXINFO_SIZE + TXWI_SIZE));
++			Status = RTMPAllocateNdisPacket(pAd, &pPacket, (PUCHAR)&rtmpHwHdr, (TXINFO_SIZE + TXWI_SIZE), pData, Length);
++			if (Status != NDIS_STATUS_SUCCESS)
++			{
++				DBGPRINT(RT_DEBUG_WARN, ("MiniportMMRequest (error:: can't allocate NDIS PACKET)\n"));
++				break;
++			}
++
++			//pAd->CommonCfg.MlmeTransmit.field.MODE = MODE_CCK;
++			//pAd->CommonCfg.MlmeRate = RATE_2;
++
++
++			Status = MlmeDataHardTransmit(pAd, QueIdx, pPacket);
++			if (Status != NDIS_STATUS_SUCCESS)
++				RTMPFreeNdisPacket(pAd, pPacket);
++			retry = MAX_DATAMM_RETRY;
++		}
++		else
++		{
++			retry ++;
++
++			printk("retry %d\n", retry);
++			pAd->RalinkCounters.MgmtRingFullCount++;
++
++			if (retry >= MAX_DATAMM_RETRY)
++			{
++				DBGPRINT(RT_DEBUG_ERROR, ("Qidx(%d), not enough space in DataRing, MgmtRingFullCount=%ld!\n",
++											QueIdx, pAd->RalinkCounters.MgmtRingFullCount));
++			}
++		}
++
++	} while (retry < MAX_DATAMM_RETRY);
++
++
++	return Status;
++}
++#endif /* RT30xx */
+ 
+ 
+ /*
+@@ -214,7 +321,23 @@ NDIS_STATUS MlmeHardTransmit(
+ 
+ }
+ 
++#ifdef RT30xx
++NDIS_STATUS MlmeDataHardTransmit(
++	IN	PRTMP_ADAPTER	pAd,
++	IN	UCHAR	QueIdx,
++	IN	PNDIS_PACKET	pPacket)
++{
++	if ((pAd->CommonCfg.RadarDetect.RDMode != RD_NORMAL_MODE)
++		)
++	{
++		return NDIS_STATUS_FAILURE;
++	}
+ 
++#ifdef RT2870
++	return MlmeHardTransmitMgmtRing(pAd,QueIdx,pPacket);
++#endif // RT2870 //
++}
++#endif /* RT30xx */
+ 
+ NDIS_STATUS MlmeHardTransmitMgmtRing(
+ 	IN	PRTMP_ADAPTER	pAd,
+@@ -614,6 +737,11 @@ BOOLEAN RTMP_FillTxBlkInfo(
+ 	}
+ 
+ 	return TRUE;
++
++#ifdef RT30xx
++FillTxBlkErr:
++	return FALSE;
++#endif
+ }
+ 
+ 
+@@ -701,6 +829,7 @@ VOID RTMPDeQueuePacket(
+ 	if (QIdx == NUM_OF_TX_RING)
+ 	{
+ 		sQIdx = 0;
++//PS packets use HCCA queue when dequeue from PS unicast queue (WiFi WPA2 MA9_DT1 for Marvell B STA)
+ 		eQIdx = 3;	// 4 ACs, start from 0.
+ 	}
+ 	else
+@@ -1413,7 +1542,15 @@ VOID RTMPResumeMsduTransmission(
+ {
+ 	DBGPRINT(RT_DEBUG_TRACE,("SCAN done, resume MSDU transmission ...\n"));
+ 
+-
++#ifdef RT30xx
++	// After finish BSS_SCAN_IN_PROGRESS, we need to restore Current R66 value
++	// R66 should not be 0
++	if (pAd->BbpTuning.R66CurrentValue == 0)
++	{
++		pAd->BbpTuning.R66CurrentValue = 0x38;
++		DBGPRINT_ERR(("RTMPResumeMsduTransmission, R66CurrentValue=0...\n"));
++	}
++#endif
+ 	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R66, pAd->BbpTuning.R66CurrentValue);
+ 
+ 	RTMP_CLEAR_FLAG(pAd, fRTMP_ADAPTER_BSS_SCAN_IN_PROGRESS);
+@@ -1774,7 +1911,12 @@ BOOLEAN MacTableDeleteEntry(
+ 	if (pAd->MacTab.Size == 0)
+ 	{
+ 		pAd->CommonCfg.AddHTInfo.AddHtInfo2.OperaionMode = 0;
++#ifndef RT30xx
+ 		AsicUpdateProtect(pAd, 0 /*pAd->CommonCfg.AddHTInfo.AddHtInfo2.OperaionMode*/, (ALLN_SETPROTECT), TRUE, 0 /*pAd->MacTab.fAnyStationNonGF*/);
++#endif
++#ifdef RT30xx
++		RT28XX_UPDATE_PROTECT(pAd);  // edit by johnli, fix "in_interrupt" error when call "MacTableDeleteEntry" in Rx tasklet
++#endif
+ 	}
+ 
+ 	return TRUE;
+--- a/drivers/staging/rt2870/common/cmm_info.c
++++ b/drivers/staging/rt2870/common/cmm_info.c
+@@ -1388,6 +1388,7 @@ VOID	RTMPSetHT(
+ 		pAd->CommonCfg.DesiredHtPhy.RxSTBC = 0;
+ 	}
+ 
++#ifndef RT30xx
+ #ifdef RT2870
+ 	/* Frank recommend ,If not, Tx maybe block in high power. Rx has no problem*/
+ 	if(IS_RT3070(pAd) && ((pAd->RfIcType == RFIC_3020) || (pAd->RfIcType == RFIC_2020)))
+@@ -1396,6 +1397,7 @@ VOID	RTMPSetHT(
+ 		pAd->CommonCfg.DesiredHtPhy.TxSTBC = 0;
+ 	}
+ #endif // RT2870 //
++#endif
+ 
+ 	if(pHTPhyMode->SHORTGI == GI_400)
+ 	{
+@@ -2454,13 +2456,26 @@ INT	Set_HtAutoBa_Proc(
+ 
+ 	Value = simple_strtol(arg, 0, 10);
+ 	if (Value == 0)
++	{
+ 		pAd->CommonCfg.BACapability.field.AutoBA = FALSE;
+-    else if (Value == 1)
++#ifdef RT30xx
++		pAd->CommonCfg.BACapability.field.Policy = BA_NOTUSE;
++#endif
++	}
++        else if (Value == 1)
++	{
+ 		pAd->CommonCfg.BACapability.field.AutoBA = TRUE;
++#ifdef RT30xx
++		pAd->CommonCfg.BACapability.field.Policy = IMMED_BA;
++#endif
++	}
+ 	else
+ 		return FALSE; //Invalid argument
+ 
+     pAd->CommonCfg.REGBACapability.field.AutoBA = pAd->CommonCfg.BACapability.field.AutoBA;
++#ifdef RT30xx
++    pAd->CommonCfg.REGBACapability.field.Policy = pAd->CommonCfg.BACapability.field.Policy;
++#endif
+ 	SetCommonHT(pAd);
+ 
+ 	DBGPRINT(RT_DEBUG_TRACE, ("Set_HtAutoBa_Proc::(HtAutoBa=%d)\n",pAd->CommonCfg.BACapability.field.AutoBA));
+@@ -2677,6 +2692,9 @@ PCHAR   RTMPGetRalinkAuthModeStr(
+ 	{
+ 		case Ndis802_11AuthModeOpen:
+ 			return "OPEN";
++#ifdef RT30xx
++        default:
++#endif
+ 		case Ndis802_11AuthModeWPAPSK:
+ 			return "WPAPSK";
+ 		case Ndis802_11AuthModeShared:
+@@ -2691,10 +2709,12 @@ PCHAR   RTMPGetRalinkAuthModeStr(
+ 			return "WPAPSKWPA2PSK";
+         case Ndis802_11AuthModeWPA1WPA2:
+ 			return "WPA1WPA2";
++#ifndef RT30xx
+ 		case Ndis802_11AuthModeWPANone:
+ 			return "WPANONE";
+ 		default:
+ 			return "UNKNOW";
++#endif
+ 	}
+ }
+ 
+@@ -2703,6 +2723,9 @@ PCHAR   RTMPGetRalinkEncryModeStr(
+ {
+ 	switch(encryMode)
+ 	{
++#ifdef RT30xx
++	    default:
++#endif
+ 		case Ndis802_11WEPDisabled:
+ 			return "NONE";
+ 		case Ndis802_11WEPEnabled:
+@@ -2713,8 +2736,10 @@ PCHAR   RTMPGetRalinkEncryModeStr(
+ 			return "AES";
+         case Ndis802_11Encryption4Enabled:
+ 			return "TKIPAES";
++#ifndef RT30xx
+ 		default:
+ 			return "UNKNOW";
++#endif
+ 	}
+ }
+ 
+@@ -2739,7 +2764,12 @@ INT RTMPShowCfgValue(
+ 	{
+ 		sprintf(pBuf, "\n");
+ 		for (PRTMP_PRIVATE_STA_SHOW_CFG_VALUE_PROC = RTMP_PRIVATE_STA_SHOW_CFG_VALUE_PROC; PRTMP_PRIVATE_STA_SHOW_CFG_VALUE_PROC->name; PRTMP_PRIVATE_STA_SHOW_CFG_VALUE_PROC++)
++#ifndef RT30xx
+ 			sprintf(pBuf + strlen(pBuf), "%s\n", PRTMP_PRIVATE_STA_SHOW_CFG_VALUE_PROC->name);
++#endif
++#ifdef RT30xx
++			sprintf(pBuf, "%s%s\n", pBuf, PRTMP_PRIVATE_STA_SHOW_CFG_VALUE_PROC->name);
++#endif
+ 	}
+ 
+ 	return Status;
+--- a/drivers/staging/rt2870/common/cmm_wpa.c
++++ b/drivers/staging/rt2870/common/cmm_wpa.c
+@@ -39,10 +39,14 @@
+ // WPA OUI
+ UCHAR		OUI_WPA_NONE_AKM[4]		= {0x00, 0x50, 0xF2, 0x00};
+ UCHAR       OUI_WPA_VERSION[4]      = {0x00, 0x50, 0xF2, 0x01};
++#ifndef RT30xx
+ UCHAR       OUI_WPA_WEP40[4]      = {0x00, 0x50, 0xF2, 0x01};
++#endif
+ UCHAR       OUI_WPA_TKIP[4]     = {0x00, 0x50, 0xF2, 0x02};
+ UCHAR       OUI_WPA_CCMP[4]     = {0x00, 0x50, 0xF2, 0x04};
++#ifndef RT30xx
+ UCHAR       OUI_WPA_WEP104[4]      = {0x00, 0x50, 0xF2, 0x05};
++#endif
+ UCHAR       OUI_WPA_8021X_AKM[4]	= {0x00, 0x50, 0xF2, 0x01};
+ UCHAR       OUI_WPA_PSK_AKM[4]      = {0x00, 0x50, 0xF2, 0x02};
+ // WPA2 OUI
+@@ -51,7 +55,9 @@ UCHAR       OUI_WPA2_TKIP[4]        = {0
+ UCHAR       OUI_WPA2_CCMP[4]        = {0x00, 0x0F, 0xAC, 0x04};
+ UCHAR       OUI_WPA2_8021X_AKM[4]   = {0x00, 0x0F, 0xAC, 0x01};
+ UCHAR       OUI_WPA2_PSK_AKM[4]   	= {0x00, 0x0F, 0xAC, 0x02};
++#ifndef RT30xx
+ UCHAR       OUI_WPA2_WEP104[4]   = {0x00, 0x0F, 0xAC, 0x05};
++#endif
+ // MSA OUI
+ UCHAR   	OUI_MSA_8021X_AKM[4]    = {0x00, 0x0F, 0xAC, 0x05};		// Not yet final - IEEE 802.11s-D1.06
+ UCHAR   	OUI_MSA_PSK_AKM[4]   	= {0x00, 0x0F, 0xAC, 0x06};		// Not yet final - IEEE 802.11s-D1.06
+@@ -370,6 +376,7 @@ static VOID RTMPInsertRsnIeCipher(
+                 break;
+         }
+ 
++#ifndef RT30xx
+ 		if ((pAd->OpMode == OPMODE_STA) &&
+ 			(pAd->StaCfg.GroupCipher != Ndis802_11Encryption2Enabled) &&
+ 			(pAd->StaCfg.GroupCipher != Ndis802_11Encryption3Enabled))
+@@ -385,7 +392,7 @@ static VOID RTMPInsertRsnIeCipher(
+ 					break;
+ 			}
+ 		}
+-
++#endif
+ 		// swap for big-endian platform
+ 		pRsnie_cipher->version = cpu2le16(pRsnie_cipher->version);
+ 	    pRsnie_cipher->ucount = cpu2le16(pRsnie_cipher->ucount);
+@@ -446,6 +453,7 @@ static VOID RTMPInsertRsnIeCipher(
+                 break;
+         }
+ 
++#ifndef RT30xx
+ 		if ((pAd->OpMode == OPMODE_STA) &&
+ 			(pAd->StaCfg.GroupCipher != Ndis802_11Encryption2Enabled) &&
+ 			(pAd->StaCfg.GroupCipher != Ndis802_11Encryption3Enabled))
+@@ -461,7 +469,7 @@ static VOID RTMPInsertRsnIeCipher(
+ 					break;
+ 			}
+ 		}
+-
++#endif
+ 		// swap for big-endian platform
+ 		pRsnie_cipher->version = cpu2le16(pRsnie_cipher->version);
+ 	    pRsnie_cipher->ucount = cpu2le16(pRsnie_cipher->ucount);
+--- a/drivers/staging/rt2870/common/eeprom.c
++++ b/drivers/staging/rt2870/common/eeprom.c
+@@ -73,12 +73,16 @@ USHORT ShiftInBits(
+         RaiseClock(pAd, &x);
+ 
+         RTMP_IO_READ32(pAd, E2PROM_CSR, &x);
+-
++#ifdef RT30xx
++		LowerClock(pAd, &x); //prevent read failed
++#endif
+         x &= ~(EEDI);
+         if(x & EEDO)
+             data |= 1;
+ 
++#ifndef RT30xx
+         LowerClock(pAd, &x);
++#endif
+     }
+ 
+     return data;
+@@ -181,6 +185,15 @@ USHORT RTMP_EEPROM_READ16(
+     UINT32		x;
+     USHORT		data;
+ 
++#ifdef RT30xx
++	if (pAd->NicConfig2.field.AntDiversity)
++    {
++    	pAd->EepromAccess = TRUE;
++    }
++//2008/09/11:KH add to support efuse<--
++//2008/09/11:KH add to support efuse-->
++{
++#endif
+     Offset /= 2;
+     // reset bits and set EECS
+     RTMP_IO_READ32(pAd, E2PROM_CSR, &x);
+@@ -188,9 +201,17 @@ USHORT RTMP_EEPROM_READ16(
+     x |= EECS;
+     RTMP_IO_WRITE32(pAd, E2PROM_CSR, x);
+ 
++#ifdef RT30xx
++	// patch can not access e-Fuse issue
++    if (!IS_RT3090(pAd))
++    {
++#endif
+ 	// kick a pulse
+ 	RaiseClock(pAd, &x);
+ 	LowerClock(pAd, &x);
++#ifdef RT30xx
++    }
++#endif
+ 
+     // output the read_opcode and register number in that order
+     ShiftOutBits(pAd, EEPROM_READ_OPCODE, 3);
+@@ -201,6 +222,17 @@ USHORT RTMP_EEPROM_READ16(
+ 
+     EEpromCleanup(pAd);
+ 
++#ifdef RT30xx
++	// Antenna and EEPROM access are both using EESK pin,
++    // Therefor we should avoid accessing EESK at the same time
++    // Then restore antenna after EEPROM access
++	if ((pAd->NicConfig2.field.AntDiversity) || (pAd->RfIcType == RFIC_3020))
++    {
++	    pAd->EepromAccess = FALSE;
++	    AsicSetRxAnt(pAd, pAd->RxAnt.Pair1PrimaryRxAnt);
++    }
++}
++#endif
+     return data;
+ }	//ReadEEprom
+ 
+@@ -211,6 +243,15 @@ VOID RTMP_EEPROM_WRITE16(
+ {
+     UINT32 x;
+ 
++#ifdef RT30xx
++	if (pAd->NicConfig2.field.AntDiversity)
++    {
++    	pAd->EepromAccess = TRUE;
++    }
++	//2008/09/11:KH add to support efuse<--
++//2008/09/11:KH add to support efuse-->
++	{
++#endif
+ 	Offset /= 2;
+ 
+ 	EWEN(pAd);
+@@ -221,9 +262,17 @@ VOID RTMP_EEPROM_WRITE16(
+     x |= EECS;
+     RTMP_IO_WRITE32(pAd, E2PROM_CSR, x);
+ 
++#ifdef RT30xx
++	// patch can not access e-Fuse issue
++    if (!IS_RT3090(pAd))
++    {
++#endif
+ 	// kick a pulse
+ 	RaiseClock(pAd, &x);
+ 	LowerClock(pAd, &x);
++#ifdef RT30xx
++    }
++#endif
+ 
+     // output the read_opcode ,register number and data in that order
+     ShiftOutBits(pAd, EEPROM_WRITE_OPCODE, 3);
+@@ -240,5 +289,1222 @@ VOID RTMP_EEPROM_WRITE16(
+ 	EWDS(pAd);
+ 
+     EEpromCleanup(pAd);
++
++#ifdef RT30xx
++	// Antenna and EEPROM access are both using EESK pin,
++    // Therefor we should avoid accessing EESK at the same time
++    // Then restore antenna after EEPROM access
++	if ((pAd->NicConfig2.field.AntDiversity) || (pAd->RfIcType == RFIC_3020))
++    {
++	    pAd->EepromAccess = FALSE;
++	    AsicSetRxAnt(pAd, pAd->RxAnt.Pair1PrimaryRxAnt);
++    }
++}
++#endif
++}
++
++//2008/09/11:KH add to support efuse<--
++#ifdef RT30xx
++/*
++	========================================================================
++
++	Routine Description:
++
++	Arguments:
++
++	Return Value:
++
++	IRQL =
++
++	Note:
++
++	========================================================================
++*/
++UCHAR eFuseReadRegisters(
++	IN	PRTMP_ADAPTER	pAd,
++	IN	USHORT Offset,
++	IN	USHORT Length,
++	OUT	USHORT* pData)
++{
++	EFUSE_CTRL_STRUC		eFuseCtrlStruc;
++	int	i;
++	USHORT	efuseDataOffset;
++	UINT32	data;
++
++	RTMP_IO_READ32(pAd, EFUSE_CTRL, (PUINT32) &eFuseCtrlStruc);
++
++	//Step0. Write 10-bit of address to EFSROM_AIN (0x580, bit25:bit16). The address must be 16-byte alignment.
++	//Use the eeprom logical address and covert to address to block number
++	eFuseCtrlStruc.field.EFSROM_AIN = Offset & 0xfff0;
++
++	//Step1. Write EFSROM_MODE (0x580, bit7:bit6) to 0.
++	eFuseCtrlStruc.field.EFSROM_MODE = 0;
++
++	//Step2. Write EFSROM_KICK (0x580, bit30) to 1 to kick-off physical read procedure.
++	eFuseCtrlStruc.field.EFSROM_KICK = 1;
++
++	NdisMoveMemory(&data, &eFuseCtrlStruc, 4);
++	RTMP_IO_WRITE32(pAd, EFUSE_CTRL, data);
++
++	//Step3. Polling EFSROM_KICK(0x580, bit30) until it become 0 again.
++	i = 0;
++	while(i < 100)
++	{
++		//rtmp.HwMemoryReadDword(EFUSE_CTRL, (DWORD *) &eFuseCtrlStruc, 4);
++		RTMP_IO_READ32(pAd, EFUSE_CTRL, (PUINT32) &eFuseCtrlStruc);
++		if(eFuseCtrlStruc.field.EFSROM_KICK == 0)
++		{
++			break;
++		}
++		RTMPusecDelay(2);
++		i++;
++	}
++
++	//if EFSROM_AOUT is not found in physical address, write 0xffff
++	if (eFuseCtrlStruc.field.EFSROM_AOUT == 0x3f)
++	{
++		for(i=0; i<Length/2; i++)
++			*(pData+2*i) = 0xffff;
++	}
++	else
++	{
++		//Step4. Read 16-byte of data from EFUSE_DATA0-3 (0x590-0x59C)
++		efuseDataOffset =  EFUSE_DATA3 - (Offset & 0xC)  ;
++		//data hold 4 bytes data.
++		//In RTMP_IO_READ32 will automatically execute 32-bytes swapping
++		RTMP_IO_READ32(pAd, efuseDataOffset, &data);
++		//Decide the upper 2 bytes or the bottom 2 bytes.
++		// Little-endian		S	|	S	Big-endian
++		// addr	3	2	1	0	|	0	1	2	3
++		// Ori-V	D	C	B	A	|	A	B	C	D
++		//After swapping
++		//		D	C	B	A	|	D	C	B	A
++		//Return 2-bytes
++		//The return byte statrs from S. Therefore, the little-endian will return BA, the Big-endian will return DC.
++		//For returning the bottom 2 bytes, the Big-endian should shift right 2-bytes.
++		data = data >> (8*(Offset & 0x3));
++
++		NdisMoveMemory(pData, &data, Length);
++	}
++
++	return (UCHAR) eFuseCtrlStruc.field.EFSROM_AOUT;
++
++}
++
++/*
++	========================================================================
++
++	Routine Description:
++
++	Arguments:
++
++	Return Value:
++
++	IRQL =
++
++	Note:
++
++	========================================================================
++*/
++VOID eFusePhysicalReadRegisters(
++	IN	PRTMP_ADAPTER	pAd,
++	IN	USHORT Offset,
++	IN	USHORT Length,
++	OUT	USHORT* pData)
++{
++	EFUSE_CTRL_STRUC		eFuseCtrlStruc;
++	int	i;
++	USHORT	efuseDataOffset;
++	UINT32	data;
++
++	RTMP_IO_READ32(pAd, EFUSE_CTRL, (PUINT32) &eFuseCtrlStruc);
++
++	//Step0. Write 10-bit of address to EFSROM_AIN (0x580, bit25:bit16). The address must be 16-byte alignment.
++	eFuseCtrlStruc.field.EFSROM_AIN = Offset & 0xfff0;
++
++	//Step1. Write EFSROM_MODE (0x580, bit7:bit6) to 1.
++	//Read in physical view
++	eFuseCtrlStruc.field.EFSROM_MODE = 1;
++
++	//Step2. Write EFSROM_KICK (0x580, bit30) to 1 to kick-off physical read procedure.
++	eFuseCtrlStruc.field.EFSROM_KICK = 1;
++
++	NdisMoveMemory(&data, &eFuseCtrlStruc, 4);
++	RTMP_IO_WRITE32(pAd, EFUSE_CTRL, data);
++
++	//Step3. Polling EFSROM_KICK(0x580, bit30) until it become 0 again.
++	i = 0;
++	while(i < 100)
++	{
++		RTMP_IO_READ32(pAd, EFUSE_CTRL, (PUINT32) &eFuseCtrlStruc);
++		if(eFuseCtrlStruc.field.EFSROM_KICK == 0)
++			break;
++		RTMPusecDelay(2);
++		i++;
++	}
++
++	//Step4. Read 16-byte of data from EFUSE_DATA0-3 (0x59C-0x590)
++	//Because the size of each EFUSE_DATA is 4 Bytes, the size of address of each is 2 bits.
++	//The previous 2 bits is the EFUSE_DATA number, the last 2 bits is used to decide which bytes
++	//Decide which EFUSE_DATA to read
++	//590:F E D C
++	//594:B A 9 8
++	//598:7 6 5 4
++	//59C:3 2 1 0
++	efuseDataOffset =  EFUSE_DATA3 - (Offset & 0xC)  ;
++
++	RTMP_IO_READ32(pAd, efuseDataOffset, &data);
++
++	data = data >> (8*(Offset & 0x3));
++
++	NdisMoveMemory(pData, &data, Length);
++
++}
++
++/*
++	========================================================================
++
++	Routine Description:
++
++	Arguments:
++
++	Return Value:
++
++	IRQL =
++
++	Note:
++
++	========================================================================
++*/
++VOID eFuseReadPhysical(
++	IN	PRTMP_ADAPTER	pAd,
++  	IN	PUSHORT lpInBuffer,
++  	IN	ULONG nInBufferSize,
++  	OUT	PUSHORT lpOutBuffer,
++  	IN	ULONG nOutBufferSize
++)
++{
++	USHORT* pInBuf = (USHORT*)lpInBuffer;
++	USHORT* pOutBuf = (USHORT*)lpOutBuffer;
++
++	USHORT Offset = pInBuf[0];					//addr
++	USHORT Length = pInBuf[1];					//length
++	int 		i;
++
++	for(i=0; i<Length; i+=2)
++	{
++		eFusePhysicalReadRegisters(pAd,Offset+i, 2, &pOutBuf[i/2]);
++	}
++}
++
++/*
++	========================================================================
++
++	Routine Description:
++
++	Arguments:
++
++	Return Value:
++
++	IRQL =
++
++	Note:
++
++	========================================================================
++*/
++NTSTATUS eFuseRead(
++	IN	PRTMP_ADAPTER	pAd,
++	IN	USHORT			Offset,
++	OUT	PUCHAR			pData,
++	IN	USHORT			Length)
++{
++	USHORT* pOutBuf = (USHORT*)pData;
++	NTSTATUS	Status = STATUS_SUCCESS;
++	UCHAR	EFSROM_AOUT;
++	int	i;
++
++	for(i=0; i<Length; i+=2)
++	{
++		EFSROM_AOUT = eFuseReadRegisters(pAd, Offset+i, 2, &pOutBuf[i/2]);
++	}
++	return Status;
++}
++
++/*
++	========================================================================
++
++	Routine Description:
++
++	Arguments:
++
++	Return Value:
++
++	IRQL =
++
++	Note:
++
++	========================================================================
++*/
++VOID eFusePhysicalWriteRegisters(
++	IN	PRTMP_ADAPTER	pAd,
++	IN	USHORT Offset,
++	IN	USHORT Length,
++	OUT	USHORT* pData)
++{
++	EFUSE_CTRL_STRUC		eFuseCtrlStruc;
++	int	i;
++	USHORT	efuseDataOffset;
++	UINT32	data, eFuseDataBuffer[4];
++
++	//Step0. Write 16-byte of data to EFUSE_DATA0-3 (0x590-0x59C), where EFUSE_DATA0 is the LSB DW, EFUSE_DATA3 is the MSB DW.
++
++	/////////////////////////////////////////////////////////////////
++	//read current values of 16-byte block
++	RTMP_IO_READ32(pAd, EFUSE_CTRL, (PUINT32) &eFuseCtrlStruc);
++
++	//Step0. Write 10-bit of address to EFSROM_AIN (0x580, bit25:bit16). The address must be 16-byte alignment.
++	eFuseCtrlStruc.field.EFSROM_AIN = Offset & 0xfff0;
++
++	//Step1. Write EFSROM_MODE (0x580, bit7:bit6) to 1.
++	eFuseCtrlStruc.field.EFSROM_MODE = 1;
++
++	//Step2. Write EFSROM_KICK (0x580, bit30) to 1 to kick-off physical read procedure.
++	eFuseCtrlStruc.field.EFSROM_KICK = 1;
++
++	NdisMoveMemory(&data, &eFuseCtrlStruc, 4);
++	RTMP_IO_WRITE32(pAd, EFUSE_CTRL, data);
++
++	//Step3. Polling EFSROM_KICK(0x580, bit30) until it become 0 again.
++	i = 0;
++	while(i < 100)
++	{
++		RTMP_IO_READ32(pAd, EFUSE_CTRL, (PUINT32) &eFuseCtrlStruc);
++
++		if(eFuseCtrlStruc.field.EFSROM_KICK == 0)
++			break;
++		RTMPusecDelay(2);
++		i++;
++	}
++
++	//Step4. Read 16-byte of data from EFUSE_DATA0-3 (0x59C-0x590)
++	efuseDataOffset =  EFUSE_DATA3;
++	for(i=0; i< 4; i++)
++	{
++		RTMP_IO_READ32(pAd, efuseDataOffset, (PUINT32) &eFuseDataBuffer[i]);
++		efuseDataOffset -=  4;
++	}
++
++	//Update the value, the offset is multiple of 2, length is 2
++	efuseDataOffset = (Offset & 0xc) >> 2;
++	data = pData[0] & 0xffff;
++	//The offset should be 0x***10 or 0x***00
++	if((Offset % 4) != 0)
++	{
++		eFuseDataBuffer[efuseDataOffset] = (eFuseDataBuffer[efuseDataOffset] & 0xffff) | (data << 16);
++	}
++	else
++	{
++		eFuseDataBuffer[efuseDataOffset] = (eFuseDataBuffer[efuseDataOffset] & 0xffff0000) | data;
++	}
++
++	efuseDataOffset =  EFUSE_DATA3;
++	for(i=0; i< 4; i++)
++	{
++		RTMP_IO_WRITE32(pAd, efuseDataOffset, eFuseDataBuffer[i]);
++		efuseDataOffset -= 4;
++	}
++	/////////////////////////////////////////////////////////////////
++
++	//Step1. Write 10-bit of address to EFSROM_AIN (0x580, bit25:bit16). The address must be 16-byte alignment.
++	eFuseCtrlStruc.field.EFSROM_AIN = Offset & 0xfff0;
++
++	//Step2. Write EFSROM_MODE (0x580, bit7:bit6) to 3.
++	eFuseCtrlStruc.field.EFSROM_MODE = 3;
++
++	//Step3. Write EFSROM_KICK (0x580, bit30) to 1 to kick-off physical write procedure.
++	eFuseCtrlStruc.field.EFSROM_KICK = 1;
++
++	NdisMoveMemory(&data, &eFuseCtrlStruc, 4);
++	RTMP_IO_WRITE32(pAd, EFUSE_CTRL, data);
++
++	//Step4. Polling EFSROM_KICK(0x580, bit30) until it become 0 again. It¡¦s done.
++	i = 0;
++	while(i < 100)
++	{
++		RTMP_IO_READ32(pAd, EFUSE_CTRL, (PUINT32) &eFuseCtrlStruc);
++
++		if(eFuseCtrlStruc.field.EFSROM_KICK == 0)
++			break;
++
++		RTMPusecDelay(2);
++		i++;
++	}
++}
++
++/*
++	========================================================================
++
++	Routine Description:
++
++	Arguments:
++
++	Return Value:
++
++	IRQL =
++
++	Note:
++
++	========================================================================
++*/
++NTSTATUS eFuseWriteRegisters(
++	IN	PRTMP_ADAPTER	pAd,
++	IN	USHORT Offset,
++	IN	USHORT Length,
++	IN	USHORT* pData)
++{
++	USHORT	i;
++	USHORT	eFuseData;
++	USHORT	LogicalAddress, BlkNum = 0xffff;
++	UCHAR	EFSROM_AOUT;
++
++	USHORT addr,tmpaddr, InBuf[3], tmpOffset;
++	USHORT buffer[8];
++	BOOLEAN		bWriteSuccess = TRUE;
++
++	DBGPRINT(RT_DEBUG_TRACE, ("eFuseWriteRegisters Offset=%x, pData=%x\n", Offset, *pData));
++
++	//Step 0. find the entry in the mapping table
++	//The address of EEPROM is 2-bytes alignment.
++	//The last bit is used for alignment, so it must be 0.
++	tmpOffset = Offset & 0xfffe;
++	EFSROM_AOUT = eFuseReadRegisters(pAd, tmpOffset, 2, &eFuseData);
++
++	if( EFSROM_AOUT == 0x3f)
++	{	//find available logical address pointer
++		//the logical address does not exist, find an empty one
++		//from the first address of block 45=16*45=0x2d0 to the last address of block 47
++		//==>48*16-3(reserved)=2FC
++		for (i=EFUSE_USAGE_MAP_START; i<=EFUSE_USAGE_MAP_END; i+=2)
++		{
++			//Retrive the logical block nubmer form each logical address pointer
++			//It will access two logical address pointer each time.
++			eFusePhysicalReadRegisters(pAd, i, 2, &LogicalAddress);
++			if( (LogicalAddress & 0xff) == 0)
++			{//Not used logical address pointer
++				BlkNum = i-EFUSE_USAGE_MAP_START;
++				break;
++			}
++			else if(( (LogicalAddress >> 8) & 0xff) == 0)
++			{//Not used logical address pointer
++				if (i != EFUSE_USAGE_MAP_END)
++				{
++					BlkNum = i-EFUSE_USAGE_MAP_START+1;
++				}
++				break;
++			}
++		}
++	}
++	else
++	{
++		BlkNum = EFSROM_AOUT;
++	}
++
++	DBGPRINT(RT_DEBUG_TRACE, ("eFuseWriteRegisters BlkNum = %d \n", BlkNum));
++
++	if(BlkNum == 0xffff)
++	{
++		DBGPRINT(RT_DEBUG_TRACE, ("eFuseWriteRegisters: out of free E-fuse space!!!\n"));
++		return FALSE;
++	}
++
++	//Step 1. Save data of this block	which is pointed by the avaible logical address pointer
++	// read and save the original block data
++	for(i =0; i<8; i++)
++	{
++		addr = BlkNum * 0x10 ;
++
++		InBuf[0] = addr+2*i;
++		InBuf[1] = 2;
++		InBuf[2] = 0x0;
++
++		eFuseReadPhysical(pAd, &InBuf[0], 4, &InBuf[2], 2);
++
++		buffer[i] = InBuf[2];
++	}
++
++	//Step 2. Update the data in buffer, and write the data to Efuse
++	buffer[ (Offset >> 1) % 8] = pData[0];
++
++	do
++	{
++		//Step 3. Write the data to Efuse
++		if(!bWriteSuccess)
++		{
++			for(i =0; i<8; i++)
++			{
++				addr = BlkNum * 0x10 ;
++
++				InBuf[0] = addr+2*i;
++				InBuf[1] = 2;
++				InBuf[2] = buffer[i];
++
++				eFuseWritePhysical(pAd, &InBuf[0], 6, NULL, 2);
++			}
++		}
++		else
++		{
++				addr = BlkNum * 0x10 ;
++
++				InBuf[0] = addr+(Offset % 16);
++				InBuf[1] = 2;
++				InBuf[2] = pData[0];
++
++				eFuseWritePhysical(pAd, &InBuf[0], 6, NULL, 2);
++		}
++
++		//Step 4. Write mapping table
++		addr = EFUSE_USAGE_MAP_START+BlkNum;
++
++		tmpaddr = addr;
++
++		if(addr % 2 != 0)
++			addr = addr -1;
++		InBuf[0] = addr;
++		InBuf[1] = 2;
++
++		//convert the address from 10 to 8 bit ( bit7, 6 = parity and bit5 ~ 0 = bit9~4), and write to logical map entry
++		tmpOffset = Offset;
++		tmpOffset >>= 4;
++		tmpOffset |= ((~((tmpOffset & 0x01) ^ ( tmpOffset >> 1 & 0x01) ^  (tmpOffset >> 2 & 0x01) ^  (tmpOffset >> 3 & 0x01))) << 6) & 0x40;
++		tmpOffset |= ((~( (tmpOffset >> 2 & 0x01) ^ (tmpOffset >> 3 & 0x01) ^ (tmpOffset >> 4 & 0x01) ^ ( tmpOffset >> 5 & 0x01))) << 7) & 0x80;
++
++		// write the logical address
++		if(tmpaddr%2 != 0)
++			InBuf[2] = tmpOffset<<8;
++		else
++			InBuf[2] = tmpOffset;
++
++		eFuseWritePhysical(pAd,&InBuf[0], 6, NULL, 0);
++
++		//Step 5. Compare data if not the same, invalidate the mapping entry, then re-write the data until E-fuse is exhausted
++		bWriteSuccess = TRUE;
++		for(i =0; i<8; i++)
++		{
++			addr = BlkNum * 0x10 ;
++
++			InBuf[0] = addr+2*i;
++			InBuf[1] = 2;
++			InBuf[2] = 0x0;
++
++			eFuseReadPhysical(pAd, &InBuf[0], 4, &InBuf[2], 2);
++
++			if(buffer[i] != InBuf[2])
++			{
++				bWriteSuccess = FALSE;
++				break;
++			}
++		}
++
++		//Step 6. invlidate mapping entry and find a free mapping entry if not succeed
++		if (!bWriteSuccess)
++		{
++			DBGPRINT(RT_DEBUG_TRACE, ("Not bWriteSuccess BlkNum = %d\n", BlkNum));
++
++			// the offset of current mapping entry
++			addr = EFUSE_USAGE_MAP_START+BlkNum;
++
++			//find a new mapping entry
++			BlkNum = 0xffff;
++			for (i=EFUSE_USAGE_MAP_START; i<=EFUSE_USAGE_MAP_END; i+=2)
++			{
++				eFusePhysicalReadRegisters(pAd, i, 2, &LogicalAddress);
++				if( (LogicalAddress & 0xff) == 0)
++				{
++					BlkNum = i-EFUSE_USAGE_MAP_START;
++					break;
++				}
++				else if(( (LogicalAddress >> 8) & 0xff) == 0)
++				{
++					if (i != EFUSE_USAGE_MAP_END)
++					{
++						BlkNum = i+1-EFUSE_USAGE_MAP_START;
++					}
++					break;
++				}
++			}
++			DBGPRINT(RT_DEBUG_TRACE, ("Not bWriteSuccess new BlkNum = %d\n", BlkNum));
++			if(BlkNum == 0xffff)
++			{
++				DBGPRINT(RT_DEBUG_TRACE, ("eFuseWriteRegisters: out of free E-fuse space!!!\n"));
++				return FALSE;
++			}
++
++			//invalidate the original mapping entry if new entry is not found
++			tmpaddr = addr;
++
++			if(addr % 2 != 0)
++				addr = addr -1;
++			InBuf[0] = addr;
++			InBuf[1] = 2;
++
++			eFuseReadPhysical(pAd, &InBuf[0], 4, &InBuf[2], 2);
++
++			// write the logical address
++			if(tmpaddr%2 != 0)
++			{
++				// Invalidate the high byte
++				for (i=8; i<15; i++)
++				{
++					if( ( (InBuf[2] >> i) & 0x01) == 0)
++					{
++						InBuf[2] |= (0x1 <<i);
++						break;
++					}
++				}
++			}
++			else
++			{
++				// invalidate the low byte
++				for (i=0; i<8; i++)
++				{
++					if( ( (InBuf[2] >> i) & 0x01) == 0)
++					{
++						InBuf[2] |= (0x1 <<i);
++						break;
++					}
++				}
++			}
++			eFuseWritePhysical(pAd, &InBuf[0], 6, NULL, 0);
++		}
++	}
++	while(!bWriteSuccess);
++
++	return TRUE;
++}
++
++/*
++	========================================================================
++
++	Routine Description:
++
++	Arguments:
++
++	Return Value:
++
++	IRQL =
++
++	Note:
++
++	========================================================================
++*/
++VOID eFuseWritePhysical(
++	IN	PRTMP_ADAPTER	pAd,
++  	PUSHORT lpInBuffer,
++	ULONG nInBufferSize,
++  	PUCHAR lpOutBuffer,
++  	ULONG nOutBufferSize
++)
++{
++	USHORT* pInBuf = (USHORT*)lpInBuffer;
++	int 		i;
++	//USHORT* pOutBuf = (USHORT*)ioBuffer;
++
++	USHORT Offset = pInBuf[0];					//addr
++	USHORT Length = pInBuf[1];					//length
++	USHORT* pValueX = &pInBuf[2];				//value ...
++		// Little-endian		S	|	S	Big-endian
++		// addr	3	2	1	0	|	0	1	2	3
++		// Ori-V	D	C	B	A	|	A	B	C	D
++		//After swapping
++		//		D	C	B	A	|	D	C	B	A
++		//Both the little and big-endian use the same sequence to write  data.
++		//Therefore, we only need swap data when read the data.
++	for(i=0; i<Length; i+=2)
++	{
++		eFusePhysicalWriteRegisters(pAd, Offset+i, 2, &pValueX[i/2]);
++	}
++}
++
++
++/*
++	========================================================================
++
++	Routine Description:
++
++	Arguments:
++
++	Return Value:
++
++	IRQL =
++
++	Note:
++
++	========================================================================
++*/
++NTSTATUS eFuseWrite(
++   	IN	PRTMP_ADAPTER	pAd,
++	IN	USHORT			Offset,
++	IN	PUCHAR			pData,
++	IN	USHORT			length)
++{
++	int i;
++
++	USHORT* pValueX = (PUSHORT) pData;				//value ...
++		//The input value=3070 will be stored as following
++ 		// Little-endian		S	|	S	Big-endian
++		// addr			1	0	|	0	1
++		// Ori-V			30	70	|	30	70
++		//After swapping
++		//				30	70	|	70	30
++		//Casting
++		//				3070	|	7030 (x)
++		//The swapping should be removed for big-endian
++	for(i=0; i<length; i+=2)
++	{
++		eFuseWriteRegisters(pAd, Offset+i, 2, &pValueX[i/2]);
++	}
++
++	return TRUE;
++}
++
++/*
++	========================================================================
++
++	Routine Description:
++
++	Arguments:
++
++	Return Value:
++
++	IRQL =
++
++	Note:
++
++	========================================================================
++*/
++INT set_eFuseGetFreeBlockCount_Proc(
++   	IN	PRTMP_ADAPTER	pAd,
++	IN	PUCHAR			arg)
++{
++	USHORT i;
++	USHORT	LogicalAddress;
++	USHORT efusefreenum=0;
++	if(!pAd->bUseEfuse)
++		return FALSE;
++	for (i = EFUSE_USAGE_MAP_START; i <= EFUSE_USAGE_MAP_END; i+=2)
++	{
++		eFusePhysicalReadRegisters(pAd, i, 2, &LogicalAddress);
++		if( (LogicalAddress & 0xff) == 0)
++		{
++			efusefreenum= (UCHAR) (EFUSE_USAGE_MAP_END-i+1);
++			break;
++		}
++		else if(( (LogicalAddress >> 8) & 0xff) == 0)
++		{
++			efusefreenum = (UCHAR) (EFUSE_USAGE_MAP_END-i);
++			break;
++		}
++
++		if(i == EFUSE_USAGE_MAP_END)
++			efusefreenum = 0;
++	}
++	printk("efuseFreeNumber is %d\n",efusefreenum);
++	return TRUE;
++}
++INT set_eFusedump_Proc(
++	IN	PRTMP_ADAPTER	pAd,
++	IN	PUCHAR			arg)
++{
++USHORT InBuf[3];
++	INT i=0;
++	if(!pAd->bUseEfuse)
++		return FALSE;
++	for(i =0; i<EFUSE_USAGE_MAP_END/2; i++)
++	{
++		InBuf[0] = 2*i;
++		InBuf[1] = 2;
++		InBuf[2] = 0x0;
++
++		eFuseReadPhysical(pAd, &InBuf[0], 4, &InBuf[2], 2);
++		if(i%4==0)
++		printk("\nBlock %x:",i/8);
++		printk("%04x ",InBuf[2]);
++	}
++	return TRUE;
++}
++INT	set_eFuseLoadFromBin_Proc(
++	IN	PRTMP_ADAPTER	pAd,
++	IN	PUCHAR			arg)
++{
++	CHAR					*src;
++	struct file				*srcf;
++	INT 					retval, orgfsuid, orgfsgid;
++   	mm_segment_t			orgfs;
++	UCHAR					*buffer;
++	UCHAR					BinFileSize=0;
++	INT						i = 0,j=0,k=1;
++	USHORT					*PDATA;
++	USHORT					DATA;
++	BinFileSize=strlen("RT30xxEEPROM.bin");
++	src = kmalloc(128, MEM_ALLOC_FLAG);
++	NdisZeroMemory(src, 128);
++
++ 	if(strlen(arg)>0)
++	{
++
++		NdisMoveMemory(src, arg, strlen(arg));
++ 	}
++
++	else
++	{
++
++		NdisMoveMemory(src, "RT30xxEEPROM.bin", BinFileSize);
++	}
++
++	DBGPRINT(RT_DEBUG_TRACE, ("FileName=%s\n",src));
++	buffer = kmalloc(MAX_EEPROM_BIN_FILE_SIZE, MEM_ALLOC_FLAG);
++
++	if(buffer == NULL)
++	{
++		kfree(src);
++		 return FALSE;
++}
++	PDATA=kmalloc(sizeof(USHORT)*8,MEM_ALLOC_FLAG);
++
++	if(PDATA==NULL)
++	{
++		kfree(src);
++
++		kfree(buffer);
++		return FALSE;
++	}
++	/* Don't change to uid 0, let the file be opened as the "normal" user */
++#if 0
++	orgfsuid = current->fsuid;
++	orgfsgid = current->fsgid;
++	current->fsuid=current->fsgid = 0;
++#endif
++    	orgfs = get_fs();
++   	 set_fs(KERNEL_DS);
++
++	if (src && *src)
++	{
++		srcf = filp_open(src, O_RDONLY, 0);
++		if (IS_ERR(srcf))
++		{
++			DBGPRINT(RT_DEBUG_ERROR, ("--> Error %ld opening %s\n", -PTR_ERR(srcf),src));
++			return FALSE;
++		}
++		else
++		{
++			// The object must have a read method
++			if (srcf->f_op && srcf->f_op->read)
++			{
++				memset(buffer, 0x00, MAX_EEPROM_BIN_FILE_SIZE);
++				while(srcf->f_op->read(srcf, &buffer[i], 1, &srcf->f_pos)==1)
++				{
++					DBGPRINT(RT_DEBUG_TRACE, ("%02X ",buffer[i]));
++					if((i+1)%8==0)
++						DBGPRINT(RT_DEBUG_TRACE, ("\n"));
++              			i++;
++						if(i>=MAX_EEPROM_BIN_FILE_SIZE)
++							{
++								DBGPRINT(RT_DEBUG_ERROR, ("--> Error %ld reading %s, The file is too large[1024]\n", -PTR_ERR(srcf),src));
++								kfree(PDATA);
++								kfree(buffer);
++								kfree(src);
++								return FALSE;
++							}
++			       }
++			}
++			else
++			{
++						DBGPRINT(RT_DEBUG_ERROR, ("--> Error!! System doest not support read function\n"));
++						kfree(PDATA);
++						kfree(buffer);
++						kfree(src);
++						return FALSE;
++			}
++      		}
++
++
++	}
++	else
++		{
++					DBGPRINT(RT_DEBUG_ERROR, ("--> Error src  or srcf is null\n"));
++					kfree(PDATA);
++					kfree(buffer);
++					return FALSE;
++
++		}
++
++
++	retval=filp_close(srcf,NULL);
++
++	if (retval)
++	{
++		DBGPRINT(RT_DEBUG_TRACE, ("--> Error %d closing %s\n", -retval, src));
++	}
++	set_fs(orgfs);
++#if 0
++	current->fsuid = orgfsuid;
++	current->fsgid = orgfsgid;
++#endif
++	for(j=0;j<i;j++)
++	{
++		DBGPRINT(RT_DEBUG_TRACE, ("%02X ",buffer[j]));
++		if((j+1)%2==0)
++			PDATA[j/2%8]=((buffer[j]<<8)&0xff00)|(buffer[j-1]&0xff);
++		if(j%16==0)
++		{
++			k=buffer[j];
++		}
++		else
++		{
++			k&=buffer[j];
++			if((j+1)%16==0)
++			{
++
++				DBGPRINT(RT_DEBUG_TRACE, (" result=%02X,blk=%02x\n",k,j/16));
++
++				if(k!=0xff)
++					eFuseWriteRegistersFromBin(pAd,(USHORT)j-15, 16, PDATA);
++				else
++					{
++						if(eFuseReadRegisters(pAd,j, 2,(PUSHORT)&DATA)!=0x3f)
++							eFuseWriteRegistersFromBin(pAd,(USHORT)j-15, 16, PDATA);
++					}
++				/*
++				for(l=0;l<8;l++)
++					printk("%04x ",PDATA[l]);
++				printk("\n");
++				*/
++				NdisZeroMemory(PDATA,16);
++
++
++			}
++		}
++
++
++	}
++
++
++	kfree(PDATA);
++	kfree(buffer);
++	kfree(src);
++	return TRUE;
++}
++NTSTATUS eFuseWriteRegistersFromBin(
++	IN	PRTMP_ADAPTER	pAd,
++	IN	USHORT Offset,
++	IN	USHORT Length,
++	IN	USHORT* pData)
++{
++	USHORT	i;
++	USHORT	eFuseData;
++	USHORT	LogicalAddress, BlkNum = 0xffff;
++	UCHAR	EFSROM_AOUT,Loop=0;
++	EFUSE_CTRL_STRUC		eFuseCtrlStruc;
++	USHORT	efuseDataOffset;
++	UINT32	data,tempbuffer;
++	USHORT addr,tmpaddr, InBuf[3], tmpOffset;
++	UINT32 buffer[4];
++	BOOLEAN		bWriteSuccess = TRUE;
++	BOOLEAN		bNotWrite=TRUE;
++	BOOLEAN		bAllocateNewBlk=TRUE;
++
++	DBGPRINT(RT_DEBUG_TRACE, ("eFuseWriteRegistersFromBin Offset=%x, pData=%04x:%04x:%04x:%04x\n", Offset, *pData,*(pData+1),*(pData+2),*(pData+3)));
++
++	do
++	{
++	//Step 0. find the entry in the mapping table
++	//The address of EEPROM is 2-bytes alignment.
++	//The last bit is used for alignment, so it must be 0.
++	Loop++;
++	tmpOffset = Offset & 0xfffe;
++	EFSROM_AOUT = eFuseReadRegisters(pAd, tmpOffset, 2, &eFuseData);
++
++	if( EFSROM_AOUT == 0x3f)
++	{	//find available logical address pointer
++		//the logical address does not exist, find an empty one
++		//from the first address of block 45=16*45=0x2d0 to the last address of block 47
++		//==>48*16-3(reserved)=2FC
++		bAllocateNewBlk=TRUE;
++		for (i=EFUSE_USAGE_MAP_START; i<=EFUSE_USAGE_MAP_END; i+=2)
++		{
++			//Retrive the logical block nubmer form each logical address pointer
++			//It will access two logical address pointer each time.
++			eFusePhysicalReadRegisters(pAd, i, 2, &LogicalAddress);
++			if( (LogicalAddress & 0xff) == 0)
++			{//Not used logical address pointer
++				BlkNum = i-EFUSE_USAGE_MAP_START;
++				break;
++			}
++			else if(( (LogicalAddress >> 8) & 0xff) == 0)
++			{//Not used logical address pointer
++				if (i != EFUSE_USAGE_MAP_END)
++				{
++					BlkNum = i-EFUSE_USAGE_MAP_START+1;
++				}
++				break;
++			}
++		}
++	}
++	else
++	{
++		bAllocateNewBlk=FALSE;
++		BlkNum = EFSROM_AOUT;
++	}
++
++	DBGPRINT(RT_DEBUG_TRACE, ("eFuseWriteRegisters BlkNum = %d \n", BlkNum));
++
++	if(BlkNum == 0xffff)
++	{
++		DBGPRINT(RT_DEBUG_TRACE, ("eFuseWriteRegisters: out of free E-fuse space!!!\n"));
++		return FALSE;
++	}
++	//Step 1.1.0
++	//If the block is not existing in mapping table, create one
++	//and write down the 16-bytes data to the new block
++	if(bAllocateNewBlk)
++	{
++		DBGPRINT(RT_DEBUG_TRACE, ("Allocate New Blk\n"));
++		efuseDataOffset =  EFUSE_DATA3;
++		for(i=0; i< 4; i++)
++		{
++			DBGPRINT(RT_DEBUG_TRACE, ("Allocate New Blk, Data%d=%04x%04x\n",3-i,pData[2*i+1],pData[2*i]));
++			tempbuffer=((pData[2*i+1]<<16)&0xffff0000)|pData[2*i];
++
++
++			RTMP_IO_WRITE32(pAd, efuseDataOffset,tempbuffer);
++			efuseDataOffset -= 4;
++
++		}
++		/////////////////////////////////////////////////////////////////
++
++		//Step1.1.1. Write 10-bit of address to EFSROM_AIN (0x580, bit25:bit16). The address must be 16-byte alignment.
++		eFuseCtrlStruc.field.EFSROM_AIN = BlkNum* 0x10 ;
++
++		//Step1.1.2. Write EFSROM_MODE (0x580, bit7:bit6) to 3.
++		eFuseCtrlStruc.field.EFSROM_MODE = 3;
++
++		//Step1.1.3. Write EFSROM_KICK (0x580, bit30) to 1 to kick-off physical write procedure.
++		eFuseCtrlStruc.field.EFSROM_KICK = 1;
++
++		NdisMoveMemory(&data, &eFuseCtrlStruc, 4);
++
++		RTMP_IO_WRITE32(pAd, EFUSE_CTRL, data);
++
++		//Step1.1.4. Polling EFSROM_KICK(0x580, bit30) until it become 0 again. It¡¦s done.
++		i = 0;
++		while(i < 100)
++		{
++			RTMP_IO_READ32(pAd, EFUSE_CTRL, (PUINT32) &eFuseCtrlStruc);
++
++			if(eFuseCtrlStruc.field.EFSROM_KICK == 0)
++				break;
++
++			RTMPusecDelay(2);
++			i++;
++		}
++
++	}
++	else
++	{	//Step1.2.
++		//If the same logical number is existing, check if the writting data and the data
++		//saving in this block are the same.
++		/////////////////////////////////////////////////////////////////
++		//read current values of 16-byte block
++		RTMP_IO_READ32(pAd, EFUSE_CTRL, (PUINT32) &eFuseCtrlStruc);
++
++		//Step1.2.0. Write 10-bit of address to EFSROM_AIN (0x580, bit25:bit16). The address must be 16-byte alignment.
++		eFuseCtrlStruc.field.EFSROM_AIN = Offset & 0xfff0;
++
++		//Step1.2.1. Write EFSROM_MODE (0x580, bit7:bit6) to 1.
++		eFuseCtrlStruc.field.EFSROM_MODE = 0;
++
++		//Step1.2.2. Write EFSROM_KICK (0x580, bit30) to 1 to kick-off physical read procedure.
++		eFuseCtrlStruc.field.EFSROM_KICK = 1;
++
++		NdisMoveMemory(&data, &eFuseCtrlStruc, 4);
++		RTMP_IO_WRITE32(pAd, EFUSE_CTRL, data);
++
++		//Step1.2.3. Polling EFSROM_KICK(0x580, bit30) until it become 0 again.
++		i = 0;
++		while(i < 100)
++		{
++			RTMP_IO_READ32(pAd, EFUSE_CTRL, (PUINT32) &eFuseCtrlStruc);
++
++			if(eFuseCtrlStruc.field.EFSROM_KICK == 0)
++				break;
++			RTMPusecDelay(2);
++			i++;
++		}
++
++		//Step1.2.4. Read 16-byte of data from EFUSE_DATA0-3 (0x59C-0x590)
++		efuseDataOffset =  EFUSE_DATA3;
++		for(i=0; i< 4; i++)
++		{
++			RTMP_IO_READ32(pAd, efuseDataOffset, (PUINT32) &buffer[i]);
++			efuseDataOffset -=  4;
++		}
++		//Step1.2.5. Check if the data of efuse and the writing data are the same.
++		for(i =0; i<4; i++)
++		{
++			tempbuffer=((pData[2*i+1]<<16)&0xffff0000)|pData[2*i];
++			DBGPRINT(RT_DEBUG_TRACE, ("buffer[%d]=%x,pData[%d]=%x,pData[%d]=%x,tempbuffer=%x\n",i,buffer[i],2*i,pData[2*i],2*i+1,pData[2*i+1],tempbuffer));
++
++			if(((buffer[i]&0xffff0000)==(pData[2*i+1]<<16))&&((buffer[i]&0xffff)==pData[2*i]))
++				bNotWrite&=TRUE;
++			else
++			{
++				bNotWrite&=FALSE;
++				break;
++			}
++		}
++		if(!bNotWrite)
++		{
++		printk("The data is not the same\n");
++
++			for(i =0; i<8; i++)
++			{
++				addr = BlkNum * 0x10 ;
++
++				InBuf[0] = addr+2*i;
++				InBuf[1] = 2;
++				InBuf[2] = pData[i];
++
++				eFuseWritePhysical(pAd, &InBuf[0], 6, NULL, 2);
++			}
++
++		}
++		else
++			return TRUE;
++	     }
++
++
++
++		//Step 2. Write mapping table
++		addr = EFUSE_USAGE_MAP_START+BlkNum;
++
++		tmpaddr = addr;
++
++		if(addr % 2 != 0)
++			addr = addr -1;
++		InBuf[0] = addr;
++		InBuf[1] = 2;
++
++		//convert the address from 10 to 8 bit ( bit7, 6 = parity and bit5 ~ 0 = bit9~4), and write to logical map entry
++		tmpOffset = Offset;
++		tmpOffset >>= 4;
++		tmpOffset |= ((~((tmpOffset & 0x01) ^ ( tmpOffset >> 1 & 0x01) ^  (tmpOffset >> 2 & 0x01) ^  (tmpOffset >> 3 & 0x01))) << 6) & 0x40;
++		tmpOffset |= ((~( (tmpOffset >> 2 & 0x01) ^ (tmpOffset >> 3 & 0x01) ^ (tmpOffset >> 4 & 0x01) ^ ( tmpOffset >> 5 & 0x01))) << 7) & 0x80;
++
++		// write the logical address
++		if(tmpaddr%2 != 0)
++			InBuf[2] = tmpOffset<<8;
++		else
++			InBuf[2] = tmpOffset;
++
++		eFuseWritePhysical(pAd,&InBuf[0], 6, NULL, 0);
++
++		//Step 3. Compare data if not the same, invalidate the mapping entry, then re-write the data until E-fuse is exhausted
++		bWriteSuccess = TRUE;
++		for(i =0; i<8; i++)
++		{
++			addr = BlkNum * 0x10 ;
++
++			InBuf[0] = addr+2*i;
++			InBuf[1] = 2;
++			InBuf[2] = 0x0;
++
++			eFuseReadPhysical(pAd, &InBuf[0], 4, &InBuf[2], 2);
++			DBGPRINT(RT_DEBUG_TRACE, ("addr=%x, buffer[i]=%x,InBuf[2]=%x\n",InBuf[0],pData[i],InBuf[2]));
++			if(pData[i] != InBuf[2])
++			{
++				bWriteSuccess = FALSE;
++				break;
++			}
++		}
++
++		//Step 4. invlidate mapping entry and find a free mapping entry if not succeed
++
++		if (!bWriteSuccess&&Loop<2)
++		{
++			DBGPRINT(RT_DEBUG_TRACE, ("eFuseWriteRegistersFromBin::Not bWriteSuccess BlkNum = %d\n", BlkNum));
++
++			// the offset of current mapping entry
++			addr = EFUSE_USAGE_MAP_START+BlkNum;
++
++			//find a new mapping entry
++			BlkNum = 0xffff;
++			for (i=EFUSE_USAGE_MAP_START; i<=EFUSE_USAGE_MAP_END; i+=2)
++			{
++				eFusePhysicalReadRegisters(pAd, i, 2, &LogicalAddress);
++				if( (LogicalAddress & 0xff) == 0)
++				{
++					BlkNum = i-EFUSE_USAGE_MAP_START;
++					break;
++				}
++				else if(( (LogicalAddress >> 8) & 0xff) == 0)
++				{
++					if (i != EFUSE_USAGE_MAP_END)
++					{
++						BlkNum = i+1-EFUSE_USAGE_MAP_START;
++					}
++					break;
++				}
++			}
++			DBGPRINT(RT_DEBUG_TRACE, ("eFuseWriteRegistersFromBin::Not bWriteSuccess new BlkNum = %d\n", BlkNum));
++			if(BlkNum == 0xffff)
++			{
++				DBGPRINT(RT_DEBUG_TRACE, ("eFuseWriteRegistersFromBin: out of free E-fuse space!!!\n"));
++				return FALSE;
++			}
++
++			//invalidate the original mapping entry if new entry is not found
++			tmpaddr = addr;
++
++			if(addr % 2 != 0)
++				addr = addr -1;
++			InBuf[0] = addr;
++			InBuf[1] = 2;
++
++			eFuseReadPhysical(pAd, &InBuf[0], 4, &InBuf[2], 2);
++
++			// write the logical address
++			if(tmpaddr%2 != 0)
++			{
++				// Invalidate the high byte
++				for (i=8; i<15; i++)
++				{
++					if( ( (InBuf[2] >> i) & 0x01) == 0)
++					{
++						InBuf[2] |= (0x1 <<i);
++						break;
++					}
++				}
++			}
++			else
++			{
++				// invalidate the low byte
++				for (i=0; i<8; i++)
++				{
++					if( ( (InBuf[2] >> i) & 0x01) == 0)
++					{
++						InBuf[2] |= (0x1 <<i);
++						break;
++					}
++				}
++			}
++			eFuseWritePhysical(pAd, &InBuf[0], 6, NULL, 0);
++		}
++
++	}
++	while(!bWriteSuccess&&Loop<2);
++
++	return TRUE;
+ }
+ 
++#endif // RT30xx //
++//2008/09/11:KH add to support efuse-->
+--- a/drivers/staging/rt2870/common/mlme.c
++++ b/drivers/staging/rt2870/common/mlme.c
+@@ -447,7 +447,13 @@ FREQUENCY_ITEM FreqItems3020[] =
+ 	{13,   247,	 2,  2},
+ 	{14,   248,	 2,  4},
+ };
++#ifndef RT30xx
+ #define	NUM_OF_3020_CHNL	(sizeof(FreqItems3020) / sizeof(FREQUENCY_ITEM))
++#endif
++#ifdef RT30xx
++//2008/07/10:KH Modified to share this variable
++UCHAR	NUM_OF_3020_CHNL=(sizeof(FreqItems3020) / sizeof(FREQUENCY_ITEM));
++#endif
+ 
+ /*
+ 	==========================================================================
+@@ -638,7 +644,10 @@ VOID MlmeHandler(
+ VOID MlmeHalt(
+ 	IN PRTMP_ADAPTER pAd)
+ {
+-	BOOLEAN 	  Cancelled;
++	BOOLEAN		Cancelled;
++#ifdef RT3070
++	UINT32		TxPinCfg = 0x00050F0F;
++#endif // RT3070 //
+ 
+ 	DBGPRINT(RT_DEBUG_TRACE, ("==> MlmeHalt\n"));
+ 
+@@ -679,6 +688,16 @@ VOID MlmeHalt(
+             RTMP_IO_WRITE32(pAd, LED_CFG, LedCfg.word);
+         }
+ #endif // RT2870 //
++#ifdef RT3070
++		//
++		// Turn off LNA_PE
++		//
++		if (IS_RT3070(pAd) || IS_RT3071(pAd))
++		{
++			TxPinCfg &= 0xFFFFF0F0;
++			RTUSBWriteMACRegister(pAd, TX_PIN_CFG, TxPinCfg);
++		}
++#endif // RT3070 //
+ 	}
+ 
+ 	RTMPusecDelay(5000);    //  5 msec to gurantee Ant Diversity timer canceled
+@@ -789,6 +808,10 @@ VOID MlmePeriodicExec(
+ //	RECBATimerTimeout(SystemSpecific1,FunctionContext,SystemSpecific2,SystemSpecific3);
+ 	pAd->Mlme.PeriodicRound ++;
+ 
++#ifdef RT3070
++	// execute every 100ms, update the Tx FIFO Cnt for update Tx Rate.
++	NICUpdateFifoStaCounters(pAd);
++#endif // RT3070 //
+ 	// execute every 500ms
+ 	if ((pAd->Mlme.PeriodicRound % 5 == 0) && RTMPAutoRateSwitchCheck(pAd)/*(OPSTATUS_TEST_FLAG(pAd, fOP_STATUS_TX_RATE_SWITCH_ENABLED))*/)
+ 	{
+@@ -852,6 +875,7 @@ VOID MlmePeriodicExec(
+ 							 pAd->RalinkCounters.OneSecTxRetryOkCount +
+ 							 pAd->RalinkCounters.OneSecTxFailCount;
+ 
++			// dynamic adjust antenna evaluation period according to the traffic
+ 			if (TxTotalCnt > 50)
+ 			{
+ 				if (pAd->Mlme.OneSecPeriodicRound % 10 == 0)
+@@ -1334,7 +1358,10 @@ VOID MlmeSelectTxRateTable(
+ 
+ 		//else if ((pAd->StaActive.SupRateLen == 4) && (pAd->StaActive.ExtRateLen == 0) && (pAd->StaActive.SupportedPhyInfo.MCSSet[0] == 0) && (pAd->StaActive.SupportedPhyInfo.MCSSet[1] == 0))
+ 		if ((pEntry->RateLen == 4)
++#ifndef RT30xx
++//Iverson mark for Adhoc b mode,sta will use rate 54  Mbps when connect with sta b/g/n mode
+ 			&& (pEntry->HTCapability.MCSSet[0] == 0) && (pEntry->HTCapability.MCSSet[1] == 0)
++#endif
+ 			)
+ 		{// B only AP
+ 			*ppTable = RateSwitchTable11B;
+@@ -2501,6 +2528,7 @@ VOID MlmeCheckPsmChange(
+ 	if (INFRA_ON(pAd) &&
+ 		(PowerMode != Ndis802_11PowerModeCAM) &&
+ 		(pAd->StaCfg.Psm == PWR_ACTIVE) &&
++#ifndef RT30xx
+ 		(pAd->Mlme.CntlMachine.CurrState == CNTL_IDLE))
+ 	{
+ 		NdisGetSystemUpTime(&pAd->Mlme.LastSendNULLpsmTime);
+@@ -2515,6 +2543,42 @@ VOID MlmeCheckPsmChange(
+ 			RTMPSendNullFrame(pAd, pAd->CommonCfg.TxRate, TRUE);
+ 		}
+ 	}
++#endif
++#ifdef RT30xx
++//		(! RTMP_TEST_FLAG(pAd, fRTMP_ADAPTER_BSS_SCAN_IN_PROGRESS))
++		(pAd->Mlme.CntlMachine.CurrState == CNTL_IDLE) /*&&
++		(pAd->RalinkCounters.OneSecTxNoRetryOkCount == 0) &&
++		(pAd->RalinkCounters.OneSecTxRetryOkCount == 0)*/)
++	{
++		// add by johnli, use Rx OK data count per second to calculate throughput
++		// If Ttraffic is too high ( > 400 Rx per second), don't go to sleep mode. If tx rate is low, use low criteria
++		// Mode=CCK/MCS=3 => 11 Mbps, Mode=OFDM/MCS=3 => 18 Mbps
++		if (((pAd->StaCfg.HTPhyMode.field.MCS <= 3) &&
++/* Iverson mark
++				(pAd->StaCfg.HTPhyMode.field.MODE <= MODE_OFDM) &&
++*/
++				(pAd->RalinkCounters.OneSecRxOkDataCnt < (ULONG)100)) ||
++			((pAd->StaCfg.HTPhyMode.field.MCS > 3) &&
++/* Iverson mark
++			(pAd->StaCfg.HTPhyMode.field.MODE > MODE_OFDM) &&
++*/
++			(pAd->RalinkCounters.OneSecRxOkDataCnt < (ULONG)400)))
++		{
++				// Get this time
++			NdisGetSystemUpTime(&pAd->Mlme.LastSendNULLpsmTime);
++			pAd->RalinkCounters.RxCountSinceLastNULL = 0;
++			MlmeSetPsmBit(pAd, PWR_SAVE);
++			if (!(pAd->CommonCfg.bAPSDCapable && pAd->CommonCfg.APEdcaParm.bAPSDCapable))
++			{
++				RTMPSendNullFrame(pAd, pAd->CommonCfg.TxRate, FALSE);
++			}
++			else
++			{
++				RTMPSendNullFrame(pAd, pAd->CommonCfg.TxRate, TRUE);
++			}
++		}
++	}
++#endif
+ }
+ 
+ // IRQL = PASSIVE_LEVEL
+@@ -2529,7 +2593,9 @@ VOID MlmeSetPsmBit(
+ 	RTMP_IO_READ32(pAd, AUTO_RSP_CFG, &csr4.word);
+ 	csr4.field.AckCtsPsmBit = (psm == PWR_SAVE)? 1:0;
+ 	RTMP_IO_WRITE32(pAd, AUTO_RSP_CFG, csr4.word);
++#ifndef RT30xx
+ 	DBGPRINT(RT_DEBUG_TRACE, ("MlmeSetPsmBit = %d\n", psm));
++#endif
+ }
+ 
+ // IRQL = DISPATCH_LEVEL
+@@ -3560,9 +3626,21 @@ ULONG BssTableSetEntry(
+ 	}
+ 	else
+ 	{
++#ifndef RT30xx
+ 		BssEntrySet(pAd, &Tab->BssEntry[Idx], pBssid, Ssid, SsidLen, BssType, BeaconPeriod,CfParm, AtimWin,
+ 					CapabilityInfo, SupRate, SupRateLen, ExtRate, ExtRateLen,pHtCapability, pAddHtInfo,HtCapabilityLen, AddHtInfoLen,
+ 					NewExtChanOffset, ChannelNo, Rssi, TimeStamp, CkipFlag, pEdcaParm, pQosCapability, pQbssLoad, LengthVIE, pVIE);
++#endif
++#ifdef RT30xx
++		/* avoid  Hidden SSID form beacon to overwirite correct SSID from probe response */
++		if ((SSID_EQUAL(Ssid, SsidLen, Tab->BssEntry[Idx].Ssid, Tab->BssEntry[Idx].SsidLen)) ||
++			(NdisEqualMemory(Tab->BssEntry[Idx].Ssid, ZeroSsid, Tab->BssEntry[Idx].SsidLen)))
++		{
++			BssEntrySet(pAd, &Tab->BssEntry[Idx], pBssid, Ssid, SsidLen, BssType, BeaconPeriod,CfParm, AtimWin,
++						CapabilityInfo, SupRate, SupRateLen, ExtRate, ExtRateLen,pHtCapability, pAddHtInfo,HtCapabilityLen, AddHtInfoLen,
++						NewExtChanOffset, ChannelNo, Rssi, TimeStamp, CkipFlag, pEdcaParm, pQosCapability, pQbssLoad, LengthVIE, pVIE);
++		}
++#endif
+ 	}
+ 
+ 	return Idx;
+@@ -3623,9 +3701,14 @@ VOID BssTableSsidSort(
+ 							continue;
+ 
+ 					// check group cipher
++#ifndef RT30xx
+ 					if ((pAd->StaCfg.WepStatus < pInBss->WPA.GroupCipher) &&
+ 						(pInBss->WPA.GroupCipher != Ndis802_11GroupWEP40Enabled) &&
+ 						(pInBss->WPA.GroupCipher != Ndis802_11GroupWEP104Enabled))
++#endif
++#ifdef RT30xx
++					if (pAd->StaCfg.WepStatus < pInBss->WPA.GroupCipher)
++#endif
+ 						continue;
+ 
+ 					// check pairwise cipher, skip if none matched
+@@ -3644,9 +3727,14 @@ VOID BssTableSsidSort(
+ 							continue;
+ 
+ 					// check group cipher
++#ifndef RT30xx
+ 					if ((pAd->StaCfg.WepStatus < pInBss->WPA.GroupCipher) &&
+ 						(pInBss->WPA2.GroupCipher != Ndis802_11GroupWEP40Enabled) &&
+ 						(pInBss->WPA2.GroupCipher != Ndis802_11GroupWEP104Enabled))
++#endif
++#ifdef RT30xx
++					if (pAd->StaCfg.WepStatus < pInBss->WPA2.GroupCipher)
++#endif
+ 						continue;
+ 
+ 					// check pairwise cipher, skip if none matched
+@@ -3924,10 +4012,16 @@ VOID BssCipherParse(
+ 				switch (*pTmp)
+ 				{
+ 					case 1:
++#ifndef RT30xx
+ 						pBss->WPA.GroupCipher = Ndis802_11GroupWEP40Enabled;
+ 						break;
+ 					case 5:
+ 						pBss->WPA.GroupCipher = Ndis802_11GroupWEP104Enabled;
++#endif
++#ifdef RT30xx
++					case 5:	// Although WEP is not allowed in WPA related auth mode, we parse it anyway
++						pBss->WPA.GroupCipher = Ndis802_11Encryption1Enabled;
++#endif
+ 						break;
+ 					case 2:
+ 						pBss->WPA.GroupCipher = Ndis802_11Encryption2Enabled;
+@@ -4014,7 +4108,6 @@ VOID BssCipherParse(
+ 					pBss->AuthMode	  = Ndis802_11AuthModeWPANone;
+ 					pBss->AuthModeAux = Ndis802_11AuthModeWPANone;
+ 					pBss->WepStatus   = pBss->WPA.GroupCipher;
+-					// Patched bugs for old driver
+ 					if (pBss->WPA.PairCipherAux == Ndis802_11WEPDisabled)
+ 						pBss->WPA.PairCipherAux = pBss->WPA.GroupCipher;
+ 				}
+@@ -4044,10 +4137,16 @@ VOID BssCipherParse(
+ 				switch (pCipher->Type)
+ 				{
+ 					case 1:
++#ifndef RT30xx
+ 						pBss->WPA2.GroupCipher = Ndis802_11GroupWEP40Enabled;
+ 						break;
+ 					case 5:
+ 						pBss->WPA2.GroupCipher = Ndis802_11GroupWEP104Enabled;
++#endif
++#ifdef RT30xx
++					case 5:	// Although WEP is not allowed in WPA related auth mode, we parse it anyway
++						pBss->WPA2.GroupCipher = Ndis802_11Encryption1Enabled;
++#endif
+ 						break;
+ 					case 2:
+ 						pBss->WPA2.GroupCipher = Ndis802_11Encryption2Enabled;
+@@ -4141,7 +4240,6 @@ VOID BssCipherParse(
+ 					pBss->WPA.PairCipherAux = pBss->WPA2.PairCipherAux;
+ 					pBss->WPA.GroupCipher	= pBss->WPA2.GroupCipher;
+ 					pBss->WepStatus 		= pBss->WPA.GroupCipher;
+-					// Patched bugs for old driver
+ 					if (pBss->WPA.PairCipherAux == Ndis802_11WEPDisabled)
+ 						pBss->WPA.PairCipherAux = pBss->WPA.GroupCipher;
+ 				}
+@@ -5249,6 +5347,277 @@ VOID 	AsicUpdateProtect(
+ 	}
+ }
+ 
++
++#ifdef RT30xx
++/*
++	========================================================================
++
++	Routine Description: Write RT30xx RF register through MAC
++
++	Arguments:
++
++	Return Value:
++
++	IRQL =
++
++	Note:
++
++	========================================================================
++*/
++NTSTATUS RT30xxWriteRFRegister(
++	IN	PRTMP_ADAPTER	pAd,
++	IN	UCHAR			RegID,
++	IN	UCHAR			Value)
++{
++	RF_CSR_CFG_STRUC	rfcsr;
++	UINT				i = 0;
++
++	do
++	{
++		RTMP_IO_READ32(pAd, RF_CSR_CFG, &rfcsr.word);
++
++		if (!rfcsr.field.RF_CSR_KICK)
++			break;
++		i++;
++	}
++	while ((i < RETRY_LIMIT) && (!RTMP_TEST_FLAG(pAd, fRTMP_ADAPTER_NIC_NOT_EXIST)));
++
++	if ((i == RETRY_LIMIT) || (RTMP_TEST_FLAG(pAd, fRTMP_ADAPTER_NIC_NOT_EXIST)))
++	{
++		DBGPRINT_RAW(RT_DEBUG_ERROR, ("Retry count exhausted or device removed!!!\n"));
++		return STATUS_UNSUCCESSFUL;
++	}
++
++	rfcsr.field.RF_CSR_WR = 1;
++	rfcsr.field.RF_CSR_KICK = 1;
++	rfcsr.field.TESTCSR_RFACC_REGNUM = RegID;
++	rfcsr.field.RF_CSR_DATA = Value;
++
++	RTMP_IO_WRITE32(pAd, RF_CSR_CFG, rfcsr.word);
++
++	return STATUS_SUCCESS;
++}
++
++
++/*
++	========================================================================
++
++	Routine Description: Read RT30xx RF register through MAC
++
++	Arguments:
++
++	Return Value:
++
++	IRQL =
++
++	Note:
++
++	========================================================================
++*/
++NTSTATUS RT30xxReadRFRegister(
++	IN	PRTMP_ADAPTER	pAd,
++	IN	UCHAR			RegID,
++	IN	PUCHAR			pValue)
++{
++	RF_CSR_CFG_STRUC	rfcsr;
++	UINT				i=0, k=0;
++
++	for (i=0; i<MAX_BUSY_COUNT; i++)
++	{
++		RTMP_IO_READ32(pAd, RF_CSR_CFG, &rfcsr.word);
++
++		if (rfcsr.field.RF_CSR_KICK == BUSY)
++		{
++			continue;
++		}
++		rfcsr.word = 0;
++		rfcsr.field.RF_CSR_WR = 0;
++		rfcsr.field.RF_CSR_KICK = 1;
++		rfcsr.field.TESTCSR_RFACC_REGNUM = RegID;
++		RTMP_IO_WRITE32(pAd, RF_CSR_CFG, rfcsr.word);
++		for (k=0; k<MAX_BUSY_COUNT; k++)
++		{
++			RTMP_IO_READ32(pAd, RF_CSR_CFG, &rfcsr.word);
++
++			if (rfcsr.field.RF_CSR_KICK == IDLE)
++				break;
++		}
++		if ((rfcsr.field.RF_CSR_KICK == IDLE) &&
++			(rfcsr.field.TESTCSR_RFACC_REGNUM == RegID))
++		{
++			*pValue = (UCHAR)rfcsr.field.RF_CSR_DATA;
++			break;
++		}
++	}
++	if (rfcsr.field.RF_CSR_KICK == BUSY)
++	{
++		DBGPRINT_ERR(("RF read R%d=0x%x fail, i[%d], k[%d]\n", RegID, rfcsr.word,i,k));
++		return STATUS_UNSUCCESSFUL;
++	}
++
++	return STATUS_SUCCESS;
++}
++#endif // RT30xx //
++
++#ifdef RT30xx
++// add by johnli, RF power sequence setup
++/*
++	==========================================================================
++	Description:
++
++	Load RF normal operation-mode setup
++
++	==========================================================================
++ */
++VOID RT30xxLoadRFNormalModeSetup(
++	IN PRTMP_ADAPTER 	pAd)
++{
++	UCHAR RFValue;
++
++	// RX0_PD & TX0_PD, RF R1 register Bit 2 & Bit 3 to 0 and RF_BLOCK_en,RX1_PD & TX1_PD, Bit0, Bit 4 & Bit5 to 1
++	RT30xxReadRFRegister(pAd, RF_R01, &RFValue);
++	RFValue = (RFValue & (~0x0C)) | 0x31;
++	RT30xxWriteRFRegister(pAd, RF_R01, RFValue);
++
++	// TX_LO2_en, RF R15 register Bit 3 to 0
++	RT30xxReadRFRegister(pAd, RF_R15, &RFValue);
++	RFValue &= (~0x08);
++	RT30xxWriteRFRegister(pAd, RF_R15, RFValue);
++
++	// TX_LO1_en, RF R17 register Bit 3 to 0
++	RT30xxReadRFRegister(pAd, RF_R17, &RFValue);
++	RFValue &= (~0x08);
++	// to fix rx long range issue
++	if (((pAd->MACVersion & 0xffff) >= 0x0211) && (pAd->NicConfig2.field.ExternalLNAForG == 0))
++	{
++		RFValue |= 0x20;
++	}
++	RT30xxWriteRFRegister(pAd, RF_R17, RFValue);
++
++	// RX_LO1_en, RF R20 register Bit 3 to 0
++	RT30xxReadRFRegister(pAd, RF_R20, &RFValue);
++	RFValue &= (~0x08);
++	RT30xxWriteRFRegister(pAd, RF_R20, RFValue);
++
++	// RX_LO2_en, RF R21 register Bit 3 to 0
++	RT30xxReadRFRegister(pAd, RF_R21, &RFValue);
++	RFValue &= (~0x08);
++	RT30xxWriteRFRegister(pAd, RF_R21, RFValue);
++
++	// LDORF_VC, RF R27 register Bit 2 to 0
++	RT30xxReadRFRegister(pAd, RF_R27, &RFValue);
++	if ((pAd->MACVersion & 0xffff) < 0x0211)
++		RFValue = (RFValue & (~0x77)) | 0x3;
++	else
++		RFValue = (RFValue & (~0x77));
++	RT30xxWriteRFRegister(pAd, RF_R27, RFValue);
++	/* end johnli */
++}
++
++/*
++	==========================================================================
++	Description:
++
++	Load RF sleep-mode setup
++
++	==========================================================================
++ */
++VOID RT30xxLoadRFSleepModeSetup(
++	IN PRTMP_ADAPTER 	pAd)
++{
++	UCHAR RFValue;
++	UINT32 MACValue;
++
++	// RF_BLOCK_en. RF R1 register Bit 0 to 0
++	RT30xxReadRFRegister(pAd, RF_R01, &RFValue);
++	RFValue &= (~0x01);
++	RT30xxWriteRFRegister(pAd, RF_R01, RFValue);
++
++	// VCO_IC, RF R7 register Bit 4 & Bit 5 to 0
++	RT30xxReadRFRegister(pAd, RF_R07, &RFValue);
++	RFValue &= (~0x30);
++	RT30xxWriteRFRegister(pAd, RF_R07, RFValue);
++
++	// Idoh, RF R9 register Bit 1, Bit 2 & Bit 3 to 0
++	RT30xxReadRFRegister(pAd, RF_R09, &RFValue);
++	RFValue &= (~0x0E);
++	RT30xxWriteRFRegister(pAd, RF_R09, RFValue);
++
++	// RX_CTB_en, RF R21 register Bit 7 to 0
++	RT30xxReadRFRegister(pAd, RF_R21, &RFValue);
++	RFValue &= (~0x80);
++	RT30xxWriteRFRegister(pAd, RF_R21, RFValue);
++
++	// LDORF_VC, RF R27 register Bit 0, Bit 1 & Bit 2 to 1
++	RT30xxReadRFRegister(pAd, RF_R27, &RFValue);
++	RFValue |= 0x77;
++	RT30xxWriteRFRegister(pAd, RF_R27, RFValue);
++
++	RTMP_IO_READ32(pAd, LDO_CFG0, &MACValue);
++	MACValue |= 0x1D000000;
++	RTMP_IO_WRITE32(pAd, LDO_CFG0, MACValue);
++}
++
++/*
++	==========================================================================
++	Description:
++
++	Reverse RF sleep-mode setup
++
++	==========================================================================
++ */
++VOID RT30xxReverseRFSleepModeSetup(
++	IN PRTMP_ADAPTER 	pAd)
++{
++	UCHAR RFValue;
++	UINT32 MACValue;
++
++	// RF_BLOCK_en, RF R1 register Bit 0 to 1
++	RT30xxReadRFRegister(pAd, RF_R01, &RFValue);
++	RFValue |= 0x01;
++	RT30xxWriteRFRegister(pAd, RF_R01, RFValue);
++
++	// VCO_IC, RF R7 register Bit 4 & Bit 5 to 1
++	RT30xxReadRFRegister(pAd, RF_R07, &RFValue);
++	RFValue |= 0x30;
++	RT30xxWriteRFRegister(pAd, RF_R07, RFValue);
++
++	// Idoh, RF R9 register Bit 1, Bit 2 & Bit 3 to 1
++	RT30xxReadRFRegister(pAd, RF_R09, &RFValue);
++	RFValue |= 0x0E;
++	RT30xxWriteRFRegister(pAd, RF_R09, RFValue);
++
++	// RX_CTB_en, RF R21 register Bit 7 to 1
++	RT30xxReadRFRegister(pAd, RF_R21, &RFValue);
++	RFValue |= 0x80;
++	RT30xxWriteRFRegister(pAd, RF_R21, RFValue);
++
++	// LDORF_VC, RF R27 register Bit 2 to 0
++	RT30xxReadRFRegister(pAd, RF_R27, &RFValue);
++	if ((pAd->MACVersion & 0xffff) < 0x0211)
++		RFValue = (RFValue & (~0x77)) | 0x3;
++	else
++		RFValue = (RFValue & (~0x77));
++	RT30xxWriteRFRegister(pAd, RF_R27, RFValue);
++
++	// RT3071 version E has fixed this issue
++	if ((pAd->NicConfig2.field.DACTestBit == 1) && ((pAd->MACVersion & 0xffff) < 0x0211))
++	{
++		// patch tx EVM issue temporarily
++		RTMP_IO_READ32(pAd, LDO_CFG0, &MACValue);
++		MACValue = ((MACValue & 0xE0FFFFFF) | 0x0D000000);
++		RTMP_IO_WRITE32(pAd, LDO_CFG0, MACValue);
++	}
++	else
++	{
++		RTMP_IO_READ32(pAd, LDO_CFG0, &MACValue);
++		MACValue = ((MACValue & 0xE0FFFFFF) | 0x01000000);
++		RTMP_IO_WRITE32(pAd, LDO_CFG0, MACValue);
++	}
++}
++// end johnli
++#endif // RT30xx //
++
+ /*
+ 	==========================================================================
+ 	Description:
+@@ -5270,6 +5639,21 @@ VOID AsicSwitchChannel(
+ 	RTMP_RF_REGS *RFRegTable;
+ 
+ 	// Search Tx power value
++#ifdef RT30xx
++	// We can't use ChannelList to search channel, since some central channl's txpowr doesn't list
++	// in ChannelList, so use TxPower array instead.
++	//
++	for (index = 0; index < MAX_NUM_OF_CHANNELS; index++)
++	{
++		if (Channel == pAd->TxPower[index].Channel)
++		{
++			TxPwer = pAd->TxPower[index].Power;
++			TxPwer2 = pAd->TxPower[index].Power2;
++			break;
++		}
++	}
++#endif
++#ifndef RT30xx
+ 	for (index = 0; index < pAd->ChannelListNum; index++)
+ 	{
+ 		if (Channel == pAd->ChannelList[index].Channel)
+@@ -5279,15 +5663,27 @@ VOID AsicSwitchChannel(
+ 			break;
+ 		}
+ 	}
++#endif
+ 
+ 	if (index == MAX_NUM_OF_CHANNELS)
+ 	{
++#ifndef RT30xx
+ 		DBGPRINT(RT_DEBUG_ERROR, ("AsicSwitchChannel: Cant find the Channel#%d \n", Channel));
++#endif
++#ifdef RT30xx
++		DBGPRINT(RT_DEBUG_ERROR, ("AsicSwitchChannel: Can't find the Channel#%d \n", Channel));
++#endif
+ 	}
+ 
+ #ifdef RT2870
+ 	// The RF programming sequence is difference between 3xxx and 2xxx
++#ifdef RT30xx
++	if ((IS_RT3070(pAd) || IS_RT3090(pAd)) && ((pAd->RfIcType == RFIC_3020) || (pAd->RfIcType == RFIC_2020) ||
++		(pAd->RfIcType == RFIC_3021) || (pAd->RfIcType == RFIC_3022)))
++#endif
++#ifndef RT30xx
+ 	if (IS_RT3070(pAd) && ((pAd->RfIcType == RFIC_3020) || (pAd->RfIcType == RFIC_2020)))
++#endif
+ 	{
+ 		/* modify by WY for Read RF Reg. error */
+ 		UCHAR RFValue;
+@@ -5300,6 +5696,7 @@ VOID AsicSwitchChannel(
+ 				RT30xxWriteRFRegister(pAd, RF_R02, FreqItems3020[index].N);
+ 				RT30xxWriteRFRegister(pAd, RF_R03, FreqItems3020[index].K);
+ 
++#ifndef RT30xx
+ 				RT30xxReadRFRegister(pAd, RF_R06, (PUCHAR)&RFValue);
+ 				RFValue = (RFValue & 0xFC) | FreqItems3020[index].R;
+ 				RT30xxWriteRFRegister(pAd, RF_R06, (UCHAR)RFValue);
+@@ -5313,7 +5710,42 @@ VOID AsicSwitchChannel(
+ 				RT30xxReadRFRegister(pAd, RF_R23, (PUCHAR)&RFValue);
+ 				RFValue = (RFValue & 0x80) | pAd->RfFreqOffset;
+ 				RT30xxWriteRFRegister(pAd, RF_R23, (UCHAR)RFValue);
++#endif
++#ifdef RT30xx
++				RT30xxReadRFRegister(pAd, RF_R06, &RFValue);
++				RFValue = (RFValue & 0xFC) | FreqItems3020[index].R;
++				RT30xxWriteRFRegister(pAd, RF_R06, RFValue);
++
++				// Set Tx0 Power
++				RT30xxReadRFRegister(pAd, RF_R12, &RFValue);
++				RFValue = (RFValue & 0xE0) | TxPwer;
++				RT30xxWriteRFRegister(pAd, RF_R12, RFValue);
++
++				// Set Tx1 Power
++				RT30xxReadRFRegister(pAd, RF_R13, &RFValue);
++				RFValue = (RFValue & 0xE0) | TxPwer2;
++				RT30xxWriteRFRegister(pAd, RF_R13, RFValue);
++
++				// Tx/Rx Stream setting
++				RT30xxReadRFRegister(pAd, RF_R01, &RFValue);
++				//if (IS_RT3090(pAd))
++				//	RFValue |= 0x01; // Enable RF block.
++				RFValue &= 0x03;	//clear bit[7~2]
++				if (pAd->Antenna.field.TxPath == 1)
++					RFValue |= 0xA0;
++				else if (pAd->Antenna.field.TxPath == 2)
++					RFValue |= 0x80;
++				if (pAd->Antenna.field.RxPath == 1)
++					RFValue |= 0x50;
++				else if (pAd->Antenna.field.RxPath == 2)
++					RFValue |= 0x40;
++				RT30xxWriteRFRegister(pAd, RF_R01, RFValue);
+ 
++				// Set RF offset
++				RT30xxReadRFRegister(pAd, RF_R23, &RFValue);
++				RFValue = (RFValue & 0x80) | pAd->RfFreqOffset;
++				RT30xxWriteRFRegister(pAd, RF_R23, RFValue);
++#endif
+ 				// Set BW
+ 				if (!bScan && (pAd->CommonCfg.BBPCurrentBW == BW_40))
+ 				{
+@@ -5324,6 +5756,7 @@ VOID AsicSwitchChannel(
+ 				{
+ 					RFValue = pAd->Mlme.CaliBW20RfR24;
+ 				}
++#ifndef RT30xx
+ 				RT30xxWriteRFRegister(pAd, RF_R24, (UCHAR)RFValue);
+ 
+ 				// Enable RF tuning
+@@ -5333,11 +5766,34 @@ VOID AsicSwitchChannel(
+ 
+ 				// latch channel for future usage.
+ 				pAd->LatchRfRegs.Channel = Channel;
++#endif
++#ifdef RT30xx
++				RT30xxWriteRFRegister(pAd, RF_R24, RFValue);
++				RT30xxWriteRFRegister(pAd, RF_R31, RFValue);
++
++				// Enable RF tuning
++				RT30xxReadRFRegister(pAd, RF_R07, &RFValue);
++				RFValue = RFValue | 0x1;
++				RT30xxWriteRFRegister(pAd, RF_R07, RFValue);
++
++				// latch channel for future usage.
++				pAd->LatchRfRegs.Channel = Channel;
+ 
++				DBGPRINT(RT_DEBUG_TRACE, ("SwitchChannel#%d(RF=%d, Pwr0=%d, Pwr1=%d, %dT), N=0x%02X, K=0x%02X, R=0x%02X\n",
++					Channel,
++					pAd->RfIcType,
++					TxPwer,
++					TxPwer2,
++					pAd->Antenna.field.TxPath,
++					FreqItems3020[index].N,
++					FreqItems3020[index].K,
++					FreqItems3020[index].R));
++#endif
+ 				break;
+ 			}
+ 		}
+ 
++#ifndef RT30xx
+ 		DBGPRINT(RT_DEBUG_TRACE, ("SwitchChannel#%d(RF=%d, Pwr0=%d, Pwr1=%d, %dT), N=0x%02X, K=0x%02X, R=0x%02X\n",
+ 			Channel,
+ 			pAd->RfIcType,
+@@ -5347,6 +5803,7 @@ VOID AsicSwitchChannel(
+ 			FreqItems3020[index].N,
+ 			FreqItems3020[index].K,
+ 			FreqItems3020[index].R));
++#endif
+ 	}
+ 	else
+ #endif // RT2870 //
+@@ -5603,6 +6060,53 @@ VOID	AsicAntennaSelect(
+ 	IN	PRTMP_ADAPTER	pAd,
+ 	IN	UCHAR			Channel)
+ {
++#ifdef RT30xx
++			if (pAd->Mlme.OneSecPeriodicRound % 2 == 1)
++			{
++				// patch for AsicSetRxAnt failed
++				pAd->RxAnt.EvaluatePeriod = 0;
++
++				// check every 2 second. If rcv-beacon less than 5 in the past 2 second, then AvgRSSI is no longer a
++				// valid indication of the distance between this AP and its clients.
++				if (OPSTATUS_TEST_FLAG(pAd, fOP_STATUS_MEDIA_STATE_CONNECTED))
++				{
++					SHORT	realavgrssi1;
++
++					// if no traffic then reset average rssi to trigger evaluation
++					if (pAd->StaCfg.NumOfAvgRssiSample < 5)
++					{
++						pAd->RxAnt.Pair1LastAvgRssi = (-99);
++						pAd->RxAnt.Pair2LastAvgRssi = (-99);
++						DBGPRINT(RT_DEBUG_TRACE, ("MlmePeriodicExec: no traffic/beacon, reset RSSI\n"));
++					}
++
++					pAd->StaCfg.NumOfAvgRssiSample = 0;
++					realavgrssi1 = (pAd->RxAnt.Pair1AvgRssi[pAd->RxAnt.Pair1PrimaryRxAnt] >> 3);
++
++					DBGPRINT(RT_DEBUG_TRACE,("Ant-realrssi0(%d), Lastrssi0(%d), EvaluateStableCnt=%d\n", realavgrssi1, pAd->RxAnt.Pair1LastAvgRssi, pAd->RxAnt.EvaluateStableCnt));
++
++					// if the difference between two rssi is larger or less than 5, then evaluate the other antenna
++					if ((pAd->RxAnt.EvaluateStableCnt < 2) || (realavgrssi1 > (pAd->RxAnt.Pair1LastAvgRssi + 5)) || (realavgrssi1 < (pAd->RxAnt.Pair1LastAvgRssi - 5)))
++					{
++						pAd->RxAnt.Pair1LastAvgRssi = realavgrssi1;
++						AsicEvaluateRxAnt(pAd);
++					}
++				}
++				else
++				{
++					// if not connected, always switch antenna to try to connect
++					UCHAR	temp;
++
++					temp = pAd->RxAnt.Pair1PrimaryRxAnt;
++					pAd->RxAnt.Pair1PrimaryRxAnt = pAd->RxAnt.Pair1SecondaryRxAnt;
++					pAd->RxAnt.Pair1SecondaryRxAnt = temp;
++
++					DBGPRINT(RT_DEBUG_TRACE, ("MlmePeriodicExec: no connect, switch to another one to try connection\n"));
++
++					AsicSetRxAnt(pAd, pAd->RxAnt.Pair1PrimaryRxAnt);
++				}
++			}
++#endif /* RT30xx */
+ }
+ 
+ /*
+@@ -6320,6 +6824,14 @@ VOID AsicSetEdcaParm(
+ 				Ac0Cfg.field.Aifsn = 3;
+ 				Ac2Cfg.field.AcTxop = 5;
+ 			}
++
++#ifdef RT30xx
++			if (pAd->RfIcType == RFIC_3020 || pAd->RfIcType == RFIC_2020)
++			{
++				// Tuning for WiFi WMM S3-T07: connexant legacy sta ==> broadcom 11n sta.
++				Ac2Cfg.field.Aifsn = 5;
++			}
++#endif // RT30xx //
+ 		}
+ 
+ 		Ac3Cfg.field.AcTxop = pEdcaParm->Txop[QID_AC_VO];
+@@ -6386,7 +6898,7 @@ VOID AsicSetEdcaParm(
+ 				AifsnCsr.field.Aifsn2 = Ac2Cfg.field.Aifsn - 4;
+ 
+ 			// Tuning for TGn Wi-Fi 5.2.32
+-			// STA TestBed changes in this item: conexant legacy sta ==> broadcom 11n sta
++			// STA TestBed changes in this item: connexant legacy sta ==> broadcom 11n sta
+ 			if (STA_TGN_WIFI_ON(pAd) &&
+ 				pEdcaParm->Aifsn[QID_AC_VI] == 10)
+ 			{
+@@ -6399,6 +6911,10 @@ VOID AsicSetEdcaParm(
+ 		}
+ 
+ 		AifsnCsr.field.Aifsn3 = Ac3Cfg.field.Aifsn - 1; //pEdcaParm->Aifsn[QID_AC_VO]; //for TGn wifi test
++#ifdef RT30xx
++		if (pAd->RfIcType == RFIC_3020 || pAd->RfIcType == RFIC_2020)
++			AifsnCsr.field.Aifsn2 = 0x2; //pEdcaParm->Aifsn[QID_AC_VI]; //for WiFi WMM S4-T04.
++#endif // RT30xx //
+ 
+ 		RTMP_IO_WRITE32(pAd, WMM_AIFSN_CFG, AifsnCsr.word);
+ 
+@@ -6461,6 +6977,7 @@ VOID 	AsicSetSlotTime(
+ 	SlotTime = (bUseShortSlotTime)? 9 : 20;
+ 
+ 	{
++#ifndef RT30xx
+ 		// force using short SLOT time for FAE to demo performance when TxBurst is ON
+ 		if (((pAd->StaActive.SupportedPhyInfo.bHtEnable == FALSE) && (OPSTATUS_TEST_FLAG(pAd, fOP_STATUS_WMM_INUSED)))
+ 			|| ((pAd->StaActive.SupportedPhyInfo.bHtEnable == TRUE) && (pAd->CommonCfg.BACapability.field.Policy == BA_NOTUSE))
+@@ -6470,6 +6987,10 @@ VOID 	AsicSetSlotTime(
+ 			// And we will not set to short slot when bEnableTxBurst is TRUE.
+ 		}
+ 		else if (pAd->CommonCfg.bEnableTxBurst)
++#endif
++#ifdef RT30xx
++		if (pAd->CommonCfg.bEnableTxBurst)
++#endif
+ 			SlotTime = 9;
+ 	}
+ 
+@@ -7302,6 +7823,58 @@ CHAR RTMPMaxRssi(
+ 	return larger;
+ }
+ 
++#ifdef RT30xx
++// Antenna divesity use GPIO3 and EESK pin for control
++// Antenna and EEPROM access are both using EESK pin,
++// Therefor we should avoid accessing EESK at the same time
++// Then restore antenna after EEPROM access
++VOID AsicSetRxAnt(
++	IN PRTMP_ADAPTER	pAd,
++	IN UCHAR			Ant)
++{
++#ifdef RT30xx
++	UINT32	Value;
++	UINT32	x;
++
++	if ((pAd->EepromAccess)										||
++		(RTMP_TEST_FLAG(pAd, fRTMP_ADAPTER_RESET_IN_PROGRESS))	||
++		(RTMP_TEST_FLAG(pAd, fRTMP_ADAPTER_HALT_IN_PROGRESS))	||
++		(RTMP_TEST_FLAG(pAd, fRTMP_ADAPTER_RADIO_OFF))			||
++		(RTMP_TEST_FLAG(pAd, fRTMP_ADAPTER_NIC_NOT_EXIST)))
++	{
++		return;
++	}
++
++	// the antenna selection is through firmware and MAC register(GPIO3)
++	if (Ant == 0)
++	{
++		// Main antenna
++		RTMP_IO_READ32(pAd, E2PROM_CSR, &x);
++		x |= (EESK);
++		RTMP_IO_WRITE32(pAd, E2PROM_CSR, x);
++
++		RTMP_IO_READ32(pAd, GPIO_CTRL_CFG, &Value);
++		Value &= ~(0x0808);
++		RTMP_IO_WRITE32(pAd, GPIO_CTRL_CFG, Value);
++		DBGPRINT_RAW(RT_DEBUG_TRACE, ("AsicSetRxAnt, switch to main antenna\n"));
++	}
++	else
++	{
++		// Aux antenna
++		RTMP_IO_READ32(pAd, E2PROM_CSR, &x);
++		x &= ~(EESK);
++		RTMP_IO_WRITE32(pAd, E2PROM_CSR, x);
++
++		RTMP_IO_READ32(pAd, GPIO_CTRL_CFG, &Value);
++		Value &= ~(0x0808);
++		Value |= 0x08;
++		RTMP_IO_WRITE32(pAd, GPIO_CTRL_CFG, Value);
++		DBGPRINT_RAW(RT_DEBUG_TRACE, ("AsicSetRxAnt, switch to aux antenna\n"));
++	}
++#endif // RT30xx //
++}
++#endif /* RT30xx */
++
+ /*
+     ========================================================================
+     Routine Description:
+@@ -7320,6 +7893,7 @@ VOID AsicEvaluateRxAnt(
+ {
+ 	UCHAR	BBPR3 = 0;
+ 
++#ifndef RT30xx
+ 	{
+ 		if (RTMP_TEST_FLAG(pAd, fRTMP_ADAPTER_RESET_IN_PROGRESS	|
+ 								fRTMP_ADAPTER_HALT_IN_PROGRESS	|
+@@ -7366,6 +7940,89 @@ VOID AsicEvaluateRxAnt(
+ 			pAd->Mlme.bLowThroughput = TRUE;
+ 		}
+ 	}
++#endif /* RT30xx */
++#ifdef RT30xx
++	if (RTMP_TEST_FLAG(pAd, fRTMP_ADAPTER_RESET_IN_PROGRESS	|
++							fRTMP_ADAPTER_HALT_IN_PROGRESS	|
++							fRTMP_ADAPTER_RADIO_OFF			|
++							fRTMP_ADAPTER_NIC_NOT_EXIST		|
++							fRTMP_ADAPTER_BSS_SCAN_IN_PROGRESS) ||
++							OPSTATUS_TEST_FLAG(pAd, fOP_STATUS_DOZE)
++#ifdef RT30xx
++							|| (pAd->EepromAccess)
++#endif // RT30xx //
++							)
++		return;
++
++
++	{
++		//if (pAd->StaCfg.Psm == PWR_SAVE)
++		//	return;
++	}
++
++	// two antenna selection mechanism- one is antenna diversity, the other is failed antenna remove
++	// one is antenna diversity:there is only one antenna can rx and tx
++	// the other is failed antenna remove:two physical antenna can rx and tx
++	if (pAd->NicConfig2.field.AntDiversity)
++	{
++		DBGPRINT(RT_DEBUG_TRACE,("AntDiv - before evaluate Pair1-Ant (%d,%d)\n",
++			pAd->RxAnt.Pair1PrimaryRxAnt, pAd->RxAnt.Pair1SecondaryRxAnt));
++
++		AsicSetRxAnt(pAd, pAd->RxAnt.Pair1SecondaryRxAnt);
++
++		pAd->RxAnt.EvaluatePeriod = 1; // 1:Means switch to SecondaryRxAnt, 0:Means switch to Pair1PrimaryRxAnt
++		pAd->RxAnt.FirstPktArrivedWhenEvaluate = FALSE;
++		pAd->RxAnt.RcvPktNumWhenEvaluate = 0;
++
++		// a one-shot timer to end the evalution
++		// dynamic adjust antenna evaluation period according to the traffic
++		if (OPSTATUS_TEST_FLAG(pAd, fOP_STATUS_MEDIA_STATE_CONNECTED))
++			RTMPSetTimer(&pAd->Mlme.RxAntEvalTimer, 100);
++		else
++			RTMPSetTimer(&pAd->Mlme.RxAntEvalTimer, 300);
++	}
++	else
++	{
++		if (pAd->StaCfg.Psm == PWR_SAVE)
++			return;
++
++		RTMP_BBP_IO_READ8_BY_REG_ID(pAd, BBP_R3, &BBPR3);
++		BBPR3 &= (~0x18);
++		if(pAd->Antenna.field.RxPath == 3)
++		{
++			BBPR3 |= (0x10);
++		}
++		else if(pAd->Antenna.field.RxPath == 2)
++		{
++			BBPR3 |= (0x8);
++		}
++		else if(pAd->Antenna.field.RxPath == 1)
++		{
++			BBPR3 |= (0x0);
++		}
++		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R3, BBPR3);
++
++		if (OPSTATUS_TEST_FLAG(pAd, fOP_STATUS_MEDIA_STATE_CONNECTED)
++			)
++		{
++			ULONG	TxTotalCnt = pAd->RalinkCounters.OneSecTxNoRetryOkCount +
++									pAd->RalinkCounters.OneSecTxRetryOkCount +
++									pAd->RalinkCounters.OneSecTxFailCount;
++
++			// dynamic adjust antenna evaluation period according to the traffic
++			if (TxTotalCnt > 50)
++			{
++				RTMPSetTimer(&pAd->Mlme.RxAntEvalTimer, 20);
++				pAd->Mlme.bLowThroughput = FALSE;
++			}
++			else
++			{
++				RTMPSetTimer(&pAd->Mlme.RxAntEvalTimer, 300);
++				pAd->Mlme.bLowThroughput = TRUE;
++			}
++		}
++	}
++#endif /* RT30xx */
+ }
+ 
+ /*
+@@ -7391,6 +8048,7 @@ VOID AsicRxAntEvalTimeout(
+ 	UCHAR			BBPR3 = 0;
+ 	CHAR			larger = -127, rssi0, rssi1, rssi2;
+ 
++#ifndef RT30xx
+ 	{
+ 		if (RTMP_TEST_FLAG(pAd, fRTMP_ADAPTER_RESET_IN_PROGRESS)	||
+ 			RTMP_TEST_FLAG(pAd, fRTMP_ADAPTER_HALT_IN_PROGRESS)		||
+@@ -7449,6 +8107,107 @@ VOID AsicRxAntEvalTimeout(
+ 		}
+ 		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R3, BBPR3);
+ 	}
++#endif /* RT30xx */
++#ifdef RT30xx
++	if (RTMP_TEST_FLAG(pAd, fRTMP_ADAPTER_RESET_IN_PROGRESS	|
++							fRTMP_ADAPTER_HALT_IN_PROGRESS	|
++							fRTMP_ADAPTER_RADIO_OFF			|
++							fRTMP_ADAPTER_NIC_NOT_EXIST) ||
++							OPSTATUS_TEST_FLAG(pAd, fOP_STATUS_DOZE)
++#ifdef RT30xx
++							|| (pAd->EepromAccess)
++#endif // RT30xx //
++							)
++		return;
++
++	{
++		//if (pAd->StaCfg.Psm == PWR_SAVE)
++		//	return;
++
++		if (pAd->NicConfig2.field.AntDiversity)
++		{
++			if ((pAd->RxAnt.RcvPktNumWhenEvaluate != 0) && (pAd->RxAnt.Pair1AvgRssi[pAd->RxAnt.Pair1SecondaryRxAnt] >= pAd->RxAnt.Pair1AvgRssi[pAd->RxAnt.Pair1PrimaryRxAnt]))
++			{
++				UCHAR			temp;
++
++				//
++				// select PrimaryRxAntPair
++				//    Role change, Used Pair1SecondaryRxAnt as PrimaryRxAntPair.
++				//    Since Pair1SecondaryRxAnt Quality good than Pair1PrimaryRxAnt
++				//
++				temp = pAd->RxAnt.Pair1PrimaryRxAnt;
++				pAd->RxAnt.Pair1PrimaryRxAnt = pAd->RxAnt.Pair1SecondaryRxAnt;
++				pAd->RxAnt.Pair1SecondaryRxAnt = temp;
++
++				pAd->RxAnt.Pair1LastAvgRssi = (pAd->RxAnt.Pair1AvgRssi[pAd->RxAnt.Pair1SecondaryRxAnt] >> 3);
++				pAd->RxAnt.EvaluateStableCnt = 0;
++			}
++			else
++			{
++				// if the evaluated antenna is not better than original, switch back to original antenna
++				AsicSetRxAnt(pAd, pAd->RxAnt.Pair1PrimaryRxAnt);
++				pAd->RxAnt.EvaluateStableCnt ++;
++			}
++
++			pAd->RxAnt.EvaluatePeriod = 0; // 1:Means switch to SecondaryRxAnt, 0:Means switch to Pair1PrimaryRxAnt
++
++			DBGPRINT(RT_DEBUG_TRACE,("AsicRxAntEvalAction::After Eval(fix in #%d), <%d, %d>, RcvPktNumWhenEvaluate=%ld\n",
++					pAd->RxAnt.Pair1PrimaryRxAnt, (pAd->RxAnt.Pair1AvgRssi[0] >> 3), (pAd->RxAnt.Pair1AvgRssi[1] >> 3), pAd->RxAnt.RcvPktNumWhenEvaluate));
++		}
++		else
++		{
++			if (pAd->StaCfg.Psm == PWR_SAVE)
++				return;
++
++			// if the traffic is low, use average rssi as the criteria
++			if (pAd->Mlme.bLowThroughput == TRUE)
++			{
++				rssi0 = pAd->StaCfg.RssiSample.LastRssi0;
++				rssi1 = pAd->StaCfg.RssiSample.LastRssi1;
++				rssi2 = pAd->StaCfg.RssiSample.LastRssi2;
++			}
++			else
++			{
++				rssi0 = pAd->StaCfg.RssiSample.AvgRssi0;
++				rssi1 = pAd->StaCfg.RssiSample.AvgRssi1;
++				rssi2 = pAd->StaCfg.RssiSample.AvgRssi2;
++			}
++
++			if(pAd->Antenna.field.RxPath == 3)
++			{
++				larger = max(rssi0, rssi1);
++
++				if (larger > (rssi2 + 20))
++					pAd->Mlme.RealRxPath = 2;
++				else
++					pAd->Mlme.RealRxPath = 3;
++			}
++			else if(pAd->Antenna.field.RxPath == 2)
++			{
++				if (rssi0 > (rssi1 + 20))
++					pAd->Mlme.RealRxPath = 1;
++				else
++					pAd->Mlme.RealRxPath = 2;
++			}
++
++			RTMP_BBP_IO_READ8_BY_REG_ID(pAd, BBP_R3, &BBPR3);
++			BBPR3 &= (~0x18);
++			if(pAd->Mlme.RealRxPath == 3)
++			{
++				BBPR3 |= (0x10);
++			}
++			else if(pAd->Mlme.RealRxPath == 2)
++			{
++				BBPR3 |= (0x8);
++			}
++			else if(pAd->Mlme.RealRxPath == 1)
++			{
++				BBPR3 |= (0x0);
++			}
++			RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R3, BBPR3);
++		}
++	}
++#endif /* RT30xx */
+ }
+ 
+ 
+@@ -7664,14 +8423,24 @@ VOID AsicStaBbpTuning(
+ #ifdef RT2870
+ 			// RT3070 is a no LNA solution, it should have different control regarding to AGC gain control
+ 			// Otherwise, it will have some throughput side effect when low RSSI
++#ifndef RT30xx
+ 			if (IS_RT3070(pAd))
++#endif
++#ifdef RT30xx
++			if (IS_RT30xx(pAd))
++#endif
+ 			{
+ 				if (Rssi > RSSI_FOR_MID_LOW_SENSIBILITY)
+ 				{
+ 					R66 = 0x1C + 2*GET_LNA_GAIN(pAd) + 0x20;
+ 					if (OrigR66Value != R66)
+ 					{
++#ifndef RT30xx
+ 						RTUSBWriteBBPRegister(pAd, BBP_R66, R66);
++#endif
++#ifdef RT30xx
++						RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R66, R66);
++#endif
+ 					}
+ 				}
+ 				else
+@@ -7679,7 +8448,12 @@ VOID AsicStaBbpTuning(
+ 					R66 = 0x1C + 2*GET_LNA_GAIN(pAd);
+ 					if (OrigR66Value != R66)
+ 					{
++#ifndef RT30xx
+ 						RTUSBWriteBBPRegister(pAd, BBP_R66, R66);
++#endif
++#ifdef RT30xx
++						RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R66, R66);
++#endif
+ 					}
+ 				}
+ 			}
+@@ -7781,12 +8555,20 @@ VOID AsicTurnOffRFClk(
+ 	IN PRTMP_ADAPTER pAd,
+ 	IN	UCHAR		Channel)
+ {
+-
+ 	// RF R2 bit 18 = 0
+ 	UINT32			R1 = 0, R2 = 0, R3 = 0;
+ 	UCHAR			index;
+ 	RTMP_RF_REGS	*RFRegTable;
+ 
++#ifdef RT30xx
++	// The RF programming sequence is difference between 3xxx and 2xxx
++	if (IS_RT3090(pAd))
++	{
++		RT30xxLoadRFSleepModeSetup(pAd);  // add by johnli,  RF power sequence setup, load RF sleep-mode setup
++	}
++	else
++	{
++#endif // RT30xx //
+ 	RFRegTable = RF2850RegTable;
+ 
+ 	switch (pAd->RfIcType)
+@@ -7828,6 +8610,10 @@ VOID AsicTurnOffRFClk(
+ 		default:
+ 			break;
+ 	}
++#ifdef RT30xx
++	}
++#endif // RT30xx //
++
+ }
+ 
+ 
+@@ -7835,12 +8621,19 @@ VOID AsicTurnOnRFClk(
+ 	IN PRTMP_ADAPTER pAd,
+ 	IN	UCHAR			Channel)
+ {
+-
+ 	// RF R2 bit 18 = 0
+ 	UINT32			R1 = 0, R2 = 0, R3 = 0;
+ 	UCHAR			index;
+ 	RTMP_RF_REGS	*RFRegTable;
+ 
++#ifdef RT30xx
++	// The RF programming sequence is difference between 3xxx and 2xxx
++	if (IS_RT3090(pAd))
++	{
++	}
++	else
++	{
++#endif // RT30xx //
+ 	RFRegTable = RF2850RegTable;
+ 
+ 	switch (pAd->RfIcType)
+@@ -7887,9 +8680,14 @@ VOID AsicTurnOnRFClk(
+ 			break;
+ 	}
+ 
++#ifndef RT30xx
+ 	DBGPRINT(RT_DEBUG_TRACE, ("AsicTurnOnRFClk#%d(RF=%d, ) , R2=0x%08x\n",
+ 		Channel,
+ 		pAd->RfIcType,
+ 		R2));
++#endif
++#ifdef RT30xx
++	}
++#endif // RT30xx //
+ }
+ 
+--- a/drivers/staging/rt2870/common/rtmp_init.c
++++ b/drivers/staging/rt2870/common/rtmp_init.c
+@@ -38,7 +38,12 @@
+     Jan Lee  2006-09-15    RT2860. Change for 802.11n , EEPROM, Led, BA, HT.
+ */
+ #include "../rt_config.h"
++#ifndef RT30xx
+ #include "firmware.h"
++#endif
++#ifdef RT30xx
++#include "../../rt3070/firmware.h"
++#endif
+ 
+ UCHAR    BIT8[] = {0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80};
+ ULONG    BIT32[] = {0x00000001, 0x00000002, 0x00000004, 0x00000008,
+@@ -134,7 +139,12 @@ REG_PAIR   RT30xx_RFRegTable[] = {
+         {RF_R06,          0x02},
+         {RF_R07,          0x70},
+         {RF_R09,          0x0F},
++#ifndef RT30xx
+         {RF_R10,          0x71},
++#endif
++#ifdef RT30xx
++        {RF_R10,          0x41},
++#endif
+         {RF_R11,          0x21},
+         {RF_R12,          0x7B},
+         {RF_R14,          0x90},
+@@ -147,7 +157,9 @@ REG_PAIR   RT30xx_RFRegTable[] = {
+         {RF_R21,          0xDB},
+         {RF_R24,          0x16},
+         {RF_R25,          0x01},
++#ifndef RT30xx
+         {RF_R27,          0x03},
++#endif
+         {RF_R29,          0x1F},
+ };
+ #define	NUM_RF_REG_PARMS	(sizeof(RT30xx_RFRegTable) / sizeof(REG_PAIR))
+@@ -184,6 +196,7 @@ RTMP_REG_PAIR	MACRegTable[] =	{
+ 	{AUTO_RSP_CFG,			0x00000013},	// Initial Auto_Responder, because QA will turn off Auto-Responder
+ 	{CCK_PROT_CFG,			0x05740003 /*0x01740003*/},	// Initial Auto_Responder, because QA will turn off Auto-Responder. And RTS threshold is enabled.
+ 	{OFDM_PROT_CFG,			0x05740003 /*0x01740003*/},	// Initial Auto_Responder, because QA will turn off Auto-Responder. And RTS threshold is enabled.
++//PS packets use Tx1Q (for HCCA) when dequeue from PS unicast queue (WiFi WPA2 MA9_DT1 for Marvell B STA)
+ #ifdef RT2870
+ 	{PBF_CFG, 				0xf40006}, 		// Only enable Queue 2
+ 	{MM40_PROT_CFG,			0x3F44084},		// Initial Auto_Responder, because QA will turn off Auto-Responder
+@@ -1070,6 +1083,7 @@ NDIS_STATUS	NICReadRegParameters(
+ 
+ 	========================================================================
+ */
++#ifndef RT30xx
+ VOID RTUSBFilterCalibration(
+ 	IN PRTMP_ADAPTER pAd)
+ {
+@@ -1206,13 +1220,168 @@ VOID RTUSBFilterCalibration(
+ 
+ 	DBGPRINT(RT_DEBUG_TRACE, ("RTUSBFilterCalibration - CaliBW20RfR24=0x%x, CaliBW40RfR24=0x%x\n", pAd->Mlme.CaliBW20RfR24, pAd->Mlme.CaliBW40RfR24));
+ }
++#endif /* RT30xx */
++#ifdef RT30xx
++VOID RTMPFilterCalibration(
++	IN PRTMP_ADAPTER pAd)
++{
++	UCHAR	R55x = 0, value, FilterTarget = 0x1E, BBPValue=0;
++	UINT	loop = 0, count = 0, loopcnt = 0, ReTry = 0;
++	UCHAR	RF_R24_Value = 0;
++
++	// Give bbp filter initial value
++	pAd->Mlme.CaliBW20RfR24 = 0x1F;
++	pAd->Mlme.CaliBW40RfR24 = 0x2F; //Bit[5] must be 1 for BW 40
++
++	do
++	{
++		if (loop == 1)	//BandWidth = 40 MHz
++		{
++			// Write 0x27 to RF_R24 to program filter
++			RF_R24_Value = 0x27;
++			RT30xxWriteRFRegister(pAd, RF_R24, RF_R24_Value);
++			if (IS_RT3090(pAd))
++				FilterTarget = 0x15;
++			else
++				FilterTarget = 0x19;
++
++			// when calibrate BW40, BBP mask must set to BW40.
++			RTMP_BBP_IO_READ8_BY_REG_ID(pAd, BBP_R4, &BBPValue);
++			BBPValue&= (~0x18);
++			BBPValue|= (0x10);
++			RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R4, BBPValue);
++
++			// set to BW40
++			RT30xxReadRFRegister(pAd, RF_R31, &value);
++			value |= 0x20;
++			RT30xxWriteRFRegister(pAd, RF_R31, value);
++		}
++		else			//BandWidth = 20 MHz
++		{
++			// Write 0x07 to RF_R24 to program filter
++			RF_R24_Value = 0x07;
++			RT30xxWriteRFRegister(pAd, RF_R24, RF_R24_Value);
++			if (IS_RT3090(pAd))
++				FilterTarget = 0x13;
++			else
++				FilterTarget = 0x16;
++
++			// set to BW20
++			RT30xxReadRFRegister(pAd, RF_R31, &value);
++			value &= (~0x20);
++			RT30xxWriteRFRegister(pAd, RF_R31, value);
++		}
++
++		// Write 0x01 to RF_R22 to enable baseband loopback mode
++		RT30xxReadRFRegister(pAd, RF_R22, &value);
++		value |= 0x01;
++		RT30xxWriteRFRegister(pAd, RF_R22, value);
++
++		// Write 0x00 to BBP_R24 to set power & frequency of passband test tone
++		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R24, 0);
++
++		do
++		{
++			// Write 0x90 to BBP_R25 to transmit test tone
++			RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R25, 0x90);
++
++			RTMPusecDelay(1000);
++			// Read BBP_R55[6:0] for received power, set R55x = BBP_R55[6:0]
++			RTMP_BBP_IO_READ8_BY_REG_ID(pAd, BBP_R55, &value);
++			R55x = value & 0xFF;
++
++		} while ((ReTry++ < 100) && (R55x == 0));
++
++		// Write 0x06 to BBP_R24 to set power & frequency of stopband test tone
++		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R24, 0x06);
++
++		while(TRUE)
++		{
++			// Write 0x90 to BBP_R25 to transmit test tone
++			RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R25, 0x90);
++
++			//We need to wait for calibration
++			RTMPusecDelay(1000);
++			RTMP_BBP_IO_READ8_BY_REG_ID(pAd, BBP_R55, &value);
++			value &= 0xFF;
++			if ((R55x - value) < FilterTarget)
++			{
++				RF_R24_Value ++;
++			}
++			else if ((R55x - value) == FilterTarget)
++			{
++				RF_R24_Value ++;
++				count ++;
++			}
++			else
++			{
++				break;
++			}
++
++			// prevent infinite loop cause driver hang.
++			if (loopcnt++ > 100)
++			{
++				DBGPRINT(RT_DEBUG_ERROR, ("RTMPFilterCalibration - can't find a valid value, loopcnt=%d stop calibrating", loopcnt));
++				break;
++			}
++
++			// Write RF_R24 to program filter
++			RT30xxWriteRFRegister(pAd, RF_R24, RF_R24_Value);
++		}
++
++		if (count > 0)
++		{
++			RF_R24_Value = RF_R24_Value - ((count) ? (1) : (0));
++		}
++
++		// Store for future usage
++		if (loopcnt < 100)
++		{
++			if (loop++ == 0)
++			{
++				//BandWidth = 20 MHz
++				pAd->Mlme.CaliBW20RfR24 = (UCHAR)RF_R24_Value;
++			}
++			else
++			{
++				//BandWidth = 40 MHz
++				pAd->Mlme.CaliBW40RfR24 = (UCHAR)RF_R24_Value;
++				break;
++			}
++		}
++		else
++			break;
++
++		RT30xxWriteRFRegister(pAd, RF_R24, RF_R24_Value);
++
++		// reset count
++		count = 0;
++	} while(TRUE);
++
++	//
++	// Set back to initial state
++	//
++	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R24, 0);
++
++	RT30xxReadRFRegister(pAd, RF_R22, &value);
++	value &= ~(0x01);
++	RT30xxWriteRFRegister(pAd, RF_R22, value);
++
++	// set BBP back to BW20
++	RTMP_BBP_IO_READ8_BY_REG_ID(pAd, BBP_R4, &BBPValue);
++	BBPValue&= (~0x18);
++	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R4, BBPValue);
+ 
++	DBGPRINT(RT_DEBUG_TRACE, ("RTMPFilterCalibration - CaliBW20RfR24=0x%x, CaliBW40RfR24=0x%x\n", pAd->Mlme.CaliBW20RfR24, pAd->Mlme.CaliBW40RfR24));
++}
++#endif /* RT30xx */
+ 
+ VOID NICInitRT30xxRFRegisters(IN PRTMP_ADAPTER pAd)
+ {
+ 	INT i;
+ 	// Driver must read EEPROM to get RfIcType before initial RF registers
+ 	// Initialize RF register to default value
++#ifndef RT30xx
+         if (IS_RT3070(pAd) && ((pAd->RfIcType == RFIC_3020) ||(pAd->RfIcType == RFIC_2020)))
+         {
+                 // Init RF calibration
+@@ -1234,7 +1403,86 @@ VOID NICInitRT30xxRFRegisters(IN PRTMP_A
+                 //For RF filter Calibration
+                 RTUSBFilterCalibration(pAd);
+         }
++#endif
++#ifdef RT30xx
++	if (IS_RT3070(pAd) || IS_RT3071(pAd))
++	{
++		// Init RF calibration
++		// Driver should toggle RF R30 bit7 before init RF registers
++		UINT32 RfReg = 0;
++		UINT32 data;
++
++		RT30xxReadRFRegister(pAd, RF_R30, (PUCHAR)&RfReg);
++		RfReg |= 0x80;
++		RT30xxWriteRFRegister(pAd, RF_R30, (UCHAR)RfReg);
++		RTMPusecDelay(1000);
++		RfReg &= 0x7F;
++		RT30xxWriteRFRegister(pAd, RF_R30, (UCHAR)RfReg);
++
++		// Initialize RF register to default value
++		for (i = 0; i < NUM_RF_REG_PARMS; i++)
++		{
++			RT30xxWriteRFRegister(pAd, RT30xx_RFRegTable[i].Register, RT30xx_RFRegTable[i].Value);
++		}
++
++		// add by johnli
++		if (IS_RT3070(pAd))
++		{
++			//  Update MAC 0x05D4 from 01xxxxxx to 0Dxxxxxx (voltage 1.2V to 1.35V) for RT3070 to improve yield rate
++			RTUSBReadMACRegister(pAd, LDO_CFG0, &data);
++			data = ((data & 0xF0FFFFFF) | 0x0D000000);
++			RTUSBWriteMACRegister(pAd, LDO_CFG0, data);
++		}
++		else if (IS_RT3071(pAd))
++		{
++			// Driver should set RF R6 bit6 on before init RF registers
++			RT30xxReadRFRegister(pAd, RF_R06, (PUCHAR)&RfReg);
++			RfReg |= 0x40;
++			RT30xxWriteRFRegister(pAd, RF_R06, (UCHAR)RfReg);
++
++			// init R31
++			RT30xxWriteRFRegister(pAd, RF_R31, 0x14);
++
++			// RT3071 version E has fixed this issue
++			if ((pAd->NicConfig2.field.DACTestBit == 1) && ((pAd->MACVersion & 0xffff) < 0x0211))
++			{
++				// patch tx EVM issue temporarily
++				RTUSBReadMACRegister(pAd, LDO_CFG0, &data);
++				data = ((data & 0xE0FFFFFF) | 0x0D000000);
++				RTUSBWriteMACRegister(pAd, LDO_CFG0, data);
++			}
++			else
++			{
++				RTMP_IO_READ32(pAd, LDO_CFG0, &data);
++				data = ((data & 0xE0FFFFFF) | 0x01000000);
++				RTMP_IO_WRITE32(pAd, LDO_CFG0, data);
++			}
++
++			// patch LNA_PE_G1 failed issue
++			RTUSBReadMACRegister(pAd, GPIO_SWITCH, &data);
++			data &= ~(0x20);
++			RTUSBWriteMACRegister(pAd, GPIO_SWITCH, data);
++		}
++
++		//For RF filter Calibration
++		RTMPFilterCalibration(pAd);
+ 
++		// Initialize RF R27 register, set RF R27 must be behind RTMPFilterCalibration()
++		if ((pAd->MACVersion & 0xffff) < 0x0211)
++			RT30xxWriteRFRegister(pAd, RF_R27, 0x3);
++
++		// set led open drain enable
++		RTUSBReadMACRegister(pAd, OPT_14, &data);
++		data |= 0x01;
++		RTUSBWriteMACRegister(pAd, OPT_14, data);
++
++		if (IS_RT3071(pAd))
++		{
++			// add by johnli, RF power sequence setup, load RF normal operation-mode setup
++			RT30xxLoadRFNormalModeSetup(pAd);
++		}
++	}
++#endif
+ }
+ #endif // RT2870 //
+ 
+@@ -1411,11 +1659,25 @@ VOID	NICReadEEPROMParameters(
+ 	Antenna.word = pAd->EEPROMDefaultValue[0];
+ 	if (Antenna.word == 0xFFFF)
+ 	{
+-		Antenna.word = 0;
+-		Antenna.field.RfIcType = RFIC_2820;
+-		Antenna.field.TxPath = 1;
+-		Antenna.field.RxPath = 2;
+-		DBGPRINT(RT_DEBUG_WARN, ("E2PROM error, hard code as 0x%04x\n", Antenna.word));
++#ifdef RT30xx
++		if(IS_RT3090(pAd))
++		{
++			Antenna.word = 0;
++			Antenna.field.RfIcType = RFIC_3020;
++			Antenna.field.TxPath = 1;
++			Antenna.field.RxPath = 1;
++		}
++		else
++		{
++#endif // RT30xx //
++			Antenna.word = 0;
++			Antenna.field.RfIcType = RFIC_2820;
++			Antenna.field.TxPath = 1;
++			Antenna.field.RxPath = 2;
++			DBGPRINT(RT_DEBUG_WARN, ("E2PROM error, hard code as 0x%04x\n", Antenna.word));
++#ifdef RT30xx
++		}
++#endif // RT30xx //
+ 	}
+ 
+ 	// Choose the desired Tx&Rx stream.
+@@ -1444,7 +1706,9 @@ VOID	NICReadEEPROMParameters(
+ 	NicConfig2.word = pAd->EEPROMDefaultValue[1];
+ 
+ 	{
++#ifndef RT30xx
+ 		NicConfig2.word = 0;
++#endif
+ 		if ((NicConfig2.word & 0x00ff) == 0xff)
+ 		{
+ 			NicConfig2.word &= 0xff00;
+@@ -1637,6 +1901,14 @@ VOID	NICReadEEPROMParameters(
+ 
+ 	RTMPReadTxPwrPerRate(pAd);
+ 
++#ifdef RT30xx
++	if (IS_RT30xx(pAd))
++	{
++		eFusePhysicalReadRegisters(pAd, EFUSE_TAG, 2, &value);
++		pAd->EFuseTag = (value & 0xff);
++	}
++#endif // RT30xx //
++
+ 	DBGPRINT(RT_DEBUG_TRACE, ("<-- NICReadEEPROMParameters\n"));
+ }
+ 
+@@ -1681,16 +1953,49 @@ VOID	NICInitAsicFromEEPROM(
+ 		}
+ 	}
+ 
++#ifndef RT30xx
+ 	Antenna.word = pAd->Antenna.word;
++#endif
++#ifdef RT30xx
++	Antenna.word = pAd->EEPROMDefaultValue[0];
++	if (Antenna.word == 0xFFFF)
++	{
++		DBGPRINT(RT_DEBUG_ERROR, ("E2PROM error, hard code as 0x%04x\n", Antenna.word));
++		BUG_ON(Antenna.word == 0xFFFF);
++	}
++#endif
+ 	pAd->Mlme.RealRxPath = (UCHAR) Antenna.field.RxPath;
+ 	pAd->RfIcType = (UCHAR) Antenna.field.RfIcType;
+ 
++#ifdef RT30xx
++	DBGPRINT(RT_DEBUG_WARN, ("pAd->RfIcType = %d, RealRxPath=%d, TxPath = %d\n", pAd->RfIcType, pAd->Mlme.RealRxPath,Antenna.field.TxPath));
++
++	// Save the antenna for future use
++	pAd->Antenna.word = Antenna.word;
++#endif
+ 	NicConfig2.word = pAd->EEPROMDefaultValue[1];
+ 
++#ifdef RT30xx
++	{
++		if ((NicConfig2.word & 0x00ff) == 0xff)
++		{
++			NicConfig2.word &= 0xff00;
++		}
+ 
++		if ((NicConfig2.word >> 8) == 0xff)
++		{
++			NicConfig2.word &= 0x00ff;
++		}
++	}
++#endif
+ 	// Save the antenna for future use
+ 	pAd->NicConfig2.word = NicConfig2.word;
+ 
++#ifdef RT30xx
++	// set default antenna as main
++	if (pAd->RfIcType == RFIC_3020)
++		AsicSetRxAnt(pAd, pAd->RxAnt.Pair1PrimaryRxAnt);
++#endif
+ 	//
+ 	// Send LED Setting to MCU.
+ 	//
+@@ -1919,6 +2224,9 @@ NDIS_STATUS	NICInitializeAsic(
+ 	NTSTATUS		Status;
+ 	UCHAR			Value = 0xff;
+ #endif // RT2870 //
++#ifdef RT30xx
++	UINT32			eFuseCtrl;
++#endif // RT30xx //
+ 	USHORT			KeyIdx;
+ 	INT				i,apidx;
+ 
+@@ -1959,9 +2267,16 @@ NDIS_STATUS	NICInitializeAsic(
+ 	// Initialize MAC register to default value
+ 	for(Index=0; Index<NUM_MAC_REG_PARMS; Index++)
+ 	{
++#ifdef RT3070
++		if ((MACRegTable[Index].Register == TX_SW_CFG0) && (IS_RT3070(pAd) || IS_RT3071(pAd)))
++		{
++			MACRegTable[Index].Value = 0x00000400;
++		}
++#endif // RT3070 //
+ 		RTMP_IO_WRITE32(pAd, (USHORT)MACRegTable[Index].Register, MACRegTable[Index].Value);
+ 	}
+ 
++#ifndef RT30xx
+ 	if(IS_RT3070(pAd))
+ 	{
+ 		// According to Frank Hsu (from Gary Tsao)
+@@ -1971,7 +2286,7 @@ NDIS_STATUS	NICInitializeAsic(
+ 		RTUSBWriteMACRegister(pAd, TX_SW_CFG1, 0);
+ 		RTUSBWriteMACRegister(pAd, TX_SW_CFG2, 0);
+ 	}
+-
++#endif
+ 
+ 	{
+ 		for (Index = 0; Index < NUM_STA_MAC_REG_PARMS; Index++)
+@@ -1981,6 +2296,36 @@ NDIS_STATUS	NICInitializeAsic(
+ 	}
+ #endif // RT2870 //
+ 
++#ifdef RT30xx
++	// Initialize RT3070 serial MAc registers which is different from RT2870 serial
++	if (IS_RT3090(pAd))
++	{
++		RTMP_IO_WRITE32(pAd, TX_SW_CFG1, 0);
++
++		// RT3071 version E has fixed this issue
++		if ((pAd->MACVersion & 0xffff) < 0x0211)
++		{
++			if (pAd->NicConfig2.field.DACTestBit == 1)
++			{
++				RTMP_IO_WRITE32(pAd, TX_SW_CFG2, 0x1F);	// To fix throughput drop drastically
++			}
++			else
++			{
++				RTMP_IO_WRITE32(pAd, TX_SW_CFG2, 0x0F);	// To fix throughput drop drastically
++			}
++		}
++		else
++		{
++			RTMP_IO_WRITE32(pAd, TX_SW_CFG2, 0x0);
++		}
++	}
++	else if (IS_RT3070(pAd))
++	{
++		RTMP_IO_WRITE32(pAd, TX_SW_CFG1, 0);
++		RTMP_IO_WRITE32(pAd, TX_SW_CFG2, 0x1F);	// To fix throughput drop drastically
++	}
++#endif // RT30xx //
++
+ 	//
+ 	// Before program BBP, we need to wait BBP/RF get wake up.
+ 	//
+@@ -2020,6 +2365,7 @@ NDIS_STATUS	NICInitializeAsic(
+ 		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBPRegTable[Index].Register, BBPRegTable[Index].Value);
+ 	}
+ 
++#ifndef RT30xx
+ 	// for rt2860E and after, init BBP_R84 with 0x19. This is for extension channel overlapping IOT.
+ 	if ((pAd->MACVersion&0xffff) != 0x0101)
+ 		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R84, 0x19);
+@@ -2033,7 +2379,55 @@ NDIS_STATUS	NICInitializeAsic(
+ 		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R105, 0x05);
+ 	}
+ #endif // RT2870 //
++#endif
++#ifdef RT30xx
++	// for rt2860E and after, init BBP_R84 with 0x19. This is for extension channel overlapping IOT.
++	// RT3090 should not program BBP R84 to 0x19, otherwise TX will block.
++	if (((pAd->MACVersion&0xffff) != 0x0101) && (!IS_RT30xx(pAd)))
++		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R84, 0x19);
++
++// add by johnli, RF power sequence setup
++	if (IS_RT30xx(pAd))
++	{	//update for RT3070/71/72/90/91/92.
++		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R79, 0x13);
++		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R80, 0x05);
++		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R81, 0x33);
++	}
++
++	if (IS_RT3090(pAd))
++	{
++		UCHAR		bbpreg=0;
+ 
++		// enable DC filter
++		if ((pAd->MACVersion & 0xffff) >= 0x0211)
++		{
++			RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R103, 0xc0);
++		}
++
++		// improve power consumption
++		RTMP_BBP_IO_READ8_BY_REG_ID(pAd, BBP_R138, &bbpreg);
++		if (pAd->Antenna.field.TxPath == 1)
++		{
++			// turn off tx DAC_1
++			bbpreg = (bbpreg | 0x20);
++		}
++
++		if (pAd->Antenna.field.RxPath == 1)
++		{
++			// turn off tx ADC_1
++			bbpreg &= (~0x2);
++		}
++		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R138, bbpreg);
++
++		// improve power consumption in RT3071 Ver.E
++		if ((pAd->MACVersion & 0xffff) >= 0x0211)
++		{
++			RTMP_BBP_IO_READ8_BY_REG_ID(pAd, BBP_R31, &bbpreg);
++			bbpreg &= (~0x3);
++			RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R31, bbpreg);
++		}
++	}
++#endif
+ 	if (pAd->MACVersion == 0x28600100)
+ 	{
+ 		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R69, 0x16);
+@@ -2123,6 +2517,20 @@ NDIS_STATUS	NICInitializeAsic(
+ 	Counter|=0x000001e;
+ 	RTMP_IO_WRITE32(pAd, USB_CYC_CFG, Counter);
+ #endif // RT2870 //
++#ifdef RT30xx
++	pAd->bUseEfuse=FALSE;
++	RTMP_IO_READ32(pAd, EFUSE_CTRL, &eFuseCtrl);
++	pAd->bUseEfuse = ( (eFuseCtrl & 0x80000000) == 0x80000000) ? 1 : 0;
++	if(pAd->bUseEfuse)
++	{
++			DBGPRINT(RT_DEBUG_TRACE, ("NVM is Efuse\n"));
++	}
++	else
++	{
++			DBGPRINT(RT_DEBUG_TRACE, ("NVM is EEPROM\n"));
++
++	}
++#endif // RT30xx //
+ 
+ 	{
+ 		// for rt2860E and after, init TXOP_CTRL_CFG with 0x583f. This is for extension channel overlapping IOT.
+@@ -2635,19 +3043,18 @@ NDIS_STATUS NICLoadFirmware(
+ 	ULONG			FileLength, Index;
+ 	//ULONG			firm;
+ 	UINT32			MacReg = 0;
+-#ifdef RT2870
+ 	UINT32			Version = (pAd->MACVersion >> 16);
+-#endif // RT2870 //
+ 
+ 	pFirmwareImage = FirmwareImage;
+ 	FileLength = sizeof(FirmwareImage);
+-#ifdef RT2870
++
+ 	// New 8k byte firmware size for RT3071/RT3072
+ 	//printk("Usb Chip\n");
+ 	if (FIRMWAREIMAGE_LENGTH == FIRMWAREIMAGE_MAX_LENGTH)
+ 	//The firmware image consists of two parts. One is the origianl and the other is the new.
+ 	//Use Second Part
+ 	{
++#ifdef RT2870
+ 		if ((Version != 0x2860) && (Version != 0x2872) && (Version != 0x3070))
+ 		{	// Use Firmware V2.
+ 			//printk("KH:Use New Version,part2\n");
+@@ -2660,6 +3067,7 @@ NDIS_STATUS NICLoadFirmware(
+ 			pFirmwareImage = FirmwareImage;
+ 			FileLength = FIRMWAREIMAGEV1_LENGTH;
+ 		}
++#endif // RT2870 //
+ 	}
+ 	else
+ 	{
+@@ -2667,8 +3075,6 @@ NDIS_STATUS NICLoadFirmware(
+ 		Status = NDIS_STATUS_FAILURE;
+ 	}
+ 
+-#endif // RT2870 //
+-
+ 	RT28XX_WRITE_FIRMWARE(pAd, pFirmwareImage, FileLength);
+ 
+ 	/* check if MCU is ready */
+@@ -2969,7 +3375,9 @@ VOID	UserCfgInit(
+ 			pAd->SharedKey[bss_index][key_index].CipherAlg = CIPHER_NONE;
+ 		}
+ 	}
+-
++#ifdef RT30xx
++	pAd->EepromAccess = FALSE;
++#endif
+ 	pAd->Antenna.word = 0;
+ 	pAd->CommonCfg.BBPCurrentBW = BW_20;
+ 
+--- a/drivers/staging/rt2870/common/rtusb_bulk.c
++++ b/drivers/staging/rt2870/common/rtusb_bulk.c
+@@ -317,6 +317,7 @@ VOID	RTUSBBulkOutDataPacket(
+ 			break;
+ 		}
+ 
++		//PS packets use HCCA queue when dequeue from PS unicast queue (WiFi WPA2 MA9_DT1 for Marvell B STA)
+ 		if (pTxInfo->QSEL != FIFO_EDCA)
+ 		{
+ 			printk("%s(): ====> pTxInfo->QueueSel(%d)!= FIFO_EDCA!!!!\n", __func__, pTxInfo->QSEL);
+@@ -349,7 +350,7 @@ VOID	RTUSBBulkOutDataPacket(
+ 		pLastTxInfo = pTxInfo;
+ 
+ 		// Make sure we use EDCA QUEUE.
+-		pTxInfo->QSEL = FIFO_EDCA;
++		pTxInfo->QSEL = FIFO_EDCA;  //PS packets use HCCA queue when dequeue from PS unicast queue (WiFi WPA2 MA9_DT1 for Marvell B STA)
+ 		ThisBulkSize += (pTxInfo->USBDMATxPktLen+4);
+ 		TmpBulkEndPos += (pTxInfo->USBDMATxPktLen+4);
+ 
+@@ -975,6 +976,17 @@ VOID	RTUSBKickBulkOut(
+ 				RTUSBBulkOutDataPacket(pAd, 3, pAd->NextBulkOutIndex[3]);
+ 			}
+ 		}
++#ifdef RT30xx
++		//PS packets use HCCA queue when dequeue from PS unicast queue (WiFi WPA2 MA9_DT1 for Marvell B STA)
++		if (RTUSB_TEST_BULK_FLAG(pAd, fRTUSB_BULK_OUT_DATA_NORMAL_5))
++		{
++			if (((!RTMP_TEST_FLAG(pAd, fRTMP_ADAPTER_BSS_SCAN_IN_PROGRESS)) ||
++				(!OPSTATUS_TEST_FLAG(pAd, fOP_STATUS_MEDIA_STATE_CONNECTED))
++				))
++			{
++			}
++		}
++#endif
+ 
+ 		// 7. Null frame is the last
+ 		else if (RTUSB_TEST_BULK_FLAG(pAd, fRTUSB_BULK_OUT_DATA_NULL))
+--- a/drivers/staging/rt2870/common/rtusb_io.c
++++ b/drivers/staging/rt2870/common/rtusb_io.c
+@@ -110,6 +110,12 @@ NTSTATUS RTUSBFirmwareWrite(
+ 	Status = RTUSBWriteMACRegister(pAd, 0x701c, 0xffffffff);
+ 	Status = RTUSBFirmwareRun(pAd);
+ 
++#ifdef RT30xx
++	RTMPusecDelay(10000);
++	RTUSBWriteMACRegister(pAd,H2M_MAILBOX_CSR,0);
++	AsicSendCommandToMcu(pAd, 0x72, 0x00, 0x00, 0x00);//reset rf by MCU supported by new firmware
++#endif
++
+ 	return Status;
+ }
+ 
+@@ -665,6 +671,7 @@ NTSTATUS	RTUSBWriteRFRegister(
+ 	return STATUS_SUCCESS;
+ }
+ 
++#ifndef RT30xx
+ /*
+ 	========================================================================
+ 
+@@ -772,6 +779,7 @@ NTSTATUS	RT30xxReadRFRegister(
+ 
+ 	return STATUS_SUCCESS;
+ }
++#endif /* RT30xx */
+ 
+ /*
+ 	========================================================================
+@@ -796,6 +804,14 @@ NTSTATUS	RTUSBReadEEPROM(
+ {
+ 	NTSTATUS	Status = STATUS_SUCCESS;
+ 
++#ifdef RT30xx
++	if(pAd->bUseEfuse)
++	{
++		Status =eFuseRead(pAd, Offset, pData, length);
++	}
++	else
++#endif // RT30xx //
++	{
+ 	Status = RTUSB_VendorRequest(
+ 		pAd,
+ 		(USBD_TRANSFER_DIRECTION_IN | USBD_SHORT_TRANSFER_OK),
+@@ -805,6 +821,7 @@ NTSTATUS	RTUSBReadEEPROM(
+ 		Offset,
+ 		pData,
+ 		length);
++	}
+ 
+ 	return Status;
+ }
+@@ -832,6 +849,14 @@ NTSTATUS	RTUSBWriteEEPROM(
+ {
+ 	NTSTATUS	Status = STATUS_SUCCESS;
+ 
++#ifdef RT30xx
++	if(pAd->bUseEfuse)
++	{
++		Status = eFuseWrite(pAd, Offset, pData, length);
++	}
++	else
++#endif // RT30xx //
++	{
+ 	Status = RTUSB_VendorRequest(
+ 		pAd,
+ 		USBD_TRANSFER_DIRECTION_OUT,
+@@ -841,6 +866,7 @@ NTSTATUS	RTUSBWriteEEPROM(
+ 		Offset,
+ 		pData,
+ 		length);
++	}
+ 
+ 	return Status;
+ }
+@@ -957,9 +983,13 @@ NDIS_STATUS	RTUSBEnqueueCmdFromNdis(
+ 	PCmdQElmt	cmdqelmt = NULL;
+ 	POS_COOKIE pObj = (POS_COOKIE) pAd->OS_Cookie;
+ 
+-
++#ifndef RT30xx
+ 	BUG_ON(pObj->RTUSBCmdThr_task == NULL);
+ 	CHECK_PID_LEGALITY(task_pid(pObj->RTUSBCmdThr_task))
++#endif
++#ifdef RT30xx
++	if (pObj->RTUSBCmdThr_pid < 0)
++#endif
+ 		return (NDIS_STATUS_RESOURCES);
+ 
+ 	status = RTMPAllocateMemory((PVOID *)&cmdqelmt, sizeof(CmdQElmt));
+@@ -1710,6 +1740,38 @@ VOID CMDHandler(
+ 					}
+ 					break;
+ 
++#ifdef RT30xx
++//Benson modified for USB interface, avoid in interrupt when write key, 20080724 -->
++				case RT_CMD_SET_KEY_TABLE: //General call for AsicAddPairwiseKeyEntry()
++				{
++					RT_ADD_PAIRWISE_KEY_ENTRY KeyInfo;
++					KeyInfo = *((PRT_ADD_PAIRWISE_KEY_ENTRY)(pData));
++					AsicAddPairwiseKeyEntry(pAd,
++											KeyInfo.MacAddr,
++											(UCHAR)KeyInfo.MacTabMatchWCID,
++											&KeyInfo.CipherKey);
++				}
++					break;
++				case RT_CMD_SET_RX_WCID_TABLE: //General call for RTMPAddWcidAttributeEntry()
++				{
++					PMAC_TABLE_ENTRY pEntry;
++					UCHAR KeyIdx;
++					UCHAR CipherAlg;
++					UCHAR ApIdx;
++
++					pEntry = (PMAC_TABLE_ENTRY)(pData);
++
++						RTMPAddWcidAttributeEntry(
++										  pAd,
++										  ApIdx,
++										  KeyIdx,
++										  CipherAlg,
++										  pEntry);
++					}
++						break;
++//Benson modified for USB interface, avoid in interrupt when write key, 20080724 <--
++#endif
++
+ 				case CMDTHREAD_SET_CLIENT_MAC_ENTRY:
+ 					{
+ 						MAC_TABLE_ENTRY *pEntry;
+@@ -1756,6 +1818,16 @@ VOID CMDHandler(
+ 					}
+ 					break;
+ 
++#ifdef RT30xx
++// add by johnli, fix "in_interrupt" error when call "MacTableDeleteEntry" in Rx tasklet
++				case CMDTHREAD_UPDATE_PROTECT:
++					{
++						AsicUpdateProtect(pAd, 0, (ALLN_SETPROTECT), TRUE, 0);
++					}
++					break;
++// end johnli
++#endif
++
+ 				case OID_802_11_ADD_WEP:
+ 					{
+ 						UINT	i;
+--- a/drivers/staging/rt2870/common/spectrum.c
++++ b/drivers/staging/rt2870/common/spectrum.c
+@@ -1569,7 +1569,12 @@ static VOID PeerMeasureReportAction(
+ 
+ 	if ((pMeasureReportInfo = kmalloc(sizeof(MEASURE_RPI_REPORT), GFP_ATOMIC)) == NULL)
+ 	{
++#ifndef RT30xx
+ 		DBGPRINT(RT_DEBUG_ERROR, ("%s unable to alloc memory for measure report buffer (size=%zu).\n", __func__, sizeof(MEASURE_RPI_REPORT)));
++#endif
++#ifdef RT30xx
++		DBGPRINT(RT_DEBUG_ERROR, ("%s unable to alloc memory for measure report buffer (size=%d).\n", __func__, sizeof(MEASURE_RPI_REPORT)));
++#endif
+ 		return;
+ 	}
+ 

@@ -1,0 +1,741 @@
+
+ block/bsg.c                 |    6 
+ drivers/base/Kconfig        |   16 ++
+ drivers/base/Makefile       |    1 
+ drivers/base/base.h         |    6 
+ drivers/base/core.c         |   54 ++++++-
+ drivers/base/devtmpfs.c     |  339 ++++++++++++++++++++++++++++++++++++++++++++
+ drivers/base/init.c         |    1 
+ drivers/gpu/drm/drm_sysfs.c |    7 
+ drivers/input/input.c       |    6 
+ drivers/usb/core/usb.c      |   11 +
+ include/linux/device.h      |   14 +
+ include/linux/shmem_fs.h    |    2 
+ init/do_mounts.c            |    2 
+ init/initramfs.c            |    2 
+ init/main.c                 |    2 
+ mm/shmem.c                  |    4 
+ sound/sound_core.c          |    7 
+ 17 files changed, 475 insertions(+), 5 deletions(-)
+
+--- a/block/bsg.c
++++ b/block/bsg.c
+@@ -1062,6 +1062,11 @@ EXPORT_SYMBOL_GPL(bsg_register_queue);
+ 
+ static struct cdev bsg_cdev;
+ 
++static char *bsg_nodename(struct device *dev)
++{
++	return kasprintf(GFP_KERNEL, "bsg/%s", dev_name(dev));
++}
++
+ static int __init bsg_init(void)
+ {
+ 	int ret, i;
+@@ -1082,6 +1087,7 @@ static int __init bsg_init(void)
+ 		ret = PTR_ERR(bsg_class);
+ 		goto destroy_kmemcache;
+ 	}
++	bsg_class->nodename = bsg_nodename;
+ 
+ 	ret = alloc_chrdev_region(&devid, 0, BSG_MAX_DEVS, "bsg");
+ 	if (ret)
+--- a/drivers/base/base.h
++++ b/drivers/base/base.h
+@@ -134,3 +134,9 @@ static inline void module_add_driver(str
+ 				     struct device_driver *drv) { }
+ static inline void module_remove_driver(struct device_driver *drv) { }
+ #endif
++
++#ifdef CONFIG_DEVTMPFS
++extern int devtmpfs_init(void);
++#else
++static inline int devtmpfs_init(void) { return 0; }
++#endif
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@ -161,10 +161,18 @@ static int dev_uevent(struct kset *kset,
+ 	struct device *dev = to_dev(kobj);
+ 	int retval = 0;
+ 
+-	/* add the major/minor if present */
++	/* add device node properties if present */
+ 	if (MAJOR(dev->devt)) {
++		const char *tmp;
++		const char *name;
++
+ 		add_uevent_var(env, "MAJOR=%u", MAJOR(dev->devt));
+ 		add_uevent_var(env, "MINOR=%u", MINOR(dev->devt));
++		name = device_get_nodename(dev, &tmp);
++		if (name) {
++			add_uevent_var(env, "DEVNAME=%s", name);
++			kfree(tmp);
++		}
+ 	}
+ 
+ 	if (dev->type && dev->type->name)
+@@ -912,6 +920,8 @@ int device_add(struct device *dev)
+ 		error = device_create_sys_dev_entry(dev);
+ 		if (error)
+ 			goto devtattrError;
++
++		devtmpfs_create_node(dev);
+ 	}
+ 
+ 	error = device_add_class_symlinks(dev);
+@@ -1055,6 +1065,7 @@ void device_del(struct device *dev)
+ 	if (parent)
+ 		klist_del(&dev->p->knode_parent);
+ 	if (MAJOR(dev->devt)) {
++		devtmpfs_delete_node(dev);
+ 		device_remove_sys_dev_entry(dev);
+ 		device_remove_file(dev, &devt_attr);
+ 	}
+@@ -1125,6 +1136,47 @@ static struct device *next_device(struct
+ }
+ 
+ /**
++ * device_get_nodename - path of device node file
++ * @dev: device
++ * @tmp: possibly allocated string
++ *
++ * Return the relative path of a possible device node.
++ * Non-default names may need to allocate a memory to compose
++ * a name. This memory is returned in tmp and needs to be
++ * freed by the caller.
++ */
++const char *device_get_nodename(struct device *dev, const char **tmp)
++{
++	char *s;
++
++	*tmp = NULL;
++
++	/* the device type may provide a specific name */
++	if (dev->type && dev->type->nodename)
++		*tmp = dev->type->nodename(dev);
++	if (*tmp)
++		return *tmp;
++
++	/* the class may provide a specific name */
++	if (dev->class && dev->class->nodename)
++		*tmp = dev->class->nodename(dev);
++	if (*tmp)
++		return *tmp;
++
++	/* return name without allocation, tmp == NULL */
++	if (strchr(dev_name(dev), '!') ==  NULL)
++		return dev_name(dev);
++
++	/* replace '!' in the name with '/' */
++	*tmp = kstrdup(dev_name(dev), GFP_KERNEL);
++	if (!*tmp)
++		return NULL;
++	while ((s = strchr(*tmp, '!')))
++		s[0] = '/';
++	return *tmp;
++}
++
++/**
+  * device_for_each_child - device child iterator.
+  * @parent: parent struct device.
+  * @data: data for the callback.
+--- /dev/null
++++ b/drivers/base/devtmpfs.c
+@@ -0,0 +1,339 @@
++/*
++ * /dev tmpfs device nodes
++ *
++ * Copyright (C) 2009, Kay Sievers <kay.sievers@vrfy.org>
++ *
++ * During bootup, before any driver core device is registered, a tmpfs
++ * filesystem is created. Every device which requests a devno, will
++ * create a device node in this filesystem. The node is named after the
++ * the nameof the device, or the susbsytem can provide a custom name
++ * for the node.
++ *
++ * All devices are owned by root. This is intended to simplify bootup, and
++ * make it possible to delay the initial coldplug done by udev in userspace.
++ *
++ * It should also provide a simpler way for rescue systems to bring up a
++ * kernel with dynamic major/minor numbers.
++ */
++
++#include <linux/kernel.h>
++#include <linux/syscalls.h>
++#include <linux/mount.h>
++#include <linux/device.h>
++#include <linux/genhd.h>
++#include <linux/namei.h>
++
++static struct vfsmount *dev_mnt;
++
++static int dev_mkdir(const char *name, mode_t mode)
++{
++	struct nameidata nd;
++	struct dentry *dentry;
++	int err;
++
++	err = vfs_path_lookup(dev_mnt->mnt_root, dev_mnt,
++			      name, LOOKUP_PARENT, &nd);
++	if (err)
++		return err;
++
++	dentry = lookup_create(&nd, 0);
++	if (!IS_ERR(dentry)) {
++		err = vfs_mkdir(nd.path.dentry->d_inode, dentry, mode);
++		dput(dentry);
++	} else {
++		err = PTR_ERR(dentry);
++	}
++	mutex_unlock(&nd.path.dentry->d_inode->i_mutex);
++
++	path_put(&nd.path);
++	return err;
++}
++
++static int dev_symlink(const char *target, const char *name)
++{
++	struct nameidata nd;
++	struct dentry *dentry;
++	int err;
++
++	err = vfs_path_lookup(dev_mnt->mnt_root, dev_mnt,
++			      name, LOOKUP_PARENT, &nd);
++	if (err)
++		return err;
++
++	dentry = lookup_create(&nd, 0);
++	if (!IS_ERR(dentry)) {
++		err = vfs_symlink(nd.path.dentry->d_inode, dentry, target);
++		dput(dentry);
++	}
++	mutex_unlock(&nd.path.dentry->d_inode->i_mutex);
++
++	path_put(&nd.path);
++	return err;
++}
++
++static int create_path(const char *nodepath)
++{
++	char *path;
++	struct nameidata nd;
++	int err = 0;
++
++	path = kstrdup(nodepath, GFP_KERNEL);
++	if (!path)
++		return -ENOMEM;
++
++	err = vfs_path_lookup(dev_mnt->mnt_root, dev_mnt,
++			      path, LOOKUP_PARENT, &nd);
++	if (err == 0) {
++		struct dentry *dentry;
++
++		/* create directory right away */
++		dentry = lookup_create(&nd, 0);
++		if (!IS_ERR(dentry)) {
++			err = vfs_mkdir(nd.path.dentry->d_inode,
++					dentry, 0775);
++		}
++		mutex_unlock(&nd.path.dentry->d_inode->i_mutex);
++
++		path_put(&nd.path);
++	} else if (err == -ENOENT) {
++		char *s;
++
++		/* parent directories do not exist, create them */
++		s = path;
++		while (1) {
++			s = strchr(s, '/');
++			if (!s)
++				break;
++			s[0] = '\0';
++			err = dev_mkdir(path, 0755);
++			if (err && err != -EEXIST)
++				;//break;
++			s[0] = '/';
++			s++;
++		}
++	}
++
++	kfree(path);
++	return err;
++}
++
++int devtmpfs_create_node(struct device *dev)
++{
++	const char *tmp = NULL;
++	const char *nodename;
++	mode_t mode;
++	struct nameidata nd;
++	struct dentry *dentry;
++	int err;
++
++	if (!dev_mnt)
++		return 0;
++
++	nodename = device_get_nodename(dev, &tmp);
++	if (!nodename)
++		return -ENOMEM;
++
++	if (dev->class == &block_class)
++		mode = S_IFBLK|0660;
++	else
++		mode = S_IFCHR|0660;
++
++	err = vfs_path_lookup(dev_mnt->mnt_root, dev_mnt,
++			      nodename, LOOKUP_PARENT, &nd);
++	if (err == -ENOENT) {
++		/* create missing parent directories */
++		create_path(nodename);
++		err = vfs_path_lookup(dev_mnt->mnt_root, dev_mnt,
++				      nodename, LOOKUP_PARENT, &nd);
++		if (err)
++			goto out_name;
++	}
++
++	dentry = lookup_create(&nd, 0);
++	if (!IS_ERR(dentry)) {
++		err = vfs_mknod(nd.path.dentry->d_inode,
++				dentry, mode, dev->devt);
++		dput(dentry);
++	} else {
++		err = PTR_ERR(dentry);
++	}
++	mutex_unlock(&nd.path.dentry->d_inode->i_mutex);
++
++	path_put(&nd.path);
++out_name:
++	kfree(tmp);
++	return err;
++}
++
++static int dev_rmdir(const char *name)
++{
++	struct nameidata nd;
++	const char *node;
++	struct dentry *dentry;
++	int err;
++
++	err = vfs_path_lookup(dev_mnt->mnt_root, dev_mnt,
++			      name, LOOKUP_PARENT, &nd);
++	if (err)
++		return err;
++
++	/* get last element */
++	node = strrchr(name, '/');
++	if (node)
++		node++;
++	else
++		node = name;
++
++	mutex_lock_nested(&nd.path.dentry->d_inode->i_mutex, I_MUTEX_PARENT);
++	dentry = lookup_one_len(node, nd.path.dentry, strlen(node));
++	if (!IS_ERR(dentry)) {
++		err = vfs_rmdir(nd.path.dentry->d_inode, dentry);
++		dput(dentry);
++	}
++	mutex_unlock(&nd.path.dentry->d_inode->i_mutex);
++
++	path_put(&nd.path);
++	return err;
++}
++
++static int delete_path(const char *nodepath)
++{
++	const char *path;
++	int err = 0;
++
++	path = kstrdup(nodepath, GFP_KERNEL);
++	if (!path)
++		return -ENOMEM;
++
++	while (1) {
++		char *base;
++
++		base = strrchr(path, '/');
++		if (!base)
++			break;
++		base[0] = '\0';
++		err = dev_rmdir(path);
++		if (err)
++			break;
++	}
++
++	kfree(path);
++	return err;
++}
++
++static int dev_matches(struct device *dev, mode_t mode, dev_t devno)
++{
++	if (dev->class == &block_class) {
++		if (!S_ISBLK(mode))
++			return 0;
++	} else {
++		if (!S_ISCHR(mode))
++			return 0;
++	}
++	if (devno != dev->devt)
++		return 0;
++	return 1;
++}
++
++int devtmpfs_delete_node(struct device *dev)
++{
++	const char *tmp = NULL;
++	const char *nodename;
++	const char *node;
++	struct nameidata nd;
++	struct dentry *dentry;
++	struct kstat stat;
++	int deleted = 1;
++	int err;
++
++	if (!dev_mnt)
++		return 0;
++
++	nodename = device_get_nodename(dev, &tmp);
++	if (!nodename)
++		return -ENOMEM;
++
++	err = vfs_path_lookup(dev_mnt->mnt_root, dev_mnt,
++			      nodename, LOOKUP_PARENT, &nd);
++	if (err)
++		goto out_name;
++
++	/* get last element */
++	node = strrchr(nodename, '/');
++	if (node)
++		node++;
++	else
++		node = nodename;
++
++	mutex_lock_nested(&nd.path.dentry->d_inode->i_mutex, I_MUTEX_PARENT);
++	dentry = lookup_one_len(node, nd.path.dentry, strlen(node));
++	if (!IS_ERR(dentry)) {
++		err = vfs_getattr(nd.path.mnt, dentry, &stat);
++		if (!err && dev_matches(dev, stat.mode, stat.rdev)) {
++			err = vfs_unlink(nd.path.dentry->d_inode, dentry);
++			if (err == 0 || err == -ENOENT)
++				deleted = 1;
++		}
++		dput(dentry);
++	} else {
++		err = PTR_ERR(dentry);
++	}
++	mutex_unlock(&nd.path.dentry->d_inode->i_mutex);
++
++	path_put(&nd.path);
++	if (deleted && strchr(nodename, '/'))
++		delete_path(nodename);
++out_name:
++	kfree(tmp);
++	return err;
++}
++
++/* After the root filesystem is mounted by the kernel at /root, or the
++ * initramfs in extracted at /root, this tmpfs will be mounted at /root/dev.
++ */
++int devtmpfs_mount(const char *mountpoint)
++{
++	struct path path;
++	int err;
++
++	if (!dev_mnt)
++		return 0;
++
++	err = kern_path(mountpoint, LOOKUP_FOLLOW, &path);
++	if (err)
++		return err;
++	err = do_add_mount(dev_mnt, &path, 0, NULL);
++	if (err)
++		printk(KERN_INFO "devtmpfs: error mounting %i\n", err);
++	else
++		printk(KERN_INFO "devtmpfs: mounted\n");
++	path_put(&path);
++	return err;
++}
++
++/*
++ * Create tmpfs mount, created core devices will add their device device
++ * nodes here.
++ */
++__init int devtmpfs_init(void)
++{
++	int err;
++
++	dev_mnt = do_kern_mount("tmpfs", 0, "devtmpfs", NULL);
++	if (IS_ERR(dev_mnt)) {
++		err = PTR_ERR(dev_mnt);
++		printk(KERN_ERR "devtmpfs: unable to initialize %i\n", err);
++		dev_mnt = NULL;
++		return -1;
++	}
++
++	/* create common files/directories */
++	dev_mkdir("pts", 0755);
++	dev_mkdir("shm", 01755);
++	dev_symlink("/proc/self/fd", "fd");
++	dev_symlink("/proc/self/fd/0", "stdin");
++	dev_symlink("/proc/self/fd/1", "stdout");
++	dev_symlink("/proc/self/fd/2", "stderr");
++	printk(KERN_INFO "devtmpfs: initialized\n");
++	return 0;
++}
+--- a/drivers/base/init.c
++++ b/drivers/base/init.c
+@@ -20,6 +20,7 @@
+ void __init driver_init(void)
+ {
+ 	/* These are the core pieces */
++	devtmpfs_init();
+ 	devices_init();
+ 	buses_init();
+ 	classes_init();
+--- a/drivers/base/Kconfig
++++ b/drivers/base/Kconfig
+@@ -8,6 +8,22 @@ config UEVENT_HELPER_PATH
+ 	  Path to uevent helper program forked by the kernel for
+ 	  every uevent.
+ 
++config DEVTMPFS
++	bool "Create a kernel maintained /dev tmpfs (EXPERIMENTAL)"
++	depends on HOTPLUG
++	help
++	  This creates a tmpfs filesystem, and mounts it at bootup
++	  and mounts it at /dev. The kernel driver core creates device
++	  nodes for all registered devices in that filesystem. All device
++	  nodes are owned by root and have the default mode of 0660.
++	  Userspace can add and delete the nodes as needed. This is
++	  intended to simplify bootup, and make it possible to delay
++	  the initial coldplug at bootup done by udev in userspace.
++	  It should also provide a simpler way for rescue systems
++	  to bring up a kernel with dynamic major/minor numbers.
++	  Meaningful symlinks, permissions and device ownership must
++	  still be handled by userspace.
++
+ config STANDALONE
+ 	bool "Select only drivers that don't need compile-time external firmware" if EXPERIMENTAL
+ 	default y
+--- a/drivers/base/Makefile
++++ b/drivers/base/Makefile
+@@ -4,6 +4,7 @@ obj-y			:= core.o sys.o bus.o dd.o \
+ 			   driver.o class.o platform.o \
+ 			   cpu.o firmware.o init.o map.o devres.o \
+ 			   attribute_container.o transport_class.o
++obj-$(CONFIG_DEVTMPFS)	+= devtmpfs.o
+ obj-y			+= power/
+ obj-$(CONFIG_HAS_DMA)	+= dma-mapping.o
+ obj-$(CONFIG_ISA)	+= isa.o
+--- a/drivers/gpu/drm/drm_sysfs.c
++++ b/drivers/gpu/drm/drm_sysfs.c
+@@ -70,6 +70,11 @@ static ssize_t version_show(struct class
+ 		       CORE_MINOR, CORE_PATCHLEVEL, CORE_DATE);
+ }
+ 
++static char *drm_nodename(struct device *dev)
++{
++	return kasprintf(GFP_KERNEL, "dri/%s", dev_name(dev));
++}
++
+ static CLASS_ATTR(version, S_IRUGO, version_show, NULL);
+ 
+ /**
+@@ -101,6 +106,8 @@ struct class *drm_sysfs_create(struct mo
+ 	if (err)
+ 		goto err_out_class;
+ 
++	class->nodename = drm_nodename;
++
+ 	return class;
+ 
+ err_out_class:
+--- a/drivers/input/input.c
++++ b/drivers/input/input.c
+@@ -1238,8 +1238,14 @@ static struct device_type input_dev_type
+ 	.uevent		= input_dev_uevent,
+ };
+ 
++static char *input_nodename(struct device *dev)
++{
++	return kasprintf(GFP_KERNEL, "input/%s", dev_name(dev));
++}
++
+ struct class input_class = {
+ 	.name		= "input",
++	.nodename	= input_nodename,
+ };
+ EXPORT_SYMBOL_GPL(input_class);
+ 
+--- a/drivers/usb/core/usb.c
++++ b/drivers/usb/core/usb.c
+@@ -306,10 +306,21 @@ static struct dev_pm_ops usb_device_pm_o
+ 
+ #endif	/* CONFIG_PM */
+ 
++
++static char *usb_nodename(struct device *dev)
++{
++	struct usb_device *usb_dev;
++
++	usb_dev = to_usb_device(dev);
++	return kasprintf(GFP_KERNEL, "bus/usb/%03d/%03d",
++			 usb_dev->bus->busnum, usb_dev->devnum);
++}
++
+ struct device_type usb_device_type = {
+ 	.name =		"usb_device",
+ 	.release =	usb_release_dev,
+ 	.uevent =	usb_dev_uevent,
++	.nodename = 	usb_nodename,
+ 	.pm =		&usb_device_pm_ops,
+ };
+ 
+--- a/include/linux/device.h
++++ b/include/linux/device.h
+@@ -189,6 +189,7 @@ struct device *driver_find_device(struct
+  */
+ struct class {
+ 	const char		*name;
++	char *(*nodename)(struct device *dev);
+ 	struct module		*owner;
+ 
+ 	struct class_attribute		*class_attrs;
+@@ -290,6 +291,7 @@ extern void class_destroy(struct class *
+ struct device_type {
+ 	const char *name;
+ 	struct attribute_group **groups;
++	char *(*nodename)(struct device *dev);
+ 	int (*uevent)(struct device *dev, struct kobj_uevent_env *env);
+ 	void (*release)(struct device *dev);
+ 
+@@ -371,6 +373,7 @@ struct device_dma_parameters {
+ 
+ struct device {
+ 	struct device		*parent;
++	char *(*nodename)(struct device *dev);
+ 
+ 	struct device_private	*p;
+ 
+@@ -498,6 +501,7 @@ extern struct device *device_find_child(
+ extern int device_rename(struct device *dev, char *new_name);
+ extern int device_move(struct device *dev, struct device *new_parent,
+ 		       enum dpm_order dpm_order);
++extern const char *device_get_nodename(struct device *dev, const char **tmp);
+ 
+ /*
+  * Root device objects for grouping under /sys/devices
+@@ -555,6 +559,16 @@ extern void put_device(struct device *de
+ 
+ extern void wait_for_device_probe(void);
+ 
++#ifdef CONFIG_DEVTMPFS
++extern int devtmpfs_create_node(struct device *dev);
++extern int devtmpfs_delete_node(struct device *dev);
++extern int devtmpfs_mount(const char *mountpoint);
++#else
++static inline int devtmpfs_create_node(struct device *dev) { return 0; }
++static inline int devtmpfs_delete_node(struct device *dev) { return 0; }
++static inline int devtmpfs_mount(const char *mountpoint) { return 0; }
++#endif
++
+ /* drivers/base/power/shutdown.c */
+ extern void device_shutdown(void);
+ 
+--- a/include/linux/shmem_fs.h
++++ b/include/linux/shmem_fs.h
+@@ -42,6 +42,8 @@ static inline struct shmem_inode_info *S
+ 	return container_of(inode, struct shmem_inode_info, vfs_inode);
+ }
+ 
++extern int init_tmpfs(void);
++
+ #ifdef CONFIG_TMPFS_POSIX_ACL
+ int shmem_permission(struct inode *, int);
+ int shmem_acl_init(struct inode *, struct inode *);
+--- a/init/do_mounts.c
++++ b/init/do_mounts.c
+@@ -414,7 +414,7 @@ void __init prepare_namespace(void)
+ 
+ 	mount_root();
+ out:
++	devtmpfs_mount("dev");
+ 	sys_mount(".", "/", NULL, MS_MOVE, NULL);
+ 	sys_chroot(".");
+ }
+-
+--- a/init/initramfs.c
++++ b/init/initramfs.c
+@@ -8,6 +8,7 @@
+ #include <linux/dirent.h>
+ #include <linux/syscalls.h>
+ #include <linux/utime.h>
++#include <linux/device.h>
+ 
+ static __initdata char *message;
+ static void __init error(char *x)
+@@ -604,6 +605,7 @@ static int __init populate_rootfs(void)
+ 			printk(KERN_EMERG "%s\n", err);
+ 		} else {
+ 			printk(" done\n");
++			devtmpfs_mount("dev");
+ 		}
+ 		free_initrd();
+ #endif
+--- a/init/main.c
++++ b/init/main.c
+@@ -64,6 +64,7 @@
+ #include <linux/idr.h>
+ #include <linux/ftrace.h>
+ #include <linux/async.h>
++#include <linux/shmem_fs.h>
+ #include <trace/boot.h>
+ 
+ #include <asm/io.h>
+@@ -778,6 +779,7 @@ static void __init do_basic_setup(void)
+ 	init_workqueues();
+ 	cpuset_init_smp();
+ 	usermodehelper_init();
++	init_tmpfs();
+ 	driver_init();
+ 	init_irq_proc();
+ 	do_initcalls();
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -2519,7 +2519,7 @@ static struct file_system_type tmpfs_fs_
+ 	.kill_sb	= kill_litter_super,
+ };
+ 
+-static int __init init_tmpfs(void)
++int __init init_tmpfs(void)
+ {
+ 	int error;
+ 
+@@ -2687,5 +2687,3 @@ int shmem_zero_setup(struct vm_area_stru
+ 	vma->vm_ops = &shmem_vm_ops;
+ 	return 0;
+ }
+-
+-module_init(init_tmpfs)
+--- a/sound/sound_core.c
++++ b/sound/sound_core.c
+@@ -27,6 +27,11 @@ MODULE_DESCRIPTION("Core sound module");
+ MODULE_AUTHOR("Alan Cox");
+ MODULE_LICENSE("GPL");
+ 
++static char *sound_nodename(struct device *dev)
++{
++	return kasprintf(GFP_KERNEL, "snd/%s", dev_name(dev));
++}
++
+ static int __init init_soundcore(void)
+ {
+ 	int rc;
+@@ -41,6 +46,8 @@ static int __init init_soundcore(void)
+ 		return PTR_ERR(sound_class);
+ 	}
+ 
++	sound_class->nodename = sound_nodename;
++
+ 	return 0;
+ }
+ 
