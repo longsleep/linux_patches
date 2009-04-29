@@ -1,22 +1,23 @@
 
- block/bsg.c                 |    6 
- drivers/base/Kconfig        |   16 ++
- drivers/base/Makefile       |    1 
- drivers/base/base.h         |    6 
- drivers/base/core.c         |   54 ++++++-
- drivers/base/devtmpfs.c     |  339 ++++++++++++++++++++++++++++++++++++++++++++
- drivers/base/init.c         |    1 
- drivers/gpu/drm/drm_sysfs.c |    7 
- drivers/input/input.c       |    6 
- drivers/usb/core/usb.c      |   11 +
- include/linux/device.h      |   14 +
- include/linux/shmem_fs.h    |    2 
- init/do_mounts.c            |    2 
- init/initramfs.c            |    2 
- init/main.c                 |    2 
- mm/shmem.c                  |    4 
- sound/sound_core.c          |    7 
- 17 files changed, 475 insertions(+), 5 deletions(-)
+ block/bsg.c                         |    6 
+ drivers/base/Kconfig                |   16 +
+ drivers/base/Makefile               |    1 
+ drivers/base/base.h                 |    6 
+ drivers/base/core.c                 |   54 +++++
+ drivers/base/devtmpfs.c             |  349 ++++++++++++++++++++++++++++++++++++
+ drivers/base/init.c                 |    1 
+ drivers/gpu/drm/drm_sysfs.c         |    7 
+ drivers/input/input.c               |    6 
+ drivers/media/dvb/dvb-core/dvbdev.c |   10 +
+ drivers/usb/core/usb.c              |   11 +
+ include/linux/device.h              |   14 +
+ include/linux/shmem_fs.h            |    2 
+ init/do_mounts.c                    |    2 
+ init/initramfs.c                    |    2 
+ init/main.c                         |    2 
+ mm/shmem.c                          |    4 
+ sound/sound_core.c                  |    7 
+ 18 files changed, 495 insertions(+), 5 deletions(-)
 
 --- a/block/bsg.c
 +++ b/block/bsg.c
@@ -141,7 +142,7 @@
   * @data: data for the callback.
 --- /dev/null
 +++ b/drivers/base/devtmpfs.c
-@@ -0,0 +1,339 @@
+@@ -0,0 +1,349 @@
 +/*
 + * /dev tmpfs device nodes
 + *
@@ -331,8 +332,13 @@
 +	mutex_lock_nested(&nd.path.dentry->d_inode->i_mutex, I_MUTEX_PARENT);
 +	dentry = lookup_one_len(node, nd.path.dentry, strlen(node));
 +	if (!IS_ERR(dentry)) {
-+		err = vfs_rmdir(nd.path.dentry->d_inode, dentry);
++		if (dentry->d_inode)
++			err = vfs_rmdir(nd.path.dentry->d_inode, dentry);
++		else
++			err = -ENOENT;
 +		dput(dentry);
++	} else {
++		err = PTR_ERR(dentry);
 +	}
 +	mutex_unlock(&nd.path.dentry->d_inode->i_mutex);
 +
@@ -412,11 +418,16 @@
 +	mutex_lock_nested(&nd.path.dentry->d_inode->i_mutex, I_MUTEX_PARENT);
 +	dentry = lookup_one_len(node, nd.path.dentry, strlen(node));
 +	if (!IS_ERR(dentry)) {
-+		err = vfs_getattr(nd.path.mnt, dentry, &stat);
-+		if (!err && dev_matches(dev, stat.mode, stat.rdev)) {
-+			err = vfs_unlink(nd.path.dentry->d_inode, dentry);
-+			if (err == 0 || err == -ENOENT)
-+				deleted = 1;
++		if (dentry->d_inode) {
++			err = vfs_getattr(nd.path.mnt, dentry, &stat);
++			if (!err && dev_matches(dev, stat.mode, stat.rdev)) {
++				err = vfs_unlink(nd.path.dentry->d_inode,
++						 dentry);
++				if (err == 0 || err == -ENOENT)
++					deleted = 1;
++			}
++		} else {
++			err = -ENOENT;
 +		}
 +		dput(dentry);
 +	} else {
@@ -566,6 +577,32 @@
  };
  EXPORT_SYMBOL_GPL(input_class);
  
+--- a/drivers/media/dvb/dvb-core/dvbdev.c
++++ b/drivers/media/dvb/dvb-core/dvbdev.c
+@@ -447,6 +447,15 @@ static int dvb_uevent(struct device *dev
+ 	return 0;
+ }
+ 
++static char *dvb_nodename(struct device *dev)
++{
++	struct dvb_device *dvbdev = dev_get_drvdata(dev);
++
++	return kasprintf(GFP_KERNEL, "dvb/adapter%d/%s%d",
++		dvbdev->adapter->num, dnames[dvbdev->type], dvbdev->id);
++}
++
++
+ static int __init init_dvbdev(void)
+ {
+ 	int retval;
+@@ -469,6 +478,7 @@ static int __init init_dvbdev(void)
+ 		goto error;
+ 	}
+ 	dvb_class->dev_uevent = dvb_uevent;
++	dvb_class->nodename = dvb_nodename;
+ 	return 0;
+ 
+ error:
 --- a/drivers/usb/core/usb.c
 +++ b/drivers/usb/core/usb.c
 @@ -311,10 +311,21 @@ static struct dev_pm_ops usb_device_pm_o
