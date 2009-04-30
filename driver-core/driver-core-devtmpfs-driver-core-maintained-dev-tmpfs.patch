@@ -1,10 +1,62 @@
+From kay.sievers@vrfy.org  Thu Apr 30 07:25:40 2009
+From: Kay Sievers <kay.sievers@vrfy.org>
+Date: Thu, 30 Apr 2009 15:23:42 +0200
+Subject: Driver Core: devtmpfs - driver core maintained /dev tmpfs
+Cc: Greg KH <greg@kroah.com>, Jan Blunck <jblunck@suse.de>
+Message-ID: <1241097822.2516.3.camel@poy>
 
+
+From: Kay Sievers <kay.sievers@vrfy.org>
+
+Subject: driver-core: devtmpfs - driver core maintained /dev tmpfs
+
+Devtmpfs lets the kernel create a tmpfs very early at kernel
+initialization, before any driver core device is registered. Every
+device with a major/minor will have a device node created in this
+tmpfs instance. After the rootfs is mounted by the kernel, the
+populated tmpfs is mounted at /dev. In initramfs, it can be moved
+to the manually mounted root filesystem before /sbin/init is
+executed.
+
+The tmpfs instance can be changed and altered by userspace at any time,
+and in any way needed - just like today's udev-mounted tmpfs. Unmodified
+udev versions will run just fine on top of it, and will recognize an
+already existing kernel-created device node and use it.
+The default node permissions are root:root 0600. Only if none of these
+values have been changed by userspace, the driver core will remove the
+device node when the device goes away. If the device node was altered
+by udev, by applying the appropriate permissions and ownership, it will
+need to be removed by udev - just as it usually works today.
+
+This makes init=/bin/sh work without any further userspace support.
+/dev will be fully populated and dynamic, and always reflect the current
+device state of the kernel. Especially in the face of the already
+implemented dynamic device numbers for block devices, this can be very
+helpful in a rescue situation, where static devices nodes no longer
+work.
+Custom, embedded-like systems should be able to use this as a dynamic
+/dev directory without any need for aditional userspace tools.
+
+With the kernel populated /dev, existing initramfs or kernel-mount
+bootup logic can be optimized to be more efficient, and not to require a
+full coldplug run, which is currently needed to bootstrap the inital
+/dev directory content, before continuing bringing up the rest of
+the system. There will be no missed events to replay, because /dev is
+available before the first kernel device is registered with the core.
+A coldplug run can take, depending on the speed of the system and the
+amount of devices which need to be handled, from one to several seconds.
+
+Signed-off-by: Kay Sievers <kay.sievers@vrfy.org>
+Signed-off-by: Jan Blunck <jblunck@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
  block/bsg.c                         |    6 
- drivers/base/Kconfig                |   16 +
+ drivers/base/Kconfig                |   17 +
  drivers/base/Makefile               |    1 
  drivers/base/base.h                 |    6 
  drivers/base/core.c                 |   54 +++++
- drivers/base/devtmpfs.c             |  349 ++++++++++++++++++++++++++++++++++++
+ drivers/base/devtmpfs.c             |  337 ++++++++++++++++++++++++++++++++++++
  drivers/base/init.c                 |    1 
  drivers/gpu/drm/drm_sysfs.c         |    7 
  drivers/input/input.c               |    6 
@@ -17,7 +69,7 @@
  init/main.c                         |    2 
  mm/shmem.c                          |    4 
  sound/sound_core.c                  |    7 
- 18 files changed, 495 insertions(+), 5 deletions(-)
+ 18 files changed, 484 insertions(+), 5 deletions(-)
 
 --- a/block/bsg.c
 +++ b/block/bsg.c
@@ -142,7 +194,7 @@
   * @data: data for the callback.
 --- /dev/null
 +++ b/drivers/base/devtmpfs.c
-@@ -0,0 +1,349 @@
+@@ -0,0 +1,337 @@
 +/*
 + * /dev tmpfs device nodes
 + *
@@ -181,7 +233,7 @@
 +	if (err)
 +		return err;
 +
-+	dentry = lookup_create(&nd, 0);
++	dentry = lookup_create(&nd, 1);
 +	if (!IS_ERR(dentry)) {
 +		err = vfs_mkdir(nd.path.dentry->d_inode, dentry, mode);
 +		dput(dentry);
@@ -232,10 +284,11 @@
 +		struct dentry *dentry;
 +
 +		/* create directory right away */
-+		dentry = lookup_create(&nd, 0);
++		dentry = lookup_create(&nd, 1);
 +		if (!IS_ERR(dentry)) {
 +			err = vfs_mkdir(nd.path.dentry->d_inode,
 +					dentry, 0775);
++			dput(dentry);
 +		}
 +		mutex_unlock(&nd.path.dentry->d_inode->i_mutex);
 +
@@ -279,9 +332,9 @@
 +		return -ENOMEM;
 +
 +	if (dev->class == &block_class)
-+		mode = S_IFBLK|0660;
++		mode = S_IFBLK|0600;
 +	else
-+		mode = S_IFCHR|0660;
++		mode = S_IFCHR|0600;
 +
 +	err = vfs_path_lookup(dev_mnt->mnt_root, dev_mnt,
 +			      nodename, LOOKUP_PARENT, &nd);
@@ -313,7 +366,6 @@
 +static int dev_rmdir(const char *name)
 +{
 +	struct nameidata nd;
-+	const char *node;
 +	struct dentry *dentry;
 +	int err;
 +
@@ -322,15 +374,8 @@
 +	if (err)
 +		return err;
 +
-+	/* get last element */
-+	node = strrchr(name, '/');
-+	if (node)
-+		node++;
-+	else
-+		node = name;
-+
 +	mutex_lock_nested(&nd.path.dentry->d_inode->i_mutex, I_MUTEX_PARENT);
-+	dentry = lookup_one_len(node, nd.path.dentry, strlen(node));
++	dentry = lookup_one_len(nd.last.name, nd.path.dentry, nd.last.len);
 +	if (!IS_ERR(dentry)) {
 +		if (dentry->d_inode)
 +			err = vfs_rmdir(nd.path.dentry->d_inode, dentry);
@@ -371,16 +416,19 @@
 +	return err;
 +}
 +
-+static int dev_matches(struct device *dev, mode_t mode, dev_t devno)
++/* never delete a node that userspace has changed */
++static int dev_unchanged(struct device *dev, struct kstat *stat)
 +{
++	if (stat->uid != 0 || stat->gid != 0)
++		return 0;
 +	if (dev->class == &block_class) {
-+		if (!S_ISBLK(mode))
++		if (stat->mode != (S_IFBLK|0600))
 +			return 0;
 +	} else {
-+		if (!S_ISCHR(mode))
++		if (stat->mode != (S_IFCHR|0600))
 +			return 0;
 +	}
-+	if (devno != dev->devt)
++	if (stat->rdev != dev->devt)
 +		return 0;
 +	return 1;
 +}
@@ -389,7 +437,6 @@
 +{
 +	const char *tmp = NULL;
 +	const char *nodename;
-+	const char *node;
 +	struct nameidata nd;
 +	struct dentry *dentry;
 +	struct kstat stat;
@@ -408,19 +455,12 @@
 +	if (err)
 +		goto out_name;
 +
-+	/* get last element */
-+	node = strrchr(nodename, '/');
-+	if (node)
-+		node++;
-+	else
-+		node = nodename;
-+
 +	mutex_lock_nested(&nd.path.dentry->d_inode->i_mutex, I_MUTEX_PARENT);
-+	dentry = lookup_one_len(node, nd.path.dentry, strlen(node));
++	dentry = lookup_one_len(nd.last.name, nd.path.dentry, nd.last.len);
 +	if (!IS_ERR(dentry)) {
 +		if (dentry->d_inode) {
 +			err = vfs_getattr(nd.path.mnt, dentry, &stat);
-+			if (!err && dev_matches(dev, stat.mode, stat.rdev)) {
++			if (!err && dev_unchanged(dev, &stat)) {
 +				err = vfs_unlink(nd.path.dentry->d_inode,
 +						 dentry);
 +				if (err == 0 || err == -ENOENT)
@@ -504,7 +544,7 @@
  	classes_init();
 --- a/drivers/base/Kconfig
 +++ b/drivers/base/Kconfig
-@@ -8,6 +8,22 @@ config UEVENT_HELPER_PATH
+@@ -8,6 +8,23 @@ config UEVENT_HELPER_PATH
  	  Path to uevent helper program forked by the kernel for
  	  every uevent.
  
@@ -515,7 +555,7 @@
 +	  This creates a tmpfs filesystem, and mounts it at bootup
 +	  and mounts it at /dev. The kernel driver core creates device
 +	  nodes for all registered devices in that filesystem. All device
-+	  nodes are owned by root and have the default mode of 0660.
++	  nodes are owned by root and have the default mode of 0600.
 +	  Userspace can add and delete the nodes as needed. This is
 +	  intended to simplify bootup, and make it possible to delay
 +	  the initial coldplug at bootup done by udev in userspace.
@@ -523,6 +563,7 @@
 +	  to bring up a kernel with dynamic major/minor numbers.
 +	  Meaningful symlinks, permissions and device ownership must
 +	  still be handled by userspace.
++	  If unsure, say N here.
 +
  config STANDALONE
  	bool "Select only drivers that don't need compile-time external firmware" if EXPERIMENTAL
@@ -605,7 +646,7 @@
  error:
 --- a/drivers/usb/core/usb.c
 +++ b/drivers/usb/core/usb.c
-@@ -311,10 +311,21 @@ static struct dev_pm_ops usb_device_pm_o
+@@ -305,10 +305,21 @@ static struct dev_pm_ops usb_device_pm_o
  
  #endif	/* CONFIG_PM */
  
@@ -629,22 +670,22 @@
  
 --- a/include/linux/device.h
 +++ b/include/linux/device.h
-@@ -189,6 +189,7 @@ struct device *driver_find_device(struct
-  */
- struct class {
- 	const char		*name;
-+	char *(*nodename)(struct device *dev);
- 	struct module		*owner;
+@@ -196,6 +196,7 @@ struct class {
+ 	struct kobject			*dev_kobj;
  
- 	struct class_attribute		*class_attrs;
-@@ -290,6 +291,7 @@ extern void class_destroy(struct class *
- struct device_type {
+ 	int (*dev_uevent)(struct device *dev, struct kobj_uevent_env *env);
++	char *(*nodename)(struct device *dev);
+ 
+ 	void (*class_release)(struct class *class);
+ 	void (*dev_release)(struct device *dev);
+@@ -291,6 +292,7 @@ struct device_type {
  	const char *name;
  	struct attribute_group **groups;
-+	char *(*nodename)(struct device *dev);
  	int (*uevent)(struct device *dev, struct kobj_uevent_env *env);
++	char *(*nodename)(struct device *dev);
  	void (*release)(struct device *dev);
  
+ 	int (*suspend)(struct device *dev, pm_message_t state);
 @@ -371,6 +373,7 @@ struct device_dma_parameters {
  
  struct device {
@@ -653,7 +694,7 @@
  
  	struct device_private	*p;
  
-@@ -498,6 +501,7 @@ extern struct device *device_find_child(
+@@ -493,6 +496,7 @@ extern struct device *device_find_child(
  extern int device_rename(struct device *dev, char *new_name);
  extern int device_move(struct device *dev, struct device *new_parent,
  		       enum dpm_order dpm_order);
@@ -661,7 +702,7 @@
  
  /*
   * Root device objects for grouping under /sys/devices
-@@ -555,6 +559,16 @@ extern void put_device(struct device *de
+@@ -550,6 +554,16 @@ extern void put_device(struct device *de
  
  extern void wait_for_device_probe(void);
  
