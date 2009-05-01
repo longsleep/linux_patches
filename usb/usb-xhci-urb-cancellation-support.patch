@@ -1,9 +1,9 @@
-From sarah.a.sharp@linux.intel.com  Tue Apr 28 16:14:32 2009
+From sarah.a.sharp@linux.intel.com  Fri May  1 14:53:57 2009
 From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
-Date: Mon, 27 Apr 2009 19:59:44 -0700
+Date: Wed, 29 Apr 2009 19:02:31 -0700
 Subject: USB: xhci: URB cancellation support.
 To: Greg KH <greg@kroah.com>
-Message-ID: <20090428025944.GA18203@gamba.jf.intel.com>
+Message-ID: <20090430020231.GA30977@gamba.jf.intel.com>
 
 
 Add URB cancellation support to the xHCI host controller driver.  This
@@ -41,8 +41,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  drivers/usb/host/xhci-hcd.c  |   64 +++++
  drivers/usb/host/xhci-mem.c  |    1 
  drivers/usb/host/xhci-ring.c |  491 ++++++++++++++++++++++++++++++++++++++++---
- drivers/usb/host/xhci.h      |   33 ++
- 4 files changed, 546 insertions(+), 43 deletions(-)
+ drivers/usb/host/xhci.h      |   31 ++
+ 4 files changed, 545 insertions(+), 42 deletions(-)
 
 --- a/drivers/usb/host/xhci.h
 +++ b/drivers/usb/host/xhci.h
@@ -66,40 +66,36 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  /* Port Status Change Event TRB fields */
  /* Port ID - bits 31:24 */
  #define GET_PORT_ID(p)		(((p) & (0xff << 24)) >> 24)
-@@ -893,22 +899,25 @@ union xhci_trb {
+@@ -893,12 +899,6 @@ union xhci_trb {
  #define TRB_MAX_BUFF_SHIFT		16
  #define TRB_MAX_BUFF_SIZE	(1 << TRB_MAX_BUFF_SHIFT)
  
-+struct xhci_segment {
-+	union xhci_trb		*trbs;
-+	/* private to HCD */
-+	struct xhci_segment	*next;
-+	dma_addr_t		dma;
-+} __attribute__ ((packed));
-+
- struct xhci_td {
- 	struct list_head	td_list;
+-struct xhci_td {
+-	struct list_head	td_list;
+-	struct urb		*urb;
+-	union xhci_trb		*last_trb;
+-};
+-
+ struct xhci_segment {
+ 	union xhci_trb		*trbs;
+ 	/* private to HCD */
+@@ -906,6 +906,15 @@ struct xhci_segment {
+ 	dma_addr_t		dma;
+ } __attribute__ ((packed));
+ 
++struct xhci_td {
++	struct list_head	td_list;
 +	struct list_head	cancelled_td_list;
- 	struct urb		*urb;
++	struct urb		*urb;
 +	struct xhci_segment	*start_seg;
 +	union xhci_trb		*first_trb;
- 	union xhci_trb		*last_trb;
- #ifdef CONFIG_USB_HCD_STAT
- 	ktime_t			start_time;
- #endif
- };
- 
--struct xhci_segment {
--	union xhci_trb		*trbs;
--	/* private to HCD */
--	struct xhci_segment	*next;
--	dma_addr_t		dma;
--} __attribute__ ((packed));
--
++	union xhci_trb		*last_trb;
++};
++
  struct xhci_ring {
  	struct xhci_segment	*first_seg;
  	union  xhci_trb		*enqueue;
-@@ -918,6 +927,14 @@ struct xhci_ring {
+@@ -915,6 +924,14 @@ struct xhci_ring {
  	struct xhci_segment	*deq_seg;
  	unsigned int		deq_updates;
  	struct list_head	td_list;
@@ -114,7 +110,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	/*
  	 * Write the cycle state into the TRB cycle field to give ownership of
  	 * the TRB to the host controller (if we are the producer), or to check
-@@ -1129,6 +1146,8 @@ void handle_event(struct xhci_hcd *xhci)
+@@ -1119,6 +1136,8 @@ void handle_event(struct xhci_hcd *xhci)
  void set_hc_event_deq(struct xhci_hcd *xhci);
  int queue_slot_control(struct xhci_hcd *xhci, u32 trb_type, u32 slot_id);
  int queue_address_device(struct xhci_hcd *xhci, dma_addr_t in_ctx_ptr, u32 slot_id);
@@ -125,7 +121,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  int queue_configure_endpoint(struct xhci_hcd *xhci, dma_addr_t in_ctx_ptr, u32 slot_id);
 --- a/drivers/usb/host/xhci-hcd.c
 +++ b/drivers/usb/host/xhci-hcd.c
-@@ -619,12 +619,70 @@ exit:
+@@ -613,12 +613,70 @@ exit:
  	return ret;
  }
  
@@ -615,9 +611,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 -	struct urb *urb;
 +	struct urb *urb = 0;
  	int status = -EINPROGRESS;
- 	ktime_t stop_time;
  
-@@ -459,6 +818,12 @@ static int handle_tx_event(struct xhci_h
+ 	xdev = xhci->devs[TRB_TO_SLOT_ID(event->flags)];
+@@ -457,6 +816,12 @@ static int handle_tx_event(struct xhci_h
  	case COMP_SUCCESS:
  	case COMP_SHORT_TX:
  		break;
@@ -630,7 +626,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	case COMP_STALL:
  		xhci_warn(xhci, "WARN: Stalled endpoint\n");
  		status = -EPIPE;
-@@ -512,11 +877,15 @@ static int handle_tx_event(struct xhci_h
+@@ -510,11 +875,15 @@ static int handle_tx_event(struct xhci_h
  		if (event_trb != ep_ring->dequeue) {
  			/* The event was for the status stage */
  			if (event_trb == td->last_trb) {
@@ -650,7 +646,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  			}
  		}
  	} else {
-@@ -575,29 +944,55 @@ static int handle_tx_event(struct xhci_h
+@@ -573,29 +942,55 @@ static int handle_tx_event(struct xhci_h
  				status = 0;
  			}
  		} else {
@@ -722,7 +718,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  cleanup:
  	inc_deq(xhci, xhci->event_ring, true);
  	set_hc_event_deq(xhci);
-@@ -751,6 +1146,7 @@ int xhci_prepare_transfer(struct xhci_hc
+@@ -744,6 +1139,7 @@ int xhci_prepare_transfer(struct xhci_hc
  	if (!*td)
  		return -ENOMEM;
  	INIT_LIST_HEAD(&(*td)->td_list);
@@ -730,7 +726,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  	ret = usb_hcd_link_urb_to_ep(xhci_to_hcd(xhci), urb);
  	if (unlikely(ret)) {
-@@ -762,6 +1158,8 @@ int xhci_prepare_transfer(struct xhci_hc
+@@ -755,6 +1151,8 @@ int xhci_prepare_transfer(struct xhci_hc
  	urb->hcpriv = (void *) (*td);
  	/* Add this TD to the tail of the endpoint ring's TD list */
  	list_add_tail(&(*td)->td_list, &xdev->ep_rings[ep_index]->td_list);
@@ -739,7 +735,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  	return 0;
  }
-@@ -830,22 +1228,16 @@ void giveback_first_trb(struct xhci_hcd 
+@@ -823,19 +1221,13 @@ void giveback_first_trb(struct xhci_hcd 
  		unsigned int ep_index, int start_cycle,
  		struct xhci_generic_trb *start_trb, struct xhci_td *td)
  {
@@ -752,9 +748,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	wmb();
  	start_trb->field[3] |= start_cycle;
 -	field = xhci_readl(xhci, &xhci->dba->doorbell[slot_id]) & DB_MASK;
- #ifdef CONFIG_USB_HCD_STAT
- 	td->start_time = ktime_get();
- #endif
 -	xhci_writel(xhci, field | EPI_TO_DB(ep_index),
 -			&xhci->dba->doorbell[slot_id]);
 -	/* Flush PCI posted writes */
@@ -763,7 +756,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  }
  
  int queue_bulk_sg_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
-@@ -1231,3 +1623,36 @@ int queue_configure_endpoint(struct xhci
+@@ -1221,3 +1613,36 @@ int queue_configure_endpoint(struct xhci
  	return queue_command(xhci, in_ctx_ptr, 0, 0,
  			TRB_TYPE(TRB_CONFIG_EP) | SLOT_ID_FOR_TRB(slot_id));
  }
