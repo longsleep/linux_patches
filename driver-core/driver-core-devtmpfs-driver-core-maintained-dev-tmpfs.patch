@@ -8,8 +8,6 @@ Message-ID: <1241097822.2516.3.camel@poy>
 
 From: Kay Sievers <kay.sievers@vrfy.org>
 
-Subject: driver-core: devtmpfs - driver core maintained /dev tmpfs
-
 Devtmpfs lets the kernel create a tmpfs very early at kernel
 initialization, before any driver core device is registered. Every
 device with a major/minor will have a device node created in this
@@ -49,28 +47,94 @@ amount of devices which need to be handled, from one to several seconds.
 Signed-off-by: Kay Sievers <kay.sievers@vrfy.org>
 Signed-off-by: Jan Blunck <jblunck@suse.de>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
-
 ---
+
+ arch/x86/kernel/cpuid.c             |    6 
+ arch/x86/kernel/microcode_core.c    |    1 
+ arch/x86/kernel/msr.c               |    6 
  block/bsg.c                         |    6 
+ block/genhd.c                       |   10 +
  drivers/base/Kconfig                |   17 +
  drivers/base/Makefile               |    1 
  drivers/base/base.h                 |    6 
  drivers/base/core.c                 |   54 +++++
- drivers/base/devtmpfs.c             |  337 ++++++++++++++++++++++++++++++++++++
+ drivers/base/devtmpfs.c             |  338 ++++++++++++++++++++++++++++++++++++
  drivers/base/init.c                 |    1 
+ drivers/block/aoe/aoechr.c          |    7 
+ drivers/block/pktcdvd.c             |    7 
+ drivers/char/misc.c                 |   15 +
+ drivers/char/raw.c                  |    6 
  drivers/gpu/drm/drm_sysfs.c         |    7 
  drivers/input/input.c               |    6 
+ drivers/md/dm-ioctl.c               |    1 
  drivers/media/dvb/dvb-core/dvbdev.c |   10 +
+ drivers/net/tun.c                   |    1 
  drivers/usb/core/usb.c              |   11 +
  include/linux/device.h              |   14 +
+ include/linux/genhd.h               |    2 
+ include/linux/miscdevice.h          |    1 
  include/linux/shmem_fs.h            |    2 
  init/do_mounts.c                    |    2 
  init/initramfs.c                    |    2 
  init/main.c                         |    2 
- mm/shmem.c                          |    4 
+ mm/shmem.c                          |    6 
  sound/sound_core.c                  |    7 
- 18 files changed, 484 insertions(+), 5 deletions(-)
+ 30 files changed, 545 insertions(+), 10 deletions(-)
 
+--- a/arch/x86/kernel/cpuid.c
++++ b/arch/x86/kernel/cpuid.c
+@@ -182,6 +182,11 @@ static struct notifier_block __refdata c
+ 	.notifier_call = cpuid_class_cpu_callback,
+ };
+ 
++static char *cpuid_nodename(struct device *dev)
++{
++	return kasprintf(GFP_KERNEL, "cpu/%u/cpuid", MINOR(dev->devt));
++}
++
+ static int __init cpuid_init(void)
+ {
+ 	int i, err = 0;
+@@ -198,6 +203,7 @@ static int __init cpuid_init(void)
+ 		err = PTR_ERR(cpuid_class);
+ 		goto out_chrdev;
+ 	}
++	cpuid_class->nodename = cpuid_nodename;
+ 	for_each_online_cpu(i) {
+ 		err = cpuid_device_create(i);
+ 		if (err != 0)
+--- a/arch/x86/kernel/microcode_core.c
++++ b/arch/x86/kernel/microcode_core.c
+@@ -173,6 +173,7 @@ static const struct file_operations micr
+ static struct miscdevice microcode_dev = {
+ 	.minor		= MICROCODE_MINOR,
+ 	.name		= "microcode",
++	.devnode	= "cpu/microcode",
+ 	.fops		= &microcode_fops,
+ };
+ 
+--- a/arch/x86/kernel/msr.c
++++ b/arch/x86/kernel/msr.c
+@@ -196,6 +196,11 @@ static struct notifier_block __refdata m
+ 	.notifier_call = msr_class_cpu_callback,
+ };
+ 
++static char *msr_nodename(struct device *dev)
++{
++	return kasprintf(GFP_KERNEL, "cpu/%u/msr", MINOR(dev->devt));
++}
++
+ static int __init msr_init(void)
+ {
+ 	int i, err = 0;
+@@ -212,6 +217,7 @@ static int __init msr_init(void)
+ 		err = PTR_ERR(msr_class);
+ 		goto out_chrdev;
+ 	}
++	msr_class->nodename = msr_nodename;
+ 	for_each_online_cpu(i) {
+ 		err = msr_device_create(i);
+ 		if (err != 0)
 --- a/block/bsg.c
 +++ b/block/bsg.c
 @@ -1062,6 +1062,11 @@ EXPORT_SYMBOL_GPL(bsg_register_queue);
@@ -93,6 +157,29 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
  	ret = alloc_chrdev_region(&devid, 0, BSG_MAX_DEVS, "bsg");
  	if (ret)
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -985,10 +985,20 @@ struct class block_class = {
+ 	.name		= "block",
+ };
+ 
++static char *block_nodename(struct device *dev)
++{
++	struct gendisk *disk = dev_to_disk(dev);
++
++	if (disk->nodename)
++		return disk->nodename(disk);
++	return NULL;
++}
++
+ static struct device_type disk_type = {
+ 	.name		= "disk",
+ 	.groups		= disk_attr_groups,
+ 	.release	= disk_release,
++	.nodename	= block_nodename,
+ };
+ 
+ #ifdef CONFIG_PROC_FS
 --- a/drivers/base/base.h
 +++ b/drivers/base/base.h
 @@ -134,3 +134,9 @@ static inline void module_add_driver(str
@@ -194,7 +281,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
   * @data: data for the callback.
 --- /dev/null
 +++ b/drivers/base/devtmpfs.c
-@@ -0,0 +1,337 @@
+@@ -0,0 +1,338 @@
 +/*
 + * /dev tmpfs device nodes
 + *
@@ -219,6 +306,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#include <linux/device.h>
 +#include <linux/genhd.h>
 +#include <linux/namei.h>
++#include <linux/fs.h>
 +
 +static struct vfsmount *dev_mnt;
 +
@@ -305,7 +393,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +			s[0] = '\0';
 +			err = dev_mkdir(path, 0755);
 +			if (err && err != -EEXIST)
-+				;//break;
++				break;
 +			s[0] = '/';
 +			s++;
 +		}
@@ -578,6 +666,126 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  obj-y			+= power/
  obj-$(CONFIG_HAS_DMA)	+= dma-mapping.o
  obj-$(CONFIG_ISA)	+= isa.o
+--- a/drivers/block/aoe/aoechr.c
++++ b/drivers/block/aoe/aoechr.c
+@@ -266,6 +266,11 @@ static const struct file_operations aoe_
+ 	.owner = THIS_MODULE,
+ };
+ 
++static char *aoe_nodename(struct device *dev)
++{
++	return kasprintf(GFP_KERNEL, "etherd/%s", dev_name(dev));
++}
++
+ int __init
+ aoechr_init(void)
+ {
+@@ -283,6 +288,8 @@ aoechr_init(void)
+ 		unregister_chrdev(AOE_MAJOR, "aoechr");
+ 		return PTR_ERR(aoe_class);
+ 	}
++	aoe_class->nodename = aoe_nodename;
++
+ 	for (i = 0; i < ARRAY_SIZE(chardevs); ++i)
+ 		device_create(aoe_class, NULL,
+ 			      MKDEV(AOE_MAJOR, chardevs[i].minor), NULL,
+--- a/drivers/block/pktcdvd.c
++++ b/drivers/block/pktcdvd.c
+@@ -2853,6 +2853,11 @@ static struct block_device_operations pk
+ 	.media_changed =	pkt_media_changed,
+ };
+ 
++static char *pktcdvd_nodename(struct gendisk *gd)
++{
++	return kasprintf(GFP_KERNEL, "pktcdvd/%s", gd->disk_name);
++}
++
+ /*
+  * Set up mapping from pktcdvd device to CD-ROM device.
+  */
+@@ -2905,6 +2910,7 @@ static int pkt_setup_dev(dev_t dev, dev_
+ 	disk->fops = &pktcdvd_ops;
+ 	disk->flags = GENHD_FL_REMOVABLE;
+ 	strcpy(disk->disk_name, pd->name);
++	disk->nodename = pktcdvd_nodename;
+ 	disk->private_data = pd;
+ 	disk->queue = blk_alloc_queue(GFP_KERNEL);
+ 	if (!disk->queue)
+@@ -3060,6 +3066,7 @@ static const struct file_operations pkt_
+ static struct miscdevice pkt_misc = {
+ 	.minor 		= MISC_DYNAMIC_MINOR,
+ 	.name  		= DRIVER_NAME,
++	.name  		= "pktcdvd/control",
+ 	.fops  		= &pkt_ctl_fops
+ };
+ 
+--- a/drivers/char/misc.c
++++ b/drivers/char/misc.c
+@@ -168,7 +168,6 @@ static const struct file_operations misc
+ 	.open		= misc_open,
+ };
+ 
+-
+ /**
+  *	misc_register	-	register a miscellaneous device
+  *	@misc: device structure
+@@ -217,8 +216,8 @@ int misc_register(struct miscdevice * mi
+ 		misc_minors[misc->minor >> 3] |= 1 << (misc->minor & 7);
+ 	dev = MKDEV(MISC_MAJOR, misc->minor);
+ 
+-	misc->this_device = device_create(misc_class, misc->parent, dev, NULL,
+-					  "%s", misc->name);
++	misc->this_device = device_create(misc_class, misc->parent, dev,
++					  misc, "%s", misc->name);
+ 	if (IS_ERR(misc->this_device)) {
+ 		err = PTR_ERR(misc->this_device);
+ 		goto out;
+@@ -264,6 +263,15 @@ int misc_deregister(struct miscdevice *m
+ EXPORT_SYMBOL(misc_register);
+ EXPORT_SYMBOL(misc_deregister);
+ 
++static char *misc_nodename(struct device *dev)
++{
++	struct miscdevice *c = dev_get_drvdata(dev);
++
++	if (c->devnode)
++		return kstrdup(c->devnode, GFP_KERNEL);
++	return NULL;
++}
++
+ static int __init misc_init(void)
+ {
+ 	int err;
+@@ -279,6 +287,7 @@ static int __init misc_init(void)
+ 	err = -EIO;
+ 	if (register_chrdev(MISC_MAJOR,"misc",&misc_fops))
+ 		goto fail_printk;
++	misc_class->nodename = misc_nodename;
+ 	return 0;
+ 
+ fail_printk:
+--- a/drivers/char/raw.c
++++ b/drivers/char/raw.c
+@@ -261,6 +261,11 @@ static const struct file_operations raw_
+ 
+ static struct cdev raw_cdev;
+ 
++static char *raw_nodename(struct device *dev)
++{
++	return kasprintf(GFP_KERNEL, "raw/%s", dev_name(dev));
++}
++
+ static int __init raw_init(void)
+ {
+ 	dev_t dev = MKDEV(RAW_MAJOR, 0);
+@@ -284,6 +289,7 @@ static int __init raw_init(void)
+ 		ret = PTR_ERR(raw_class);
+ 		goto error_region;
+ 	}
++	raw_class->nodename = raw_nodename;
+ 	device_create(raw_class, NULL, MKDEV(RAW_MAJOR, 0), NULL, "rawctl");
+ 
+ 	return 0;
 --- a/drivers/gpu/drm/drm_sysfs.c
 +++ b/drivers/gpu/drm/drm_sysfs.c
 @@ -70,6 +70,11 @@ static ssize_t version_show(struct class
@@ -618,6 +826,16 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  };
  EXPORT_SYMBOL_GPL(input_class);
  
+--- a/drivers/md/dm-ioctl.c
++++ b/drivers/md/dm-ioctl.c
+@@ -1513,6 +1513,7 @@ static const struct file_operations _ctl
+ static struct miscdevice _dm_misc = {
+ 	.minor 		= MISC_DYNAMIC_MINOR,
+ 	.name  		= DM_NAME,
++	.devnode	= "mapper/control",
+ 	.fops  		= &_ctl_fops
+ };
+ 
 --- a/drivers/media/dvb/dvb-core/dvbdev.c
 +++ b/drivers/media/dvb/dvb-core/dvbdev.c
 @@ -447,6 +447,15 @@ static int dvb_uevent(struct device *dev
@@ -644,6 +862,16 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	return 0;
  
  error:
+--- a/drivers/net/tun.c
++++ b/drivers/net/tun.c
+@@ -1318,6 +1318,7 @@ static const struct file_operations tun_
+ static struct miscdevice tun_miscdev = {
+ 	.minor = TUN_MINOR,
+ 	.name = "tun",
++	.devnode = "net/tun",
+ 	.fops = &tun_fops,
+ };
+ 
 --- a/drivers/usb/core/usb.c
 +++ b/drivers/usb/core/usb.c
 @@ -305,10 +305,21 @@ static struct dev_pm_ops usb_device_pm_o
@@ -719,6 +947,27 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  /* drivers/base/power/shutdown.c */
  extern void device_shutdown(void);
  
+--- a/include/linux/genhd.h
++++ b/include/linux/genhd.h
+@@ -140,7 +140,7 @@ struct gendisk {
+                                          * disks that can't be partitioned. */
+ 
+ 	char disk_name[DISK_NAME_LEN];	/* name of major driver */
+-
++	char *(*nodename)(struct gendisk *gd);
+ 	/* Array of pointers to partitions indexed by partno.
+ 	 * Protected with matching bdev lock but stat and other
+ 	 * non-critical accesses use RCU.  Always access through
+--- a/include/linux/miscdevice.h
++++ b/include/linux/miscdevice.h
+@@ -37,6 +37,7 @@ struct device;
+ struct miscdevice  {
+ 	int minor;
+ 	const char *name;
++	const char *devnode;
+ 	const struct file_operations *fops;
+ 	struct list_head list;
+ 	struct device *parent;
 --- a/include/linux/shmem_fs.h
 +++ b/include/linux/shmem_fs.h
 @@ -42,6 +42,8 @@ static inline struct shmem_inode_info *S
@@ -787,6 +1036,15 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +int __init init_tmpfs(void)
  {
  	int error;
+ 
+@@ -2576,7 +2576,7 @@ static struct file_system_type tmpfs_fs_
+ 	.kill_sb	= kill_litter_super,
+ };
+ 
+-static int __init init_tmpfs(void)
++int __init init_tmpfs(void)
+ {
+ 	BUG_ON(register_filesystem(&tmpfs_fs_type) != 0);
  
 @@ -2687,5 +2687,3 @@ int shmem_zero_setup(struct vm_area_stru
  	vma->vm_ops = &shmem_vm_ops;
