@@ -8,16 +8,12 @@ Message-ID: <1241097822.2516.3.camel@poy>
 
 From: Kay Sievers <kay.sievers@vrfy.org>
 
-Devtmpfs lets the kernel create a tmpfs very early at kernel
-initialization, before any driver-core device is registered. Every
-device with a major/minor will have a device node created in this
-tmpfs instance. After the rootfs is mounted by the kernel, the
-populated tmpfs is mounted at /dev. In initramfs
-"mount --move /dev /root/dev" can move it to the manually mounted
-root filesystem before changing into /root and /sbin/init is
-executed.
+Devtmpfs lets the kernel create a tmpfs instance called devtmpfs
+very early at kernel initialization, before any driver-core device
+is registered. Every device with a major/minor will create a
+device node in devtmpfs.
 
-The tmpfs instance can be changed and altered by userspace at any time,
+Devtmpfs can be changed and altered by userspace at any time,
 and in any way needed - just like today's udev-mounted tmpfs. Unmodified
 udev versions will run just fine on top of it, and will recognize an
 already existing kernel-created device node and use it.
@@ -32,12 +28,12 @@ when the device goes away. If the device node was created by
 userspace, or the devtmpfs created node was replaced by userspace, it
 will not be removed by devtmpfs.
 
-This makes init=/bin/sh work without any further userspace support.
-/dev will be fully populated and dynamic, and always reflect the current
-device state of the kernel. Especially in the face of the already
-implemented dynamic device numbers for block devices, this can be very
-helpful in a rescue situation, where static devices nodes will no longer
-work.
+If automatically mounted, it makes init=/bin/sh work without any
+further userspace support. /dev will be fully populated and dynamic,
+and always reflect the current device state of the kernel. Especially
+in the face of the already implemented dynamic device numbers, this
+can be very helpful in a rescue situation, where static devices nodes
+may no longer work correctly.
 Custom, embedded-like systems should be able to use this as a dynamic
 /dev directory without any need for aditional userspace tools.
 
@@ -47,28 +43,25 @@ full coldplug run, which is currently needed to bootstrap the inital
 /dev directory content, before continuing bringing up the rest of
 the system. There will be no missed events to replay, because /dev is
 available before the first kernel device is registered with the
-driver-core. A coldplug run can take, depending on the speed of the
-system and the amount of devices which need to be handled, from one
-to several seconds.
+driver-core.
 
 Signed-off-by: Kay Sievers <kay.sievers@vrfy.org>
 Signed-off-by: Jan Blunck <jblunck@suse.de>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
- drivers/base/Kconfig     |   17 ++
+ drivers/base/Kconfig     |   25 ++
  drivers/base/Makefile    |    1 
  drivers/base/base.h      |    6 
  drivers/base/core.c      |    3 
- drivers/base/devtmpfs.c  |  354 +++++++++++++++++++++++++++++++++++++++++++++++
+ drivers/base/devtmpfs.c  |  405 +++++++++++++++++++++++++++++++++++++++++++++++
  drivers/base/init.c      |    1 
  include/linux/device.h   |   10 +
  include/linux/shmem_fs.h |    2 
  init/do_mounts.c         |    2 
- init/initramfs.c         |    2 
  init/main.c              |    2 
  mm/shmem.c               |    6 
- 12 files changed, 401 insertions(+), 5 deletions(-)
+ 11 files changed, 458 insertions(+), 5 deletions(-)
 
 --- a/drivers/base/base.h
 +++ b/drivers/base/base.h
@@ -103,9 +96,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	}
 --- /dev/null
 +++ b/drivers/base/devtmpfs.c
-@@ -0,0 +1,354 @@
+@@ -0,0 +1,405 @@
 +/*
-+ * /dev tmpfs device nodes
++ * devtmpfs - tmpfs based device node filesystem
 + *
 + * Copyright (C) 2009, Kay Sievers <kay.sievers@vrfy.org>
 + *
@@ -129,8 +122,63 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#include <linux/genhd.h>
 +#include <linux/namei.h>
 +#include <linux/fs.h>
++#include <linux/cred.h>
 +
++static DECLARE_MUTEX(dev_sb_sem);
 +static struct vfsmount *dev_mnt;
++static struct file_system_type dev_fs_type;
++static struct cred *kern_cred;
++
++#if defined CONFIG_DEVTMPFS_MOUNT
++static int dev_mount = 1;
++#else
++static int dev_mount;
++#endif
++
++static int __init mount_param(char *str)
++{
++	dev_mount = simple_strtoul(str, NULL, 0);
++	return 1;
++}
++__setup("devtmpfs.mount=", mount_param);
++
++static int dev_get_sb(struct file_system_type *fs_type, int flags,
++		      const char *dev_name, void *data, struct vfsmount *mnt)
++{
++	int ret = 0;
++
++	down(&dev_sb_sem);
++	if (!dev_mnt) {
++		static struct file_system_type *tmpfs;
++
++		tmpfs = get_fs_type("tmpfs");
++		if (!tmpfs) {
++			printk(KERN_ERR "dev_get_sb: unable get tmpfs "
++			       "fstype\n");
++			ret = -ENOENT;
++			goto out;
++		}
++		ret = tmpfs->get_sb(fs_type, flags, dev_name, data, mnt);
++		if (ret) {
++			printk(KERN_ERR "dev_get_sb: unable to init "
++			       "tmpfs superblock\n");
++			goto out;
++		}
++		dev_mnt = mnt;
++	} else {
++		/* we use a tmpfs superblock, fill_super() is not called */
++		get_sb_single(fs_type, flags, data, NULL, mnt);
++	}
++out:
++	up(&dev_sb_sem);
++	return ret;
++}
++
++static struct file_system_type dev_fs_type = {
++	.name = "devtmpfs",
++	.get_sb = dev_get_sb,
++	.kill_sb = kill_litter_super,
++};
 +
 +#ifdef CONFIG_BLOCK
 +static inline int is_blockdev(struct device *dev)
@@ -158,28 +206,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		dput(dentry);
 +	} else {
 +		err = PTR_ERR(dentry);
-+	}
-+	mutex_unlock(&nd.path.dentry->d_inode->i_mutex);
-+
-+	path_put(&nd.path);
-+	return err;
-+}
-+
-+static int dev_symlink(const char *target, const char *name)
-+{
-+	struct nameidata nd;
-+	struct dentry *dentry;
-+	int err;
-+
-+	err = vfs_path_lookup(dev_mnt->mnt_root, dev_mnt,
-+			      name, LOOKUP_PARENT, &nd);
-+	if (err)
-+		return err;
-+
-+	dentry = lookup_create(&nd, 0);
-+	if (!IS_ERR(dentry)) {
-+		err = vfs_symlink(nd.path.dentry->d_inode, dentry, target);
-+		dput(dentry);
 +	}
 +	mutex_unlock(&nd.path.dentry->d_inode->i_mutex);
 +
@@ -268,8 +294,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +
 +	dentry = lookup_create(&nd, 0);
 +	if (!IS_ERR(dentry)) {
++		const struct cred *curr_cred;
++
++		curr_cred = override_creds(kern_cred);
 +		err = vfs_mknod(nd.path.dentry->d_inode,
 +				dentry, mode, dev->devt);
++		revert_creds(curr_cred);
 +		/* mark as kernel created inode */
 +		if (!err)
 +			dentry->d_inode->i_private = &dev_mnt;
@@ -417,6 +447,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	struct path path;
 +	int err;
 +
++	if (!dev_mount)
++		return 0;
++
 +	if (!dev_mnt)
 +		return 0;
 +
@@ -436,25 +469,36 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + * Create tmpfs mount, created core devices will add their device device
 + * nodes here.
 + */
-+__init int devtmpfs_init(void)
++int __init devtmpfs_init(void)
 +{
 +	int err;
++	struct vfsmount *mnt;
 +
-+	dev_mnt = do_kern_mount("tmpfs", 0, "devtmpfs", NULL);
-+	if (IS_ERR(dev_mnt)) {
-+		err = PTR_ERR(dev_mnt);
-+		printk(KERN_ERR "devtmpfs: unable to initialize %i\n", err);
-+		dev_mnt = NULL;
-+		return -1;
++	kern_cred = prepare_kernel_cred(NULL);
++	if (!kern_cred) {
++		printk(KERN_ERR "devtmpfs: unable to create credentials\n");
++		return -EINVAL;
 +	}
 +
-+	/* create common files/directories */
-+	dev_mkdir("pts", 0755);
++	err = register_filesystem(&dev_fs_type);
++	if (err) {
++		printk(KERN_ERR "devtmpfs: unable to register devtmpfs "
++		       "type %i\n", err);
++		put_cred(kern_cred);
++		return err;
++	}
++
++	mnt = kern_mount(&dev_fs_type);
++	if (IS_ERR(mnt)) {
++		err = PTR_ERR(mnt);
++		printk(KERN_ERR "devtmpfs: unable to create devtmpfs %i\n", err);
++		unregister_filesystem(&dev_fs_type);
++		put_cred(kern_cred);
++		return err;
++	}
++
 +	dev_mkdir("shm", 01755);
-+	dev_symlink("/proc/self/fd", "fd");
-+	dev_symlink("/proc/self/fd/0", "stdin");
-+	dev_symlink("/proc/self/fd/1", "stdout");
-+	dev_symlink("/proc/self/fd/2", "stderr");
++
 +	printk(KERN_INFO "devtmpfs: initialized\n");
 +	return 0;
 +}
@@ -470,7 +514,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	classes_init();
 --- a/drivers/base/Kconfig
 +++ b/drivers/base/Kconfig
-@@ -8,6 +8,23 @@ config UEVENT_HELPER_PATH
+@@ -8,6 +8,31 @@ config UEVENT_HELPER_PATH
  	  Path to uevent helper program forked by the kernel for
  	  every uevent.
  
@@ -489,6 +533,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	  to bring up a kernel with dynamic major/minor numbers.
 +	  Meaningful symlinks, permissions and device ownership must
 +	  still be handled by userspace.
++	  If unsure, say N here.
++
++config DEVTMPFS_MOUNT
++	bool "Automount devtmpfs at /dev"
++	depends on DEVTMPFS
++	help
++	  This will mount devtmpfs at /dev if the kernel mounts the root
++	  filesystem. It will not affect initramfs based mounting.
 +	  If unsure, say N here.
 +
  config STANDALONE
@@ -545,24 +597,6 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	sys_chroot(".");
  }
 -
---- a/init/initramfs.c
-+++ b/init/initramfs.c
-@@ -8,6 +8,7 @@
- #include <linux/dirent.h>
- #include <linux/syscalls.h>
- #include <linux/utime.h>
-+#include <linux/device.h>
- 
- static __initdata char *message;
- static void __init error(char *x)
-@@ -600,6 +601,7 @@ static int __init populate_rootfs(void)
- 			initrd_end - initrd_start);
- 		if (err)
- 			printk(KERN_EMERG "Initramfs unpacking failed: %s\n", err);
-+		devtmpfs_mount("dev");
- 		free_initrd();
- #endif
- 	}
 --- a/init/main.c
 +++ b/init/main.c
 @@ -64,6 +64,7 @@
