@@ -1,7 +1,7 @@
 From kay.sievers@vrfy.org  Thu Apr 30 07:25:40 2009
 From: Kay Sievers <kay.sievers@vrfy.org>
 Date: Thu, 30 Apr 2009 15:23:42 +0200
-Subject: Driver Core: devtmpfs - driver core maintained /dev tmpfs
+Subject: Driver Core: devtmpfs - kernel-maintained tmpfs-based /dev
 Cc: Greg KH <greg@kroah.com>, Jan Blunck <jblunck@suse.de>
 Message-ID: <1241097822.2516.3.camel@poy>
 
@@ -10,58 +10,50 @@ From: Kay Sievers <kay.sievers@vrfy.org>
 
 Devtmpfs lets the kernel create a tmpfs instance called devtmpfs
 very early at kernel initialization, before any driver-core device
-is registered. Every device with a major/minor will create a
+is registered. Every device with a major/minor will provide a
 device node in devtmpfs.
 
 Devtmpfs can be changed and altered by userspace at any time,
-and in any way needed - just like today's udev-mounted tmpfs. Unmodified
-udev versions will run just fine on top of it, and will recognize an
-already existing kernel-created device node and use it.
-
+and in any way needed - just like today's udev-mounted tmpfs.
+Unmodified udev versions will run just fine on top of it, and will
+recognize an already existing kernel-created device node and use it.
 The default node permissions are root:root 0600. Proper permissions
-and user/group ownership, meaningful symlinks, all other policy besides
-the node name, still needs to be applied by udev, just as without
-devtmpfs.
+and user/group ownership, meaningful symlinks, all other policy still
+needs to be applied by userspace.
 
 If a node is created by devtmps, devtmpfs will remove the device node
 when the device goes away. If the device node was created by
 userspace, or the devtmpfs created node was replaced by userspace, it
-will not be removed by devtmpfs.
+will no longer be removed by devtmpfs.
 
-If automatically mounted, it makes init=/bin/sh work without any
-further userspace support. /dev will be fully populated and dynamic,
-and always reflect the current device state of the kernel. Especially
-in the face of the already implemented dynamic device numbers, this
-can be very helpful in a rescue situation, where static devices nodes
-may no longer work correctly.
-Custom, embedded-like systems should be able to use this as a dynamic
-/dev directory without any need for aditional userspace tools.
+If it is requested to auto-mount it, it makes init=/bin/sh work
+without any further userspace support. /dev will be fully populated
+and dynamic, and always reflect the current device state of the kernel.
+With the commonly used dynamic device numbers, it solves the problem
+where static devices nodes may point to the wrong devices.
 
-With the kernel populated /dev, existing initramfs or kernel-mount
-bootup logic can be optimized to be more efficient, and not to require a
-full coldplug run, which is currently needed to bootstrap the inital
-/dev directory content, before continuing bringing up the rest of
-the system. There will be no missed events to replay, because /dev is
-available before the first kernel device is registered with the
-driver-core.
+It is intended to make the initial bootup logic simpler and more robust,
+by de-coupling the creation of the inital environment, to reliably run
+userspace processes, from a complex userspace bootstrap logic to provide
+a working /dev.
 
 Signed-off-by: Kay Sievers <kay.sievers@vrfy.org>
 Signed-off-by: Jan Blunck <jblunck@suse.de>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
- drivers/base/Kconfig     |   25 ++
+ drivers/base/Kconfig     |   25 +++
  drivers/base/Makefile    |    1 
  drivers/base/base.h      |    6 
  drivers/base/core.c      |    3 
- drivers/base/devtmpfs.c  |  405 +++++++++++++++++++++++++++++++++++++++++++++++
+ drivers/base/devtmpfs.c  |  367 +++++++++++++++++++++++++++++++++++++++++++++++
  drivers/base/init.c      |    1 
  include/linux/device.h   |   10 +
- include/linux/shmem_fs.h |    2 
+ include/linux/shmem_fs.h |    3 
  init/do_mounts.c         |    2 
  init/main.c              |    2 
- mm/shmem.c               |    6 
- 11 files changed, 458 insertions(+), 5 deletions(-)
+ mm/shmem.c               |    9 -
+ 11 files changed, 422 insertions(+), 7 deletions(-)
 
 --- a/drivers/base/base.h
 +++ b/drivers/base/base.h
@@ -96,23 +88,18 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	}
 --- /dev/null
 +++ b/drivers/base/devtmpfs.c
-@@ -0,0 +1,405 @@
+@@ -0,0 +1,367 @@
 +/*
-+ * devtmpfs - tmpfs based device node filesystem
++ * devtmpfs - kernel-maintained tmpfs-based /dev
 + *
 + * Copyright (C) 2009, Kay Sievers <kay.sievers@vrfy.org>
 + *
-+ * During bootup, before any driver core device is registered, a tmpfs
-+ * filesystem is created. Every device which requests a devno, will
-+ * create a device node in this filesystem. The node is named after the
-+ * the nameof the device, or the susbsytem can provide a custom name
-+ * for the node.
-+ *
-+ * All devices are owned by root. This is intended to simplify bootup, and
-+ * make it possible to delay the initial coldplug done by udev in userspace.
-+ *
-+ * It should also provide a simpler way for rescue systems to bring up a
-+ * kernel with dynamic major/minor numbers.
++ * During bootup, before any driver core device is registered,
++ * devtmpfs, a tmpfs-based filesystem is created. Every driver-core
++ * device which requests a device node, will add a node in this
++ * filesystem. The node is named after the the name of the device,
++ * or the susbsytem can provide a custom name. All devices are
++ * owned by root and have a mode of 0600.
 + */
 +
 +#include <linux/kernel.h>
@@ -122,12 +109,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +#include <linux/genhd.h>
 +#include <linux/namei.h>
 +#include <linux/fs.h>
++#include <linux/shmem_fs.h>
 +#include <linux/cred.h>
++#include <linux/init_task.h>
 +
-+static DECLARE_MUTEX(dev_sb_sem);
 +static struct vfsmount *dev_mnt;
-+static struct file_system_type dev_fs_type;
-+static struct cred *kern_cred;
 +
 +#if defined CONFIG_DEVTMPFS_MOUNT
 +static int dev_mount = 1;
@@ -145,33 +131,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +static int dev_get_sb(struct file_system_type *fs_type, int flags,
 +		      const char *dev_name, void *data, struct vfsmount *mnt)
 +{
-+	int ret = 0;
-+
-+	down(&dev_sb_sem);
-+	if (!dev_mnt) {
-+		static struct file_system_type *tmpfs;
-+
-+		tmpfs = get_fs_type("tmpfs");
-+		if (!tmpfs) {
-+			printk(KERN_ERR "dev_get_sb: unable get tmpfs "
-+			       "fstype\n");
-+			ret = -ENOENT;
-+			goto out;
-+		}
-+		ret = tmpfs->get_sb(fs_type, flags, dev_name, data, mnt);
-+		if (ret) {
-+			printk(KERN_ERR "dev_get_sb: unable to init "
-+			       "tmpfs superblock\n");
-+			goto out;
-+		}
-+		dev_mnt = mnt;
-+	} else {
-+		/* we use a tmpfs superblock, fill_super() is not called */
-+		get_sb_single(fs_type, flags, data, NULL, mnt);
-+	}
-+out:
-+	up(&dev_sb_sem);
-+	return ret;
++	return get_sb_single(fs_type, flags, data, shmem_fill_super, mnt);
 +}
 +
 +static struct file_system_type dev_fs_type = {
@@ -264,6 +224,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +{
 +	const char *tmp = NULL;
 +	const char *nodename;
++	const struct cred *curr_cred;
 +	mode_t mode;
 +	struct nameidata nd;
 +	struct dentry *dentry;
@@ -281,6 +242,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	else
 +		mode = S_IFCHR|0600;
 +
++	curr_cred = override_creds(&init_cred);
 +	err = vfs_path_lookup(dev_mnt->mnt_root, dev_mnt,
 +			      nodename, LOOKUP_PARENT, &nd);
 +	if (err == -ENOENT) {
@@ -289,17 +251,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		err = vfs_path_lookup(dev_mnt->mnt_root, dev_mnt,
 +				      nodename, LOOKUP_PARENT, &nd);
 +		if (err)
-+			goto out_name;
++			goto out;
 +	}
 +
 +	dentry = lookup_create(&nd, 0);
 +	if (!IS_ERR(dentry)) {
-+		const struct cred *curr_cred;
-+
-+		curr_cred = override_creds(kern_cred);
 +		err = vfs_mknod(nd.path.dentry->d_inode,
 +				dentry, mode, dev->devt);
-+		revert_creds(curr_cred);
 +		/* mark as kernel created inode */
 +		if (!err)
 +			dentry->d_inode->i_private = &dev_mnt;
@@ -310,8 +268,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	mutex_unlock(&nd.path.dentry->d_inode->i_mutex);
 +
 +	path_put(&nd.path);
-+out_name:
++out:
 +	kfree(tmp);
++	revert_creds(curr_cred);
 +	return err;
 +}
 +
@@ -393,6 +352,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +{
 +	const char *tmp = NULL;
 +	const char *nodename;
++	const struct cred *curr_cred;
 +	struct nameidata nd;
 +	struct dentry *dentry;
 +	struct kstat stat;
@@ -406,10 +366,11 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	if (!nodename)
 +		return -ENOMEM;
 +
++	curr_cred = override_creds(&init_cred);
 +	err = vfs_path_lookup(dev_mnt->mnt_root, dev_mnt,
 +			      nodename, LOOKUP_PARENT, &nd);
 +	if (err)
-+		goto out_name;
++		goto out;
 +
 +	mutex_lock_nested(&nd.path.dentry->d_inode->i_mutex, I_MUTEX_PARENT);
 +	dentry = lookup_one_len(nd.last.name, nd.path.dentry, nd.last.len);
@@ -434,13 +395,15 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	path_put(&nd.path);
 +	if (deleted && strchr(nodename, '/'))
 +		delete_path(nodename);
-+out_name:
++out:
 +	kfree(tmp);
++	revert_creds(curr_cred);
 +	return err;
 +}
 +
-+/* After the root filesystem is mounted by the kernel at /root, or the
-+ * initramfs in extracted at /root, this tmpfs will be mounted at /root/dev.
++/*
++ * If configured, or requested by the commandline, devtmpfs will be
++ * auto-mounted after the kernel mounted the root filesystem.
 + */
 +int devtmpfs_mount(const char *mountpoint)
 +{
@@ -466,7 +429,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +}
 +
 +/*
-+ * Create tmpfs mount, created core devices will add their device device
++ * Create devtmpfs instance, driver-core devices will add their device
 + * nodes here.
 + */
 +int __init devtmpfs_init(void)
@@ -474,17 +437,10 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +	int err;
 +	struct vfsmount *mnt;
 +
-+	kern_cred = prepare_kernel_cred(NULL);
-+	if (!kern_cred) {
-+		printk(KERN_ERR "devtmpfs: unable to create credentials\n");
-+		return -EINVAL;
-+	}
-+
 +	err = register_filesystem(&dev_fs_type);
 +	if (err) {
 +		printk(KERN_ERR "devtmpfs: unable to register devtmpfs "
 +		       "type %i\n", err);
-+		put_cred(kern_cred);
 +		return err;
 +	}
 +
@@ -493,11 +449,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 +		err = PTR_ERR(mnt);
 +		printk(KERN_ERR "devtmpfs: unable to create devtmpfs %i\n", err);
 +		unregister_filesystem(&dev_fs_type);
-+		put_cred(kern_cred);
 +		return err;
 +	}
-+
-+	dev_mkdir("shm", 01755);
++	dev_mnt = mnt;
 +
 +	printk(KERN_INFO "devtmpfs: initialized\n");
 +	return 0;
@@ -577,11 +531,12 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  
 --- a/include/linux/shmem_fs.h
 +++ b/include/linux/shmem_fs.h
-@@ -42,6 +42,8 @@ static inline struct shmem_inode_info *S
+@@ -42,6 +42,9 @@ static inline struct shmem_inode_info *S
  	return container_of(inode, struct shmem_inode_info, vfs_inode);
  }
  
 +extern int init_tmpfs(void);
++extern int shmem_fill_super(struct super_block *sb, void *data, int silent);
 +
  #ifdef CONFIG_TMPFS_POSIX_ACL
  int shmem_permission(struct inode *, int);
@@ -617,7 +572,17 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	do_initcalls();
 --- a/mm/shmem.c
 +++ b/mm/shmem.c
-@@ -2523,7 +2523,7 @@ static struct file_system_type tmpfs_fs_
+@@ -2297,8 +2297,7 @@ static void shmem_put_super(struct super
+ 	sb->s_fs_info = NULL;
+ }
+ 
+-static int shmem_fill_super(struct super_block *sb,
+-			    void *data, int silent)
++int shmem_fill_super(struct super_block *sb, void *data, int silent)
+ {
+ 	struct inode *inode;
+ 	struct dentry *root;
+@@ -2523,7 +2522,7 @@ static struct file_system_type tmpfs_fs_
  	.kill_sb	= kill_litter_super,
  };
  
@@ -626,7 +591,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  {
  	int error;
  
-@@ -2580,7 +2580,7 @@ static struct file_system_type tmpfs_fs_
+@@ -2580,7 +2579,7 @@ static struct file_system_type tmpfs_fs_
  	.kill_sb	= kill_litter_super,
  };
  
@@ -635,7 +600,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  {
  	BUG_ON(register_filesystem(&tmpfs_fs_type) != 0);
  
-@@ -2691,5 +2691,3 @@ int shmem_zero_setup(struct vm_area_stru
+@@ -2691,5 +2690,3 @@ int shmem_zero_setup(struct vm_area_stru
  	vma->vm_ops = &shmem_vm_ops;
  	return 0;
  }
