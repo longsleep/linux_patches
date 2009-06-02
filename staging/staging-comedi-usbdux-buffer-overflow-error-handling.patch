@@ -1,0 +1,76 @@
+From BerndPorr@f2s.com  Tue Jun  2 14:40:40 2009
+From: Bernd Porr <BerndPorr@f2s.com>
+Date: Sun, 24 May 2009 20:36:09 +0100
+Subject: Staging: comedi: usbdux: buffer overflow error handling
+To: Greg KH <greg@kroah.com>
+Cc: comedi_list@googlegroups.com, Greg KH <gregkh@suse.de>
+Message-ID: <4A19A1A9.5080606@f2s.com>
+
+From: Bernd Porr <BerndPorr@f2s.com>
+
+These changes guarantee that the URBs are not resubmitted in case of a
+comedi buffer overflow.  Otherwise this runs in the background even when
+the userspace program has terminated.
+
+From: Bernd Porr <BerndPorr@f2s.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/staging/comedi/drivers/usbdux.c     |   15 ++++++++++-----
+ drivers/staging/comedi/drivers/usbduxfast.c |   11 ++++++++---
+ 2 files changed, 18 insertions(+), 8 deletions(-)
+
+--- a/drivers/staging/comedi/drivers/usbdux.c
++++ b/drivers/staging/comedi/drivers/usbdux.c
+@@ -509,14 +509,19 @@ static void usbduxsub_ai_IsocIrq(struct 
+ 	for (i = 0; i < n; i++) {
+ 		/* transfer data */
+ 		if (CR_RANGE(s->async->cmd.chanlist[i]) <= 1) {
+-			comedi_buf_put
++			err = comedi_buf_put
+ 				(s->async,
+-				le16_to_cpu(this_usbduxsub->
+-					inBuffer[i]) ^ 0x800);
++				 le16_to_cpu(this_usbduxsub->
++					     inBuffer[i]) ^ 0x800);
+ 		} else {
+-			comedi_buf_put
++			err = comedi_buf_put
+ 				(s->async,
+-				le16_to_cpu(this_usbduxsub->inBuffer[i]));
++				 le16_to_cpu(this_usbduxsub->inBuffer[i]));
++		}
++		if (unlikely(err == 0)) {
++			/* buffer overflow */
++			usbdux_ai_stop(this_usbduxsub, 0);
++			return;
+ 		}
+ 	}
+ 	/* tell comedi that data is there */
+--- a/drivers/staging/comedi/drivers/usbduxfast.c
++++ b/drivers/staging/comedi/drivers/usbduxfast.c
+@@ -406,7 +406,7 @@ static void usbduxfastsub_ai_Irq(struct 
+ 					udfs->ai_sample_count
+ 					* sizeof(uint16_t));
+ 				usbduxfast_ai_stop(udfs, 0);
+-				/* say comedi that the acquistion is over */
++				/* tell comedi that the acquistion is over */
+ 				s->async->events |= COMEDI_CB_EOA;
+ 				comedi_event(udfs->comedidev, s);
+ 				return;
+@@ -414,8 +414,13 @@ static void usbduxfastsub_ai_Irq(struct 
+ 			udfs->ai_sample_count -= n;
+ 		}
+ 		/* write the full buffer to comedi */
+-		cfc_write_array_to_buffer(s, urb->transfer_buffer,
+-					  urb->actual_length);
++		err = cfc_write_array_to_buffer(s, urb->transfer_buffer,
++						urb->actual_length);
++		if (unlikely(err == 0)) {
++			/* buffer overflow */
++			usbduxfast_ai_stop(udfs, 0);
++			return;
++		}
+ 
+ 		/* tell comedi that data is there */
+ 		comedi_event(udfs->comedidev, s);

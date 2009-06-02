@@ -1,0 +1,183 @@
+From dongxiao.xu@intel.com  Tue Jun  2 15:07:55 2009
+From: "Xu, Dongxiao" <dongxiao.xu@intel.com>
+Date: Sun, 31 May 2009 14:44:01 +0800
+Subject: Staging: heci: fix the problem that file_ext->state should be protected by device_lock
+To: "greg@kroah.com" <greg@kroah.com>
+Cc: "Nashif, Anas" <anas.nashif@intel.com>, "Obara, Marcin" <marcin.obara@intel.com>
+Message-ID: <EADF0A36011179459010BDF5142A457501C9BF2AE7@pdsmsx502.ccr.corp.intel.com>
+
+
+From: Dongxiao Xu <dongxiao.xu@intel.com>
+
+While access file_ext->state, we should use device_lock to protect it. The
+original codes miss this in some places.
+
+Signed-off-by: Dongxiao Xu <dongxiao.xu@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/staging/heci/heci_init.c |    9 +++++++--
+ drivers/staging/heci/heci_main.c |   15 ++++++++++++---
+ drivers/staging/heci/io_heci.c   |    8 +++++++-
+ 3 files changed, 26 insertions(+), 6 deletions(-)
+
+--- a/drivers/staging/heci/heci_init.c
++++ b/drivers/staging/heci/heci_init.c
+@@ -998,8 +998,12 @@ int heci_disconnect_host_client(struct i
+ 	if ((!dev) || (!file_ext))
+ 		return -ENODEV;
+ 
+-	if (file_ext->state != HECI_FILE_DISCONNECTING)
++	spin_lock_bh(&dev->device_lock);
++	if (file_ext->state != HECI_FILE_DISCONNECTING) {
++		spin_unlock_bh(&dev->device_lock);
+ 		return 0;
++	}
++	spin_unlock_bh(&dev->device_lock);
+ 
+ 	priv_cb = kzalloc(sizeof(struct heci_cb_private), GFP_KERNEL);
+ 	if (!priv_cb)
+@@ -1031,6 +1035,8 @@ int heci_disconnect_host_client(struct i
+ 	err = wait_event_timeout(dev->wait_recvd_msg,
+ 		 (HECI_FILE_DISCONNECTED == file_ext->state),
+ 		 timeout * HZ);
++
++	spin_lock_bh(&dev->device_lock);
+ 	if (HECI_FILE_DISCONNECTED == file_ext->state) {
+ 		rets = 0;
+ 		DBG("successfully disconnected from fw client.\n");
+@@ -1045,7 +1051,6 @@ int heci_disconnect_host_client(struct i
+ 		DBG("failed to disconnect from fw client.\n");
+ 	}
+ 
+-	spin_lock_bh(&dev->device_lock);
+ 	heci_flush_list(&dev->ctrl_rd_list, file_ext);
+ 	heci_flush_list(&dev->ctrl_wr_list, file_ext);
+ 	spin_unlock_bh(&dev->device_lock);
+--- a/drivers/staging/heci/heci_main.c
++++ b/drivers/staging/heci/heci_main.c
+@@ -751,7 +751,9 @@ static int heci_open(struct inode *inode
+ 		(1 << (file_ext->host_client_id % 8));
+ 	spin_unlock_bh(&dev->device_lock);
+ 	spin_lock(&file_ext->file_lock);
++	spin_lock_bh(&dev->device_lock);
+ 	file_ext->state = HECI_FILE_INITIALIZING;
++	spin_unlock_bh(&dev->device_lock);
+ 	file_ext->sm_state = 0;
+ 
+ 	file->private_data = file_ext;
+@@ -785,8 +787,10 @@ static int heci_release(struct inode *in
+ 
+ 	if (file_ext != &dev->iamthif_file_ext) {
+ 		spin_lock(&file_ext->file_lock);
++		spin_lock_bh(&dev->device_lock);
+ 		if (file_ext->state == HECI_FILE_CONNECTED) {
+ 			file_ext->state = HECI_FILE_DISCONNECTING;
++			spin_unlock_bh(&dev->device_lock);
+ 			spin_unlock(&file_ext->file_lock);
+ 			DBG("disconnecting client host client = %d, "
+ 			    "ME client = %d\n",
+@@ -794,8 +798,8 @@ static int heci_release(struct inode *in
+ 			    file_ext->me_client_id);
+ 			rets = heci_disconnect_host_client(dev, file_ext);
+ 			spin_lock(&file_ext->file_lock);
++			spin_lock_bh(&dev->device_lock);
+ 		}
+-		spin_lock_bh(&dev->device_lock);
+ 		heci_flush_queues(dev, file_ext);
+ 		DBG("remove client host client = %d, ME client = %d\n",
+ 		    file_ext->host_client_id,
+@@ -983,12 +987,15 @@ static ssize_t heci_read(struct file *fi
+ 			return -ERESTARTSYS;
+ 		}
+ 
++		spin_lock_bh(&dev->device_lock);
+ 		if (HECI_FILE_INITIALIZING == file_ext->state ||
+ 		    HECI_FILE_DISCONNECTED == file_ext->state ||
+ 		    HECI_FILE_DISCONNECTING == file_ext->state) {
++			spin_unlock_bh(&dev->device_lock);
+ 			rets = -EBUSY;
+ 			goto out;
+ 		}
++		spin_unlock_bh(&dev->device_lock);
+ 		spin_lock_bh(&file_ext->read_io_lock);
+ 	}
+ 
+@@ -1225,6 +1232,7 @@ static ssize_t heci_write(struct file *f
+ 	priv_write_cb->request_buffer.size = length;
+ 
+ 	spin_lock(&file_ext->write_io_lock);
++	spin_lock_bh(&dev->device_lock);
+ 	DBG("host client = %d, ME client = %d\n",
+ 	    file_ext->host_client_id, file_ext->me_client_id);
+ 	if (file_ext->state != HECI_FILE_CONNECTED) {
+@@ -1232,7 +1240,7 @@ static ssize_t heci_write(struct file *f
+ 		DBG("host client = %d,  is not connected to ME client = %d",
+ 		    file_ext->host_client_id,
+ 		    file_ext->me_client_id);
+-
++		spin_unlock_bh(&dev->device_lock);
+ 		goto unlock;
+ 	}
+ 	for (i = 0; i < dev->num_heci_me_clients; i++) {
+@@ -1243,15 +1251,16 @@ static ssize_t heci_write(struct file *f
+ 	BUG_ON(dev->me_clients[i].client_id != file_ext->me_client_id);
+ 	if (i == dev->num_heci_me_clients) {
+ 		rets = -ENODEV;
++		spin_unlock_bh(&dev->device_lock);
+ 		goto unlock;
+ 	}
+ 	if (length > dev->me_clients[i].props.max_msg_length || length <= 0) {
+ 		rets = -EINVAL;
++		spin_unlock_bh(&dev->device_lock);
+ 		goto unlock;
+ 	}
+ 	priv_write_cb->file_private = file_ext;
+ 
+-	spin_lock_bh(&dev->device_lock);
+ 	if (flow_ctrl_creds(dev, file_ext) &&
+ 		dev->host_buffer_is_empty) {
+ 		spin_unlock_bh(&dev->device_lock);
+--- a/drivers/staging/heci/io_heci.c
++++ b/drivers/staging/heci/io_heci.c
+@@ -297,6 +297,7 @@ int heci_ioctl_connect_client(struct iam
+ 		if (!heci_connect(dev, file_ext)) {
+ 			rets = -ENODEV;
+ 			spin_unlock_bh(&dev->device_lock);
++			spin_unlock(&file_ext->file_lock);
+ 			goto end;
+ 		} else {
+ 			file_ext->timer_count = HECI_CONNECT_TIMEOUT;
+@@ -320,7 +321,9 @@ int heci_ioctl_connect_client(struct iam
+ 			 || HECI_FILE_DISCONNECTED == file_ext->state),
+ 			timeout * HZ);
+ 
++	spin_lock_bh(&dev->device_lock);
+ 	if (HECI_FILE_CONNECTED == file_ext->state) {
++		spin_unlock_bh(&dev->device_lock);
+ 		DBG("successfully connected to FW client.\n");
+ 		rets = file_ext->status;
+ 		/* now copy the data to user space */
+@@ -337,6 +340,7 @@ int heci_ioctl_connect_client(struct iam
+ 	} else {
+ 		DBG("failed to connect to FW client.file_ext->state = %d.\n",
+ 		    file_ext->state);
++		spin_unlock_bh(&dev->device_lock);
+ 		if (!err) {
+ 			DBG("wait_event_interruptible_timeout failed on client"
+ 			    " connect message fw response message.\n");
+@@ -637,11 +641,13 @@ int heci_start_read(struct iamt_heci_dev
+ 		DBG("received wrong function input param.\n");
+ 		return -ENODEV;
+ 	}
++
++	spin_lock_bh(&dev->device_lock);
+ 	if (file_ext->state != HECI_FILE_CONNECTED) {
++		spin_unlock_bh(&dev->device_lock);
+ 		return -ENODEV;
+ 	}
+ 
+-	spin_lock_bh(&dev->device_lock);
+ 	if (dev->heci_state != HECI_ENABLED) {
+ 		spin_unlock_bh(&dev->device_lock);
+ 		return -ENODEV;

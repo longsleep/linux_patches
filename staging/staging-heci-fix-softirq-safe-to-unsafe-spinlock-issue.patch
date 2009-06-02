@@ -1,0 +1,212 @@
+From dongxiao.xu@intel.com  Tue Jun  2 15:06:27 2009
+From: "Xu, Dongxiao" <dongxiao.xu@intel.com>
+Date: Sun, 31 May 2009 14:43:46 +0800
+Subject: Staging: heci: fix softirq safe to unsafe spinlock issue
+To: "greg@kroah.com" <greg@kroah.com>
+Cc: "Nashif, Anas" <anas.nashif@intel.com>, "Obara, Marcin" <marcin.obara@intel.com>
+Message-ID: <EADF0A36011179459010BDF5142A457501C9BF2AE2@pdsmsx502.ccr.corp.intel.com>
+
+
+From: Dongxiao Xu <dongxiao.xu@intel.com>
+
+When spinlock is nested, and the outside one is spin_lock_bh, the inner
+spinlock should also be spin_lock_bh, otherwise it will bring softirq-safe
+to softirq-unsafe lock conversion.
+
+Signed-off-by: Dongxiao Xu <dongxiao.xu@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/staging/heci/heci_main.c |   24 ++++++++++++------------
+ drivers/staging/heci/interrupt.c |    8 ++++----
+ drivers/staging/heci/io_heci.c   |   20 ++++++++++----------
+ 3 files changed, 26 insertions(+), 26 deletions(-)
+
+--- a/drivers/staging/heci/heci_main.c
++++ b/drivers/staging/heci/heci_main.c
+@@ -955,10 +955,10 @@ static ssize_t heci_read(struct file *fi
+ 	}
+ 
+ 	err = heci_start_read(dev, if_num, file_ext);
+-	spin_lock(&file_ext->read_io_lock);
++	spin_lock_bh(&file_ext->read_io_lock);
+ 	if (err != 0 && err != -EBUSY) {
+ 		DBG("heci start read failure with status = %d\n", err);
+-		spin_unlock(&file_ext->read_io_lock);
++		spin_unlock_bh(&file_ext->read_io_lock);
+ 		rets = err;
+ 		goto out;
+ 	}
+@@ -966,10 +966,10 @@ static ssize_t heci_read(struct file *fi
+ 			&& !waitqueue_active(&file_ext->rx_wait)) {
+ 		if (file->f_flags & O_NONBLOCK) {
+ 			rets = -EAGAIN;
+-			spin_unlock(&file_ext->read_io_lock);
++			spin_unlock_bh(&file_ext->read_io_lock);
+ 			goto out;
+ 		}
+-		spin_unlock(&file_ext->read_io_lock);
++		spin_unlock_bh(&file_ext->read_io_lock);
+ 
+ 		if (wait_event_interruptible(file_ext->rx_wait,
+ 			(HECI_READ_COMPLETE == file_ext->reading_state
+@@ -989,20 +989,20 @@ static ssize_t heci_read(struct file *fi
+ 			rets = -EBUSY;
+ 			goto out;
+ 		}
+-		spin_lock(&file_ext->read_io_lock);
++		spin_lock_bh(&file_ext->read_io_lock);
+ 	}
+ 
+ 	priv_cb = file_ext->read_cb;
+ 
+ 	if (!priv_cb) {
+-		spin_unlock(&file_ext->read_io_lock);
++		spin_unlock_bh(&file_ext->read_io_lock);
+ 		return -ENODEV;
+ 	}
+ 	if (file_ext->reading_state != HECI_READ_COMPLETE) {
+-		spin_unlock(&file_ext->read_io_lock);
++		spin_unlock_bh(&file_ext->read_io_lock);
+ 		return 0;
+ 	}
+-	spin_unlock(&file_ext->read_io_lock);
++	spin_unlock_bh(&file_ext->read_io_lock);
+ 	/* now copy the data to user space */
+ copy_buffer:
+ 	DBG("priv_cb->response_buffer size - %d\n",
+@@ -1040,11 +1040,11 @@ free:
+ 		list_del(&priv_cb_pos->cb_list);
+ 	spin_unlock_bh(&dev->device_lock);
+ 	heci_free_cb_private(priv_cb);
+-	spin_lock(&file_ext->read_io_lock);
++	spin_lock_bh(&file_ext->read_io_lock);
+ 	file_ext->reading_state = HECI_IDLE;
+ 	file_ext->read_cb = NULL;
+ 	file_ext->read_pending = 0;
+-	spin_unlock(&file_ext->read_io_lock);
++	spin_unlock_bh(&file_ext->read_io_lock);
+ out:	DBG("end heci read rets= %d\n", rets);
+ 	return rets;
+ }
+@@ -1106,11 +1106,11 @@ static ssize_t heci_write(struct file *f
+ 			list_del(&priv_write_cb->cb_list);
+ 			heci_free_cb_private(priv_write_cb);
+ 			priv_write_cb = NULL;
+-			spin_lock(&file_ext->read_io_lock);
++			spin_lock_bh(&file_ext->read_io_lock);
+ 			file_ext->reading_state = HECI_IDLE;
+ 			file_ext->read_cb = NULL;
+ 			file_ext->read_pending = 0;
+-			spin_unlock(&file_ext->read_io_lock);
++			spin_unlock_bh(&file_ext->read_io_lock);
+ 		}
+ 	} else if (file_ext->reading_state == HECI_IDLE &&
+ 			file_ext->read_pending == 0)
+--- a/drivers/staging/heci/interrupt.c
++++ b/drivers/staging/heci/interrupt.c
+@@ -622,7 +622,7 @@ static int heci_bh_read_client_message(s
+ 				priv_cb_pos->file_private;
+ 		if ((file_ext != NULL) &&
+ 		    (_heci_bh_state_ok(file_ext, heci_hdr))) {
+-			spin_lock(&file_ext->read_io_lock);
++			spin_lock_bh(&file_ext->read_io_lock);
+ 			file_ext->reading_state = HECI_READING;
+ 			buffer = (unsigned char *)
+ 				(priv_cb_pos->response_buffer.data +
+@@ -636,7 +636,7 @@ static int heci_bh_read_client_message(s
+ 					priv_cb_pos->information) {
+ 				DBG("message overflow.\n");
+ 				list_del(&priv_cb_pos->cb_list);
+-				spin_unlock(&file_ext->read_io_lock);
++				spin_unlock_bh(&file_ext->read_io_lock);
+ 				return -ENOMEM;
+ 			}
+ 			if (buffer) {
+@@ -647,7 +647,7 @@ static int heci_bh_read_client_message(s
+ 			if (heci_hdr->msg_complete) {
+ 				file_ext->status = 0;
+ 				list_del(&priv_cb_pos->cb_list);
+-				spin_unlock(&file_ext->read_io_lock);
++				spin_unlock_bh(&file_ext->read_io_lock);
+ 				DBG("completed read host client = %d,"
+ 					"ME client = %d, "
+ 					"data length = %lu\n",
+@@ -662,7 +662,7 @@ static int heci_bh_read_client_message(s
+ 				list_add_tail(&priv_cb_pos->cb_list,
+ 					&complete_list->heci_cb.cb_list);
+ 			} else {
+-				spin_unlock(&file_ext->read_io_lock);
++				spin_unlock_bh(&file_ext->read_io_lock);
+ 			}
+ 
+ 			break;
+--- a/drivers/staging/heci/io_heci.c
++++ b/drivers/staging/heci/io_heci.c
+@@ -648,26 +648,26 @@ int heci_start_read(struct iamt_heci_dev
+ 	}
+ 	spin_unlock_bh(&dev->device_lock);
+ 	DBG("check if read is pending.\n");
+-	spin_lock(&file_ext->read_io_lock);
++	spin_lock_bh(&file_ext->read_io_lock);
+ 	if ((file_ext->read_pending) || (file_ext->read_cb != NULL)) {
+ 		DBG("read is pending.\n");
+-		spin_unlock(&file_ext->read_io_lock);
++		spin_unlock_bh(&file_ext->read_io_lock);
+ 		return -EBUSY;
+ 	}
+-	spin_unlock(&file_ext->read_io_lock);
++	spin_unlock_bh(&file_ext->read_io_lock);
+ 
+ 	priv_cb = kzalloc(sizeof(struct heci_cb_private), GFP_KERNEL);
+ 	if (!priv_cb)
+ 		return -ENOMEM;
+ 
+-	spin_lock(&file_ext->read_io_lock);
++	spin_lock_bh(&file_ext->read_io_lock);
+ 	DBG("allocation call back success\n"
+ 	    "host client = %d, ME client = %d\n",
+ 	    file_ext->host_client_id, file_ext->me_client_id);
+-	spin_unlock(&file_ext->read_io_lock);
++	spin_unlock_bh(&file_ext->read_io_lock);
+ 
+ 	spin_lock_bh(&dev->device_lock);
+-	spin_lock(&file_ext->read_io_lock);
++	spin_lock_bh(&file_ext->read_io_lock);
+ 	for (i = 0; i < dev->num_heci_me_clients; i++) {
+ 		if (dev->me_clients[i].client_id == file_ext->me_client_id)
+ 			break;
+@@ -675,7 +675,7 @@ int heci_start_read(struct iamt_heci_dev
+ 	}
+ 
+ 	BUG_ON(dev->me_clients[i].client_id != file_ext->me_client_id);
+-	spin_unlock(&file_ext->read_io_lock);
++	spin_unlock_bh(&file_ext->read_io_lock);
+ 	if (i == dev->num_heci_me_clients) {
+ 		rets = -ENODEV;
+ 		goto unlock;
+@@ -695,13 +695,13 @@ int heci_start_read(struct iamt_heci_dev
+ 	priv_cb->information = 0;
+ 	priv_cb->file_private = (void *) file_ext;
+ 	spin_lock_bh(&dev->device_lock);
+-	spin_lock(&file_ext->read_io_lock);
++	spin_lock_bh(&file_ext->read_io_lock);
+ 	file_ext->read_cb = priv_cb;
+ 	if (dev->host_buffer_is_empty) {
+ 		dev->host_buffer_is_empty = 0;
+ 		if (!heci_send_flow_control(dev, file_ext)) {
+ 			rets = -ENODEV;
+-			spin_unlock(&file_ext->read_io_lock);
++			spin_unlock_bh(&file_ext->read_io_lock);
+ 			goto unlock;
+ 		} else {
+ 			list_add_tail(&priv_cb->cb_list,
+@@ -711,7 +711,7 @@ int heci_start_read(struct iamt_heci_dev
+ 		list_add_tail(&priv_cb->cb_list,
+ 			      &dev->ctrl_wr_list.heci_cb.cb_list);
+ 	}
+-	spin_unlock(&file_ext->read_io_lock);
++	spin_unlock_bh(&file_ext->read_io_lock);
+ 	spin_unlock_bh(&dev->device_lock);
+ 	return rets;
+ unlock:
