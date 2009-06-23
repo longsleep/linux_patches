@@ -4,21 +4,89 @@ To: Greg KH <greg@kroah.com>
 From: Greg Kroah-Hartman <gregkh@suse.de>
 Subject: Driver core: move dev_get/set_drvdata to drivers/base/dd.c
 
-No one should directly access the driver_data field, so change the
-variable to hopefully state this.  Then move the get/set functions into
-dd.c so that we can properly handle the changes that will be needed to
-these functions in the future when we add the multiple device/driver
-logic to the driver core.
+No one should directly access the driver_data field, so remove the field
+and make it private.  We dynamically create the private field now if it
+is needed, to handle drivers that call get/set before they are
+registered with the driver core.
 
 Also update the copyright notices on these files while we are there.
 
+Cc: Kay Sievers <kay.sievers@vrfy.org>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
- drivers/base/dd.c      |   20 ++++++++++++++++++--
- include/linux/device.h |   20 ++++++++------------
- 2 files changed, 26 insertions(+), 14 deletions(-)
+ drivers/base/base.h    |    5 +++++
+ drivers/base/core.c    |   20 ++++++++++++++------
+ drivers/base/dd.c      |   31 +++++++++++++++++++++++++++++--
+ include/linux/device.h |   16 ++++------------
+ 4 files changed, 52 insertions(+), 20 deletions(-)
 
+--- a/drivers/base/base.h
++++ b/drivers/base/base.h
+@@ -70,6 +70,8 @@ struct class_private {
+  * @knode_parent - node in sibling list
+  * @knode_driver - node in driver list
+  * @knode_bus - node in bus list
++ * @driver_data - private pointer for driver specific info.  Will turn into a
++ * list soon.
+  * @device - pointer back to the struct class that this structure is
+  * associated with.
+  *
+@@ -80,6 +82,7 @@ struct device_private {
+ 	struct klist_node knode_parent;
+ 	struct klist_node knode_driver;
+ 	struct klist_node knode_bus;
++	void *driver_data;
+ 	struct device *device;
+ };
+ #define to_device_private_parent(obj)	\
+@@ -89,6 +92,8 @@ struct device_private {
+ #define to_device_private_bus(obj)	\
+ 	container_of(obj, struct device_private, knode_bus)
+ 
++extern int device_private_init(struct device *dev);
++
+ /* initialisation functions */
+ extern int devices_init(void);
+ extern int buses_init(void);
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@ -843,6 +843,17 @@ static void device_remove_sys_dev_entry(
+ 	}
+ }
+ 
++int device_private_init(struct device *dev)
++{
++	dev->p = kzalloc(sizeof(*dev->p), GFP_KERNEL);
++	if (!dev->p)
++		return -ENOMEM;
++	dev->p->device = dev;
++	klist_init(&dev->p->klist_children, klist_children_get,
++		   klist_children_put);
++	return 0;
++}
++
+ /**
+  * device_add - add device to device hierarchy.
+  * @dev: device.
+@@ -868,14 +879,11 @@ int device_add(struct device *dev)
+ 	if (!dev)
+ 		goto done;
+ 
+-	dev->p = kzalloc(sizeof(*dev->p), GFP_KERNEL);
+ 	if (!dev->p) {
+-		error = -ENOMEM;
+-		goto done;
++		error = device_private_init(dev);
++		if (error)
++			goto done;
+ 	}
+-	dev->p->device = dev;
+-	klist_init(&dev->p->klist_children, klist_children_get,
+-		   klist_children_put);
+ 
+ 	/*
+ 	 * for statically allocated devices, which should all be converted
 --- a/drivers/base/dd.c
 +++ b/drivers/base/dd.c
 @@ -11,8 +11,8 @@
@@ -32,7 +100,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
   *
   * This file is released under the GPLv2
   */
-@@ -380,3 +380,19 @@ void driver_detach(struct device_driver 
+@@ -380,3 +380,30 @@ void driver_detach(struct device_driver 
  		put_device(dev);
  	}
  }
@@ -43,13 +111,24 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 + */
 +void *dev_get_drvdata(const struct device *dev)
 +{
-+	return dev->dd_DO_NOT_USE;
++	if (dev && dev->p)
++		return dev->p->driver_data;
++	return NULL;
 +}
 +EXPORT_SYMBOL(dev_get_drvdata);
 +
 +void dev_set_drvdata(struct device *dev, void *data)
 +{
-+	dev->dd_DO_NOT_USE = data;
++	int error;
++
++	if (!dev)
++		return;
++	if (!dev->p) {
++		error = device_private_init(dev);
++		if (error)
++			return;
++	}
++	dev->p->driver_data = data;
 +}
 +EXPORT_SYMBOL(dev_set_drvdata);
 --- a/include/linux/device.h
@@ -64,19 +143,15 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
   *
   * This file is released under the GPLv2
   *
-@@ -382,7 +383,10 @@ struct device {
+@@ -382,7 +383,6 @@ struct device {
  	struct bus_type	*bus;		/* type of bus device is on */
  	struct device_driver *driver;	/* which driver has allocated this
  					   device */
 -	void		*driver_data;	/* data private to the driver */
-+	void		*dd_DO_NOT_USE;	/* data private to the driver, do
-+					 * not directly touch this field,
-+					 * use the dev_get/set_drvdata()
-+					 * functions instead. */
  	void		*platform_data;	/* Platform specific data, device
  					   core doesn't touch it */
  	struct dev_pm_info	power;
-@@ -448,16 +452,6 @@ static inline void set_dev_node(struct d
+@@ -448,16 +448,6 @@ static inline void set_dev_node(struct d
  }
  #endif
  
@@ -93,7 +168,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  static inline unsigned int dev_get_uevent_suppress(const struct device *dev)
  {
  	return dev->kobj.uevent_suppress;
-@@ -491,6 +485,8 @@ extern int device_rename(struct device *
+@@ -491,6 +481,8 @@ extern int device_rename(struct device *
  extern int device_move(struct device *dev, struct device *new_parent,
  		       enum dpm_order dpm_order);
  extern const char *device_get_nodename(struct device *dev, const char **tmp);
