@@ -1,0 +1,134 @@
+From stern@rowland.harvard.edu  Tue Jun 23 14:59:05 2009
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Thu, 11 Jun 2009 14:56:22 -0400 (EDT)
+Subject: USB: EHCI: update toggle state for linked QHs
+To: Greg KH <gregkh@suse.de>
+Cc: David Brownell <david-b@pacbell.net>, David <david@unsolicited.net>
+Message-ID: <Pine.LNX.4.44L0.0906111452080.4875-100000@iolanthe.rowland.org>
+
+
+This is an update to the "usb-ehci-update-toggle-state-for-linked-qhs"
+patch.  Since an HCD's endpoint_reset method can be called in
+interrupt context, it mustn't assume that interrupts are enabled or
+that it can sleep.
+
+So we revert to the original way of refreshing QHs' toggle bits.  Now
+the endpoint_reset method merely clears the toggle flag in the device
+structure (as was done before) and starts an async QH unlink.  When the
+QH is linked again, after the unlink finishes and an URB is queued,
+the qh_refresh() routine will update the QH's toggle bit.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Tested-by: David <david@unsolicited.net>
+CC: David Brownell <david-b@pacbell.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ drivers/usb/host/ehci-hcd.c |   35 ++++++++++++++++-------------------
+ drivers/usb/host/ehci-q.c   |   19 ++++++++++++++++++-
+ 2 files changed, 34 insertions(+), 20 deletions(-)
+
+--- a/drivers/usb/host/ehci-hcd.c
++++ b/drivers/usb/host/ehci-hcd.c
+@@ -1030,12 +1030,14 @@ ehci_endpoint_reset(struct usb_hcd *hcd,
+ 	struct ehci_hcd		*ehci = hcd_to_ehci(hcd);
+ 	struct ehci_qh		*qh;
+ 	int			eptype = usb_endpoint_type(&ep->desc);
++	int			epnum = usb_endpoint_num(&ep->desc);
++	int			is_out = usb_endpoint_dir_out(&ep->desc);
++	unsigned long		flags;
+ 
+ 	if (eptype != USB_ENDPOINT_XFER_BULK && eptype != USB_ENDPOINT_XFER_INT)
+ 		return;
+ 
+- rescan:
+-	spin_lock_irq(&ehci->lock);
++	spin_lock_irqsave(&ehci->lock, flags);
+ 	qh = ep->hcpriv;
+ 
+ 	/* For Bulk and Interrupt endpoints we maintain the toggle state
+@@ -1044,29 +1046,24 @@ ehci_endpoint_reset(struct usb_hcd *hcd,
+ 	 * the toggle bit in the QH.
+ 	 */
+ 	if (qh) {
++		usb_settoggle(qh->dev, epnum, is_out, 0);
+ 		if (!list_empty(&qh->qtd_list)) {
+ 			WARN_ONCE(1, "clear_halt for a busy endpoint\n");
+-		} else if (qh->qh_state == QH_STATE_IDLE) {
+-			qh->hw_token &= ~cpu_to_hc32(ehci, QTD_TOGGLE);
+-		} else {
+-			/* It's not safe to write into the overlay area
+-			 * while the QH is active.  Unlink it first and
+-			 * wait for the unlink to complete.
++		} else if (qh->qh_state == QH_STATE_LINKED) {
++
++			/* The toggle value in the QH can't be updated
++			 * while the QH is active.  Unlink it now;
++			 * re-linking will call qh_refresh().
+ 			 */
+-			if (qh->qh_state == QH_STATE_LINKED) {
+-				if (eptype == USB_ENDPOINT_XFER_BULK) {
+-					unlink_async(ehci, qh);
+-				} else {
+-					intr_deschedule(ehci, qh);
+-					(void) qh_schedule(ehci, qh);
+-				}
++			if (eptype == USB_ENDPOINT_XFER_BULK) {
++				unlink_async(ehci, qh);
++			} else {
++				intr_deschedule(ehci, qh);
++				(void) qh_schedule(ehci, qh);
+ 			}
+-			spin_unlock_irq(&ehci->lock);
+-			schedule_timeout_uninterruptible(1);
+-			goto rescan;
+ 		}
+ 	}
+-	spin_unlock_irq(&ehci->lock);
++	spin_unlock_irqrestore(&ehci->lock, flags);
+ }
+ 
+ static int ehci_get_frame (struct usb_hcd *hcd)
+--- a/drivers/usb/host/ehci-q.c
++++ b/drivers/usb/host/ehci-q.c
+@@ -93,6 +93,22 @@ qh_update (struct ehci_hcd *ehci, struct
+ 	qh->hw_qtd_next = QTD_NEXT(ehci, qtd->qtd_dma);
+ 	qh->hw_alt_next = EHCI_LIST_END(ehci);
+ 
++	/* Except for control endpoints, we make hardware maintain data
++	 * toggle (like OHCI) ... here (re)initialize the toggle in the QH,
++	 * and set the pseudo-toggle in udev. Only usb_clear_halt() will
++	 * ever clear it.
++	 */
++	if (!(qh->hw_info1 & cpu_to_hc32(ehci, 1 << 14))) {
++		unsigned	is_out, epnum;
++
++		is_out = !(qtd->hw_token & cpu_to_hc32(ehci, 1 << 8));
++		epnum = (hc32_to_cpup(ehci, &qh->hw_info1) >> 8) & 0x0f;
++		if (unlikely (!usb_gettoggle (qh->dev, epnum, is_out))) {
++			qh->hw_token &= ~cpu_to_hc32(ehci, QTD_TOGGLE);
++			usb_settoggle (qh->dev, epnum, is_out, 1);
++		}
++	}
++
+ 	/* HC must see latest qtd and qh data before we clear ACTIVE+HALT */
+ 	wmb ();
+ 	qh->hw_token &= cpu_to_hc32(ehci, QTD_TOGGLE | QTD_STS_PING);
+@@ -834,6 +850,7 @@ done:
+ 	qh->qh_state = QH_STATE_IDLE;
+ 	qh->hw_info1 = cpu_to_hc32(ehci, info1);
+ 	qh->hw_info2 = cpu_to_hc32(ehci, info2);
++	usb_settoggle (urb->dev, usb_pipeendpoint (urb->pipe), !is_input, 1);
+ 	qh_refresh (ehci, qh);
+ 	return qh;
+ }
+@@ -864,7 +881,7 @@ static void qh_link_async (struct ehci_h
+ 		}
+ 	}
+ 
+-	/* clear halt and maybe recover from silicon quirk */
++	/* clear halt and/or toggle; and maybe recover from silicon quirk */
+ 	if (qh->qh_state == QH_STATE_IDLE)
+ 		qh_refresh (ehci, qh);
+ 
