@@ -1,0 +1,78 @@
+From stern@rowland.harvard.edu  Thu Jul  2 15:55:25 2009
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Mon, 29 Jun 2009 17:36:14 -0400 (EDT)
+Subject: USB: EHCI: check for STALL before other errors
+To: Greg KH <greg@kroah.com>
+Cc: David Brownell <david-b@pacbell.net>, USB list <linux-usb@vger.kernel.org>
+Message-ID: <Pine.LNX.4.44L0.0906291735260.18279-100000@iolanthe.rowland.org>
+
+
+This patch (as1257) revises the way ehci-hcd detects STALLs.  The
+logic is a little peculiar because there's no hardware status bit
+specifically meant to indicate a STALL.  You just have to guess that a
+STALL was received if the BABBLE bit (which is fatal) isn't set and
+the transfer stopped before all its retries were used up.
+
+The existing code doesn't do this properly, because it tests for MMF
+(Missed MicroFrame) and DBE (Data Buffer Error) before testing the
+retry counter.  Thus, if a transaction gets either MMF or DBE the
+corresponding flag is set and the transaction is retried.  If the
+second attempt receives a STALL then -EPIPE is the correct return
+value.  But the existing code would see the MMF or DBE flag instead
+and return -EPROTO, -ENOSR, or -ECOMM.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+CC: David Brownell <david-b@pacbell.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/ehci-q.c |   30 ++++++++++++++++--------------
+ 1 file changed, 16 insertions(+), 14 deletions(-)
+
+--- a/drivers/usb/host/ehci-q.c
++++ b/drivers/usb/host/ehci-q.c
+@@ -214,6 +214,14 @@ static int qtd_copy_status (
+ 		if (token & QTD_STS_BABBLE) {
+ 			/* FIXME "must" disable babbling device's port too */
+ 			status = -EOVERFLOW;
++		/* CERR nonzero + halt --> stall */
++		} else if (QTD_CERR(token)) {
++			status = -EPIPE;
++
++		/* In theory, more than one of the following bits can be set
++		 * since they are sticky and the transaction is retried.
++		 * Which to test first is rather arbitrary.
++		 */
+ 		} else if (token & QTD_STS_MMF) {
+ 			/* fs/ls interrupt xfer missed the complete-split */
+ 			status = -EPROTO;
+@@ -222,21 +230,15 @@ static int qtd_copy_status (
+ 				? -ENOSR  /* hc couldn't read data */
+ 				: -ECOMM; /* hc couldn't write data */
+ 		} else if (token & QTD_STS_XACT) {
+-			/* timeout, bad crc, wrong PID, etc; retried */
+-			if (QTD_CERR (token))
+-				status = -EPIPE;
+-			else {
+-				ehci_dbg (ehci, "devpath %s ep%d%s 3strikes\n",
+-					urb->dev->devpath,
+-					usb_pipeendpoint (urb->pipe),
+-					usb_pipein (urb->pipe) ? "in" : "out");
+-				status = -EPROTO;
+-			}
+-		/* CERR nonzero + no errors + halt --> stall */
+-		} else if (QTD_CERR (token))
+-			status = -EPIPE;
+-		else	/* unknown */
++			/* timeout, bad CRC, wrong PID, etc */
++			ehci_dbg(ehci, "devpath %s ep%d%s 3strikes\n",
++				urb->dev->devpath,
++				usb_pipeendpoint(urb->pipe),
++				usb_pipein(urb->pipe) ? "in" : "out");
++			status = -EPROTO;
++		} else {	/* unknown */
+ 			status = -EPROTO;
++		}
+ 
+ 		ehci_vdbg (ehci,
+ 			"dev%d ep%d%s qtd token %08x --> status %d\n",
