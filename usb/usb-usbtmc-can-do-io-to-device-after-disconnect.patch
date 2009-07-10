@@ -1,0 +1,89 @@
+From oliver@neukum.org  Fri Jul 10 15:17:05 2009
+From: Oliver Neukum <oliver@neukum.org>
+Date: Thu, 2 Jul 2009 11:36:30 +0200
+Subject: USB: usbtmc can do IO to device after disconnect
+To: greg@kroah.com, USB list <linux-usb@vger.kernel.org>
+Message-ID: <200907021136.30963.oliver@neukum.org>
+
+
+usbtmc will happily complete read/write requests even after disconnect
+has returned. The fix is to introduce a flag.
+
+
+Signed-off-by: Oliver Neukum <oliver@neukum.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/class/usbtmc.c |   19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+--- a/drivers/usb/class/usbtmc.c
++++ b/drivers/usb/class/usbtmc.c
+@@ -86,6 +86,8 @@ struct usbtmc_device_data {
+ 	bool TermCharEnabled;
+ 	bool auto_abort;
+ 
++	bool zombie; /* fd of disconnected device */
++
+ 	struct usbtmc_dev_capabilities	capabilities;
+ 	struct kref kref;
+ 	struct mutex io_mutex;	/* only one i/o function running at a time */
+@@ -384,6 +386,10 @@ static ssize_t usbtmc_read(struct file *
+ 		return -ENOMEM;
+ 
+ 	mutex_lock(&data->io_mutex);
++	if (data->zombie) {
++		retval = -ENODEV;
++		goto exit;
++	}
+ 
+ 	remaining = count;
+ 	done = 0;
+@@ -496,6 +502,10 @@ static ssize_t usbtmc_write(struct file 
+ 		return -ENOMEM;
+ 
+ 	mutex_lock(&data->io_mutex);
++	if (data->zombie) {
++		retval = -ENODEV;
++		goto exit;
++	}
+ 
+ 	remaining = count;
+ 	done = 0;
+@@ -925,6 +935,10 @@ static long usbtmc_ioctl(struct file *fi
+ 
+ 	data = file->private_data;
+ 	mutex_lock(&data->io_mutex);
++	if (data->zombie) {
++		retval = -ENODEV;
++		goto skip_io_on_zombie;
++	}
+ 
+ 	switch (cmd) {
+ 	case USBTMC_IOCTL_CLEAR_OUT_HALT:
+@@ -952,6 +966,7 @@ static long usbtmc_ioctl(struct file *fi
+ 		break;
+ 	}
+ 
++skip_io_on_zombie:
+ 	mutex_unlock(&data->io_mutex);
+ 	return retval;
+ }
+@@ -995,6 +1010,7 @@ static int usbtmc_probe(struct usb_inter
+ 	usb_set_intfdata(intf, data);
+ 	kref_init(&data->kref);
+ 	mutex_init(&data->io_mutex);
++	data->zombie = 0;
+ 
+ 	/* Initialize USBTMC bTag and other fields */
+ 	data->bTag	= 1;
+@@ -1065,6 +1081,9 @@ static void usbtmc_disconnect(struct usb
+ 	usb_deregister_dev(intf, &usbtmc_class);
+ 	sysfs_remove_group(&intf->dev.kobj, &capability_attr_grp);
+ 	sysfs_remove_group(&intf->dev.kobj, &data_attr_grp);
++	mutex_lock(&data->io_mutex);
++	data->zombie = 1;
++	mutex_unlock(&data->io_mutex);
+ 	kref_put(&data->kref, usbtmc_delete);
+ }
+ 
