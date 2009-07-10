@@ -1,0 +1,85 @@
+From oliver@neukum.org  Fri Jul 10 10:29:15 2009
+From: Oliver Neukum <oliver@neukum.org>
+Date: Wed, 8 Jul 2009 19:09:23 +0200
+Subject: USB: fix race leading to a write after kfree in usbfs
+To: Greg KH <greg@kroah.com>, Alan Stern <stern@rowland.harvard.edu>, Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Message-ID: <200907081909.24254.oliver@neukum.org>
+Content-Disposition: inline
+
+
+
+this fixes a race between async_completed() and proc_reapurbnonblock().
+
+CPU A                   CPU B
+
+spin_lock(&ps->lock);
+list_move_tail(&as->asynclist, &ps->async_completed);
+spin_unlock(&ps->lock);
+
+                                if (!(as = async_getcompleted(ps)))
+                                        return -EAGAIN;
+                                return processcompl(as, (void __user * __user *)arg);
+
+processcompl() calls free_async() which calls kfree(as)
+
+as->status = urb->status;
+if (as->signr) {
+        sinfo.si_signo = as->signr;
+        sinfo.si_errno = as->status;
+        sinfo.si_code = SI_ASYNCIO;
+        sinfo.si_addr = as->userurb;
+        kill_pid_info_as_uid(as->signr, &sinfo, as->pid, as->uid,
+                              as->euid, as->secid);
+}
+snoop(&urb->dev->dev, "urb complete\n");
+snoop_urb(urb, as->userurb);
+
+write after kfree
+
+Signed-off-by: Oliver Neukum <oliver@neukum.org>
+
+---
+ drivers/usb/core/devio.c |   21 +++++++++++++++++----
+ 1 file changed, 17 insertions(+), 4 deletions(-)
+
+--- a/drivers/usb/core/devio.c
++++ b/drivers/usb/core/devio.c
+@@ -325,21 +325,34 @@ static void async_completed(struct urb *
+ 	struct async *as = urb->context;
+ 	struct dev_state *ps = as->ps;
+ 	struct siginfo sinfo;
++	struct pid *pid = NULL;
++	uid_t uid = 0;
++	uid_t euid = 0;
++	u32 secid = 0;
++	int signr;
+ 
+ 	spin_lock(&ps->lock);
+ 	list_move_tail(&as->asynclist, &ps->async_completed);
+-	spin_unlock(&ps->lock);
+ 	as->status = urb->status;
+-	if (as->signr) {
++	signr = as->signr;
++	if (signr) {
+ 		sinfo.si_signo = as->signr;
+ 		sinfo.si_errno = as->status;
+ 		sinfo.si_code = SI_ASYNCIO;
+ 		sinfo.si_addr = as->userurb;
+-		kill_pid_info_as_uid(as->signr, &sinfo, as->pid, as->uid,
+-				      as->euid, as->secid);
++		pid = as->pid;
++		uid = as->uid;
++		euid = as->euid;
++		secid = as->secid;
+ 	}
+ 	snoop(&urb->dev->dev, "urb complete\n");
+ 	snoop_urb(urb, as->userurb);
++	spin_unlock(&ps->lock);
++
++	if (signr)
++		kill_pid_info_as_uid(sinfo.si_signo, &sinfo, pid, uid,
++				      euid, secid);
++
+ 	wake_up(&ps->wait);
+ }
+ 
