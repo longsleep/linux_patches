@@ -1,0 +1,91 @@
+From herton@mandriva.com.br  Fri Jul 10 14:26:21 2009
+From: Herton Ronaldo Krzesinski <herton@mandriva.com.br>
+Date: Thu, 18 Jun 2009 14:43:56 -0300
+Subject: Staging: comedi: s626: use subvendor:subdevice ids for SAA7146 board
+To: Ian Abbott <abbotti@mev.co.uk>
+Cc: "fmhess@users.sourceforge.net" <fmhess@users.sourceforge.net>, Ian Abbott <ian.abbott@mev.co.uk>, Greg KH <gregkh@suse.de>, Gianluca Palli <gpalli@deis.unibo.it>, David Schleef <ds@schleef.org>
+Message-ID: <200906181443.57660.herton@mandriva.com.br>
+
+
+The current s626 comedi driver in staging conflicts with philips SAA7146
+media/dvb based cards, because it claims the same vendor:device pci id
+for all subdevice/subvendor ids. What happens is that for people that have a
+philips SAA7146 media/dvb based card, s626 if available gets loaded by udev
+and makes system freeze (https://qa.mandriva.com/show_bug.cgi?id=51445).
+
+The s626 driver shouldn't claim all 1131:7146 devices. Fix this by
+specifying specific known subvendor:subdevice ids in its pci id table
+list.
+
+Also s626_attach is modified to use now pci_get_subsys instead of
+pci_get_device as reported by Ian Abbott, and now we loop over pci id
+table entries in case more ids are added in the future.
+
+Reference: http://lkml.org/lkml/2009/6/16/552
+
+Signed-off-by: Herton Ronaldo Krzesinski <herton@mandriva.com.br>
+Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/staging/comedi/drivers/s626.c |   35 +++++++++++++++++++---------------
+ 1 file changed, 20 insertions(+), 15 deletions(-)
+
+--- a/drivers/staging/comedi/drivers/s626.c
++++ b/drivers/staging/comedi/drivers/s626.c
+@@ -111,9 +111,13 @@ static const struct s626_board s626_boar
+ #define PCI_VENDOR_ID_S626 0x1131
+ #define PCI_DEVICE_ID_S626 0x7146
+ 
++/*
++ * For devices with vendor:device id == 0x1131:0x7146 you must specify
++ * also subvendor:subdevice ids, because otherwise it will conflict with
++ * Philips SAA7146 media/dvb based cards.
++ */
+ static DEFINE_PCI_DEVICE_TABLE(s626_pci_table) = {
+-	{PCI_VENDOR_ID_S626, PCI_DEVICE_ID_S626, PCI_ANY_ID, PCI_ANY_ID, 0, 0,
+-		0},
++	{PCI_VENDOR_ID_S626, PCI_DEVICE_ID_S626, 0x6000, 0x0272, 0, 0, 0},
+ 	{0}
+ };
+ 
+@@ -499,25 +503,26 @@ static int s626_attach(struct comedi_dev
+ 	resource_size_t resourceStart;
+ 	dma_addr_t appdma;
+ 	struct comedi_subdevice *s;
+-	struct pci_dev *pdev;
++	const struct pci_device_id *ids;
++	struct pci_dev *pdev = NULL;
+ 
+ 	if (alloc_private(dev, sizeof(struct s626_private)) < 0)
+ 		return -ENOMEM;
+ 
+-	for (pdev = pci_get_device(PCI_VENDOR_ID_S626, PCI_DEVICE_ID_S626,
+-			NULL); pdev != NULL;
+-		pdev = pci_get_device(PCI_VENDOR_ID_S626,
+-			PCI_DEVICE_ID_S626, pdev)) {
+-		if (it->options[0] || it->options[1]) {
+-			if (pdev->bus->number == it->options[0] &&
+-				PCI_SLOT(pdev->devfn) == it->options[1]) {
++	for (i = 0; i < (ARRAY_SIZE(s626_pci_table) - 1) && !pdev; i++) {
++		ids = &s626_pci_table[i];
++		do {
++			pdev = pci_get_subsys(ids->vendor, ids->device, ids->subvendor,
++					      ids->subdevice, pdev);
++
++			if ((it->options[0] || it->options[1]) && pdev) {
+ 				/* matches requested bus/slot */
++				if (pdev->bus->number == it->options[0] &&
++				    PCI_SLOT(pdev->devfn) == it->options[1])
++					break;
++			} else
+ 				break;
+-			}
+-		} else {
+-			/* no bus/slot specified */
+-			break;
+-		}
++		} while (1);
+ 	}
+ 	devpriv->pdev = pdev;
+ 
