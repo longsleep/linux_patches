@@ -1,0 +1,125 @@
+From vapier@gentoo.org  Thu Jul 16 16:32:29 2009
+From: Mike Frysinger <vapier@gentoo.org>
+Date: Wed, 15 Jul 2009 23:22:54 -0400
+Subject: USB: isp1760: allow platform devices to customize devflags
+To: Greg KH <greg@kroah.com>
+Cc: linux-kernel@vger.kernel.org, linux-usb@vger.kernel.org, Michael Hennerich <michael.hennerich@analog.com>, Bryan Wu <cooloney@kernel.org>
+Message-ID: <1247714574-7445-1-git-send-email-vapier@gentoo.org>
+
+
+From: Michael Hennerich <michael.hennerich@analog.com>
+
+Platform device support was merged earlier, but support for boards to
+customize the devflags aspect of the controller was not.  We want this on
+Blackfin systems to control the bus width, but might as well expose all of
+the fields while we're at it.
+
+Signed-off-by: Michael Hennerich <michael.hennerich@analog.com>
+Signed-off-by: Bryan Wu <cooloney@kernel.org>
+Signed-off-by: Mike Frysinger <vapier@gentoo.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/isp1760-hcd.c |    4 ++++
+ drivers/usb/host/isp1760-hcd.h |    2 ++
+ drivers/usb/host/isp1760-if.c  |   21 ++++++++++++++++++++-
+ include/linux/usb/isp1760.h    |   18 ++++++++++++++++++
+ 4 files changed, 44 insertions(+), 1 deletion(-)
+
+--- a/drivers/usb/host/isp1760-hcd.c
++++ b/drivers/usb/host/isp1760-hcd.c
+@@ -386,6 +386,10 @@ static int isp1760_hc_setup(struct usb_h
+ 		hwmode |= HW_DACK_POL_HIGH;
+ 	if (priv->devflags & ISP1760_FLAG_DREQ_POL_HIGH)
+ 		hwmode |= HW_DREQ_POL_HIGH;
++	if (priv->devflags & ISP1760_FLAG_INTR_POL_HIGH)
++		hwmode |= HW_INTR_HIGH_ACT;
++	if (priv->devflags & ISP1760_FLAG_INTR_EDGE_TRIG)
++		hwmode |= HW_INTR_EDGE_TRIG;
+ 
+ 	/*
+ 	 * We have to set this first in case we're in 16-bit mode.
+--- a/drivers/usb/host/isp1760-hcd.h
++++ b/drivers/usb/host/isp1760-hcd.h
+@@ -142,6 +142,8 @@ typedef void (packet_enqueue)(struct usb
+ #define ISP1760_FLAG_DACK_POL_HIGH	0x00000010 /* DACK active high */
+ #define ISP1760_FLAG_DREQ_POL_HIGH	0x00000020 /* DREQ active high */
+ #define ISP1760_FLAG_ISP1761		0x00000040 /* Chip is ISP1761 */
++#define ISP1760_FLAG_INTR_POL_HIGH	0x00000080 /* Interrupt polarity active high */
++#define ISP1760_FLAG_INTR_EDGE_TRIG	0x00000100 /* Interrupt edge triggered */
+ 
+ /* chip memory management */
+ struct memory_chunk {
+--- a/drivers/usb/host/isp1760-if.c
++++ b/drivers/usb/host/isp1760-if.c
+@@ -3,6 +3,7 @@
+  * Currently there is support for
+  * - OpenFirmware
+  * - PCI
++ * - PDEV (generic platform device centralized driver model)
+  *
+  * (c) 2007 Sebastian Siewior <bigeasy@linutronix.de>
+  *
+@@ -11,6 +12,7 @@
+ #include <linux/usb.h>
+ #include <linux/io.h>
+ #include <linux/platform_device.h>
++#include <linux/usb/isp1760.h>
+ 
+ #include "../core/hcd.h"
+ #include "isp1760-hcd.h"
+@@ -308,6 +310,8 @@ static int __devinit isp1760_plat_probe(
+ 	struct resource *mem_res;
+ 	struct resource *irq_res;
+ 	resource_size_t mem_size;
++	struct isp1760_platform_data *priv = pdev->dev.platform_data;
++	unsigned int devflags = 0;
+ 	unsigned long irqflags = IRQF_SHARED | IRQF_DISABLED;
+ 
+ 	mem_res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+@@ -330,8 +334,23 @@ static int __devinit isp1760_plat_probe(
+ 	}
+ 	irqflags |= irq_res->flags & IRQF_TRIGGER_MASK;
+ 
++	if (priv) {
++		if (priv->is_isp1761)
++			devflags |= ISP1760_FLAG_ISP1761;
++		if (priv->bus_width_16)
++			devflags |= ISP1760_FLAG_BUS_WIDTH_16;
++		if (priv->port1_otg)
++			devflags |= ISP1760_FLAG_OTG_EN;
++		if (priv->analog_oc)
++			devflags |= ISP1760_FLAG_ANALOG_OC;
++		if (priv->dack_polarity_high)
++			devflags |= ISP1760_FLAG_DACK_POL_HIGH;
++		if (priv->dreq_polarity_high)
++			devflags |= ISP1760_FLAG_DREQ_POL_HIGH;
++	}
++
+ 	hcd = isp1760_register(mem_res->start, mem_size, irq_res->start,
+-			       irqflags, &pdev->dev, dev_name(&pdev->dev), 0);
++			       irqflags, &pdev->dev, dev_name(&pdev->dev), devflags);
+ 	if (IS_ERR(hcd)) {
+ 		pr_warning("isp1760: Failed to register the HCD device\n");
+ 		ret = -ENODEV;
+--- /dev/null
++++ b/include/linux/usb/isp1760.h
+@@ -0,0 +1,18 @@
++/*
++ * board initialization should put one of these into dev->platform_data
++ * and place the isp1760 onto platform_bus named "isp1760-hcd".
++ */
++
++#ifndef __LINUX_USB_ISP1760_H
++#define __LINUX_USB_ISP1760_H
++
++struct isp1760_platform_data {
++	unsigned is_isp1761:1;			/* Chip is ISP1761 */
++	unsigned bus_width_16:1;		/* 16/32-bit data bus width */
++	unsigned port1_otg:1;			/* Port 1 supports OTG */
++	unsigned analog_oc:1;			/* Analog overcurrent */
++	unsigned dack_polarity_high:1;		/* DACK active high */
++	unsigned dreq_polarity_high:1;		/* DREQ active high */
++};
++
++#endif /* __LINUX_USB_ISP1760_H */

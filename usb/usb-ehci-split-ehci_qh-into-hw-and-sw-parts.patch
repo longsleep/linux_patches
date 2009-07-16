@@ -1,0 +1,673 @@
+From alek.du@intel.com  Thu Jul 16 16:16:55 2009
+From: Alek Du <alek.du@intel.com>
+Date: Tue, 14 Jul 2009 07:23:29 +0800
+Subject: USB: EHCI: split ehci_qh into hw and sw parts
+To: Greg KH <greg@kroah.com>
+Cc: David Brownell <david-b@pacbell.net>, Alan Stern <stern@rowland.harvard.edu>
+Message-ID: <20090714072329.000067e7@unknown>
+
+
+From: Alek Du <alek.du@intel.com>
+
+The ehci_qh structure merged hw and sw together which is not good:
+1. More and more items are being added into ehci_qh, the ehci_qh software
+   part are unnecessary to be allocated in DMA qh_pool.
+2. If HCD has local SRAM, the sw part will consume it too, and it won't
+   bring any benefit.
+3. For non-cache-coherence system, the entire ehci_qh is uncachable, actually
+   we only need the hw part to be uncacheable. Spliting them will let the sw
+   part to be cacheable.
+
+Signed-off-by: Alek Du <alek.du@intel.com>
+Cc: David Brownell <dbrownell@users.sourceforge.net>
+CC: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/ehci-dbg.c   |   43 +++++++++++++++------------
+ drivers/usb/host/ehci-hcd.c   |   14 +++++---
+ drivers/usb/host/ehci-mem.c   |   26 ++++++++++------
+ drivers/usb/host/ehci-q.c     |   50 +++++++++++++++++--------------
+ drivers/usb/host/ehci-sched.c |   66 ++++++++++++++++++++++++++++--------------
+ drivers/usb/host/ehci.h       |    9 +++--
+ 6 files changed, 127 insertions(+), 81 deletions(-)
+
+--- a/drivers/usb/host/ehci-dbg.c
++++ b/drivers/usb/host/ehci-dbg.c
+@@ -134,10 +134,11 @@ dbg_qtd (const char *label, struct ehci_
+ static void __maybe_unused
+ dbg_qh (const char *label, struct ehci_hcd *ehci, struct ehci_qh *qh)
+ {
++	struct ehci_qh_hw *hw = qh->hw;
++
+ 	ehci_dbg (ehci, "%s qh %p n%08x info %x %x qtd %x\n", label,
+-		qh, qh->hw_next, qh->hw_info1, qh->hw_info2,
+-		qh->hw_current);
+-	dbg_qtd ("overlay", ehci, (struct ehci_qtd *) &qh->hw_qtd_next);
++		qh, hw->hw_next, hw->hw_info1, hw->hw_info2, hw->hw_current);
++	dbg_qtd("overlay", ehci, (struct ehci_qtd *) &hw->hw_qtd_next);
+ }
+ 
+ static void __maybe_unused
+@@ -400,31 +401,32 @@ static void qh_lines (
+ 	char			*next = *nextp;
+ 	char			mark;
+ 	__le32			list_end = EHCI_LIST_END(ehci);
++	struct ehci_qh_hw	*hw = qh->hw;
+ 
+-	if (qh->hw_qtd_next == list_end)	/* NEC does this */
++	if (hw->hw_qtd_next == list_end)	/* NEC does this */
+ 		mark = '@';
+ 	else
+-		mark = token_mark(ehci, qh->hw_token);
++		mark = token_mark(ehci, hw->hw_token);
+ 	if (mark == '/') {	/* qh_alt_next controls qh advance? */
+-		if ((qh->hw_alt_next & QTD_MASK(ehci))
+-				== ehci->async->hw_alt_next)
++		if ((hw->hw_alt_next & QTD_MASK(ehci))
++				== ehci->async->hw->hw_alt_next)
+ 			mark = '#';	/* blocked */
+-		else if (qh->hw_alt_next == list_end)
++		else if (hw->hw_alt_next == list_end)
+ 			mark = '.';	/* use hw_qtd_next */
+ 		/* else alt_next points to some other qtd */
+ 	}
+-	scratch = hc32_to_cpup(ehci, &qh->hw_info1);
+-	hw_curr = (mark == '*') ? hc32_to_cpup(ehci, &qh->hw_current) : 0;
++	scratch = hc32_to_cpup(ehci, &hw->hw_info1);
++	hw_curr = (mark == '*') ? hc32_to_cpup(ehci, &hw->hw_current) : 0;
+ 	temp = scnprintf (next, size,
+ 			"qh/%p dev%d %cs ep%d %08x %08x (%08x%c %s nak%d)",
+ 			qh, scratch & 0x007f,
+ 			speed_char (scratch),
+ 			(scratch >> 8) & 0x000f,
+-			scratch, hc32_to_cpup(ehci, &qh->hw_info2),
+-			hc32_to_cpup(ehci, &qh->hw_token), mark,
+-			(cpu_to_hc32(ehci, QTD_TOGGLE) & qh->hw_token)
++			scratch, hc32_to_cpup(ehci, &hw->hw_info2),
++			hc32_to_cpup(ehci, &hw->hw_token), mark,
++			(cpu_to_hc32(ehci, QTD_TOGGLE) & hw->hw_token)
+ 				? "data1" : "data0",
+-			(hc32_to_cpup(ehci, &qh->hw_alt_next) >> 1) & 0x0f);
++			(hc32_to_cpup(ehci, &hw->hw_alt_next) >> 1) & 0x0f);
+ 	size -= temp;
+ 	next += temp;
+ 
+@@ -435,10 +437,10 @@ static void qh_lines (
+ 		mark = ' ';
+ 		if (hw_curr == td->qtd_dma)
+ 			mark = '*';
+-		else if (qh->hw_qtd_next == cpu_to_hc32(ehci, td->qtd_dma))
++		else if (hw->hw_qtd_next == cpu_to_hc32(ehci, td->qtd_dma))
+ 			mark = '+';
+ 		else if (QTD_LENGTH (scratch)) {
+-			if (td->hw_alt_next == ehci->async->hw_alt_next)
++			if (td->hw_alt_next == ehci->async->hw->hw_alt_next)
+ 				mark = '#';
+ 			else if (td->hw_alt_next != list_end)
+ 				mark = '/';
+@@ -550,12 +552,15 @@ static ssize_t fill_periodic_buffer(stru
+ 		next += temp;
+ 
+ 		do {
++			struct ehci_qh_hw *hw;
++
+ 			switch (hc32_to_cpu(ehci, tag)) {
+ 			case Q_TYPE_QH:
++				hw = p.qh->hw;
+ 				temp = scnprintf (next, size, " qh%d-%04x/%p",
+ 						p.qh->period,
+ 						hc32_to_cpup(ehci,
+-								&p.qh->hw_info2)
++							&hw->hw_info2)
+ 							/* uframe masks */
+ 							& (QH_CMASK | QH_SMASK),
+ 						p.qh);
+@@ -576,7 +581,7 @@ static ssize_t fill_periodic_buffer(stru
+ 				/* show more info the first time around */
+ 				if (temp == seen_count) {
+ 					u32	scratch = hc32_to_cpup(ehci,
+-							&p.qh->hw_info1);
++							&hw->hw_info1);
+ 					struct ehci_qtd	*qtd;
+ 					char		*type = "";
+ 
+@@ -609,7 +614,7 @@ static ssize_t fill_periodic_buffer(stru
+ 				} else
+ 					temp = 0;
+ 				if (p.qh) {
+-					tag = Q_NEXT_TYPE(ehci, p.qh->hw_next);
++					tag = Q_NEXT_TYPE(ehci, hw->hw_next);
+ 					p = p.qh->qh_next;
+ 				}
+ 				break;
+--- a/drivers/usb/host/ehci.h
++++ b/drivers/usb/host/ehci.h
+@@ -299,8 +299,8 @@ union ehci_shadow {
+  * These appear in both the async and (for interrupt) periodic schedules.
+  */
+ 
+-struct ehci_qh {
+-	/* first part defined by EHCI spec */
++/* first part defined by EHCI spec */
++struct ehci_qh_hw {
+ 	__hc32			hw_next;	/* see EHCI 3.6.1 */
+ 	__hc32			hw_info1;       /* see EHCI 3.6.2 */
+ #define	QH_HEAD		0x00008000
+@@ -318,7 +318,10 @@ struct ehci_qh {
+ 	__hc32			hw_token;
+ 	__hc32			hw_buf [5];
+ 	__hc32			hw_buf_hi [5];
++} __attribute__ ((aligned(32)));
+ 
++struct ehci_qh {
++	struct ehci_qh_hw	*hw;
+ 	/* the rest is HCD-private */
+ 	dma_addr_t		qh_dma;		/* address of qh */
+ 	union ehci_shadow	qh_next;	/* ptr to qh; or periodic */
+@@ -358,7 +361,7 @@ struct ehci_qh {
+ 
+ 	struct usb_device	*dev;		/* access to TT */
+ 	unsigned		clearing_tt:1;	/* Clear-TT-Buf in progress */
+-} __attribute__ ((aligned (32)));
++};
+ 
+ /*-------------------------------------------------------------------------*/
+ 
+--- a/drivers/usb/host/ehci-hcd.c
++++ b/drivers/usb/host/ehci-hcd.c
+@@ -507,6 +507,7 @@ static int ehci_init(struct usb_hcd *hcd
+ 	u32			temp;
+ 	int			retval;
+ 	u32			hcc_params;
++	struct ehci_qh_hw	*hw;
+ 
+ 	spin_lock_init(&ehci->lock);
+ 
+@@ -550,12 +551,13 @@ static int ehci_init(struct usb_hcd *hcd
+ 	 * from automatically advancing to the next td after short reads.
+ 	 */
+ 	ehci->async->qh_next.qh = NULL;
+-	ehci->async->hw_next = QH_NEXT(ehci, ehci->async->qh_dma);
+-	ehci->async->hw_info1 = cpu_to_hc32(ehci, QH_HEAD);
+-	ehci->async->hw_token = cpu_to_hc32(ehci, QTD_STS_HALT);
+-	ehci->async->hw_qtd_next = EHCI_LIST_END(ehci);
++	hw = ehci->async->hw;
++	hw->hw_next = QH_NEXT(ehci, ehci->async->qh_dma);
++	hw->hw_info1 = cpu_to_hc32(ehci, QH_HEAD);
++	hw->hw_token = cpu_to_hc32(ehci, QTD_STS_HALT);
++	hw->hw_qtd_next = EHCI_LIST_END(ehci);
+ 	ehci->async->qh_state = QH_STATE_LINKED;
+-	ehci->async->hw_alt_next = QTD_NEXT(ehci, ehci->async->dummy->qtd_dma);
++	hw->hw_alt_next = QTD_NEXT(ehci, ehci->async->dummy->qtd_dma);
+ 
+ 	/* clear interrupt enables, set irq latency */
+ 	if (log2_irq_thresh < 0 || log2_irq_thresh > 6)
+@@ -984,7 +986,7 @@ rescan:
+ 	/* endpoints can be iso streams.  for now, we don't
+ 	 * accelerate iso completions ... so spin a while.
+ 	 */
+-	if (qh->hw_info1 == 0) {
++	if (qh->hw->hw_info1 == 0) {
+ 		ehci_vdbg (ehci, "iso delay\n");
+ 		goto idle_timeout;
+ 	}
+--- a/drivers/usb/host/ehci-mem.c
++++ b/drivers/usb/host/ehci-mem.c
+@@ -75,7 +75,8 @@ static void qh_destroy(struct ehci_qh *q
+ 	}
+ 	if (qh->dummy)
+ 		ehci_qtd_free (ehci, qh->dummy);
+-	dma_pool_free (ehci->qh_pool, qh, qh->qh_dma);
++	dma_pool_free(ehci->qh_pool, qh->hw, qh->qh_dma);
++	kfree(qh);
+ }
+ 
+ static struct ehci_qh *ehci_qh_alloc (struct ehci_hcd *ehci, gfp_t flags)
+@@ -83,12 +84,14 @@ static struct ehci_qh *ehci_qh_alloc (st
+ 	struct ehci_qh		*qh;
+ 	dma_addr_t		dma;
+ 
+-	qh = (struct ehci_qh *)
+-		dma_pool_alloc (ehci->qh_pool, flags, &dma);
++	qh = kzalloc(sizeof *qh, GFP_ATOMIC);
+ 	if (!qh)
+-		return qh;
+-
+-	memset (qh, 0, sizeof *qh);
++		goto done;
++	qh->hw = (struct ehci_qh_hw *)
++		dma_pool_alloc(ehci->qh_pool, flags, &dma);
++	if (!qh->hw)
++		goto fail;
++	memset(qh->hw, 0, sizeof *qh->hw);
+ 	qh->refcount = 1;
+ 	qh->ehci = ehci;
+ 	qh->qh_dma = dma;
+@@ -99,10 +102,15 @@ static struct ehci_qh *ehci_qh_alloc (st
+ 	qh->dummy = ehci_qtd_alloc (ehci, flags);
+ 	if (qh->dummy == NULL) {
+ 		ehci_dbg (ehci, "no dummy td\n");
+-		dma_pool_free (ehci->qh_pool, qh, qh->qh_dma);
+-		qh = NULL;
++		goto fail1;
+ 	}
++done:
+ 	return qh;
++fail1:
++	dma_pool_free(ehci->qh_pool, qh->hw, qh->qh_dma);
++fail:
++	kfree(qh);
++	return NULL;
+ }
+ 
+ /* to share a qh (cpu threads, or hc) */
+@@ -180,7 +188,7 @@ static int ehci_mem_init (struct ehci_hc
+ 	/* QHs for control/bulk/intr transfers */
+ 	ehci->qh_pool = dma_pool_create ("ehci_qh",
+ 			ehci_to_hcd(ehci)->self.controller,
+-			sizeof (struct ehci_qh),
++			sizeof(struct ehci_qh_hw),
+ 			32 /* byte alignment (for hw parts) */,
+ 			4096 /* can't cross 4K */);
+ 	if (!ehci->qh_pool) {
+--- a/drivers/usb/host/ehci-q.c
++++ b/drivers/usb/host/ehci-q.c
+@@ -87,31 +87,33 @@ qtd_fill(struct ehci_hcd *ehci, struct e
+ static inline void
+ qh_update (struct ehci_hcd *ehci, struct ehci_qh *qh, struct ehci_qtd *qtd)
+ {
++	struct ehci_qh_hw *hw = qh->hw;
++
+ 	/* writes to an active overlay are unsafe */
+ 	BUG_ON(qh->qh_state != QH_STATE_IDLE);
+ 
+-	qh->hw_qtd_next = QTD_NEXT(ehci, qtd->qtd_dma);
+-	qh->hw_alt_next = EHCI_LIST_END(ehci);
++	hw->hw_qtd_next = QTD_NEXT(ehci, qtd->qtd_dma);
++	hw->hw_alt_next = EHCI_LIST_END(ehci);
+ 
+ 	/* Except for control endpoints, we make hardware maintain data
+ 	 * toggle (like OHCI) ... here (re)initialize the toggle in the QH,
+ 	 * and set the pseudo-toggle in udev. Only usb_clear_halt() will
+ 	 * ever clear it.
+ 	 */
+-	if (!(qh->hw_info1 & cpu_to_hc32(ehci, 1 << 14))) {
++	if (!(hw->hw_info1 & cpu_to_hc32(ehci, 1 << 14))) {
+ 		unsigned	is_out, epnum;
+ 
+ 		is_out = !(qtd->hw_token & cpu_to_hc32(ehci, 1 << 8));
+-		epnum = (hc32_to_cpup(ehci, &qh->hw_info1) >> 8) & 0x0f;
++		epnum = (hc32_to_cpup(ehci, &hw->hw_info1) >> 8) & 0x0f;
+ 		if (unlikely (!usb_gettoggle (qh->dev, epnum, is_out))) {
+-			qh->hw_token &= ~cpu_to_hc32(ehci, QTD_TOGGLE);
++			hw->hw_token &= ~cpu_to_hc32(ehci, QTD_TOGGLE);
+ 			usb_settoggle (qh->dev, epnum, is_out, 1);
+ 		}
+ 	}
+ 
+ 	/* HC must see latest qtd and qh data before we clear ACTIVE+HALT */
+ 	wmb ();
+-	qh->hw_token &= cpu_to_hc32(ehci, QTD_TOGGLE | QTD_STS_PING);
++	hw->hw_token &= cpu_to_hc32(ehci, QTD_TOGGLE | QTD_STS_PING);
+ }
+ 
+ /* if it weren't for a common silicon quirk (writing the dummy into the qh
+@@ -129,7 +131,7 @@ qh_refresh (struct ehci_hcd *ehci, struc
+ 		qtd = list_entry (qh->qtd_list.next,
+ 				struct ehci_qtd, qtd_list);
+ 		/* first qtd may already be partially processed */
+-		if (cpu_to_hc32(ehci, qtd->qtd_dma) == qh->hw_current)
++		if (cpu_to_hc32(ehci, qtd->qtd_dma) == qh->hw->hw_current)
+ 			qtd = NULL;
+ 	}
+ 
+@@ -260,7 +262,7 @@ __acquires(ehci->lock)
+ 		struct ehci_qh	*qh = (struct ehci_qh *) urb->hcpriv;
+ 
+ 		/* S-mask in a QH means it's an interrupt urb */
+-		if ((qh->hw_info2 & cpu_to_hc32(ehci, QH_SMASK)) != 0) {
++		if ((qh->hw->hw_info2 & cpu_to_hc32(ehci, QH_SMASK)) != 0) {
+ 
+ 			/* ... update hc-wide periodic stats (for usbfs) */
+ 			ehci_to_hcd(ehci)->self.bandwidth_int_reqs--;
+@@ -315,6 +317,7 @@ qh_completions (struct ehci_hcd *ehci, s
+ 	unsigned		count = 0;
+ 	u8			state;
+ 	__le32			halt = HALT_BIT(ehci);
++	struct ehci_qh_hw	*hw = qh->hw;
+ 
+ 	if (unlikely (list_empty (&qh->qtd_list)))
+ 		return count;
+@@ -393,7 +396,8 @@ qh_completions (struct ehci_hcd *ehci, s
+ 					qtd->hw_token = cpu_to_hc32(ehci,
+ 							token);
+ 					wmb();
+-					qh->hw_token = cpu_to_hc32(ehci, token);
++					hw->hw_token = cpu_to_hc32(ehci,
++							token);
+ 					goto retry_xacterr;
+ 				}
+ 				stopped = 1;
+@@ -436,8 +440,8 @@ qh_completions (struct ehci_hcd *ehci, s
+ 			/* qh unlinked; token in overlay may be most current */
+ 			if (state == QH_STATE_IDLE
+ 					&& cpu_to_hc32(ehci, qtd->qtd_dma)
+-						== qh->hw_current) {
+-				token = hc32_to_cpu(ehci, qh->hw_token);
++						== hw->hw_current) {
++				token = hc32_to_cpu(ehci, hw->hw_token);
+ 
+ 				/* An unlink may leave an incomplete
+ 				 * async transaction in the TT buffer.
+@@ -450,9 +454,9 @@ qh_completions (struct ehci_hcd *ehci, s
+ 			 * patch the qh later and so that completions can't
+ 			 * activate it while we "know" it's stopped.
+ 			 */
+-			if ((halt & qh->hw_token) == 0) {
++			if ((halt & hw->hw_token) == 0) {
+ halt:
+-				qh->hw_token |= halt;
++				hw->hw_token |= halt;
+ 				wmb ();
+ 			}
+ 		}
+@@ -511,7 +515,7 @@ halt:
+ 	 * it after fault cleanup, or recovering from silicon wrongly
+ 	 * overlaying the dummy qtd (which reduces DMA chatter).
+ 	 */
+-	if (stopped != 0 || qh->hw_qtd_next == EHCI_LIST_END(ehci)) {
++	if (stopped != 0 || hw->hw_qtd_next == EHCI_LIST_END(ehci)) {
+ 		switch (state) {
+ 		case QH_STATE_IDLE:
+ 			qh_refresh(ehci, qh);
+@@ -529,7 +533,7 @@ halt:
+ 			 * except maybe high bandwidth ...
+ 			 */
+ 			if ((cpu_to_hc32(ehci, QH_SMASK)
+-					& qh->hw_info2) != 0) {
++					& hw->hw_info2) != 0) {
+ 				intr_deschedule (ehci, qh);
+ 				(void) qh_schedule (ehci, qh);
+ 			} else
+@@ -650,7 +654,7 @@ qh_urb_transaction (
+ 		 * (this will usually be overridden later.)
+ 		 */
+ 		if (is_input)
+-			qtd->hw_alt_next = ehci->async->hw_alt_next;
++			qtd->hw_alt_next = ehci->async->hw->hw_alt_next;
+ 
+ 		/* qh makes control packets use qtd toggle; maybe switch it */
+ 		if ((maxpacket & (this_qtd_len + (maxpacket - 1))) == 0)
+@@ -745,6 +749,7 @@ qh_make (
+ 	int			is_input, type;
+ 	int			maxp = 0;
+ 	struct usb_tt		*tt = urb->dev->tt;
++	struct ehci_qh_hw	*hw;
+ 
+ 	if (!qh)
+ 		return qh;
+@@ -891,8 +896,9 @@ done:
+ 
+ 	/* init as live, toggle clear, advance to dummy */
+ 	qh->qh_state = QH_STATE_IDLE;
+-	qh->hw_info1 = cpu_to_hc32(ehci, info1);
+-	qh->hw_info2 = cpu_to_hc32(ehci, info2);
++	hw = qh->hw;
++	hw->hw_info1 = cpu_to_hc32(ehci, info1);
++	hw->hw_info2 = cpu_to_hc32(ehci, info2);
+ 	usb_settoggle (urb->dev, usb_pipeendpoint (urb->pipe), !is_input, 1);
+ 	qh_refresh (ehci, qh);
+ 	return qh;
+@@ -934,11 +940,11 @@ static void qh_link_async (struct ehci_h
+ 
+ 	/* splice right after start */
+ 	qh->qh_next = head->qh_next;
+-	qh->hw_next = head->hw_next;
++	qh->hw->hw_next = head->hw->hw_next;
+ 	wmb ();
+ 
+ 	head->qh_next.qh = qh;
+-	head->hw_next = dma;
++	head->hw->hw_next = dma;
+ 
+ 	qh->xacterrs = QH_XACTERR_MAX;
+ 	qh->qh_state = QH_STATE_LINKED;
+@@ -984,7 +990,7 @@ static struct ehci_qh *qh_append_tds (
+ 
+                         /* usb_reset_device() briefly reverts to address 0 */
+                         if (usb_pipedevice (urb->pipe) == 0)
+-                                qh->hw_info1 &= ~qh_addr_mask;
++				qh->hw->hw_info1 &= ~qh_addr_mask;
+ 		}
+ 
+ 		/* just one way to queue requests: swap with the dummy qtd.
+@@ -1170,7 +1176,7 @@ static void start_unlink_async (struct e
+ 	while (prev->qh_next.qh != qh)
+ 		prev = prev->qh_next.qh;
+ 
+-	prev->hw_next = qh->hw_next;
++	prev->hw->hw_next = qh->hw->hw_next;
+ 	prev->qh_next = qh->qh_next;
+ 	wmb ();
+ 
+--- a/drivers/usb/host/ehci-sched.c
++++ b/drivers/usb/host/ehci-sched.c
+@@ -60,6 +60,20 @@ periodic_next_shadow(struct ehci_hcd *eh
+ 	}
+ }
+ 
++static __hc32 *
++shadow_next_periodic(struct ehci_hcd *ehci, union ehci_shadow *periodic,
++		__hc32 tag)
++{
++	switch (hc32_to_cpu(ehci, tag)) {
++	/* our ehci_shadow.qh is actually software part */
++	case Q_TYPE_QH:
++		return &periodic->qh->hw->hw_next;
++	/* others are hw parts */
++	default:
++		return periodic->hw_next;
++	}
++}
++
+ /* caller must hold ehci->lock */
+ static void periodic_unlink (struct ehci_hcd *ehci, unsigned frame, void *ptr)
+ {
+@@ -71,7 +85,8 @@ static void periodic_unlink (struct ehci
+ 	while (here.ptr && here.ptr != ptr) {
+ 		prev_p = periodic_next_shadow(ehci, prev_p,
+ 				Q_NEXT_TYPE(ehci, *hw_p));
+-		hw_p = here.hw_next;
++		hw_p = shadow_next_periodic(ehci, &here,
++				Q_NEXT_TYPE(ehci, *hw_p));
+ 		here = *prev_p;
+ 	}
+ 	/* an interrupt entry (at list end) could have been shared */
+@@ -83,7 +98,7 @@ static void periodic_unlink (struct ehci
+ 	 */
+ 	*prev_p = *periodic_next_shadow(ehci, &here,
+ 			Q_NEXT_TYPE(ehci, *hw_p));
+-	*hw_p = *here.hw_next;
++	*hw_p = *shadow_next_periodic(ehci, &here, Q_NEXT_TYPE(ehci, *hw_p));
+ }
+ 
+ /* how many of the uframe's 125 usecs are allocated? */
+@@ -93,18 +108,20 @@ periodic_usecs (struct ehci_hcd *ehci, u
+ 	__hc32			*hw_p = &ehci->periodic [frame];
+ 	union ehci_shadow	*q = &ehci->pshadow [frame];
+ 	unsigned		usecs = 0;
++	struct ehci_qh_hw	*hw;
+ 
+ 	while (q->ptr) {
+ 		switch (hc32_to_cpu(ehci, Q_NEXT_TYPE(ehci, *hw_p))) {
+ 		case Q_TYPE_QH:
++			hw = q->qh->hw;
+ 			/* is it in the S-mask? */
+-			if (q->qh->hw_info2 & cpu_to_hc32(ehci, 1 << uframe))
++			if (hw->hw_info2 & cpu_to_hc32(ehci, 1 << uframe))
+ 				usecs += q->qh->usecs;
+ 			/* ... or C-mask? */
+-			if (q->qh->hw_info2 & cpu_to_hc32(ehci,
++			if (hw->hw_info2 & cpu_to_hc32(ehci,
+ 					1 << (8 + uframe)))
+ 				usecs += q->qh->c_usecs;
+-			hw_p = &q->qh->hw_next;
++			hw_p = &hw->hw_next;
+ 			q = &q->qh->qh_next;
+ 			break;
+ 		// case Q_TYPE_FSTN:
+@@ -237,10 +254,10 @@ periodic_tt_usecs (
+ 			continue;
+ 		case Q_TYPE_QH:
+ 			if (same_tt(dev, q->qh->dev)) {
+-				uf = tt_start_uframe(ehci, q->qh->hw_info2);
++				uf = tt_start_uframe(ehci, q->qh->hw->hw_info2);
+ 				tt_usecs[uf] += q->qh->tt_usecs;
+ 			}
+-			hw_p = &q->qh->hw_next;
++			hw_p = &q->qh->hw->hw_next;
+ 			q = &q->qh->qh_next;
+ 			continue;
+ 		case Q_TYPE_SITD:
+@@ -375,6 +392,7 @@ static int tt_no_collision (
+ 	for (; frame < ehci->periodic_size; frame += period) {
+ 		union ehci_shadow	here;
+ 		__hc32			type;
++		struct ehci_qh_hw	*hw;
+ 
+ 		here = ehci->pshadow [frame];
+ 		type = Q_NEXT_TYPE(ehci, ehci->periodic [frame]);
+@@ -385,17 +403,18 @@ static int tt_no_collision (
+ 				here = here.itd->itd_next;
+ 				continue;
+ 			case Q_TYPE_QH:
++				hw = here.qh->hw;
+ 				if (same_tt (dev, here.qh->dev)) {
+ 					u32		mask;
+ 
+ 					mask = hc32_to_cpu(ehci,
+-							here.qh->hw_info2);
++							hw->hw_info2);
+ 					/* "knows" no gap is needed */
+ 					mask |= mask >> 8;
+ 					if (mask & uf_mask)
+ 						break;
+ 				}
+-				type = Q_NEXT_TYPE(ehci, here.qh->hw_next);
++				type = Q_NEXT_TYPE(ehci, hw->hw_next);
+ 				here = here.qh->qh_next;
+ 				continue;
+ 			case Q_TYPE_SITD:
+@@ -498,7 +517,8 @@ static int qh_link_periodic (struct ehci
+ 
+ 	dev_dbg (&qh->dev->dev,
+ 		"link qh%d-%04x/%p start %d [%d/%d us]\n",
+-		period, hc32_to_cpup(ehci, &qh->hw_info2) & (QH_CMASK | QH_SMASK),
++		period, hc32_to_cpup(ehci, &qh->hw->hw_info2)
++			& (QH_CMASK | QH_SMASK),
+ 		qh, qh->start, qh->usecs, qh->c_usecs);
+ 
+ 	/* high bandwidth, or otherwise every microframe */
+@@ -517,7 +537,7 @@ static int qh_link_periodic (struct ehci
+ 			if (type == cpu_to_hc32(ehci, Q_TYPE_QH))
+ 				break;
+ 			prev = periodic_next_shadow(ehci, prev, type);
+-			hw_p = &here.qh->hw_next;
++			hw_p = shadow_next_periodic(ehci, &here, type);
+ 			here = *prev;
+ 		}
+ 
+@@ -528,14 +548,14 @@ static int qh_link_periodic (struct ehci
+ 			if (qh->period > here.qh->period)
+ 				break;
+ 			prev = &here.qh->qh_next;
+-			hw_p = &here.qh->hw_next;
++			hw_p = &here.qh->hw->hw_next;
+ 			here = *prev;
+ 		}
+ 		/* link in this qh, unless some earlier pass did that */
+ 		if (qh != here.qh) {
+ 			qh->qh_next = here;
+ 			if (here.qh)
+-				qh->hw_next = *hw_p;
++				qh->hw->hw_next = *hw_p;
+ 			wmb ();
+ 			prev->qh = qh;
+ 			*hw_p = QH_NEXT (ehci, qh->qh_dma);
+@@ -580,7 +600,7 @@ static int qh_unlink_periodic(struct ehc
+ 	dev_dbg (&qh->dev->dev,
+ 		"unlink qh%d-%04x/%p start %d [%d/%d us]\n",
+ 		qh->period,
+-		hc32_to_cpup(ehci, &qh->hw_info2) & (QH_CMASK | QH_SMASK),
++		hc32_to_cpup(ehci, &qh->hw->hw_info2) & (QH_CMASK | QH_SMASK),
+ 		qh, qh->start, qh->usecs, qh->c_usecs);
+ 
+ 	/* qh->qh_next still "live" to HC */
+@@ -595,6 +615,7 @@ static int qh_unlink_periodic(struct ehc
+ static void intr_deschedule (struct ehci_hcd *ehci, struct ehci_qh *qh)
+ {
+ 	unsigned	wait;
++	struct ehci_qh_hw *hw = qh->hw;
+ 
+ 	qh_unlink_periodic (ehci, qh);
+ 
+@@ -605,14 +626,14 @@ static void intr_deschedule (struct ehci
+ 	 */
+ 	if (list_empty (&qh->qtd_list)
+ 			|| (cpu_to_hc32(ehci, QH_CMASK)
+-					& qh->hw_info2) != 0)
++					& hw->hw_info2) != 0)
+ 		wait = 2;
+ 	else
+ 		wait = 55;	/* worst case: 3 * 1024 */
+ 
+ 	udelay (wait);
+ 	qh->qh_state = QH_STATE_IDLE;
+-	qh->hw_next = EHCI_LIST_END(ehci);
++	hw->hw_next = EHCI_LIST_END(ehci);
+ 	wmb ();
+ }
+ 
+@@ -738,14 +759,15 @@ static int qh_schedule(struct ehci_hcd *
+ 	unsigned	uframe;
+ 	__hc32		c_mask;
+ 	unsigned	frame;		/* 0..(qh->period - 1), or NO_FRAME */
++	struct ehci_qh_hw	*hw = qh->hw;
+ 
+ 	qh_refresh(ehci, qh);
+-	qh->hw_next = EHCI_LIST_END(ehci);
++	hw->hw_next = EHCI_LIST_END(ehci);
+ 	frame = qh->start;
+ 
+ 	/* reuse the previous schedule slots, if we can */
+ 	if (frame < qh->period) {
+-		uframe = ffs(hc32_to_cpup(ehci, &qh->hw_info2) & QH_SMASK);
++		uframe = ffs(hc32_to_cpup(ehci, &hw->hw_info2) & QH_SMASK);
+ 		status = check_intr_schedule (ehci, frame, --uframe,
+ 				qh, &c_mask);
+ 	} else {
+@@ -783,11 +805,11 @@ static int qh_schedule(struct ehci_hcd *
+ 		qh->start = frame;
+ 
+ 		/* reset S-frame and (maybe) C-frame masks */
+-		qh->hw_info2 &= cpu_to_hc32(ehci, ~(QH_CMASK | QH_SMASK));
+-		qh->hw_info2 |= qh->period
++		hw->hw_info2 &= cpu_to_hc32(ehci, ~(QH_CMASK | QH_SMASK));
++		hw->hw_info2 |= qh->period
+ 			? cpu_to_hc32(ehci, 1 << uframe)
+ 			: cpu_to_hc32(ehci, QH_SMASK);
+-		qh->hw_info2 |= c_mask;
++		hw->hw_info2 |= c_mask;
+ 	} else
+ 		ehci_dbg (ehci, "reused qh %p schedule\n", qh);
+ 
+@@ -2187,7 +2209,7 @@ restart:
+ 			case Q_TYPE_QH:
+ 				/* handle any completions */
+ 				temp.qh = qh_get (q.qh);
+-				type = Q_NEXT_TYPE(ehci, q.qh->hw_next);
++				type = Q_NEXT_TYPE(ehci, q.qh->hw->hw_next);
+ 				q = q.qh->qh_next;
+ 				modified = qh_completions (ehci, temp.qh);
+ 				if (unlikely (list_empty (&temp.qh->qtd_list)))
