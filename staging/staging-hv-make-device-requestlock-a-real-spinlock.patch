@@ -1,0 +1,109 @@
+From foo@baz Wed Jul 15 14:55:29 PDT 2009
+Date: Wed, 15 Jul 2009 14:55:29 -0700
+From: Greg Kroah-Hartman <gregkh@suse.de>
+Subject: Staging: hv: make Device->RequestLock a real spinlock
+
+From: Greg Kroah-Hartman <gregkh@suse.de>
+
+Don't use the wrapper functions for this lock, make it a real
+lock so that we know what is going on.
+
+I don't think we really want to be doing a irqsave for this code, but I
+left it alone to preserve the original codepath.  It should be reviewed
+later.
+
+Cc: Hank Janssen <hjanssen@microsoft.com>
+Cc: Haiyang Zhang <haiyangz@microsoft.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+---
+ drivers/staging/hv/RndisFilter.c |   26 ++++++++++++--------------
+ 1 file changed, 12 insertions(+), 14 deletions(-)
+
+--- a/drivers/staging/hv/RndisFilter.c
++++ b/drivers/staging/hv/RndisFilter.c
+@@ -54,7 +54,7 @@ typedef struct _RNDIS_DEVICE {
+ 	u32					LinkStatus;
+ 	u32					NewRequestId;
+ 
+-	HANDLE					RequestLock;
++	spinlock_t request_lock;
+ 	LIST_ENTRY				RequestList;
+ 
+ 	unsigned char					HwMacAddr[HW_MACADDR_LEN];
+@@ -216,12 +216,7 @@ static inline RNDIS_DEVICE* GetRndisDevi
+ 		return NULL;
+ 	}
+ 
+-	device->RequestLock = SpinlockCreate();
+-	if (!device->RequestLock)
+-	{
+-		kfree(device);
+-		return NULL;
+-	}
++	spin_lock_init(&device->request_lock);
+ 
+ 	INITIALIZE_LIST_HEAD(&device->RequestList);
+ 
+@@ -232,7 +227,6 @@ static inline RNDIS_DEVICE* GetRndisDevi
+ 
+ static inline void PutRndisDevice(RNDIS_DEVICE *Device)
+ {
+-	SpinlockClose(Device->RequestLock);
+ 	kfree(Device);
+ }
+ 
+@@ -241,6 +235,7 @@ static inline RNDIS_REQUEST* GetRndisReq
+ 	RNDIS_REQUEST *request;
+ 	RNDIS_MESSAGE *rndisMessage;
+ 	RNDIS_SET_REQUEST *set;
++	unsigned long flags;
+ 
+ 	request = kzalloc(sizeof(RNDIS_REQUEST), GFP_KERNEL);
+ 	if (!request)
+@@ -265,18 +260,20 @@ static inline RNDIS_REQUEST* GetRndisReq
+ 	set->RequestId = InterlockedIncrement((int*)&Device->NewRequestId);
+ 
+ 	// Add to the request list
+-	SpinlockAcquire(Device->RequestLock);
++	spin_lock_irqsave(&Device->request_lock, flags);
+ 	INSERT_TAIL_LIST(&Device->RequestList, &request->ListEntry);
+-	SpinlockRelease(Device->RequestLock);
++	spin_unlock_irqrestore(&Device->request_lock, flags);
+ 
+ 	return request;
+ }
+ 
+ static inline void PutRndisRequest(RNDIS_DEVICE *Device, RNDIS_REQUEST *Request)
+ {
+-	SpinlockAcquire(Device->RequestLock);
++	unsigned long flags;
++
++	spin_lock_irqsave(&Device->request_lock, flags);
+ 	REMOVE_ENTRY_LIST(&Request->ListEntry);
+-	SpinlockRelease(Device->RequestLock);
++	spin_unlock_irqrestore(&Device->request_lock, flags);
+ 
+ 	WaitEventClose(Request->WaitEvent);
+ 	kfree(Request);
+@@ -385,10 +382,11 @@ RndisFilterReceiveResponse(
+ 	LIST_ENTRY *curr;
+ 	RNDIS_REQUEST *request=NULL;
+ 	bool found = false;
++	unsigned long flags;
+ 
+ 	DPRINT_ENTER(NETVSC);
+ 
+-	SpinlockAcquire(Device->RequestLock);
++	spin_lock_irqsave(&Device->request_lock, flags);
+ 	ITERATE_LIST_ENTRIES(anchor, curr, &Device->RequestList)
+ 	{
+ 		request = CONTAINING_RECORD(curr, RNDIS_REQUEST, ListEntry);
+@@ -403,7 +401,7 @@ RndisFilterReceiveResponse(
+ 			break;
+ 		}
+ 	}
+-	SpinlockRelease(Device->RequestLock);
++	spin_unlock_irqrestore(&Device->request_lock, flags);
+ 
+ 	if (found)
+ 	{
