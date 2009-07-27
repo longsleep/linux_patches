@@ -1,0 +1,55 @@
+From sarah.a.sharp@linux.intel.com  Mon Jul 27 12:28:05 2009
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Date: Mon, 27 Jul 2009 12:03:40 -0700
+Subject: USB: xhci: Correct Event Handler Busy flag usage.
+Cc: linux-usb@vger.kernel.org, Greg KH <greg@kroah.com>
+Message-ID: <20090727190340.GA7653@gamba.jf.intel.com>
+Content-Disposition: inline
+
+
+The Event Handler Busy bit in the event ring dequeue pointer is write 1 to
+clear.  Fix the interrupt service routine to clear that bit after the
+event handler has run.
+
+xhci_set_hc_event_deq() is designed to update the event ring dequeue pointer
+without changing any of the four reserved bits in the lower nibble.  The event
+handler busy (EHB) bit is write one to clear, so the new value must always
+contain a zero in that bit in order to preserve the EHB value.
+
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+---
+ drivers/usb/host/xhci-hcd.c  |    4 ++--
+ drivers/usb/host/xhci-ring.c |    6 +++++-
+ 2 files changed, 7 insertions(+), 3 deletions(-)
+
+--- a/drivers/usb/host/xhci-hcd.c
++++ b/drivers/usb/host/xhci-hcd.c
+@@ -249,9 +249,9 @@ static void xhci_work(struct xhci_hcd *x
+ 	/* FIXME this should be a delayed service routine that clears the EHB */
+ 	xhci_handle_event(xhci);
+ 
+-	/* Clear the event handler busy flag; the event ring should be empty. */
++	/* Clear the event handler busy flag (RW1C); the event ring should be empty. */
+ 	temp_64 = xhci_read_64(xhci, &xhci->ir_set->erst_dequeue);
+-	xhci_write_64(xhci, temp_64 & ~ERST_EHB, &xhci->ir_set->erst_dequeue);
++	xhci_write_64(xhci, temp_64 | ERST_EHB, &xhci->ir_set->erst_dequeue);
+ 	/* Flush posted writes -- FIXME is this necessary? */
+ 	xhci_readl(xhci, &xhci->ir_set->irq_pending);
+ }
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -248,8 +248,12 @@ void xhci_set_hc_event_deq(struct xhci_h
+ 	/* Update HC event ring dequeue pointer */
+ 	temp = xhci_read_64(xhci, &xhci->ir_set->erst_dequeue);
+ 	temp &= ERST_PTR_MASK;
++	/* Don't clear the EHB bit (which is RW1C) because
++	 * there might be more events to service.
++	 */
++	temp &= ~ERST_EHB;
+ 	if (!in_interrupt())
+-		xhci_dbg(xhci, "// Write event ring dequeue pointer\n");
++		xhci_dbg(xhci, "// Write event ring dequeue pointer, preserving EHB bit\n");
+ 	xhci_write_64(xhci, ((u64) deq & (u64) ~ERST_PTR_MASK) | temp,
+ 			&xhci->ir_set->erst_dequeue);
+ }

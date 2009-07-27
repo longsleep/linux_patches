@@ -1,0 +1,185 @@
+From johnyoun@synopsys.com  Mon Jul 27 12:30:05 2009
+From: John Youn <johnyoun@synopsys.com>
+Date: Mon, 27 Jul 2009 12:05:03 -0700
+Subject: USB: xhci: Scratchpad buffer allocation
+Cc: linux-usb@vger.kernel.org, Greg KH <greg@kroah.com>, John Youn <johnyoun@synopsys.com>
+Message-ID: <20090727190503.GA7953@gamba.jf.intel.com>
+
+
+From: John Youn <johnyoun@synopsys.com>
+
+Allocates and initializes the scratchpad buffer array (XHCI 4.20).  This is an
+array of 64-bit DMA addresses to scratch pages that the controller may use
+during operation.  The number of pages is specified in the "Max Scratchpad
+Buffers" field of HCSPARAMS2.  The DMA address of this array is written into
+slot 0 of the DCBAA.
+
+Signed-off-by: John Youn <johnyoun@synopsys.com>
+Acked-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/xhci-mem.c |  102 ++++++++++++++++++++++++++++++++++++++++++++
+ drivers/usb/host/xhci.h     |   11 ++++
+ 2 files changed, 113 insertions(+)
+
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -89,6 +89,7 @@ struct xhci_cap_regs {
+ #define HCS_ERST_MAX(p)		(((p) >> 4) & 0xf)
+ /* bit 26 Scratchpad restore - for save/restore HW state - not used yet */
+ /* bits 27:31 number of Scratchpad buffers SW must allocate for the HW */
++#define HCS_MAX_SCRATCHPAD(p)   (((p) >> 27) & 0x1f)
+ 
+ /* HCSPARAMS3 - hcs_params3 - bitmasks */
+ /* bits 0:7, Max U1 to U0 latency for the roothub ports */
+@@ -951,6 +952,13 @@ struct xhci_erst {
+ 	unsigned int		erst_size;
+ };
+ 
++struct xhci_scratchpad {
++	u64 *sp_array;
++	dma_addr_t sp_dma;
++	void **sp_buffers;
++	dma_addr_t *sp_dma_buffers;
++};
++
+ /*
+  * Each segment table entry is 4*32bits long.  1K seems like an ok size:
+  * (1K bytes * 8bytes/bit) / (4*32 bits) = 64 segment entries in the table,
+@@ -1005,6 +1013,9 @@ struct xhci_hcd {
+ 	struct xhci_ring	*cmd_ring;
+ 	struct xhci_ring	*event_ring;
+ 	struct xhci_erst	erst;
++	/* Scratchpad */
++	struct xhci_scratchpad  *scratchpad;
++
+ 	/* slot enabling and address device helpers */
+ 	struct completion	addr_dev;
+ 	int slot_id;
+--- a/drivers/usb/host/xhci-mem.c
++++ b/drivers/usb/host/xhci-mem.c
+@@ -545,6 +545,103 @@ void xhci_endpoint_zero(struct xhci_hcd 
+ 	 */
+ }
+ 
++/* Set up the scratchpad buffer array and scratchpad buffers, if needed. */
++static int scratchpad_alloc(struct xhci_hcd *xhci, gfp_t flags)
++{
++	int i;
++	struct device *dev = xhci_to_hcd(xhci)->self.controller;
++	int num_sp = HCS_MAX_SCRATCHPAD(xhci->hcs_params2);
++
++	xhci_dbg(xhci, "Allocating %d scratchpad buffers\n", num_sp);
++
++	if (!num_sp)
++		return 0;
++
++	xhci->scratchpad = kzalloc(sizeof(*xhci->scratchpad), flags);
++	if (!xhci->scratchpad)
++		goto fail_sp;
++
++	xhci->scratchpad->sp_array =
++		pci_alloc_consistent(to_pci_dev(dev),
++				     num_sp * sizeof(u64),
++				     &xhci->scratchpad->sp_dma);
++	if (!xhci->scratchpad->sp_array)
++		goto fail_sp2;
++
++	xhci->scratchpad->sp_buffers = kzalloc(sizeof(void *) * num_sp, flags);
++	if (!xhci->scratchpad->sp_buffers)
++		goto fail_sp3;
++
++	xhci->scratchpad->sp_dma_buffers =
++		kzalloc(sizeof(dma_addr_t) * num_sp, flags);
++
++	if (!xhci->scratchpad->sp_dma_buffers)
++		goto fail_sp4;
++
++	xhci->dcbaa->dev_context_ptrs[0] = xhci->scratchpad->sp_dma;
++	for (i = 0; i < num_sp; i++) {
++		dma_addr_t dma;
++		void *buf = pci_alloc_consistent(to_pci_dev(dev),
++						 xhci->page_size, &dma);
++		if (!buf)
++			goto fail_sp5;
++
++		xhci->scratchpad->sp_array[i] = dma;
++		xhci->scratchpad->sp_buffers[i] = buf;
++		xhci->scratchpad->sp_dma_buffers[i] = dma;
++	}
++
++	return 0;
++
++ fail_sp5:
++	for (i = i - 1; i >= 0; i--) {
++		pci_free_consistent(to_pci_dev(dev), xhci->page_size,
++				    xhci->scratchpad->sp_buffers[i],
++				    xhci->scratchpad->sp_dma_buffers[i]);
++	}
++	kfree(xhci->scratchpad->sp_dma_buffers);
++
++ fail_sp4:
++	kfree(xhci->scratchpad->sp_buffers);
++
++ fail_sp3:
++	pci_free_consistent(to_pci_dev(dev), num_sp * sizeof(u64),
++			    xhci->scratchpad->sp_array,
++			    xhci->scratchpad->sp_dma);
++
++ fail_sp2:
++	kfree(xhci->scratchpad);
++	xhci->scratchpad = NULL;
++
++ fail_sp:
++	return -ENOMEM;
++}
++
++static void scratchpad_free(struct xhci_hcd *xhci)
++{
++	int num_sp;
++	int i;
++	struct pci_dev	*pdev = to_pci_dev(xhci_to_hcd(xhci)->self.controller);
++
++	if (!xhci->scratchpad)
++		return;
++
++	num_sp = HCS_MAX_SCRATCHPAD(xhci->hcs_params2);
++
++	for (i = 0; i < num_sp; i++) {
++		pci_free_consistent(pdev, xhci->page_size,
++				    xhci->scratchpad->sp_buffers[i],
++				    xhci->scratchpad->sp_dma_buffers[i]);
++	}
++	kfree(xhci->scratchpad->sp_dma_buffers);
++	kfree(xhci->scratchpad->sp_buffers);
++	pci_free_consistent(pdev, num_sp * sizeof(u64),
++			    xhci->scratchpad->sp_array,
++			    xhci->scratchpad->sp_dma);
++	kfree(xhci->scratchpad);
++	xhci->scratchpad = NULL;
++}
++
+ void xhci_mem_cleanup(struct xhci_hcd *xhci)
+ {
+ 	struct pci_dev	*pdev = to_pci_dev(xhci_to_hcd(xhci)->self.controller);
+@@ -593,6 +690,7 @@ void xhci_mem_cleanup(struct xhci_hcd *x
+ 
+ 	xhci->page_size = 0;
+ 	xhci->page_shift = 0;
++	scratchpad_free(xhci);
+ }
+ 
+ int xhci_mem_init(struct xhci_hcd *xhci, gfp_t flags)
+@@ -755,7 +853,11 @@ int xhci_mem_init(struct xhci_hcd *xhci,
+ 	for (i = 0; i < MAX_HC_SLOTS; ++i)
+ 		xhci->devs[i] = 0;
+ 
++	if (scratchpad_alloc(xhci, flags))
++		goto fail;
++
+ 	return 0;
++
+ fail:
+ 	xhci_warn(xhci, "Couldn't initialize memory\n");
+ 	xhci_mem_cleanup(xhci);
