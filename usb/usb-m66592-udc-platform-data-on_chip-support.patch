@@ -1,0 +1,752 @@
+From magnus.damm@gmail.com  Mon Jul 27 14:19:34 2009
+From: Magnus Damm <magnus.damm@gmail.com>
+Date: Wed, 22 Jul 2009 23:41:35 +0900
+Subject: USB: m66592-udc platform data on_chip support
+To: linux-sh@vger.kernel.org
+Cc: Magnus Damm <magnus.damm@gmail.com>, lethal@linux-sh.org, shimoda.yoshihiro@renesas.com, linux-usb@vger.kernel.org, gregkh@suse.de
+Message-ID: <20090722144135.17180.23767.sendpatchset@rx1.opensource.se>
+
+
+From: Magnus Damm <damm@igel.co.jp>
+
+Convert the m66592-udc driver to use the on_chip flag
+from platform data to enable on chip behaviour instead
+of relying on CONFIG_SUPERH_BUILT_IN_M66592 ugliness.
+
+This makes the code cleaner and also allows us to support
+both external and internal m66592 with the same kernel.
+
+It also makes the Kconfig part more future proof since
+we with this patch can add support for new processors
+with on-chip m66592 without modifying the Kconfig.
+
+The patch adds a m66592 header file for platform data
+and ties in platform data to the existing m66592 devices.
+
+Signed-off-by: Magnus Damm <damm@igel.co.jp>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ arch/sh/boards/mach-highlander/setup.c |    7 
+ arch/sh/boards/mach-x3proto/setup.c    |    7 
+ arch/sh/kernel/cpu/sh4a/setup-sh7722.c |    8 -
+ drivers/usb/gadget/Kconfig             |   10 -
+ drivers/usb/gadget/m66592-udc.c        |  251 +++++++++++++++++++--------------
+ drivers/usb/gadget/m66592-udc.h        |   87 +++++------
+ include/linux/usb/m66592.h             |   44 +++++
+ 7 files changed, 256 insertions(+), 158 deletions(-)
+
+--- a/arch/sh/boards/mach-highlander/setup.c
++++ b/arch/sh/boards/mach-highlander/setup.c
+@@ -22,6 +22,7 @@
+ #include <linux/irq.h>
+ #include <linux/interrupt.h>
+ #include <linux/usb/r8a66597.h>
++#include <linux/usb/m66592.h>
+ #include <net/ax88796.h>
+ #include <asm/machvec.h>
+ #include <mach/highlander.h>
+@@ -60,6 +61,11 @@ static struct platform_device r8a66597_u
+ 	.resource	= r8a66597_usb_host_resources,
+ };
+ 
++static struct m66592_platdata usbf_platdata = {
++	.xtal = M66592_PLATDATA_XTAL_24MHZ,
++	.vif = 1,
++};
++
+ static struct resource m66592_usb_peripheral_resources[] = {
+ 	[0] = {
+ 		.name	= "m66592_udc",
+@@ -81,6 +87,7 @@ static struct platform_device m66592_usb
+ 	.dev = {
+ 		.dma_mask		= NULL,		/* don't use dma */
+ 		.coherent_dma_mask	= 0xffffffff,
++		.platform_data		= &usbf_platdata,
+ 	},
+ 	.num_resources	= ARRAY_SIZE(m66592_usb_peripheral_resources),
+ 	.resource	= m66592_usb_peripheral_resources,
+--- a/arch/sh/boards/mach-x3proto/setup.c
++++ b/arch/sh/boards/mach-x3proto/setup.c
+@@ -17,6 +17,7 @@
+ #include <linux/irq.h>
+ #include <linux/interrupt.h>
+ #include <linux/usb/r8a66597.h>
++#include <linux/usb/m66592.h>
+ #include <asm/ilsel.h>
+ 
+ static struct resource heartbeat_resources[] = {
+@@ -89,6 +90,11 @@ static struct platform_device r8a66597_u
+ 	.resource	= r8a66597_usb_host_resources,
+ };
+ 
++static struct m66592_platdata usbf_platdata = {
++	.xtal = M66592_PLATDATA_XTAL_24MHZ,
++	.vif = 1,
++};
++
+ static struct resource m66592_usb_peripheral_resources[] = {
+ 	[0] = {
+ 		.name	= "m66592_udc",
+@@ -109,6 +115,7 @@ static struct platform_device m66592_usb
+ 	.dev = {
+ 		.dma_mask		= NULL,		/* don't use dma */
+ 		.coherent_dma_mask	= 0xffffffff,
++		.platform_data		= &usbf_platdata,
+ 	},
+ 	.num_resources	= ARRAY_SIZE(m66592_usb_peripheral_resources),
+ 	.resource	= m66592_usb_peripheral_resources,
+--- a/arch/sh/kernel/cpu/sh4a/setup-sh7722.c
++++ b/arch/sh/kernel/cpu/sh4a/setup-sh7722.c
+@@ -13,6 +13,7 @@
+ #include <linux/serial_sci.h>
+ #include <linux/mm.h>
+ #include <linux/uio_driver.h>
++#include <linux/usb/m66592.h>
+ #include <linux/sh_timer.h>
+ #include <asm/clock.h>
+ #include <asm/mmzone.h>
+@@ -47,9 +48,13 @@ static struct platform_device rtc_device
+ 	.resource	= rtc_resources,
+ };
+ 
++static struct m66592_platdata usbf_platdata = {
++	.on_chip = 1,
++};
++
+ static struct resource usbf_resources[] = {
+ 	[0] = {
+-		.name	= "m66592_udc",
++		.name	= "USBF",
+ 		.start	= 0x04480000,
+ 		.end	= 0x044800FF,
+ 		.flags	= IORESOURCE_MEM,
+@@ -67,6 +72,7 @@ static struct platform_device usbf_devic
+ 	.dev = {
+ 		.dma_mask		= NULL,
+ 		.coherent_dma_mask	= 0xffffffff,
++		.platform_data		= &usbf_platdata,
+ 	},
+ 	.num_resources	= ARRAY_SIZE(usbf_resources),
+ 	.resource	= usbf_resources,
+--- a/drivers/usb/gadget/Kconfig
++++ b/drivers/usb/gadget/Kconfig
+@@ -360,16 +360,6 @@ config USB_M66592
+ 	default USB_GADGET
+ 	select USB_GADGET_SELECTED
+ 
+-config SUPERH_BUILT_IN_M66592
+-	boolean "Enable SuperH built-in USB like the M66592"
+-	depends on USB_GADGET_M66592 && CPU_SUBTYPE_SH7722
+-	help
+-	   SH7722 has USB like the M66592.
+-
+-	   The transfer rate is very slow when use "Ethernet Gadget".
+-	   However, this problem is improved if change a value of
+-	   NET_IP_ALIGN to 4.
+-
+ #
+ # Controllers available only in discrete form (and all PCI controllers)
+ #
+--- a/drivers/usb/gadget/m66592-udc.c
++++ b/drivers/usb/gadget/m66592-udc.c
+@@ -37,32 +37,7 @@ MODULE_LICENSE("GPL");
+ MODULE_AUTHOR("Yoshihiro Shimoda");
+ MODULE_ALIAS("platform:m66592_udc");
+ 
+-#define DRIVER_VERSION	"18 Oct 2007"
+-
+-/* module parameters */
+-#if defined(CONFIG_SUPERH_BUILT_IN_M66592)
+-static unsigned short endian = M66592_LITTLE;
+-module_param(endian, ushort, 0644);
+-MODULE_PARM_DESC(endian, "data endian: big=0, little=0 (default=0)");
+-#else
+-static unsigned short clock = M66592_XTAL24;
+-module_param(clock, ushort, 0644);
+-MODULE_PARM_DESC(clock, "input clock: 48MHz=32768, 24MHz=16384, 12MHz=0 "
+-		"(default=16384)");
+-
+-static unsigned short vif = M66592_LDRV;
+-module_param(vif, ushort, 0644);
+-MODULE_PARM_DESC(vif, "input VIF: 3.3V=32768, 1.5V=0 (default=32768)");
+-
+-static unsigned short endian;
+-module_param(endian, ushort, 0644);
+-MODULE_PARM_DESC(endian, "data endian: big=256, little=0 (default=0)");
+-
+-static unsigned short irq_sense = M66592_INTL;
+-module_param(irq_sense, ushort, 0644);
+-MODULE_PARM_DESC(irq_sense, "IRQ sense: low level=2, falling edge=0 "
+-		"(default=2)");
+-#endif
++#define DRIVER_VERSION	"21 July 2009"
+ 
+ static const char udc_name[] = "m66592_udc";
+ static const char *m66592_ep_name[] = {
+@@ -244,6 +219,7 @@ static inline int get_buffer_size(struct
+ static inline void pipe_change(struct m66592 *m66592, u16 pipenum)
+ {
+ 	struct m66592_ep *ep = m66592->pipenum2ep[pipenum];
++	unsigned short mbw;
+ 
+ 	if (ep->use_dma)
+ 		return;
+@@ -252,7 +228,12 @@ static inline void pipe_change(struct m6
+ 
+ 	ndelay(450);
+ 
+-	m66592_bset(m66592, M66592_MBW, ep->fifosel);
++	if (m66592->pdata->on_chip)
++		mbw = M66592_MBW_32;
++	else
++		mbw = M66592_MBW_16;
++
++	m66592_bset(m66592, mbw, ep->fifosel);
+ }
+ 
+ static int pipe_buffer_setting(struct m66592 *m66592,
+@@ -340,6 +321,7 @@ static void pipe_buffer_release(struct m
+ static void pipe_initialize(struct m66592_ep *ep)
+ {
+ 	struct m66592 *m66592 = ep->m66592;
++	unsigned short mbw;
+ 
+ 	m66592_mdfy(m66592, 0, M66592_CURPIPE, ep->fifosel);
+ 
+@@ -351,7 +333,12 @@ static void pipe_initialize(struct m6659
+ 
+ 		ndelay(450);
+ 
+-		m66592_bset(m66592, M66592_MBW, ep->fifosel);
++		if (m66592->pdata->on_chip)
++			mbw = M66592_MBW_32;
++		else
++			mbw = M66592_MBW_16;
++
++		m66592_bset(m66592, mbw, ep->fifosel);
+ 	}
+ }
+ 
+@@ -367,15 +354,13 @@ static void m66592_ep_setting(struct m66
+ 			ep->fifosel = M66592_D0FIFOSEL;
+ 			ep->fifoctr = M66592_D0FIFOCTR;
+ 			ep->fifotrn = M66592_D0FIFOTRN;
+-#if !defined(CONFIG_SUPERH_BUILT_IN_M66592)
+-		} else if (m66592->num_dma == 1) {
++		} else if (!m66592->pdata->on_chip && m66592->num_dma == 1) {
+ 			m66592->num_dma++;
+ 			ep->use_dma = 1;
+ 			ep->fifoaddr = M66592_D1FIFO;
+ 			ep->fifosel = M66592_D1FIFOSEL;
+ 			ep->fifoctr = M66592_D1FIFOCTR;
+ 			ep->fifotrn = M66592_D1FIFOTRN;
+-#endif
+ 		} else {
+ 			ep->use_dma = 0;
+ 			ep->fifoaddr = M66592_CFIFO;
+@@ -620,76 +605,120 @@ static void start_ep0(struct m66592_ep *
+ 	}
+ }
+ 
+-#if defined(CONFIG_SUPERH_BUILT_IN_M66592)
+ static void init_controller(struct m66592 *m66592)
+ {
+-	m66592_bset(m66592, M66592_HSE, M66592_SYSCFG);		/* High spd */
+-	m66592_bclr(m66592, M66592_USBE, M66592_SYSCFG);
+-	m66592_bclr(m66592, M66592_DPRPU, M66592_SYSCFG);
+-	m66592_bset(m66592, M66592_USBE, M66592_SYSCFG);
++	unsigned int endian;
+ 
+-	/* This is a workaound for SH7722 2nd cut */
+-	m66592_bset(m66592, 0x8000, M66592_DVSTCTR);
+-	m66592_bset(m66592, 0x1000, M66592_TESTMODE);
+-	m66592_bclr(m66592, 0x8000, M66592_DVSTCTR);
++	if (m66592->pdata->on_chip) {
++		if (m66592->pdata->endian)
++			endian = 0; /* big endian */
++		else
++			endian = M66592_LITTLE; /* little endian */
+ 
+-	m66592_bset(m66592, M66592_INTL, M66592_INTENB1);
++		m66592_bset(m66592, M66592_HSE, M66592_SYSCFG);	/* High spd */
++		m66592_bclr(m66592, M66592_USBE, M66592_SYSCFG);
++		m66592_bclr(m66592, M66592_DPRPU, M66592_SYSCFG);
++		m66592_bset(m66592, M66592_USBE, M66592_SYSCFG);
++
++		/* This is a workaound for SH7722 2nd cut */
++		m66592_bset(m66592, 0x8000, M66592_DVSTCTR);
++		m66592_bset(m66592, 0x1000, M66592_TESTMODE);
++		m66592_bclr(m66592, 0x8000, M66592_DVSTCTR);
++
++		m66592_bset(m66592, M66592_INTL, M66592_INTENB1);
++
++		m66592_write(m66592, 0, M66592_CFBCFG);
++		m66592_write(m66592, 0, M66592_D0FBCFG);
++		m66592_bset(m66592, endian, M66592_CFBCFG);
++		m66592_bset(m66592, endian, M66592_D0FBCFG);
++	} else {
++		unsigned int clock, vif, irq_sense;
+ 
+-	m66592_write(m66592, 0, M66592_CFBCFG);
+-	m66592_write(m66592, 0, M66592_D0FBCFG);
+-	m66592_bset(m66592, endian, M66592_CFBCFG);
+-	m66592_bset(m66592, endian, M66592_D0FBCFG);
+-}
+-#else	/* #if defined(CONFIG_SUPERH_BUILT_IN_M66592) */
+-static void init_controller(struct m66592 *m66592)
+-{
+-	m66592_bset(m66592, (vif & M66592_LDRV) | (endian & M66592_BIGEND),
+-			M66592_PINCFG);
+-	m66592_bset(m66592, M66592_HSE, M66592_SYSCFG);		/* High spd */
+-	m66592_mdfy(m66592, clock & M66592_XTAL, M66592_XTAL, M66592_SYSCFG);
++		if (m66592->pdata->endian)
++			endian = M66592_BIGEND; /* big endian */
++		else
++			endian = 0; /* little endian */
+ 
+-	m66592_bclr(m66592, M66592_USBE, M66592_SYSCFG);
+-	m66592_bclr(m66592, M66592_DPRPU, M66592_SYSCFG);
+-	m66592_bset(m66592, M66592_USBE, M66592_SYSCFG);
++		if (m66592->pdata->vif)
++			vif = M66592_LDRV; /* 3.3v */
++		else
++			vif = 0; /* 1.5v */
+ 
+-	m66592_bset(m66592, M66592_XCKE, M66592_SYSCFG);
++		switch (m66592->pdata->xtal) {
++		case M66592_PLATDATA_XTAL_12MHZ:
++			clock = M66592_XTAL12;
++			break;
++		case M66592_PLATDATA_XTAL_24MHZ:
++			clock = M66592_XTAL24;
++			break;
++		case M66592_PLATDATA_XTAL_48MHZ:
++			clock = M66592_XTAL48;
++			break;
++		default:
++			pr_warning("m66592-udc: xtal configuration error\n");
++			clock = 0;
++		}
+ 
+-	msleep(3);
++		switch (m66592->irq_trigger) {
++		case IRQF_TRIGGER_LOW:
++			irq_sense = M66592_INTL;
++			break;
++		case IRQF_TRIGGER_FALLING:
++			irq_sense = 0;
++			break;
++		default:
++			pr_warning("m66592-udc: irq trigger config error\n");
++			irq_sense = 0;
++		}
++
++		m66592_bset(m66592,
++			    (vif & M66592_LDRV) | (endian & M66592_BIGEND),
++			    M66592_PINCFG);
++		m66592_bset(m66592, M66592_HSE, M66592_SYSCFG);	/* High spd */
++		m66592_mdfy(m66592, clock & M66592_XTAL, M66592_XTAL,
++			    M66592_SYSCFG);
++		m66592_bclr(m66592, M66592_USBE, M66592_SYSCFG);
++		m66592_bclr(m66592, M66592_DPRPU, M66592_SYSCFG);
++		m66592_bset(m66592, M66592_USBE, M66592_SYSCFG);
++
++		m66592_bset(m66592, M66592_XCKE, M66592_SYSCFG);
++
++		msleep(3);
+ 
+-	m66592_bset(m66592, M66592_RCKE | M66592_PLLC, M66592_SYSCFG);
++		m66592_bset(m66592, M66592_RCKE | M66592_PLLC, M66592_SYSCFG);
+ 
+-	msleep(1);
++		msleep(1);
+ 
+-	m66592_bset(m66592, M66592_SCKE, M66592_SYSCFG);
++		m66592_bset(m66592, M66592_SCKE, M66592_SYSCFG);
+ 
+-	m66592_bset(m66592, irq_sense & M66592_INTL, M66592_INTENB1);
+-	m66592_write(m66592, M66592_BURST | M66592_CPU_ADR_RD_WR,
+-			M66592_DMA0CFG);
++		m66592_bset(m66592, irq_sense & M66592_INTL, M66592_INTENB1);
++		m66592_write(m66592, M66592_BURST | M66592_CPU_ADR_RD_WR,
++			     M66592_DMA0CFG);
++	}
+ }
+-#endif	/* #if defined(CONFIG_SUPERH_BUILT_IN_M66592) */
+ 
+ static void disable_controller(struct m66592 *m66592)
+ {
+-#if !defined(CONFIG_SUPERH_BUILT_IN_M66592)
+-	m66592_bclr(m66592, M66592_SCKE, M66592_SYSCFG);
+-	udelay(1);
+-	m66592_bclr(m66592, M66592_PLLC, M66592_SYSCFG);
+-	udelay(1);
+-	m66592_bclr(m66592, M66592_RCKE, M66592_SYSCFG);
+-	udelay(1);
+-	m66592_bclr(m66592, M66592_XCKE, M66592_SYSCFG);
+-#endif
++	if (!m66592->pdata->on_chip) {
++		m66592_bclr(m66592, M66592_SCKE, M66592_SYSCFG);
++		udelay(1);
++		m66592_bclr(m66592, M66592_PLLC, M66592_SYSCFG);
++		udelay(1);
++		m66592_bclr(m66592, M66592_RCKE, M66592_SYSCFG);
++		udelay(1);
++		m66592_bclr(m66592, M66592_XCKE, M66592_SYSCFG);
++	}
+ }
+ 
+ static void m66592_start_xclock(struct m66592 *m66592)
+ {
+-#if !defined(CONFIG_SUPERH_BUILT_IN_M66592)
+ 	u16 tmp;
+ 
+-	tmp = m66592_read(m66592, M66592_SYSCFG);
+-	if (!(tmp & M66592_XCKE))
+-		m66592_bset(m66592, M66592_XCKE, M66592_SYSCFG);
+-#endif
++	if (!m66592->pdata->on_chip) {
++		tmp = m66592_read(m66592, M66592_SYSCFG);
++		if (!(tmp & M66592_XCKE))
++			m66592_bset(m66592, M66592_XCKE, M66592_SYSCFG);
++	}
+ }
+ 
+ /*-------------------------------------------------------------------------*/
+@@ -1177,8 +1206,7 @@ static irqreturn_t m66592_irq(int irq, v
+ 	intsts0 = m66592_read(m66592, M66592_INTSTS0);
+ 	intenb0 = m66592_read(m66592, M66592_INTENB0);
+ 
+-#if defined(CONFIG_SUPERH_BUILT_IN_M66592)
+-	if (!intsts0 && !intenb0) {
++	if (m66592->pdata->on_chip && !intsts0 && !intenb0) {
+ 		/*
+ 		 * When USB clock stops, it cannot read register. Even if a
+ 		 * clock stops, the interrupt occurs. So this driver turn on
+@@ -1188,7 +1216,6 @@ static irqreturn_t m66592_irq(int irq, v
+ 		intsts0 = m66592_read(m66592, M66592_INTSTS0);
+ 		intenb0 = m66592_read(m66592, M66592_INTENB0);
+ 	}
+-#endif
+ 
+ 	savepipe = m66592_read(m66592, M66592_CFIFOSEL);
+ 
+@@ -1534,9 +1561,11 @@ static int __exit m66592_remove(struct p
+ 	iounmap(m66592->reg);
+ 	free_irq(platform_get_irq(pdev, 0), m66592);
+ 	m66592_free_request(&m66592->ep[0].ep, m66592->ep0_req);
+-#if defined(CONFIG_SUPERH_BUILT_IN_M66592) && defined(CONFIG_HAVE_CLK)
+-	clk_disable(m66592->clk);
+-	clk_put(m66592->clk);
++#ifdef CONFIG_HAVE_CLK
++	if (m66592->pdata->on_chip) {
++		clk_disable(m66592->clk);
++		clk_put(m66592->clk);
++	}
+ #endif
+ 	kfree(m66592);
+ 	return 0;
+@@ -1548,11 +1577,10 @@ static void nop_completion(struct usb_ep
+ 
+ static int __init m66592_probe(struct platform_device *pdev)
+ {
+-	struct resource *res;
+-	int irq;
++	struct resource *res, *ires;
+ 	void __iomem *reg = NULL;
+ 	struct m66592 *m66592 = NULL;
+-#if defined(CONFIG_SUPERH_BUILT_IN_M66592) && defined(CONFIG_HAVE_CLK)
++#ifdef CONFIG_HAVE_CLK
+ 	char clk_name[8];
+ #endif
+ 	int ret = 0;
+@@ -1565,10 +1593,11 @@ static int __init m66592_probe(struct pl
+ 		goto clean_up;
+ 	}
+ 
+-	irq = platform_get_irq(pdev, 0);
+-	if (irq < 0) {
++	ires = platform_get_resource(pdev, IORESOURCE_IRQ, 0);
++	if (!ires) {
+ 		ret = -ENODEV;
+-		pr_err("platform_get_irq error.\n");
++		dev_err(&pdev->dev,
++			"platform_get_resource IORESOURCE_IRQ error.\n");
+ 		goto clean_up;
+ 	}
+ 
+@@ -1579,6 +1608,12 @@ static int __init m66592_probe(struct pl
+ 		goto clean_up;
+ 	}
+ 
++	if (pdev->dev.platform_data == NULL) {
++		dev_err(&pdev->dev, "no platform data\n");
++		ret = -ENODEV;
++		goto clean_up;
++	}
++
+ 	/* initialize ucd */
+ 	m66592 = kzalloc(sizeof(struct m66592), GFP_KERNEL);
+ 	if (m66592 == NULL) {
+@@ -1586,6 +1621,9 @@ static int __init m66592_probe(struct pl
+ 		goto clean_up;
+ 	}
+ 
++	m66592->pdata = pdev->dev.platform_data;
++	m66592->irq_trigger = ires->flags & IRQF_TRIGGER_MASK;
++
+ 	spin_lock_init(&m66592->lock);
+ 	dev_set_drvdata(&pdev->dev, m66592);
+ 
+@@ -1605,22 +1643,25 @@ static int __init m66592_probe(struct pl
+ 
+ 	m66592->bi_bufnum = M66592_BASE_BUFNUM;
+ 
+-	ret = request_irq(irq, m66592_irq, IRQF_DISABLED | IRQF_SHARED,
++	ret = request_irq(ires->start, m66592_irq, IRQF_DISABLED | IRQF_SHARED,
+ 			udc_name, m66592);
+ 	if (ret < 0) {
+ 		pr_err("request_irq error (%d)\n", ret);
+ 		goto clean_up;
+ 	}
+ 
+-#if defined(CONFIG_SUPERH_BUILT_IN_M66592) && defined(CONFIG_HAVE_CLK)
+-	snprintf(clk_name, sizeof(clk_name), "usbf%d", pdev->id);
+-	m66592->clk = clk_get(&pdev->dev, clk_name);
+-	if (IS_ERR(m66592->clk)) {
+-		dev_err(&pdev->dev, "cannot get clock \"%s\"\n", clk_name);
+-		ret = PTR_ERR(m66592->clk);
+-		goto clean_up2;
++#ifdef CONFIG_HAVE_CLK
++	if (m66592->pdata->on_chip) {
++		snprintf(clk_name, sizeof(clk_name), "usbf%d", pdev->id);
++		m66592->clk = clk_get(&pdev->dev, clk_name);
++		if (IS_ERR(m66592->clk)) {
++			dev_err(&pdev->dev, "cannot get clock \"%s\"\n",
++				clk_name);
++			ret = PTR_ERR(m66592->clk);
++			goto clean_up2;
++		}
++		clk_enable(m66592->clk);
+ 	}
+-	clk_enable(m66592->clk);
+ #endif
+ 	INIT_LIST_HEAD(&m66592->gadget.ep_list);
+ 	m66592->gadget.ep0 = &m66592->ep[0].ep;
+@@ -1662,12 +1703,14 @@ static int __init m66592_probe(struct pl
+ 	return 0;
+ 
+ clean_up3:
+-#if defined(CONFIG_SUPERH_BUILT_IN_M66592) && defined(CONFIG_HAVE_CLK)
+-	clk_disable(m66592->clk);
+-	clk_put(m66592->clk);
++#ifdef CONFIG_HAVE_CLK
++	if (m66592->pdata->on_chip) {
++		clk_disable(m66592->clk);
++		clk_put(m66592->clk);
++	}
+ clean_up2:
+ #endif
+-	free_irq(irq, m66592);
++	free_irq(ires->start, m66592);
+ clean_up:
+ 	if (m66592) {
+ 		if (m66592->ep0_req)
+--- a/drivers/usb/gadget/m66592-udc.h
++++ b/drivers/usb/gadget/m66592-udc.h
+@@ -23,10 +23,12 @@
+ #ifndef __M66592_UDC_H__
+ #define __M66592_UDC_H__
+ 
+-#if defined(CONFIG_SUPERH_BUILT_IN_M66592) && defined(CONFIG_HAVE_CLK)
++#ifdef CONFIG_HAVE_CLK
+ #include <linux/clk.h>
+ #endif
+ 
++#include <linux/usb/m66592.h>
++
+ #define M66592_SYSCFG		0x00
+ #define M66592_XTAL		0xC000	/* b15-14: Crystal selection */
+ #define   M66592_XTAL48		 0x8000		/* 48MHz */
+@@ -76,11 +78,11 @@
+ #define   M66592_P_TST_J	 0x0001		/* PERI TEST J */
+ #define   M66592_P_TST_NORMAL	 0x0000		/* PERI Normal Mode */
+ 
+-#if defined(CONFIG_SUPERH_BUILT_IN_M66592)
++/* built-in registers */
+ #define M66592_CFBCFG		0x0A
+ #define M66592_D0FBCFG		0x0C
+ #define M66592_LITTLE		0x0100	/* b8: Little endian mode */
+-#else
++/* external chip case */
+ #define M66592_PINCFG		0x0A
+ #define M66592_LDRV		0x8000	/* b15: Drive Current Adjust */
+ #define M66592_BIGEND		0x0100	/* b8: Big endian mode */
+@@ -100,8 +102,8 @@
+ #define M66592_PKTM		0x0020	/* b5: Packet mode */
+ #define M66592_DENDE		0x0010	/* b4: Dend enable */
+ #define M66592_OBUS		0x0004	/* b2: OUTbus mode */
+-#endif	/* #if defined(CONFIG_SUPERH_BUILT_IN_M66592) */
+ 
++/* common case */
+ #define M66592_CFIFO		0x10
+ #define M66592_D0FIFO		0x14
+ #define M66592_D1FIFO		0x18
+@@ -113,13 +115,9 @@
+ #define M66592_REW		0x4000	/* b14: Buffer rewind */
+ #define M66592_DCLRM		0x2000	/* b13: DMA buffer clear mode */
+ #define M66592_DREQE		0x1000	/* b12: DREQ output enable */
+-#if defined(CONFIG_SUPERH_BUILT_IN_M66592)
+-#define M66592_MBW		0x0800	/* b11: Maximum bit width for FIFO */
+-#else
+-#define M66592_MBW		0x0400	/* b10: Maximum bit width for FIFO */
+-#define   M66592_MBW_8		 0x0000   /*  8bit */
+-#define   M66592_MBW_16		 0x0400   /* 16bit */
+-#endif	/* #if defined(CONFIG_SUPERH_BUILT_IN_M66592) */
++#define M66592_MBW_8		0x0000   /*  8bit */
++#define M66592_MBW_16		0x0400   /* 16bit */
++#define M66592_MBW_32		0x0800   /* 32bit */
+ #define M66592_TRENB		0x0200	/* b9: Transaction counter enable */
+ #define M66592_TRCLR		0x0100	/* b8: Transaction counter clear */
+ #define M66592_DEZPM		0x0080	/* b7: Zero-length packet mode */
+@@ -480,9 +478,11 @@ struct m66592_ep {
+ struct m66592 {
+ 	spinlock_t		lock;
+ 	void __iomem		*reg;
+-#if defined(CONFIG_SUPERH_BUILT_IN_M66592) && defined(CONFIG_HAVE_CLK)
++#ifdef CONFIG_HAVE_CLK
+ 	struct clk *clk;
+ #endif
++	struct m66592_platdata	*pdata;
++	unsigned long		irq_trigger;
+ 
+ 	struct usb_gadget		gadget;
+ 	struct usb_gadget_driver	*driver;
+@@ -547,13 +547,13 @@ static inline void m66592_read_fifo(stru
+ {
+ 	unsigned long fifoaddr = (unsigned long)m66592->reg + offset;
+ 
+-#if defined(CONFIG_SUPERH_BUILT_IN_M66592)
+-	len = (len + 3) / 4;
+-	insl(fifoaddr, buf, len);
+-#else
+-	len = (len + 1) / 2;
+-	insw(fifoaddr, buf, len);
+-#endif
++	if (m66592->pdata->on_chip) {
++		len = (len + 3) / 4;
++		insl(fifoaddr, buf, len);
++	} else {
++		len = (len + 1) / 2;
++		insw(fifoaddr, buf, len);
++	}
+ }
+ 
+ static inline void m66592_write(struct m66592 *m66592, u16 val,
+@@ -567,33 +567,34 @@ static inline void m66592_write_fifo(str
+ 		void *buf, unsigned long len)
+ {
+ 	unsigned long fifoaddr = (unsigned long)m66592->reg + offset;
+-#if defined(CONFIG_SUPERH_BUILT_IN_M66592)
+-	unsigned long count;
+-	unsigned char *pb;
+-	int i;
+-
+-	count = len / 4;
+-	outsl(fifoaddr, buf, count);
+-
+-	if (len & 0x00000003) {
+-		pb = buf + count * 4;
+-		for (i = 0; i < (len & 0x00000003); i++) {
+-			if (m66592_read(m66592, M66592_CFBCFG))	/* little */
+-				outb(pb[i], fifoaddr + (3 - i));
+-			else
+-				outb(pb[i], fifoaddr + i);
++
++	if (m66592->pdata->on_chip) {
++		unsigned long count;
++		unsigned char *pb;
++		int i;
++
++		count = len / 4;
++		outsl(fifoaddr, buf, count);
++
++		if (len & 0x00000003) {
++			pb = buf + count * 4;
++			for (i = 0; i < (len & 0x00000003); i++) {
++				if (m66592_read(m66592, M66592_CFBCFG))	/* le */
++					outb(pb[i], fifoaddr + (3 - i));
++				else
++					outb(pb[i], fifoaddr + i);
++			}
+ 		}
+-	}
+-#else
+-	unsigned long odd = len & 0x0001;
++	} else {
++		unsigned long odd = len & 0x0001;
+ 
+-	len = len / 2;
+-	outsw(fifoaddr, buf, len);
+-	if (odd) {
+-		unsigned char *p = buf + len*2;
+-		outb(*p, fifoaddr);
++		len = len / 2;
++		outsw(fifoaddr, buf, len);
++		if (odd) {
++			unsigned char *p = buf + len*2;
++			outb(*p, fifoaddr);
++		}
+ 	}
+-#endif	/* #if defined(CONFIG_SUPERH_BUILT_IN_M66592) */
+ }
+ 
+ static inline void m66592_mdfy(struct m66592 *m66592, u16 val, u16 pat,
+--- /dev/null
++++ b/include/linux/usb/m66592.h
+@@ -0,0 +1,44 @@
++/*
++ * M66592 driver platform data
++ *
++ * Copyright (C) 2009  Renesas Solutions Corp.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
++ *
++ */
++
++#ifndef __LINUX_USB_M66592_H
++#define __LINUX_USB_M66592_H
++
++#define M66592_PLATDATA_XTAL_12MHZ	0x01
++#define M66592_PLATDATA_XTAL_24MHZ	0x02
++#define M66592_PLATDATA_XTAL_48MHZ	0x03
++
++struct m66592_platdata {
++	/* one = on chip controller, zero = external controller */
++	unsigned	on_chip:1;
++
++	/* one = big endian, zero = little endian */
++	unsigned	endian:1;
++
++	/* (external controller only) M66592_PLATDATA_XTAL_nnMHZ */
++	unsigned	xtal:2;
++
++	/* (external controller only) one = 3.3V, zero = 1.5V */
++	unsigned	vif:1;
++
++};
++
++#endif /* __LINUX_USB_M66592_H */
++
