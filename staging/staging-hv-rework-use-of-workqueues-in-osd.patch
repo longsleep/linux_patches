@@ -1,0 +1,241 @@
+From wfp5p@virginia.edu  Wed Jul 29 14:22:02 2009
+From: Bill Pemberton <wfp5p@virginia.edu>
+Date: Wed, 29 Jul 2009 17:00:09 -0400
+Subject: Staging: hv: rework use of workqueues in osd
+To: greg@kroah.com
+Cc: hjanssen@microsoft.com
+Message-ID: <1248901215-29685-2-git-send-email-wfp5p@virginia.edu>
+
+
+Change the usage of workqueues to be consistant with other parts of
+the kernel.
+
+Signed-off-by: Bill Pemberton <wfp5p@virginia.edu>
+Cc: Hank Janssen <hjanssen@microsoft.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/staging/hv/ChannelMgmt.c |   14 +++++---
+ drivers/staging/hv/Connection.c  |   12 +++++--
+ drivers/staging/hv/Vmbus.c       |    4 +-
+ drivers/staging/hv/include/osd.h |   11 +-----
+ drivers/staging/hv/osd.c         |   66 ++++++++++++---------------------------
+ 5 files changed, 45 insertions(+), 62 deletions(-)
+
+--- a/drivers/staging/hv/ChannelMgmt.c
++++ b/drivers/staging/hv/ChannelMgmt.c
+@@ -149,7 +149,7 @@ static VMBUS_CHANNEL* AllocVmbusChannel(
+ 	}
+ 
+ 	/* channel->dataWorkQueue = WorkQueueCreate("data"); */
+-	channel->ControlWQ = WorkQueueCreate("control");
++	channel->ControlWQ = create_workqueue("hv_vmbus_ctl");
+ 	if (!channel->ControlWQ)
+ 	{
+ 		TimerClose(channel->PollTimer);
+@@ -176,7 +176,7 @@ static inline void ReleaseVmbusChannel(v
+ 	DPRINT_ENTER(VMBUS);
+ 
+ 	DPRINT_DBG(VMBUS, "releasing channel (%p)", channel);
+-	WorkQueueClose(channel->ControlWQ);
++	destroy_workqueue(channel->ControlWQ);
+ 	DPRINT_DBG(VMBUS, "channel released (%p)", channel);
+ 
+ 	kfree(channel);
+@@ -199,7 +199,8 @@ static void FreeVmbusChannel(VMBUS_CHANN
+ 
+ 	/* We have to release the channel's workqueue/thread in the vmbus's workqueue/thread context */
+ 	/* ie we can't destroy ourselves. */
+-	WorkQueueQueueWorkItem(gVmbusConnection.WorkQueue, ReleaseVmbusChannel, (void*)Channel);
++	osd_schedule_callback(gVmbusConnection.WorkQueue, ReleaseVmbusChannel,
++			      (void *)Channel);
+ }
+ 
+ 
+@@ -389,7 +390,8 @@ VmbusChannelOnOffer(
+ 	newChannel->MonitorBit = (u8)offer->MonitorId % 32;
+ 
+ 	/* TODO: Make sure the offer comes from our parent partition */
+-	WorkQueueQueueWorkItem(newChannel->ControlWQ, VmbusChannelProcessOffer, newChannel);
++	osd_schedule_callback(newChannel->ControlWQ, VmbusChannelProcessOffer,
++			      newChannel);
+ 
+ 	DPRINT_EXIT(VMBUS);
+ }
+@@ -422,7 +424,9 @@ VmbusChannelOnOfferRescind(
+ 		return;
+ 	}
+ 
+-	WorkQueueQueueWorkItem(channel->ControlWQ, VmbusChannelProcessRescindOffer, channel);
++	osd_schedule_callback(channel->ControlWQ,
++			      VmbusChannelProcessRescindOffer,
++			      channel);
+ 
+ 	DPRINT_EXIT(VMBUS);
+ }
+--- a/drivers/staging/hv/Connection.c
++++ b/drivers/staging/hv/Connection.c
+@@ -60,7 +60,12 @@ VmbusConnect(void)
+ 
+ 	/* Initialize the vmbus connection */
+ 	gVmbusConnection.ConnectState = Connecting;
+-	gVmbusConnection.WorkQueue = WorkQueueCreate("vmbusQ");
++	gVmbusConnection.WorkQueue = create_workqueue("hv_vmbus_con");
++	if (!gVmbusConnection.WorkQueue)
++	{
++		ret = -1;
++		goto Cleanup;
++	}
+ 
+ 	INITIALIZE_LIST_HEAD(&gVmbusConnection.ChannelMsgList);
+ 	spin_lock_init(&gVmbusConnection.channelmsg_lock);
+@@ -160,7 +165,8 @@ Cleanup:
+ 
+ 	gVmbusConnection.ConnectState = Disconnected;
+ 
+-	WorkQueueClose(gVmbusConnection.WorkQueue);
++	if (gVmbusConnection.WorkQueue)
++		destroy_workqueue(gVmbusConnection.WorkQueue);
+ 
+ 	if (gVmbusConnection.InterruptPage)
+ 	{
+@@ -226,7 +232,7 @@ VmbusDisconnect(
+ 
+ 	/* TODO: iterate thru the msg list and free up */
+ 
+-	WorkQueueClose(gVmbusConnection.WorkQueue);
++	destroy_workqueue(gVmbusConnection.WorkQueue);
+ 
+ 	gVmbusConnection.ConnectState = Disconnected;
+ 
+--- a/drivers/staging/hv/include/osd.h
++++ b/drivers/staging/hv/include/osd.h
+@@ -47,7 +47,6 @@ typedef struct _DLIST_ENTRY {
+ 
+ /* typedef unsigned char		GUID[16]; */
+ 
+-typedef void (*PFN_WORKITEM_CALLBACK)(void* context);
+ typedef void (*PFN_TIMER_CALLBACK)(void* context);
+ 
+ 
+@@ -155,12 +154,8 @@ void* PageMapVirtualAddress(unsigned lon
+ void PageUnmapVirtualAddress(void* VirtAddr);
+ 
+ 
+-extern struct workqueue_struct *WorkQueueCreate(char* name);
+-extern void WorkQueueClose(struct workqueue_struct *hWorkQueue);
+-extern int WorkQueueQueueWorkItem(struct workqueue_struct *hWorkQueue,
+-				  PFN_WORKITEM_CALLBACK workItem,
+-				  void *context);
+-
+-extern void QueueWorkItem(PFN_WORKITEM_CALLBACK workItem, void* context);
++int osd_schedule_callback(struct workqueue_struct *wq,
++			  void (*func)(void *),
++			  void *data);
+ 
+ #endif /* _OSD_H_ */
+--- a/drivers/staging/hv/osd.c
++++ b/drivers/staging/hv/osd.c
+@@ -50,11 +50,11 @@
+ /* Data types */
+ 
+ 
+-typedef struct _WORKITEM {
++struct osd_callback_struct {
+ 	struct work_struct work;
+-	PFN_WORKITEM_CALLBACK callback;
+-	void* context;
+-} WORKITEM;
++	void (*callback)(void *);
++	void *data;
++};
+ 
+ 
+ void BitSet(unsigned int* addr, int bit)
+@@ -269,56 +269,32 @@ unsigned long Virtual2Physical(void * Vi
+ 	return pfn << PAGE_SHIFT;
+ }
+ 
+-static void WorkItemCallback(struct work_struct *work)
++static void osd_callback_work(struct work_struct *work)
+ {
+-	WORKITEM* w = (WORKITEM*)work;
++	struct osd_callback_struct *cb = container_of(work,
++						      struct osd_callback_struct,
++						      work);
++	(cb->callback)(cb->data);
+ 
+-	w->callback(w->context);
+-
+-	kfree(w);
+-}
+-
+-struct workqueue_struct *WorkQueueCreate(char *name)
+-{
+-	struct workqueue_struct *wq;
+-	wq = create_workqueue(name);
+-	if (unlikely(!wq))
+-		return NULL;
+-	return wq;
++	kfree(cb);
+ }
+ 
+-void WorkQueueClose(struct workqueue_struct *hWorkQueue)
++int osd_schedule_callback(struct workqueue_struct *wq,
++			  void (*func)(void *),
++			  void *data)
+ {
+-	destroy_workqueue(hWorkQueue);
+-	return;
+-}
++	struct osd_callback_struct *cb;
+ 
+-int WorkQueueQueueWorkItem(struct workqueue_struct *hWorkQueue,
+-			   PFN_WORKITEM_CALLBACK workItem,
+-			   void* context)
+-{
+-	WORKITEM* w = kmalloc(sizeof(WORKITEM), GFP_ATOMIC);
+-	if (!w)
++	cb = kmalloc(sizeof(*cb), GFP_KERNEL);
++	if (!cb)
+ 	{
++		printk(KERN_ERR "unable to allocate memory in osd_schedule_callback");
+ 		return -1;
+ 	}
+ 
+-	w->callback = workItem,
+-	w->context = context;
+-	INIT_WORK(&w->work, WorkItemCallback);
+-	return queue_work(hWorkQueue, &w->work);
++	cb->callback = func;
++	cb->data = data;
++	INIT_WORK(&cb->work, osd_callback_work);
++	return queue_work(wq, &cb->work);
+ }
+ 
+-void QueueWorkItem(PFN_WORKITEM_CALLBACK workItem, void* context)
+-{
+-	WORKITEM* w = kmalloc(sizeof(WORKITEM), GFP_ATOMIC);
+-	if (!w)
+-	{
+-		return;
+-	}
+-
+-	w->callback = workItem,
+-	w->context = context;
+-	INIT_WORK(&w->work, WorkItemCallback);
+-	schedule_work(&w->work);
+-}
+--- a/drivers/staging/hv/Vmbus.c
++++ b/drivers/staging/hv/Vmbus.c
+@@ -423,7 +423,9 @@ VmbusOnMsgDPC(
+ 			}
+ 
+ 			memcpy(copied, msg, sizeof(HV_MESSAGE));
+-			WorkQueueQueueWorkItem(gVmbusConnection.WorkQueue, VmbusOnChannelMessage, (void*)copied);
++			osd_schedule_callback(gVmbusConnection.WorkQueue,
++					      VmbusOnChannelMessage,
++					      (void *)copied);
+ 		}
+ 
+ 		msg->Header.MessageType = HvMessageTypeNone;
