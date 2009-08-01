@@ -1,0 +1,99 @@
+serial: extract carrier operations
+
+From: Alan Cox <alan@linux.intel.com>
+
+The switch to using the tty port helpers needs some functions separated out
+and provided as tty port helpers. Do the split but don't yet switch to the
+tty_port logic so that we can bisect bugs better
+
+Signed-off-by; Alan Cox <alan@linux.intel.com>
+---
+
+ drivers/serial/serial_core.c |   39 +++++++++++++++++++++++++++++++--------
+ 1 files changed, 31 insertions(+), 8 deletions(-)
+
+
+diff --git a/drivers/serial/serial_core.c b/drivers/serial/serial_core.c
+index 2514d00..285c051 100644
+--- a/drivers/serial/serial_core.c
++++ b/drivers/serial/serial_core.c
+@@ -1473,6 +1473,28 @@ static void uart_update_termios(struct uart_state *state)
+ 	}
+ }
+ 
++static void uart_raise_dtr_rts(struct tty_port *port, int up)
++{
++	struct uart_state *state = container_of(port, struct uart_state, port);
++	struct uart_port *uport = state->uart_port;
++	uart_set_mctrl(uport, up ? TIOCM_DTR : 0);
++}
++
++static int uart_carrier_raised(struct tty_port *port)
++{
++	struct uart_state *state = container_of(port, struct uart_state, port);
++	struct uart_port *uport = state->uart_port;
++	unsigned int mctrl;
++
++	spin_lock_irq(&uport->lock);
++	uport->ops->enable_ms(uport);
++	mctrl = uport->ops->get_mctrl(uport);
++	spin_unlock_irq(&uport->lock);
++	if (mctrl & TIOCM_CAR)
++		return 1;
++	return 0;
++}
++
+ /*
+  * Block the open until the port is ready.  We must be called with
+  * the per-port semaphore held.
+@@ -1481,9 +1503,7 @@ static int
+ uart_block_til_ready(struct file *filp, struct uart_state *state)
+ {
+ 	DECLARE_WAITQUEUE(wait, current);
+-	struct uart_port *uport = state->uart_port;
+ 	struct tty_port *port = &state->port;
+-	unsigned int mctrl;
+ 
+ 	port->blocked_open++;
+ 	port->count--;
+@@ -1524,17 +1544,14 @@ uart_block_til_ready(struct file *filp, struct uart_state *state)
+ 		 * the data from the modem.
+ 		 */
+ 		if (port->tty->termios->c_cflag & CBAUD)
+-			uart_set_mctrl(uport, TIOCM_DTR);
++			tty_port_raise_dtr_rts(port);
+ 
+ 		/*
+ 		 * and wait for the carrier to indicate that the
+ 		 * modem is ready for us.
+ 		 */
+-		spin_lock_irq(&uport->lock);
+-		uport->ops->enable_ms(uport);
+-		mctrl = uport->ops->get_mctrl(uport);
+-		spin_unlock_irq(&uport->lock);
+-		if (mctrl & TIOCM_CAR)
++		
++		if (tty_port_carrier_raised(port))
+ 			break;
+ 
+ 		mutex_unlock(&port->mutex);
+@@ -2326,6 +2343,11 @@ static const struct tty_operations uart_ops = {
+ #endif
+ };
+ 
++static const struct tty_port_operations uart_port_ops = {
++	.carrier_raised = uart_carrier_raised,
++	.dtr_rts = uart_raise_dtr_rts,
++};
++
+ /**
+  *	uart_register_driver - register a driver with the uart core layer
+  *	@drv: low level driver structure
+@@ -2383,6 +2405,7 @@ int uart_register_driver(struct uart_driver *drv)
+ 		struct tty_port *port = &state->port;
+ 
+ 		tty_port_init(port);
++		port->ops = &uart_port_ops;
+ 		port->close_delay     = 500;	/* .5 seconds */
+ 		port->closing_wait    = 30000;	/* 30 seconds */
+ 		tasklet_init(&state->tlet, uart_tasklet_action,

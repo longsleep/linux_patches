@@ -1,0 +1,230 @@
+serial_core: use the tty_port wait_until_ready
+
+From: Alan Cox <alan@linux.intel.com>
+
+This subtly changes the locking. Our count and other fields become locked
+by the tty_port (which is the correct behaviour).
+
+The mutex behaviour on open that serial had is actually very useful so we
+propogate that into the tty_port core code.
+
+Signed-off-by: Alan Cox <alan@linux.intel.com>
+---
+
+ drivers/char/tty_port.c      |   41 ++++++++++++++++++-
+ drivers/serial/serial_core.c |   91 ++----------------------------------------
+ include/linux/tty.h          |    2 +
+ 3 files changed, 45 insertions(+), 89 deletions(-)
+
+
+diff --git a/drivers/char/tty_port.c b/drivers/char/tty_port.c
+index 0293d25..61b09bd 100644
+--- a/drivers/char/tty_port.c
++++ b/drivers/char/tty_port.c
+@@ -180,7 +180,7 @@ void tty_port_lower_dtr_rts(struct tty_port *port)
+ EXPORT_SYMBOL(tty_port_lower_dtr_rts);
+ 
+ /**
+- *	tty_port_block_til_ready	-	Waiting logic for tty open
++ *	__tty_port_block_til_ready	-	Waiting logic for tty open
+  *	@port: the tty port being opened
+  *	@tty: the tty device being bound
+  *	@filp: the file pointer of the opener
+@@ -197,9 +197,12 @@ EXPORT_SYMBOL(tty_port_lower_dtr_rts);
+  *	do carrier detect and the dtr_rts method if it supports software
+  *	management of these lines. Note that the dtr/rts raise is done each
+  *	iteration as a hangup may have previously dropped them while we wait.
++ *
++ *	Called with the port mutex held. See tty_port_block_til_ready for
++ *	normal uses.
+  */
+  
+-int tty_port_block_til_ready(struct tty_port *port,
++int __tty_port_block_til_ready(struct tty_port *port,
+ 				struct tty_struct *tty, struct file *filp)
+ {
+ 	int do_clocal = 0, retval;
+@@ -265,7 +268,9 @@ int tty_port_block_til_ready(struct tty_port *port,
+ 			retval = -ERESTARTSYS;
+ 			break;
+ 		}
++		mutex_unlock(&port->mutex);
+ 		schedule();
++		mutex_lock(&port->mutex);
+ 	}
+ 	finish_wait(&port->open_wait, &wait);
+ 
+@@ -281,6 +286,38 @@ int tty_port_block_til_ready(struct tty_port *port,
+ 	return retval;
+ 	
+ }
++EXPORT_SYMBOL(__tty_port_block_til_ready);
++
++/**
++ *	tty_port_block_til_ready	-	Waiting logic for tty open
++ *	@port: the tty port being opened
++ *	@tty: the tty device being bound
++ *	@filp: the file pointer of the opener
++ *
++ *	Implement the core POSIX/SuS tty behaviour when opening a tty device.
++ *	Handles:
++ *		- hangup (both before and during)
++ *		- non blocking open
++ *		- rts/dtr/dcd
++ *		- signals
++ *		- port flags and counts
++ *
++ *	The passed tty_port must implement the carrier_raised method if it can
++ *	do carrier detect and the dtr_rts method if it supports software
++ *	management of these lines. Note that the dtr/rts raise is done each
++ *	iteration as a hangup may have previously dropped them while we wait.
++ */
++ 
++int tty_port_block_til_ready(struct tty_port *port,
++				struct tty_struct *tty, struct file *filp)
++{
++	int retval;
++	mutex_lock(&port->mutex);
++	retval = __tty_port_block_til_ready(port, tty, filp);
++	mutex_unlock(&port->mutex);
++	return retval;
++}
++
+ EXPORT_SYMBOL(tty_port_block_til_ready);
+ 
+ int tty_port_close_start(struct tty_port *port, struct tty_struct *tty, struct file *filp)
+diff --git a/drivers/serial/serial_core.c b/drivers/serial/serial_core.c
+index 6d2290d..b1d4b91 100644
+--- a/drivers/serial/serial_core.c
++++ b/drivers/serial/serial_core.c
+@@ -1452,86 +1452,6 @@ static int uart_carrier_raised(struct tty_port *port)
+ 	return 0;
+ }
+ 
+-/*
+- * Block the open until the port is ready.  We must be called with
+- * the per-port semaphore held.
+- */
+-static int
+-uart_block_til_ready(struct file *filp, struct uart_state *state)
+-{
+-	DECLARE_WAITQUEUE(wait, current);
+-	struct tty_port *port = &state->port;
+-
+-	port->blocked_open++;
+-	port->count--;
+-
+-	add_wait_queue(&port->open_wait, &wait);
+-	while (1) {
+-		set_current_state(TASK_INTERRUPTIBLE);
+-
+-		/*
+-		 * If we have been hung up, tell userspace/restart open.
+-		 */
+-		if (tty_hung_up_p(filp) || port->tty == NULL)
+-			break;
+-
+-		/*
+-		 * If the port has been closed, tell userspace/restart open.
+-		 */
+-		if (!(port->flags & ASYNC_INITIALIZED))
+-			break;
+-
+-		/*
+-		 * If non-blocking mode is set, or CLOCAL mode is set,
+-		 * we don't want to wait for the modem status lines to
+-		 * indicate that the port is ready.
+-		 *
+-		 * Also, if the port is not enabled/configured, we want
+-		 * to allow the open to succeed here.  Note that we will
+-		 * have set TTY_IO_ERROR for a non-existant port.
+-		 */
+-		if ((filp->f_flags & O_NONBLOCK) ||
+-		    (port->tty->termios->c_cflag & CLOCAL) ||
+-		    (port->tty->flags & (1 << TTY_IO_ERROR)))
+-			break;
+-
+-		/*
+-		 * Set DTR to allow modem to know we're waiting.  Do
+-		 * not set RTS here - we want to make sure we catch
+-		 * the data from the modem.
+-		 */
+-		if (port->tty->termios->c_cflag & CBAUD)
+-			tty_port_raise_dtr_rts(port);
+-
+-		/*
+-		 * and wait for the carrier to indicate that the
+-		 * modem is ready for us.
+-		 */
+-		
+-		if (tty_port_carrier_raised(port))
+-			break;
+-
+-		mutex_unlock(&port->mutex);
+-		schedule();
+-		mutex_lock(&port->mutex);
+-
+-		if (signal_pending(current))
+-			break;
+-	}
+-	set_current_state(TASK_RUNNING);
+-	remove_wait_queue(&port->open_wait, &wait);
+-
+-	port->count++;
+-	port->blocked_open--;
+-
+-	if (signal_pending(current))
+-		return -ERESTARTSYS;
+-
+-	if (!port->tty || tty_hung_up_p(filp))
+-		return -EAGAIN;
+-
+-	return 0;
+-}
+ 
+ static struct uart_state *uart_get(struct uart_driver *drv, int line)
+ {
+@@ -1590,7 +1510,7 @@ static int uart_open(struct tty_struct *tty, struct file *filp)
+ 		goto fail;
+ 
+ 	/*
+-	 * We take the semaphore inside uart_get to guarantee that we won't
++	 * We take the mutex inside uart_get to guarantee that we won't
+ 	 * be re-entered while allocating the state structure, or while we
+ 	 * request any IRQs that the driver may need.  This also has the nice
+ 	 * side-effect that it delays the action of uart_hangup, so we can
+@@ -1640,18 +1560,15 @@ static int uart_open(struct tty_struct *tty, struct file *filp)
+ 	 * If we succeeded, wait until the port is ready.
+ 	 */
+ 	if (retval == 0)
+-		retval = uart_block_til_ready(filp, state);
++		retval = tty_port_block_til_ready(port, tty, filp);
+ 	mutex_unlock(&port->mutex);
+ 
+ 	/*
+ 	 * If this is the first open to succeed, adjust things to suit.
+ 	 */
+-	if (retval == 0 && !(port->flags & ASYNC_NORMAL_ACTIVE)) {
+-		set_bit(ASYNCB_NORMAL_ACTIVE, &port->flags);
+-
++	if (retval == 0 &&
++		     !test_and_set_bit(ASYNCB_NORMAL_ACTIVE, &port->flags))
+ 		uart_update_termios(state);
+-	}
+-
+ fail:
+ 	return retval;
+ }
+diff --git a/include/linux/tty.h b/include/linux/tty.h
+index 65a7549..7163493 100644
+--- a/include/linux/tty.h
++++ b/include/linux/tty.h
+@@ -458,6 +458,8 @@ extern int tty_port_carrier_raised(struct tty_port *port);
+ extern void tty_port_raise_dtr_rts(struct tty_port *port);
+ extern void tty_port_lower_dtr_rts(struct tty_port *port);
+ extern void tty_port_hangup(struct tty_port *port);
++extern int __tty_port_block_til_ready(struct tty_port *port,
++				struct tty_struct *tty, struct file *filp);
+ extern int tty_port_block_til_ready(struct tty_port *port,
+ 				struct tty_struct *tty, struct file *filp);
+ extern int tty_port_close_start(struct tty_port *port,
