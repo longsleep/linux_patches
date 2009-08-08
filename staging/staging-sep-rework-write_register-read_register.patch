@@ -1,0 +1,490 @@
+From alan@lxorguk.ukuu.org.uk  Fri Aug  7 16:52:32 2009
+From: Alan Cox <alan@lxorguk.ukuu.org.uk>
+Date: Thu, 06 Aug 2009 20:45:24 +0100
+Subject: Staging: sep: rework write_register/read_register
+To: greg@kroah.com, mark.a.allyn@intel.com
+Message-ID: <20090806194512.18419.73611.stgit@localhost.localdomain>
+
+
+From: Alan Cox <alan@linux.intel.com>
+
+Replace the macros with an inline to get type safety and pass sep_dev
+instead of the reg pointer
+
+Signed-off-by: Alan Cox <alan@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+---
+
+ drivers/staging/sep/sep_dev.h                 |   20 ++++-
+ drivers/staging/sep/sep_driver_config.h       |   56 ----------------
+ drivers/staging/sep/sep_ext_with_pci_driver.c |   34 +++-------
+ drivers/staging/sep/sep_main_mod.c            |   87 ++++++++------------------
+ 4 files changed, 58 insertions(+), 139 deletions(-)
+
+
+--- a/drivers/staging/sep/sep_dev.h
++++ b/drivers/staging/sep/sep_dev.h
+@@ -60,7 +60,7 @@ struct sep_device {
+ 	unsigned long rar_region_addr;
+ 
+ 	/* start address of the access to the SEP registers from driver */
+-	unsigned long reg_base_address;
++	void __iomem *reg_base_address;
+ 	/* transaction counter that coordinates the transactions between SEP and HOST */
+ 	unsigned long host_to_sep_send_counter;
+ 	/* counter for the messages from sep */
+@@ -103,17 +103,27 @@ struct sep_device {
+ 
+ extern struct sep_device *sep_dev;
+ 
+-extern inline void sep_write_reg(struct sep_device *dev, int reg, u32 value)
++static inline void sep_write_reg(struct sep_device *dev, int reg, u32 value)
+ {
+ 	void __iomem *addr = dev->reg_base_address + reg;
+-	writel(value, reg);
++	writel(value, addr);
+ }
+ 
+-extern inline u32 sep_read_reg(struct sep_device *dev, int reg)
++static inline u32 sep_read_reg(struct sep_device *dev, int reg)
+ {
+ 	void __iomem *addr = dev->reg_base_address + reg;
+-	return readl(reg);
++	return readl(addr);
+ }
+ 
++/* wait for SRAM write complete(indirect write */
++static inline void sep_wait_sram_write(struct sep_device *dev)
++{
++	u32 reg_val;
++	do
++		reg_val = sep_read_reg(dev, HW_SRAM_DATA_READY_REG_ADDR);
++	while(!(reg_val & 1));
++}
++
++
+ #endif
+ 
+--- a/drivers/staging/sep/sep_driver_config.h
++++ b/drivers/staging/sep/sep_driver_config.h
+@@ -244,62 +244,6 @@ do { \
+ 		printk(KERN_WARNING info, param1, param2, param3, param4); \
+ } while (0)
+ 
+-#if 0
+-/* write register macro with option for debug print */
+-#define SEP_WRITE_REGISTER(address, value) \
+-do { \
+-	if (sepDebug & SEP_DEBUG_LEVEL_REGISTERS) \
+-		printk(KERN_WARNING "Write Register: address %lu value %lu\n", \
+-		(unsigned long)(address), (unsigned long)(value)); \
+-	writel((value), (void *)(address)); \
+-} while (0)
+-
+-/* read register macro with option for debug print */
+-#define SEP_READ_REGISTER(address , value) \
+-do { \
+-	(value) = readl((void *)(address)); \
+-	if (sepDebug & SEP_DEBUG_LEVEL_REGISTERS) \
+-		printk(KERN_WARNING "Read Register: address %lu value %lu\n", \
+-		(address), (value)); \
+-} while (0)
+-#else
+-
+-#if 1
+-
+-#define SEP_WRITE_REGISTER(address, value)  writel((value), (void *)(address))
+-#define SEP_READ_REGISTER(address, value)  (value) = readl((void *)(address))
+-#endif
+-
+-#endif
+-
+-#if 0
+-#define SEP_WRITE_ROM(address, value)  writel((value), (void *)(address))
+ 
+-#define SEP_WRITE_REGISTER(address, value) \
+-do { \
+-	unsigned long i; \
+-	for (i = 0; i < 1000; i++); \
+-		writel((value), (void *)(address)); \
+-} while (0)
+-
+-
+-#define SEP_READ_REGISTER(address , value) \
+-do { \
+-	unsigned long i; \
+-	for (i = 0; i < 1000; i++); \
+-		(value) = readl((void *) (address)); \
+-} while (0)
+-
+-#endif
+-
+-/* wait for SRAM write complete(indirect write */
+-#define SEP_WAIT_SRAM_WRITE_COMPLETE() \
+-do { \
+-	unsigned long  reg_val; \
+-	do { \
+-		SEP_READ_REGISTER(sep_dev->reg_base_address + \
+-		HW_SRAM_DATA_READY_REG_ADDR, (reg_val)); \
+-	} while (!(reg_val & 0x1)); \
+-} while (0)
+ 
+ #endif
+--- a/drivers/staging/sep/sep_ext_with_pci_driver.c
++++ b/drivers/staging/sep/sep_ext_with_pci_driver.c
+@@ -424,7 +424,7 @@ static int __devinit sep_probe(struct pc
+ 	  "SEP Driver:io_memory_start_virtual_address is %p\n",
+ 	sep_dev->io_memory_start_virtual_address);
+ 
+-	sep_dev->reg_base_address = (unsigned long)sep_dev->io_memory_start_virtual_address;
++	sep_dev->reg_base_address = (void __iomem *)sep_dev->io_memory_start_virtual_address;
+ 
+ 
+ 	/* set up system base address and shared memory location */
+@@ -455,11 +455,11 @@ static int __devinit sep_probe(struct pc
+ 	  "SEP Driver: about to write IMR and ICR REG_ADDR\n");
+ 
+ 	/* clear ICR register */
+-	SEP_WRITE_REGISTER(sep_dev->reg_base_address + HW_HOST_ICR_REG_ADDR,
++	sep_write_reg(sep_dev, HW_HOST_ICR_REG_ADDR,
+ 	  0xFFFFFFFF);
+ 
+ 	/* set the IMR register - open only GPR 2 */
+-	SEP_WRITE_REGISTER(sep_dev->reg_base_address + HW_HOST_IMR_REG_ADDR,
++	sep_write_reg(sep_dev, HW_HOST_IMR_REG_ADDR,
+ 	  (~(0x1 << 13)));
+ 
+ 	/* figure out our irq */
+@@ -482,7 +482,7 @@ static int __devinit sep_probe(struct pc
+ 	  "SEP Driver: about to write IMR REG_ADDR");
+ 
+ 	/* set the IMR register - open only GPR 2 */
+-	SEP_WRITE_REGISTER(sep_dev->reg_base_address + HW_HOST_IMR_REG_ADDR,
++	sep_write_reg(sep_dev, HW_HOST_IMR_REG_ADDR,
+ 	  (~(0x1 << 13)));
+ 
+ #endif /* SEP_DRIVER_POLLING_MODE */
+@@ -529,11 +529,10 @@ void sep_load_rom_code(void)
+ 
+ 	for (i = 0; i < 4; i++) {
+ 		/* write bank */
+-		SEP_WRITE_REGISTER(sep_dev->reg_base_address
+-		  + SEP_ROM_BANK_register_offset, i);
++		sep_write_reg(sep_dev, SEP_ROM_BANK_register_offset, i);
+ 
+ 		for (j = 0; j < CRYS_SEP_ROM_length / 4; j++) {
+-			SEP_WRITE_REGISTER(sep_dev->reg_base_address +
++			sep_write_reg(sep_dev,
+ 			  CRYS_SEP_ROM_start_address_offset + 4*j,
+ 			  CRYS_SEP_ROM[i * 0x1000 + j]);
+ 
+@@ -547,13 +546,11 @@ void sep_load_rom_code(void)
+ 	}
+ 
+ 	/* reset the SEP*/
+-	SEP_WRITE_REGISTER(sep_dev->reg_base_address
+-	  + HW_HOST_SEP_SW_RST_REG_ADDR, 0x1);
++	sep_write_reg(sep_dev, HW_HOST_SEP_SW_RST_REG_ADDR, 0x1);
+ 
+ 	/* poll for SEP ROM boot finish */
+ 	do {
+-		SEP_READ_REGISTER(sep_dev->reg_base_address
+-		  + HW_HOST_SEP_HOST_GPR3_REG_ADDR, regVal);
++		retVal = sep_read_reg(sep_dev, HW_HOST_SEP_HOST_GPR3_REG_ADDR);
+ 	} while (!regVal);
+ 
+ 	DEBUG_PRINT_0(SEP_DEBUG_LEVEL_EXTENDED,
+@@ -562,38 +559,33 @@ void sep_load_rom_code(void)
+ 	switch (regVal) {
+ 	case 0x1:
+ 		/* fatal error - read erro status from GPRO */
+-		SEP_READ_REGISTER(sep_dev->reg_base_address
+-		  + HW_HOST_SEP_HOST_GPR0_REG_ADDR, Error);
++		Error = sep_read_reg(sep_dev, HW_HOST_SEP_HOST_GPR0_REG_ADDR);
+ 		DEBUG_PRINT_0(SEP_DEBUG_LEVEL_EXTENDED,
+ 		  "SEP Driver: ROM polling case 1\n");
+ 		break;
+ 	case 0x2:
+ 		/* Boot First Phase ended  */
+-		SEP_READ_REGISTER(sep_dev->reg_base_address
+-		  + HW_HOST_SEP_HOST_GPR0_REG_ADDR, warning);
++		warning = sep_read_reg(sep_dev, HW_HOST_SEP_HOST_GPR0_REG_ADDR);
+ 		DEBUG_PRINT_0(SEP_DEBUG_LEVEL_EXTENDED,
+ 		  "SEP Driver: ROM polling case 2\n");
+ 		break;
+ 	case 0x4:
+ 		/* Cold boot ended successfully  */
+-		SEP_READ_REGISTER(sep_dev->reg_base_address
+-		  + HW_HOST_SEP_HOST_GPR0_REG_ADDR, warning);
++		warning = sep_read_reg(sep_dev, HW_HOST_SEP_HOST_GPR0_REG_ADDR);
+ 		DEBUG_PRINT_0(SEP_DEBUG_LEVEL_EXTENDED,
+ 		  "SEP Driver: ROM polling case 4\n");
+ 		Error = 0;
+ 		break;
+ 	case 0x8:
+ 		/* Warmboot ended successfully */
+-		SEP_READ_REGISTER(sep_dev->reg_base_address
+-		  + HW_HOST_SEP_HOST_GPR0_REG_ADDR, warning);
++		warning = sep_read_reg(sep_dev, HW_HOST_SEP_HOST_GPR0_REG_ADDR);
+ 		DEBUG_PRINT_0(SEP_DEBUG_LEVEL_EXTENDED,
+ 		  "SEP Driver: ROM polling case 8\n");
+ 		Error = 0;
+ 		break;
+ 	case 0x10:
+ 		/* ColdWarm boot ended successfully */
+-		SEP_READ_REGISTER(sep_dev->reg_base_address
+-		  + HW_HOST_SEP_HOST_GPR0_REG_ADDR, warning);
++		warning = sep_read_reg(sep_dev, HW_HOST_SEP_HOST_GPR0_REG_ADDR);
+ 		DEBUG_PRINT_0(SEP_DEBUG_LEVEL_EXTENDED,
+ 		  "SEP Driver: ROM polling case 16\n");
+ 		Error = 0;
+--- a/drivers/staging/sep/sep_main_mod.c
++++ b/drivers/staging/sep/sep_main_mod.c
+@@ -374,9 +374,7 @@ void sep_driver_poll()
+ #ifdef SEP_DRIVER_POLLING_MODE
+ 
+   while (sep_dev->host_to_sep_send_counter != (retVal & 0x7FFFFFFF))
+-	SEP_READ_REGISTER(sep_dev->reg_base_address +
+-			HW_HOST_SEP_HOST_GPR2_REG_ADDR,
+-			retVal);
++	retVal = sep_read_reg(sep_dev, HW_HOST_SEP_HOST_GPR2_REG_ADDR);
+ 
+   sep_dev->sep_to_host_reply_counter++;
+ #else
+@@ -446,7 +444,7 @@ static int sep_release(struct inode *ino
+ 
+ #if 0/*!SEP_DRIVER_POLLING_MODE*/
+   /* close IMR */
+-  SEP_WRITE_REGISTER(sep_dev->reg_base_address + HW_HOST_IMR_REG_ADDR, 0x7FFF);
++  sep_write_reg(sep_dev, HW_HOST_IMR_REG_ADDR, 0x7FFF);
+ 
+   /* release IRQ line */
+   free_irq(SEP_DIRVER_IRQ_NUM, &sep_dev->reg_base_address);
+@@ -542,9 +540,7 @@ static unsigned int sep_poll(struct file
+ #if SEP_DRIVER_POLLING_MODE
+ 
+   while (sep_dev->host_to_sep_send_counter != (retVal & 0x7FFFFFFF)) {
+-	SEP_READ_REGISTER(sep_dev->reg_base_address +
+-	HW_HOST_SEP_HOST_GPR2_REG_ADDR,
+-	retVal);
++	retVal = sep_read_reg(sep_dev, HW_HOST_SEP_HOST_GPR2_REG_ADDR);
+ 
+ 	for (count = 0; count < 10 * 4; count += 4)
+ 	DEBUG_PRINT_2(SEP_DEBUG_LEVEL_EXTENDED,
+@@ -581,9 +577,7 @@ static unsigned int sep_poll(struct file
+ 	count,
+ 	*((unsigned long *)(sep_dev->shared_area_addr + 0x1800 + count)));
+ 
+-	SEP_READ_REGISTER(sep_dev->reg_base_address +
+-		HW_HOST_SEP_HOST_GPR2_REG_ADDR,
+-		retVal);
++	retVal = sep_read_reg(sep_dev, HW_HOST_SEP_HOST_GPR2_REG_ADDR);
+ 	DEBUG_PRINT_1(SEP_DEBUG_LEVEL_EXTENDED, "retVal is %lu\n", retVal);
+ 	/* check if the this is sep reply or request */
+ 	if (retVal >> 31) {
+@@ -913,16 +907,13 @@ for the current transaction */
+ #if (SEP_DRIVER_RECONFIG_MESSAGE_AREA == 1)
+ 
+   /* send the new SHARED MESSAGE AREA to the SEP */
+-  SEP_WRITE_REGISTER(sep_dev->reg_base_address + HW_HOST_HOST_SEP_GPR1_REG_ADDR,
++  sep_write_reg(sep_dev, HW_HOST_HOST_SEP_GPR1_REG_ADDR,
+ 			sep_dev->phys_shared_area_addr);
+ 
+   /* poll for SEP response */
+-  SEP_READ_REGISTER(sep_dev->reg_base_address + HW_HOST_SEP_HOST_GPR1_REG_ADDR,
+-			retVal);
++  retVal = sep_read_reg(sep_dev, HW_HOST_SEP_HOST_GPR1_REG_ADDR);
+   while (retVal != 0xffffffff && retVal != sep_dev->phys_shared_area_addr)
+-	SEP_READ_REGISTER(sep_dev->reg_base_address +
+-			HW_HOST_SEP_HOST_GPR1_REG_ADDR,
+-			retVal);
++	retVal = sep_read_reg(sep_dev, HW_HOST_SEP_HOST_GPR1_REG_ADDR);
+ 
+   /* check the return value (register) */
+   if (retVal != sep_dev->phys_shared_area_addr) {
+@@ -1060,15 +1051,14 @@ irqreturn_t sep_inthandler(int irq, void
+   int_error = IRQ_HANDLED;
+ 
+   /* read the IRR register to check if this is SEP interrupt */
+-  SEP_READ_REGISTER(sep_dev->reg_base_address + HW_HOST_IRR_REG_ADDR, reg_val);
++  reg_val = sep_read_reg(sep_dev, HW_HOST_IRR_REG_ADDR);
+   DEBUG_PRINT_1(SEP_DEBUG_LEVEL_EXTENDED, "SEP Interrupt - reg is %08lx\n",
+ 			reg_val);
+ 
+   /* check if this is the flow interrupt */
+   if (0/*reg_val & (0x1 << 11)*/) {
+ 	/* read GPRO to find out the which flow is done */
+-	SEP_READ_REGISTER(sep_dev->reg_base_address + HW_HOST_IRR_REG_ADDR,
+-	flow_id);
++	flow_id = sep_read_reg(sep_dev, HW_HOST_IRR_REG_ADDR);
+ 
+ 	/* find the contex of the flow */
+ 	error = sep_find_flow_context(flow_id >> 28, &flow_context_ptr);
+@@ -1097,7 +1087,7 @@ irqreturn_t sep_inthandler(int irq, void
+ end_function_with_error:
+ 
+   /* clear the interrupt */
+-  SEP_WRITE_REGISTER(sep_dev->reg_base_address + HW_HOST_ICR_REG_ADDR, reg_val);
++  sep_write_reg(sep_dev, HW_HOST_ICR_REG_ADDR, reg_val);
+ 
+ end_function:
+ 
+@@ -2235,8 +2225,7 @@ static void sep_send_command_handler()
+   sep_dev->host_to_sep_send_counter++;
+ 
+   /* send interrupt to SEP */
+-  SEP_WRITE_REGISTER(sep_dev->reg_base_address +
+-			HW_HOST_HOST_SEP_GPR0_REG_ADDR, 0x2);
++  sep_write_reg(sep_dev, HW_HOST_HOST_SEP_GPR0_REG_ADDR, 0x2);
+ 
+   DEBUG_PRINT_0(SEP_DEBUG_LEVEL_BASIC,
+ 		"SEP Driver:<-------- sep_send_command_handler end\n");
+@@ -2269,7 +2258,7 @@ static void sep_send_reply_command_handl
+   sep_dev->host_to_sep_send_counter++;
+ 
+   /* send the interrupt to SEP */
+-  SEP_WRITE_REGISTER(sep_dev->reg_base_address + HW_HOST_HOST_SEP_GPR2_REG_ADDR,
++  sep_write_reg(sep_dev, HW_HOST_HOST_SEP_GPR2_REG_ADDR,
+ 				sep_dev->host_to_sep_send_counter);
+ 
+   /* update both counters */
+@@ -3016,15 +3005,13 @@ static int sep_start_handler(void)
+ 
+   /* wait in polling for message from SEP */
+   do {
+-	SEP_READ_REGISTER(sep_dev->reg_base_address +
+-			HW_HOST_SEP_HOST_GPR3_REG_ADDR, reg_val);
++	reg_val = sep_read_reg(sep_dev, HW_HOST_SEP_HOST_GPR3_REG_ADDR);
+   } while (!reg_val);
+ 
+   /* check the value */
+   if (reg_val == 0x1) {
+ 	/* fatal error - read erro status from GPRO */
+-	SEP_READ_REGISTER(sep_dev->reg_base_address +
+-				HW_HOST_SEP_HOST_GPR0_REG_ADDR, error);
++	error = sep_read_reg(sep_dev, HW_HOST_SEP_HOST_GPR0_REG_ADDR);
+ 	goto end_function;
+   }
+ 
+@@ -3086,9 +3073,7 @@ static int sep_init_handler(unsigned lon
+   message_ptr = (unsigned long *)command_args.message_addr;
+ 
+   /* set the base address of the SRAM  */
+-  SEP_WRITE_REGISTER(sep_dev->reg_base_address +
+-					HW_SRAM_ADDR_REG_ADDR,
+-					HW_CC_SRAM_BASE_ADDRESS);
++  sep_write_reg(sep_dev, HW_SRAM_ADDR_REG_ADDR,	HW_CC_SRAM_BASE_ADDRESS);
+ 
+   for (counter = 0 ;
+ 		counter < command_args.message_size_in_words;
+@@ -3096,7 +3081,7 @@ static int sep_init_handler(unsigned lon
+ 	get_user(message_word, message_ptr);
+ 
+ 	/* write data to SRAM */
+-	SEP_WRITE_REGISTER(sep_dev->reg_base_address + HW_SRAM_DATA_REG_ADDR,
++	sep_write_reg(sep_dev, HW_SRAM_DATA_REG_ADDR,
+ 						message_word);
+ 
+ 	DEBUG_PRINT_1(SEP_DEBUG_LEVEL_EXTENDED,
+@@ -3104,19 +3089,18 @@ static int sep_init_handler(unsigned lon
+ 					message_word);
+ 
+ 		/* wait for write complete */
+-	SEP_WAIT_SRAM_WRITE_COMPLETE();
++	sep_wait_sram_write(sep_dev);
+   }
+ 
+   DEBUG_PRINT_0(SEP_DEBUG_LEVEL_BASIC,
+ 		"SEP Driver:--------> sep_init_handler - finished getting messages from user space\n");
+ 
+   /* signal SEP */
+-  SEP_WRITE_REGISTER(sep_dev->reg_base_address + HW_HOST_HOST_SEP_GPR0_REG_ADDR,
++  sep_write_reg(sep_dev, HW_HOST_HOST_SEP_GPR0_REG_ADDR,
+ 					0x1);
+ 
+   do {
+-	SEP_READ_REGISTER(sep_dev->reg_base_address +
+-			HW_HOST_SEP_HOST_GPR3_REG_ADDR, reg_val);
++        reg_val = sep_read_reg(sep_dev, HW_HOST_SEP_HOST_GPR3_REG_ADDR);
+   } while (!(reg_val & 0xFFFFFFFD));
+ 
+   DEBUG_PRINT_0(SEP_DEBUG_LEVEL_BASIC,
+@@ -3127,15 +3111,13 @@ static int sep_init_handler(unsigned lon
+ 	DEBUG_PRINT_0(SEP_DEBUG_LEVEL_EXTENDED,
+ 		"SEP Driver:init failed\n");
+ 
+-	SEP_READ_REGISTER(sep_dev->reg_base_address + 0x8060, error);
++	error = sep_read_reg(sep_dev, 0x8060);
+ 	DEBUG_PRINT_1(SEP_DEBUG_LEVEL_EXTENDED,
+ 			"SEP Driver:sw monitor is %lu\n",
+ 			error);
+ 
+ 	/* fatal error - read erro status from GPRO */
+-	SEP_READ_REGISTER(sep_dev->reg_base_address +
+-				HW_HOST_SEP_HOST_GPR0_REG_ADDR,
+-				error);
++	error = sep_read_reg(sep_dev, HW_HOST_SEP_HOST_GPR0_REG_ADDR);
+ 	DEBUG_PRINT_1(SEP_DEBUG_LEVEL_EXTENDED,
+ 			"SEP Driver:error is %lu\n", error);
+ 	goto end_function;
+@@ -3307,7 +3289,7 @@ static int sep_end_transaction_handler(u
+ 
+ #if 0/*!SEP_DRIVER_POLLING_MODE*/
+   /* close IMR */
+-  SEP_WRITE_REGISTER(sep_dev->reg_base_address + HW_HOST_IMR_REG_ADDR, 0x7FFF);
++  sep_write_reg(sep_dev, HW_HOST_IMR_REG_ADDR, 0x7FFF);
+ 
+   /* release IRQ line */
+   free_irq(SEP_DIRVER_IRQ_NUM, &sep_dev->reg_base_address);
+@@ -3352,9 +3334,7 @@ static void sep_flow_done_handler(struct
+ 	(void *)sep_dev->shared_area_addr,
+ 	flow_data_ptr->message_size_in_bytes);
+ 
+-	SEP_WRITE_REGISTER(sep_dev->reg_base_address +
+-			HW_HOST_HOST_SEP_GPR2_REG_ADDR,
+-			0x2);
++	sep_write_reg(sep_dev, HW_HOST_HOST_SEP_GPR2_REG_ADDR, 0x2);
+   }
+   mutex_unlock(&sep_mutex);
+ }
+@@ -3837,33 +3817,26 @@ static void sep_configure_dma_burst(void
+ 		"SEP Driver:<-------- sep_configure_dma_burst start \n");
+ 
+   /* request access to registers from SEP */
+-  SEP_WRITE_REGISTER(sep_dev->reg_base_address +
+-					HW_HOST_HOST_SEP_GPR0_REG_ADDR, 0x2UL);
++  sep_write_reg(sep_dev, HW_HOST_HOST_SEP_GPR0_REG_ADDR, 0x2);
+ 
+   DEBUG_PRINT_0(SEP_DEBUG_LEVEL_BASIC,
+ 		"SEP Driver:<-------- sep_configure_dma_burst finished request access to registers from SEP (write reg)  \n");
+ 
+-  SEP_READ_REGISTER(sep_dev->reg_base_address +
+-					HW_HOST_SEP_BUSY_REG_ADDR, regVal);
++ regVal = sep_read_reg(sep_dev, HW_HOST_SEP_BUSY_REG_ADDR);
+   while (regVal)
+-	SEP_READ_REGISTER(sep_dev->reg_base_address +
+-					HW_HOST_SEP_BUSY_REG_ADDR, regVal);
++	regVal = sep_read_reg(sep_dev, HW_HOST_SEP_BUSY_REG_ADDR);
+ 
+   DEBUG_PRINT_0(SEP_DEBUG_LEVEL_BASIC,
+ 		"SEP Driver:<-------- sep_configure_dma_burst finished request access to registers from SEP (while(revVal) wait loop)  \n");
+ 
+   /* set the DMA burst register to single burst*/
+-  SEP_WRITE_REGISTER(sep_dev->reg_base_address +
+-					HW_AHB_RD_WR_BURSTS_REG_ADDR, 0x0UL);
++  sep_write_reg(sep_dev, HW_AHB_RD_WR_BURSTS_REG_ADDR, 0x0UL);
+ 
+   /* release the sep busy */
+-  SEP_WRITE_REGISTER(sep_dev->reg_base_address +
+-					HW_HOST_HOST_SEP_GPR0_REG_ADDR, 0x0UL);
+-  SEP_READ_REGISTER(sep_dev->reg_base_address +
+-					HW_HOST_SEP_BUSY_REG_ADDR, regVal);
++  sep_write_reg(sep_dev, HW_HOST_HOST_SEP_GPR0_REG_ADDR, 0x0UL);
++  regVal = sep_read_reg(sep_dev, HW_HOST_SEP_BUSY_REG_ADDR);
+   while (regVal != 0x0)
+-	SEP_READ_REGISTER(sep_dev->reg_base_address +
+-					HW_HOST_SEP_BUSY_REG_ADDR, regVal);
++	  regVal = sep_read_reg(sep_dev, HW_HOST_SEP_BUSY_REG_ADDR);
+ 
+   DEBUG_PRINT_0(SEP_DEBUG_LEVEL_BASIC,
+ 		"SEP Driver:<-------- sep_configure_dma_burst done  \n");

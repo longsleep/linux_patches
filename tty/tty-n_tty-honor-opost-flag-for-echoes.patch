@@ -1,0 +1,162 @@
+From akpm@linux-foundation.org  Fri Aug  7 16:55:12 2009
+From: Joe Peterson <joe@skyrush.com>
+Date: Thu, 06 Aug 2009 16:10:53 -0700
+Subject: tty: n_tty: honor opost flag for echoes
+To: greg@kroah.com
+Cc: akpm@linux-foundation.org, joe@skyrush.com
+Message-ID: <200908062310.n76NArWa014111@imap1.linux-foundation.org>
+
+
+From: Joe Peterson <joe@skyrush.com>
+
+Fixes the following bug:
+
+      http://bugs.linuxbase.org/show_bug.cgi?id=2692
+
+Causes processing of echoed characters (output from the echo buffer) to
+honor the O_OPOST flag.  This re-establishes this behavior.
+
+Note that this and the next patch ("n_tty: move echoctl check and clean up
+logic") were verified together by the bug reporters, and all tty tests now
+pass.
+
+The tty tests are from the "Linux Standard Base" test suite:
+
+	http://www.linuxfoundation.org/collaborate/workgroups/lsb
+
+Signed-off-by: Joe Peterson <joe@skyrush.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+---
+
+ drivers/char/n_tty.c |  100 +++++++++++++++++++++++++++------------------------
+ 1 file changed, 53 insertions(+), 47 deletions(-)
+
+--- a/drivers/char/n_tty.c
++++ b/drivers/char/n_tty.c
+@@ -292,54 +292,56 @@ static int do_output_char(unsigned char 
+ 	if (!space)
+ 		return -1;
+ 
+-	switch (c) {
+-	case '\n':
+-		if (O_ONLRET(tty))
+-			tty->column = 0;
+-		if (O_ONLCR(tty)) {
+-			if (space < 2)
+-				return -1;
+-			tty->canon_column = tty->column = 0;
+-			tty_put_char(tty, '\r');
+-			tty_put_char(tty, c);
+-			return 2;
+-		}
+-		tty->canon_column = tty->column;
+-		break;
+-	case '\r':
+-		if (O_ONOCR(tty) && tty->column == 0)
+-			return 0;
+-		if (O_OCRNL(tty)) {
+-			c = '\n';
++	if (O_OPOST(tty)) {
++		switch (c) {
++		case '\n':
+ 			if (O_ONLRET(tty))
++				tty->column = 0;
++			if (O_ONLCR(tty)) {
++				if (space < 2)
++					return -1;
+ 				tty->canon_column = tty->column = 0;
++				tty_put_char(tty, '\r');
++				tty_put_char(tty, c);
++				return 2;
++			}
++			tty->canon_column = tty->column;
+ 			break;
+-		}
+-		tty->canon_column = tty->column = 0;
+-		break;
+-	case '\t':
+-		spaces = 8 - (tty->column & 7);
+-		if (O_TABDLY(tty) == XTABS) {
+-			if (space < spaces)
+-				return -1;
++		case '\r':
++			if (O_ONOCR(tty) && tty->column == 0)
++				return 0;
++			if (O_OCRNL(tty)) {
++				c = '\n';
++				if (O_ONLRET(tty))
++					tty->canon_column = tty->column = 0;
++				break;
++			}
++			tty->canon_column = tty->column = 0;
++			break;
++		case '\t':
++			spaces = 8 - (tty->column & 7);
++			if (O_TABDLY(tty) == XTABS) {
++				if (space < spaces)
++					return -1;
++				tty->column += spaces;
++				tty->ops->write(tty, "        ", spaces);
++				return spaces;
++			}
+ 			tty->column += spaces;
+-			tty->ops->write(tty, "        ", spaces);
+-			return spaces;
+-		}
+-		tty->column += spaces;
+-		break;
+-	case '\b':
+-		if (tty->column > 0)
+-			tty->column--;
+-		break;
+-	default:
+-		if (!iscntrl(c)) {
+-			if (O_OLCUC(tty))
+-				c = toupper(c);
+-			if (!is_continuation(c, tty))
+-				tty->column++;
++			break;
++		case '\b':
++			if (tty->column > 0)
++				tty->column--;
++			break;
++		default:
++			if (!iscntrl(c)) {
++				if (O_OLCUC(tty))
++					c = toupper(c);
++				if (!is_continuation(c, tty))
++					tty->column++;
++			}
++			break;
+ 		}
+-		break;
+ 	}
+ 
+ 	tty_put_char(tty, c);
+@@ -351,8 +353,9 @@ static int do_output_char(unsigned char 
+  *	@c: character (or partial unicode symbol)
+  *	@tty: terminal device
+  *
+- *	Perform OPOST processing.  Returns -1 when the output device is
+- *	full and the character must be retried.
++ *	Output a character (with OPOST processing if enabled).
++ *	Returns -1 if the output device is full and the character
++ *	must be retried.
+  *
+  *	Locking: output_lock to protect column state and space left
+  *		 (also, this is called from n_tty_write under the
+@@ -378,8 +381,11 @@ static int process_output(unsigned char 
+ /**
+  *	process_output_block		-	block post processor
+  *	@tty: terminal device
+- *	@inbuf: user buffer
+- *	@nr: number of bytes
++ *	@buf: character buffer
++ *	@nr: number of bytes to output
++ *
++ *	Output a block of characters (with OPOST processing - assumed enabled).
++ *	Returns the number of characters output.
+  *
+  *	This path is used to speed up block console writes, among other
+  *	things when processing blocks of output data. It handles only
