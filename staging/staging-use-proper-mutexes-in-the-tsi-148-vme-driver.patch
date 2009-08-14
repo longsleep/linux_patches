@@ -1,0 +1,564 @@
+From martyn.welch@gefanuc.com  Thu Aug 13 16:55:27 2009
+From: Martyn Welch <martyn.welch@gefanuc.com>
+Date: Tue, 11 Aug 2009 16:20:22 +0100
+Subject: Staging: Use proper mutexes in the tsi-148 VME driver
+To: gregkh@suse.de
+Cc: devel@linuxdriverproject.org, cota@braap.org
+Message-ID: <20090811151921.23047.55977.stgit@ES-J7S4D2J.amer.consind.ge.com>
+
+
+The VME core and tsi-148 driver currently use semaphores as mutexes. Switch to proper
+mutex implementation.
+
+Signed-off-by: Martyn Welch <martyn.welch@gefanuc.com>
+Reviewed-by: Emilio G. Cota <cota@braap.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/staging/vme/bridges/vme_tsi148.c |   86 +++++++++++++------------------
+ drivers/staging/vme/vme.c                |   60 ++++++++++-----------
+ drivers/staging/vme/vme_bridge.h         |    8 +-
+ 3 files changed, 71 insertions(+), 83 deletions(-)
+
+--- a/drivers/staging/vme/bridges/vme_tsi148.c
++++ b/drivers/staging/vme/bridges/vme_tsi148.c
+@@ -76,13 +76,13 @@ void (*lm_callback[4])(int);	/* Called i
+ void *crcsr_kernel;
+ dma_addr_t crcsr_bus;
+ struct vme_master_resource *flush_image;
+-struct semaphore vme_rmw;	/* Only one RMW cycle at a time */
+-struct semaphore vme_int;	/*
++struct mutex vme_rmw;	/* Only one RMW cycle at a time */
++struct mutex vme_int;	/*
+ 				 * Only one VME interrupt can be
+ 				 * generated at a time, provide locking
+ 				 */
+-struct semaphore vme_irq;	/* Locking for VME irq callback configuration */
+-struct semaphore vme_lm;	/* Locking for location monitor operations */
++struct mutex vme_irq;	/* Locking for VME irq callback configuration */
++struct mutex vme_lm;	/* Locking for location monitor operations */
+ 
+ 
+ static char driver_name[] = "vme_tsi148";
+@@ -445,11 +445,10 @@ int tsi148_request_irq(int level, int st
+ {
+ 	u32 tmp;
+ 
+-	/* Get semaphore */
+-	down(&(vme_irq));
++	mutex_lock(&(vme_irq));
+ 
+ 	if(tsi148_bridge->irq[level - 1].callback[statid].func) {
+-		up(&(vme_irq));
++		mutex_unlock(&(vme_irq));
+ 		printk("VME Interrupt already taken\n");
+ 		return -EBUSY;
+ 	}
+@@ -468,8 +467,7 @@ int tsi148_request_irq(int level, int st
+ 	tmp |= TSI148_LCSR_INTEN_IRQEN[level - 1];
+ 	iowrite32be(tmp, tsi148_bridge->base + TSI148_LCSR_INTEN);
+ 
+-	/* Release semaphore */
+-	up(&(vme_irq));
++	mutex_unlock(&(vme_irq));
+ 
+ 	return 0;
+ }
+@@ -482,8 +480,7 @@ void tsi148_free_irq(int level, int stat
+ 	u32 tmp;
+ 	struct pci_dev *pdev;
+ 
+-	/* Get semaphore */
+-	down(&(vme_irq));
++	mutex_lock(&(vme_irq));
+ 
+ 	tsi148_bridge->irq[level - 1].count--;
+ 
+@@ -505,22 +502,18 @@ void tsi148_free_irq(int level, int stat
+ 	tsi148_bridge->irq[level - 1].callback[statid].func = NULL;
+ 	tsi148_bridge->irq[level - 1].callback[statid].priv_data = NULL;
+ 
+-	/* Release semaphore */
+-	up(&(vme_irq));
++	mutex_unlock(&(vme_irq));
+ }
+ 
+ /*
+  * Generate a VME bus interrupt at the requested level & vector. Wait for
+  * interrupt to be acked.
+- *
+- * Only one interrupt can be generated at a time - so add a semaphore.
+  */
+ int tsi148_generate_irq(int level, int statid)
+ {
+ 	u32 tmp;
+ 
+-	/* Get semaphore */
+-	down(&(vme_int));
++	mutex_lock(&(vme_int));
+ 
+ 	/* Read VICR register */
+ 	tmp = ioread32be(tsi148_bridge->base + TSI148_LCSR_VICR);
+@@ -537,8 +530,7 @@ int tsi148_generate_irq(int level, int s
+ 	/* XXX Consider implementing a timeout? */
+ 	wait_event_interruptible(iack_queue, tsi148_iack_received());
+ 
+-	/* Release semaphore */
+-	up(&(vme_int));
++	mutex_unlock(&(vme_int));
+ 
+ 	return 0;
+ }
+@@ -1379,7 +1371,7 @@ skip_chk:
+ }
+ 
+ 
+-/* XXX We need to change vme_master_resource->sem to a spinlock so that read
++/* XXX We need to change vme_master_resource->mtx to a spinlock so that read
+  *     and write functions can be used in an interrupt context
+  */
+ ssize_t tsi148_master_write(struct vme_master_resource *image, void *buf,
+@@ -1455,7 +1447,7 @@ unsigned int tsi148_master_rmw(struct vm
+ 	i = image->number;
+ 
+ 	/* Locking as we can only do one of these at a time */
+-	down(&(vme_rmw));
++	mutex_lock(&(vme_rmw));
+ 
+ 	/* Lock image */
+ 	spin_lock(&(image->lock));
+@@ -1490,7 +1482,7 @@ unsigned int tsi148_master_rmw(struct vm
+ 
+ 	spin_unlock(&(image->lock));
+ 
+-	up(&(vme_rmw));
++	mutex_unlock(&(vme_rmw));
+ 
+ 	return result;
+ }
+@@ -1867,7 +1859,7 @@ int tsi148_dma_list_exec(struct vme_dma_
+ 
+ 	ctrlr = list->parent;
+ 
+-	down(&(ctrlr->sem));
++	mutex_lock(&(ctrlr->mtx));
+ 
+ 	channel = ctrlr->number;
+ 
+@@ -1878,7 +1870,7 @@ int tsi148_dma_list_exec(struct vme_dma_
+ 		 *     Return busy.
+ 		 */
+ 		/* Need to add to pending here */
+-		up(&(ctrlr->sem));
++		mutex_unlock(&(ctrlr->mtx));
+ 		return -EBUSY;
+ 	} else {
+ 		list_add(&(list->list), &(ctrlr->running));
+@@ -1932,7 +1924,7 @@ int tsi148_dma_list_exec(struct vme_dma_
+ 
+ 	bus_addr = virt_to_bus(&(entry->descriptor));
+ 
+-	up(&(ctrlr->sem));
++	mutex_unlock(&(ctrlr->mtx));
+ 
+ 	reg_split(bus_addr, &bus_addr_high, &bus_addr_low);
+ 
+@@ -1959,9 +1951,9 @@ int tsi148_dma_list_exec(struct vme_dma_
+ 	}
+ 
+ 	/* Remove list from running list */
+-	down(&(ctrlr->sem));
++	mutex_lock(&(ctrlr->mtx));
+ 	list_del(&(list->list));
+-	up(&(ctrlr->sem));
++	mutex_unlock(&(ctrlr->mtx));
+ 
+ 	return retval;
+ }
+@@ -1999,13 +1991,12 @@ int tsi148_lm_set(unsigned long long lm_
+ 	u32 lm_base_high, lm_base_low, lm_ctl = 0;
+ 	int i;
+ 
+-	/* Get semaphore */
+-	down(&(vme_lm));
++	mutex_lock(&(vme_lm));
+ 
+ 	/* If we already have a callback attached, we can't move it! */
+ 	for (i = 0; i < 4; i++) {
+ 		if(lm_callback[i] != NULL) {
+-			up(&(vme_lm));
++			mutex_unlock(&(vme_lm));
+ 			printk("Location monitor callback attached, can't "
+ 				"reset\n");
+ 			return -EBUSY;
+@@ -2026,7 +2017,7 @@ int tsi148_lm_set(unsigned long long lm_
+ 		lm_ctl |= TSI148_LCSR_LMAT_AS_A64;
+ 		break;
+ 	default:
+-		up(&(vme_lm));
++		mutex_unlock(&(vme_lm));
+ 		printk("Invalid address space\n");
+ 		return -EINVAL;
+ 		break;
+@@ -2047,7 +2038,7 @@ int tsi148_lm_set(unsigned long long lm_
+ 	iowrite32be(lm_base_low, tsi148_bridge->base + TSI148_LCSR_LMBAL);
+ 	iowrite32be(lm_ctl, tsi148_bridge->base + TSI148_LCSR_LMAT);
+ 
+-	up(&(vme_lm));
++	mutex_unlock(&(vme_lm));
+ 
+ 	return 0;
+ }
+@@ -2060,8 +2051,7 @@ int tsi148_lm_get(unsigned long long *lm
+ {
+ 	u32 lm_base_high, lm_base_low, lm_ctl, enabled = 0;
+ 
+-	/* Get semaphore */
+-	down(&(vme_lm));
++	mutex_lock(&(vme_lm));
+ 
+ 	lm_base_high = ioread32be(tsi148_bridge->base + TSI148_LCSR_LMBAU);
+ 	lm_base_low = ioread32be(tsi148_bridge->base + TSI148_LCSR_LMBAL);
+@@ -2094,7 +2084,7 @@ int tsi148_lm_get(unsigned long long *lm
+ 	if (lm_ctl & TSI148_LCSR_LMAT_DATA)
+ 		*cycle |= VME_DATA;
+ 
+-	up(&(vme_lm));
++	mutex_unlock(&(vme_lm));
+ 
+ 	return enabled;
+ }
+@@ -2108,20 +2098,19 @@ int tsi148_lm_attach(int monitor, void (
+ {
+ 	u32 lm_ctl, tmp;
+ 
+-	/* Get semaphore */
+-	down(&(vme_lm));
++	mutex_lock(&(vme_lm));
+ 
+ 	/* Ensure that the location monitor is configured - need PGM or DATA */
+ 	lm_ctl = ioread32be(tsi148_bridge->base + TSI148_LCSR_LMAT);
+ 	if ((lm_ctl & (TSI148_LCSR_LMAT_PGM | TSI148_LCSR_LMAT_DATA)) == 0) {
+-		up(&(vme_lm));
++		mutex_unlock(&(vme_lm));
+ 		printk("Location monitor not properly configured\n");
+ 		return -EINVAL;
+ 	}
+ 
+ 	/* Check that a callback isn't already attached */
+ 	if (lm_callback[monitor] != NULL) {
+-		up(&(vme_lm));
++		mutex_unlock(&(vme_lm));
+ 		printk("Existing callback attached\n");
+ 		return -EBUSY;
+ 	}
+@@ -2144,7 +2133,7 @@ int tsi148_lm_attach(int monitor, void (
+ 		iowrite32be(lm_ctl, tsi148_bridge->base + TSI148_LCSR_LMAT);
+ 	}
+ 
+-	up(&(vme_lm));
++	mutex_unlock(&(vme_lm));
+ 
+ 	return 0;
+ }
+@@ -2156,8 +2145,7 @@ int tsi148_lm_detach(int monitor)
+ {
+ 	u32 lm_en, tmp;
+ 
+-	/* Get semaphore */
+-	down(&(vme_lm));
++	mutex_lock(&(vme_lm));
+ 
+ 	/* Disable Location Monitor and ensure previous interrupts are clear */
+ 	lm_en = ioread32be(tsi148_bridge->base + TSI148_LCSR_INTEN);
+@@ -2182,7 +2170,7 @@ int tsi148_lm_detach(int monitor)
+ 		iowrite32be(tmp, tsi148_bridge->base + TSI148_LCSR_LMAT);
+ 	}
+ 
+-	up(&(vme_lm));
++	mutex_unlock(&(vme_lm));
+ 
+ 	return 0;
+ }
+@@ -2347,10 +2335,10 @@ static int tsi148_probe(struct pci_dev *
+ 	init_waitqueue_head(&dma_queue[0]);
+ 	init_waitqueue_head(&dma_queue[1]);
+ 	init_waitqueue_head(&iack_queue);
+-	init_MUTEX(&(vme_int));
+-	init_MUTEX(&(vme_irq));
+-	init_MUTEX(&(vme_rmw));
+-	init_MUTEX(&(vme_lm));
++	mutex_init(&(vme_int));
++	mutex_init(&(vme_irq));
++	mutex_init(&(vme_rmw));
++	mutex_init(&(vme_lm));
+ 
+ 	tsi148_bridge->parent = &(pdev->dev);
+ 	strcpy(tsi148_bridge->name, driver_name);
+@@ -2436,7 +2424,7 @@ static int tsi148_probe(struct pci_dev *
+ 			goto err_slave;
+ 		}
+ 		slave_image->parent = tsi148_bridge;
+-		init_MUTEX(&(slave_image->sem));
++		mutex_init(&(slave_image->mtx));
+ 		slave_image->locked = 0;
+ 		slave_image->number = i;
+ 		slave_image->address_attr = VME_A16 | VME_A24 | VME_A32 |
+@@ -2462,7 +2450,7 @@ static int tsi148_probe(struct pci_dev *
+ 			goto err_dma;
+ 		}
+ 		dma_ctrlr->parent = tsi148_bridge;
+-		init_MUTEX(&(dma_ctrlr->sem));
++		mutex_init(&(dma_ctrlr->mtx));
+ 		dma_ctrlr->locked = 0;
+ 		dma_ctrlr->number = i;
+ 		INIT_LIST_HEAD(&(dma_ctrlr->pending));
+--- a/drivers/staging/vme/vme_bridge.h
++++ b/drivers/staging/vme/vme_bridge.h
+@@ -11,7 +11,7 @@ struct vme_master_resource {
+ 	struct vme_bridge *parent;
+ 	/*
+ 	 * We are likely to need to access the VME bus in interrupt context, so
+-	 * protect master routines with a spinlock rather than a semaphore.
++	 * protect master routines with a spinlock rather than a mutex.
+ 	 */
+ 	spinlock_t lock;
+ 	int locked;
+@@ -26,7 +26,7 @@ struct vme_master_resource {
+ struct vme_slave_resource {
+ 	struct list_head list;
+ 	struct vme_bridge *parent;
+-	struct semaphore sem;
++	struct mutex mtx;
+ 	int locked;
+ 	int number;
+ 	vme_address_t address_attr;
+@@ -53,13 +53,13 @@ struct vme_dma_list {
+ 	struct list_head list;
+ 	struct vme_dma_resource *parent;
+ 	struct list_head entries;
+-	struct semaphore sem;
++	struct mutex mtx;
+ };
+ 
+ struct vme_dma_resource {
+ 	struct list_head list;
+ 	struct vme_bridge *parent;
+-	struct semaphore sem;
++	struct mutex mtx;
+ 	int locked;
+ 	int number;
+ 	struct list_head pending;
+--- a/drivers/staging/vme/vme.c
++++ b/drivers/staging/vme/vme.c
+@@ -28,15 +28,15 @@
+ #include <linux/device.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/syscalls.h>
+-#include <linux/semaphore.h>
++#include <linux/mutex.h>
+ #include <linux/spinlock.h>
+ 
+ #include "vme.h"
+ #include "vme_bridge.h"
+ 
+-/* Bitmask and semaphore to keep track of bridge numbers */
++/* Bitmask and mutex to keep track of bridge numbers */
+ static unsigned int vme_bus_numbers;
+-DECLARE_MUTEX(vme_bus_num_sem);
++DEFINE_MUTEX(vme_bus_num_mtx);
+ 
+ static void __exit vme_exit (void);
+ static int __init vme_init (void);
+@@ -251,17 +251,17 @@ struct vme_resource * vme_slave_request(
+ 		}
+ 
+ 		/* Find an unlocked and compatible image */
+-		down(&(slave_image->sem));
++		mutex_lock(&(slave_image->mtx));
+ 		if(((slave_image->address_attr & address) == address) &&
+ 			((slave_image->cycle_attr & cycle) == cycle) &&
+ 			(slave_image->locked == 0)) {
+ 
+ 			slave_image->locked = 1;
+-			up(&(slave_image->sem));
++			mutex_unlock(&(slave_image->mtx));
+ 			allocated_image = slave_image;
+ 			break;
+ 		}
+-		up(&(slave_image->sem));
++		mutex_unlock(&(slave_image->mtx));
+ 	}
+ 
+ 	/* No free image */
+@@ -280,9 +280,9 @@ struct vme_resource * vme_slave_request(
+ 
+ err_alloc:
+ 	/* Unlock image */
+-	down(&(slave_image->sem));
++	mutex_lock(&(slave_image->mtx));
+ 	slave_image->locked = 0;
+-	up(&(slave_image->sem));
++	mutex_unlock(&(slave_image->mtx));
+ err_image:
+ err_bus:
+ 	return NULL;
+@@ -365,12 +365,12 @@ void vme_slave_free(struct vme_resource 
+ 	}
+ 
+ 	/* Unlock image */
+-	down(&(slave_image->sem));
++	mutex_lock(&(slave_image->mtx));
+ 	if (slave_image->locked == 0)
+ 		printk(KERN_ERR "Image is already free\n");
+ 
+ 	slave_image->locked = 0;
+-	up(&(slave_image->sem));
++	mutex_unlock(&(slave_image->mtx));
+ 
+ 	/* Free up resource memory */
+ 	kfree(resource);
+@@ -668,14 +668,14 @@ struct vme_resource *vme_request_dma(str
+ 		}
+ 
+ 		/* Find an unlocked controller */
+-		down(&(dma_ctrlr->sem));
++		mutex_lock(&(dma_ctrlr->mtx));
+ 		if(dma_ctrlr->locked == 0) {
+ 			dma_ctrlr->locked = 1;
+-			up(&(dma_ctrlr->sem));
++			mutex_unlock(&(dma_ctrlr->mtx));
+ 			allocated_ctrlr = dma_ctrlr;
+ 			break;
+ 		}
+-		up(&(dma_ctrlr->sem));
++		mutex_unlock(&(dma_ctrlr->mtx));
+ 	}
+ 
+ 	/* Check to see if we found a resource */
+@@ -694,9 +694,9 @@ struct vme_resource *vme_request_dma(str
+ 
+ err_alloc:
+ 	/* Unlock image */
+-	down(&(dma_ctrlr->sem));
++	mutex_lock(&(dma_ctrlr->mtx));
+ 	dma_ctrlr->locked = 0;
+-	up(&(dma_ctrlr->sem));
++	mutex_unlock(&(dma_ctrlr->mtx));
+ err_ctrlr:
+ err_bus:
+ 	return NULL;
+@@ -726,7 +726,7 @@ struct vme_dma_list *vme_new_dma_list(st
+ 	}
+ 	INIT_LIST_HEAD(&(dma_list->entries));
+ 	dma_list->parent = ctrlr;
+-	init_MUTEX(&(dma_list->sem));
++	mutex_init(&(dma_list->mtx));
+ 
+ 	return dma_list;
+ }
+@@ -876,14 +876,14 @@ int vme_dma_list_add(struct vme_dma_list
+ 		return -EINVAL;
+ 	}
+ 
+-	if (down_trylock(&(list->sem))) {
++	if (mutex_trylock(&(list->mtx))) {
+ 		printk("Link List already submitted\n");
+ 		return -EINVAL;
+ 	}
+ 
+ 	retval = bridge->dma_list_add(list, src, dest, count);
+ 
+-	up(&(list->sem));
++	mutex_unlock(&(list->mtx));
+ 
+ 	return retval;
+ }
+@@ -899,11 +899,11 @@ int vme_dma_list_exec(struct vme_dma_lis
+ 		return -EINVAL;
+ 	}
+ 
+-	down(&(list->sem));
++	mutex_lock(&(list->mtx));
+ 
+ 	retval = bridge->dma_list_exec(list);
+ 
+-	up(&(list->sem));
++	mutex_unlock(&(list->mtx));
+ 
+ 	return retval;
+ }
+@@ -919,7 +919,7 @@ int vme_dma_list_free(struct vme_dma_lis
+ 		return -EINVAL;
+ 	}
+ 
+-	if (down_trylock(&(list->sem))) {
++	if (mutex_trylock(&(list->mtx))) {
+ 		printk("Link List in use\n");
+ 		return -EINVAL;
+ 	}
+@@ -931,10 +931,10 @@ int vme_dma_list_free(struct vme_dma_lis
+ 	retval = bridge->dma_list_empty(list);
+ 	if (retval) {
+ 		printk("Unable to empty link-list entries\n");
+-		up(&(list->sem));
++		mutex_unlock(&(list->mtx));
+ 		return retval;
+ 	}
+-	up(&(list->sem));
++	mutex_unlock(&(list->mtx));
+ 	kfree(list);
+ 
+ 	return retval;
+@@ -952,20 +952,20 @@ int vme_dma_free(struct vme_resource *re
+ 
+ 	ctrlr = list_entry(resource->entry, struct vme_dma_resource, list);
+ 
+-	if (down_trylock(&(ctrlr->sem))) {
++	if (mutex_trylock(&(ctrlr->mtx))) {
+ 		printk("Resource busy, can't free\n");
+ 		return -EBUSY;
+ 	}
+ 
+ 	if (!(list_empty(&(ctrlr->pending)) && list_empty(&(ctrlr->running)))) {
+ 		printk("Resource still processing transfers\n");
+-		up(&(ctrlr->sem));
++		mutex_unlock(&(ctrlr->mtx));
+ 		return -EBUSY;
+ 	}
+ 
+ 	ctrlr->locked = 0;
+ 
+-	up(&(ctrlr->sem));
++	mutex_unlock(&(ctrlr->mtx));
+ 
+ 	return 0;
+ }
+@@ -1149,23 +1149,23 @@ static int vme_alloc_bus_num(void)
+ {
+ 	int i;
+ 
+-	down(&vme_bus_num_sem);
++	mutex_lock(&vme_bus_num_mtx);
+ 	for (i = 0; i < sizeof(vme_bus_numbers) * 8; i++) {
+ 		if (((vme_bus_numbers >> i) & 0x1) == 0) {
+ 			vme_bus_numbers |= (0x1 << i);
+ 			break;
+ 		}
+ 	}
+-	up(&vme_bus_num_sem);
++	mutex_unlock(&vme_bus_num_mtx);
+ 
+ 	return i;
+ }
+ 
+ static void vme_free_bus_num(int bus)
+ {
+-	down(&vme_bus_num_sem);
++	mutex_lock(&vme_bus_num_mtx);
+ 	vme_bus_numbers |= ~(0x1 << bus);
+-	up(&vme_bus_num_sem);
++	mutex_unlock(&vme_bus_num_mtx);
+ }
+ 
+ int vme_register_bridge (struct vme_bridge *bridge)

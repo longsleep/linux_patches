@@ -1,0 +1,604 @@
+From martyn.welch@gefanuc.com  Thu Aug 13 16:56:05 2009
+From: Martyn Welch <martyn.welch@gefanuc.com>
+Date: Tue, 11 Aug 2009 17:44:56 +0100
+Subject: Staging: vme: add VME Location Monitor management mechanism
+To: gregkh@suse.de
+Cc: devel@linuxdriverproject.org
+Message-ID: <20090811164440.26697.26993.stgit@ES-J7S4D2J.amer.consind.ge.com>
+
+
+Extend the image and DMA channel resource management methods to control the
+location monitor resource. The location monitor should be controlled as it can
+only be used at a single location at a time.
+
+Signed-off-by: Martyn Welch <martyn.welch@gefanuc.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+---
+
+ drivers/staging/vme/TODO                 |   36 +++---
+ drivers/staging/vme/bridges/vme_tsi148.c |   69 ++++++++----
+ drivers/staging/vme/vme.c                |  170 ++++++++++++++++++++++++++-----
+ drivers/staging/vme/vme.h                |   15 +-
+ drivers/staging/vme/vme_bridge.h         |   20 ++-
+ 5 files changed, 232 insertions(+), 78 deletions(-)
+
+--- a/drivers/staging/vme/bridges/vme_tsi148.c
++++ b/drivers/staging/vme/bridges/vme_tsi148.c
+@@ -59,10 +59,6 @@ int tsi148_dma_list_add (struct vme_dma_
+ int tsi148_dma_list_exec(struct vme_dma_list *);
+ int tsi148_dma_list_empty(struct vme_dma_list *);
+ int tsi148_generate_irq(int, int);
+-int tsi148_lm_set(unsigned long long, vme_address_t, vme_cycle_t);
+-int tsi148_lm_get(unsigned long long *, vme_address_t *, vme_cycle_t *);
+-int tsi148_lm_attach(int, void (*callback)(int));
+-int tsi148_lm_detach(int);
+ int tsi148_slot_get(void);
+ 
+ /* Modue parameter */
+@@ -82,7 +78,6 @@ struct mutex vme_int;	/*
+ 				 * generated at a time, provide locking
+ 				 */
+ struct mutex vme_irq;	/* Locking for VME irq callback configuration */
+-struct mutex vme_lm;	/* Locking for location monitor operations */
+ 
+ 
+ static char driver_name[] = "vme_tsi148";
+@@ -1985,18 +1980,18 @@ int tsi148_dma_list_empty(struct vme_dma
+  * This does not enable the LM monitor - that should be done when the first
+  * callback is attached and disabled when the last callback is removed.
+  */
+-int tsi148_lm_set(unsigned long long lm_base, vme_address_t aspace,
+-	vme_cycle_t cycle)
++int tsi148_lm_set(struct vme_lm_resource *lm, unsigned long long lm_base,
++	vme_address_t aspace, vme_cycle_t cycle)
+ {
+ 	u32 lm_base_high, lm_base_low, lm_ctl = 0;
+ 	int i;
+ 
+-	mutex_lock(&(vme_lm));
++	mutex_lock(&(lm->mtx));
+ 
+ 	/* If we already have a callback attached, we can't move it! */
+-	for (i = 0; i < 4; i++) {
++	for (i = 0; i < lm->monitors; i++) {
+ 		if(lm_callback[i] != NULL) {
+-			mutex_unlock(&(vme_lm));
++			mutex_unlock(&(lm->mtx));
+ 			printk("Location monitor callback attached, can't "
+ 				"reset\n");
+ 			return -EBUSY;
+@@ -2017,7 +2012,7 @@ int tsi148_lm_set(unsigned long long lm_
+ 		lm_ctl |= TSI148_LCSR_LMAT_AS_A64;
+ 		break;
+ 	default:
+-		mutex_unlock(&(vme_lm));
++		mutex_unlock(&(lm->mtx));
+ 		printk("Invalid address space\n");
+ 		return -EINVAL;
+ 		break;
+@@ -2038,7 +2033,7 @@ int tsi148_lm_set(unsigned long long lm_
+ 	iowrite32be(lm_base_low, tsi148_bridge->base + TSI148_LCSR_LMBAL);
+ 	iowrite32be(lm_ctl, tsi148_bridge->base + TSI148_LCSR_LMAT);
+ 
+-	mutex_unlock(&(vme_lm));
++	mutex_unlock(&(lm->mtx));
+ 
+ 	return 0;
+ }
+@@ -2046,12 +2041,12 @@ int tsi148_lm_set(unsigned long long lm_
+ /* Get configuration of the callback monitor and return whether it is enabled
+  * or disabled.
+  */
+-int tsi148_lm_get(unsigned long long *lm_base, vme_address_t *aspace,
+-	vme_cycle_t *cycle)
++int tsi148_lm_get(struct vme_lm_resource *lm, unsigned long long *lm_base,
++	vme_address_t *aspace, vme_cycle_t *cycle)
+ {
+ 	u32 lm_base_high, lm_base_low, lm_ctl, enabled = 0;
+ 
+-	mutex_lock(&(vme_lm));
++	mutex_lock(&(lm->mtx));
+ 
+ 	lm_base_high = ioread32be(tsi148_bridge->base + TSI148_LCSR_LMBAU);
+ 	lm_base_low = ioread32be(tsi148_bridge->base + TSI148_LCSR_LMBAL);
+@@ -2084,7 +2079,7 @@ int tsi148_lm_get(unsigned long long *lm
+ 	if (lm_ctl & TSI148_LCSR_LMAT_DATA)
+ 		*cycle |= VME_DATA;
+ 
+-	mutex_unlock(&(vme_lm));
++	mutex_unlock(&(lm->mtx));
+ 
+ 	return enabled;
+ }
+@@ -2094,23 +2089,24 @@ int tsi148_lm_get(unsigned long long *lm
+  *
+  * Callback will be passed the monitor triggered.
+  */
+-int tsi148_lm_attach(int monitor, void (*callback)(int))
++int tsi148_lm_attach(struct vme_lm_resource *lm, int monitor,
++	void (*callback)(int))
+ {
+ 	u32 lm_ctl, tmp;
+ 
+-	mutex_lock(&(vme_lm));
++	mutex_lock(&(lm->mtx));
+ 
+ 	/* Ensure that the location monitor is configured - need PGM or DATA */
+ 	lm_ctl = ioread32be(tsi148_bridge->base + TSI148_LCSR_LMAT);
+ 	if ((lm_ctl & (TSI148_LCSR_LMAT_PGM | TSI148_LCSR_LMAT_DATA)) == 0) {
+-		mutex_unlock(&(vme_lm));
++		mutex_unlock(&(lm->mtx));
+ 		printk("Location monitor not properly configured\n");
+ 		return -EINVAL;
+ 	}
+ 
+ 	/* Check that a callback isn't already attached */
+ 	if (lm_callback[monitor] != NULL) {
+-		mutex_unlock(&(vme_lm));
++		mutex_unlock(&(lm->mtx));
+ 		printk("Existing callback attached\n");
+ 		return -EBUSY;
+ 	}
+@@ -2133,7 +2129,7 @@ int tsi148_lm_attach(int monitor, void (
+ 		iowrite32be(lm_ctl, tsi148_bridge->base + TSI148_LCSR_LMAT);
+ 	}
+ 
+-	mutex_unlock(&(vme_lm));
++	mutex_unlock(&(lm->mtx));
+ 
+ 	return 0;
+ }
+@@ -2141,11 +2137,11 @@ int tsi148_lm_attach(int monitor, void (
+ /*
+  * Detach a callback function forn a specific location monitor.
+  */
+-int tsi148_lm_detach(int monitor)
++int tsi148_lm_detach(struct vme_lm_resource *lm, int monitor)
+ {
+ 	u32 lm_en, tmp;
+ 
+-	mutex_lock(&(vme_lm));
++	mutex_lock(&(lm->mtx));
+ 
+ 	/* Disable Location Monitor and ensure previous interrupts are clear */
+ 	lm_en = ioread32be(tsi148_bridge->base + TSI148_LCSR_INTEN);
+@@ -2170,7 +2166,7 @@ int tsi148_lm_detach(int monitor)
+ 		iowrite32be(tmp, tsi148_bridge->base + TSI148_LCSR_LMAT);
+ 	}
+ 
+-	mutex_unlock(&(vme_lm));
++	mutex_unlock(&(lm->mtx));
+ 
+ 	return 0;
+ }
+@@ -2285,6 +2281,7 @@ static int tsi148_probe(struct pci_dev *
+ 	struct vme_master_resource *master_image;
+ 	struct vme_slave_resource *slave_image;
+ 	struct vme_dma_resource *dma_ctrlr;
++	struct vme_lm_resource *lm;
+ 
+ 	/* If we want to support more than one of each bridge, we need to
+ 	 * dynamically generate this so we get one per device
+@@ -2338,7 +2335,6 @@ static int tsi148_probe(struct pci_dev *
+ 	mutex_init(&(vme_int));
+ 	mutex_init(&(vme_irq));
+ 	mutex_init(&(vme_rmw));
+-	mutex_init(&(vme_lm));
+ 
+ 	tsi148_bridge->parent = &(pdev->dev);
+ 	strcpy(tsi148_bridge->name, driver_name);
+@@ -2459,6 +2455,22 @@ static int tsi148_probe(struct pci_dev *
+ 			&(tsi148_bridge->dma_resources));
+ 	}
+ 
++	/* Add location monitor to list */
++	INIT_LIST_HEAD(&(tsi148_bridge->lm_resources));
++	lm = kmalloc(sizeof(struct vme_lm_resource), GFP_KERNEL);
++	if (lm == NULL) {
++		dev_err(&pdev->dev, "Failed to allocate memory for "
++		"location monitor resource structure\n");
++		retval = -ENOMEM;
++		goto err_lm;
++	}
++	lm->parent = tsi148_bridge;
++	mutex_init(&(lm->mtx));
++	lm->locked = 0;
++	lm->number = 1;
++	lm->monitors = 4;
++	list_add_tail(&(lm->list), &(tsi148_bridge->lm_resources));
++
+ 	tsi148_bridge->slave_get = tsi148_slave_get;
+ 	tsi148_bridge->slave_set = tsi148_slave_set;
+ 	tsi148_bridge->master_get = tsi148_master_get;
+@@ -2513,6 +2525,13 @@ static int tsi148_probe(struct pci_dev *
+ err_reg:
+ 	tsi148_crcsr_exit(pdev);
+ err_crcsr:
++err_lm:
++	/* resources are stored in link list */
++	list_for_each(pos, &(tsi148_bridge->lm_resources)) {
++		lm = list_entry(pos, struct vme_lm_resource, list);
++		list_del(pos);
++		kfree(lm);
++	}
+ err_dma:
+ 	/* resources are stored in link list */
+ 	list_for_each(pos, &(tsi148_bridge->dma_resources)) {
+--- a/drivers/staging/vme/TODO
++++ b/drivers/staging/vme/TODO
+@@ -331,44 +331,44 @@ monitor.
+ Location Monitor Management
+ ---------------------------
+ 
+-TODO:	Provide a mechanism to request use of the location monitor. The location
+-	monitors can be moved and we only want one driver to be able to do that
+-	at a time! We also need to be able to free the location monitor for
+-	others to use.
++The following functions are provided to request the use of a block of location
++monitors and to free them after they are no longer required:
+ 
+-	struct vme_resource * vme_request_lm(struct device *dev);
++	struct vme_resource * vme_lm_request(struct device *dev);
+ 
+-	void vme_free_lm(struct vme_resource * res);
++	void vme_lm_free(struct vme_resource * res);
++
++Each block may provide a number of location monitors, monitoring adjacent
++locations. The following function can be used to determine how many locations
++are provided:
++
++	int vme_lm_count(struct vme_resource * res);
+ 
+ 
+ Location Monitor Configuration
+ ------------------------------
+ 
+-TODO:	Change to struct "vme_resource *res" rather than "struct device *dev".
++Once a bank of location monitors has been allocated, the following functions
++are provided to configure the location and mode of the location monitor:
+ 
+-The following functions are provided to configure the location and mode of the
+-location monitor:
+-
+-	int vme_lm_set(struct device *dev, unsigned long long base,
++	int vme_lm_set(struct vme_resource *res, unsigned long long base,
+ 		vme_address_t aspace, vme_cycle_t cycle);
+ 
+-	int vme_lm_get(struct device *dev, unsigned long long *base,
++	int vme_lm_get(struct vme_resource *res, unsigned long long *base,
+ 		vme_address_t *aspace, vme_cycle_t *cycle);
+ 
+ 
+ Location Monitor Use
+ --------------------
+ 
+-TODO:	Change to struct "vme_resource *res" rather than "struct device *dev".
+-
+ The following functions allow a callback to be attached and detached from each
+-location monitor location. The API currently supports 4 location monitors,
+-monitoring 4 adjacent locations:
++location monitor location. Each location monitor can monitor a number of
++adjacent locations:
+ 
+-	int vme_lm_attach(struct device *dev, int num,
++	int vme_lm_attach(struct vme_resource *res, int num,
+ 		void (*callback)(int));
+ 
+-	int vme_lm_detach(struct device *dev, int num);
++	int vme_lm_detach(struct vme_resource *res, int num);
+ 
+ The callback function is declared as follows.
+ 
+--- a/drivers/staging/vme/vme_bridge.h
++++ b/drivers/staging/vme/vme_bridge.h
+@@ -66,6 +66,15 @@ struct vme_dma_resource {
+ 	struct list_head running;
+ };
+ 
++struct vme_lm_resource {
++	struct list_head list;
++	struct vme_bridge *parent;
++	struct mutex mtx;
++	int locked;
++	int number;
++	int monitors;
++};
++
+ struct vme_bus_error {
+ 	struct list_head list;
+ 	unsigned long long address;
+@@ -97,6 +106,7 @@ struct vme_bridge {
+ 	struct list_head master_resources;
+ 	struct list_head slave_resources;
+ 	struct list_head dma_resources;
++	struct list_head lm_resources;
+ 
+ 	struct list_head vme_errors;	/* List for errors generated on VME */
+ 
+@@ -144,10 +154,12 @@ struct vme_bridge {
+ 	int (*generate_irq) (int, int);
+ 
+ 	/* Location monitor functions */
+-	int (*lm_set) (unsigned long long, vme_address_t, vme_cycle_t);
+-	int (*lm_get) (unsigned long long *, vme_address_t *, vme_cycle_t *);
+-	int (*lm_attach) (int, void (*callback)(int));
+-	int (*lm_detach) (int);
++	int (*lm_set) (struct vme_lm_resource *, unsigned long long,
++		vme_address_t, vme_cycle_t);
++	int (*lm_get) (struct vme_lm_resource *, unsigned long long *,
++		vme_address_t *, vme_cycle_t *);
++	int (*lm_attach) (struct vme_lm_resource *, int, void (*callback)(int));
++	int (*lm_detach) (struct vme_lm_resource *, int);
+ 
+ 	/* CR/CSR space functions */
+ 	int (*slot_get) (void);
+--- a/drivers/staging/vme/vme.c
++++ b/drivers/staging/vme/vme.c
+@@ -69,6 +69,10 @@ static struct vme_bridge *find_bridge(st
+ 		return list_entry(resource->entry, struct vme_dma_resource,
+ 			list)->parent;
+ 		break;
++	case VME_LM:
++		return list_entry(resource->entry, struct vme_lm_resource,
++			list)->parent;
++		break;
+ 	default:
+ 		printk(KERN_ERR "Unknown resource type\n");
+ 		return NULL;
+@@ -1045,84 +1049,198 @@ int vme_generate_irq(struct device *dev,
+ }
+ EXPORT_SYMBOL(vme_generate_irq);
+ 
+-int vme_lm_set(struct device *dev, unsigned long long lm_base, vme_address_t aspace,
+-	vme_cycle_t cycle)
++/*
++ * Request the location monitor, return resource or NULL
++ */
++struct vme_resource *vme_lm_request(struct device *dev)
+ {
+ 	struct vme_bridge *bridge;
++	struct list_head *lm_pos = NULL;
++	struct vme_lm_resource *allocated_lm = NULL;
++	struct vme_lm_resource *lm = NULL;
++	struct vme_resource *resource = NULL;
+ 
+ 	bridge = dev_to_bridge(dev);
+ 	if (bridge == NULL) {
+ 		printk(KERN_ERR "Can't find VME bus\n");
++		goto err_bus;
++	}
++
++	/* Loop through DMA resources */
++	list_for_each(lm_pos, &(bridge->lm_resources)) {
++		lm = list_entry(lm_pos,
++			struct vme_lm_resource, list);
++
++		if (lm == NULL) {
++			printk(KERN_ERR "Registered NULL Location Monitor "
++				"resource\n");
++			continue;
++		}
++
++		/* Find an unlocked controller */
++		mutex_lock(&(lm->mtx));
++		if (lm->locked == 0) {
++			lm->locked = 1;
++			mutex_unlock(&(lm->mtx));
++			allocated_lm = lm;
++			break;
++		}
++		mutex_unlock(&(lm->mtx));
++	}
++
++	/* Check to see if we found a resource */
++	if (allocated_lm == NULL)
++		goto err_lm;
++
++	resource = kmalloc(sizeof(struct vme_resource), GFP_KERNEL);
++	if (resource == NULL) {
++		printk(KERN_ERR "Unable to allocate resource structure\n");
++		goto err_alloc;
++	}
++	resource->type = VME_LM;
++	resource->entry = &(allocated_lm->list);
++
++	return resource;
++
++err_alloc:
++	/* Unlock image */
++	mutex_lock(&(lm->mtx));
++	lm->locked = 0;
++	mutex_unlock(&(lm->mtx));
++err_lm:
++err_bus:
++	return NULL;
++}
++EXPORT_SYMBOL(vme_lm_request);
++
++int vme_lm_count(struct vme_resource *resource)
++{
++	struct vme_lm_resource *lm;
++
++	if (resource->type != VME_LM) {
++		printk(KERN_ERR "Not a Location Monitor resource\n");
+ 		return -EINVAL;
+ 	}
+ 
++	lm = list_entry(resource->entry, struct vme_lm_resource, list);
++
++	return lm->monitors;
++}
++EXPORT_SYMBOL(vme_lm_count);
++
++int vme_lm_set(struct vme_resource *resource, unsigned long long lm_base,
++	vme_address_t aspace, vme_cycle_t cycle)
++{
++	struct vme_bridge *bridge = find_bridge(resource);
++	struct vme_lm_resource *lm;
++
++	if (resource->type != VME_LM) {
++		printk(KERN_ERR "Not a Location Monitor resource\n");
++		return -EINVAL;
++	}
++
++	lm = list_entry(resource->entry, struct vme_lm_resource, list);
++
+ 	if (bridge->lm_set == NULL) {
+-		printk("vme_lm_set not supported\n");
++		printk(KERN_ERR "vme_lm_set not supported\n");
+ 		return -EINVAL;
+ 	}
+ 
+-	return bridge->lm_set(lm_base, aspace, cycle);
++	/* XXX Check parameters */
++
++	return lm->parent->lm_set(lm, lm_base, aspace, cycle);
+ }
+ EXPORT_SYMBOL(vme_lm_set);
+ 
+-int vme_lm_get(struct device *dev, unsigned long long *lm_base, vme_address_t *aspace,
+-	vme_cycle_t *cycle)
++int vme_lm_get(struct vme_resource *resource, unsigned long long *lm_base,
++	vme_address_t *aspace, vme_cycle_t *cycle)
+ {
+-	struct vme_bridge *bridge;
++	struct vme_bridge *bridge = find_bridge(resource);
++	struct vme_lm_resource *lm;
+ 
+-	bridge = dev_to_bridge(dev);
+-	if (bridge == NULL) {
+-		printk(KERN_ERR "Can't find VME bus\n");
++	if (resource->type != VME_LM) {
++		printk(KERN_ERR "Not a Location Monitor resource\n");
+ 		return -EINVAL;
+ 	}
+ 
++	lm = list_entry(resource->entry, struct vme_lm_resource, list);
++
+ 	if (bridge->lm_get == NULL) {
+-		printk("vme_lm_get not supported\n");
++		printk(KERN_ERR "vme_lm_get not supported\n");
+ 		return -EINVAL;
+ 	}
+ 
+-	return bridge->lm_get(lm_base, aspace, cycle);
++	return bridge->lm_get(lm, lm_base, aspace, cycle);
+ }
+ EXPORT_SYMBOL(vme_lm_get);
+ 
+-int vme_lm_attach(struct device *dev, int monitor, void (*callback)(int))
++int vme_lm_attach(struct vme_resource *resource, int monitor,
++	void (*callback)(int))
+ {
+-	struct vme_bridge *bridge;
++	struct vme_bridge *bridge = find_bridge(resource);
++	struct vme_lm_resource *lm;
+ 
+-	bridge = dev_to_bridge(dev);
+-	if (bridge == NULL) {
+-		printk(KERN_ERR "Can't find VME bus\n");
++	if (resource->type != VME_LM) {
++		printk(KERN_ERR "Not a Location Monitor resource\n");
+ 		return -EINVAL;
+ 	}
+ 
++	lm = list_entry(resource->entry, struct vme_lm_resource, list);
++
+ 	if (bridge->lm_attach == NULL) {
+-		printk("vme_lm_attach not supported\n");
++		printk(KERN_ERR "vme_lm_attach not supported\n");
+ 		return -EINVAL;
+ 	}
+ 
+-	return bridge->lm_attach(monitor, callback);
++	return bridge->lm_attach(lm, monitor, callback);
+ }
+ EXPORT_SYMBOL(vme_lm_attach);
+ 
+-int vme_lm_detach(struct device *dev, int monitor)
++int vme_lm_detach(struct vme_resource *resource, int monitor)
+ {
+-	struct vme_bridge *bridge;
++	struct vme_bridge *bridge = find_bridge(resource);
++	struct vme_lm_resource *lm;
+ 
+-	bridge = dev_to_bridge(dev);
+-	if (bridge == NULL) {
+-		printk(KERN_ERR "Can't find VME bus\n");
++	if (resource->type != VME_LM) {
++		printk(KERN_ERR "Not a Location Monitor resource\n");
+ 		return -EINVAL;
+ 	}
+ 
++	lm = list_entry(resource->entry, struct vme_lm_resource, list);
++
+ 	if (bridge->lm_detach == NULL) {
+-		printk("vme_lm_detach not supported\n");
++		printk(KERN_ERR "vme_lm_detach not supported\n");
+ 		return -EINVAL;
+ 	}
+ 
+-	return bridge->lm_detach(monitor);
++	return bridge->lm_detach(lm, monitor);
+ }
+ EXPORT_SYMBOL(vme_lm_detach);
+ 
++void vme_lm_free(struct vme_resource *resource)
++{
++	struct vme_lm_resource *lm;
++
++	if (resource->type != VME_LM) {
++		printk(KERN_ERR "Not a Location Monitor resource\n");
++		return;
++	}
++
++	lm = list_entry(resource->entry, struct vme_lm_resource, list);
++
++	if (mutex_trylock(&(lm->mtx))) {
++		printk(KERN_ERR "Resource busy, can't free\n");
++		return;
++	}
++
++	/* XXX Check to see that there aren't any callbacks still attached */
++
++	lm->locked = 0;
++
++	mutex_unlock(&(lm->mtx));
++}
++EXPORT_SYMBOL(vme_lm_free);
++
+ int vme_slot_get(struct device *bus)
+ {
+ 	struct vme_bridge *bridge;
+--- a/drivers/staging/vme/vme.h
++++ b/drivers/staging/vme/vme.h
+@@ -5,7 +5,8 @@
+ enum vme_resource_type {
+ 	VME_MASTER,
+ 	VME_SLAVE,
+-	VME_DMA
++	VME_DMA,
++	VME_LM
+ };
+ 
+ /* VME Address Spaces */
+@@ -140,11 +141,15 @@ int vme_request_irq(struct device *, int
+ void vme_free_irq(struct device *, int, int);
+ int vme_generate_irq(struct device *, int, int);
+ 
+-int vme_lm_set(struct device *, unsigned long long, vme_address_t, vme_cycle_t);
+-int vme_lm_get(struct device *, unsigned long long *, vme_address_t *,
++struct vme_resource * vme_lm_request(struct device *);
++int vme_lm_count(struct vme_resource *);
++int vme_lm_set(struct vme_resource *, unsigned long long, vme_address_t,
++	vme_cycle_t);
++int vme_lm_get(struct vme_resource *, unsigned long long *, vme_address_t *,
+ 	vme_cycle_t *);
+-int vme_lm_attach(struct device *, int, void (*callback)(int));
+-int vme_lm_detach(struct device *, int);
++int vme_lm_attach(struct vme_resource *, int, void (*callback)(int));
++int vme_lm_detach(struct vme_resource *, int);
++void vme_lm_free(struct vme_resource *);
+ 
+ int vme_slot_get(struct device *);
+ 
