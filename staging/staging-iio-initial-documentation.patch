@@ -1,0 +1,645 @@
+From jic23@cam.ac.uk  Tue Aug 18 10:30:24 2009
+From: Jonathan Cameron <jic23@cam.ac.uk>
+Date: Tue, 18 Aug 2009 18:06:32 +0100
+Subject: Staging: IIO: Initial documentation
+To: greg@kroah.com
+Cc: jic23@cam.ac.uk
+Message-ID: <1250615193-32501-15-git-send-email-jic23@cam.ac.uk>
+
+This needs considerably more work, all comments / suggestions
+welcomed.
+
+Signed-off-by: Jonathan Cameron <jic23@cam.ac.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/staging/iio/Documentation/device.txt              |   49 ++++
+ drivers/staging/iio/Documentation/iio_utils.h             |  159 +++++++++++++
+ drivers/staging/iio/Documentation/lis3l02dqbuffersimple.c |  171 ++++++++++++++
+ drivers/staging/iio/Documentation/overview.txt            |   62 +++++
+ drivers/staging/iio/Documentation/ring.txt                |   61 ++++
+ drivers/staging/iio/Documentation/trigger.txt             |   38 +++
+ drivers/staging/iio/Documentation/userspace.txt           |   60 ++++
+ 7 files changed, 600 insertions(+)
+
+--- /dev/null
++++ b/drivers/staging/iio/Documentation/device.txt
+@@ -0,0 +1,49 @@
++IIO Device drivers
++
++This is not intended to provide a comprehensive guide to writing an
++IIO device driver.  For further information see the drivers within the
++subsystem.
++
++The crucial structure for device drivers in iio is iio_dev.
++
++First allocate one using:
++
++struct iio_dev *indio_dev = iio_allocate_device();
++
++The fill in the following.
++
++indio_dev->dev.parent
++  the struct device associated with the underlying hardware.
++
++indio_dev->num_interrupt_lines
++   number of event triggering hardware lines the device has.
++
++indio_dev->event_attrs
++   attributes used to enable / disable hardware events - note the
++   attributes are embedded in iio_event_attr structures with an
++   associated iio_event_handler which may or may note be shared.
++   If num_interrupt_lines = 0, then no need to fill this in.
++
++indio_dev->attrs
++   general attributes such as polled access to device channels.
++
++indio_dev->dev_data
++   private device specific data.
++
++indio_dev->driver_module
++   typically set to THIS_MODULE. Used to specify ownership of some
++   iio created resources.
++
++indio_dev->modes
++   whether direct access and / or ring buffer access is supported.
++
++Once these are set up, a call to iio_device_register(indio_dev),
++will register the device with the iio core.
++
++Worth noting here is that, if a ring buffer is to be used, it can be
++allocated prior to registering the device with the iio-core, but must
++be registered afterwards (otherwise the whole parentage of devices
++gets confused)
++
++On remove iio_device_unregister(indio_dev) will remove the device from
++the core, and iio_free_device will clean up.
+--- /dev/null
++++ b/drivers/staging/iio/Documentation/iio_utils.h
+@@ -0,0 +1,159 @@
++/* IIO - useful set of util functionality
++ *
++ * Copyright (c) 2008 Jonathan Cameron
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published by
++ * the Free Software Foundation.
++ */
++
++#define IIO_EVENT_CODE_RING_50_FULL 200
++#define IIO_EVENT_CODE_RING_75_FULL 201
++#define IIO_EVENT_CODE_RING_100_FULL 202
++
++struct iio_event_data {
++	int id;
++	__s64 timestamp;
++};
++
++
++inline char *find_ring_subelement(const char *directory, const char *subelement)
++{
++	DIR *dp;
++	const struct dirent *ent;
++	int pos;
++	char temp[100];
++	char *returnstring;
++	dp = opendir(directory);
++	if (dp == NULL) {
++		printf("could not directory: %s\n", directory);
++		return NULL;
++	}
++	while (ent = readdir(dp), ent != NULL) {
++		if (strcmp(ent->d_name, ".") != 0 &&
++		    strcmp(ent->d_name, "..") != 0)  {
++			if (strncmp(ent->d_name, subelement, strlen(subelement)) == 0) {
++				int length = sprintf(temp, "%s%s%s", directory, ent->d_name, "/");
++				returnstring = malloc(length+1);
++				strncpy(returnstring, temp, length+1);
++				return returnstring;
++
++			}
++		}
++	}
++	return 0;
++}
++
++
++char *find_type_by_name(const char *name, const char *type)
++{
++	const char *iio_dir = "/sys/class/iio/";
++	const struct dirent *ent;
++	int cnt, pos, pos2;
++
++	FILE *nameFile;
++	DIR *dp;
++	char thisname[100];
++	char temp[100];
++
++	char *returnstring = NULL;
++	struct stat Stat;
++	pos = sprintf(temp, "%s", iio_dir);
++	dp = opendir(iio_dir);
++	if (dp == NULL) {
++		printf("No industrialio devices available");
++		return NULL;
++	}
++	while (ent = readdir(dp), ent != NULL) {
++		cnt++;
++		/*reject . and .. */
++		if (strcmp(ent->d_name, ".") != 0 &&
++		    strcmp(ent->d_name, "..") != 0)  {
++			/*make sure it isn't a trigger!*/
++			if (strncmp(ent->d_name, type, strlen(type)) == 0) {
++				/* build full path to new file */
++				pos2 = pos + sprintf(temp + pos, "%s/", ent->d_name);
++				sprintf(temp + pos2, "name");
++				printf("search location %s\n", temp);
++				nameFile = fopen(temp, "r");
++				if (!nameFile) {
++					sprintf(temp + pos2, "modalias", ent->d_name);
++					nameFile = fopen(temp, "r");
++					if (!nameFile) {
++						printf("Failed to find a name for device\n");
++						return NULL;
++					}
++				}
++				fscanf(nameFile, "%s", thisname);
++				if (strcmp(name, thisname) == 0) {
++					returnstring = malloc(strlen(temp) + 1);
++					sprintf(temp + pos2, "");
++					strcpy(returnstring, temp);
++					return returnstring;
++				}
++				fclose(nameFile);
++
++			}
++		}
++	}
++}
++
++int write_sysfs_int(char *filename, char *basedir, int val)
++{
++	int ret;
++	FILE  *sysfsfp;
++	char temp[100];
++	sprintf(temp, "%s%s", basedir, filename);
++	sysfsfp = fopen(temp, "w");
++	if (sysfsfp == NULL)
++		return -1;
++	fprintf(sysfsfp, "%d", val);
++	fclose(sysfsfp);
++	return 0;
++}
++
++/**
++ * write_sysfs_string_and_verify() - string write, readback and verify
++ * @filename: name of file to write to
++ * @basedir: the sysfs directory in which the file is to be found
++ * @val: the string to write
++ **/
++int write_sysfs_string_and_verify(char *filename, char *basedir, char *val)
++{
++	int ret;
++	FILE  *sysfsfp;
++	char temp[100];
++	sprintf(temp, "%s%s", basedir, filename);
++	sysfsfp = fopen(temp, "w");
++	if (sysfsfp == NULL)
++		return -1;
++	fprintf(sysfsfp, "%s", val);
++	fclose(sysfsfp);
++
++	sysfsfp = fopen(temp, "r");
++	if (sysfsfp == NULL)
++		return -1;
++	fscanf(sysfsfp, "%s", temp);
++	if (strcmp(temp, val) != 0) {
++		printf("Possible failure in string write %s to %s%s \n",
++		       val,
++		       basedir,
++		       filename);
++		return -1;
++	}
++	return 0;
++}
++
++int read_sysfs_posint(char *filename, char *basedir)
++{
++	int ret;
++	FILE  *sysfsfp;
++	char temp[100];
++	sprintf(temp, "%s%s", basedir, filename);
++	sysfsfp = fopen(temp, "r");
++	if (sysfsfp == NULL)
++		return -1;
++	fscanf(sysfsfp, "%d\n", &ret);
++	fclose(sysfsfp);
++	return ret;
++}
+--- /dev/null
++++ b/drivers/staging/iio/Documentation/lis3l02dqbuffersimple.c
+@@ -0,0 +1,171 @@
++/* Industrialio test ring buffer with a lis3l02dq acceleromter
++ *
++ * Copyright (c) 2008 Jonathan Cameron
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published by
++ * the Free Software Foundation.
++ *
++ * Assumes suitable udev rules are used to create the dev nodes as named here.
++ */
++
++#include <dirent.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <errno.h>
++#include <stdint.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <sys/dir.h>
++
++#include <linux/types.h>
++#include <dirent.h>
++#include "iio_util.h"
++
++static const char *ring_access = "/dev/iio/lis3l02dq_ring_access";
++static const char *ring_event = "/dev/iio/lis3l02dq_ring_event";
++static const char *device_name = "lis3l02dq";
++static const char *trigger_name = "lis3l02dq-dev0";
++static int NumVals = 3;
++static int scan_ts = 1;
++static int RingLength = 128;
++
++/*
++ * Could get this from ring bps, but only after starting the ring
++ * which is a bit late for it to be useful
++ */
++int size_from_scanmode(int numVals, int timestamp)
++{
++	if (numVals && timestamp)
++		return 16;
++	else if (timestamp)
++		return 8;
++	else
++		return numVals*2;
++}
++
++int main(int argc, char **argv)
++{
++	int i, j, k, toread;
++	FILE *fp_ev;
++	int fp;
++	char *data;
++	size_t read_size;
++	struct iio_event_data dat;
++
++	char	*BaseDirectoryName,
++		*TriggerDirectoryName,
++		*RingBufferDirectoryName;
++
++	BaseDirectoryName = find_type_by_name(device_name, "device");
++	if (BaseDirectoryName == NULL) {
++		printf("Failed to find the %s \n", device_name);
++		return -1;
++	}
++	TriggerDirectoryName = find_type_by_name(trigger_name, "trigger");
++	if (TriggerDirectoryName == NULL) {
++		printf("Failed to find the %s\n", trigger_name);
++		return -1;
++	}
++	RingBufferDirectoryName = find_ring_subelement(BaseDirectoryName,
++						       "ring_buffer");
++	if (RingBufferDirectoryName == NULL) {
++		printf("Failed to find ring buffer\n");
++		return -1;
++	}
++
++	if (write_sysfs_string_and_verify("trigger/current_trigger",
++					  BaseDirectoryName,
++					  (char *)trigger_name) < 0) {
++		printf("Failed to write current_trigger file \n");
++		return -1;
++	}
++
++	/* Setup ring buffer parameters */
++	if (write_sysfs_int("length", RingBufferDirectoryName,
++			    RingLength) < 0) {
++		printf("Failed to open the ring buffer length file \n");
++		return -1;
++	}
++
++	/* Enable the ring buffer */
++	if (write_sysfs_int("ring_enable", RingBufferDirectoryName, 1) < 0) {
++		printf("Failed to open the ring buffer control file \n");
++		return -1;
++	};
++
++	data = malloc(size_from_scanmode(NumVals, scan_ts)*RingLength);
++	if (!data) {
++		printf("Could not allocate space for usespace data store\n");
++		return -1;
++	}
++
++	/* Attempt to open non blocking the access dev */
++	fp = open(ring_access, O_RDONLY | O_NONBLOCK);
++	if (fp == -1) { /*If it isn't there make the node */
++		printf("Failed to open %s\n", ring_access);
++		return -1;
++	}
++	/* Attempt to open the event access dev (blocking this time) */
++	fp_ev = fopen(ring_event, "rb");
++	if (fp_ev == NULL) {
++		printf("Failed to open %s\n", ring_event);
++		return -1;
++	}
++
++	/* Wait for events 10 times */
++	for (j = 0; j < 10; j++) {
++		read_size = fread(&dat, 1, sizeof(struct iio_event_data),
++				  fp_ev);
++		switch (dat.id) {
++		case IIO_EVENT_CODE_RING_100_FULL:
++			toread = RingLength;
++			break;
++		case IIO_EVENT_CODE_RING_75_FULL:
++			toread = RingLength*3/4;
++			break;
++		case IIO_EVENT_CODE_RING_50_FULL:
++			toread = RingLength/2;
++			break;
++		default:
++			printf("Unexpecteded event code\n");
++			continue;
++		}
++		read_size = read(fp,
++				 data,
++				 toread*size_from_scanmode(NumVals, scan_ts));
++		if (read_size == -EAGAIN) {
++			printf("nothing available \n");
++			continue;
++		}
++
++		for (i = 0;
++		     i < read_size/size_from_scanmode(NumVals, scan_ts);
++		     i++) {
++			for (k = 0; k < NumVals; k++) {
++				__s16 val = *(__s16 *)(&data[i*size_from_scanmode(NumVals, scan_ts)
++							     + (k)*2]);
++				printf("%05d ", val);
++			}
++			printf(" %lld\n",
++			       *(__s64 *)(&data[(i+1)*size_from_scanmode(NumVals, scan_ts)
++						- sizeof(__s64)]));
++		}
++	}
++
++	/* Stop the ring buffer */
++	if (write_sysfs_int("ring_enable", RingBufferDirectoryName, 0) < 0) {
++		printf("Failed to open the ring buffer control file \n");
++		return -1;
++	};
++
++	/* Disconnect from the trigger - writing something that doesn't exist.*/
++	write_sysfs_string_and_verify("trigger/current_trigger",
++				      BaseDirectoryName, "NULL");
++	free(BaseDirectoryName);
++	free(TriggerDirectoryName);
++	free(RingBufferDirectoryName);
++	free(data);
++
++	return 0;
++}
+--- /dev/null
++++ b/drivers/staging/iio/Documentation/overview.txt
+@@ -0,0 +1,62 @@
++Overview of IIO
++
++The Industrial I/O subsytem is intended to provide support for devices
++that in some sense are analog to digital convertors (ADCs). As many
++actual devices combine some ADCs with digital to analog convertors
++(DACs) the intention is to add that functionality at a future date
++(hence the name).
++
++The aim is to fill the gap between the somewhat similar hwmon and
++input subsystems.  Hwmon is very much directed at low sample rate
++sensors used in applications such as fan speed control and temperature
++measurement.  Input is, as it's name suggests focused on input
++devices. In some cases there is considerable overlap between these and
++IIO.
++
++A typical device falling into this category would be connected via SPI
++or I2C.
++
++Functionality of IIO
++
++* Basic device registration and handling. This is very similar to
++hwmon with simple polled access to device channels via sysfs.
++
++* Event chrdevs.  These are similar to input in that they provide a
++route to user space for hardware triggered events. Such events include
++threshold detectors, free-fall detectors and more complex action
++detection.  They events themselves are currently very simple with
++merely an event code and a timestamp.  Any data associated with the
++event must be accessed via polling. Note a given device may have one
++or more event channel.  These events are turned on or off (if possible)
++via sysfs interfaces.
++
++* Hardware ring buffer support.  Some recent sensors have included
++fifo / ring buffers on the sensor chip.  These greatly reduce the load
++on the host CPU by buffering relatively large numbers of data samples
++based on an internal sampling clock. Examples include VTI SCA3000
++series and Analog Device ADXL345 accelerometers.  Each ring buffer
++typically has an event chrdev (similar to the more general ones above)
++to pass on events such as buffer 50% full and an access chrdev via
++which the raw data it self may be read back.
++
++* Trigger and software ring buffer support. In many data analysis
++applications it it useful to be able to capture data based on some
++external signal (trigger).  These triggers might be a data ready
++signal, a gpio line connected to some external system or an on
++processor periodic interrupt.  A single trigger many initialize data
++capture or reading from a number of sensors.  These triggers are
++used in iio to fill software ring buffers acting in a very similar
++fashion to the hardware buffers described above.
++
++Other documentation:
++
++userspace.txt - overview of ring buffer reading from userspace
++
++device.txt - elemennts of a typical device driver.
++
++trigger.txt - elements of a typical trigger driver.
++
++ring.txt - additional elements required for ring buffer support
++
++
++
+--- /dev/null
++++ b/drivers/staging/iio/Documentation/ring.txt
+@@ -0,0 +1,61 @@
++Ring buffer support within IIO
++
++This document is intended as a general overview of the functionality
++a ring buffer may supply and how it is specified within IIO.  For more
++specific information on a given ring buffer implementation, see the
++comments in the source code.  Note that the intention is to allow
++some drivers to specify ring buffers choice at probe or runtime, but
++for now the selection is hard coded within a given driver.
++
++A given ring buffer implementation typically embedded a struct
++iio_ring_buffer and it is a pointer to this that is provided to the
++IIO core. Access to the embedding structure is typically done via
++container_of functions.
++
++struct iio_ring_buffer contains 4 function pointers
++(preenable, postenable, predisable, postdisable).
++These are used to perform implementation specific steps on either side
++of the core changing it's current mode to indicate that the ring buffer
++is enabled or disabled (along with enabling triggering etc as appropriate).
++
++Also in struct iio_ring_buffer is a struct iio_ring_access_funcs.
++The function pointers within here are used to allow the core to handle
++as much ring buffer functionality as possible. Note almost all of these
++are optional.
++
++mark_in_use, unmark_in_use
++  Basically indicate that not changes should be made to the ring
++  buffer state that will effect the form of the data being captures
++  (e.g. scan elements or length)
++
++store_to
++  If possible, push data to ring buffer.
++
++read_last
++  If possible get the most recent entry from the buffer (without removal).
++  This provides polling like functionality whilst the ring buffering is in
++  use without a separate read from the device.
++
++rip_lots
++  The primary ring buffer reading function. Note that it may well not return
++  as much data as requested.  The deadoffset is used to indicate that some
++  initial data in the data array is not guaranteed to be valid.
++
++mark_param_changed
++  Used to indicate that something has changed. Used in conjunction with
++request_update
++  If parameters have changed that require reinitialization or configuration of
++  the ring buffer this will trigger it.
++
++get_bpd, set_bpd
++  Get/set the number of bytes for a given reading (single element, not sample set)
++  The value of bps (bytes per set) is created from a combination of this and the
++  enabled scan elements.
++
++get_length / set_length
++  Get/set the number of sample sets that may be held by the buffer.
++
++is_enabled
++  Query if ring buffer is in use
++enable
++  Start the ring buffer.
+--- /dev/null
++++ b/drivers/staging/iio/Documentation/trigger.txt
+@@ -0,0 +1,38 @@
++IIO trigger drivers.
++
++Many triggers are provided by hardware that will also be registered as
++an IIO device.  Whilst this can create device specific complexities
++such triggers are registered with the core in the same way as
++stand-alone triggers.
++
++struct iio_trig *trig = iio_allocate_trigger();
++
++allocates a trigger structure.  The key elements to then fill in within
++a driver are:
++
++trig->control_attrs
++	Any sysfs attributes needed to control parameters of the trigger
++
++trig->private_data
++	Device specific private data.
++
++trig->owner
++	Typically set to THIS_MODULE. Used to ensure correct
++	ownership of core allocated resources.
++
++trig->name
++	A unique name for the trigger.
++
++When these have been set call:
++
++iio_trigger_register(trig);
++
++to register the trigger with the core, making it available to trigger
++consumers.
++
++
++Trigger Consumers
++
++Currently triggers are only used for the filling of software ring
++buffers and as such any device supporting INDIO_RING_TRIGGERED has the
++consumer interface automatically created.
+--- /dev/null
++++ b/drivers/staging/iio/Documentation/userspace.txt
+@@ -0,0 +1,60 @@
++Userspace access to IIO
++
++Example, ST Microelectronics LIS3L02DQ accelerometer.
++
++Typical sysfs entries (pruned for clarity)
++
++/sys/class/iio
++  device0 - iio_dev related elements
++    name - driver specific identifier (here lis3l02dq)
++    accel_x - polled (or from ring) raw readout of acceleration
++    accel_x_gain - hardware gain (calibration)
++    accel_x_offset - hardware offset (calibration)
++    available_sampling_frequency
++
++    available_sampling_frequency - what options are there
++    sampling_frequency - control of internal sampling frequency
++    scan_elements - controls which channels will be stored in the ring buffer
++      scan_en_accel_x
++      scan_en_accel_y
++      scan_en_timestamp
++    device - link to underlying hardware device
++    uevent - udev related element
++
++    thresh - unified threshold used for detection on all axis
++    event_line0_sources - which events are enabled
++      accel_x_high - enable x axis high threshold event
++      accel_x_low - enable x axis low threshold event
++
++    event_line0 - event interface
++      dev - major:minor for the chrdev (note major allocation dynamic)
++    trigger - consumer attachement
++      current_trigger - name based association with a trigger
++    ring_buffer0 - ring buffer interface
++      bps - byptes per sample (read only), dependant on scan element selection
++      length - (rw) specificy length fo software ring buffer (typically ro in hw case)
++      ring_enable - turn the ring on. If its the first to be enabled attached to this
++                    trigger will also enable the trigger.
++      ring_access0
++        dev - major:minor for ring buffer access chrdev
++      ring_event_line0
++        dev - major:minor for ring buffer event chrdev
++
++  trigger0 - data ready trigger elements
++    name - unqiue name of trigger
++
++Udev will create the following entries under /dev by default:
++
++ring_access0 - ring access chrdev
++ring_event0 - ring event chrdev
++event_line0 - general event chrdev.
++
++For the example code we assume the following rules have been used to ensure
++unique and consistent naming of these for the lis3l02dq in question:
++
++KERNEL="ring_event_line*", ID="spi1.0", DRIVER="lis3l02dq", NAME="iio/lis3l02dq_ring_event"
++KERNEL="event_line*", ID="spi1.0", DRIVER="lis3l02dq", NAME="iio/lis3l02dq_event"
++KERNEL="ring_access*", ID="spi1.0", DRIVER="lis3l02dq", NAME="iio/lis3l02dq_ring_access"
++
++The files, lis3l02dqbuffersimple.c and iio_util.h in this directory provide an example
++of how to use the ring buffer and event interfaces.

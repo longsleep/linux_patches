@@ -1,0 +1,660 @@
+From jic23@cam.ac.uk  Tue Aug 18 10:28:31 2009
+From: Jonathan Cameron <jic23@cam.ac.uk>
+Date: Tue, 18 Aug 2009 18:06:26 +0100
+Subject: Staging: IIO: Trigger support added to core.
+To: greg@kroah.com
+Cc: jic23@cam.ac.uk
+Message-ID: <1250615193-32501-9-git-send-email-jic23@cam.ac.uk>
+
+Add general registration support for IIO triggers.  These
+are currently only used to initialize a 'poll' of a given
+device.  Examples include the lis3l02dq's data ready signal
+being used to initialize a read and gpio triggers being
+used to allow externally synchronized sensor reading.
+
+Each trigger can cause any number of 'consumer' devices
+to be polled with each storing data into a related ring
+buffer.
+
+Two stage triggering is supported with 'fast' and 'slow'
+paths.  The first is used for things like pulling a data
+hold line high and the second for actual read which
+may take far longer.
+
+Changes since V2:
+* As with IIO triggers now use a registration approach
+  much closer to that of input leading to cleaner code.
+
+Signed-off-by: Jonathan Cameron <jic23@cam.ac.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/staging/iio/Kconfig                |    8 
+ drivers/staging/iio/Makefile               |    1 
+ drivers/staging/iio/industrialio-trigger.c |  399 +++++++++++++++++++++++++++++
+ drivers/staging/iio/trigger.h              |  151 ++++++++++
+ drivers/staging/iio/trigger_consumer.h     |   21 +
+ 5 files changed, 579 insertions(+), 1 deletion(-)
+
+--- /dev/null
++++ b/drivers/staging/iio/industrialio-trigger.c
+@@ -0,0 +1,399 @@
++/* The industrial I/O core, trigger handling functions
++ *
++ * Copyright (c) 2008 Jonathan Cameron
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published by
++ * the Free Software Foundation.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/idr.h>
++#include <linux/err.h>
++#include <linux/device.h>
++#include <linux/interrupt.h>
++#include <linux/list.h>
++
++#include "iio.h"
++#include "trigger.h"
++
++/* RFC - Question of approach
++ * Make the common case (single sensor single trigger)
++ * simple by starting trigger capture from when first sensors
++ * is added.
++ *
++ * Complex simultaneous start requires use of 'hold' functionality
++ * of the trigger. (not implemented)
++ *
++ * Any other suggestions?
++ */
++
++
++static DEFINE_IDR(iio_trigger_idr);
++static DEFINE_SPINLOCK(iio_trigger_idr_lock);
++
++/* Single list of all available triggers */
++static LIST_HEAD(iio_trigger_list);
++static DEFINE_MUTEX(iio_trigger_list_lock);
++
++/**
++ * iio_trigger_register_sysfs() - create a device for this trigger
++ * @trig_info:	the trigger
++ *
++ * Also adds any control attribute registered by the trigger driver
++ **/
++static int iio_trigger_register_sysfs(struct iio_trigger *trig_info)
++{
++	int ret = 0;
++
++	if (trig_info->control_attrs)
++		ret = sysfs_create_group(&trig_info->dev.kobj,
++					 trig_info->control_attrs);
++
++	return ret;
++}
++
++static void iio_trigger_unregister_sysfs(struct iio_trigger *trig_info)
++{
++	if (trig_info->control_attrs)
++		sysfs_remove_group(&trig_info->dev.kobj,
++				   trig_info->control_attrs);
++}
++
++
++/**
++ * iio_trigger_register_id() - get a unique id for this trigger
++ * @trig_info:	the trigger
++ **/
++static int iio_trigger_register_id(struct iio_trigger *trig_info)
++{
++	int ret = 0;
++
++idr_again:
++	if (unlikely(idr_pre_get(&iio_trigger_idr, GFP_KERNEL) == 0))
++		return -ENOMEM;
++
++	spin_lock(&iio_trigger_idr_lock);
++	ret = idr_get_new(&iio_trigger_idr, NULL, &trig_info->id);
++	spin_unlock(&iio_trigger_idr_lock);
++	if (unlikely(ret == -EAGAIN))
++		goto idr_again;
++	else if (likely(!ret))
++		trig_info->id = trig_info->id & MAX_ID_MASK;
++
++	return ret;
++}
++
++/**
++ * iio_trigger_unregister_id() - free up unique id for use by another trigger
++ * @trig_info: the trigger
++ **/
++static void iio_trigger_unregister_id(struct iio_trigger *trig_info)
++{
++		spin_lock(&iio_trigger_idr_lock);
++		idr_remove(&iio_trigger_idr, trig_info->id);
++		spin_unlock(&iio_trigger_idr_lock);
++}
++
++int iio_trigger_register(struct iio_trigger *trig_info)
++{
++	int ret;
++
++	ret = iio_trigger_register_id(trig_info);
++	if (ret)
++		goto error_ret;
++	/* Set the name used for the sysfs directory etc */
++	dev_set_name(&trig_info->dev, "trigger%ld",
++		     (unsigned long) trig_info->id);
++
++	ret = device_add(&trig_info->dev);
++	if (ret)
++		goto error_unregister_id;
++
++	ret = iio_trigger_register_sysfs(trig_info);
++	if (ret)
++		goto error_device_del;
++
++	/* Add to list of available triggers held by the IIO core */
++	mutex_lock(&iio_trigger_list_lock);
++	list_add_tail(&trig_info->list, &iio_trigger_list);
++	mutex_unlock(&iio_trigger_list_lock);
++
++	return 0;
++
++error_device_del:
++	device_del(&trig_info->dev);
++error_unregister_id:
++	iio_trigger_unregister_id(trig_info);
++error_ret:
++	return ret;
++}
++EXPORT_SYMBOL(iio_trigger_register);
++
++void iio_trigger_unregister(struct iio_trigger *trig_info)
++{
++	struct iio_trigger *cursor;
++
++	mutex_lock(&iio_trigger_list_lock);
++	list_for_each_entry(cursor, &iio_trigger_list, list)
++		if (cursor == trig_info) {
++			list_del(&cursor->list);
++			break;
++		}
++	mutex_unlock(&iio_trigger_list_lock);
++
++	iio_trigger_unregister_sysfs(trig_info);
++	iio_trigger_unregister_id(trig_info);
++	/* Possible issue in here */
++	device_unregister(&trig_info->dev);
++}
++EXPORT_SYMBOL(iio_trigger_unregister);
++
++struct iio_trigger *iio_trigger_find_by_name(const char *name, size_t len)
++{
++	struct iio_trigger *trig;
++	bool found = false;
++
++	mutex_lock(&iio_trigger_list_lock);
++	list_for_each_entry(trig, &iio_trigger_list, list) {
++		if (strncmp(trig->name, name, len) == 0) {
++			found = true;
++			break;
++		}
++	}
++	mutex_unlock(&iio_trigger_list_lock);
++
++	return found ? trig : NULL;
++};
++EXPORT_SYMBOL(iio_trigger_find_by_name);
++
++void iio_trigger_poll(struct iio_trigger *trig)
++{
++	struct iio_poll_func *pf_cursor;
++
++	list_for_each_entry(pf_cursor, &trig->pollfunc_list, list) {
++		if (pf_cursor->poll_func_immediate) {
++			pf_cursor->poll_func_immediate(pf_cursor->private_data);
++			trig->use_count++;
++		}
++	}
++	list_for_each_entry(pf_cursor, &trig->pollfunc_list, list) {
++		if (pf_cursor->poll_func_main) {
++			pf_cursor->poll_func_main(pf_cursor->private_data);
++			trig->use_count++;
++		}
++	}
++}
++EXPORT_SYMBOL(iio_trigger_poll);
++
++void iio_trigger_notify_done(struct iio_trigger *trig)
++{
++	trig->use_count--;
++	if (trig->use_count == 0 && trig->try_reenable)
++		if (trig->try_reenable(trig)) {
++			/* Missed and interrupt so launch new poll now */
++			trig->timestamp = 0;
++			iio_trigger_poll(trig);
++		}
++}
++EXPORT_SYMBOL(iio_trigger_notify_done);
++
++/**
++ * iio_trigger_read_name() - retrieve useful identifying name
++ **/
++ssize_t iio_trigger_read_name(struct device *dev,
++			      struct device_attribute *attr,
++			      char *buf)
++{
++	struct iio_trigger *trig = dev_get_drvdata(dev);
++	return sprintf(buf, "%s\n", trig->name);
++}
++EXPORT_SYMBOL(iio_trigger_read_name);
++
++/* Trigger Consumer related functions */
++
++/* Complexity in here.  With certain triggers (datardy) an acknowledgement
++ * may be needed if the pollfuncs do not include the data read for the
++ * triggering device.
++ * This is not currently handled.  Alternative of not enabling trigger unless
++ * the relevant function is in there may be the best option.
++ */
++/* Worth protecting against double additions?*/
++int iio_trigger_attach_poll_func(struct iio_trigger *trig,
++				 struct iio_poll_func *pf)
++{
++	int ret = 0;
++	unsigned long flags;
++
++	spin_lock_irqsave(&trig->pollfunc_list_lock, flags);
++	list_add_tail(&pf->list, &trig->pollfunc_list);
++	spin_unlock_irqrestore(&trig->pollfunc_list_lock, flags);
++
++	if (trig->set_trigger_state)
++		ret = trig->set_trigger_state(trig, true);
++	if (ret) {
++		printk(KERN_ERR "set trigger state failed\n");
++		list_del(&pf->list);
++	}
++	return ret;
++}
++EXPORT_SYMBOL(iio_trigger_attach_poll_func);
++
++int iio_trigger_dettach_poll_func(struct iio_trigger *trig,
++				  struct iio_poll_func *pf)
++{
++	struct iio_poll_func *pf_cursor;
++	unsigned long flags;
++	int ret = -EINVAL;
++
++	spin_lock_irqsave(&trig->pollfunc_list_lock, flags);
++	list_for_each_entry(pf_cursor, &trig->pollfunc_list, list)
++		if (pf_cursor == pf) {
++			ret = 0;
++			break;
++		}
++	if (!ret) {
++		if (list_is_singular(&trig->pollfunc_list)
++		    && trig->set_trigger_state) {
++			spin_unlock_irqrestore(&trig->pollfunc_list_lock,
++					       flags);
++			/* May sleep hence cannot hold the spin lock */
++			ret = trig->set_trigger_state(trig, false);
++			if (ret)
++				goto error_ret;
++			spin_lock_irqsave(&trig->pollfunc_list_lock, flags);
++		}
++		/*
++		 * Now we can delete safe in the knowledge that, if this is
++		 * the last pollfunc then we have disabled the trigger anyway
++		 * and so nothing should be able to call the pollfunc.
++		 */
++		list_del(&pf_cursor->list);
++	}
++	spin_unlock_irqrestore(&trig->pollfunc_list_lock, flags);
++
++error_ret:
++	return ret;
++}
++EXPORT_SYMBOL(iio_trigger_dettach_poll_func);
++
++/**
++ * iio_trigger_read_currrent() trigger consumer sysfs query which trigger
++ *
++ * For trigger consumers the current_trigger interface allows the trigger
++ * used by the device to be queried.
++ **/
++static ssize_t iio_trigger_read_current(struct device *dev,
++					struct device_attribute *attr,
++					char *buf)
++{
++	struct iio_dev *dev_info = dev_get_drvdata(dev);
++	int len = 0;
++	if (dev_info->trig)
++		len = snprintf(buf,
++			       IIO_TRIGGER_NAME_LENGTH,
++			       "%s\n",
++			       dev_info->trig->name);
++	return len;
++}
++
++/**
++ * iio_trigger_write_current() trigger consumer sysfs set current trigger
++ *
++ * For trigger consumers the current_trigger interface allows the trigger
++ * used for this device to be specified at run time based on the triggers
++ * name.
++ **/
++static ssize_t iio_trigger_write_current(struct device *dev,
++					 struct device_attribute *attr,
++					 const char *buf,
++					 size_t len)
++{
++	struct iio_dev *dev_info = dev_get_drvdata(dev);
++	struct iio_trigger *oldtrig = dev_info->trig;
++	mutex_lock(&dev_info->mlock);
++	if (dev_info->currentmode == INDIO_RING_TRIGGERED) {
++		mutex_unlock(&dev_info->mlock);
++		return -EBUSY;
++	}
++	mutex_unlock(&dev_info->mlock);
++
++	len = len < IIO_TRIGGER_NAME_LENGTH ? len : IIO_TRIGGER_NAME_LENGTH;
++
++	dev_info->trig = iio_trigger_find_by_name(buf, len);
++	if (oldtrig && dev_info->trig != oldtrig)
++		iio_put_trigger(oldtrig);
++	if (dev_info->trig)
++		iio_get_trigger(dev_info->trig);
++
++	return len;
++}
++
++DEVICE_ATTR(current_trigger, S_IRUGO | S_IWUSR,
++	    iio_trigger_read_current,
++	    iio_trigger_write_current);
++
++static struct attribute *iio_trigger_consumer_attrs[] = {
++	&dev_attr_current_trigger.attr,
++	NULL,
++};
++
++static const struct attribute_group iio_trigger_consumer_attr_group = {
++	.name = "trigger",
++	.attrs = iio_trigger_consumer_attrs,
++};
++
++static void iio_trig_release(struct device *device)
++{
++	struct iio_trigger *trig = to_iio_trigger(device);
++	kfree(trig);
++	iio_put();
++}
++
++static struct device_type iio_trig_type = {
++	.release = iio_trig_release,
++};
++
++struct iio_trigger *iio_allocate_trigger(void)
++{
++	struct iio_trigger *trig;
++	trig = kzalloc(sizeof *trig, GFP_KERNEL);
++	if (trig) {
++		trig->dev.type = &iio_trig_type;
++		trig->dev.class = &iio_class;
++		device_initialize(&trig->dev);
++		dev_set_drvdata(&trig->dev, (void *)trig);
++		spin_lock_init(&trig->pollfunc_list_lock);
++		INIT_LIST_HEAD(&trig->list);
++		INIT_LIST_HEAD(&trig->pollfunc_list);
++		iio_get();
++	}
++	return trig;
++}
++EXPORT_SYMBOL(iio_allocate_trigger);
++
++void iio_free_trigger(struct iio_trigger *trig)
++{
++	if (trig)
++		put_device(&trig->dev);
++}
++EXPORT_SYMBOL(iio_free_trigger);
++
++int iio_device_register_trigger_consumer(struct iio_dev *dev_info)
++{
++	int ret;
++	ret = sysfs_create_group(&dev_info->dev.kobj,
++				 &iio_trigger_consumer_attr_group);
++	return ret;
++}
++EXPORT_SYMBOL(iio_device_register_trigger_consumer);
++
++int iio_device_unregister_trigger_consumer(struct iio_dev *dev_info)
++{
++	sysfs_remove_group(&dev_info->dev.kobj,
++			   &iio_trigger_consumer_attr_group);
++	return 0;
++}
++EXPORT_SYMBOL(iio_device_unregister_trigger_consumer);
++
+--- a/drivers/staging/iio/Kconfig
++++ b/drivers/staging/iio/Kconfig
+@@ -17,6 +17,14 @@ config IIO_RING_BUFFER
+ 	  Provide core support for various ring buffer based data
+ 	  acquisition methods.
+ 
++config IIO_TRIGGER
++	boolean "Enable triggered sampling support"
++	help
++	  Provides IIO core support for triggers.  Currently these
++	  are used to initialize capture of samples to push into
++	  ring buffers.  The triggers are effectively a 'capture
++	  data now' interrupt.
++
+ source "drivers/staging/iio/accel/Kconfig"
+ source "drivers/staging/iio/adc/Kconfig"
+ source "drivers/staging/iio/light/Kconfig"
+--- a/drivers/staging/iio/Makefile
++++ b/drivers/staging/iio/Makefile
+@@ -5,6 +5,7 @@
+ obj-$(CONFIG_IIO) += industrialio.o
+ industrialio-y := industrialio-core.o
+ industrialio-$(CONFIG_IIO_RING_BUFFER) += industrialio-ring.o
++industrialio-$(CONFIG_IIO_TRIGGER) += industrialio-trigger.o
+ 
+ obj-y += accel/
+ obj-y += adc/
+--- a/drivers/staging/iio/trigger_consumer.h
++++ b/drivers/staging/iio/trigger_consumer.h
+@@ -8,6 +8,20 @@
+  * the Free Software Foundation.
+  */
+ 
++#ifdef CONFIG_IIO_TRIGGER
++/**
++ * iio_device_register_trigger_consumer() - set up an iio_dev to use triggers.
++ * @dev_info: iio_dev associated with the device that will consume the trigger
++ **/
++int iio_device_register_trigger_consumer(struct iio_dev *dev_info);
++/**
++ * iio_device_unregister_trigger_consumer() - reverse the registration process.
++ * @dev_info: iio_dev associated with the device that consumed the trigger
++ **/
++int iio_device_unregister_trigger_consumer(struct iio_dev *dev_info);
++
++#else
++
+ /**
+  * iio_device_register_trigger_consumer() - set up an iio_dev to use triggers.
+  * @dev_info: iio_dev associated with the device that will consume the trigger
+@@ -18,9 +32,14 @@ int iio_device_register_trigger_consumer
+ };
+ /**
+  * iio_device_unregister_trigger_consumer() - reverse the registration process
+-. * @dev_info: iio_dev associated with the device that consumed the trigger
++ * @dev_info: iio_dev associated with the device that consumed the trigger
+  **/
+ int iio_device_unregister_trigger_consumer(struct iio_dev *dev_info)
+ {
+ 	return 0;
+ };
++
++#endif /* CONFIG_TRIGGER_CONSUMER */
++
++
++
+--- /dev/null
++++ b/drivers/staging/iio/trigger.h
+@@ -0,0 +1,151 @@
++/* The industrial I/O core, trigger handling functions
++ *
++ * Copyright (c) 2008 Jonathan Cameron
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published by
++ * the Free Software Foundation.
++ */
++#ifndef _IIO_TRIGGER_H_
++#define _IIO_TRIGGER_H_
++#define IIO_TRIGGER_NAME_LENGTH 20
++#define IIO_TRIGGER_ID_PREFIX "iio:trigger"
++#define IIO_TRIGGER_ID_FORMAT IIO_TRIGGER_ID_PREFIX "%d"
++
++
++/**
++ * struct iio_trigger - industrial I/O trigger device
++ *
++ * @id:			[INTERN] unique id number
++ * @name:		[DRIVER] unique name
++ * @dev:		[DRIVER] associated device (if relevant)
++ * @sysfs_dev:		[INTERN] sysfs relevant device
++ * @private_data:	[DRIVER] device specific data
++ * @list:		[INTERN] used in maintenance of global trigger list
++ * @alloc_list:		[DRIVER] used for driver specific trigger list
++ * @poll_func_list_lock:[INTERN] protection of the polling function list
++ * @pollfunc_list:	[INTERN] list of functions to run on trigger.
++ * @control_attrs:	[DRIVER] sysfs attributes relevant to trigger type
++ * @set_trigger_state:	[DRIVER] switch on/off the trigger on demand
++ * @timestamp:		[INTERN] timestamp usesd by some trigs (e.g. datardy)
++ * @owner:		[DRIVER] used to monitor usage count of the trigger.
++ **/
++struct iio_trigger {
++	int				id;
++	const char			*name;
++	struct device			dev;
++
++	void				*private_data;
++	struct list_head		list;
++	struct list_head		alloc_list;
++	spinlock_t			pollfunc_list_lock;
++	struct list_head		pollfunc_list;
++	const struct attribute_group	*control_attrs;
++	s64				timestamp;
++	struct module			*owner;
++	int use_count;
++
++	int (*set_trigger_state)(struct iio_trigger *trig, bool state);
++	int (*try_reenable)(struct iio_trigger *trig);
++};
++
++static inline struct iio_trigger *to_iio_trigger(struct device *d)
++{
++	return container_of(d, struct iio_trigger, dev);
++};
++
++static inline void iio_put_trigger(struct iio_trigger *trig)
++{
++	put_device(&trig->dev);
++	module_put(trig->owner);
++};
++
++static inline void iio_get_trigger(struct iio_trigger *trig)
++{
++	__module_get(trig->owner);
++	get_device(&trig->dev);
++};
++
++/**
++ * iio_trigger_read_name() - sysfs access function to get the trigger name
++ **/
++ssize_t iio_trigger_read_name(struct device *dev,
++			      struct device_attribute *attr,
++			      char *buf);
++
++#define IIO_TRIGGER_NAME_ATTR DEVICE_ATTR(name, S_IRUGO,		\
++					  iio_trigger_read_name,	\
++					  NULL);
++
++/**
++ * iio_trigger_find_by_name() - search global trigger list
++ **/
++struct iio_trigger *iio_trigger_find_by_name(const char *name, size_t len);
++
++/**
++ * iio_trigger_register() - register a trigger with the IIO core
++ * @trig_info:	trigger to be registered
++ **/
++int iio_trigger_register(struct iio_trigger *trig_info);
++
++/**
++ * iio_trigger_unregister() - unregister a trigger from the core
++ **/
++void iio_trigger_unregister(struct iio_trigger *trig_info);
++
++/**
++ * iio_trigger_attach_poll_func() - add a function pair to be run on trigger
++ * @trig:	trigger to which the function pair are being added
++ * @pf:	poll function pair
++ **/
++int iio_trigger_attach_poll_func(struct iio_trigger *trig,
++				 struct iio_poll_func *pf);
++
++/**
++ * iio_trigger_dettach_poll_func() -	remove function pair from those to be
++ *					run on trigger.
++ * @trig:	trigger from which the function is being removed.
++ * @pf:		poll function pair
++ **/
++int iio_trigger_dettach_poll_func(struct iio_trigger *trig,
++				  struct iio_poll_func *pf);
++
++/**
++ * iio_trigger_poll() - called on a trigger occuring
++ * Typically called in relevant hardware interrupt handler.
++ **/
++void iio_trigger_poll(struct iio_trigger *);
++void iio_trigger_notify_done(struct iio_trigger *);
++
++/**
++ * struct iio_poll_func - poll function pair
++ *
++ * @list:			associate this with a triggers pollfunc_list
++ * @private_data:		data specific to device (passed into poll func)
++ * @poll_func_immediate:	function in here is run first. They should be
++ *				extremely lightweight.  Typically used for latch
++ *				control on sensor supporting it.
++ * @poll_func_main:		function in here is run after all immediates.
++ *				Reading from sensor etc typically involves
++ *				scheduling
++ *				from here.
++ *
++ * The two stage approach used here only important when multiple sensors are
++ * being triggered by a single trigger. This really comes into it's own with
++ * simultaneous sampling devices where a simple latch command can be used to
++ * make the device store the values on all inputs.
++ **/
++struct iio_poll_func {
++	struct				list_head list;
++	void				*private_data;
++	void (*poll_func_immediate)(struct iio_dev *indio_dev);
++	void (*poll_func_main)(struct iio_dev  *private_data);
++
++};
++
++struct iio_trigger *iio_allocate_trigger(void);
++
++void iio_free_trigger(struct iio_trigger *trig);
++
++
++#endif /* _IIO_TRIGGER_H_ */
