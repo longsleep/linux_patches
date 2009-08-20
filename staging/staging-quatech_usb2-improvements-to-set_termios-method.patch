@@ -1,0 +1,105 @@
+From richard@audacityteam.org  Thu Aug 20 14:40:14 2009
+From: Richard Ash <richard@audacityteam.org>
+Date: Thu, 20 Aug 2009 11:25:12 +0100
+Subject: Staging: quatech_usb2: Improvements to set_termios method
+To: Greg KH <greg@kroah.com>
+Message-ID: <1250763912.4310.68.camel@linux-dev>
+
+
+This patch implements several improvements to the set_termios method
+suggested by Alan Cox:
+* Correct check for whether any changes are being requested.
+* Inform callers that mark/space parity isn't supported by always
+clearing the bit.
+* Pass back the actual used baud rate in case it doesn't match what was
+requested.
+
+Remaining known issues are that IXANY flow control is not supported, but
+we don't tell the caller that, and input and output XON/XOFF flow
+control are either both on or both off, but we don't indicate that back
+to the caller either.
+
+Signed-off-by: Richard Ash <richard@audacityteam.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/staging/quatech_usb2/TODO           |    8 +++++++
+ drivers/staging/quatech_usb2/quatech_usb2.c |   30 +++++++++++++++++-----------
+ 2 files changed, 27 insertions(+), 11 deletions(-)
+
+--- a/drivers/staging/quatech_usb2/quatech_usb2.c
++++ b/drivers/staging/quatech_usb2/quatech_usb2.c
+@@ -83,8 +83,8 @@ static int debug;
+ #define QT2_SERIAL_6_DATA	0x01
+ #define QT2_SERIAL_5_DATA	0x00
+ 
+-#define QT2_SERIAL_ODD_PARITY	0X08
+-#define QT2_SERIAL_EVEN_PARITY	0X18
++#define QT2_SERIAL_ODD_PARITY	0x08
++#define QT2_SERIAL_EVEN_PARITY	0x18
+ #define QT2_SERIAL_TWO_STOPB	0x04
+ #define QT2_SERIAL_ONE_STOPB	0x00
+ 
+@@ -978,14 +978,8 @@ static void qt2_set_termios(struct tty_s
+ 
+ 	UartNumber = port->number;
+ 
+-	if (old_termios) {
+-		if ((tty->termios->c_cflag == old_termios->c_cflag) &&
+-			(RELEVANT_IFLAG(tty->termios->c_iflag) ==
+-			RELEVANT_IFLAG(old_termios->c_iflag))) {
+-			dbg("%s(): Nothing to change", __func__);
+-			return;
+-		}
+-	}
++	if (old_termios && !tty_termios_hw_change(old_termios, tty->termios))
++		return;
+ 
+ 	switch (tty->termios->c_cflag) {
+ 	case CS5:
+@@ -1010,12 +1004,21 @@ static void qt2_set_termios(struct tty_s
+ 		else
+ 			LCR_change_to |= QT2_SERIAL_EVEN_PARITY;
+ 	}
++	/* Because LCR_change_to is initialised to zero, we don't have to worry
++	 * about the case where PARENB is not set or clearing bits, because by
++	 * default all of them are cleared, turning parity off.
++	 * as we don't support mark/space parity, we should clear the
++	 * mark/space parity bit in c_cflag, so the caller can tell we have
++	 * ignored the request */
++	tty->termios->c_cflag &= ~CMSPAR;
++
+ 	if (tty->termios->c_cflag & CSTOPB)
+ 		LCR_change_to |= QT2_SERIAL_TWO_STOPB;
+ 	else
+ 		LCR_change_to |= QT2_SERIAL_ONE_STOPB;
+ 
+-	/* Thats the LCR stuff, go ahead and set it */
++	/* Thats the LCR stuff, next we need to work out the divisor as the
++	 * LCR and the divisor are set together */
+ 	baud = tty_get_baud_rate(tty);
+ 	if (!baud) {
+ 		/* pick a default, any default... */
+@@ -1036,6 +1039,11 @@ static void qt2_set_termios(struct tty_s
+ 	if (status < 0)	{
+ 		dbg("qt2_boxsetuart() failed");
+ 		return;
++	} else {
++		/* now encode the baud rate we actually set, which may be
++		 * different to the request */
++		baud = QT2_MAX_BAUD_RATE / divisor;
++		tty_encode_baud_rate(tty, baud, baud);
+ 	}
+ 
+ 	/* Now determine flow control */
+--- /dev/null
++++ b/drivers/staging/quatech_usb2/TODO
+@@ -0,0 +1,8 @@
++Incomplete list of things that this driver does not yet implement completely or
++at all. some of these may not be possible to implement because the hardware
++support does not exist. Others may be possible, but the magic control codes to
++make them happen are unknown, and some may just need the driver support to
++implement them writing.
++
++* Mark/Space parity is not implemented (reported back correctly)
++* IXANY flow control mode is not implemented (flag ignored completely)
