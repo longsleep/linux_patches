@@ -1,0 +1,499 @@
+From alan@linux.intel.com  Thu Aug 27 14:30:17 2009
+From: Alan Cox <alan@linux.intel.com>
+Date: Thu, 27 Aug 2009 11:02:25 +0100
+Subject: Staging: et131x: put the jagcore routines in with their users
+To: greg@kroah.com
+Message-ID: <20090827100217.23892.29740.stgit@localhost.localdomain>
+
+
+We have two trivial IRQ routines, a single statement and a real function -
+relocate them. While we are at it kill the trivial to sort out soft reset
+and slv bits in the same areas of code.
+
+Signed-off-by: Alan Cox <alan@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+---
+
+ drivers/staging/et131x/Makefile             |    1 
+ drivers/staging/et131x/et1310_address_map.h |   56 +------
+ drivers/staging/et131x/et1310_jagcore.c     |  214 ----------------------------
+ drivers/staging/et131x/et131x_initpci.c     |   77 +++++++++-
+ drivers/staging/et131x/et131x_isr.c         |   43 +++++
+ 5 files changed, 128 insertions(+), 263 deletions(-)
+ delete mode 100644 drivers/staging/et131x/et1310_jagcore.c
+
+
+--- a/drivers/staging/et131x/et1310_address_map.h
++++ b/drivers/staging/et131x/et1310_address_map.h
+@@ -116,52 +116,20 @@
+  */
+ 
+ /*
+- * structure for software reset reg in global address map
+- * located at address 0x0028
++ * Software reset reg at address 0x0028
++ * 0: 	txdma_sw_reset
++ * 1:	rxdma_sw_reset
++ * 2:	txmac_sw_reset
++ * 3:	rxmac_sw_reset
++ * 4:	mac_sw_reset
++ * 5:	mac_stat_sw_reset
++ * 6:	mmc_sw_reset
++ *31:	selfclr_disable
+  */
+-typedef union _SW_RESET_t {
+-	u32 value;
+-	struct {
+-#ifdef _BIT_FIELDS_HTOL
+-		u32 selfclr_disable:1;	/* bit 31 */
+-		u32 unused:24;		/* bits 7-30 */
+-		u32 mmc_sw_reset:1;	/* bit 6 */
+-		u32 mac_stat_sw_reset:1;	/* bit 5 */
+-		u32 mac_sw_reset:1;	/* bit 4 */
+-		u32 rxmac_sw_reset:1;	/* bit 3 */
+-		u32 txmac_sw_reset:1;	/* bit 2 */
+-		u32 rxdma_sw_reset:1;	/* bit 1 */
+-		u32 txdma_sw_reset:1;	/* bit 0 */
+-#else
+-		u32 txdma_sw_reset:1;	/* bit 0 */
+-		u32 rxdma_sw_reset:1;	/* bit 1 */
+-		u32 txmac_sw_reset:1;	/* bit 2 */
+-		u32 rxmac_sw_reset:1;	/* bit 3 */
+-		u32 mac_sw_reset:1;	/* bit 4 */
+-		u32 mac_stat_sw_reset:1;	/* bit 5 */
+-		u32 mmc_sw_reset:1;	/* bit 6 */
+-		u32 unused:24;		/* bits 7-30 */
+-		u32 selfclr_disable:1;	/* bit 31 */
+-#endif
+-	} bits;
+-} SW_RESET_t, *PSW_RESET_t;
+ 
+ /*
+- * structure for SLV Timer reg in global address map
+- * located at address 0x002C
++ * SLV Timer reg at address 0x002C (low 24 bits)
+  */
+-typedef union _SLV_TIMER_t {
+-	u32 value;
+-	struct {
+-#ifdef _BIT_FIELDS_HTOL
+-		u32 unused:8;	/* bits 24-31 */
+-		u32 timer_ini:24;	/* bits 0-23 */
+-#else
+-		u32 timer_ini:24;	/* bits 0-23 */
+-		u32 unused:8;	/* bits 24-31 */
+-#endif
+-	} bits;
+-} SLV_TIMER_t, *PSLV_TIMER_t;
+ 
+ /*
+  * structure for MSI Configuration reg in global address map
+@@ -218,8 +186,8 @@ typedef struct _GLOBAL_t {			/* Location
+ 	u32 int_mask;				/*  0x001C */
+ 	u32 int_alias_clr_en;			/*  0x0020 */
+ 	u32 int_status_alias;			/*  0x0024 */
+-	SW_RESET_t sw_reset;			/*  0x0028 */
+-	SLV_TIMER_t slv_timer;			/*  0x002C */
++	u32 sw_reset;				/*  0x0028 */
++	u32 slv_timer;				/*  0x002C */
+ 	MSI_CONFIG_t msi_config;		/*  0x0030 */
+ 	LOOPBACK_t loopback;			/*  0x0034 */
+ 	u32 watchdog_timer;			/*  0x0038 */
+--- a/drivers/staging/et131x/et1310_jagcore.c
++++ /dev/null
+@@ -1,214 +0,0 @@
+-/*
+- * Agere Systems Inc.
+- * 10/100/1000 Base-T Ethernet Driver for the ET1301 and ET131x series MACs
+- *
+- * Copyright © 2005 Agere Systems Inc.
+- * All rights reserved.
+- *   http://www.agere.com
+- *
+- *------------------------------------------------------------------------------
+- *
+- * et1310_jagcore.c - All code pertaining to the ET1301/ET131x's JAGcore
+- *
+- *------------------------------------------------------------------------------
+- *
+- * SOFTWARE LICENSE
+- *
+- * This software is provided subject to the following terms and conditions,
+- * which you should read carefully before using the software.  Using this
+- * software indicates your acceptance of these terms and conditions.  If you do
+- * not agree with these terms and conditions, do not use the software.
+- *
+- * Copyright © 2005 Agere Systems Inc.
+- * All rights reserved.
+- *
+- * Redistribution and use in source or binary forms, with or without
+- * modifications, are permitted provided that the following conditions are met:
+- *
+- * . Redistributions of source code must retain the above copyright notice, this
+- *    list of conditions and the following Disclaimer as comments in the code as
+- *    well as in the documentation and/or other materials provided with the
+- *    distribution.
+- *
+- * . Redistributions in binary form must reproduce the above copyright notice,
+- *    this list of conditions and the following Disclaimer in the documentation
+- *    and/or other materials provided with the distribution.
+- *
+- * . Neither the name of Agere Systems Inc. nor the names of the contributors
+- *    may be used to endorse or promote products derived from this software
+- *    without specific prior written permission.
+- *
+- * Disclaimer
+- *
+- * THIS SOFTWARE IS PROVIDED "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,
+- * INCLUDING, BUT NOT LIMITED TO, INFRINGEMENT AND THE IMPLIED WARRANTIES OF
+- * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  ANY
+- * USE, MODIFICATION OR DISTRIBUTION OF THIS SOFTWARE IS SOLELY AT THE USERS OWN
+- * RISK. IN NO EVENT SHALL AGERE SYSTEMS INC. OR CONTRIBUTORS BE LIABLE FOR ANY
+- * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+- * ON ANY THEORY OF LIABILITY, INCLUDING, BUT NOT LIMITED TO, CONTRACT, STRICT
+- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
+- * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH
+- * DAMAGE.
+- *
+- */
+-
+-#include "et131x_version.h"
+-#include "et131x_debug.h"
+-#include "et131x_defs.h"
+-
+-#include <linux/init.h>
+-#include <linux/module.h>
+-#include <linux/types.h>
+-#include <linux/kernel.h>
+-
+-#include <linux/sched.h>
+-#include <linux/ptrace.h>
+-#include <linux/slab.h>
+-#include <linux/ctype.h>
+-#include <linux/string.h>
+-#include <linux/timer.h>
+-#include <linux/interrupt.h>
+-#include <linux/in.h>
+-#include <linux/delay.h>
+-#include <linux/io.h>
+-#include <linux/bitops.h>
+-#include <asm/system.h>
+-
+-#include <linux/netdevice.h>
+-#include <linux/etherdevice.h>
+-#include <linux/skbuff.h>
+-#include <linux/if_arp.h>
+-#include <linux/ioport.h>
+-
+-#include "et1310_phy.h"
+-#include "et1310_pm.h"
+-#include "et1310_jagcore.h"
+-
+-#include "et131x_adapter.h"
+-#include "et131x_initpci.h"
+-
+-/* Data for debugging facilities */
+-#ifdef CONFIG_ET131X_DEBUG
+-extern dbg_info_t *et131x_dbginfo;
+-#endif /* CONFIG_ET131X_DEBUG */
+-
+-/**
+- * ConfigGlobalRegs - Used to configure the global registers on the JAGCore
+- * @pAdpater: pointer to our adapter structure
+- */
+-void ConfigGlobalRegs(struct et131x_adapter *etdev)
+-{
+-	struct _GLOBAL_t __iomem *pGbl = &etdev->regs->global;
+-
+-	DBG_ENTER(et131x_dbginfo);
+-
+-	if (etdev->RegistryPhyLoopbk == false) {
+-		if (etdev->RegistryJumboPacket < 2048) {
+-			/* Tx / RxDMA and Tx/Rx MAC interfaces have a 1k word
+-			 * block of RAM that the driver can split between Tx
+-			 * and Rx as it desires.  Our default is to split it
+-			 * 50/50:
+-			 */
+-			writel(0, &pGbl->rxq_start_addr);
+-			writel(PARM_RX_MEM_END_DEF, &pGbl->rxq_end_addr);
+-			writel(PARM_RX_MEM_END_DEF + 1, &pGbl->txq_start_addr);
+-			writel(INTERNAL_MEM_SIZE - 1, &pGbl->txq_end_addr);
+-		} else if (etdev->RegistryJumboPacket < 8192) {
+-			/* For jumbo packets > 2k but < 8k, split 50-50. */
+-			writel(0, &pGbl->rxq_start_addr);
+-			writel(INTERNAL_MEM_RX_OFFSET, &pGbl->rxq_end_addr);
+-			writel(INTERNAL_MEM_RX_OFFSET + 1, &pGbl->txq_start_addr);
+-			writel(INTERNAL_MEM_SIZE - 1, &pGbl->txq_end_addr);
+-		} else {
+-			/* 9216 is the only packet size greater than 8k that
+-			 * is available. The Tx buffer has to be big enough
+-			 * for one whole packet on the Tx side. We'll make
+-			 * the Tx 9408, and give the rest to Rx
+-			 */
+-			writel(0x0000, &pGbl->rxq_start_addr);
+-			writel(0x01b3, &pGbl->rxq_end_addr);
+-			writel(0x01b4, &pGbl->txq_start_addr);
+-			writel(INTERNAL_MEM_SIZE - 1,&pGbl->txq_end_addr);
+-		}
+-
+-		/* Initialize the loopback register. Disable all loopbacks. */
+-		writel(0, &pGbl->loopback.value);
+-	} else {
+-		/* For PHY Line loopback, the memory is configured as if Tx
+-		 * and Rx both have all the memory.  This is because the
+-		 * RxMAC will write data into the space, and the TxMAC will
+-		 * read it out.
+-		 */
+-		writel(0, &pGbl->rxq_start_addr);
+-		writel(INTERNAL_MEM_SIZE - 1, &pGbl->rxq_end_addr);
+-		writel(0, &pGbl->txq_start_addr);
+-		writel(INTERNAL_MEM_SIZE - 1, &pGbl->txq_end_addr);
+-
+-		/* Initialize the loopback register (MAC loopback). */
+-		writel(1, &pGbl->loopback);
+-	}
+-
+-	/* MSI Register */
+-	writel(0, &pGbl->msi_config.value);
+-
+-	/* By default, disable the watchdog timer.  It will be enabled when
+-	 * a packet is queued.
+-	 */
+-	writel(0, &pGbl->watchdog_timer);
+-
+-	DBG_LEAVE(et131x_dbginfo);
+-}
+-
+-/**
+- * ConfigMMCRegs - Used to configure the main memory registers in the JAGCore
+- * @etdev: pointer to our adapter structure
+- */
+-void ConfigMMCRegs(struct et131x_adapter *etdev)
+-{
+-	DBG_ENTER(et131x_dbginfo);
+-	/* All we need to do is initialize the Memory Control Register */
+-	writel(ET_MMC_ENABLE, &etdev->regs->mmc.mmc_ctrl);
+-	DBG_LEAVE(et131x_dbginfo);
+-}
+-
+-/**
+- *	et131x_enable_interrupts	-	enable interrupt
+- *	@adapter: et131x device
+- *
+- *	Enable the appropriate interrupts on the ET131x according to our
+- *	configuration
+- */
+-
+-void et131x_enable_interrupts(struct et131x_adapter *adapter)
+-{
+-	u32 mask;
+-
+-	/* Enable all global interrupts */
+-	if (adapter->FlowControl == TxOnly || adapter->FlowControl == Both)
+-		mask = INT_MASK_ENABLE;
+-	else
+-		mask = INT_MASK_ENABLE_NO_FLOW;
+-
+-	if (adapter->DriverNoPhyAccess)
+-		mask |= ET_INTR_PHY;
+-
+-	adapter->CachedMaskValue = mask;
+-	writel(mask, &adapter->regs->global.int_mask);
+-}
+-
+-/**
+- *	et131x_disable_interrupts	-	interrupt disable
+- *	@adapter: et131x device
+- *
+- *	Block all interrupts from the et131x device at the device itself
+- */
+-
+-void et131x_disable_interrupts(struct et131x_adapter *adapter)
+-{
+-	/* Disable all global interrupts */
+-	adapter->CachedMaskValue = INT_MASK_DISABLE;
+-	writel(INT_MASK_DISABLE, &adapter->regs->global.int_mask);
+-}
+--- a/drivers/staging/et131x/et131x_initpci.c
++++ b/drivers/staging/et131x/et131x_initpci.c
+@@ -532,6 +532,76 @@ void et131x_link_detection_handler(unsig
+ }
+ 
+ /**
++ * et131x_configure_global_regs	-	configure JAGCore global regs
++ * @etdev: pointer to our adapter structure
++ *
++ * Used to configure the global registers on the JAGCore
++ */
++void ConfigGlobalRegs(struct et131x_adapter *etdev)
++{
++	struct _GLOBAL_t __iomem *pGbl = &etdev->regs->global;
++
++	DBG_ENTER(et131x_dbginfo);
++
++	if (etdev->RegistryPhyLoopbk == false) {
++		if (etdev->RegistryJumboPacket < 2048) {
++			/* Tx / RxDMA and Tx/Rx MAC interfaces have a 1k word
++			 * block of RAM that the driver can split between Tx
++			 * and Rx as it desires.  Our default is to split it
++			 * 50/50:
++			 */
++			writel(0, &pGbl->rxq_start_addr);
++			writel(PARM_RX_MEM_END_DEF, &pGbl->rxq_end_addr);
++			writel(PARM_RX_MEM_END_DEF + 1, &pGbl->txq_start_addr);
++			writel(INTERNAL_MEM_SIZE - 1, &pGbl->txq_end_addr);
++		} else if (etdev->RegistryJumboPacket < 8192) {
++			/* For jumbo packets > 2k but < 8k, split 50-50. */
++			writel(0, &pGbl->rxq_start_addr);
++			writel(INTERNAL_MEM_RX_OFFSET, &pGbl->rxq_end_addr);
++			writel(INTERNAL_MEM_RX_OFFSET + 1, &pGbl->txq_start_addr);
++			writel(INTERNAL_MEM_SIZE - 1, &pGbl->txq_end_addr);
++		} else {
++			/* 9216 is the only packet size greater than 8k that
++			 * is available. The Tx buffer has to be big enough
++			 * for one whole packet on the Tx side. We'll make
++			 * the Tx 9408, and give the rest to Rx
++			 */
++			writel(0x0000, &pGbl->rxq_start_addr);
++			writel(0x01b3, &pGbl->rxq_end_addr);
++			writel(0x01b4, &pGbl->txq_start_addr);
++			writel(INTERNAL_MEM_SIZE - 1,&pGbl->txq_end_addr);
++		}
++
++		/* Initialize the loopback register. Disable all loopbacks. */
++		writel(0, &pGbl->loopback.value);
++	} else {
++		/* For PHY Line loopback, the memory is configured as if Tx
++		 * and Rx both have all the memory.  This is because the
++		 * RxMAC will write data into the space, and the TxMAC will
++		 * read it out.
++		 */
++		writel(0, &pGbl->rxq_start_addr);
++		writel(INTERNAL_MEM_SIZE - 1, &pGbl->rxq_end_addr);
++		writel(0, &pGbl->txq_start_addr);
++		writel(INTERNAL_MEM_SIZE - 1, &pGbl->txq_end_addr);
++
++		/* Initialize the loopback register (MAC loopback). */
++		writel(1, &pGbl->loopback);
++	}
++
++	/* MSI Register */
++	writel(0, &pGbl->msi_config.value);
++
++	/* By default, disable the watchdog timer.  It will be enabled when
++	 * a packet is queued.
++	 */
++	writel(0, &pGbl->watchdog_timer);
++
++	DBG_LEAVE(et131x_dbginfo);
++}
++
++
++/**
+  * et131x_adapter_setup - Set the adapter up as per cassini+ documentation
+  * @adapter: pointer to our private adapter structure
+  *
+@@ -547,7 +617,10 @@ int et131x_adapter_setup(struct et131x_a
+ 	ConfigGlobalRegs(etdev);
+ 
+ 	ConfigMACRegs1(etdev);
+-	ConfigMMCRegs(etdev);
++
++	/* Configure the MMC registers */
++	/* All we need to do is initialize the Memory Control Register */
++	writel(ET_MMC_ENABLE, &etdev->regs->mmc.mmc_ctrl);
+ 
+ 	ConfigRxMacRegs(etdev);
+ 	ConfigTxMacRegs(etdev);
+@@ -645,7 +718,7 @@ void et131x_soft_reset(struct et131x_ada
+ 	writel(0xc00f0000, &adapter->regs->mac.cfg1.value);
+ 
+ 	/* Set everything to a reset value */
+-	writel(0x7F, &adapter->regs->global.sw_reset.value);
++	writel(0x7F, &adapter->regs->global.sw_reset);
+ 	writel(0x000f0000, &adapter->regs->mac.cfg1.value);
+ 	writel(0x00000000, &adapter->regs->mac.cfg1.value);
+ 
+--- a/drivers/staging/et131x/et131x_isr.c
++++ b/drivers/staging/et131x/et131x_isr.c
+@@ -97,12 +97,53 @@ extern dbg_info_t *et131x_dbginfo;
+ #endif /* CONFIG_ET131X_DEBUG */
+ 
+ /**
++ *	et131x_enable_interrupts	-	enable interrupt
++ *	@adapter: et131x device
++ *
++ *	Enable the appropriate interrupts on the ET131x according to our
++ *	configuration
++ */
++
++void et131x_enable_interrupts(struct et131x_adapter *adapter)
++{
++	u32 mask;
++
++	/* Enable all global interrupts */
++	if (adapter->FlowControl == TxOnly || adapter->FlowControl == Both)
++		mask = INT_MASK_ENABLE;
++	else
++		mask = INT_MASK_ENABLE_NO_FLOW;
++
++	if (adapter->DriverNoPhyAccess)
++		mask |= ET_INTR_PHY;
++
++	adapter->CachedMaskValue = mask;
++	writel(mask, &adapter->regs->global.int_mask);
++}
++
++/**
++ *	et131x_disable_interrupts	-	interrupt disable
++ *	@adapter: et131x device
++ *
++ *	Block all interrupts from the et131x device at the device itself
++ */
++
++void et131x_disable_interrupts(struct et131x_adapter *adapter)
++{
++	/* Disable all global interrupts */
++	adapter->CachedMaskValue = INT_MASK_DISABLE;
++	writel(INT_MASK_DISABLE, &adapter->regs->global.int_mask);
++}
++
++
++/**
+  * et131x_isr - The Interrupt Service Routine for the driver.
+  * @irq: the IRQ on which the interrupt was received.
+  * @dev_id: device-specific info (here a pointer to a net_device struct)
+  *
+  * Returns a value indicating if the interrupt was handled.
+  */
++
+ irqreturn_t et131x_isr(int irq, void *dev_id)
+ {
+ 	bool handled = true;
+@@ -197,7 +238,6 @@ irqreturn_t et131x_isr(int irq, void *de
+ 	 * execution
+ 	 */
+ 	schedule_work(&adapter->task);
+-
+ out:
+ 	return IRQ_RETVAL(handled);
+ }
+@@ -476,6 +516,5 @@ void et131x_isr_handler(struct work_stru
+ 			DBG_VERBOSE(et131x_dbginfo, "SLV_TIMEOUT interrupt\n");
+ 		}
+ 	}
+-
+ 	et131x_enable_interrupts(etdev);
+ }
+--- a/drivers/staging/et131x/Makefile
++++ b/drivers/staging/et131x/Makefile
+@@ -5,7 +5,6 @@
+ obj-$(CONFIG_ET131X) += et131x.o
+ 
+ et131x-objs :=	et1310_eeprom.o \
+-		et1310_jagcore.o \
+ 		et1310_mac.o \
+ 		et1310_phy.o \
+ 		et1310_pm.o \
