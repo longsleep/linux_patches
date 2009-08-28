@@ -1,0 +1,342 @@
+From zbr@ioremap.net  Fri Aug 28 08:17:31 2009
+From: Evgeniy Polyakov <zbr@ioremap.net>
+Date: Fri, 28 Aug 2009 17:57:58 +0400
+Subject: Staging: pohmelfs: sync with the development tree
+To: GregKH <greg@kroah.com>
+Message-ID: <20090828135758.GA21567@ioremap.net>
+Content-Disposition: inline
+
+ * cache coherency protocol fix
+ * proper timeout handling
+ * implement dump/del all config group command
+ 	(Signed-off-by: Pierpaolo Giacomin <yrz@anche.no>)
+
+Signed-off-by: Evgeniy Polyakov <zbr@ioremap.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/staging/pohmelfs/config.c |   98 ++++++++++++++++++++++++++++++++++++--
+ drivers/staging/pohmelfs/crypto.c |    4 -
+ drivers/staging/pohmelfs/dir.c    |   25 ++++++---
+ drivers/staging/pohmelfs/inode.c  |    7 +-
+ drivers/staging/pohmelfs/net.c    |   18 +++---
+ drivers/staging/pohmelfs/netfs.h  |    5 +
+ drivers/staging/pohmelfs/trans.c  |    3 -
+ 7 files changed, 132 insertions(+), 28 deletions(-)
+
+--- a/drivers/staging/pohmelfs/config.c
++++ b/drivers/staging/pohmelfs/config.c
+@@ -284,9 +284,91 @@ static int pohmelfs_cn_disp(struct cn_ms
+ 		i += 1;
+ 	}
+ 
++ out_unlock:
++	mutex_unlock(&pohmelfs_config_lock);
++	return err;
++}
++
++static int pohmelfs_cn_dump(struct cn_msg *msg)
++{
++	struct pohmelfs_config_group *g;
++	struct pohmelfs_config *c, *tmp;
++	int err = 0, i = 1;
++	int total_msg = 0;
++
++	if (msg->len != sizeof(struct pohmelfs_ctl))
++		return -EBADMSG;
++
++	mutex_lock(&pohmelfs_config_lock);
++
++	list_for_each_entry(g, &pohmelfs_config_list, group_entry) {
++		if (g)
++			total_msg += g->num_entry;
++	}
++	if (total_msg == 0) {
++		if (pohmelfs_send_reply(err, 0, POHMELFS_NOINFO_ACK, msg, NULL))
++			err = -ENOMEM;
++		goto out_unlock;
++	}
++
++	list_for_each_entry(g, &pohmelfs_config_list, group_entry) {
++		if (g) {
++			list_for_each_entry_safe(c, tmp, &g->config_list, config_entry) {
++				struct pohmelfs_ctl *sc = &c->state.ctl;
++				if (pohmelfs_send_reply(err, total_msg - i, POHMELFS_CTLINFO_ACK, msg, sc)) {
++					err = -ENOMEM;
++					goto out_unlock;
++				}
++				i += 1;
++			}
++		}
++	}
++
+ out_unlock:
+-        mutex_unlock(&pohmelfs_config_lock);
+-        return err;
++	mutex_unlock(&pohmelfs_config_lock);
++	return err;
++}
++
++static int pohmelfs_cn_flush(struct cn_msg *msg)
++{
++	struct pohmelfs_config_group *g;
++	struct pohmelfs_ctl *ctl = (struct pohmelfs_ctl *)msg->data;
++	struct pohmelfs_config *c, *tmp;
++	int err = 0;
++
++	if (msg->len != sizeof(struct pohmelfs_ctl))
++		return -EBADMSG;
++
++	mutex_lock(&pohmelfs_config_lock);
++
++	if (ctl->idx != POHMELFS_NULL_IDX) {
++		g = pohmelfs_find_config_group(ctl->idx);
++
++		if (!g)
++			goto out_unlock;
++
++		list_for_each_entry_safe(c, tmp, &g->config_list, config_entry) {
++			list_del(&c->config_entry);
++			g->num_entry--;
++			kfree(c);
++		}
++	} else {
++		list_for_each_entry(g, &pohmelfs_config_list, group_entry) {
++			if (g) {
++				list_for_each_entry_safe(c, tmp, &g->config_list, config_entry) {
++					list_del(&c->config_entry);
++					g->num_entry--;
++					kfree(c);
++				}
++			}
++		}
++	}
++
++out_unlock:
++	mutex_unlock(&pohmelfs_config_lock);
++	pohmelfs_cn_dump(msg);
++
++	return err;
+ }
+ 
+ static int pohmelfs_modify_config(struct pohmelfs_ctl *old, struct pohmelfs_ctl *new)
+@@ -350,7 +432,7 @@ static int pohmelfs_cn_ctl(struct cn_msg
+ 
+ 	list_add_tail(&c->config_entry, &g->config_list);
+ 
+-out_unlock:
++ out_unlock:
+ 	mutex_unlock(&pohmelfs_config_lock);
+ 	if (pohmelfs_send_reply(err, 0, POHMELFS_NOINFO_ACK, msg, NULL))
+ 		err = -ENOMEM;
+@@ -408,7 +490,6 @@ static int pohmelfs_crypto_cipher_init(s
+ 	return 0;
+ }
+ 
+-
+ static int pohmelfs_cn_crypto(struct cn_msg *msg)
+ {
+ 	struct pohmelfs_crypto *crypto = (struct pohmelfs_crypto *)msg->data;
+@@ -456,9 +537,15 @@ static void pohmelfs_cn_callback(struct 
+ 		case POHMELFS_FLAGS_MODIFY:
+ 			err = pohmelfs_cn_ctl(msg, msg->flags);
+ 			break;
++		case POHMELFS_FLAGS_FLUSH:
++			err = pohmelfs_cn_flush(msg);
++			break;
+ 		case POHMELFS_FLAGS_SHOW:
+ 			err = pohmelfs_cn_disp(msg);
+ 			break;
++		case POHMELFS_FLAGS_DUMP:
++			err = pohmelfs_cn_dump(msg);
++			break;
+ 		case POHMELFS_FLAGS_CRYPTO:
+ 			err = pohmelfs_cn_crypto(msg);
+ 			break;
+@@ -497,7 +584,8 @@ int pohmelfs_config_check(struct pohmelf
+ 
+ int __init pohmelfs_config_init(void)
+ {
+-	return cn_add_callback(&pohmelfs_cn_id, "pohmelfs", pohmelfs_cn_callback);
++	/* XXX remove (void *) cast when vanilla connector got synced */
++	return cn_add_callback(&pohmelfs_cn_id, "pohmelfs", (void *)pohmelfs_cn_callback);
+ }
+ 
+ void pohmelfs_config_exit(void)
+--- a/drivers/staging/pohmelfs/crypto.c
++++ b/drivers/staging/pohmelfs/crypto.c
+@@ -176,7 +176,7 @@ static int pohmelfs_crypto_process(struc
+ 					timeout);
+ 			if (!err)
+ 				err = -ETIMEDOUT;
+-			else
++			else if (err > 0)
+ 				err = complete.error;
+ 			break;
+ 		default:
+@@ -738,7 +738,7 @@ static int pohmelfs_crypto_init_handshak
+ 			psb->wait_on_page_timeout);
+ 	if (!err)
+ 		err = -ETIMEDOUT;
+-	else
++	else if (err > 0)
+ 		err = -psb->flags;
+ 
+ 	if (!err)
+--- a/drivers/staging/pohmelfs/dir.c
++++ b/drivers/staging/pohmelfs/dir.c
+@@ -352,7 +352,9 @@ static int pohmelfs_sync_remote_dir(stru
+ 			test_bit(NETFS_INODE_REMOTE_DIR_SYNCED, &pi->state) || pi->error, ret);
+ 	dprintk("%s: awake dir: %llu, ret: %ld, err: %d.\n", __func__, pi->ino, ret, pi->error);
+ 	if (ret <= 0) {
+-		err = -ETIMEDOUT;
++		err = ret;
++		if (!err)
++			err = -ETIMEDOUT;
+ 		goto err_out_exit;
+ 	}
+ 
+@@ -472,10 +474,11 @@ static int pohmelfs_lookup_single(struct
+ 	err = 0;
+ 	ret = wait_event_interruptible_timeout(psb->wait,
+ 			!test_bit(NETFS_COMMAND_PENDING, &parent->state), ret);
+-	if (ret == 0)
+-		err = -ETIMEDOUT;
+-	else if (signal_pending(current))
+-		err = -EINTR;
++	if (ret <= 0) {
++		err = ret;
++		if (!err)
++			err = -ETIMEDOUT;
++	}
+ 
+ 	if (err)
+ 		goto err_out_exit;
+@@ -505,13 +508,21 @@ struct dentry *pohmelfs_lookup(struct in
+ 	struct pohmelfs_name *n;
+ 	struct inode *inode = NULL;
+ 	unsigned long ino = 0;
+-	int err, lock_type = POHMELFS_READ_LOCK, need_lock;
++	int err, lock_type = POHMELFS_READ_LOCK, need_lock = 1;
+ 	struct qstr str = dentry->d_name;
+ 
+ 	if ((nd->intent.open.flags & O_ACCMODE) > 1)
+ 		lock_type = POHMELFS_WRITE_LOCK;
+ 
+-	need_lock = pohmelfs_need_lock(parent, lock_type);
++	if (test_bit(NETFS_INODE_OWNED, &parent->state)) {
++		if (lock_type == parent->lock_type)
++			need_lock = 0;
++		if ((lock_type == POHMELFS_READ_LOCK) && (parent->lock_type == POHMELFS_WRITE_LOCK))
++			need_lock = 0;
++	}
++
++	if ((lock_type == POHMELFS_READ_LOCK) && !test_bit(NETFS_INODE_REMOTE_DIR_SYNCED, &parent->state))
++		need_lock = 1;
+ 
+ 	str.hash = jhash(dentry->d_name.name, dentry->d_name.len, 0);
+ 
+--- a/drivers/staging/pohmelfs/inode.c
++++ b/drivers/staging/pohmelfs/inode.c
+@@ -1504,7 +1504,9 @@ static void pohmelfs_flush_inode(struct 
+ 		inode->i_sb->s_op->write_inode(inode, 0);
+ 	}
+ 
++#ifdef POHMELFS_TRUNCATE_ON_INODE_FLUSH
+ 	truncate_inode_pages(inode->i_mapping, 0);
++#endif
+ 
+ 	pohmelfs_data_unlock(pi, 0, ~0, POHMELFS_WRITE_LOCK);
+ 	mutex_unlock(&inode->i_mutex);
+@@ -1743,11 +1745,10 @@ static int pohmelfs_root_handshake(struc
+ 	err = wait_event_interruptible_timeout(psb->wait,
+ 			(psb->flags != ~0),
+ 			psb->wait_on_page_timeout);
+-	if (!err) {
++	if (!err)
+ 		err = -ETIMEDOUT;
+-	} else {
++	else if (err > 0)
+ 		err = -psb->flags;
+-	}
+ 
+ 	if (err)
+ 		goto err_out_exit;
+--- a/drivers/staging/pohmelfs/net.c
++++ b/drivers/staging/pohmelfs/net.c
+@@ -1005,13 +1005,12 @@ int netfs_state_init(struct netfs_state 
+ 
+ 	if (st->socket->ops->family == AF_INET) {
+ 		struct sockaddr_in *sin = (struct sockaddr_in *)&ctl->addr;
+-		printk(KERN_INFO "%s: (re)connected to peer %u.%u.%u.%u:%d.\n", __func__,
+-			NIPQUAD(sin->sin_addr.s_addr), ntohs(sin->sin_port));
++		printk(KERN_INFO "%s: (re)connected to peer %pi4:%d.\n", __func__,
++			&sin->sin_addr.s_addr, ntohs(sin->sin_port));
+ 	} else if (st->socket->ops->family == AF_INET6) {
+ 		struct sockaddr_in6 *sin = (struct sockaddr_in6 *)&ctl->addr;
+-		printk(KERN_INFO "%s: (re)connected to peer "
+-			"%pi6:%d",
+-			__func__, &sin->sin6_addr, ntohs(sin->sin6_port));
++		printk(KERN_INFO "%s: (re)connected to peer %pi6:%d", __func__,
++				&sin->sin6_addr, ntohs(sin->sin6_port));
+ 	}
+ 
+ 	return 0;
+@@ -1031,13 +1030,12 @@ void netfs_state_exit(struct netfs_state
+ 
+ 		if (st->socket->ops->family == AF_INET) {
+ 			struct sockaddr_in *sin = (struct sockaddr_in *)&st->ctl.addr;
+-			printk("%s: disconnected from peer %u.%u.%u.%u:%d.\n", __func__,
+-				NIPQUAD(sin->sin_addr.s_addr), ntohs(sin->sin_port));
++			printk(KERN_INFO "%s: disconnected from peer %pi4:%d.\n", __func__,
++				&sin->sin_addr.s_addr, ntohs(sin->sin_port));
+ 		} else if (st->socket->ops->family == AF_INET6) {
+ 			struct sockaddr_in6 *sin = (struct sockaddr_in6 *)&st->ctl.addr;
+-			printk("%s: disconnected from peer "
+-				"%pi6:%d",
+-				__func__, &sin->sin6_addr, ntohs(sin->sin6_port));
++			printk(KERN_INFO "%s: disconnected from peer %pi6:%d", __func__,
++				&sin->sin6_addr, ntohs(sin->sin6_port));
+ 		}
+ 
+ 		sock_release(st->socket);
+--- a/drivers/staging/pohmelfs/netfs.h
++++ b/drivers/staging/pohmelfs/netfs.h
+@@ -25,6 +25,7 @@
+ #define POHMELFS_CTLINFO_ACK		1
+ #define POHMELFS_NOINFO_ACK		2
+ 
++#define POHMELFS_NULL_IDX		65535
+ 
+ /*
+  * Network command structure.
+@@ -87,6 +88,8 @@ enum {
+ 	POHMELFS_FLAGS_SHOW,    /* Network state control message for SHOW */
+ 	POHMELFS_FLAGS_CRYPTO,	/* Crypto data control message */
+ 	POHMELFS_FLAGS_MODIFY,	/* Network state modification message */
++	POHMELFS_FLAGS_DUMP,	/* Network state control message for SHOW ALL */
++	POHMELFS_FLAGS_FLUSH,	/* Network state control message for FLUSH */
+ };
+ 
+ /*
+@@ -905,6 +908,8 @@ static inline void pohmelfs_mcache_put(s
+ 		pohmelfs_mcache_free(psb, m);
+ }
+ 
++//#define POHMELFS_TRUNCATE_ON_INODE_FLUSH
++
+ #endif /* __KERNEL__*/
+ 
+ #endif /* __NETFS_H */
+--- a/drivers/staging/pohmelfs/trans.c
++++ b/drivers/staging/pohmelfs/trans.c
+@@ -468,7 +468,8 @@ int netfs_trans_finish_send(struct netfs
+ 				continue;
+ 		}
+ 
+-		if (psb->active_state && (psb->active_state->state.ctl.prio >= st->ctl.prio))
++		if (psb->active_state && (psb->active_state->state.ctl.prio >= st->ctl.prio) &&
++				(t->flags & NETFS_TRANS_SINGLE_DST))
+ 			st = &psb->active_state->state;
+ 
+ 		err = netfs_trans_push(t, st);
