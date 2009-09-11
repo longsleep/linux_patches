@@ -1,0 +1,185 @@
+From sarah.a.sharp@linux.intel.com  Fri Sep 11 15:58:35 2009
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Date: Fri, 4 Sep 2009 10:53:20 -0700
+Subject: USB: xhci: Support USB hubs.
+To: Greg KH <gregkh@suse.de>
+Cc: linux-usb@vger.kernel.org
+Message-ID: <20090904175320.GA5385@xanatos>
+Content-Disposition: inline
+
+
+For a USB hub to work under an xHCI host controller, the xHC's internal
+scheduler must be made aware of the hub's characteristics.  Add an xHCI
+hook that the USB core will call after it fetches the hub descriptor.
+This hook will add hub information to the slot context for that device,
+including whether it has multiple TTs or a single TT, the number of ports
+on the hub, and TT think time.
+
+Setting up the slot context for the device is different for 0.95 and 0.96
+xHCI host controllers.
+
+Some of the slot context reserved fields in the 0.95 specification were
+changed into hub fields in the 0.96 specification.  Don't set the TT think
+time or number of ports for a hub if we're dealing with a 0.95-compliant
+xHCI host controller.
+
+The 0.95 xHCI specification says that to modify the hub flag, we need to
+issue an evaluate context command.  The 0.96 specification says that flag
+can be set with a configure endpoint command.  Issue the correct command
+based on the version reported by the hardware.
+
+This patch does not add support for multi-TT hubs.  Multi-TT hubs expose
+a single TT on alt setting 0, and multi-TT on alt setting 1.  The xHCI
+driver can't handle setting alternate interfaces yet.
+
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+---
+ drivers/usb/host/xhci-hcd.c  |   82 +++++++++++++++++++++++++++++++++++++++++++
+ drivers/usb/host/xhci-pci.c  |    2 +
+ drivers/usb/host/xhci-ring.c |    3 +
+ drivers/usb/host/xhci.h      |    5 ++
+ 4 files changed, 92 insertions(+)
+
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -509,6 +509,8 @@ struct xhci_slot_ctx {
+ #define MAX_EXIT	(0xffff)
+ /* Root hub port number that is needed to access the USB device */
+ #define ROOT_HUB_PORT(p)	(((p) & 0xff) << 16)
++/* Maximum number of ports under a hub device */
++#define XHCI_MAX_PORTS(p)	(((p) & 0xff) << 24)
+ 
+ /* tt_info bitmasks */
+ /*
+@@ -522,6 +524,7 @@ struct xhci_slot_ctx {
+  * '0' if the device is not low or full speed.
+  */
+ #define TT_PORT		(0xff << 8)
++#define TT_THINK_TIME(p)	(((p) & 0x3) << 16)
+ 
+ /* dev_state bitmasks */
+ /* USB device address - assigned by the HC */
+@@ -1231,6 +1234,8 @@ irqreturn_t xhci_irq(struct usb_hcd *hcd
+ int xhci_alloc_dev(struct usb_hcd *hcd, struct usb_device *udev);
+ void xhci_free_dev(struct usb_hcd *hcd, struct usb_device *udev);
+ int xhci_address_device(struct usb_hcd *hcd, struct usb_device *udev);
++int xhci_update_hub_device(struct usb_hcd *hcd, struct usb_device *hdev,
++			struct usb_tt *tt, gfp_t mem_flags);
+ int xhci_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags);
+ int xhci_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status);
+ int xhci_add_endpoint(struct usb_hcd *hcd, struct usb_device *udev, struct usb_host_endpoint *ep);
+--- a/drivers/usb/host/xhci-hcd.c
++++ b/drivers/usb/host/xhci-hcd.c
+@@ -1594,6 +1594,88 @@ int xhci_address_device(struct usb_hcd *
+ 	return 0;
+ }
+ 
++/* Once a hub descriptor is fetched for a device, we need to update the xHC's
++ * internal data structures for the device.
++ */
++int xhci_update_hub_device(struct usb_hcd *hcd, struct usb_device *hdev,
++			struct usb_tt *tt, gfp_t mem_flags)
++{
++	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
++	struct xhci_virt_device *vdev;
++	struct xhci_command *config_cmd;
++	struct xhci_input_control_ctx *ctrl_ctx;
++	struct xhci_slot_ctx *slot_ctx;
++	unsigned long flags;
++	unsigned think_time;
++	int ret;
++
++	/* Ignore root hubs */
++	if (!hdev->parent)
++		return 0;
++
++	vdev = xhci->devs[hdev->slot_id];
++	if (!vdev) {
++		xhci_warn(xhci, "Cannot update hub desc for unknown device.\n");
++		return -EINVAL;
++	}
++	config_cmd = xhci_alloc_command(xhci, true, mem_flags);
++	if (!config_cmd) {
++		xhci_dbg(xhci, "Could not allocate xHCI command structure.\n");
++		return -ENOMEM;
++	}
++
++	spin_lock_irqsave(&xhci->lock, flags);
++	xhci_slot_copy(xhci, config_cmd->in_ctx, vdev->out_ctx);
++	ctrl_ctx = xhci_get_input_control_ctx(xhci, config_cmd->in_ctx);
++	ctrl_ctx->add_flags |= SLOT_FLAG;
++	slot_ctx = xhci_get_slot_ctx(xhci, config_cmd->in_ctx);
++	slot_ctx->dev_info |= DEV_HUB;
++	if (tt->multi)
++		slot_ctx->dev_info |= DEV_MTT;
++	if (xhci->hci_version > 0x95) {
++		xhci_dbg(xhci, "xHCI version %x needs hub "
++				"TT think time and number of ports\n",
++				(unsigned int) xhci->hci_version);
++		slot_ctx->dev_info2 |= XHCI_MAX_PORTS(hdev->maxchild);
++		/* Set TT think time - convert from ns to FS bit times.
++		 * 0 = 8 FS bit times, 1 = 16 FS bit times,
++		 * 2 = 24 FS bit times, 3 = 32 FS bit times.
++		 */
++		think_time = tt->think_time;
++		if (think_time != 0)
++			think_time = (think_time / 666) - 1;
++		slot_ctx->tt_info |= TT_THINK_TIME(think_time);
++	} else {
++		xhci_dbg(xhci, "xHCI version %x doesn't need hub "
++				"TT think time or number of ports\n",
++				(unsigned int) xhci->hci_version);
++	}
++	slot_ctx->dev_state = 0;
++	spin_unlock_irqrestore(&xhci->lock, flags);
++
++	xhci_dbg(xhci, "Set up %s for hub device.\n",
++			(xhci->hci_version > 0x95) ?
++			"configure endpoint" : "evaluate context");
++	xhci_dbg(xhci, "Slot %u Input Context:\n", hdev->slot_id);
++	xhci_dbg_ctx(xhci, config_cmd->in_ctx, 0);
++
++	/* Issue and wait for the configure endpoint or
++	 * evaluate context command.
++	 */
++	if (xhci->hci_version > 0x95)
++		ret = xhci_configure_endpoint(xhci, hdev, config_cmd,
++				false, false);
++	else
++		ret = xhci_configure_endpoint(xhci, hdev, config_cmd,
++				true, false);
++
++	xhci_dbg(xhci, "Slot %u Output Context:\n", hdev->slot_id);
++	xhci_dbg_ctx(xhci, vdev->out_ctx, 0);
++
++	xhci_free_command(xhci, config_cmd);
++	return ret;
++}
++
+ int xhci_get_frame(struct usb_hcd *hcd)
+ {
+ 	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
+--- a/drivers/usb/host/xhci-pci.c
++++ b/drivers/usb/host/xhci-pci.c
+@@ -63,6 +63,8 @@ static int xhci_pci_setup(struct usb_hcd
+ 	xhci->hcs_params1 = xhci_readl(xhci, &xhci->cap_regs->hcs_params1);
+ 	xhci->hcs_params2 = xhci_readl(xhci, &xhci->cap_regs->hcs_params2);
+ 	xhci->hcs_params3 = xhci_readl(xhci, &xhci->cap_regs->hcs_params3);
++	xhci->hcc_params = xhci_readl(xhci, &xhci->cap_regs->hc_capbase);
++	xhci->hci_version = HC_VERSION(xhci->hcc_params);
+ 	xhci->hcc_params = xhci_readl(xhci, &xhci->cap_regs->hcc_params);
+ 	xhci_print_registers(xhci);
+ 
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -789,6 +789,9 @@ static void handle_cmd_completion(struct
+ 		}
+ 		break;
+ 	case TRB_TYPE(TRB_EVAL_CONTEXT):
++		virt_dev = xhci->devs[slot_id];
++		if (handle_cmd_in_cmd_wait_list(xhci, virt_dev, event))
++			break;
+ 		xhci->devs[slot_id]->cmd_status = GET_COMP_CODE(event->status);
+ 		complete(&xhci->devs[slot_id]->cmd_completion);
+ 		break;
