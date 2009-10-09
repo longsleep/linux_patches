@@ -1,0 +1,47 @@
+From sarah.a.sharp@linux.intel.com  Fri Oct  9 10:38:51 2009
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Date: Wed, 16 Sep 2009 16:42:39 -0700
+Subject: USB: xhci: Don't wait for a disable slot cmd when HC dies.
+To: Greg KH <gregkh@suse.de>
+Cc: linux-usb@vger.kernel.org
+Message-ID: <20090916234239.GA16810@xanatos>
+Content-Disposition: inline
+
+
+When the host controller dies or is removed while a device is plugged in,
+the USB core will attempt to deallocate the struct usb_device.  That will
+call into xhci_free_dev().  This function used to attempt to submit a
+disable slot command to the host controller and clean up the device
+structures when that command returned.  Change xhci_free_dev() to skip the
+command submission and just free the memory if the host controller died.
+
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/xhci-hcd.c |    9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+--- a/drivers/usb/host/xhci-hcd.c
++++ b/drivers/usb/host/xhci-hcd.c
+@@ -1428,11 +1428,20 @@ void xhci_free_dev(struct usb_hcd *hcd, 
+ {
+ 	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
+ 	unsigned long flags;
++	u32 state;
+ 
+ 	if (udev->slot_id == 0)
+ 		return;
+ 
+ 	spin_lock_irqsave(&xhci->lock, flags);
++	/* Don't disable the slot if the host controller is dead. */
++	state = xhci_readl(xhci, &xhci->op_regs->status);
++	if (state == 0xffffffff) {
++		xhci_free_virt_device(xhci, udev->slot_id);
++		spin_unlock_irqrestore(&xhci->lock, flags);
++		return;
++	}
++
+ 	if (xhci_queue_slot_control(xhci, TRB_DISABLE_SLOT, udev->slot_id)) {
+ 		spin_unlock_irqrestore(&xhci->lock, flags);
+ 		xhci_dbg(xhci, "FIXME: allocate a command ring segment\n");
