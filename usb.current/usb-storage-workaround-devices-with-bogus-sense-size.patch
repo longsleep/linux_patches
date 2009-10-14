@@ -1,0 +1,66 @@
+From benh@kernel.crashing.org  Wed Oct 14 10:17:59 2009
+From: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Date: Tue, 13 Oct 2009 15:53:47 +1100
+Subject: usb-storage: Workaround devices with bogus sense size
+To: Alan Stern <stern@rowland.harvard.edu>
+Cc: Ben Efros <ben@pc-doctor.com>, Josua Dietze <digidietze@draisberghof.de>, fangxiaozhi <huananhu@huawei.com>, Greg KH <greg@kroah.com>, Hugh Blemings <hugh@blemings.org>
+Message-ID: <1255409627.2192.172.camel@pasglop>
+
+
+usb-storage: Workaround devices with bogus sense size
+
+Some devices, such as Huawei E169, advertise more than the standard
+amount of sense data, causing us to set US_FL_SANE_SENSE, assuming
+they support it. However, they subsequently fail the request sense
+with that size.
+
+This works around it generically. When a sense request fails due to
+a device returning an error, US_FL_SANE_SENSE was set, and that sense
+request used a larger sense size, we retry with a smaller size before
+giving up.
+
+Based on an original patch by Ben Efros <ben@pc-doctor.com>
+
+Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Acked-by: Alan Stern <stern@rowland.harvard.edu>
+Cc: stable <stable@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ drivers/usb/storage/transport.c |   17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+--- a/drivers/usb/storage/transport.c
++++ b/drivers/usb/storage/transport.c
+@@ -696,7 +696,7 @@ void usb_stor_invoke_transport(struct sc
+ 		/* device supports and needs bigger sense buffer */
+ 		if (us->fflags & US_FL_SANE_SENSE)
+ 			sense_size = ~0;
+-
++Retry_Sense:
+ 		US_DEBUGP("Issuing auto-REQUEST_SENSE\n");
+ 
+ 		scsi_eh_prep_cmnd(srb, &ses, NULL, 0, sense_size);
+@@ -720,6 +720,21 @@ void usb_stor_invoke_transport(struct sc
+ 			srb->result = DID_ABORT << 16;
+ 			goto Handle_Errors;
+ 		}
++
++		/* Some devices claim to support larger sense but fail when
++		 * trying to request it. When a transport failure happens
++		 * using US_FS_SANE_SENSE, we always retry with a standard
++		 * (small) sense request. This fixes some USB GSM modems
++		 */
++		if (temp_result == USB_STOR_TRANSPORT_FAILED &&
++		    (us->fflags & US_FL_SANE_SENSE) &&
++		    sense_size != US_SENSE_SIZE) {
++			US_DEBUGP("-- auto-sense failure, retry small sense\n");
++			sense_size = US_SENSE_SIZE;
++			goto Retry_Sense;
++		}
++
++		/* Other failures */
+ 		if (temp_result != USB_STOR_TRANSPORT_GOOD) {
+ 			US_DEBUGP("-- auto-sense failure\n");
+ 
