@@ -1,0 +1,215 @@
+From shawn.bohrer@gmail.com  Mon Oct 19 14:40:17 2009
+From: Shawn Bohrer <shawn.bohrer@gmail.com>
+Date: Sun, 18 Oct 2009 15:32:16 -0500
+Subject: Staging: comedi: remove check for HAVE_COMPAT_IOCTL
+To: Greg Kroah-Hartman <gregkh@suse.de>
+Cc: devel@driverdev.osuosl.org, Shawn Bohrer <shawn.bohrer@gmail.com>
+Message-ID: <1255897939-9247-2-git-send-email-shawn.bohrer@gmail.com>
+
+
+All new kernels have support for compat_ioctl so remove the check and support
+for older kernels.
+
+Signed-off-by: Shawn Bohrer <shawn.bohrer@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/staging/comedi/comedi_compat32.c |  108 -------------------------------
+ drivers/staging/comedi/comedi_compat32.h |   16 ----
+ drivers/staging/comedi/comedi_fops.c     |    6 -
+ 3 files changed, 130 deletions(-)
+
+--- a/drivers/staging/comedi/comedi_compat32.c
++++ b/drivers/staging/comedi/comedi_compat32.c
+@@ -33,10 +33,6 @@
+ 
+ #ifdef CONFIG_COMPAT
+ 
+-#ifndef HAVE_COMPAT_IOCTL
+-#include <linux/ioctl32.h>	/* for (un)register_ioctl32_conversion */
+-#endif
+-
+ #define COMEDI32_CHANINFO _IOR(CIO, 3, struct comedi32_chaninfo_struct)
+ #define COMEDI32_RANGEINFO _IOR(CIO, 8, struct comedi32_rangeinfo_struct)
+ /* N.B. COMEDI32_CMD and COMEDI_CMD ought to use _IOWR, not _IOR.
+@@ -462,8 +458,6 @@ static inline int raw_ioctl(struct file
+ 	return rc;
+ }
+ 
+-#ifdef HAVE_COMPAT_IOCTL	/* defined in <linux/fs.h> 2.6.11 onwards */
+-
+ /* compat_ioctl file operation. */
+ /* Returns -ENOIOCTLCMD for unrecognised ioctl codes. */
+ long comedi_compat_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+@@ -471,106 +465,4 @@ long comedi_compat_ioctl(struct file *fi
+ 	return raw_ioctl(file, cmd, arg);
+ }
+ 
+-#else /* HAVE_COMPAT_IOCTL */
+-
+-/*
+- * Brain-dead ioctl compatibility for 2.6.10 and earlier.
+- *
+- * It's brain-dead because cmd numbers need to be unique system-wide!
+- * The comedi driver could end up attempting to execute ioctls for non-Comedi
+- * devices because it registered the system-wide cmd code first.  Similarly,
+- * another driver could end up attempting to execute ioctls for a Comedi
+- * device because it registered the cmd code first.  Chaos ensues.
+- */
+-
+-/* Handler for all 32-bit ioctl codes registered by this driver. */
+-static int mapped_ioctl(unsigned int fd, unsigned int cmd, unsigned long arg,
+-			struct file *file)
+-{
+-	int rc;
+-
+-	/* Make sure we are dealing with a Comedi device. */
+-	if (imajor(file->f_dentry->d_inode) != COMEDI_MAJOR)
+-		return -ENOTTY;
+-
+-	rc = raw_ioctl(file, cmd, arg);
+-	/* Do not return -ENOIOCTLCMD. */
+-	if (rc == -ENOIOCTLCMD)
+-		rc = -ENOTTY;
+-
+-	return rc;
+-}
+-
+-struct ioctl32_map {
+-	unsigned int cmd;
+-	int (*handler) (unsigned int, unsigned int, unsigned long,
+-			struct file *);
+-	int registered;
+-};
+-
+-static struct ioctl32_map comedi_ioctl32_map[] = {
+-	{COMEDI_DEVCONFIG, mapped_ioctl, 0},
+-	{COMEDI_DEVINFO, mapped_ioctl, 0},
+-	{COMEDI_SUBDINFO, mapped_ioctl, 0},
+-	{COMEDI_BUFCONFIG, mapped_ioctl, 0},
+-	{COMEDI_BUFINFO, mapped_ioctl, 0},
+-	{COMEDI_LOCK, mapped_ioctl, 0},
+-	{COMEDI_UNLOCK, mapped_ioctl, 0},
+-	{COMEDI_CANCEL, mapped_ioctl, 0},
+-	{COMEDI_POLL, mapped_ioctl, 0},
+-	{COMEDI32_CHANINFO, mapped_ioctl, 0},
+-	{COMEDI32_RANGEINFO, mapped_ioctl, 0},
+-	{COMEDI32_CMD, mapped_ioctl, 0},
+-	{COMEDI32_CMDTEST, mapped_ioctl, 0},
+-	{COMEDI32_INSNLIST, mapped_ioctl, 0},
+-	{COMEDI32_INSN, mapped_ioctl, 0},
+-};
+-
+-#define NUM_IOCTL32_MAPS ARRAY_SIZE(comedi_ioctl32_map)
+-
+-/* Register system-wide 32-bit ioctl handlers. */
+-void comedi_register_ioctl32(void)
+-{
+-	int n, rc;
+-
+-	for (n = 0; n < NUM_IOCTL32_MAPS; n++) {
+-		rc = register_ioctl32_conversion(comedi_ioctl32_map[n].cmd,
+-						 comedi_ioctl32_map[n].handler);
+-		if (rc) {
+-			printk(KERN_WARNING
+-			       "comedi: failed to register 32-bit "
+-			       "compatible ioctl handler for 0x%X - "
+-			       "expect bad things to happen!\n",
+-			       comedi_ioctl32_map[n].cmd);
+-		}
+-		comedi_ioctl32_map[n].registered = !rc;
+-	}
+-}
+-
+-/* Unregister system-wide 32-bit ioctl translations. */
+-void comedi_unregister_ioctl32(void)
+-{
+-	int n, rc;
+-
+-	for (n = 0; n < NUM_IOCTL32_MAPS; n++) {
+-		if (comedi_ioctl32_map[n].registered) {
+-			rc = unregister_ioctl32_conversion(comedi_ioctl32_map
+-							   [n].cmd,
+-							   comedi_ioctl32_map
+-							   [n].handler);
+-			if (rc) {
+-				printk(KERN_ERR
+-				       "comedi: failed to unregister 32-bit "
+-				       "compatible ioctl handler for 0x%X - "
+-				       "expect kernel Oops!\n",
+-				       comedi_ioctl32_map[n].cmd);
+-			} else {
+-				comedi_ioctl32_map[n].registered = 0;
+-			}
+-		}
+-	}
+-}
+-
+-#endif /* HAVE_COMPAT_IOCTL */
+-
+ #endif /* CONFIG_COMPAT */
+--- a/drivers/staging/comedi/comedi_compat32.h
++++ b/drivers/staging/comedi/comedi_compat32.h
+@@ -28,32 +28,16 @@
+ #define _COMEDI_COMPAT32_H
+ 
+ #include <linux/compat.h>
+-
+-/* For HAVE_COMPAT_IOCTL and HAVE_UNLOCKED_IOCTL */
+ #include <linux/fs.h>
+ 
+ #ifdef CONFIG_COMPAT
+ 
+-#ifdef HAVE_COMPAT_IOCTL
+-
+ extern long comedi_compat_ioctl(struct file *file, unsigned int cmd,
+ 				unsigned long arg);
+-#define comedi_register_ioctl32() do {} while (0)
+-#define comedi_unregister_ioctl32() do {} while (0)
+-
+-#else /* HAVE_COMPAT_IOCTL */
+-
+-#define comedi_compat_ioctl 0	/* NULL */
+-extern void comedi_register_ioctl32(void);
+-extern void comedi_unregister_ioctl32(void);
+-
+-#endif /* HAVE_COMPAT_IOCTL */
+ 
+ #else /* CONFIG_COMPAT */
+ 
+ #define comedi_compat_ioctl 0	/* NULL */
+-#define comedi_register_ioctl32() do {} while (0)
+-#define comedi_unregister_ioctl32() do {} while (0)
+ 
+ #endif /* CONFIG_COMPAT */
+ 
+--- a/drivers/staging/comedi/comedi_fops.c
++++ b/drivers/staging/comedi/comedi_fops.c
+@@ -1863,9 +1863,7 @@ static int comedi_fasync(int fd, struct
+ const struct file_operations comedi_fops = {
+ 	.owner = THIS_MODULE,
+ 	.unlocked_ioctl = comedi_unlocked_ioctl,
+-#ifdef HAVE_COMPAT_IOCTL
+ 	.compat_ioctl = comedi_compat_ioctl,
+-#endif
+ 	.open = comedi_open,
+ 	.release = comedi_close,
+ 	.read = comedi_read,
+@@ -1950,8 +1948,6 @@ static int __init comedi_init(void)
+ 		}
+ 	}
+ 
+-	comedi_register_ioctl32();
+-
+ 	return 0;
+ }
+ 
+@@ -1968,8 +1964,6 @@ static void __exit comedi_cleanup(void)
+ 	unregister_chrdev_region(MKDEV(COMEDI_MAJOR, 0), COMEDI_NUM_MINORS);
+ 
+ 	comedi_proc_cleanup();
+-
+-	comedi_unregister_ioctl32();
+ }
+ 
+ module_init(comedi_init);
