@@ -1,0 +1,97 @@
+From dmitry.torokhov@gmail.com  Mon Oct 26 16:01:05 2009
+From: Dmitry Torokhov <dmitry.torokhov@gmail.com>
+Date: Mon, 12 Oct 2009 20:17:41 -0700
+Subject: Driver core: allow certain drivers prohibit bind/unbind via sysfs
+To: Greg KH <gregkh@suse.de>
+Cc: Éric Piel <eric.piel@tremplin-utc.net>
+Message-ID: <20091013031741.GB2887@core.coreip.homeip.net>
+Content-Disposition: inline
+
+
+From: Dmitry Torokhov <dmitry.torokhov@gmail.com>
+
+Platform drivers registered via platform_driver_probe() can be bound
+to devices only once, upon registration, because discard their probe()
+routines to save memory. Unbinding the driver through sysfs 'unbind'
+leaves the device stranded and confuses users so let's not create
+bind and unbind attributes for such drivers.
+
+Signed-off-by: Dmitry Torokhov <dtor@mail.ru>
+Cc: Éric Piel <eric.piel@tremplin-utc.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/base/bus.c      |   17 +++++++++++------
+ drivers/base/platform.c |    6 +++++-
+ include/linux/device.h  |    4 +++-
+ 3 files changed, 19 insertions(+), 8 deletions(-)
+
+--- a/drivers/base/bus.c
++++ b/drivers/base/bus.c
+@@ -689,15 +689,19 @@ int bus_add_driver(struct device_driver 
+ 		printk(KERN_ERR "%s: driver_add_attrs(%s) failed\n",
+ 			__func__, drv->name);
+ 	}
+-	error = add_bind_files(drv);
+-	if (error) {
+-		/* Ditto */
+-		printk(KERN_ERR "%s: add_bind_files(%s) failed\n",
+-			__func__, drv->name);
++
++	if (!drv->suppress_bind_attrs) {
++		error = add_bind_files(drv);
++		if (error) {
++			/* Ditto */
++			printk(KERN_ERR "%s: add_bind_files(%s) failed\n",
++				__func__, drv->name);
++		}
+ 	}
+ 
+ 	kobject_uevent(&priv->kobj, KOBJ_ADD);
+ 	return 0;
++
+ out_unregister:
+ 	kfree(drv->p);
+ 	drv->p = NULL;
+@@ -720,7 +724,8 @@ void bus_remove_driver(struct device_dri
+ 	if (!drv->bus)
+ 		return;
+ 
+-	remove_bind_files(drv);
++	if (!drv->suppress_bind_attrs)
++		remove_bind_files(drv);
+ 	driver_remove_attrs(drv->bus, drv);
+ 	driver_remove_file(drv, &driver_attr_uevent);
+ 	klist_remove(&drv->p->knode_bus);
+--- a/drivers/base/platform.c
++++ b/drivers/base/platform.c
+@@ -521,11 +521,15 @@ int __init_or_module platform_driver_pro
+ {
+ 	int retval, code;
+ 
++	/* make sure driver won't have bind/unbind attributes */
++	drv->driver.suppress_bind_attrs = true;
++
+ 	/* temporary section violation during probe() */
+ 	drv->probe = probe;
+ 	retval = code = platform_driver_register(drv);
+ 
+-	/* Fixup that section violation, being paranoid about code scanning
++	/*
++	 * Fixup that section violation, being paranoid about code scanning
+ 	 * the list of drivers in order to probe new devices.  Check to see
+ 	 * if the probe was successful, and make sure any forced probes of
+ 	 * new devices fail.
+--- a/include/linux/device.h
++++ b/include/linux/device.h
+@@ -124,7 +124,9 @@ struct device_driver {
+ 	struct bus_type		*bus;
+ 
+ 	struct module		*owner;
+-	const char 		*mod_name;	/* used for built-in modules */
++	const char		*mod_name;	/* used for built-in modules */
++
++	bool suppress_bind_attrs;	/* disables bind/unbind via sysfs */
+ 
+ 	int (*probe) (struct device *dev);
+ 	int (*remove) (struct device *dev);
