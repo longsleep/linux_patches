@@ -1,0 +1,122 @@
+From sarah.a.sharp@linux.intel.com  Tue Oct 27 11:20:27 2009
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Date: Tue, 27 Oct 2009 10:56:33 -0700
+Subject: USB: xhci: Re-purpose xhci_quiesce().
+To: Greg KH <gregkh@suse.de>
+Cc: linux-usb@vger.kernel.org, Alan Stern <stern@rowland.harvard.edu>, David Vrabel <david.vrabel@csr.com>, Oliver Neukum <oliver@neukum.org>
+Message-ID: <20091027175632.GB1583@xanatos>
+Content-Disposition: inline
+
+
+xhci_quiesce() is basically a no-op right now.  It's only called if
+HC_IS_RUNNING() is true, and the body of the function consists of a
+BUG_ON if HC_IS_RUNNING() is false.  For the new xHCI watchdog timer, we
+need a new function that clears the xHCI running bit in the command
+register, but doesn't wait for the halt status to show up in the status
+register.  Re-purpose xhci_quiesce() to do that.
+
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/xhci-hcd.c |   51 ++++++++++++++------------------------------
+ drivers/usb/host/xhci.h     |    1 
+ 2 files changed, 18 insertions(+), 34 deletions(-)
+
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -1223,6 +1223,7 @@ void xhci_unregister_pci(void);
+ #endif
+ 
+ /* xHCI host controller glue */
++void xhci_quiesce(struct xhci_hcd *xhci);
+ int xhci_halt(struct xhci_hcd *xhci);
+ int xhci_reset(struct xhci_hcd *xhci);
+ int xhci_init(struct usb_hcd *hcd);
+--- a/drivers/usb/host/xhci-hcd.c
++++ b/drivers/usb/host/xhci-hcd.c
+@@ -67,22 +67,14 @@ static int handshake(struct xhci_hcd *xh
+ }
+ 
+ /*
+- * Force HC into halt state.
+- *
+- * Disable any IRQs and clear the run/stop bit.
+- * HC will complete any current and actively pipelined transactions, and
+- * should halt within 16 microframes of the run/stop bit being cleared.
+- * Read HC Halted bit in the status register to see when the HC is finished.
+- * XXX: shouldn't we set HC_STATE_HALT here somewhere?
++ * Disable interrupts and begin the xHCI halting process.
+  */
+-int xhci_halt(struct xhci_hcd *xhci)
++void xhci_quiesce(struct xhci_hcd *xhci)
+ {
+ 	u32 halted;
+ 	u32 cmd;
+ 	u32 mask;
+ 
+-	xhci_dbg(xhci, "// Halt the HC\n");
+-	/* Disable all interrupts from the host controller */
+ 	mask = ~(XHCI_IRQS);
+ 	halted = xhci_readl(xhci, &xhci->op_regs->status) & STS_HALT;
+ 	if (!halted)
+@@ -91,6 +83,21 @@ int xhci_halt(struct xhci_hcd *xhci)
+ 	cmd = xhci_readl(xhci, &xhci->op_regs->command);
+ 	cmd &= mask;
+ 	xhci_writel(xhci, cmd, &xhci->op_regs->command);
++}
++
++/*
++ * Force HC into halt state.
++ *
++ * Disable any IRQs and clear the run/stop bit.
++ * HC will complete any current and actively pipelined transactions, and
++ * should halt within 16 microframes of the run/stop bit being cleared.
++ * Read HC Halted bit in the status register to see when the HC is finished.
++ * XXX: shouldn't we set HC_STATE_HALT here somewhere?
++ */
++int xhci_halt(struct xhci_hcd *xhci)
++{
++	xhci_dbg(xhci, "// Halt the HC\n");
++	xhci_quiesce(xhci);
+ 
+ 	return handshake(xhci, &xhci->op_regs->status,
+ 			STS_HALT, STS_HALT, XHCI_MAX_HALT_USEC);
+@@ -124,28 +131,6 @@ int xhci_reset(struct xhci_hcd *xhci)
+ 	return handshake(xhci, &xhci->op_regs->command, CMD_RESET, 0, 250 * 1000);
+ }
+ 
+-/*
+- * Stop the HC from processing the endpoint queues.
+- */
+-static void xhci_quiesce(struct xhci_hcd *xhci)
+-{
+-	/*
+-	 * Queues are per endpoint, so we need to disable an endpoint or slot.
+-	 *
+-	 * To disable a slot, we need to insert a disable slot command on the
+-	 * command ring and ring the doorbell.  This will also free any internal
+-	 * resources associated with the slot (which might not be what we want).
+-	 *
+-	 * A Release Endpoint command sounds better - doesn't free internal HC
+-	 * memory, but removes the endpoints from the schedule and releases the
+-	 * bandwidth, disables the doorbells, and clears the endpoint enable
+-	 * flag.  Usually used prior to a set interface command.
+-	 *
+-	 * TODO: Implement after command ring code is done.
+-	 */
+-	BUG_ON(!HC_IS_RUNNING(xhci_to_hcd(xhci)->state));
+-	xhci_dbg(xhci, "Finished quiescing -- code not written yet\n");
+-}
+ 
+ #if 0
+ /* Set up MSI-X table for entry 0 (may claim other entries later) */
+@@ -490,8 +475,6 @@ void xhci_stop(struct usb_hcd *hcd)
+ 	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
+ 
+ 	spin_lock_irq(&xhci->lock);
+-	if (HC_IS_RUNNING(hcd->state))
+-		xhci_quiesce(xhci);
+ 	xhci_halt(xhci);
+ 	xhci_reset(xhci);
+ 	spin_unlock_irq(&xhci->lock);
