@@ -1,0 +1,85 @@
+From epasheva@sierrawireless.com  Wed Oct 28 09:42:05 2009
+From: Elina Pasheva <epasheva@sierrawireless.com>
+Date: Tue, 27 Oct 2009 13:49:59 -0700
+Subject: USB: serial: sierra driver autopm fixes
+To: <gregkh@suse.de>
+Cc: <rfiler@sierrawireless.com>, <epasheva@sierrawireless.com>
+Message-ID: <1256676599.4530.2.camel@Linuxdev4-laptop>
+
+
+From: Elina Pasheva <epasheva@sierrawireless.com>
+
+This patch presents fixes for the autosuspend feature implementation in
+sierra usb serial driver in  functions sierra_open(), sierra_close() and
+stop_read_write_urbs().
+
+The patch "sierra_close() must resume the device before it notifies it
+of a closure" submitted by Oliver Neukum on Wed, October 14 has been
+merged as fix in sierra_close() function.
+
+The bug fix  in sierra_open() function restores the autopm interface
+state on error condition.
+
+The bug fix in in stop_read_write_urbs() function assures that both
+receive and interrupt urbs are recycled.
+
+Signed-off-by: Elina Pasheva <epasheva@sierrawireless.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ drivers/usb/serial/sierra.c |   14 ++++++++------
+ 1 file changed, 8 insertions(+), 6 deletions(-)
+
+--- a/drivers/usb/serial/sierra.c
++++ b/drivers/usb/serial/sierra.c
+@@ -777,8 +777,11 @@ static void sierra_close(struct usb_seri
+ 
+ 	if (serial->dev) {
+ 		mutex_lock(&serial->disc_mutex);
+-		if (!serial->disconnected)
++		if (!serial->disconnected) {
++			serial->interface->needs_remote_wakeup = 0;
++			usb_autopm_get_interface(serial->interface);
+ 			sierra_send_setup(port);
++		}
+ 		mutex_unlock(&serial->disc_mutex);
+ 		spin_lock_irq(&intfdata->susp_lock);
+ 		portdata->opened = 0;
+@@ -792,8 +795,6 @@ static void sierra_close(struct usb_seri
+ 			sierra_release_urb(portdata->in_urbs[i]);
+ 			portdata->in_urbs[i] = NULL;
+ 		}
+-		usb_autopm_get_interface(serial->interface);
+-		serial->interface->needs_remote_wakeup = 0;
+ 	}
+ }
+ 
+@@ -831,6 +832,8 @@ static int sierra_open(struct tty_struct
+ 	if (err) {
+ 		/* get rid of everything as in close */
+ 		sierra_close(port);
++		/* restore balance for autopm */
++		usb_autopm_put_interface(serial->interface);
+ 		return err;
+ 	}
+ 	sierra_send_setup(port);
+@@ -919,7 +922,7 @@ static void sierra_release(struct usb_se
+ #ifdef CONFIG_PM
+ static void stop_read_write_urbs(struct usb_serial *serial)
+ {
+-	int i, j;
++	int i;
+ 	struct usb_serial_port *port;
+ 	struct sierra_port_private *portdata;
+ 
+@@ -927,8 +930,7 @@ static void stop_read_write_urbs(struct 
+ 	for (i = 0; i < serial->num_ports; ++i) {
+ 		port = serial->port[i];
+ 		portdata = usb_get_serial_port_data(port);
+-		for (j = 0; j < N_IN_URB; j++)
+-			usb_kill_urb(portdata->in_urbs[j]);
++		sierra_stop_rx_urbs(port);
+ 		usb_kill_anchored_urbs(&portdata->active);
+ 	}
+ }

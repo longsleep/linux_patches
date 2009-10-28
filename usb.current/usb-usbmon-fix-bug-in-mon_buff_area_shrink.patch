@@ -1,0 +1,62 @@
+From stern@rowland.harvard.edu  Wed Oct 28 09:41:39 2009
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Tue, 27 Oct 2009 15:29:15 -0400 (EDT)
+Subject: USB: usbmon: fix bug in mon_buff_area_shrink
+To: Greg KH <greg@kroah.com>
+Cc: Pete Zaitcev <zaitcev@redhat.com>
+Message-ID: <Pine.LNX.4.44L0.0910271526530.2687-100000@iolanthe.rowland.org>
+
+
+This patch (as1299) fixes a bug in an error-handling path of usbmon's
+binary interface.  The storage area for URB data is divided into
+fixed-size blocks.  If an URB's data can't be copied, the area
+reserved for it should be decreased to the size of the truncated
+information (rounded up to a block boundary).  Rounding up the amount
+to be removed and subtracting it from the reserved size is definitely
+the wrong thing to do.
+
+Also, when the data for an isochronous URB can't be copied, we can
+still copy the isoc packet descriptors.  In fact the current code does
+copy the descriptors, but then sets the capture length to 0 so they
+become inaccessible.  The capture length should be reduced to the
+length of the descriptors, not set to 0.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+CC: Pete Zaitcev <zaitcev@redhat.com>
+Cc: stable <stable@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/mon/mon_bin.c |   12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+--- a/drivers/usb/mon/mon_bin.c
++++ b/drivers/usb/mon/mon_bin.c
+@@ -350,10 +350,13 @@ static unsigned int mon_buff_area_alloc_
+  * Return a few (kilo-)bytes to the head of the buffer.
+  * This is used if a DMA fetch fails.
+  */
+-static void mon_buff_area_shrink(struct mon_reader_bin *rp, unsigned int size)
++static void mon_buff_area_shrink(struct mon_reader_bin *rp, unsigned int num,
++		unsigned int oldsize)
+ {
++	unsigned int size;
+ 
+-	size = (size + PKT_ALIGN-1) & ~(PKT_ALIGN-1);
++	size = ((oldsize + PKT_ALIGN-1) & ~(PKT_ALIGN-1)) -
++			((oldsize - num + PKT_ALIGN-1) & ~(PKT_ALIGN-1));
+ 	rp->b_cnt -= size;
+ 	if (rp->b_in < size)
+ 		rp->b_in += rp->b_size;
+@@ -537,8 +540,9 @@ static void mon_bin_event(struct mon_rea
+ 	if (length != 0) {
+ 		ep->flag_data = mon_bin_get_data(rp, offset, urb, length);
+ 		if (ep->flag_data != 0) {	/* Yes, it's 0x00, not '0' */
+-			ep->len_cap = 0;
+-			mon_buff_area_shrink(rp, length);
++			ep->len_cap = lendesc;
++			mon_buff_area_shrink(rp, length,
++					length + PKT_SIZE + lendesc);
+ 		}
+ 	} else {
+ 		ep->flag_data = data_tag;
