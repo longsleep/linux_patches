@@ -1,0 +1,511 @@
+From m.nazarewicz@samsung.com  Fri Nov  6 14:43:21 2009
+From: Michal Nazarewicz <m.nazarewicz@samsung.com>
+Date: Wed, 28 Oct 2009 16:57:22 +0100
+Subject: USB: g_mass_storage: fsg_common_init() created
+To: Greg KH <greg@kroah.com>
+Cc: Michal Nazarewicz <m.nazarewicz@samsung.com>
+Message-ID: <7125966df6e9d532ef4dcaf148e69a310f793824.1256745228.git.m.nazarewicz@samsung.com>
+
+
+Moved code initialising fsg_common structure to fsg_common_init()
+function which is called from fsg_bind().  Moreover, changed
+reference counting mechanism: fsg_common has a reference counter
+which counts how many fsg_dev structures uses it.  When this
+reaches zero fsg_common_release() is run which unregisters
+LUN devices and frees memory.
+
+fsg_common_init() takes pointer to fsg_common structure as an
+argument.  If it is NULL function allocates storage otherwise
+uses pointed to memory (handy if fsg_common is a field of another
+structure or a static variable).
+
+fsg_common_release() will free storage only if
+free_storage_on_release is set -- it is initialised by
+fsg_common_init(): set if allocation was done, unset
+otherwise (one may overwrite it of course).
+
+Signed-off-by: Michal Nazarewicz <m.nazarewicz@samsung.com>
+Cc: David Brownell <dbrownell@users.sourceforge.net>
+Cc: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+---
+ drivers/usb/gadget/f_mass_storage.c |  361 +++++++++++++++++++-----------------
+ 1 file changed, 199 insertions(+), 162 deletions(-)
+
+--- a/drivers/usb/gadget/f_mass_storage.c
++++ b/drivers/usb/gadget/f_mass_storage.c
+@@ -323,6 +323,8 @@ MODULE_PARM_DESC(cdrom, "true to emulate
+ 
+ /* Data shared by all the FSG instances. */
+ struct fsg_common {
++	struct usb_gadget	*gadget;
++
+ 	/* filesem protects: backing files in use */
+ 	struct rw_semaphore	filesem;
+ 
+@@ -337,6 +339,10 @@ struct fsg_common {
+ 	unsigned int		lun;
+ 	struct fsg_lun		*luns;
+ 	struct fsg_lun		*curlun;
++
++	unsigned int		free_storage_on_release:1;
++
++	struct kref		ref;
+ };
+ 
+ 
+@@ -347,9 +353,6 @@ struct fsg_dev {
+ 	spinlock_t		lock;
+ 	struct usb_gadget	*gadget;
+ 
+-	/* reference counting: wait until all LUNs are released */
+-	struct kref		ref;
+-
+ 	struct usb_ep		*ep0;		// Handy copy of gadget->ep0
+ 	struct usb_request	*ep0req;	// For control responses
+ 	unsigned int		ep0_req_tag;
+@@ -2757,7 +2760,7 @@ static int fsg_main_thread(void *fsg_)
+ }
+ 
+ 
+-/*-------------------------------------------------------------------------*/
++/*************************** DEVICE ATTRIBUTES ***************************/
+ 
+ 
+ /* The write permissions and store_xxx pointers are set in fsg_bind() */
+@@ -2765,92 +2768,214 @@ static DEVICE_ATTR(ro, 0444, fsg_show_ro
+ static DEVICE_ATTR(file, 0444, fsg_show_file, NULL);
+ 
+ 
+-/*-------------------------------------------------------------------------*/
++/****************************** FSG COMMON ******************************/
++
++static void fsg_common_release(struct kref *ref);
+ 
+-static void fsg_release(struct fsg_dev *fsg)
++static void fsg_lun_release(struct device *dev)
+ {
+-	kfree(fsg->common->luns);
+-	kfree(fsg);
++	/* Nothing needs to be done */
+ }
+ 
+-static void lun_release(struct device *dev)
++static inline void fsg_common_get(struct fsg_common *common)
+ {
++	kref_get(&common->ref);
+ }
+ 
+-static void /* __init_or_exit */ fsg_unbind(struct usb_gadget *gadget)
++static inline void fsg_common_put(struct fsg_common *common)
+ {
+-	struct fsg_dev		*fsg = get_gadget_data(gadget);
+-	int			i;
+-	struct fsg_lun		*curlun;
+-	struct usb_request	*req = fsg->ep0req;
++	kref_put(&common->ref, fsg_common_release);
++}
+ 
+-	DBG(fsg, "unbind\n");
+-	clear_bit(REGISTERED, &fsg->atomic_bitflags);
+ 
+-	/* Unregister the sysfs attribute files and the LUNs */
+-	for (i = 0; i < fsg->common->nluns; ++i) {
+-		curlun = &fsg->common->luns[i];
+-		if (curlun->registered) {
+-			device_remove_file(&curlun->dev, &dev_attr_ro);
+-			device_remove_file(&curlun->dev, &dev_attr_file);
+-			fsg_lun_close(curlun);
+-			device_unregister(&curlun->dev);
+-			curlun->registered = 0;
+-		}
+-	}
++static struct fsg_common *fsg_common_init(struct fsg_common *common,
++					  struct usb_gadget *gadget)
++{
++	struct fsg_buffhd *bh;
++	struct fsg_lun *curlun;
++	int nluns, i, rc;
+ 
+-	/* If the thread isn't already dead, tell it to exit now */
+-	if (fsg->state != FSG_STATE_TERMINATED) {
+-		raise_exception(fsg, FSG_STATE_EXIT);
+-		wait_for_completion(&fsg->thread_notifier);
++	/* Find out how many LUNs there should be */
++	nluns = mod_data.nluns;
++	if (nluns == 0)
++		nluns = max(mod_data.num_filenames, 1u);
++	if (nluns < 1 || nluns > FSG_MAX_LUNS) {
++		dev_err(&gadget->dev, "invalid number of LUNs: %u\n", nluns);
++		return ERR_PTR(-EINVAL);
++	}
+ 
+-		/* The cleanup routine waits for this completion also */
+-		complete(&fsg->thread_notifier);
++	/* Allocate? */
++	if (!common) {
++		common = kzalloc(sizeof *common, GFP_KERNEL);
++		if (!common)
++			return ERR_PTR(-ENOMEM);
++		common->free_storage_on_release = 1;
++	} else {
++		memset(common, 0, sizeof common);
++		common->free_storage_on_release = 0;
+ 	}
++	common->gadget = gadget;
+ 
+-	/* Free the request and buffer for endpoint 0 */
+-	if (req) {
+-		kfree(req->buf);
+-		usb_ep_free_request(fsg->ep0, req);
++	/* Create the LUNs, open their backing files, and register the
++	 * LUN devices in sysfs. */
++	curlun = kzalloc(nluns * sizeof *curlun, GFP_KERNEL);
++	if (!curlun) {
++		kfree(common);
++		return ERR_PTR(-ENOMEM);
+ 	}
++	common->luns = curlun;
+ 
+-	set_gadget_data(gadget, NULL);
+-}
++	init_rwsem(&common->filesem);
+ 
++	for (i = 0; i < nluns; ++i, ++curlun) {
++		curlun->cdrom = !!mod_data.cdrom;
++		curlun->ro = mod_data.cdrom || mod_data.ro[i];
++		curlun->removable = mod_data.removable;
++		curlun->dev.release = fsg_lun_release;
++		curlun->dev.parent = &gadget->dev;
++		curlun->dev.driver = &fsg_driver.driver;
++		dev_set_drvdata(&curlun->dev, &common->filesem);
++		dev_set_name(&curlun->dev,"%s-lun%d",
++			     dev_name(&gadget->dev), i);
+ 
+-static int __init check_parameters(struct fsg_dev *fsg)
+-{
+-	int	gcnum;
++		rc = device_register(&curlun->dev);
++		if (rc) {
++			INFO(common, "failed to register LUN%d: %d\n", i, rc);
++			common->nluns = i;
++			goto error_release;
++		}
++
++		rc = device_create_file(&curlun->dev, &dev_attr_ro);
++		if (rc)
++			goto error_luns;
++		rc = device_create_file(&curlun->dev, &dev_attr_file);
++		if (rc)
++			goto error_luns;
++
++		if (mod_data.file[i] && *mod_data.file[i]) {
++			rc = fsg_lun_open(curlun, mod_data.file[i]);
++			if (rc)
++				goto error_luns;
++		} else if (!mod_data.removable) {
++			ERROR(common, "no file given for LUN%d\n", i);
++			rc = -EINVAL;
++			goto error_luns;
++		}
++	}
++	common->nluns = nluns;
++
++
++	/* Data buffers cyclic list */
++	/* Buffers in buffhds are static -- no need for additional
++	 * allocation. */
++	bh = common->buffhds;
++	i = FSG_NUM_BUFFERS - 1;
++	do {
++		bh->next = bh + 1;
++	} while (++bh, --i);
++	bh->next = common->buffhds;
+ 
+-	/* Some peripheral controllers are known not to be able to
+-	 * halt bulk endpoints correctly.  If one of them is present,
+-	 * disable stalls.
+-	 */
+-	if (gadget_is_sh(fsg->gadget) || gadget_is_at91(fsg->gadget))
+-		mod_data.can_stall = 0;
+ 
++	/* Release */
+ 	if (mod_data.release == 0xffff) {	// Parameter wasn't set
++		int	gcnum;
++
+ 		/* The sa1100 controller is not supported */
+-		if (gadget_is_sa1100(fsg->gadget))
++		if (gadget_is_sa1100(gadget))
+ 			gcnum = -1;
+ 		else
+-			gcnum = usb_gadget_controller_number(fsg->gadget);
++			gcnum = usb_gadget_controller_number(gadget);
+ 		if (gcnum >= 0)
+ 			mod_data.release = 0x0300 + gcnum;
+ 		else {
+-			WARNING(fsg, "controller '%s' not recognized\n",
+-				fsg->gadget->name);
++			WARNING(common, "controller '%s' not recognized\n",
++				gadget->name);
++			WARNING(common, "controller '%s' not recognized\n",
++				gadget->name);
+ 			mod_data.release = 0x0399;
+ 		}
+ 	}
+ 
+-	return 0;
++
++	/* Some peripheral controllers are known not to be able to
++	 * halt bulk endpoints correctly.  If one of them is present,
++	 * disable stalls.
++	 */
++	if (gadget_is_sh(fsg->gadget) || gadget_is_at91(fsg->gadget))
++		mod_data.can_stall = 0;
++
++
++	kref_init(&common->ref);
++	return common;
++
++
++error_luns:
++	common->nluns = i + 1;
++error_release:
++	/* Call fsg_common_release() directly, ref is not initialised */
++	fsg_common_release(&common->ref);
++	return ERR_PTR(rc);
++}
++
++
++static void fsg_common_release(struct kref *ref)
++{
++	struct fsg_common *common =
++		container_of(ref, struct fsg_common, ref);
++	unsigned i = common->nluns;
++	struct fsg_lun *lun = common->luns;
++
++	/* Beware tempting for -> do-while optimization: when in error
++	 * recovery nluns may be zero. */
++
++	for (; i; --i, ++lun) {
++		device_remove_file(&lun->dev, &dev_attr_ro);
++		device_remove_file(&lun->dev, &dev_attr_file);
++		fsg_lun_close(lun);
++		device_unregister(&lun->dev);
++	}
++
++	kfree(common->luns);
++	if (common->free_storage_on_release)
++		kfree(common);
++}
++
++
++/*-------------------------------------------------------------------------*/
++
++
++static void /* __init_or_exit */ fsg_unbind(struct usb_gadget *gadget)
++{
++	struct fsg_dev		*fsg = get_gadget_data(gadget);
++	struct usb_request	*req = fsg->ep0req;
++
++	DBG(fsg, "unbind\n");
++	clear_bit(REGISTERED, &fsg->atomic_bitflags);
++
++	/* If the thread isn't already dead, tell it to exit now */
++	if (fsg->state != FSG_STATE_TERMINATED) {
++		raise_exception(fsg, FSG_STATE_EXIT);
++		wait_for_completion(&fsg->thread_notifier);
++
++		/* The cleanup routine waits for this completion also */
++		complete(&fsg->thread_notifier);
++	}
++
++	/* Free the request and buffer for endpoint 0 */
++	if (req) {
++		kfree(req->buf);
++		usb_ep_free_request(fsg->ep0, req);
++	}
++
++	fsg_common_put(fsg->common);
++	kfree(fsg);
++	set_gadget_data(gadget, NULL);
+ }
+ 
+ 
+ static int __init fsg_bind(struct usb_gadget *gadget)
+ {
+-	struct fsg_dev		*fsg = the_fsg;
++	struct fsg_dev		*fsg;
+ 	int			rc;
+ 	int			i;
+ 	struct fsg_lun		*curlun;
+@@ -2858,15 +2983,27 @@ static int __init fsg_bind(struct usb_ga
+ 	struct usb_request	*req;
+ 	char			*pathbuf, *p;
+ 
++	/* Allocate */
++	fsg = kzalloc(sizeof *fsg, GFP_KERNEL);
++	if (!fsg)
++		return -ENOMEM;
++
++	/* Initialise common */
++	fsg->common = fsg_common_init(0, gadget);
++	if (IS_ERR(fsg->common))
++		return PTR_ERR(fsg->common);
++
++	/* Basic parameters */
+ 	fsg->gadget = gadget;
+ 	set_gadget_data(gadget, fsg);
+ 	fsg->ep0 = gadget->ep0;
+ 	fsg->ep0->driver_data = fsg;
+ 
+-	if ((rc = check_parameters(fsg)) != 0)
+-		goto out;
++	spin_lock_init(&fsg->lock);
++	init_completion(&fsg->thread_notifier);
+ 
+-	if (mod_data.removable) {	// Enable the store_xxx attributes
++	/* Enable the store_xxx attributes */
++	if (mod_data.removable) {
+ 		dev_attr_file.attr.mode = 0644;
+ 		dev_attr_file.store = fsg_store_file;
+ 		if (!mod_data.cdrom) {
+@@ -2875,62 +3012,6 @@ static int __init fsg_bind(struct usb_ga
+ 		}
+ 	}
+ 
+-	/* Find out how many LUNs there should be */
+-	i = mod_data.nluns;
+-	if (i == 0)
+-		i = max(mod_data.num_filenames, 1u);
+-	if (i > FSG_MAX_LUNS) {
+-		ERROR(fsg, "invalid number of LUNs: %d\n", i);
+-		rc = -EINVAL;
+-		goto out;
+-	}
+-
+-	/* Create the LUNs, open their backing files, and register the
+-	 * LUN devices in sysfs. */
+-	fsg->common->luns = kzalloc(i * sizeof(struct fsg_lun), GFP_KERNEL);
+-	if (!fsg->common->luns) {
+-		rc = -ENOMEM;
+-		goto out;
+-	}
+-	fsg->common->nluns = i;
+-
+-	for (i = 0; i < fsg->common->nluns; ++i) {
+-		curlun = &fsg->common->luns[i];
+-		curlun->cdrom = !!mod_data.cdrom;
+-		curlun->ro = mod_data.cdrom || mod_data.ro[i];
+-		curlun->initially_ro = curlun->ro;
+-		curlun->removable = mod_data.removable;
+-		curlun->dev.release = lun_release;
+-		curlun->dev.parent = &gadget->dev;
+-		curlun->dev.driver = &fsg_driver.driver;
+-		dev_set_drvdata(&curlun->dev, &fsg->common->filesem);
+-		dev_set_name(&curlun->dev,"%s-lun%d",
+-			     dev_name(&gadget->dev), i);
+-
+-		if ((rc = device_register(&curlun->dev)) != 0) {
+-			INFO(fsg, "failed to register LUN%d: %d\n", i, rc);
+-			goto out;
+-		}
+-		if ((rc = device_create_file(&curlun->dev,
+-					&dev_attr_ro)) != 0 ||
+-				(rc = device_create_file(&curlun->dev,
+-					&dev_attr_file)) != 0) {
+-			device_unregister(&curlun->dev);
+-			goto out;
+-		}
+-		curlun->registered = 1;
+-
+-		if (mod_data.file[i] && *mod_data.file[i]) {
+-			if ((rc = fsg_lun_open(curlun,
+-					mod_data.file[i])) != 0)
+-				goto out;
+-		} else if (!mod_data.removable) {
+-			ERROR(fsg, "no file given for LUN%d\n", i);
+-			rc = -EINVAL;
+-			goto out;
+-		}
+-	}
+-
+ 	/* Find all the endpoints we will use */
+ 	usb_ep_autoconfig_reset(gadget);
+ 	ep = usb_ep_autoconfig(gadget, &fsg_fs_bulk_in_desc);
+@@ -3028,6 +3109,8 @@ static int __init fsg_bind(struct usb_ga
+ 
+ 	/* Tell the thread to start working */
+ 	wake_up_process(fsg->thread_task);
++
++	the_fsg = fsg;
+ 	return 0;
+ 
+ autoconf_fail:
+@@ -3066,64 +3149,18 @@ static struct usb_gadget_driver		fsg_dri
+ };
+ 
+ 
+-static int __init fsg_alloc(void)
+-{
+-	struct fsg_dev		*fsg;
+-	struct fsg_buffhd	*bh;
+-	unsigned		i;
+-
+-	fsg = kzalloc(sizeof *fsg, GFP_KERNEL);
+-	if (!fsg)
+-		return -ENOMEM;
+-
+-	fsg->common = kzalloc(sizeof *fsg->common, GFP_KERNEL);
+-	if (!fsg->common) {
+-		kfree(fsg);
+-		return -ENOMEM;
+-	}
+-
+-	bh = fsg->common->buffhds;
+-	i = FSG_NUM_BUFFERS - 1;
+-	do {
+-		bh->next = bh + 1;
+-	} while (++bh, --i);
+-	bh->next = fsg->common->buffhds;
+-
+-	spin_lock_init(&fsg->lock);
+-	init_rwsem(&fsg->common->filesem);
+-	init_completion(&fsg->thread_notifier);
+-
+-	the_fsg = fsg;
+-	return 0;
+-}
+-
+-
+ static int __init fsg_init(void)
+ {
+-	int		rc;
+-	struct fsg_dev	*fsg;
+-
+-	if ((rc = fsg_alloc()) != 0)
+-		return rc;
+-	fsg = the_fsg;
+-	if ((rc = usb_gadget_register_driver(&fsg_driver)) != 0)
+-		fsg_release(fsg);
+-	return rc;
++	return usb_gadget_register_driver(&fsg_driver);
+ }
+ module_init(fsg_init);
+ 
+ 
+ static void __exit fsg_cleanup(void)
+ {
+-	struct fsg_dev	*fsg = the_fsg;
+-
+ 	/* Unregister the driver iff the thread hasn't already done so */
+-	if (test_and_clear_bit(REGISTERED, &fsg->atomic_bitflags))
++	if (the_fsg &&
++	    test_and_clear_bit(REGISTERED, &the_fsg->atomic_bitflags))
+ 		usb_gadget_unregister_driver(&fsg_driver);
+-
+-	/* Wait for the thread to finish up */
+-	wait_for_completion(&fsg->thread_notifier);
+-
+-	fsg_release(fsg);
+ }
+ module_exit(fsg_cleanup);
