@@ -1,0 +1,170 @@
+From alan@linux.intel.com  Thu Nov 19 14:44:11 2009
+From: Alan Cox <alan@linux.intel.com>
+Date: Wed, 18 Nov 2009 14:07:58 +0000
+Subject: Staging: et131x: clean up the avail fields in the rx registers
+To: greg@kroah.com
+Message-ID: <20091118140753.2578.51525.stgit@localhost.localdomain>
+
+
+These have a wrap bit but again need little work to clean out. There are a
+couple of uglies left that want addressing in later clean up. Notably we should
+probably keep the local psr copy and wrap as two values.
+
+Signed-off-by: Alan Cox <alan@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+---
+
+ drivers/staging/et131x/et1310_address_map.h |   40 +++++++---------------------
+ drivers/staging/et131x/et1310_rx.c          |   28 ++++++++++---------
+ drivers/staging/et131x/et1310_rx.h          |    2 -
+ 3 files changed, 26 insertions(+), 44 deletions(-)
+
+
+--- a/drivers/staging/et131x/et1310_address_map.h
++++ b/drivers/staging/et131x/et1310_address_map.h
+@@ -393,40 +393,20 @@ typedef union _RXDMA_CSR_t {
+ /*
+  * structure for packet status ring available offset reg in rxdma address map
+  * located at address 0x202C
++ *
++ * 31-13: unused
++ * 12: psr avail wrap
++ * 11-0: psr avail
+  */
+-typedef union _RXDMA_PSR_AVAIL_OFFSET_t {
+-	u32 value;
+-	struct {
+-#ifdef _BIT_FIELDS_HTOL
+-		u32 unused:19;		/* bits 13-31 */
+-		u32 psr_avail_wrap:1;	/* bit 12 */
+-		u32 psr_avail:12;	/* bit 0-11 */
+-#else
+-		u32 psr_avail:12;	/* bit 0-11 */
+-		u32 psr_avail_wrap:1;	/* bit 12 */
+-		u32 unused:19;		/* bits 13-31 */
+-#endif
+-	} bits;
+-} RXDMA_PSR_AVAIL_OFFSET_t, *PRXDMA_PSR_AVAIL_OFFSET_t;
+ 
+ /*
+  * structure for packet status ring full offset reg in rxdma address map
+  * located at address 0x2030
++ *
++ * 31-13: unused
++ * 12: psr full wrap
++ * 11-0: psr full
+  */
+-typedef union _RXDMA_PSR_FULL_OFFSET_t {
+-	u32 value;
+-	struct {
+-#ifdef _BIT_FIELDS_HTOL
+-		u32 unused:19;		/* bits 13-31 */
+-		u32 psr_full_wrap:1;	/* bit 12 */
+-		u32 psr_full:12;	/* bit 0-11 */
+-#else
+-		u32 psr_full:12;	/* bit 0-11 */
+-		u32 psr_full_wrap:1;	/* bit 12 */
+-		u32 unused:19;		/* bits 13-31 */
+-#endif
+-	} bits;
+-} RXDMA_PSR_FULL_OFFSET_t, *PRXDMA_PSR_FULL_OFFSET_t;
+ 
+ /*
+  * structure for packet status ring access index reg in rxdma address map
+@@ -556,8 +536,8 @@ typedef struct _RXDMA_t {				/* Location
+ 	u32 psr_base_lo;				/*  0x2020 */
+ 	u32 psr_base_hi;				/*  0x2024 */
+ 	u32 psr_num_des;				/*  0x2028 */
+-	RXDMA_PSR_AVAIL_OFFSET_t psr_avail_offset;	/*  0x202C */
+-	RXDMA_PSR_FULL_OFFSET_t psr_full_offset;	/*  0x2030 */
++	u32 psr_avail_offset;				/*  0x202C */
++	u32 psr_full_offset;				/*  0x2030 */
+ 	u32 psr_access_index;				/*  0x2034 */
+ 	u32 psr_min_des;				/*  0x2038 */
+ 	u32 fbr0_base_lo;				/*  0x203C */
+--- a/drivers/staging/et131x/et1310_rx.c
++++ b/drivers/staging/et131x/et1310_rx.c
+@@ -624,7 +624,7 @@ void ConfigRxDmaRegs(struct et131x_adapt
+ 	       &rx_dma->psr_base_hi);
+ 	writel((u32) rx_local->pPSRingPa, &rx_dma->psr_base_lo);
+ 	writel(rx_local->PsrNumEntries - 1, &rx_dma->psr_num_des);
+-	writel(0, &rx_dma->psr_full_offset.value);
++	writel(0, &rx_dma->psr_full_offset);
+ 
+ 	psr_num_des = readl(&rx_dma->psr_num_des) & 0xFFF;
+ 	writel((psr_num_des * LO_MARK_PERCENT_FOR_PSR) / 100,
+@@ -633,8 +633,7 @@ void ConfigRxDmaRegs(struct et131x_adapt
+ 	spin_lock_irqsave(&etdev->RcvLock, flags);
+ 
+ 	/* These local variables track the PSR in the adapter structure */
+-	rx_local->local_psr_full.bits.psr_full = 0;
+-	rx_local->local_psr_full.bits.psr_full_wrap = 0;
++	rx_local->local_psr_full = 0;
+ 
+ 	/* Now's the best time to initialize FBR1 contents */
+ 	fbr_entry = (PFBR_DESC_t) rx_local->pFbr1RingVa;
+@@ -808,17 +807,18 @@ PMP_RFD nic_rx_pkts(struct et131x_adapte
+ 	 */
+ 	status = (PRX_STATUS_BLOCK_t) rx_local->pRxStatusVa;
+ 
++	/* FIXME: tidy later when conversions complete */
+ 	if (status->Word1.bits.PSRoffset ==
+-			rx_local->local_psr_full.bits.psr_full &&
++			(rx_local->local_psr_full & 0xFFF) &&
+ 			status->Word1.bits.PSRwrap ==
+-			rx_local->local_psr_full.bits.psr_full_wrap) {
++			((rx_local->local_psr_full >> 12) & 1)) {
+ 		/* Looks like this ring is not updated yet */
+ 		return NULL;
+ 	}
+ 
+ 	/* The packet status ring indicates that data is available. */
+ 	psr = (PPKT_STAT_DESC_t) (rx_local->pPSRingVa) +
+-			rx_local->local_psr_full.bits.psr_full;
++			(rx_local->local_psr_full & 0xFFF);
+ 
+ 	/* Grab any information that is required once the PSR is
+ 	 * advanced, since we can no longer rely on the memory being
+@@ -830,14 +830,16 @@ PMP_RFD nic_rx_pkts(struct et131x_adapte
+ 	Word0 = psr->word0;
+ 
+ 	/* Indicate that we have used this PSR entry. */
+-	if (++rx_local->local_psr_full.bits.psr_full >
+-	    rx_local->PsrNumEntries - 1) {
+-		rx_local->local_psr_full.bits.psr_full = 0;
+-		rx_local->local_psr_full.bits.psr_full_wrap ^= 1;
++	/* FIXME wrap 12 */
++	rx_local->local_psr_full = (rx_local->local_psr_full + 1) & 0xFFF;
++	if (rx_local->local_psr_full  > rx_local->PsrNumEntries - 1) {
++		/* Clear psr full and toggle the wrap bit */
++		rx_local->local_psr_full &=  0xFFF;
++		rx_local->local_psr_full ^= 0x1000;
+ 	}
+ 
+-	writel(rx_local->local_psr_full.value,
+-	       &etdev->regs->rxdma.psr_full_offset.value);
++	writel(rx_local->local_psr_full,
++	       &etdev->regs->rxdma.psr_full_offset);
+ 
+ #ifndef USE_FBR0
+ 	if (rindex != 1) {
+@@ -860,7 +862,7 @@ PMP_RFD nic_rx_pkts(struct et131x_adapte
+ 		dev_err(&etdev->pdev->dev,
+ 			  "NICRxPkts PSR Entry %d indicates "
+ 			  "length of %d and/or bad bi(%d)\n",
+-			  rx_local->local_psr_full.bits.psr_full,
++			  rx_local->local_psr_full & 0xFFF,
+ 			  len, bindex);
+ 		return NULL;
+ 	}
+--- a/drivers/staging/et131x/et1310_rx.h
++++ b/drivers/staging/et131x/et1310_rx.h
+@@ -300,7 +300,7 @@ typedef struct _rx_ring_t {
+ 
+ 	void *pPSRingVa;
+ 	dma_addr_t pPSRingPa;
+-	RXDMA_PSR_FULL_OFFSET_t local_psr_full;
++	u32 local_psr_full;
+ 	u32 PsrNumEntries;
+ 
+ 	void *pRxStatusVa;
