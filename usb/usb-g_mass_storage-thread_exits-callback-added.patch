@@ -1,0 +1,151 @@
+From m.nazarewicz@samsung.com  Fri Nov 20 12:29:06 2009
+From: Michal Nazarewicz <m.nazarewicz@samsung.com>
+Date: Mon, 09 Nov 2009 14:15:26 +0100
+Subject: USB: g_mass_storage: thread_exits callback added
+To: Greg KH <greg@kroah.com>
+Cc: Michal Nazarewicz <m.nazarewicz@samsung.com>
+Message-ID: <1257772527-870-8-git-send-email-m.nazarewicz@samsung.com>
+
+
+From: Michal Nazarewicz <m.nazarewicz@samsung.com>
+
+thread_exits callback has been added to fsg_common structure.
+This callback is called when MSF's thread exits (is terminated
+by a signal or function is unregistered).  It's then gadget's
+responsibility to unregister the gadget.
+
+Signed-off-by: Michal Nazarewicz <m.nazarewicz@samsung.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/gadget/f_mass_storage.c |   23 ++++++++++++++++++-----
+ drivers/usb/gadget/mass_storage.c   |   20 +++++++++++---------
+ 2 files changed, 29 insertions(+), 14 deletions(-)
+
+--- a/drivers/usb/gadget/f_mass_storage.c
++++ b/drivers/usb/gadget/f_mass_storage.c
+@@ -367,6 +367,11 @@ struct fsg_common {
+ 	struct completion	thread_notifier;
+ 	struct task_struct	*thread_task;
+ 
++	/* Callback function to call when thread exits. */
++	void			(*thread_exits)(struct fsg_common *common);
++	/* Gadget's private data. */
++	void			*private_data;
++
+ 	/* Vendor (8 chars), product (16 chars), release (4
+ 	 * hexadecimal digits) and NUL byte */
+ 	char inquiry_string[8 + 16 + 4 + 1];
+@@ -387,6 +392,11 @@ struct fsg_config {
+ 	const char		*lun_name_format;
+ 	const char		*thread_name;
+ 
++	/* Callback function to call when thread exits. */
++	void			(*thread_exits)(struct fsg_common *common);
++	/* Gadget's private data. */
++	void			*private_data;
++
+ 	const char *vendor_name;		/*  8 characters or less */
+ 	const char *product_name;		/* 16 characters or less */
+ 	u16 release;
+@@ -2605,11 +2615,8 @@ static int fsg_main_thread(void *common_
+ 	common->thread_task = NULL;
+ 	spin_unlock_irq(&common->lock);
+ 
+-	/* XXX */
+-	/* If we are exiting because of a signal, unregister the
+-	 * gadget driver. */
+-	/* if (test_and_clear_bit(REGISTERED, &fsg->atomic_bitflags)) */
+-	/* 	usb_gadget_unregister_driver(&fsg_driver); */
++	if (common->thread_exits)
++		common->thread_exits(common);
+ 
+ 	/* Let the unbind and cleanup routines know the thread has exited */
+ 	complete_and_exit(&common->thread_notifier, 0);
+@@ -2672,6 +2679,8 @@ static struct fsg_common *fsg_common_ini
+ 		common->free_storage_on_release = 0;
+ 	}
+ 
++	common->private_data = cfg->private_data;
++
+ 	common->gadget = gadget;
+ 	common->ep0 = gadget->ep0;
+ 	common->ep0req = cdev->req;
+@@ -2791,6 +2800,7 @@ static struct fsg_common *fsg_common_ini
+ 
+ 
+ 	/* Tell the thread to start working */
++	common->thread_exits = cfg->thread_exits;
+ 	common->thread_task =
+ 		kthread_create(fsg_main_thread, common,
+ 			       OR(cfg->thread_name, "file-storage"));
+@@ -3057,6 +3067,9 @@ fsg_config_from_params(struct fsg_config
+ 	cfg->product_name = 0;
+ 	cfg->release = 0xffff;
+ 
++	cfg->thread_exits = 0;
++	cfg->private_data = 0;
++
+ 	/* Finalise */
+ 	cfg->can_stall = params->stall;
+ }
+--- a/drivers/usb/gadget/mass_storage.c
++++ b/drivers/usb/gadget/mass_storage.c
+@@ -132,9 +132,13 @@ static struct fsg_module_parameters mod_
+ };
+ FSG_MODULE_PARAMETERS(/* no prefix */, mod_data);
+ 
++static unsigned long msg_registered = 0;
++static void msg_cleanup(void);
++
+ static int __init msg_do_config(struct usb_configuration *c)
+ {
+ 	struct fsg_common *common;
++	struct fsg_config config;
+ 	int ret;
+ 
+ 	if (gadget_is_otg(c->cdev->gadget)) {
+@@ -142,7 +146,9 @@ static int __init msg_do_config(struct u
+ 		c->bmAttributes |= USB_CONFIG_ATT_WAKEUP;
+ 	}
+ 
+-	common = fsg_common_from_params(0, c->cdev, &mod_data);
++	fsg_config_from_params(&config, &mod_data);
++	config.thread_exits = (void(*)(struct fsg_common*))&msg_cleanup;
++	common = fsg_common_init(0, c->cdev, &config);
+ 	if (IS_ERR(common))
+ 		return PTR_ERR(common);
+ 
+@@ -201,11 +207,7 @@ static int __init msg_bind(struct usb_co
+ 		return status;
+ 
+ 	dev_info(&gadget->dev, DRIVER_DESC ", version: " DRIVER_VERSION "\n");
+-	return 0;
+-}
+-
+-static int __exit msg_unbind(struct usb_composite_dev *cdev)
+-{
++	set_bit(0, &msg_registered);
+ 	return 0;
+ }
+ 
+@@ -218,7 +220,6 @@ static struct usb_composite_driver msg_d
+ 	.dev		= &msg_device_desc,
+ 	.strings	= dev_strings,
+ 	.bind		= msg_bind,
+-	.unbind		= __exit_p(msg_unbind),
+ };
+ 
+ MODULE_DESCRIPTION(DRIVER_DESC);
+@@ -231,8 +232,9 @@ static int __init msg_init(void)
+ }
+ module_init(msg_init);
+ 
+-static void __exit msg_cleanup(void)
++static void msg_cleanup(void)
+ {
+-	usb_composite_unregister(&msg_driver);
++	if (test_and_clear_bit(0, &msg_registered))
++		usb_composite_unregister(&msg_driver);
+ }
+ module_exit(msg_cleanup);
