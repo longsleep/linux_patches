@@ -1,0 +1,101 @@
+From oliver@neukum.org  Mon Nov 30 14:34:55 2009
+From: Oliver Neukum <oliver@neukum.org>
+Date: Fri, 27 Nov 2009 15:17:59 +0100
+Subject: USB: work around for EHCI with quirky periodic schedules
+To: "Greg Kroah-Hartman" <gregkh@suse.de>, Sarah Sharp <sarah.a.sharp@linux.intel.com>, Stephan Diestelhorst <stephan.diestelhorst@gmail.com>, Alan Stern <stern@rowland.harvard.edu>
+Message-ID: <200911271517.59867.oliver@neukum.org>
+
+
+a quirky chipset needs periodic schedules to run for a minimum
+time before they can be disabled again. This enforces the requirement
+with a time stamp and a calculated delay
+
+Signed-off-by: Oliver Neukum <oliver@neukum.org>
+Cc: stable <stable@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ drivers/usb/host/ehci-hcd.c   |    2 ++
+ drivers/usb/host/ehci-pci.c   |    4 ++++
+ drivers/usb/host/ehci-sched.c |   12 ++++++++++++
+ drivers/usb/host/ehci.h       |    2 ++
+ 4 files changed, 20 insertions(+)
+
+--- a/drivers/usb/host/ehci.h
++++ b/drivers/usb/host/ehci.h
+@@ -118,6 +118,7 @@ struct ehci_hcd {			/* one per controlle
+ 	unsigned		stamp;
+ 	unsigned		random_frame;
+ 	unsigned long		next_statechange;
++	ktime_t			last_periodic_enable;
+ 	u32			command;
+ 
+ 	/* SILICON QUIRKS */
+@@ -127,6 +128,7 @@ struct ehci_hcd {			/* one per controlle
+ 	unsigned		big_endian_desc:1;
+ 	unsigned		has_amcc_usb23:1;
+ 	unsigned		need_io_watchdog:1;
++	unsigned		broken_periodic:1;
+ 
+ 	/* required for usb32 quirk */
+ 	#define OHCI_CTRL_HCFS          (3 << 6)
+--- a/drivers/usb/host/ehci-hcd.c
++++ b/drivers/usb/host/ehci-hcd.c
+@@ -28,6 +28,7 @@
+ #include <linux/errno.h>
+ #include <linux/init.h>
+ #include <linux/timer.h>
++#include <linux/ktime.h>
+ #include <linux/list.h>
+ #include <linux/interrupt.h>
+ #include <linux/usb.h>
+@@ -676,6 +677,7 @@ static int ehci_run (struct usb_hcd *hcd
+ 	ehci_readl(ehci, &ehci->regs->command);	/* unblock posted writes */
+ 	msleep(5);
+ 	up_write(&ehci_cf_port_reset_rwsem);
++	ehci->last_periodic_enable = ktime_get_real();
+ 
+ 	temp = HC_VERSION(ehci_readl(ehci, &ehci->caps->hc_capbase));
+ 	ehci_info (ehci,
+--- a/drivers/usb/host/ehci-pci.c
++++ b/drivers/usb/host/ehci-pci.c
+@@ -111,6 +111,10 @@ static int ehci_pci_setup(struct usb_hcd
+ 	switch (pdev->vendor) {
+ 	case PCI_VENDOR_ID_INTEL:
+ 		ehci->need_io_watchdog = 0;
++		if (pdev->device == 0x27cc) {
++			ehci->broken_periodic = 1;
++			ehci_info(ehci, "using broken periodic workaround\n");
++		}
+ 		break;
+ 	case PCI_VENDOR_ID_TDI:
+ 		if (pdev->device == PCI_DEVICE_ID_TDI_EHCI) {
+--- a/drivers/usb/host/ehci-sched.c
++++ b/drivers/usb/host/ehci-sched.c
+@@ -475,6 +475,8 @@ static int enable_periodic (struct ehci_
+ 	/* make sure ehci_work scans these */
+ 	ehci->next_uframe = ehci_readl(ehci, &ehci->regs->frame_index)
+ 		% (ehci->periodic_size << 3);
++	if (unlikely(ehci->broken_periodic))
++		ehci->last_periodic_enable = ktime_get_real();
+ 	return 0;
+ }
+ 
+@@ -486,6 +488,16 @@ static int disable_periodic (struct ehci
+ 	if (--ehci->periodic_sched)
+ 		return 0;
+ 
++	if (unlikely(ehci->broken_periodic)) {
++		/* delay experimentally determined */
++		ktime_t safe = ktime_add_us(ehci->last_periodic_enable, 1000);
++		ktime_t now = ktime_get_real();
++		s64 delay = ktime_us_delta(safe, now);
++
++		if (unlikely(delay > 0))
++			udelay(delay);
++	}
++
+ 	/* did setting PSE not take effect yet?
+ 	 * takes effect only at frame boundaries...
+ 	 */
