@@ -1,0 +1,114 @@
+From sarah.a.sharp@linux.intel.com  Mon Dec  7 16:32:35 2009
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Date: Thu, 3 Dec 2009 09:44:34 -0800
+Subject: USB: Refactor code to find alternate interface settings.
+To: Greg KH <gregkh@suse.de>
+Cc: linux-usb@vger.kernel.org, Alan Stern <stern@rowland.harvard.edu>
+Message-ID: <20091203174434.GA11172@xanatos>
+Content-Disposition: inline
+
+
+Refactor out the code to find alternate interface settings into
+usb_find_alt_setting().  Print a debugging message and return null if the
+alt setting is not found.
+
+While we're at it, correct a bug in the refactored code.  The interfaces
+in the configuration's interface cache are not necessarily in numerical
+order, so we can't just use the interface number as an array index.  Loop
+through the interface caches, looking for the correct interface.
+
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+---
+ drivers/usb/core/hcd.c |   12 ++----------
+ drivers/usb/core/usb.c |   37 +++++++++++++++++++++++++++++++++++++
+ include/linux/usb.h    |    4 ++++
+ 3 files changed, 43 insertions(+), 10 deletions(-)
+
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -1606,7 +1606,6 @@ int usb_hcd_check_bandwidth(struct usb_d
+ 		struct usb_interface *new_intf)
+ {
+ 	int num_intfs, i, j;
+-	struct usb_interface_cache *intf_cache;
+ 	struct usb_host_interface *alt = NULL;
+ 	int ret = 0;
+ 	struct usb_hcd *hcd;
+@@ -1654,15 +1653,8 @@ int usb_hcd_check_bandwidth(struct usb_d
+ 			}
+ 		}
+ 		for (i = 0; i < num_intfs; ++i) {
+-
+-			/* Dig the endpoints for alt setting 0 out of the
+-			 * interface cache for this interface
+-			 */
+-			intf_cache = new_config->intf_cache[i];
+-			for (j = 0; j < intf_cache->num_altsetting; j++) {
+-				if (intf_cache->altsetting[j].desc.bAlternateSetting == 0)
+-					alt = &intf_cache->altsetting[j];
+-			}
++			/* Set up endpoints for alternate interface setting 0 */
++			alt = usb_find_alt_setting(new_config, i, 0);
+ 			if (!alt) {
+ 				printk(KERN_DEBUG "Did not find alt setting 0 for intf %d\n", i);
+ 				continue;
+--- a/drivers/usb/core/usb.c
++++ b/drivers/usb/core/usb.c
+@@ -64,6 +64,43 @@ MODULE_PARM_DESC(autosuspend, "default a
+ 
+ 
+ /**
++ * usb_find_alt_setting() - Given a configuration, find the alternate setting
++ * for the given interface.
++ * @config - the configuration to search (not necessarily the current config).
++ * @iface_num - interface number to search in
++ * @alt_num - alternate interface setting number to search for.
++ *
++ * Search the configuration's interface cache for the given alt setting.
++ */
++struct usb_host_interface *usb_find_alt_setting(
++		struct usb_host_config *config,
++		unsigned int iface_num,
++		unsigned int alt_num)
++{
++	struct usb_interface_cache *intf_cache = NULL;
++	int i;
++
++	for (i = 0; i < config->desc.bNumInterfaces; i++) {
++		if (config->intf_cache[i]->altsetting[0].desc.bInterfaceNumber
++				== iface_num) {
++			intf_cache = config->intf_cache[i];
++			break;
++		}
++	}
++	if (!intf_cache)
++		return NULL;
++	for (i = 0; i < intf_cache->num_altsetting; i++)
++		if (intf_cache->altsetting[i].desc.bAlternateSetting == alt_num)
++			return &intf_cache->altsetting[i];
++
++	printk(KERN_DEBUG "Did not find alt setting %u for intf %u, "
++			"config %u\n", alt_num, iface_num,
++			config->desc.bConfigurationValue);
++	return NULL;
++}
++EXPORT_SYMBOL_GPL(usb_find_alt_setting);
++
++/**
+  * usb_ifnum_to_if - get the interface object with a given interface number
+  * @dev: the device whose current configuration is considered
+  * @ifnum: the desired interface
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -619,6 +619,10 @@ extern struct usb_interface *usb_ifnum_t
+ 		unsigned ifnum);
+ extern struct usb_host_interface *usb_altnum_to_altsetting(
+ 		const struct usb_interface *intf, unsigned int altnum);
++extern struct usb_host_interface *usb_find_alt_setting(
++		struct usb_host_config *config,
++		unsigned int iface_num,
++		unsigned int alt_num);
+ 
+ 
+ /**

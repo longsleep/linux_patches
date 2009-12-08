@@ -1,0 +1,494 @@
+From stern@rowland.harvard.edu  Mon Dec  7 11:04:06 2009
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Mon, 7 Dec 2009 13:01:37 -0500 (EST)
+Subject: USB: prepare for changover to Runtime PM framework
+To: Greg KH <greg@kroah.com>
+Message-ID: <Pine.LNX.4.44L0.0912071255560.15701-100000@iolanthe.rowland.org>
+
+
+This patch (as1303) revises the USB Power Management infrastructure to
+make it compatible with the new driver-model Runtime PM framework:
+
+	Drivers are no longer allowed to access intf->pm_usage_cnt
+	directly; the PM framework manages its own usage counters.
+
+	usb_autopm_set_interface() is eliminated, because it directly
+	sets intf->pm_usage_cnt.
+
+	usb_autopm_enable() and usb_autopm_disable() are eliminated,
+	because they call usb_autopm_set_interface().
+
+	usb_autopm_get_interface_no_resume() and
+	usb_autopm_put_interface_no_suspend() are added.  They
+	correspond to pm_runtime_get_noresume() and
+	pm_runtime_put_noidle() in the PM framework.
+
+	The power/level attribute no longer accepts "suspend", only
+	"on" and "auto".  The PM framework doesn't allow devices to be
+	forced into a suspended mode.
+
+The hub driver contains the only code that violates the new
+guidelines.  It is updated to use the new interface routines instead.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ Documentation/usb/power-management.txt |   60 +++++++++++++++------------------
+ drivers/usb/core/driver.c              |   31 -----------------
+ drivers/usb/core/hub.c                 |   45 +++++++++++++++++-------
+ drivers/usb/core/sysfs.c               |   25 ++-----------
+ include/linux/usb.h                    |   26 +++++---------
+ 5 files changed, 74 insertions(+), 113 deletions(-)
+
+--- a/Documentation/usb/power-management.txt
++++ b/Documentation/usb/power-management.txt
+@@ -2,7 +2,7 @@
+ 
+ 		 Alan Stern <stern@rowland.harvard.edu>
+ 
+-			    October 5, 2007
++			    November 10, 2009
+ 
+ 
+ 
+@@ -123,9 +123,9 @@ relevant attribute files are: wakeup, le
+ 
+ 	power/level
+ 
+-		This file contains one of three words: "on", "auto",
+-		or "suspend".  You can write those words to the file
+-		to change the device's setting.
++		This file contains one of two words: "on" or "auto".
++		You can write those words to the file to change the
++		device's setting.
+ 
+ 		"on" means that the device should be resumed and
+ 		autosuspend is not allowed.  (Of course, system
+@@ -134,10 +134,10 @@ relevant attribute files are: wakeup, le
+ 		"auto" is the normal state in which the kernel is
+ 		allowed to autosuspend and autoresume the device.
+ 
+-		"suspend" means that the device should remain
+-		suspended, and autoresume is not allowed.  (But remote
+-		wakeup may still be allowed, since it is controlled
+-		separately by the power/wakeup attribute.)
++		(In kernels up to 2.6.32, you could also specify
++		"suspend", meaning that the device should remain
++		suspended and autoresume was not allowed.  This
++		setting is no longer supported.)
+ 
+ 	power/autosuspend
+ 
+@@ -313,13 +313,14 @@ three of the methods listed above.  In a
+ that it supports autosuspend by setting the .supports_autosuspend flag
+ in its usb_driver structure.  It is then responsible for informing the
+ USB core whenever one of its interfaces becomes busy or idle.  The
+-driver does so by calling these five functions:
++driver does so by calling these six functions:
+ 
+ 	int  usb_autopm_get_interface(struct usb_interface *intf);
+ 	void usb_autopm_put_interface(struct usb_interface *intf);
+-	int  usb_autopm_set_interface(struct usb_interface *intf);
+ 	int  usb_autopm_get_interface_async(struct usb_interface *intf);
+ 	void usb_autopm_put_interface_async(struct usb_interface *intf);
++	void usb_autopm_get_interface_no_resume(struct usb_interface *intf);
++	void usb_autopm_put_interface_no_suspend(struct usb_interface *intf);
+ 
+ The functions work by maintaining a counter in the usb_interface
+ structure.  When intf->pm_usage_count is > 0 then the interface is
+@@ -331,11 +332,13 @@ considered to be idle, and the kernel ma
+ associated with the device itself rather than any of its interfaces.
+ This field is used only by the USB core.)
+ 
+-The driver owns intf->pm_usage_count; it can modify the value however
+-and whenever it likes.  A nice aspect of the non-async usb_autopm_*
+-routines is that the changes they make are protected by the usb_device
+-structure's PM mutex (udev->pm_mutex); however drivers may change
+-pm_usage_count without holding the mutex.  Drivers using the async
++Drivers must not modify intf->pm_usage_count directly; its value
++should be changed only be using the functions listed above.  Drivers
++are responsible for insuring that the overall change to pm_usage_count
++during their lifetime balances out to 0 (it may be necessary for the
++disconnect method to call usb_autopm_put_interface() one or more times
++to fulfill this requirement).  The first two routines use the PM mutex
++in struct usb_device for mutual exclusion; drivers using the async
+ routines are responsible for their own synchronization and mutual
+ exclusion.
+ 
+@@ -347,11 +350,6 @@ exclusion.
+ 	attempts an autosuspend if the new value is <= 0 and the
+ 	device isn't suspended.
+ 
+-	usb_autopm_set_interface() leaves pm_usage_count alone.
+-	It attempts an autoresume if the value is > 0 and the device
+-	is suspended, and it attempts an autosuspend if the value is
+-	<= 0 and the device isn't suspended.
+-
+ 	usb_autopm_get_interface_async() and
+ 	usb_autopm_put_interface_async() do almost the same things as
+ 	their non-async counterparts.  The differences are: they do
+@@ -360,13 +358,11 @@ exclusion.
+ 	such as an URB's completion handler, but when they return the
+ 	device will not generally not yet be in the desired state.
+ 
+-There also are a couple of utility routines drivers can use:
+-
+-	usb_autopm_enable() sets pm_usage_cnt to 0 and then calls
+-	usb_autopm_set_interface(), which will attempt an autosuspend.
+-
+-	usb_autopm_disable() sets pm_usage_cnt to 1 and then calls
+-	usb_autopm_set_interface(), which will attempt an autoresume.
++	usb_autopm_get_interface_no_resume() and
++	usb_autopm_put_interface_no_suspend() merely increment or
++	decrement the pm_usage_count value; they do not attempt to
++	carry out an autoresume or an autosuspend.  Hence they can be
++	called in an atomic context.
+ 
+ The conventional usage pattern is that a driver calls
+ usb_autopm_get_interface() in its open routine and
+@@ -400,11 +396,11 @@ though, setting this flag won't cause th
+ Normally a driver would set this flag in its probe method, at which
+ time the device is guaranteed not to be autosuspended.)
+ 
+-The usb_autopm_* routines have to run in a sleepable process context;
+-they must not be called from an interrupt handler or while holding a
+-spinlock.  In fact, the entire autosuspend mechanism is not well geared
+-toward interrupt-driven operation.  However there is one thing a
+-driver can do in an interrupt handler:
++The synchronous usb_autopm_* routines have to run in a sleepable
++process context; they must not be called from an interrupt handler or
++while holding a spinlock.  In fact, the entire autosuspend mechanism
++is not well geared toward interrupt-driven operation.  However there
++is one thing a driver can do in an interrupt handler:
+ 
+ 	usb_mark_last_busy(struct usb_device *udev);
+ 
+--- a/drivers/usb/core/driver.c
++++ b/drivers/usb/core/driver.c
+@@ -948,8 +948,6 @@ static int usb_resume_device(struct usb_
+ 
+  done:
+ 	dev_vdbg(&udev->dev, "%s: status %d\n", __func__, status);
+-	if (status == 0)
+-		udev->autoresume_disabled = 0;
+ 	return status;
+ }
+ 
+@@ -1280,11 +1278,6 @@ static int usb_resume_both(struct usb_de
+ 
+ 	/* Propagate the resume up the tree, if necessary */
+ 	if (udev->state == USB_STATE_SUSPENDED) {
+-		if ((msg.event & PM_EVENT_AUTO) &&
+-				udev->autoresume_disabled) {
+-			status = -EPERM;
+-			goto done;
+-		}
+ 		if (parent) {
+ 			status = usb_autoresume_device(parent);
+ 			if (status == 0) {
+@@ -1638,8 +1631,6 @@ int usb_autopm_get_interface_async(struc
+ 
+ 	if (intf->condition == USB_INTERFACE_UNBOUND)
+ 		status = -ENODEV;
+-	else if (udev->autoresume_disabled)
+-		status = -EPERM;
+ 	else {
+ 		atomic_inc(&intf->pm_usage_cnt);
+ 		if (atomic_read(&intf->pm_usage_cnt) > 0 &&
+@@ -1652,28 +1643,6 @@ int usb_autopm_get_interface_async(struc
+ }
+ EXPORT_SYMBOL_GPL(usb_autopm_get_interface_async);
+ 
+-/**
+- * usb_autopm_set_interface - set a USB interface's autosuspend state
+- * @intf: the usb_interface whose state should be set
+- *
+- * This routine sets the autosuspend state of @intf's device according
+- * to @intf's usage counter, which the caller must have set previously.
+- * If the counter is <= 0, the device is autosuspended (if it isn't
+- * already suspended and if nothing else prevents the autosuspend).  If
+- * the counter is > 0, the device is autoresumed (if it isn't already
+- * awake).
+- */
+-int usb_autopm_set_interface(struct usb_interface *intf)
+-{
+-	int	status;
+-
+-	status = usb_autopm_do_interface(intf, 0);
+-	dev_vdbg(&intf->dev, "%s: status %d cnt %d\n",
+-			__func__, status, atomic_read(&intf->pm_usage_cnt));
+-	return status;
+-}
+-EXPORT_SYMBOL_GPL(usb_autopm_set_interface);
+-
+ #else
+ 
+ void usb_autosuspend_work(struct work_struct *work)
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -71,6 +71,7 @@ struct usb_hub {
+ 
+ 	unsigned		mA_per_port;	/* current for each child */
+ 
++	unsigned		init_done:1;
+ 	unsigned		limited_power:1;
+ 	unsigned		quiescing:1;
+ 	unsigned		disconnected:1;
+@@ -375,12 +376,13 @@ static void kick_khubd(struct usb_hub *h
+ {
+ 	unsigned long	flags;
+ 
+-	/* Suppress autosuspend until khubd runs */
+-	atomic_set(&to_usb_interface(hub->intfdev)->pm_usage_cnt, 1);
+-
+ 	spin_lock_irqsave(&hub_event_lock, flags);
+ 	if (!hub->disconnected && list_empty(&hub->event_list)) {
+ 		list_add_tail(&hub->event_list, &hub_event_list);
++
++		/* Suppress autosuspend until khubd runs */
++		usb_autopm_get_interface_no_resume(
++				to_usb_interface(hub->intfdev));
+ 		wake_up(&khubd_wait);
+ 	}
+ 	spin_unlock_irqrestore(&hub_event_lock, flags);
+@@ -665,7 +667,7 @@ int usb_remove_device(struct usb_device 
+ }
+ 
+ enum hub_activation_type {
+-	HUB_INIT, HUB_INIT2, HUB_INIT3,
++	HUB_INIT, HUB_INIT2, HUB_INIT3,		/* INITs must come first */
+ 	HUB_POST_RESET, HUB_RESUME, HUB_RESET_RESUME,
+ };
+ 
+@@ -710,8 +712,8 @@ static void hub_activate(struct usb_hub 
+ 					msecs_to_jiffies(delay));
+ 
+ 			/* Suppress autosuspend until init is done */
+-			atomic_set(&to_usb_interface(hub->intfdev)->
+-					pm_usage_cnt, 1);
++			usb_autopm_get_interface_no_resume(
++					to_usb_interface(hub->intfdev));
+ 			return;		/* Continues at init2: below */
+ 		} else {
+ 			hub_power_on(hub, true);
+@@ -818,6 +820,7 @@ static void hub_activate(struct usb_hub 
+ 	}
+  init3:
+ 	hub->quiescing = 0;
++	hub->init_done = 1;
+ 
+ 	status = usb_submit_urb(hub->urb, GFP_NOIO);
+ 	if (status < 0)
+@@ -827,6 +830,10 @@ static void hub_activate(struct usb_hub 
+ 
+ 	/* Scan all ports that need attention */
+ 	kick_khubd(hub);
++
++	/* Allow autosuspend if it was suppressed */
++	if (type <= HUB_INIT3)
++		usb_autopm_put_interface_async(to_usb_interface(hub->intfdev));
+ }
+ 
+ /* Implement the continuations for the delays above */
+@@ -854,6 +861,11 @@ static void hub_quiesce(struct usb_hub *
+ 	int i;
+ 
+ 	cancel_delayed_work_sync(&hub->init_work);
++	if (!hub->init_done) {
++		hub->init_done = 1;
++		usb_autopm_put_interface_no_suspend(
++				to_usb_interface(hub->intfdev));
++	}
+ 
+ 	/* khubd and related activity won't re-trigger */
+ 	hub->quiescing = 1;
+@@ -1176,7 +1188,10 @@ static void hub_disconnect(struct usb_in
+ 
+ 	/* Take the hub off the event list and don't let it be added again */
+ 	spin_lock_irq(&hub_event_lock);
+-	list_del_init(&hub->event_list);
++	if (!list_empty(&hub->event_list)) {
++		list_del_init(&hub->event_list);
++		usb_autopm_put_interface_no_suspend(intf);
++	}
+ 	hub->disconnected = 1;
+ 	spin_unlock_irq(&hub_event_lock);
+ 
+@@ -3235,7 +3250,7 @@ static void hub_events(void)
+ 		 * disconnected while waiting for the lock to succeed. */
+ 		usb_lock_device(hdev);
+ 		if (unlikely(hub->disconnected))
+-			goto loop;
++			goto loop2;
+ 
+ 		/* If the hub has died, clean up after it */
+ 		if (hdev->state == USB_STATE_NOTATTACHED) {
+@@ -3384,11 +3399,15 @@ static void hub_events(void)
+ 			}
+ 		}
+ 
+-loop_autopm:
+-		/* Allow autosuspend if we're not going to run again */
+-		if (list_empty(&hub->event_list))
+-			usb_autopm_enable(intf);
+-loop:
++ loop_autopm:
++		/* Balance the usb_autopm_get_interface() above */
++		usb_autopm_put_interface_no_suspend(intf);
++ loop:
++		/* Balance the usb_autopm_get_interface_no_resume() in
++		 * kick_khubd() and allow autosuspend.
++		 */
++		usb_autopm_put_interface(intf);
++ loop2:
+ 		usb_unlock_device(hdev);
+ 		kref_put(&hub->kref, hub_release);
+ 
+--- a/drivers/usb/core/sysfs.c
++++ b/drivers/usb/core/sysfs.c
+@@ -327,7 +327,6 @@ static DEVICE_ATTR(autosuspend, S_IRUGO 
+ 
+ static const char on_string[] = "on";
+ static const char auto_string[] = "auto";
+-static const char suspend_string[] = "suspend";
+ 
+ static ssize_t
+ show_level(struct device *dev, struct device_attribute *attr, char *buf)
+@@ -335,13 +334,8 @@ show_level(struct device *dev, struct de
+ 	struct usb_device *udev = to_usb_device(dev);
+ 	const char *p = auto_string;
+ 
+-	if (udev->state == USB_STATE_SUSPENDED) {
+-		if (udev->autoresume_disabled)
+-			p = suspend_string;
+-	} else {
+-		if (udev->autosuspend_disabled)
+-			p = on_string;
+-	}
++	if (udev->state != USB_STATE_SUSPENDED && udev->autosuspend_disabled)
++		p = on_string;
+ 	return sprintf(buf, "%s\n", p);
+ }
+ 
+@@ -353,7 +347,7 @@ set_level(struct device *dev, struct dev
+ 	int len = count;
+ 	char *cp;
+ 	int rc = 0;
+-	int old_autosuspend_disabled, old_autoresume_disabled;
++	int old_autosuspend_disabled;
+ 
+ 	cp = memchr(buf, '\n', count);
+ 	if (cp)
+@@ -361,7 +355,6 @@ set_level(struct device *dev, struct dev
+ 
+ 	usb_lock_device(udev);
+ 	old_autosuspend_disabled = udev->autosuspend_disabled;
+-	old_autoresume_disabled = udev->autoresume_disabled;
+ 
+ 	/* Setting the flags without calling usb_pm_lock is a subject to
+ 	 * races, but who cares...
+@@ -369,28 +362,18 @@ set_level(struct device *dev, struct dev
+ 	if (len == sizeof on_string - 1 &&
+ 			strncmp(buf, on_string, len) == 0) {
+ 		udev->autosuspend_disabled = 1;
+-		udev->autoresume_disabled = 0;
+ 		rc = usb_external_resume_device(udev, PMSG_USER_RESUME);
+ 
+ 	} else if (len == sizeof auto_string - 1 &&
+ 			strncmp(buf, auto_string, len) == 0) {
+ 		udev->autosuspend_disabled = 0;
+-		udev->autoresume_disabled = 0;
+ 		rc = usb_external_resume_device(udev, PMSG_USER_RESUME);
+ 
+-	} else if (len == sizeof suspend_string - 1 &&
+-			strncmp(buf, suspend_string, len) == 0) {
+-		udev->autosuspend_disabled = 0;
+-		udev->autoresume_disabled = 1;
+-		rc = usb_external_suspend_device(udev, PMSG_USER_SUSPEND);
+-
+ 	} else
+ 		rc = -EINVAL;
+ 
+-	if (rc) {
++	if (rc)
+ 		udev->autosuspend_disabled = old_autosuspend_disabled;
+-		udev->autoresume_disabled = old_autoresume_disabled;
+-	}
+ 	usb_unlock_device(udev);
+ 	return (rc < 0 ? rc : count);
+ }
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -432,7 +432,6 @@ struct usb_tt;
+  * @do_remote_wakeup:  remote wakeup should be enabled
+  * @reset_resume: needs reset instead of resume
+  * @autosuspend_disabled: autosuspend disabled by the user
+- * @autoresume_disabled: autoresume disabled by the user
+  * @skip_sys_resume: skip the next system resume
+  * @wusb_dev: if this is a Wireless USB device, link to the WUSB
+  *	specific data for the device.
+@@ -516,7 +515,6 @@ struct usb_device {
+ 	unsigned do_remote_wakeup:1;
+ 	unsigned reset_resume:1;
+ 	unsigned autosuspend_disabled:1;
+-	unsigned autoresume_disabled:1;
+ 	unsigned skip_sys_resume:1;
+ #endif
+ 	struct wusb_dev *wusb_dev;
+@@ -542,22 +540,20 @@ extern struct usb_device *usb_find_devic
+ 
+ /* USB autosuspend and autoresume */
+ #ifdef CONFIG_USB_SUSPEND
+-extern int usb_autopm_set_interface(struct usb_interface *intf);
+ extern int usb_autopm_get_interface(struct usb_interface *intf);
+ extern void usb_autopm_put_interface(struct usb_interface *intf);
+ extern int usb_autopm_get_interface_async(struct usb_interface *intf);
+ extern void usb_autopm_put_interface_async(struct usb_interface *intf);
+ 
+-static inline void usb_autopm_enable(struct usb_interface *intf)
++static inline void usb_autopm_get_interface_no_resume(
++		struct usb_interface *intf)
+ {
+-	atomic_set(&intf->pm_usage_cnt, 0);
+-	usb_autopm_set_interface(intf);
++	atomic_inc(&intf->pm_usage_cnt);
+ }
+-
+-static inline void usb_autopm_disable(struct usb_interface *intf)
++static inline void usb_autopm_put_interface_no_suspend(
++		struct usb_interface *intf)
+ {
+-	atomic_set(&intf->pm_usage_cnt, 1);
+-	usb_autopm_set_interface(intf);
++	atomic_dec(&intf->pm_usage_cnt);
+ }
+ 
+ static inline void usb_mark_last_busy(struct usb_device *udev)
+@@ -567,12 +563,8 @@ static inline void usb_mark_last_busy(st
+ 
+ #else
+ 
+-static inline int usb_autopm_set_interface(struct usb_interface *intf)
+-{ return 0; }
+-
+ static inline int usb_autopm_get_interface(struct usb_interface *intf)
+ { return 0; }
+-
+ static inline int usb_autopm_get_interface_async(struct usb_interface *intf)
+ { return 0; }
+ 
+@@ -580,9 +572,11 @@ static inline void usb_autopm_put_interf
+ { }
+ static inline void usb_autopm_put_interface_async(struct usb_interface *intf)
+ { }
+-static inline void usb_autopm_enable(struct usb_interface *intf)
++static inline void usb_autopm_get_interface_no_resume(
++		struct usb_interface *intf)
+ { }
+-static inline void usb_autopm_disable(struct usb_interface *intf)
++static inline void usb_autopm_put_interface_no_suspend(
++		struct usb_interface *intf)
+ { }
+ static inline void usb_mark_last_busy(struct usb_device *udev)
+ { }
