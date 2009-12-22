@@ -1,0 +1,174 @@
+From simon@fire.lp0.eu  Tue Dec 22 11:24:33 2009
+From: Simon Arlott <simon@fire.lp0.eu>
+Date: Sat, 21 Nov 2009 15:15:47 +0000
+Subject: USB: cxacru: remove cxacru-cf.bin loader
+To: Greg Kroah-Hartman <gregkh@suse.de>
+Message-ID: <4B080423.2080803@simon.arlott.org.uk>
+
+
+This has never worked properly because wsize passed to
+cxacru_cm() is incorrectly set to the number of values
+instead of the data bytes. The maximum number of values
+that can be set at once is 7 which means the device will
+not get enough data to work with and none of the
+configuration values will be used.
+
+At least one existing cxacru-cf.bin file contains invalid
+data which will prevent the modem from syncing properly.
+
+Fixing it is likely to break existing systems, and the
+new sysfs interface for setting configuration parameters
+can provide the same functionality. A script is provided
+to convert from the original format.
+
+Signed-off-by: Simon Arlott <simon@fire.lp0.eu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+---
+ Documentation/networking/00-INDEX     |    2 +
+ Documentation/networking/cxacru-cf.py |   48 ++++++++++++++++++++++++++++++++++
+ Documentation/networking/cxacru.txt   |    6 ++++
+ drivers/usb/atm/cxacru.c              |   31 ++-------------------
+ 4 files changed, 59 insertions(+), 28 deletions(-)
+ create mode 100644 Documentation/networking/cxacru-cf.py
+
+--- a/Documentation/networking/00-INDEX
++++ b/Documentation/networking/00-INDEX
+@@ -32,6 +32,8 @@ cs89x0.txt
+ 	- the Crystal LAN (CS8900/20-based) Ethernet ISA adapter driver
+ cxacru.txt
+ 	- Conexant AccessRunner USB ADSL Modem
++cxacru-cf.py
++	- Conexant AccessRunner USB ADSL Modem configuration file parser
+ de4x5.txt
+ 	- the Digital EtherWORKS DE4?? and DE5?? PCI Ethernet driver
+ decnet.txt
+--- /dev/null
++++ b/Documentation/networking/cxacru-cf.py
+@@ -0,0 +1,48 @@
++#!/usr/bin/env python
++# Copyright 2009 Simon Arlott
++#
++# This program is free software; you can redistribute it and/or modify it
++# under the terms of the GNU General Public License as published by the Free
++# Software Foundation; either version 2 of the License, or (at your option)
++# any later version.
++#
++# This program is distributed in the hope that it will be useful, but WITHOUT
++# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++# more details.
++#
++# You should have received a copy of the GNU General Public License along with
++# this program; if not, write to the Free Software Foundation, Inc., 59
++# Temple Place - Suite 330, Boston, MA  02111-1307, USA.
++#
++# Usage: cxacru-cf.py < cxacru-cf.bin
++# Output: values string suitable for the sysfs adsl_config attribute
++#
++# Warning: cxacru-cf.bin with MD5 hash cdbac2689969d5ed5d4850f117702110
++# contains mis-aligned values which will stop the modem from being able
++# to make a connection. If the first and last two bytes are removed then
++# the values become valid, but the modulation will be forced to ANSI
++# T1.413 only which may not be appropriate.
++#
++# The original binary format is a packed list of le32 values.
++
++import sys
++import struct
++
++i = 0
++while True:
++	buf = sys.stdin.read(4)
++
++	if len(buf) == 0:
++		break
++	elif len(buf) != 4:
++		sys.stdout.write("\n")
++		sys.stderr.write("Error: read {0} not 4 bytes\n".format(len(buf)))
++		sys.exit(1)
++
++	if i > 0:
++		sys.stdout.write(" ")
++	sys.stdout.write("{0:x}={1}".format(i, struct.unpack("<I", buf)[0]))
++	i += 1
++
++sys.stdout.write("\n")
+--- a/Documentation/networking/cxacru.txt
++++ b/Documentation/networking/cxacru.txt
+@@ -4,6 +4,12 @@ While it is capable of managing/maintain
+ module loaded, the device will sometimes stop responding after unloading the
+ driver and it is necessary to unplug/remove power to the device to fix this.
+ 
++Note: support for cxacru-cf.bin has been removed. It was not loaded correctly
++so it had no effect on the device configuration. Fixing it could have stopped
++existing devices working when an invalid configuration is supplied.
++
++There is a script cxacru-cf.py to convert an existing file to the sysfs form.
++
+ Detected devices will appear as ATM devices named "cxacru". In /sys/class/atm/
+ these are directories named cxacruN where N is the device number. A symlink
+ named device points to the USB interface device's directory which contains
+--- a/drivers/usb/atm/cxacru.c
++++ b/drivers/usb/atm/cxacru.c
+@@ -978,11 +978,9 @@ cleanup:
+ 
+ static void cxacru_upload_firmware(struct cxacru_data *instance,
+ 				   const struct firmware *fw,
+-				   const struct firmware *bp,
+-				   const struct firmware *cf)
++				   const struct firmware *bp)
+ {
+ 	int ret;
+-	int off;
+ 	struct usbatm_data *usbatm = instance->usbatm;
+ 	struct usb_device *usb_dev = usbatm->usb_dev;
+ 	__le16 signature[] = { usb_dev->descriptor.idVendor,
+@@ -1066,24 +1064,6 @@ static void cxacru_upload_firmware(struc
+ 		usb_err(usbatm, "modem failed to initialize: %d\n", ret);
+ 		return;
+ 	}
+-
+-	/* Load config data (le32), doing one packet at a time */
+-	if (cf)
+-		for (off = 0; off < cf->size / 4; ) {
+-			__le32 buf[CMD_PACKET_SIZE / 4 - 1];
+-			int i, len = min_t(int, cf->size / 4 - off, CMD_PACKET_SIZE / 4 / 2 - 1);
+-			buf[0] = cpu_to_le32(len);
+-			for (i = 0; i < len; i++, off++) {
+-				buf[i * 2 + 1] = cpu_to_le32(off);
+-				memcpy(buf + i * 2 + 2, cf->data + off * 4, 4);
+-			}
+-			ret = cxacru_cm(instance, CM_REQUEST_CARD_DATA_SET,
+-					(u8 *) buf, len, NULL, 0);
+-			if (ret < 0) {
+-				usb_err(usbatm, "load config data failed: %d\n", ret);
+-				return;
+-			}
+-		}
+ }
+ 
+ static int cxacru_find_firmware(struct cxacru_data *instance,
+@@ -1109,7 +1089,7 @@ static int cxacru_find_firmware(struct c
+ static int cxacru_heavy_init(struct usbatm_data *usbatm_instance,
+ 			     struct usb_interface *usb_intf)
+ {
+-	const struct firmware *fw, *bp, *cf;
++	const struct firmware *fw, *bp;
+ 	struct cxacru_data *instance = usbatm_instance->driver_data;
+ 
+ 	int ret = cxacru_find_firmware(instance, "fw", &fw);
+@@ -1127,13 +1107,8 @@ static int cxacru_heavy_init(struct usba
+ 		}
+ 	}
+ 
+-	if (cxacru_find_firmware(instance, "cf", &cf))		/* optional */
+-		cf = NULL;
+-
+-	cxacru_upload_firmware(instance, fw, bp, cf);
++	cxacru_upload_firmware(instance, fw, bp);
+ 
+-	if (cf)
+-		release_firmware(cf);
+ 	if (instance->modem_type->boot_rom_patch)
+ 		release_firmware(bp);
+ 	release_firmware(fw);

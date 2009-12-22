@@ -1,0 +1,111 @@
+From stern@rowland.harvard.edu  Tue Dec 22 11:35:17 2009
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Fri, 11 Dec 2009 16:20:20 -0500 (EST)
+Subject: USB: check the endpoint type against the pipe type
+To: Greg KH <greg@kroah.com>
+Cc: Ondrej Zary <linux@rainbow-software.org>,  USB list <linux-usb@vger.kernel.org>
+Message-ID: <Pine.LNX.4.44L0.0912111617360.2777-100000@iolanthe.rowland.org>
+
+
+This patch (as1316) adds some error checking to usb_submit_urb().
+It's conditional on CONFIG_USB_DEBUG, so it won't affect normal users.
+The new check makes sure that the actual type of the endpoint
+described by urb->pipe agrees with the type encoded in the pipe value.
+
+The USB error code documentation is updated to include the code
+returned by the new check, and the usbfs SUBMITURB handler is updated
+to use the correct pipe type when legacy user code tries to submit a
+bulk transfer to an interrupt endpoint.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ Documentation/usb/error-codes.txt |    6 ++++--
+ drivers/usb/core/devio.c          |   22 +++++++++++++---------
+ drivers/usb/core/urb.c            |    7 +++++++
+ 3 files changed, 24 insertions(+), 11 deletions(-)
+
+--- a/Documentation/usb/error-codes.txt
++++ b/Documentation/usb/error-codes.txt
+@@ -41,8 +41,8 @@ USB-specific:
+ 
+ -EFBIG		Host controller driver can't schedule that many ISO frames.
+ 
+--EPIPE		Specified endpoint is stalled.  For non-control endpoints,
+-		reset this status with usb_clear_halt().
++-EPIPE		The pipe type specified in the URB doesn't match the
++		endpoint's actual type.
+ 
+ -EMSGSIZE	(a) endpoint maxpacket size is zero; it is not usable
+ 		    in the current interface altsetting.
+@@ -60,6 +60,8 @@ USB-specific:
+ 
+ -EHOSTUNREACH	URB was rejected because the device is suspended.
+ 
++-ENOEXEC	A control URB doesn't contain a Setup packet.
++
+ 
+ **************************************************************************
+ *                   Error codes returned by in urb->status               *
+--- a/drivers/usb/core/devio.c
++++ b/drivers/usb/core/devio.c
+@@ -1104,13 +1104,25 @@ static int proc_do_submiturb(struct dev_
+ 		case USB_ENDPOINT_XFER_CONTROL:
+ 		case USB_ENDPOINT_XFER_ISOC:
+ 			return -EINVAL;
+-		/* allow single-shot interrupt transfers, at bogus rates */
++		case USB_ENDPOINT_XFER_INT:
++			/* allow single-shot interrupt transfers */
++			uurb->type = USBDEVFS_URB_TYPE_INTERRUPT;
++			goto interrupt_urb;
+ 		}
+ 		uurb->number_of_packets = 0;
+ 		if (uurb->buffer_length > MAX_USBFS_BUFFER_SIZE)
+ 			return -EINVAL;
+ 		break;
+ 
++	case USBDEVFS_URB_TYPE_INTERRUPT:
++		if (!usb_endpoint_xfer_int(&ep->desc))
++			return -EINVAL;
++ interrupt_urb:
++		uurb->number_of_packets = 0;
++		if (uurb->buffer_length > MAX_USBFS_BUFFER_SIZE)
++			return -EINVAL;
++		break;
++
+ 	case USBDEVFS_URB_TYPE_ISO:
+ 		/* arbitrary limit */
+ 		if (uurb->number_of_packets < 1 ||
+@@ -1143,14 +1155,6 @@ static int proc_do_submiturb(struct dev_
+ 		uurb->buffer_length = totlen;
+ 		break;
+ 
+-	case USBDEVFS_URB_TYPE_INTERRUPT:
+-		uurb->number_of_packets = 0;
+-		if (!usb_endpoint_xfer_int(&ep->desc))
+-			return -EINVAL;
+-		if (uurb->buffer_length > MAX_USBFS_BUFFER_SIZE)
+-			return -EINVAL;
+-		break;
+-
+ 	default:
+ 		return -EINVAL;
+ 	}
+--- a/drivers/usb/core/urb.c
++++ b/drivers/usb/core/urb.c
+@@ -387,6 +387,13 @@ int usb_submit_urb(struct urb *urb, gfp_
+ 	{
+ 	unsigned int	orig_flags = urb->transfer_flags;
+ 	unsigned int	allowed;
++	static int pipetypes[4] = {
++		PIPE_CONTROL, PIPE_ISOCHRONOUS, PIPE_BULK, PIPE_INTERRUPT
++	};
++
++	/* Check that the pipe's type matches the endpoint's type */
++	if (usb_pipetype(urb->pipe) != pipetypes[xfertype])
++		return -EPIPE;		/* The most suitable error code :-) */
+ 
+ 	/* enforce simple/standard policy */
+ 	allowed = (URB_NO_TRANSFER_DMA_MAP | URB_NO_SETUP_DMA_MAP |
