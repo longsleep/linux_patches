@@ -1,0 +1,138 @@
+From sarah.a.sharp@linux.intel.com  Thu Jan 14 16:51:02 2010
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Date: Wed, 6 Jan 2010 10:16:51 -0800
+Subject: USB: Fix duplicate sysfs problem after device reset.
+To: Greg KH <gregkh@suse.de>
+Message-ID: <20100106181651.GA4542@xanatos>
+
+
+Borislav Petkov reports issues with duplicate sysfs endpoint files after a
+resume from a hibernate.  It turns out that the code to support alternate
+settings under xHCI has issues when a device with a non-default alternate
+setting is reset during the hibernate:
+
+[  427.681810] Restarting tasks ...
+[  427.681995] hub 1-0:1.0: state 7 ports 6 chg 0004 evt 0000
+[  427.682019] usb usb3: usb resume
+[  427.682030] ohci_hcd 0000:00:12.0: wakeup root hub
+[  427.682191] hub 1-0:1.0: port 2, status 0501, change 0000, 480 Mb/s
+[  427.682205] usb 1-2: usb wakeup-resume
+[  427.682226] usb 1-2: finish reset-resume
+[  427.682886] done.
+[  427.734658] ehci_hcd 0000:00:12.2: port 2 high speed
+[  427.734663] ehci_hcd 0000:00:12.2: GetStatus port 2 status 001005 POWER sig=se0 PE CONNECT
+[  427.746682] hub 3-0:1.0: hub_reset_resume
+[  427.746693] hub 3-0:1.0: trying to enable port power on non-switchable hub
+[  427.786715] usb 1-2: reset high speed USB device using ehci_hcd and address 2
+[  427.839653] ehci_hcd 0000:00:12.2: port 2 high speed
+[  427.839666] ehci_hcd 0000:00:12.2: GetStatus port 2 status 001005 POWER sig=se0 PE CONNECT
+[  427.847717] ohci_hcd 0000:00:12.0: GetStatus roothub.portstatus [1] = 0x00010100 CSC PPS
+[  427.915497] hub 1-2:1.0: remove_intf_ep_devs: if: ffff88022f9e8800 ->ep_devs_created: 1
+[  427.915774] hub 1-2:1.0: remove_intf_ep_devs: bNumEndpoints: 1
+[  427.915934] hub 1-2:1.0: if: ffff88022f9e8800: endpoint devs removed.
+[  427.916158] hub 1-2:1.0: create_intf_ep_devs: if: ffff88022f9e8800 ->ep_devs_created: 0, ->unregistering: 0
+[  427.916434] hub 1-2:1.0: create_intf_ep_devs: bNumEndpoints: 1
+[  427.916609]  ep_81: create, parent hub
+[  427.916632] ------------[ cut here ]------------
+[  427.916644] WARNING: at fs/sysfs/dir.c:477 sysfs_add_one+0x82/0x96()
+[  427.916649] Hardware name: System Product Name
+[  427.916653] sysfs: cannot create duplicate filename '/devices/pci0000:00/0000:00:12.2/usb1/1-2/1-2:1.0/ep_81'
+[  427.916658] Modules linked in: binfmt_misc kvm_amd kvm powernow_k8 cpufreq_ondemand cpufreq_powersave cpufreq_userspace freq_table cpufreq_conservative ipv6 vfat fat
++8250_pnp 8250 pcspkr ohci_hcd serial_core k10temp edac_core
+[  427.916694] Pid: 278, comm: khubd Not tainted 2.6.33-rc2-00187-g08d869a-dirty #13
+[  427.916699] Call Trace:
+
+The problem is caused by a mismatch between the USB core's view of the
+device state and the USB device and xHCI host's view of the device state.
+
+After the device reset and re-configuration, the device and the xHCI host
+think they are using alternate setting 0 of all interfaces.  However, the
+USB core keeps track of the old state, which may include non-zero
+alternate settings.  It uses intf->cur_altsetting to keep the endpoint
+sysfs files for the old state across the reset.
+
+The bandwidth allocation functions need to know what the xHCI host thinks
+the current alternate settings are, so original patch set
+intf->cur_altsetting to the alternate setting 0.  This caused duplicate
+endpoint files to be created.
+
+The solution is to not set intf->cur_altsetting before calling
+usb_set_interface() in usb_reset_and_verify_device().  Instead, we add a
+new flag to struct usb_interface to tell usb_hcd_alloc_bandwidth() to use
+alternate setting 0 as the currently installed alternate setting.
+
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Tested-by: Borislav Petkov <petkovbb@googlemail.com>
+Cc: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/hcd.c |   18 ++++++++++++++++++
+ drivers/usb/core/hub.c |   15 +++++----------
+ include/linux/usb.h    |    1 +
+ 3 files changed, 24 insertions(+), 10 deletions(-)
+
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -1684,6 +1684,24 @@ int usb_hcd_alloc_bandwidth(struct usb_d
+ 		}
+ 	}
+ 	if (cur_alt && new_alt) {
++		struct usb_interface *iface = usb_ifnum_to_if(udev,
++				cur_alt->desc.bInterfaceNumber);
++
++		if (iface->resetting_device) {
++			/*
++			 * The USB core just reset the device, so the xHCI host
++			 * and the device will think alt setting 0 is installed.
++			 * However, the USB core will pass in the alternate
++			 * setting installed before the reset as cur_alt.  Dig
++			 * out the alternate setting 0 structure, or the first
++			 * alternate setting if a broken device doesn't have alt
++			 * setting 0.
++			 */
++			cur_alt = usb_altnum_to_altsetting(iface, 0);
++			if (!cur_alt)
++				cur_alt = &iface->altsetting[0];
++		}
++
+ 		/* Drop all the endpoints in the current alt setting */
+ 		for (i = 0; i < cur_alt->desc.bNumEndpoints; i++) {
+ 			ret = hcd->driver->drop_endpoint(hcd, udev,
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -3695,19 +3695,14 @@ static int usb_reset_and_verify_device(s
+ 			usb_enable_interface(udev, intf, true);
+ 			ret = 0;
+ 		} else {
+-			/* We've just reset the device, so it will think alt
+-			 * setting 0 is installed.  For usb_set_interface() to
+-			 * work properly, we need to set the current alternate
+-			 * interface setting to 0 (or the first alt setting, if
+-			 * the device doesn't have alt setting 0).
++			/* Let the bandwidth allocation function know that this
++			 * device has been reset, and it will have to use
++			 * alternate setting 0 as the current alternate setting.
+ 			 */
+-			intf->cur_altsetting =
+-				usb_find_alt_setting(config, i, 0);
+-			if (!intf->cur_altsetting)
+-				intf->cur_altsetting =
+-					&config->intf_cache[i]->altsetting[0];
++			intf->resetting_device = 1;
+ 			ret = usb_set_interface(udev, desc->bInterfaceNumber,
+ 					desc->bAlternateSetting);
++			intf->resetting_device = 0;
+ 		}
+ 		if (ret < 0) {
+ 			dev_err(&udev->dev, "failed to restore interface %d "
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -192,6 +192,7 @@ struct usb_interface {
+ 	unsigned needs_altsetting0:1;	/* switch to altsetting 0 is pending */
+ 	unsigned needs_binding:1;	/* needs delayed unbind/rebind */
+ 	unsigned reset_running:1;
++	unsigned resetting_device:1;	/* true: bandwidth alloc after reset */
+ 
+ 	struct device dev;		/* interface specific device info */
+ 	struct device *usb_dev;
