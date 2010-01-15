@@ -1,0 +1,92 @@
+From stern@rowland.harvard.edu  Fri Jan 15 13:39:30 2010
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Fri, 8 Jan 2010 12:57:02 -0500 (EST)
+Subject: USB: change handling of negative autosuspend delays
+To: Greg KH <greg@kroah.com>
+Message-ID: <Pine.LNX.4.44L0.1001081252430.4862-100000@iolanthe.rowland.org>
+
+
+This patch (as1327) changes the way negative autosuspend delays
+prevent device from autosuspending.  The current code checks for
+negative values explicitly in the autosuspend_check() routine.  The
+updated code keeps things from getting that far by using
+usb_autoresume_device() to increment the usage counter when a negative
+delay is set, and by using usb_autosuspend_device() to decrement the
+usage counter when a non-negative delay is set.
+
+This complicates the set_autosuspend() attribute method code slightly,
+but it will reduce the overall power management overhead.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/quirks.c |   10 ++++++++++
+ drivers/usb/core/sysfs.c  |   22 +++++++++++++++++-----
+ 2 files changed, 27 insertions(+), 5 deletions(-)
+
+--- a/drivers/usb/core/quirks.c
++++ b/drivers/usb/core/quirks.c
+@@ -103,11 +103,21 @@ void usb_detect_quirks(struct usb_device
+ 		dev_dbg(&udev->dev, "USB quirks for this device: %x\n",
+ 				udev->quirks);
+ 
++#ifdef	CONFIG_USB_SUSPEND
++
+ 	/* By default, disable autosuspend for all devices.  The hub driver
+ 	 * will enable it for hubs.
+ 	 */
+ 	usb_disable_autosuspend(udev);
+ 
++	/* Autosuspend can also be disabled if the initial autosuspend_delay
++	 * is negative.
++	 */
++	if (udev->autosuspend_delay < 0)
++		usb_autoresume_device(udev);
++
++#endif
++
+ 	/* For the present, all devices default to USB-PERSIST enabled */
+ #if 0		/* was: #ifdef CONFIG_PM */
+ 	/* Hubs are automatically enabled for USB-PERSIST */
+--- a/drivers/usb/core/sysfs.c
++++ b/drivers/usb/core/sysfs.c
+@@ -346,7 +346,8 @@ set_autosuspend(struct device *dev, stru
+ 		const char *buf, size_t count)
+ {
+ 	struct usb_device *udev = to_usb_device(dev);
+-	int value;
++	int value, old_delay;
++	int rc;
+ 
+ 	if (sscanf(buf, "%d", &value) != 1 || value >= INT_MAX/HZ ||
+ 			value <= - INT_MAX/HZ)
+@@ -354,13 +355,24 @@ set_autosuspend(struct device *dev, stru
+ 	value *= HZ;
+ 
+ 	usb_lock_device(udev);
++	old_delay = udev->autosuspend_delay;
+ 	udev->autosuspend_delay = value;
+-	if (value >= 0)
+-		usb_try_autosuspend_device(udev);
+-	else {
+-		if (usb_autoresume_device(udev) == 0)
++
++	if (old_delay < 0) {	/* Autosuspend wasn't allowed */
++		if (value >= 0)
+ 			usb_autosuspend_device(udev);
++	} else {		/* Autosuspend was allowed */
++		if (value < 0) {
++			rc = usb_autoresume_device(udev);
++			if (rc < 0) {
++				count = rc;
++				udev->autosuspend_delay = old_delay;
++			}
++		} else {
++			usb_try_autosuspend_device(udev);
++		}
+ 	}
++
+ 	usb_unlock_device(udev);
+ 	return count;
+ }

@@ -1,0 +1,167 @@
+From stern@rowland.harvard.edu  Fri Jan 15 13:38:29 2010
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Fri, 8 Jan 2010 12:56:19 -0500 (EST)
+Subject: USB: change locking for device-level autosuspend
+To: Greg KH <greg@kroah.com>
+Message-ID: <Pine.LNX.4.44L0.1001081249160.4862-100000@iolanthe.rowland.org>
+
+
+This patch (as1323) changes the locking requirements for
+usb_autosuspend_device(), usb_autoresume_device(), and
+usb_try_autosuspend_device().  This isn't a very important change;
+mainly it's meant to make the locking more uniform.
+
+The most tricky part of the patch involves changes to usbdev_open().
+To avoid an ABBA locking problem, it was necessary to reduce the
+region protected by usbfs_mutex.  Since that mutex now protects only
+against simultaneous open and remove, this posed no difficulty -- its
+scope was larger than necessary.
+
+And it turns out that usbfs_mutex is no longer needed in
+usbdev_release() at all.  The list of usbfs "ps" structures is now
+protected by the device lock instead of by usbfs_mutex.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/devio.c  |   40 ++++++++++++++++++++++++----------------
+ drivers/usb/core/driver.c |    8 ++++----
+ drivers/usb/core/sysfs.c  |    2 ++
+ 3 files changed, 30 insertions(+), 20 deletions(-)
+
+--- a/drivers/usb/core/devio.c
++++ b/drivers/usb/core/devio.c
+@@ -654,19 +654,21 @@ static int usbdev_open(struct inode *ino
+ 	int ret;
+ 
+ 	lock_kernel();
+-	/* Protect against simultaneous removal or release */
+-	mutex_lock(&usbfs_mutex);
+ 
+ 	ret = -ENOMEM;
+ 	ps = kmalloc(sizeof(struct dev_state), GFP_KERNEL);
+ 	if (!ps)
+-		goto out;
++		goto out_free_ps;
+ 
+ 	ret = -ENODEV;
+ 
++	/* Protect against simultaneous removal or release */
++	mutex_lock(&usbfs_mutex);
++
+ 	/* usbdev device-node */
+ 	if (imajor(inode) == USB_DEVICE_MAJOR)
+ 		dev = usbdev_lookup_by_devt(inode->i_rdev);
++
+ #ifdef CONFIG_USB_DEVICEFS
+ 	/* procfs file */
+ 	if (!dev) {
+@@ -678,13 +680,19 @@ static int usbdev_open(struct inode *ino
+ 			dev = NULL;
+ 	}
+ #endif
+-	if (!dev || dev->state == USB_STATE_NOTATTACHED)
+-		goto out;
++	mutex_unlock(&usbfs_mutex);
++
++	if (!dev)
++		goto out_free_ps;
++
++	usb_lock_device(dev);
++	if (dev->state == USB_STATE_NOTATTACHED)
++		goto out_unlock_device;
++
+ 	ret = usb_autoresume_device(dev);
+ 	if (ret)
+-		goto out;
++		goto out_unlock_device;
+ 
+-	ret = 0;
+ 	ps->dev = dev;
+ 	ps->file = file;
+ 	spin_lock_init(&ps->lock);
+@@ -702,14 +710,17 @@ static int usbdev_open(struct inode *ino
+ 	smp_wmb();
+ 	list_add_tail(&ps->list, &dev->filelist);
+ 	file->private_data = ps;
++	usb_unlock_device(dev);
+ 	snoop(&dev->dev, "opened by process %d: %s\n", task_pid_nr(current),
+ 			current->comm);
+- out:
+-	if (ret) {
+-		kfree(ps);
+-		usb_put_dev(dev);
+-	}
+-	mutex_unlock(&usbfs_mutex);
++	unlock_kernel();
++	return ret;
++
++ out_unlock_device:
++	usb_unlock_device(dev);
++	usb_put_dev(dev);
++ out_free_ps:
++	kfree(ps);
+ 	unlock_kernel();
+ 	return ret;
+ }
+@@ -724,10 +735,7 @@ static int usbdev_release(struct inode *
+ 	usb_lock_device(dev);
+ 	usb_hub_release_all_ports(dev, ps);
+ 
+-	/* Protect against simultaneous open */
+-	mutex_lock(&usbfs_mutex);
+ 	list_del_init(&ps->list);
+-	mutex_unlock(&usbfs_mutex);
+ 
+ 	for (ifnum = 0; ps->ifclaimed && ifnum < 8*sizeof(ps->ifclaimed);
+ 			ifnum++) {
+--- a/drivers/usb/core/driver.c
++++ b/drivers/usb/core/driver.c
+@@ -1470,8 +1470,7 @@ void usb_autoresume_work(struct work_str
+  * driver requires remote-wakeup capability during autosuspend but remote
+  * wakeup is disabled, the autosuspend will fail.
+  *
+- * Often the caller will hold @udev's device lock, but this is not
+- * necessary.
++ * The caller must hold @udev's device lock.
+  *
+  * This routine can run only in process context.
+  */
+@@ -1495,6 +1494,8 @@ void usb_autosuspend_device(struct usb_d
+  * for an active interface is greater than 0, or autosuspend is not allowed
+  * for any other reason, no autosuspend request will be queued.
+  *
++ * The caller must hold @udev's device lock.
++ *
+  * This routine can run only in process context.
+  */
+ void usb_try_autosuspend_device(struct usb_device *udev)
+@@ -1518,8 +1519,7 @@ void usb_try_autosuspend_device(struct u
+  * @udev's usage counter is incremented to prevent subsequent autosuspends.
+  * However if the autoresume fails then the usage counter is re-decremented.
+  *
+- * Often the caller will hold @udev's device lock, but this is not
+- * necessary (and attempting it might cause deadlock).
++ * The caller must hold @udev's device lock.
+  *
+  * This routine can run only in process context.
+  */
+--- a/drivers/usb/core/sysfs.c
++++ b/drivers/usb/core/sysfs.c
+@@ -352,6 +352,7 @@ set_autosuspend(struct device *dev, stru
+ 		return -EINVAL;
+ 	value *= HZ;
+ 
++	usb_lock_device(udev);
+ 	udev->autosuspend_delay = value;
+ 	if (value >= 0)
+ 		usb_try_autosuspend_device(udev);
+@@ -359,6 +360,7 @@ set_autosuspend(struct device *dev, stru
+ 		if (usb_autoresume_device(udev) == 0)
+ 			usb_autosuspend_device(udev);
+ 	}
++	usb_unlock_device(udev);
+ 	return count;
+ }
+ 
