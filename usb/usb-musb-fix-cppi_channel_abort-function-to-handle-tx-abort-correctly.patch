@@ -1,0 +1,99 @@
+From felipe.balbi@nokia.com  Fri Jan 15 10:39:23 2010
+From: Felipe Balbi <felipe.balbi@nokia.com>
+Date: Mon, 28 Dec 2009 13:40:38 +0200
+Subject: usb: musb: Fix cppi_channel_abort() function to handle Tx abort correctly
+To: Greg Kroah-Hartman <gregkh@suse.de>
+Cc: linux-usb@vger.kernel.org, Swaminathan S <swami.iyer@ti.com>, Felipe Balbi <felipe.balbi@nokia.com>
+Message-ID: <1262000446-19672-6-git-send-email-felipe.balbi@nokia.com>
+
+
+From: Swaminathan S <swami.iyer@ti.com>
+
+This patch fixes the Tx abort/teardown logic. We now wait for the teardown
+completion interrupt and acknowledge the same by setting the tx_complete
+register to 0.
+
+This change is needed to ensure that abort processing works on DM365 platform.
+Without this change after completion of abort processing the system is
+overwhelmed with continuous stream of abort interrupts.
+
+This change has been tested on all CPPI3.x platforms (DM644x, DM646x, DM35x,
+DM36x).
+
+Signed-off-by: Swaminathan S <swami.iyer@ti.com>
+Signed-off-by: Felipe Balbi <felipe.balbi@nokia.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/musb/cppi_dma.c |   33 ++++++++++-----------------------
+ 1 file changed, 10 insertions(+), 23 deletions(-)
+
+--- a/drivers/usb/musb/cppi_dma.c
++++ b/drivers/usb/musb/cppi_dma.c
+@@ -1191,8 +1191,13 @@ irqreturn_t cppi_interrupt(int irq, void
+ 
+ 		bd = tx_ch->head;
+ 
++		/*
++		 * If Head is null then this could mean that a abort interrupt
++		 * that needs to be acknowledged.
++		 */
+ 		if (NULL == bd) {
+ 			DBG(1, "null BD\n");
++			tx_ram->tx_complete = 0;
+ 			continue;
+ 		}
+ 
+@@ -1412,15 +1417,6 @@ static int cppi_channel_abort(struct dma
+ 
+ 	if (cppi_ch->transmit) {
+ 		struct cppi_tx_stateram __iomem *tx_ram;
+-		int			enabled;
+-
+-		/* mask interrupts raised to signal teardown complete.  */
+-		enabled = musb_readl(tibase, DAVINCI_TXCPPI_INTENAB_REG)
+-				& (1 << cppi_ch->index);
+-		if (enabled)
+-			musb_writel(tibase, DAVINCI_TXCPPI_INTCLR_REG,
+-					(1 << cppi_ch->index));
+-
+ 		/* REVISIT put timeouts on these controller handshakes */
+ 
+ 		cppi_dump_tx(6, cppi_ch, " (teardown)");
+@@ -1435,7 +1431,6 @@ static int cppi_channel_abort(struct dma
+ 		do {
+ 			value = musb_readl(&tx_ram->tx_complete, 0);
+ 		} while (0xFFFFFFFC != value);
+-		musb_writel(&tx_ram->tx_complete, 0, 0xFFFFFFFC);
+ 
+ 		/* FIXME clean up the transfer state ... here?
+ 		 * the completion routine should get called with
+@@ -1448,23 +1443,15 @@ static int cppi_channel_abort(struct dma
+ 		musb_writew(regs, MUSB_TXCSR, value);
+ 		musb_writew(regs, MUSB_TXCSR, value);
+ 
+-		/* While we scrub the TX state RAM, ensure that we clean
+-		 * up any interrupt that's currently asserted:
++		/*
+ 		 * 1. Write to completion Ptr value 0x1(bit 0 set)
+ 		 *    (write back mode)
+-		 * 2. Write to completion Ptr value 0x0(bit 0 cleared)
+-		 *    (compare mode)
+-		 * Value written is compared(for bits 31:2) and when
+-		 * equal, interrupt is deasserted.
++		 * 2. Wait for abort interrupt and then put the channel in
++		 *    compare mode by writing 1 to the tx_complete register.
+ 		 */
+ 		cppi_reset_tx(tx_ram, 1);
+-		musb_writel(&tx_ram->tx_complete, 0, 0);
+-
+-		/* re-enable interrupt */
+-		if (enabled)
+-			musb_writel(tibase, DAVINCI_TXCPPI_INTENAB_REG,
+-					(1 << cppi_ch->index));
+-
++		cppi_ch->head = 0;
++		musb_writel(&tx_ram->tx_complete, 0, 1);
+ 		cppi_dump_tx(5, cppi_ch, " (done teardown)");
+ 
+ 		/* REVISIT tx side _should_ clean up the same way
