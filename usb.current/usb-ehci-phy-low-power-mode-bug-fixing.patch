@@ -1,0 +1,58 @@
+From alek.du@intel.com  Wed Jan 27 14:41:05 2010
+From: alek du <alek.du@intel.com>
+Date: Tue, 19 Jan 2010 16:31:31 +0800
+Subject: USB: ehci: phy low power mode bug fixing
+To: Arnd Bergmann <arnd@arndb.de>, Greg KH <greg@kroah.com>
+Cc: Julia Lawall <julia@diku.dk>, Andreas Mohr <andi@lisas.de>, "Pan, Jacob jun" <jacob.jun.pan@intel.com>, Alan Stern <stern@rowland.harvard.edu>
+Message-ID: <20100119163131.0af9f540@dxy2>
+
+
+From: Alek Du <alek.du@intel.com>
+
+1. There are two msleep calls inside two spin lock sections, need to unlock
+   and lock again after msleep.
+2. Save a extra status reg setting.
+
+Signed-off-by: Alek Du <alek.du@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/ehci-hub.c |   13 ++++++++-----
+ 1 file changed, 8 insertions(+), 5 deletions(-)
+
+--- a/drivers/usb/host/ehci-hub.c
++++ b/drivers/usb/host/ehci-hub.c
+@@ -196,7 +196,9 @@ static int ehci_bus_suspend (struct usb_
+ 			if (hostpc_reg) {
+ 				u32	t3;
+ 
++				spin_unlock_irq(&ehci->lock);
+ 				msleep(5);/* 5ms for HCD enter low pwr mode */
++				spin_lock_irq(&ehci->lock);
+ 				t3 = ehci_readl(ehci, hostpc_reg);
+ 				ehci_writel(ehci, t3 | HOSTPC_PHCD, hostpc_reg);
+ 				t3 = ehci_readl(ehci, hostpc_reg);
+@@ -904,17 +906,18 @@ static int ehci_hub_control (
+ 			if ((temp & PORT_PE) == 0
+ 					|| (temp & PORT_RESET) != 0)
+ 				goto error;
+-			ehci_writel(ehci, temp | PORT_SUSPEND, status_reg);
++
+ 			/* After above check the port must be connected.
+ 			 * Set appropriate bit thus could put phy into low power
+ 			 * mode if we have hostpc feature
+ 			 */
++			temp &= ~PORT_WKCONN_E;
++			temp |= PORT_WKDISC_E | PORT_WKOC_E;
++			ehci_writel(ehci, temp | PORT_SUSPEND, status_reg);
+ 			if (hostpc_reg) {
+-				temp &= ~PORT_WKCONN_E;
+-				temp |= (PORT_WKDISC_E | PORT_WKOC_E);
+-				ehci_writel(ehci, temp | PORT_SUSPEND,
+-							status_reg);
++				spin_unlock_irqrestore(&ehci->lock, flags);
+ 				msleep(5);/* 5ms for HCD enter low pwr mode */
++				spin_lock_irqsave(&ehci->lock, flags);
+ 				temp1 = ehci_readl(ehci, hostpc_reg);
+ 				ehci_writel(ehci, temp1 | HOSTPC_PHCD,
+ 					hostpc_reg);
