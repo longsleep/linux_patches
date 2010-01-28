@@ -1,0 +1,108 @@
+From m.nazarewicz@samsung.com  Thu Jan 28 09:55:26 2010
+From: Michal Nazarewicz <m.nazarewicz@samsung.com>
+Date: Thu, 28 Jan 2010 13:05:26 +0100
+Subject: USB: mass_storage: eject LUNs on thread exit
+To: linux-usb@vger.kernel.org, linux-next@vger.kernel.org
+Cc: Greg KH <greg@kroah.com>, Alan Stern <stern@rowland.harvard.edu>, David Brownell <dbrownell@users.sourceforge.net>, Marek Szyprowski <m.szyprowski@samsung.com>, Kyungmin Park <kyungmin.park@samsung.com>, Michal Nazarewicz <m.nazarewicz@samsung.com>
+Message-ID: <1264680326-20671-1-git-send-email-m.nazarewicz@samsung.com>
+
+
+Adds a fallback which forces all LUNs ejection (including
+non-removable and with prevent_medium_removal flag) when mass storage
+function (MSF) worker thread exits and gadget fails to handle the
+situation.
+
+Previously, if thread_exits was not specified mass storage function
+(MSF) did nothing when exiting thread as it's unclear for *function*
+what to do when it's thread terminates so responsibility of handling
+this situation was left to the *gadget* using the function.
+
+The g_mass_storage handled the situation by unregistering itself (the
+same thing that file storage gadget does).  However, g_multi did
+nothing and so MSF did not eject LUNs which prevented file system
+unmounting.
+
+Signed-off-by: Michal Nazarewicz <m.nazarewicz@samsung.com>
+Reviewed-by: Kyungmin Park <kyungmin.park@samsung.com>
+Cc: David Brownell <dbrownell@users.sourceforge.net>
+Cc: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/gadget/f_mass_storage.c |   26 +++++++++++++++++++++-----
+ drivers/usb/gadget/mass_storage.c   |    8 +++++++-
+ 2 files changed, 28 insertions(+), 6 deletions(-)
+
+--- a/drivers/usb/gadget/f_mass_storage.c
++++ b/drivers/usb/gadget/f_mass_storage.c
+@@ -368,7 +368,7 @@ struct fsg_common {
+ 	struct task_struct	*thread_task;
+ 
+ 	/* Callback function to call when thread exits. */
+-	void			(*thread_exits)(struct fsg_common *common);
++	int			(*thread_exits)(struct fsg_common *common);
+ 	/* Gadget's private data. */
+ 	void			*private_data;
+ 
+@@ -392,8 +392,12 @@ struct fsg_config {
+ 	const char		*lun_name_format;
+ 	const char		*thread_name;
+ 
+-	/* Callback function to call when thread exits. */
+-	void			(*thread_exits)(struct fsg_common *common);
++	/* Callback function to call when thread exits.  If no
++	 * callback is set or it returns value lower then zero MSF
++	 * will force eject all LUNs it operates on (including those
++	 * marked as non-removable or with prevent_medium_removal flag
++	 * set). */
++	int			(*thread_exits)(struct fsg_common *common);
+ 	/* Gadget's private data. */
+ 	void			*private_data;
+ 
+@@ -2615,8 +2619,20 @@ static int fsg_main_thread(void *common_
+ 	common->thread_task = NULL;
+ 	spin_unlock_irq(&common->lock);
+ 
+-	if (common->thread_exits)
+-		common->thread_exits(common);
++	if (!common->thread_exits || common->thread_exits(common) < 0) {
++		struct fsg_lun *curlun = common->luns;
++		unsigned i = common->nluns;
++
++		down_write(&common->filesem);
++		for (; i--; ++curlun) {
++			if (!fsg_lun_is_open(curlun))
++				continue;
++
++			fsg_lun_close(curlun);
++			curlun->unit_attention_data = SS_MEDIUM_NOT_PRESENT;
++		}
++		up_write(&common->filesem);
++	}
+ 
+ 	/* Let the unbind and cleanup routines know the thread has exited */
+ 	complete_and_exit(&common->thread_notifier, 0);
+--- a/drivers/usb/gadget/mass_storage.c
++++ b/drivers/usb/gadget/mass_storage.c
+@@ -135,6 +135,12 @@ FSG_MODULE_PARAMETERS(/* no prefix */, m
+ static unsigned long msg_registered = 0;
+ static void msg_cleanup(void);
+ 
++static int msg_thread_exits(struct fsg_common *common)
++{
++	msg_cleanup();
++	return 0;
++}
++
+ static int __init msg_do_config(struct usb_configuration *c)
+ {
+ 	struct fsg_common *common;
+@@ -147,7 +153,7 @@ static int __init msg_do_config(struct u
+ 	}
+ 
+ 	fsg_config_from_params(&config, &mod_data);
+-	config.thread_exits = (void(*)(struct fsg_common*))&msg_cleanup;
++	config.thread_exits = msg_thread_exits;
+ 	common = fsg_common_init(0, c->cdev, &config);
+ 	if (IS_ERR(common))
+ 		return PTR_ERR(common);
