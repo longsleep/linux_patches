@@ -1,0 +1,188 @@
+From martyn.welch@ge.com  Thu Feb 25 10:08:52 2010
+From: Martyn Welch <martyn.welch@ge.com>
+Date: Thu, 18 Feb 2010 15:12:58 +0000
+Subject: Staging: vme: Attribute Testing For Dma Request
+To: gregkh@suse.de
+Cc: devel@linuxdriverproject.org
+Message-ID: <20100218151258.10665.36110.stgit@ES-J7S4D2J.amer.consind.ge.com>
+
+
+From: Martyn Welch <martyn.welch@gefanuc.com>
+
+Check the directions in which the DMA controller is expected to operate
+before giving control of a resource.
+
+Signed-off-by: Martyn Welch <martyn.welch@gefanuc.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/staging/vme/TODO                   |   22 ----------------------
+ drivers/staging/vme/bridges/vme_ca91cx42.c |    2 ++
+ drivers/staging/vme/bridges/vme_tsi148.c   |    4 ++++
+ drivers/staging/vme/vme.c                  |    8 +++++---
+ drivers/staging/vme/vme.h                  |   10 +++++++++-
+ drivers/staging/vme/vme_api.txt            |   27 +++++++++++++++++++--------
+ drivers/staging/vme/vme_bridge.h           |    1 +
+ 7 files changed, 40 insertions(+), 34 deletions(-)
+
+--- a/drivers/staging/vme/TODO
++++ b/drivers/staging/vme/TODO
+@@ -4,28 +4,6 @@
+ API
+ ===
+ 
+-DMA Resource Allocation incomplete
+-----------------------------------
+-
+-The current DMA resource Allocation provides no means of selecting the
+-suitability of a DMA controller based on it's supported modes of operation, as
+-opposed to the resource allocation mechanisms for master and slave windows:
+-
+-	struct vme_resource *vme_dma_request(struct device *dev);
+-
+-As opposed to:
+-
+-	struct vme_resource * vme_master_request(struct device *dev,
+-		vme_address_t aspace, vme_cycle_t cycle, vme_width_t width);
+-
+-The TSI148 can perform, VME-to-PCI, PCI-to-VME, PATTERN-to-VME, PATTERN-to-PCI,
+-VME-to-VME and PCI-to-PCI transfers. The CA91C142 can only provide VME-to-PCI
+-and PCI-to-VME.
+-
+-Add a mechanism to select a VME controller based on source/target type,
+-required aspace, cycle and width requirements.
+-
+-
+ Master window broadcast select mask
+ -----------------------------------
+ 
+--- a/drivers/staging/vme/bridges/vme_ca91cx42.c
++++ b/drivers/staging/vme/bridges/vme_ca91cx42.c
+@@ -1109,6 +1109,8 @@ static int ca91cx42_probe(struct pci_dev
+ 		mutex_init(&(dma_ctrlr->mtx));
+ 		dma_ctrlr->locked = 0;
+ 		dma_ctrlr->number = i;
++		dma_ctrlr->route_attr = VME_DMA_VME_TO_MEM |
++			VME_DMA_MEM_TO_VME;
+ 		INIT_LIST_HEAD(&(dma_ctrlr->pending));
+ 		INIT_LIST_HEAD(&(dma_ctrlr->running));
+ 		list_add_tail(&(dma_ctrlr->list),
+--- a/drivers/staging/vme/bridges/vme_tsi148.c
++++ b/drivers/staging/vme/bridges/vme_tsi148.c
+@@ -2421,6 +2421,10 @@ static int tsi148_probe(struct pci_dev *
+ 		mutex_init(&(dma_ctrlr->mtx));
+ 		dma_ctrlr->locked = 0;
+ 		dma_ctrlr->number = i;
++		dma_ctrlr->route_attr = VME_DMA_VME_TO_MEM |
++			VME_DMA_MEM_TO_VME | VME_DMA_VME_TO_VME |
++			VME_DMA_MEM_TO_MEM | VME_DMA_PATTERN_TO_VME |
++			VME_DMA_PATTERN_TO_MEM;
+ 		INIT_LIST_HEAD(&(dma_ctrlr->pending));
+ 		INIT_LIST_HEAD(&(dma_ctrlr->running));
+ 		list_add_tail(&(dma_ctrlr->list),
+--- a/drivers/staging/vme/vme.c
++++ b/drivers/staging/vme/vme.c
+@@ -643,7 +643,7 @@ EXPORT_SYMBOL(vme_master_free);
+  * Request a DMA controller with specific attributes, return some unique
+  * identifier.
+  */
+-struct vme_resource *vme_dma_request(struct device *dev)
++struct vme_resource *vme_dma_request(struct device *dev, vme_dma_route_t route)
+ {
+ 	struct vme_bridge *bridge;
+ 	struct list_head *dma_pos = NULL;
+@@ -670,9 +670,11 @@ struct vme_resource *vme_dma_request(str
+ 			continue;
+ 		}
+ 
+-		/* Find an unlocked controller */
++		/* Find an unlocked and compatible controller */
+ 		mutex_lock(&(dma_ctrlr->mtx));
+-		if (dma_ctrlr->locked == 0) {
++		if (((dma_ctrlr->route_attr & route) == route) &&
++			(dma_ctrlr->locked == 0)) {
++
+ 			dma_ctrlr->locked = 1;
+ 			mutex_unlock(&(dma_ctrlr->mtx));
+ 			allocated_ctrlr = dma_ctrlr;
+--- a/drivers/staging/vme/vme.h
++++ b/drivers/staging/vme/vme.h
+@@ -68,6 +68,14 @@ typedef u32 vme_pattern_t;
+ #define VME_DMA_PATTERN_WORD		(1<<1)
+ #define VME_DMA_PATTERN_INCREMENT	(1<<2)
+ 
++typedef u32 vme_dma_route_t;
++#define VME_DMA_VME_TO_MEM		(1<<0)
++#define VME_DMA_MEM_TO_VME		(1<<1)
++#define VME_DMA_VME_TO_VME		(1<<2)
++#define VME_DMA_MEM_TO_MEM		(1<<3)
++#define VME_DMA_PATTERN_TO_VME		(1<<4)
++#define VME_DMA_PATTERN_TO_MEM		(1<<5)
++
+ struct vme_dma_attr {
+ 	vme_dma_t type;
+ 	void *private;
+@@ -124,7 +132,7 @@ unsigned int vme_master_rmw(struct vme_r
+ 	unsigned int, loff_t);
+ void vme_master_free(struct vme_resource *);
+ 
+-struct vme_resource *vme_dma_request(struct device *);
++struct vme_resource *vme_dma_request(struct device *, vme_dma_route_t);
+ struct vme_dma_list *vme_new_dma_list(struct vme_resource *);
+ struct vme_dma_attr *vme_dma_pattern_attribute(u32, vme_pattern_t);
+ struct vme_dma_attr *vme_dma_pci_attribute(dma_addr_t);
+--- a/drivers/staging/vme/vme_api.txt
++++ b/drivers/staging/vme/vme_api.txt
+@@ -77,16 +77,21 @@ driver in question:
+ 	struct vme_resource * vme_slave_request(struct device *dev,
+ 		vme_address_t aspace, vme_cycle_t cycle);
+ 
+-	struct vme_resource *vme_dma_request(struct device *dev);
++	struct vme_resource *vme_dma_request(struct device *dev,
++		vme_dma_route_t route);
+ 
+ For slave windows these attributes are split into those of type 'vme_address_t'
+-and 'vme_cycle_t'. Master windows add a further set of attributes 'vme_cycle_t'.
+-These attributes are defined as bitmasks and as such any combination of the
+-attributes can be requested for a single window, the core will assign a window
+-that meets the requirements, returning a pointer of type vme_resource that
+-should be used to identify the allocated resource when it is used. If an
+-unallocated window fitting the requirements can not be found a NULL pointer will
+-be returned.
++and 'vme_cycle_t'. Master windows add a further set of attributes
++'vme_cycle_t'.  These attributes are defined as bitmasks and as such any
++combination of the attributes can be requested for a single window, the core
++will assign a window that meets the requirements, returning a pointer of type
++vme_resource that should be used to identify the allocated resource when it is
++used. For DMA controllers, the request function requires the potential
++direction of any transfers to be provided in the route attributes. This is
++typically VME-to-MEM and/or MEM-to-VME, though some hardware can support
++VME-to-VME and MEM-to-MEM transfers as well as test pattern generation. If an
++unallocated window fitting the requirements can not be found a NULL pointer
++will be returned.
+ 
+ Functions are also provided to free window allocations once they are no longer
+ required. These functions should be passed the pointer to the resource provided
+@@ -237,6 +242,12 @@ covered under "Transfer Attributes"):
+ 		struct vme_dma_attr *src, struct vme_dma_attr *dest,
+ 		size_t count);
+ 
++NOTE:	The detailed attributes of the transfers source and destination
++	are not checked until an entry is added to a DMA list, the request
++	for a DMA channel purely checks the directions in which the
++	controller is expected to transfer data. As a result it is
++	possible for this call to return an error, for example if the
++	source or destination is in an unsupported VME address space.
+ 
+ Transfer Attributes
+ -------------------
+--- a/drivers/staging/vme/vme_bridge.h
++++ b/drivers/staging/vme/vme_bridge.h
+@@ -64,6 +64,7 @@ struct vme_dma_resource {
+ 	int number;
+ 	struct list_head pending;
+ 	struct list_head running;
++	vme_dma_route_t route_attr;
+ };
+ 
+ struct vme_lm_resource {
