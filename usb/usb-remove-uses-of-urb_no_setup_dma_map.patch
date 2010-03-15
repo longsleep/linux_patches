@@ -1,0 +1,405 @@
+From stern@rowland.harvard.edu  Mon Mar 15 16:31:41 2010
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Fri, 5 Mar 2010 15:10:17 -0500 (EST)
+Subject: USB: remove uses of URB_NO_SETUP_DMA_MAP
+To: Greg KH <greg@kroah.com>
+Cc: Albert Herranz <albert_herranz@yahoo.es>
+Message-ID: <Pine.LNX.4.44L0.1003051508520.1384-100000@iolanthe.rowland.org>
+
+
+This patch (as1350) removes all usages of coherent buffers for USB
+control-request setup-packet buffers.  There's no good reason to
+reserve coherent memory for these things; control requests are hardly
+ever used in large quantity (the major exception is firmware
+transfers, and they aren't time-critical).  Furthermore, only seven
+drivers used it.  We might as well always use streaming DMA mappings
+for setup-packet buffers, and remove some extra complexity from
+usbcore.
+
+The DMA-mapping portion of hcd.c is currently in flux.  A separate
+patch will be submitted to remove support for URB_NO_SETUP_DMA_MAP
+after everything else settles down.  The removal should go smoothly,
+as by then nobody will be using it.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/hid/usbhid/hid-core.c   |    8 +++-----
+ drivers/hid/usbhid/usbhid.h     |    1 -
+ drivers/hid/usbhid/usbkbd.c     |    8 +++-----
+ drivers/input/misc/cm109.c      |   12 +++---------
+ drivers/input/misc/powermate.c  |    9 ++-------
+ drivers/input/misc/yealink.c    |   11 +++--------
+ drivers/usb/core/urb.c          |    4 ++--
+ drivers/usb/core/usb.c          |   18 +++---------------
+ drivers/usb/misc/usbtest.c      |    9 ++-------
+ drivers/usb/storage/transport.c |    2 --
+ drivers/usb/storage/usb.c       |   15 +++++----------
+ drivers/usb/storage/usb.h       |    3 +--
+ drivers/usb/wusbcore/wa-xfer.c  |    2 --
+ 13 files changed, 27 insertions(+), 75 deletions(-)
+
+--- a/drivers/hid/usbhid/hid-core.c
++++ b/drivers/hid/usbhid/hid-core.c
+@@ -787,8 +787,7 @@ static int hid_alloc_buffers(struct usb_
+ 			&usbhid->inbuf_dma);
+ 	usbhid->outbuf = usb_buffer_alloc(dev, usbhid->bufsize, GFP_KERNEL,
+ 			&usbhid->outbuf_dma);
+-	usbhid->cr = usb_buffer_alloc(dev, sizeof(*usbhid->cr), GFP_KERNEL,
+-			&usbhid->cr_dma);
++	usbhid->cr = kmalloc(sizeof(*usbhid->cr), GFP_KERNEL);
+ 	usbhid->ctrlbuf = usb_buffer_alloc(dev, usbhid->bufsize, GFP_KERNEL,
+ 			&usbhid->ctrlbuf_dma);
+ 	if (!usbhid->inbuf || !usbhid->outbuf || !usbhid->cr ||
+@@ -846,7 +845,7 @@ static void hid_free_buffers(struct usb_
+ 
+ 	usb_buffer_free(dev, usbhid->bufsize, usbhid->inbuf, usbhid->inbuf_dma);
+ 	usb_buffer_free(dev, usbhid->bufsize, usbhid->outbuf, usbhid->outbuf_dma);
+-	usb_buffer_free(dev, sizeof(*(usbhid->cr)), usbhid->cr, usbhid->cr_dma);
++	kfree(usbhid->cr);
+ 	usb_buffer_free(dev, usbhid->bufsize, usbhid->ctrlbuf, usbhid->ctrlbuf_dma);
+ }
+ 
+@@ -1014,9 +1013,8 @@ static int usbhid_start(struct hid_devic
+ 
+ 	usb_fill_control_urb(usbhid->urbctrl, dev, 0, (void *) usbhid->cr,
+ 			     usbhid->ctrlbuf, 1, hid_ctrl, hid);
+-	usbhid->urbctrl->setup_dma = usbhid->cr_dma;
+ 	usbhid->urbctrl->transfer_dma = usbhid->ctrlbuf_dma;
+-	usbhid->urbctrl->transfer_flags |= (URB_NO_TRANSFER_DMA_MAP | URB_NO_SETUP_DMA_MAP);
++	usbhid->urbctrl->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+ 
+ 	if (!(hid->quirks & HID_QUIRK_NO_INIT_REPORTS))
+ 		usbhid_init_reports(hid);
+--- a/drivers/hid/usbhid/usbhid.h
++++ b/drivers/hid/usbhid/usbhid.h
+@@ -75,7 +75,6 @@ struct usbhid_device {
+ 
+ 	struct urb *urbctrl;                                            /* Control URB */
+ 	struct usb_ctrlrequest *cr;                                     /* Control request struct */
+-	dma_addr_t cr_dma;                                              /* Control request struct dma */
+ 	struct hid_control_fifo ctrl[HID_CONTROL_FIFO_SIZE];  		/* Control fifo */
+ 	unsigned char ctrlhead, ctrltail;                               /* Control fifo head & tail */
+ 	char *ctrlbuf;                                                  /* Control buffer */
+--- a/drivers/hid/usbhid/usbkbd.c
++++ b/drivers/hid/usbhid/usbkbd.c
+@@ -74,7 +74,6 @@ struct usb_kbd {
+ 	unsigned char *new;
+ 	struct usb_ctrlrequest *cr;
+ 	unsigned char *leds;
+-	dma_addr_t cr_dma;
+ 	dma_addr_t new_dma;
+ 	dma_addr_t leds_dma;
+ };
+@@ -199,7 +198,7 @@ static int usb_kbd_alloc_mem(struct usb_
+ 		return -1;
+ 	if (!(kbd->new = usb_buffer_alloc(dev, 8, GFP_ATOMIC, &kbd->new_dma)))
+ 		return -1;
+-	if (!(kbd->cr = usb_buffer_alloc(dev, sizeof(struct usb_ctrlrequest), GFP_ATOMIC, &kbd->cr_dma)))
++	if (!(kbd->cr = kmalloc(sizeof(struct usb_ctrlrequest), GFP_KERNEL)))
+ 		return -1;
+ 	if (!(kbd->leds = usb_buffer_alloc(dev, 1, GFP_ATOMIC, &kbd->leds_dma)))
+ 		return -1;
+@@ -212,7 +211,7 @@ static void usb_kbd_free_mem(struct usb_
+ 	usb_free_urb(kbd->irq);
+ 	usb_free_urb(kbd->led);
+ 	usb_buffer_free(dev, 8, kbd->new, kbd->new_dma);
+-	usb_buffer_free(dev, sizeof(struct usb_ctrlrequest), kbd->cr, kbd->cr_dma);
++	kfree(kbd->cr);
+ 	usb_buffer_free(dev, 1, kbd->leds, kbd->leds_dma);
+ }
+ 
+@@ -304,9 +303,8 @@ static int usb_kbd_probe(struct usb_inte
+ 	usb_fill_control_urb(kbd->led, dev, usb_sndctrlpipe(dev, 0),
+ 			     (void *) kbd->cr, kbd->leds, 1,
+ 			     usb_kbd_led, kbd);
+-	kbd->led->setup_dma = kbd->cr_dma;
+ 	kbd->led->transfer_dma = kbd->leds_dma;
+-	kbd->led->transfer_flags |= (URB_NO_TRANSFER_DMA_MAP | URB_NO_SETUP_DMA_MAP);
++	kbd->led->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+ 
+ 	error = input_register_device(kbd->dev);
+ 	if (error)
+--- a/drivers/input/misc/cm109.c
++++ b/drivers/input/misc/cm109.c
+@@ -102,7 +102,6 @@ struct cm109_dev {
+ 	struct cm109_ctl_packet *ctl_data;
+ 	dma_addr_t ctl_dma;
+ 	struct usb_ctrlrequest *ctl_req;
+-	dma_addr_t ctl_req_dma;
+ 	struct urb *urb_ctl;
+ 	/*
+ 	 * The 3 bitfields below are protected by ctl_submit_lock.
+@@ -629,9 +628,7 @@ static const struct usb_device_id cm109_
+ 
+ static void cm109_usb_cleanup(struct cm109_dev *dev)
+ {
+-	if (dev->ctl_req)
+-		usb_buffer_free(dev->udev, sizeof(*(dev->ctl_req)),
+-				dev->ctl_req, dev->ctl_req_dma);
++	kfree(dev->ctl_req);
+ 	if (dev->ctl_data)
+ 		usb_buffer_free(dev->udev, USB_PKT_LEN,
+ 				dev->ctl_data, dev->ctl_dma);
+@@ -696,8 +693,7 @@ static int cm109_usb_probe(struct usb_in
+ 	if (!dev->ctl_data)
+ 		goto err_out;
+ 
+-	dev->ctl_req = usb_buffer_alloc(udev, sizeof(*(dev->ctl_req)),
+-					GFP_KERNEL, &dev->ctl_req_dma);
++	dev->ctl_req = kmalloc(sizeof(*(dev->ctl_req)), GFP_KERNEL);
+ 	if (!dev->ctl_req)
+ 		goto err_out;
+ 
+@@ -735,10 +731,8 @@ static int cm109_usb_probe(struct usb_in
+ 	usb_fill_control_urb(dev->urb_ctl, udev, usb_sndctrlpipe(udev, 0),
+ 			     (void *)dev->ctl_req, dev->ctl_data, USB_PKT_LEN,
+ 			     cm109_urb_ctl_callback, dev);
+-	dev->urb_ctl->setup_dma = dev->ctl_req_dma;
+ 	dev->urb_ctl->transfer_dma = dev->ctl_dma;
+-	dev->urb_ctl->transfer_flags |= URB_NO_SETUP_DMA_MAP |
+-					URB_NO_TRANSFER_DMA_MAP;
++	dev->urb_ctl->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+ 	dev->urb_ctl->dev = udev;
+ 
+ 	/* find out the physical bus location */
+--- a/drivers/input/misc/powermate.c
++++ b/drivers/input/misc/powermate.c
+@@ -64,7 +64,6 @@ struct powermate_device {
+ 	dma_addr_t data_dma;
+ 	struct urb *irq, *config;
+ 	struct usb_ctrlrequest *configcr;
+-	dma_addr_t configcr_dma;
+ 	struct usb_device *udev;
+ 	struct input_dev *input;
+ 	spinlock_t lock;
+@@ -182,8 +181,6 @@ static void powermate_sync_state(struct
+ 	usb_fill_control_urb(pm->config, pm->udev, usb_sndctrlpipe(pm->udev, 0),
+ 			     (void *) pm->configcr, NULL, 0,
+ 			     powermate_config_complete, pm);
+-	pm->config->setup_dma = pm->configcr_dma;
+-	pm->config->transfer_flags |= URB_NO_SETUP_DMA_MAP;
+ 
+ 	if (usb_submit_urb(pm->config, GFP_ATOMIC))
+ 		printk(KERN_ERR "powermate: usb_submit_urb(config) failed");
+@@ -281,8 +278,7 @@ static int powermate_alloc_buffers(struc
+ 	if (!pm->data)
+ 		return -1;
+ 
+-	pm->configcr = usb_buffer_alloc(udev, sizeof(*(pm->configcr)),
+-					GFP_ATOMIC, &pm->configcr_dma);
++	pm->configcr = kmalloc(sizeof(*(pm->configcr)), GFP_KERNEL);
+ 	if (!pm->configcr)
+ 		return -1;
+ 
+@@ -293,8 +289,7 @@ static void powermate_free_buffers(struc
+ {
+ 	usb_buffer_free(udev, POWERMATE_PAYLOAD_SIZE_MAX,
+ 			pm->data, pm->data_dma);
+-	usb_buffer_free(udev, sizeof(*(pm->configcr)),
+-			pm->configcr, pm->configcr_dma);
++	kfree(pm->configcr);
+ }
+ 
+ /* Called whenever a USB device matching one in our supported devices table is connected */
+--- a/drivers/input/misc/yealink.c
++++ b/drivers/input/misc/yealink.c
+@@ -111,7 +111,6 @@ struct yealink_dev {
+ 	struct yld_ctl_packet	*ctl_data;
+ 	dma_addr_t		ctl_dma;
+ 	struct usb_ctrlrequest	*ctl_req;
+-	dma_addr_t		ctl_req_dma;
+ 	struct urb		*urb_ctl;
+ 
+ 	char phys[64];			/* physical device path */
+@@ -836,8 +835,7 @@ static int usb_cleanup(struct yealink_de
+ 	usb_free_urb(yld->urb_irq);
+ 	usb_free_urb(yld->urb_ctl);
+ 
+-	usb_buffer_free(yld->udev, sizeof(*(yld->ctl_req)),
+-			yld->ctl_req, yld->ctl_req_dma);
++	kfree(yld->ctl_req);
+ 	usb_buffer_free(yld->udev, USB_PKT_LEN,
+ 			yld->ctl_data, yld->ctl_dma);
+ 	usb_buffer_free(yld->udev, USB_PKT_LEN,
+@@ -896,8 +894,7 @@ static int usb_probe(struct usb_interfac
+ 	if (!yld->ctl_data)
+ 		return usb_cleanup(yld, -ENOMEM);
+ 
+-	yld->ctl_req = usb_buffer_alloc(udev, sizeof(*(yld->ctl_req)),
+-					GFP_ATOMIC, &yld->ctl_req_dma);
++	yld->ctl_req = kmalloc(sizeof(*(yld->ctl_req)), GFP_KERNEL);
+ 	if (yld->ctl_req == NULL)
+ 		return usb_cleanup(yld, -ENOMEM);
+ 
+@@ -936,10 +933,8 @@ static int usb_probe(struct usb_interfac
+ 	usb_fill_control_urb(yld->urb_ctl, udev, usb_sndctrlpipe(udev, 0),
+ 			(void *)yld->ctl_req, yld->ctl_data, USB_PKT_LEN,
+ 			urb_ctl_callback, yld);
+-	yld->urb_ctl->setup_dma	= yld->ctl_req_dma;
+ 	yld->urb_ctl->transfer_dma	= yld->ctl_dma;
+-	yld->urb_ctl->transfer_flags	|= URB_NO_SETUP_DMA_MAP |
+-					URB_NO_TRANSFER_DMA_MAP;
++	yld->urb_ctl->transfer_flags	|= URB_NO_TRANSFER_DMA_MAP;
+ 	yld->urb_ctl->dev = udev;
+ 
+ 	/* find out the physical bus location */
+--- a/drivers/usb/core/urb.c
++++ b/drivers/usb/core/urb.c
+@@ -396,8 +396,8 @@ int usb_submit_urb(struct urb *urb, gfp_
+ 		return -EPIPE;		/* The most suitable error code :-) */
+ 
+ 	/* enforce simple/standard policy */
+-	allowed = (URB_NO_TRANSFER_DMA_MAP | URB_NO_SETUP_DMA_MAP |
+-			URB_NO_INTERRUPT | URB_DIR_MASK | URB_FREE_BUFFER);
++	allowed = (URB_NO_TRANSFER_DMA_MAP | URB_NO_INTERRUPT | URB_DIR_MASK |
++			URB_FREE_BUFFER);
+ 	switch (xfertype) {
+ 	case USB_ENDPOINT_XFER_BULK:
+ 		if (is_out)
+--- a/drivers/usb/core/usb.c
++++ b/drivers/usb/core/usb.c
+@@ -775,7 +775,7 @@ EXPORT_SYMBOL_GPL(usb_buffer_free);
+  * @urb: urb whose transfer_buffer/setup_packet will be mapped
+  *
+  * Return value is either null (indicating no buffer could be mapped), or
+- * the parameter.  URB_NO_TRANSFER_DMA_MAP and URB_NO_SETUP_DMA_MAP are
++ * the parameter.  URB_NO_TRANSFER_DMA_MAP is
+  * added to urb->transfer_flags if the operation succeeds.  If the device
+  * is connected to this system through a non-DMA controller, this operation
+  * always succeeds.
+@@ -803,17 +803,11 @@ struct urb *usb_buffer_map(struct urb *u
+ 			urb->transfer_buffer, urb->transfer_buffer_length,
+ 			usb_pipein(urb->pipe)
+ 				? DMA_FROM_DEVICE : DMA_TO_DEVICE);
+-		if (usb_pipecontrol(urb->pipe))
+-			urb->setup_dma = dma_map_single(controller,
+-					urb->setup_packet,
+-					sizeof(struct usb_ctrlrequest),
+-					DMA_TO_DEVICE);
+ 	/* FIXME generic api broken like pci, can't report errors */
+ 	/* if (urb->transfer_dma == DMA_ADDR_INVALID) return 0; */
+ 	} else
+ 		urb->transfer_dma = ~0;
+-	urb->transfer_flags |= (URB_NO_TRANSFER_DMA_MAP
+-				| URB_NO_SETUP_DMA_MAP);
++	urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+ 	return urb;
+ }
+ EXPORT_SYMBOL_GPL(usb_buffer_map);
+@@ -881,14 +875,8 @@ void usb_buffer_unmap(struct urb *urb)
+ 			urb->transfer_dma, urb->transfer_buffer_length,
+ 			usb_pipein(urb->pipe)
+ 				? DMA_FROM_DEVICE : DMA_TO_DEVICE);
+-		if (usb_pipecontrol(urb->pipe))
+-			dma_unmap_single(controller,
+-					urb->setup_dma,
+-					sizeof(struct usb_ctrlrequest),
+-					DMA_TO_DEVICE);
+ 	}
+-	urb->transfer_flags &= ~(URB_NO_TRANSFER_DMA_MAP
+-				| URB_NO_SETUP_DMA_MAP);
++	urb->transfer_flags &= ~URB_NO_TRANSFER_DMA_MAP;
+ }
+ EXPORT_SYMBOL_GPL(usb_buffer_unmap);
+ #endif  /*  0  */
+--- a/drivers/usb/misc/usbtest.c
++++ b/drivers/usb/misc/usbtest.c
+@@ -977,15 +977,13 @@ test_ctrl_queue (struct usbtest_dev *dev
+ 		if (!u)
+ 			goto cleanup;
+ 
+-		reqp = usb_buffer_alloc (udev, sizeof *reqp, GFP_KERNEL,
+-				&u->setup_dma);
++		reqp = kmalloc(sizeof *reqp, GFP_KERNEL);
+ 		if (!reqp)
+ 			goto cleanup;
+ 		reqp->setup = req;
+ 		reqp->number = i % NUM_SUBCASES;
+ 		reqp->expected = expected;
+ 		u->setup_packet = (char *) &reqp->setup;
+-		u->transfer_flags |= URB_NO_SETUP_DMA_MAP;
+ 
+ 		u->context = &context;
+ 		u->complete = ctrl_complete;
+@@ -1017,10 +1015,7 @@ cleanup:
+ 		if (!urb [i])
+ 			continue;
+ 		urb [i]->dev = udev;
+-		if (urb [i]->setup_packet)
+-			usb_buffer_free (udev, sizeof (struct usb_ctrlrequest),
+-					urb [i]->setup_packet,
+-					urb [i]->setup_dma);
++		kfree(urb[i]->setup_packet);
+ 		simple_free_urb (urb [i]);
+ 	}
+ 	kfree (urb);
+--- a/drivers/usb/storage/transport.c
++++ b/drivers/usb/storage/transport.c
+@@ -147,11 +147,9 @@ static int usb_stor_msg_common(struct us
+ 	 * hasn't been mapped for DMA.  Yes, this is clunky, but it's
+ 	 * easier than always having the caller tell us whether the
+ 	 * transfer buffer has already been mapped. */
+-	us->current_urb->transfer_flags = URB_NO_SETUP_DMA_MAP;
+ 	if (us->current_urb->transfer_buffer == us->iobuf)
+ 		us->current_urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+ 	us->current_urb->transfer_dma = us->iobuf_dma;
+-	us->current_urb->setup_dma = us->cr_dma;
+ 
+ 	/* submit the URB */
+ 	status = usb_submit_urb(us->current_urb, GFP_NOIO);
+--- a/drivers/usb/storage/usb.c
++++ b/drivers/usb/storage/usb.c
+@@ -407,9 +407,8 @@ static int associate_dev(struct us_data
+ 	/* Store our private data in the interface */
+ 	usb_set_intfdata(intf, us);
+ 
+-	/* Allocate the device-related DMA-mapped buffers */
+-	us->cr = usb_buffer_alloc(us->pusb_dev, sizeof(*us->cr),
+-			GFP_KERNEL, &us->cr_dma);
++	/* Allocate the control/setup and DMA-mapped buffers */
++	us->cr = kmalloc(sizeof(*us->cr), GFP_KERNEL);
+ 	if (!us->cr) {
+ 		US_DEBUGP("usb_ctrlrequest allocation failed\n");
+ 		return -ENOMEM;
+@@ -757,13 +756,9 @@ static void dissociate_dev(struct us_dat
+ {
+ 	US_DEBUGP("-- %s\n", __func__);
+ 
+-	/* Free the device-related DMA-mapped buffers */
+-	if (us->cr)
+-		usb_buffer_free(us->pusb_dev, sizeof(*us->cr), us->cr,
+-				us->cr_dma);
+-	if (us->iobuf)
+-		usb_buffer_free(us->pusb_dev, US_IOBUF_SIZE, us->iobuf,
+-				us->iobuf_dma);
++	/* Free the buffers */
++	kfree(us->cr);
++	usb_buffer_free(us->pusb_dev, US_IOBUF_SIZE, us->iobuf, us->iobuf_dma);
+ 
+ 	/* Remove our private data from the interface */
+ 	usb_set_intfdata(us->pusb_intf, NULL);
+--- a/drivers/usb/storage/usb.h
++++ b/drivers/usb/storage/usb.h
+@@ -139,8 +139,7 @@ struct us_data {
+ 	struct usb_ctrlrequest	*cr;		 /* control requests	 */
+ 	struct usb_sg_request	current_sg;	 /* scatter-gather req.  */
+ 	unsigned char		*iobuf;		 /* I/O buffer		 */
+-	dma_addr_t		cr_dma;		 /* buffer DMA addresses */
+-	dma_addr_t		iobuf_dma;
++	dma_addr_t		iobuf_dma;	 /* buffer DMA addresses */
+ 	struct task_struct	*ctl_thread;	 /* the control thread   */
+ 
+ 	/* mutual exclusion and synchronization structures */
+--- a/drivers/usb/wusbcore/wa-xfer.c
++++ b/drivers/usb/wusbcore/wa-xfer.c
+@@ -473,8 +473,6 @@ static void __wa_xfer_setup_hdr0(struct
+ 		struct wa_xfer_ctl *xfer_ctl =
+ 			container_of(xfer_hdr0, struct wa_xfer_ctl, hdr);
+ 		xfer_ctl->bmAttribute = xfer->is_inbound ? 1 : 0;
+-		BUG_ON(xfer->urb->transfer_flags & URB_NO_SETUP_DMA_MAP
+-		       && xfer->urb->setup_packet == NULL);
+ 		memcpy(&xfer_ctl->baSetupData, xfer->urb->setup_packet,
+ 		       sizeof(xfer_ctl->baSetupData));
+ 		break;
