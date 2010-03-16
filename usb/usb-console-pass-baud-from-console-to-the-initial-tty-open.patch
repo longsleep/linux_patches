@@ -1,0 +1,89 @@
+From jason.wessel@windriver.com  Tue Mar 16 14:44:49 2010
+From: Jason Wessel <jason.wessel@windriver.com>
+Date: Tue, 16 Mar 2010 16:05:44 -0500
+Subject: usb-console: pass baud from console to the initial tty open
+To: gregkh@suse.de, Alan Stern <stern@rowland.harvard.edu>
+Cc: Jason Wessel <jason.wessel@windriver.com>, Alan Cox <alan@linux.intel.com>, Alan Stern <stern@rowland.harvard.edu>
+Message-ID: <1268773546-12457-4-git-send-email-jason.wessel@windriver.com>
+
+
+The usb console code has had a long standing problem of not being able
+to pass the baud rate from the kernel argument console=ttyUSB0,BAUD
+down to the initial tty open, unless you were willing to settle for
+9600 baud.
+
+The solution is to directly use tty_init_termios() in
+usb_console_setup() as this will preserve any changes to the initial
+termios setting on future opens.
+
+CC: Alan Cox <alan@linux.intel.com>
+CC: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Jason Wessel <jason.wessel@windriver.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/serial/console.c |   22 ++++++++++------------
+ 1 file changed, 10 insertions(+), 12 deletions(-)
+
+--- a/drivers/usb/serial/console.c
++++ b/drivers/usb/serial/console.c
+@@ -66,7 +66,7 @@ static int usb_console_setup(struct cons
+ 	struct usb_serial_port *port;
+ 	int retval;
+ 	struct tty_struct *tty = NULL;
+-	struct ktermios *termios = NULL, dummy;
++	struct ktermios dummy;
+ 
+ 	dbg("%s", __func__);
+ 
+@@ -141,15 +141,14 @@ static int usb_console_setup(struct cons
+ 				goto reset_open_count;
+ 			}
+ 			kref_init(&tty->kref);
+-			termios = kzalloc(sizeof(*termios), GFP_KERNEL);
+-			if (!termios) {
++			tty_port_tty_set(&port->port, tty);
++			tty->driver = usb_serial_tty_driver;
++			tty->index = co->index;
++			if (tty_init_termios(tty)) {
+ 				retval = -ENOMEM;
+ 				err("no more memory");
+ 				goto free_tty;
+ 			}
+-			memset(&dummy, 0, sizeof(struct ktermios));
+-			tty->termios = termios;
+-			tty_port_tty_set(&port->port, tty);
+ 		}
+ 
+ 		/* only call the device specific open if this
+@@ -161,16 +160,16 @@ static int usb_console_setup(struct cons
+ 
+ 		if (retval) {
+ 			err("could not open USB console port");
+-			goto free_termios;
++			goto fail;
+ 		}
+ 
+ 		if (serial->type->set_termios) {
+-			termios->c_cflag = cflag;
+-			tty_termios_encode_baud_rate(termios, baud, baud);
++			tty->termios->c_cflag = cflag;
++			tty_termios_encode_baud_rate(tty->termios, baud, baud);
++			memset(&dummy, 0, sizeof(struct ktermios));
+ 			serial->type->set_termios(tty, port, &dummy);
+ 
+ 			tty_port_tty_set(&port->port, NULL);
+-			kfree(termios);
+ 			kfree(tty);
+ 		}
+ 		set_bit(ASYNCB_INITIALIZED, &port->port.flags);
+@@ -185,8 +184,7 @@ static int usb_console_setup(struct cons
+ 	mutex_unlock(&serial->disc_mutex);
+ 	return retval;
+ 
+- free_termios:
+-	kfree(termios);
++ fail:
+ 	tty_port_tty_set(&port->port, NULL);
+  free_tty:
+ 	kfree(tty);
