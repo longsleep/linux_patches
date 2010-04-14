@@ -1,0 +1,84 @@
+From stern@rowland.harvard.edu  Wed Apr 14 11:27:22 2010
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Fri, 2 Apr 2010 13:20:11 -0400 (EDT)
+Subject: USB: fix remote wakeup settings during system sleep
+To: Greg KH <greg@kroah.com>
+Cc: Erik Andrén <erik.andren@gmail.com>,  USB list <linux-usb@vger.kernel.org>
+Message-ID: <Pine.LNX.4.44L0.1004021308150.1324-100000@iolanthe.rowland.org>
+
+
+This patch (as1363) changes the way USB remote wakeup is handled
+during system sleeps.  It won't be enabled unless an interface driver
+specifically needs it.  Also, it won't be enabled during the FREEZE or
+QUIESCE phases of hibernation, when the system doesn't respond to
+wakeup events anyway.  Finally, if the device is already
+runtime-suspended with remote wakeup enabled, but wakeup is supposed
+to be disabled for the system sleep, the device gets woken up so that
+it can be suspended again with the proper wakeup setting.
+
+This will fix problems people have reported with certain USB webcams
+that generate wakeup requests when they shouldn't, and as a result
+cause system suspends to fail.  See
+
+	https://bugs.launchpad.net/ubuntu/+source/linux/+bug/515109
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Tested-by: Erik Andrén <erik.andren@gmail.com>
+CC: <stable@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/driver.c |   36 +++++++++++++++++++++++++++++++++++-
+ 1 file changed, 35 insertions(+), 1 deletion(-)
+
+--- a/drivers/usb/core/driver.c
++++ b/drivers/usb/core/driver.c
+@@ -1263,13 +1263,47 @@ static int usb_resume_both(struct usb_de
+ 	return status;
+ }
+ 
++static void choose_wakeup(struct usb_device *udev, pm_message_t msg)
++{
++	int			w, i;
++	struct usb_interface	*intf;
++
++	/* Remote wakeup is needed only when we actually go to sleep.
++	 * For things like FREEZE and QUIESCE, if the device is already
++	 * autosuspended then its current wakeup setting is okay.
++	 */
++	if (msg.event == PM_EVENT_FREEZE || msg.event == PM_EVENT_QUIESCE) {
++		if (udev->state != USB_STATE_SUSPENDED)
++			udev->do_remote_wakeup = 0;
++		return;
++	}
++
++	/* If remote wakeup is permitted, see whether any interface drivers
++	 * actually want it.
++	 */
++	w = 0;
++	if (device_may_wakeup(&udev->dev) && udev->actconfig) {
++		for (i = 0; i < udev->actconfig->desc.bNumInterfaces; i++) {
++			intf = udev->actconfig->interface[i];
++			w |= intf->needs_remote_wakeup;
++		}
++	}
++
++	/* If the device is autosuspended with the wrong wakeup setting,
++	 * autoresume now so the setting can be changed.
++	 */
++	if (udev->state == USB_STATE_SUSPENDED && w != udev->do_remote_wakeup)
++		pm_runtime_resume(&udev->dev);
++	udev->do_remote_wakeup = w;
++}
++
+ /* The device lock is held by the PM core */
+ int usb_suspend(struct device *dev, pm_message_t msg)
+ {
+ 	struct usb_device	*udev = to_usb_device(dev);
+ 
+ 	do_unbind_rebind(udev, DO_UNBIND);
+-	udev->do_remote_wakeup = device_may_wakeup(&udev->dev);
++	choose_wakeup(udev, msg);
+ 	return usb_suspend_both(udev, msg);
+ }
+ 

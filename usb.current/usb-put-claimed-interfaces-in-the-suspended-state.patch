@@ -1,0 +1,86 @@
+From stern@rowland.harvard.edu  Wed Apr 14 11:30:24 2010
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Fri, 9 Apr 2010 16:03:43 -0400 (EDT)
+Subject: USB: put claimed interfaces in the "suspended" state
+To: Greg KH <greg@kroah.com>
+Cc: Dominik Brodowski <linux@dominikbrodowski.net>
+Message-ID: <Pine.LNX.4.44L0.1004091601030.1852-100000@iolanthe.rowland.org>
+
+
+This patch (as1370) fixes a bug in the USB runtime power management
+code.  When a driver claims an interface, it doesn't expect to need to
+call usb_autopm_get_interface() or usb_autopm_put_interface() for
+runtime PM to work.  Runtime PM can be controlled by the driver's
+primary interface; the additional interfaces it claims shouldn't
+interfere.  As things stand, the claimed interfaces will prevent the
+device from autosuspending.
+
+To fix this problem, the patch sets interfaces to the suspended state
+when they are claimed.
+
+Also, although in theory this shouldn't matter, the patch changes the
+suspend code so that interfaces are suspended in reverse order from
+detection and resuming.  This is how the PM core works, and we ought
+to use the same approach.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Debugged-and-tested-by: Dominik Brodowski <linux@dominikbrodowski.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/driver.c |   13 +++++++------
+ 1 file changed, 7 insertions(+), 6 deletions(-)
+
+--- a/drivers/usb/core/driver.c
++++ b/drivers/usb/core/driver.c
+@@ -301,7 +301,7 @@ static int usb_probe_interface(struct de
+ 
+ 	intf->condition = USB_INTERFACE_BINDING;
+ 
+-	/* Bound interfaces are initially active.  They are
++	/* Probed interfaces are initially active.  They are
+ 	 * runtime-PM-enabled only if the driver has autosuspend support.
+ 	 * They are sensitive to their children's power states.
+ 	 */
+@@ -437,11 +437,11 @@ int usb_driver_claim_interface(struct us
+ 
+ 	iface->condition = USB_INTERFACE_BOUND;
+ 
+-	/* Bound interfaces are initially active.  They are
++	/* Claimed interfaces are initially inactive (suspended).  They are
+ 	 * runtime-PM-enabled only if the driver has autosuspend support.
+ 	 * They are sensitive to their children's power states.
+ 	 */
+-	pm_runtime_set_active(dev);
++	pm_runtime_set_suspended(dev);
+ 	pm_suspend_ignore_children(dev, false);
+ 	if (driver->supports_autosuspend)
+ 		pm_runtime_enable(dev);
+@@ -1170,7 +1170,7 @@ done:
+ static int usb_suspend_both(struct usb_device *udev, pm_message_t msg)
+ {
+ 	int			status = 0;
+-	int			i = 0;
++	int			i = 0, n = 0;
+ 	struct usb_interface	*intf;
+ 
+ 	if (udev->state == USB_STATE_NOTATTACHED ||
+@@ -1179,7 +1179,8 @@ static int usb_suspend_both(struct usb_d
+ 
+ 	/* Suspend all the interfaces and then udev itself */
+ 	if (udev->actconfig) {
+-		for (; i < udev->actconfig->desc.bNumInterfaces; i++) {
++		n = udev->actconfig->desc.bNumInterfaces;
++		for (i = n - 1; i >= 0; --i) {
+ 			intf = udev->actconfig->interface[i];
+ 			status = usb_suspend_interface(udev, intf, msg);
+ 			if (status != 0)
+@@ -1192,7 +1193,7 @@ static int usb_suspend_both(struct usb_d
+ 	/* If the suspend failed, resume interfaces that did get suspended */
+ 	if (status != 0) {
+ 		msg.event ^= (PM_EVENT_SUSPEND | PM_EVENT_RESUME);
+-		while (--i >= 0) {
++		while (++i < n) {
+ 			intf = udev->actconfig->interface[i];
+ 			usb_resume_interface(udev, intf, msg, 0);
+ 		}
