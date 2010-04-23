@@ -1,0 +1,83 @@
+From jhovold@gmail.com  Fri Apr 23 15:30:15 2010
+From: Johan Hovold <jhovold@gmail.com>
+Date: Wed, 17 Mar 2010 23:05:57 +0100
+Subject: [RFC][PATCH 05/20] USB: serial: generalise generic read implementation
+To: linux-usb@vger.kernel.org
+Cc: Greg Kroah-Hartman <gregkh@suse.de>, Johan Hovold <jhovold@gmail.com>
+Message-ID: <1268863572-17891-6-git-send-email-jhovold@gmail.com>
+
+
+Add process_read_urb to usb_serial_driver so that a driver can rely on
+the generic read (and throttle) mechanism but still do device specific
+processing of incoming data (such as adding tty_flags before pushing to
+line discipline).
+
+The default generic implementation handles sysrq for consoles but
+otherwise simply pushes to tty.
+
+Signed-off-by: Johan Hovold <jhovold@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/serial/generic.c    |    5 +++--
+ drivers/usb/serial/usb-serial.c |    1 +
+ include/linux/usb/serial.h      |    3 +++
+ 3 files changed, 7 insertions(+), 2 deletions(-)
+
+--- a/drivers/usb/serial/generic.c
++++ b/drivers/usb/serial/generic.c
+@@ -408,7 +408,7 @@ int usb_serial_generic_submit_read_urb(s
+ }
+ EXPORT_SYMBOL_GPL(usb_serial_generic_submit_read_urb);
+ 
+-static void usb_serial_generic_process_read_urb(struct urb *urb)
++void usb_serial_generic_process_read_urb(struct urb *urb)
+ {
+ 	struct usb_serial_port *port = urb->context;
+ 	struct tty_struct *tty;
+@@ -433,6 +433,7 @@ static void usb_serial_generic_process_r
+ 	tty_flip_buffer_push(tty);
+ 	tty_kref_put(tty);
+ }
++EXPORT_SYMBOL_GPL(usb_serial_generic_process_read_urb);
+ 
+ void usb_serial_generic_read_bulk_callback(struct urb *urb)
+ {
+@@ -451,7 +452,7 @@ void usb_serial_generic_read_bulk_callba
+ 
+ 	usb_serial_debug_data(debug, &port->dev, __func__,
+ 						urb->actual_length, data);
+-	usb_serial_generic_process_read_urb(urb);
++	port->serial->type->process_read_urb(urb);
+ 
+ 	/* Throttle the device if requested by tty */
+ 	spin_lock_irqsave(&port->lock, flags);
+--- a/drivers/usb/serial/usb-serial.c
++++ b/drivers/usb/serial/usb-serial.c
+@@ -1298,6 +1298,7 @@ static void fixup_generic(struct usb_ser
+ 	set_to_generic_if_null(device, write_bulk_callback);
+ 	set_to_generic_if_null(device, disconnect);
+ 	set_to_generic_if_null(device, release);
++	set_to_generic_if_null(device, process_read_urb);
+ }
+ 
+ int usb_serial_register(struct usb_serial_driver *driver)
+--- a/include/linux/usb/serial.h
++++ b/include/linux/usb/serial.h
+@@ -272,6 +272,8 @@ struct usb_serial_driver {
+ 	void (*write_int_callback)(struct urb *urb);
+ 	void (*read_bulk_callback)(struct urb *urb);
+ 	void (*write_bulk_callback)(struct urb *urb);
++	/* Called by the generic read bulk callback */
++	void (*process_read_urb)(struct urb *urb);
+ };
+ #define to_usb_serial_driver(d) \
+ 	container_of(d, struct usb_serial_driver, driver)
+@@ -323,6 +325,7 @@ extern int usb_serial_generic_register(i
+ extern void usb_serial_generic_deregister(void);
+ extern int usb_serial_generic_submit_read_urb(struct usb_serial_port *port,
+ 						 gfp_t mem_flags);
++extern void usb_serial_generic_process_read_urb(struct urb *urb);
+ extern int usb_serial_handle_sysrq_char(struct tty_struct *tty,
+ 					struct usb_serial_port *port,
+ 					unsigned int ch);

@@ -1,0 +1,1517 @@
+From peter.korsgaard@barco.com  Fri Apr 23 15:42:00 2010
+From: Peter Korsgaard <peter.korsgaard@barco.com>
+Date: Thu,  8 Apr 2010 09:31:15 +0200
+Subject: USB: gadget: add HID gadget driver
+To: greg@kroah.com, linux-usb@vger.kernel.org, dbrownell@users.sourceforge.net
+Cc: Fabien Chouteau <fabien.chouteau@barco.com>, Peter Korsgaard <peter.korsgaard@barco.com>
+Message-ID: <1270711875-31857-1-git-send-email-peter.korsgaard@barco.com>
+
+
+From: Fabien Chouteau <fabien.chouteau@barco.com>
+
+g_hid is a USB gadget driver implementing the Human Interface Device class
+specification. The driver handles basic HID protocol handling in the
+kernel, and allows userspace to read/write HID reports trough /dev/hidgX
+character devices.
+
+Signed-off-by: Fabien Chouteau <fabien.chouteau@barco.com>
+Signed-off-by: Peter Korsgaard <peter.korsgaard@barco.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ Documentation/usb/gadget_hid.txt |  445 +++++++++++++++++++++++++
+ drivers/usb/gadget/Kconfig       |   11 
+ drivers/usb/gadget/Makefile      |    2 
+ drivers/usb/gadget/f_hid.c       |  673 +++++++++++++++++++++++++++++++++++++++
+ drivers/usb/gadget/hid.c         |  288 ++++++++++++++++
+ include/linux/usb/g_hid.h        |   32 +
+ 6 files changed, 1451 insertions(+)
+
+--- /dev/null
++++ b/Documentation/usb/gadget_hid.txt
+@@ -0,0 +1,445 @@
++
++		     Linux USB HID gadget driver
++
++Introduction
++
++	The HID Gadget driver provides emulation of USB Human Interface
++	Devices (HID). The basic HID handling is done in the kernel,
++	and HID reports can be sent/received through I/O on the
++	/dev/hidgX character devices.
++
++	For more details about HID, see the developer page on
++	http://www.usb.org/developers/hidpage/
++
++Configuration
++
++	g_hid is a platform driver, so to use it you need to add
++	struct platform_device(s) to your platform code defining the
++	HID function descriptors you want to use - E.G. something
++	like:
++
++#include <linux/platform_device.h>
++#include <linux/usb/g_hid.h>
++
++/* hid descriptor for a keyboard */
++static struct hidg_func_descriptor my_hid_data = {
++	.subclass		= 0, /* No subclass */
++	.protocol		= 1, /* Keyboard */
++	.report_length		= 8,
++	.report_desc_length	= 63,
++	.report_desc		= {
++		0x05, 0x01,	/* USAGE_PAGE (Generic Desktop)	          */
++		0x09, 0x06,	/* USAGE (Keyboard)                       */
++		0xa1, 0x01,	/* COLLECTION (Application)               */
++		0x05, 0x07,	/*   USAGE_PAGE (Keyboard)                */
++		0x19, 0xe0,	/*   USAGE_MINIMUM (Keyboard LeftControl) */
++		0x29, 0xe7,	/*   USAGE_MAXIMUM (Keyboard Right GUI)   */
++		0x15, 0x00,	/*   LOGICAL_MINIMUM (0)                  */
++		0x25, 0x01,	/*   LOGICAL_MAXIMUM (1)                  */
++		0x75, 0x01,	/*   REPORT_SIZE (1)                      */
++		0x95, 0x08,	/*   REPORT_COUNT (8)                     */
++		0x81, 0x02,	/*   INPUT (Data,Var,Abs)                 */
++		0x95, 0x01,	/*   REPORT_COUNT (1)                     */
++		0x75, 0x08,	/*   REPORT_SIZE (8)                      */
++		0x81, 0x03,	/*   INPUT (Cnst,Var,Abs)                 */
++		0x95, 0x05,	/*   REPORT_COUNT (5)                     */
++		0x75, 0x01,	/*   REPORT_SIZE (1)                      */
++		0x05, 0x08,	/*   USAGE_PAGE (LEDs)                    */
++		0x19, 0x01,	/*   USAGE_MINIMUM (Num Lock)             */
++		0x29, 0x05,	/*   USAGE_MAXIMUM (Kana)                 */
++		0x91, 0x02,	/*   OUTPUT (Data,Var,Abs)                */
++		0x95, 0x01,	/*   REPORT_COUNT (1)                     */
++		0x75, 0x03,	/*   REPORT_SIZE (3)                      */
++		0x91, 0x03,	/*   OUTPUT (Cnst,Var,Abs)                */
++		0x95, 0x06,	/*   REPORT_COUNT (6)                     */
++		0x75, 0x08,	/*   REPORT_SIZE (8)                      */
++		0x15, 0x00,	/*   LOGICAL_MINIMUM (0)                  */
++		0x25, 0x65,	/*   LOGICAL_MAXIMUM (101)                */
++		0x05, 0x07,	/*   USAGE_PAGE (Keyboard)                */
++		0x19, 0x00,	/*   USAGE_MINIMUM (Reserved)             */
++		0x29, 0x65,	/*   USAGE_MAXIMUM (Keyboard Application) */
++		0x81, 0x00,	/*   INPUT (Data,Ary,Abs)                 */
++		0xc0		/* END_COLLECTION                         */
++	}
++};
++
++static struct platform_device my_hid = {
++	.name			= "hidg",
++	.id			= 0,
++	.num_resources		= 0,
++	.resource		= 0,
++	.dev.platform_data	= &my_hid_data,
++};
++
++	You can add as many HID functions as you want, only limited by
++	the amount of interrupt endpoints your gadget driver supports.
++
++Send and receive HID reports
++
++	HID reports can be sent/received using read/write on the
++	/dev/hidgX character devices. See below for an example program
++	to do this.
++
++	hid_gadget_test is a small interactive program to test the HID
++ 	gadget driver. To use, point it at a hidg device and set the
++ 	device type (keyboard / mouse / joystick) - E.G.:
++
++		# hid_gadget_test /dev/hidg0 keyboard
++
++	You are now in the prompt of hid_gadget_test. You can type any
++	combination of options and values. Available options and
++	values are listed at program start. In keyboard mode you can
++	send up to six values.
++
++	For example type: g i s t r --left-shift
++
++	Hit return and the corresponding report will be sent by the
++	HID gadget.
++
++	Another interesting example is the caps lock test. Type
++	-–caps-lock and hit return. A report is then sent by the
++	gadget and you should receive the host answer, corresponding
++	to the caps lock LED status.
++
++		--caps-lock
++		recv report:2
++
++	With this command:
++
++		# hid_gadget_test /dev/hidg1 mouse
++
++	You can test the mouse emulation. Values are two signed numbers.
++
++
++Sample code
++
++/* hid_gadget_test */
++
++#include <pthread.h>
++#include <string.h>
++#include <stdio.h>
++#include <ctype.h>
++#include <fcntl.h>
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++
++#define BUF_LEN 512
++
++struct options {
++	const char    *opt;
++	unsigned char val;
++};
++
++static struct options kmod[] = {
++	{.opt = "--left-ctrl",		.val = 0x01},
++	{.opt = "--right-ctrl",		.val = 0x10},
++	{.opt = "--left-shift",		.val = 0x02},
++	{.opt = "--right-shift",	.val = 0x20},
++	{.opt = "--left-alt",		.val = 0x04},
++	{.opt = "--right-alt",		.val = 0x40},
++	{.opt = "--left-meta",		.val = 0x08},
++	{.opt = "--right-meta",		.val = 0x80},
++	{.opt = NULL}
++};
++
++static struct options kval[] = {
++	{.opt = "--return",	.val = 0x28},
++	{.opt = "--esc",	.val = 0x29},
++	{.opt = "--bckspc",	.val = 0x2a},
++	{.opt = "--tab",	.val = 0x2b},
++	{.opt = "--spacebar",	.val = 0x2c},
++	{.opt = "--caps-lock",	.val = 0x39},
++	{.opt = "--f1",		.val = 0x3a},
++	{.opt = "--f2",		.val = 0x3b},
++	{.opt = "--f3",		.val = 0x3c},
++	{.opt = "--f4",		.val = 0x3d},
++	{.opt = "--f5",		.val = 0x3e},
++	{.opt = "--f6",		.val = 0x3f},
++	{.opt = "--f7",		.val = 0x40},
++	{.opt = "--f8",		.val = 0x41},
++	{.opt = "--f9",		.val = 0x42},
++	{.opt = "--f10",	.val = 0x43},
++	{.opt = "--f11",	.val = 0x44},
++	{.opt = "--f12",	.val = 0x45},
++	{.opt = "--insert",	.val = 0x49},
++	{.opt = "--home",	.val = 0x4a},
++	{.opt = "--pageup",	.val = 0x4b},
++	{.opt = "--del",	.val = 0x4c},
++	{.opt = "--end",	.val = 0x4d},
++	{.opt = "--pagedown",	.val = 0x4e},
++	{.opt = "--right",	.val = 0x4f},
++	{.opt = "--left",	.val = 0x50},
++	{.opt = "--down",	.val = 0x51},
++	{.opt = "--kp-enter",	.val = 0x58},
++	{.opt = "--up",		.val = 0x52},
++	{.opt = "--num-lock",	.val = 0x53},
++	{.opt = NULL}
++};
++
++int keyboard_fill_report(char report[8], char buf[BUF_LEN], int *hold)
++{
++	char *tok = strtok(buf, " ");
++	int key = 0;
++	int i = 0;
++
++	for (; tok != NULL; tok = strtok(NULL, " ")) {
++
++		if (strcmp(tok, "--quit") == 0)
++			return -1;
++
++		if (strcmp(tok, "--hold") == 0) {
++			*hold = 1;
++			continue;
++		}
++
++		if (key < 6) {
++			for (i = 0; kval[i].opt != NULL; i++)
++				if (strcmp(tok, kval[i].opt) == 0) {
++					report[2 + key++] = kval[i].val;
++					break;
++				}
++			if (kval[i].opt != NULL)
++				continue;
++		}
++
++		if (key < 6)
++			if (islower(tok[0])) {
++				report[2 + key++] = (tok[0] - ('a' - 0x04));
++				continue;
++			}
++
++		for (i = 0; kmod[i].opt != NULL; i++)
++			if (strcmp(tok, kmod[i].opt) == 0) {
++				report[0] = report[0] | kmod[i].val;
++				break;
++			}
++		if (kmod[i].opt != NULL)
++			continue;
++
++		if (key < 6)
++			fprintf(stderr, "unknown option: %s\n", tok);
++	}
++	return 8;
++}
++
++static struct options mmod[] = {
++	{.opt = "--b1", .val = 0x01},
++	{.opt = "--b2", .val = 0x02},
++	{.opt = "--b3", .val = 0x04},
++	{.opt = NULL}
++};
++
++int mouse_fill_report(char report[8], char buf[BUF_LEN], int *hold)
++{
++	char *tok = strtok(buf, " ");
++	int mvt = 0;
++	int i = 0;
++	for (; tok != NULL; tok = strtok(NULL, " ")) {
++
++		if (strcmp(tok, "--quit") == 0)
++			return -1;
++
++		if (strcmp(tok, "--hold") == 0) {
++			*hold = 1;
++			continue;
++		}
++
++		for (i = 0; mmod[i].opt != NULL; i++)
++			if (strcmp(tok, mmod[i].opt) == 0) {
++				report[0] = report[0] | mmod[i].val;
++				break;
++			}
++		if (mmod[i].opt != NULL)
++			continue;
++
++		if (!(tok[0] == '-' && tok[1] == '-') && mvt < 2) {
++			errno = 0;
++			report[1 + mvt++] = (char)strtol(tok, NULL, 0);
++			if (errno != 0) {
++				fprintf(stderr, "Bad value:'%s'\n", tok);
++				report[1 + mvt--] = 0;
++			}
++			continue;
++		}
++
++		fprintf(stderr, "unknown option: %s\n", tok);
++	}
++	return 3;
++}
++
++static struct options jmod[] = {
++	{.opt = "--b1",		.val = 0x10},
++	{.opt = "--b2",		.val = 0x20},
++	{.opt = "--b3",		.val = 0x40},
++	{.opt = "--b4",		.val = 0x80},
++	{.opt = "--hat1",	.val = 0x00},
++	{.opt = "--hat2",	.val = 0x01},
++	{.opt = "--hat3",	.val = 0x02},
++	{.opt = "--hat4",	.val = 0x03},
++	{.opt = "--hatneutral",	.val = 0x04},
++	{.opt = NULL}
++};
++
++int joystick_fill_report(char report[8], char buf[BUF_LEN], int *hold)
++{
++	char *tok = strtok(buf, " ");
++	int mvt = 0;
++	int i = 0;
++
++	*hold = 1;
++
++	/* set default hat position: neutral */
++	report[3] = 0x04;
++
++	for (; tok != NULL; tok = strtok(NULL, " ")) {
++
++		if (strcmp(tok, "--quit") == 0)
++			return -1;
++
++		for (i = 0; jmod[i].opt != NULL; i++)
++			if (strcmp(tok, jmod[i].opt) == 0) {
++				report[3] = (report[3] & 0xF0) | jmod[i].val;
++				break;
++			}
++		if (jmod[i].opt != NULL)
++			continue;
++
++		if (!(tok[0] == '-' && tok[1] == '-') && mvt < 3) {
++			errno = 0;
++			report[mvt++] = (char)strtol(tok, NULL, 0);
++			if (errno != 0) {
++				fprintf(stderr, "Bad value:'%s'\n", tok);
++				report[mvt--] = 0;
++			}
++			continue;
++		}
++
++		fprintf(stderr, "unknown option: %s\n", tok);
++	}
++	return 4;
++}
++
++void print_options(char c)
++{
++	int i = 0;
++
++	if (c == 'k') {
++		printf("	keyboard options:\n"
++		       "		--hold\n");
++		for (i = 0; kmod[i].opt != NULL; i++)
++			printf("\t\t%s\n", kmod[i].opt);
++		printf("\n	keyboard values:\n"
++		       "		[a-z] or\n");
++		for (i = 0; kval[i].opt != NULL; i++)
++			printf("\t\t%-8s%s", kval[i].opt, i % 2 ? "\n" : "");
++		printf("\n");
++	} else if (c == 'm') {
++		printf("	mouse options:\n"
++		       "		--hold\n");
++		for (i = 0; mmod[i].opt != NULL; i++)
++			printf("\t\t%s\n", mmod[i].opt);
++		printf("\n	mouse values:\n"
++		       "		Two signed numbers\n"
++		       "--quit to close\n");
++	} else {
++		printf("	joystick options:\n");
++		for (i = 0; jmod[i].opt != NULL; i++)
++			printf("\t\t%s\n", jmod[i].opt);
++		printf("\n	joystick values:\n"
++		       "		three signed numbers\n"
++		       "--quit to close\n");
++	}
++}
++
++int main(int argc, const char *argv[])
++{
++	const char *filename = NULL;
++	int fd = 0;
++	char buf[BUF_LEN];
++	int cmd_len;
++	char report[8];
++	int to_send = 8;
++	int hold = 0;
++	fd_set rfds;
++	int retval, i;
++
++	if (argc < 3) {
++		fprintf(stderr, "Usage: %s devname mouse|keyboard|joystick\n",
++			argv[0]);
++		return 1;
++	}
++
++	if (argv[2][0] != 'k' && argv[2][0] != 'm' && argv[2][0] != 'j')
++	  return 2;
++
++	filename = argv[1];
++
++	if ((fd = open(filename, O_RDWR, 0666)) == -1) {
++		perror(filename);
++		return 3;
++	}
++
++	print_options(argv[2][0]);
++
++	while (42) {
++
++		FD_ZERO(&rfds);
++		FD_SET(STDIN_FILENO, &rfds);
++		FD_SET(fd, &rfds);
++
++		retval = select(fd + 1, &rfds, NULL, NULL, NULL);
++		if (retval == -1 && errno == EINTR)
++			continue;
++		if (retval < 0) {
++			perror("select()");
++			return 4;
++		}
++
++		if (FD_ISSET(fd, &rfds)) {
++			cmd_len = read(fd, buf, BUF_LEN - 1);
++			printf("recv report:");
++			for (i = 0; i < cmd_len; i++)
++				printf(" %02x", buf[i]);
++			printf("\n");
++		}
++
++		if (FD_ISSET(STDIN_FILENO, &rfds)) {
++			memset(report, 0x0, sizeof(report));
++			cmd_len = read(STDIN_FILENO, buf, BUF_LEN - 1);
++
++			if (cmd_len == 0)
++				break;
++
++			buf[cmd_len - 1] = '\0';
++			hold = 0;
++
++			memset(report, 0x0, sizeof(report));
++			if (argv[2][0] == 'k')
++				to_send = keyboard_fill_report(report, buf, &hold);
++			else if (argv[2][0] == 'm')
++				to_send = mouse_fill_report(report, buf, &hold);
++			else
++				to_send = joystick_fill_report(report, buf, &hold);
++
++			if (to_send == -1)
++				break;
++
++			if (write(fd, report, to_send) != to_send) {
++				perror(filename);
++				return 5;
++			}
++			if (!hold) {
++				memset(report, 0x0, sizeof(report));
++				if (write(fd, report, to_send) != to_send) {
++					perror(filename);
++					return 6;
++				}
++			}
++		}
++	}
++
++	close(fd);
++	return 0;
++}
+--- a/drivers/usb/gadget/Kconfig
++++ b/drivers/usb/gadget/Kconfig
+@@ -863,6 +863,17 @@ config USB_G_MULTI_CDC
+ 
+ 	  If unsure, say "y".
+ 
++config USB_G_HID
++	tristate "HID Gadget"
++	help
++	  The HID gadget driver provides generic emulation of USB
++	  Human Interface Devices (HID).
++
++	  For more information, see Documentation/usb/gadget_hid.txt which
++	  includes sample code for accessing the device files.
++
++	  Say "y" to link the driver statically, or "m" to build a
++	  dynamically linked module called "g_hid".
+ 
+ # put drivers that need isochronous transfer support (for audio
+ # or video class gadget drivers), or specific hardware, here.
+--- a/drivers/usb/gadget/Makefile
++++ b/drivers/usb/gadget/Makefile
+@@ -43,6 +43,7 @@ g_mass_storage-objs		:= mass_storage.o
+ g_printer-objs			:= printer.o
+ g_cdc-objs			:= cdc2.o
+ g_multi-objs			:= multi.o
++g_hid-objs			:= hid.o
+ g_nokia-objs			:= nokia.o
+ 
+ obj-$(CONFIG_USB_ZERO)		+= g_zero.o
+@@ -55,6 +56,7 @@ obj-$(CONFIG_USB_G_SERIAL)	+= g_serial.o
+ obj-$(CONFIG_USB_G_PRINTER)	+= g_printer.o
+ obj-$(CONFIG_USB_MIDI_GADGET)	+= g_midi.o
+ obj-$(CONFIG_USB_CDC_COMPOSITE) += g_cdc.o
++obj-$(CONFIG_USB_G_HID)		+= g_hid.o
+ obj-$(CONFIG_USB_G_MULTI)	+= g_multi.o
+ obj-$(CONFIG_USB_G_NOKIA)	+= g_nokia.o
+ 
+--- /dev/null
++++ b/drivers/usb/gadget/f_hid.c
+@@ -0,0 +1,673 @@
++/*
++ * f_hid.c -- USB HID function driver
++ *
++ * Copyright (C) 2010 Fabien Chouteau <fabien.chouteau@barco.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++
++#include <linux/kernel.h>
++#include <linux/utsname.h>
++#include <linux/module.h>
++#include <linux/hid.h>
++#include <linux/cdev.h>
++#include <linux/mutex.h>
++#include <linux/poll.h>
++#include <linux/smp_lock.h>
++#include <linux/uaccess.h>
++#include <linux/wait.h>
++#include <linux/usb/g_hid.h>
++
++static int major, minors;
++static struct class *hidg_class;
++
++/*-------------------------------------------------------------------------*/
++/*                            HID gadget struct                            */
++
++struct f_hidg {
++	/* configuration */
++	unsigned char			bInterfaceSubClass;
++	unsigned char			bInterfaceProtocol;
++	unsigned short			report_desc_length;
++	char				*report_desc;
++	unsigned short			report_length;
++
++	/* recv report */
++	char				*set_report_buff;
++	unsigned short			set_report_length;
++	spinlock_t			spinlock;
++	wait_queue_head_t		read_queue;
++
++	/* send report */
++	struct mutex			lock;
++	bool				write_pending;
++	wait_queue_head_t		write_queue;
++	struct usb_request		*req;
++
++	int				minor;
++	struct cdev			cdev;
++	struct usb_function		func;
++	struct usb_ep			*in_ep;
++	struct usb_endpoint_descriptor	*fs_in_ep_desc;
++	struct usb_endpoint_descriptor	*hs_in_ep_desc;
++};
++
++static inline struct f_hidg *func_to_hidg(struct usb_function *f)
++{
++	return container_of(f, struct f_hidg, func);
++}
++
++/*-------------------------------------------------------------------------*/
++/*                           Static descriptors                            */
++
++static struct usb_interface_descriptor hidg_interface_desc = {
++	.bLength		= sizeof hidg_interface_desc,
++	.bDescriptorType	= USB_DT_INTERFACE,
++	/* .bInterfaceNumber	= DYNAMIC */
++	.bAlternateSetting	= 0,
++	.bNumEndpoints		= 1,
++	.bInterfaceClass	= USB_CLASS_HID,
++	/* .bInterfaceSubClass	= DYNAMIC */
++	/* .bInterfaceProtocol	= DYNAMIC */
++	/* .iInterface		= DYNAMIC */
++};
++
++static struct hid_descriptor hidg_desc = {
++	.bLength			= sizeof hidg_desc,
++	.bDescriptorType		= HID_DT_HID,
++	.bcdHID				= 0x0101,
++	.bCountryCode			= 0x00,
++	.bNumDescriptors		= 0x1,
++	/*.desc[0].bDescriptorType	= DYNAMIC */
++	/*.desc[0].wDescriptorLenght	= DYNAMIC */
++};
++
++/* High-Speed Support */
++
++static struct usb_endpoint_descriptor hidg_hs_in_ep_desc = {
++	.bLength		= USB_DT_ENDPOINT_SIZE,
++	.bDescriptorType	= USB_DT_ENDPOINT,
++	.bEndpointAddress	= USB_DIR_IN,
++	.bmAttributes		= USB_ENDPOINT_XFER_INT,
++	/*.wMaxPacketSize	= DYNAMIC */
++	.bInterval		= 4, /* FIXME: Add this field in the
++				      * HID gadget configuration?
++				      * (struct hidg_func_descriptor)
++				      */
++};
++
++static struct usb_descriptor_header *hidg_hs_descriptors[] = {
++	(struct usb_descriptor_header *)&hidg_interface_desc,
++	(struct usb_descriptor_header *)&hidg_desc,
++	(struct usb_descriptor_header *)&hidg_hs_in_ep_desc,
++	NULL,
++};
++
++/* Full-Speed Support */
++
++static struct usb_endpoint_descriptor hidg_fs_in_ep_desc = {
++	.bLength		= USB_DT_ENDPOINT_SIZE,
++	.bDescriptorType	= USB_DT_ENDPOINT,
++	.bEndpointAddress	= USB_DIR_IN,
++	.bmAttributes		= USB_ENDPOINT_XFER_INT,
++	/*.wMaxPacketSize	= DYNAMIC */
++	.bInterval		= 10, /* FIXME: Add this field in the
++				       * HID gadget configuration?
++				       * (struct hidg_func_descriptor)
++				       */
++};
++
++static struct usb_descriptor_header *hidg_fs_descriptors[] = {
++	(struct usb_descriptor_header *)&hidg_interface_desc,
++	(struct usb_descriptor_header *)&hidg_desc,
++	(struct usb_descriptor_header *)&hidg_fs_in_ep_desc,
++	NULL,
++};
++
++/*-------------------------------------------------------------------------*/
++/*                              Char Device                                */
++
++static ssize_t f_hidg_read(struct file *file, char __user *buffer,
++			size_t count, loff_t *ptr)
++{
++	struct f_hidg	*hidg     = (struct f_hidg *)file->private_data;
++	char		*tmp_buff = NULL;
++	unsigned long	flags;
++
++	if (!count)
++		return 0;
++
++	if (!access_ok(VERIFY_WRITE, buffer, count))
++		return -EFAULT;
++
++	spin_lock_irqsave(&hidg->spinlock, flags);
++
++#define READ_COND (hidg->set_report_buff != NULL)
++
++	while (!READ_COND) {
++		spin_unlock_irqrestore(&hidg->spinlock, flags);
++		if (file->f_flags & O_NONBLOCK)
++			return -EAGAIN;
++
++		if (wait_event_interruptible(hidg->read_queue, READ_COND))
++			return -ERESTARTSYS;
++
++		spin_lock_irqsave(&hidg->spinlock, flags);
++	}
++
++
++	count = min_t(unsigned, count, hidg->set_report_length);
++	tmp_buff = hidg->set_report_buff;
++	hidg->set_report_buff = NULL;
++
++	spin_unlock_irqrestore(&hidg->spinlock, flags);
++
++	if (tmp_buff != NULL) {
++		/* copy to user outside spinlock */
++		count -= copy_to_user(buffer, tmp_buff, count);
++		kfree(tmp_buff);
++	} else
++		count = -ENOMEM;
++
++	return count;
++}
++
++static void f_hidg_req_complete(struct usb_ep *ep, struct usb_request *req)
++{
++	struct f_hidg *hidg = (struct f_hidg *)ep->driver_data;
++
++	if (req->status != 0) {
++		ERROR(hidg->func.config->cdev,
++			"End Point Request ERROR: %d\n", req->status);
++	}
++
++	hidg->write_pending = 0;
++	wake_up(&hidg->write_queue);
++}
++
++static ssize_t f_hidg_write(struct file *file, const char __user *buffer,
++			    size_t count, loff_t *offp)
++{
++	struct f_hidg *hidg  = (struct f_hidg *)file->private_data;
++	ssize_t status = -ENOMEM;
++
++	if (!access_ok(VERIFY_READ, buffer, count))
++		return -EFAULT;
++
++	mutex_lock(&hidg->lock);
++
++#define WRITE_COND (!hidg->write_pending)
++
++	/* write queue */
++	while (!WRITE_COND) {
++		mutex_unlock(&hidg->lock);
++		if (file->f_flags & O_NONBLOCK)
++			return -EAGAIN;
++
++		if (wait_event_interruptible_exclusive(
++				hidg->write_queue, WRITE_COND))
++			return -ERESTARTSYS;
++
++		mutex_lock(&hidg->lock);
++	}
++
++	count  = min_t(unsigned, count, hidg->report_length);
++	status = copy_from_user(hidg->req->buf, buffer, count);
++
++	if (status != 0) {
++		ERROR(hidg->func.config->cdev,
++			"copy_from_user error\n");
++		mutex_unlock(&hidg->lock);
++		return -EINVAL;
++	}
++
++	hidg->req->status   = 0;
++	hidg->req->zero     = 0;
++	hidg->req->length   = count;
++	hidg->req->complete = f_hidg_req_complete;
++	hidg->req->context  = hidg;
++	hidg->write_pending = 1;
++
++	status = usb_ep_queue(hidg->in_ep, hidg->req, GFP_ATOMIC);
++	if (status < 0) {
++		ERROR(hidg->func.config->cdev,
++			"usb_ep_queue error on int endpoint %zd\n", status);
++		hidg->write_pending = 0;
++		wake_up(&hidg->write_queue);
++	} else {
++		status = count;
++	}
++
++	mutex_unlock(&hidg->lock);
++
++	return status;
++}
++
++static unsigned int f_hidg_poll(struct file *file, poll_table *wait)
++{
++	struct f_hidg	*hidg  = (struct f_hidg *)file->private_data;
++	unsigned int	ret = 0;
++
++	poll_wait(file, &hidg->read_queue, wait);
++	poll_wait(file, &hidg->write_queue, wait);
++
++	if (WRITE_COND)
++		ret |= POLLOUT | POLLWRNORM;
++
++	if (READ_COND)
++		ret |= POLLIN | POLLRDNORM;
++
++	return ret;
++}
++
++#undef WRITE_COND
++#undef READ_COND
++
++static int f_hidg_release(struct inode *inode, struct file *fd)
++{
++	fd->private_data = NULL;
++	return 0;
++}
++
++static int f_hidg_open(struct inode *inode, struct file *fd)
++{
++	struct f_hidg *hidg =
++		container_of(inode->i_cdev, struct f_hidg, cdev);
++
++	fd->private_data = hidg;
++
++	return 0;
++}
++
++/*-------------------------------------------------------------------------*/
++/*                                usb_function                             */
++
++static void hidg_set_report_complete(struct usb_ep *ep, struct usb_request *req)
++{
++	struct f_hidg *hidg = (struct f_hidg *)req->context;
++
++	if (req->status != 0 || req->buf == NULL || req->actual == 0) {
++		ERROR(hidg->func.config->cdev, "%s FAILED\n", __func__);
++		return;
++	}
++
++	spin_lock(&hidg->spinlock);
++
++	hidg->set_report_buff = krealloc(hidg->set_report_buff,
++					 req->actual, GFP_ATOMIC);
++
++	if (hidg->set_report_buff == NULL) {
++		spin_unlock(&hidg->spinlock);
++		return;
++	}
++	hidg->set_report_length = req->actual;
++	memcpy(hidg->set_report_buff, req->buf, req->actual);
++
++	spin_unlock(&hidg->spinlock);
++
++	wake_up(&hidg->read_queue);
++
++	return;
++}
++
++static int hidg_setup(struct usb_function *f,
++		const struct usb_ctrlrequest *ctrl)
++{
++	struct f_hidg			*hidg = func_to_hidg(f);
++	struct usb_composite_dev	*cdev = f->config->cdev;
++	struct usb_request		*req  = cdev->req;
++	int status = 0;
++	__u16 value, length;
++
++	value	= __le16_to_cpu(ctrl->wValue);
++	length	= __le16_to_cpu(ctrl->wLength);
++
++	VDBG(cdev, "hid_setup crtl_request : bRequestType:0x%x bRequest:0x%x "
++		"Value:0x%x\n", ctrl->bRequestType, ctrl->bRequest, value);
++
++	switch ((ctrl->bRequestType << 8) | ctrl->bRequest) {
++	case ((USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE) << 8
++		  | HID_REQ_GET_REPORT):
++		VDBG(cdev, "get_report\n");
++
++		/* send an empty report */
++		length = min_t(unsigned, length, hidg->report_length);
++		memset(req->buf, 0x0, length);
++
++		goto respond;
++		break;
++
++	case ((USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE) << 8
++		  | HID_REQ_GET_PROTOCOL):
++		VDBG(cdev, "get_protocol\n");
++		goto stall;
++		break;
++
++	case ((USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE) << 8
++		  | HID_REQ_SET_REPORT):
++		VDBG(cdev, "set_report | wLenght=%d\n", ctrl->wLength);
++		req->context  = hidg;
++		req->complete = hidg_set_report_complete;
++		goto respond;
++		break;
++
++	case ((USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE) << 8
++		  | HID_REQ_SET_PROTOCOL):
++		VDBG(cdev, "set_protocol\n");
++		goto stall;
++		break;
++
++	case ((USB_DIR_IN | USB_TYPE_STANDARD | USB_RECIP_INTERFACE) << 8
++		  | USB_REQ_GET_DESCRIPTOR):
++		switch (value >> 8) {
++		case HID_DT_REPORT:
++			VDBG(cdev, "USB_REQ_GET_DESCRIPTOR: REPORT\n");
++			length = min_t(unsigned short, length,
++						   hidg->report_desc_length);
++			memcpy(req->buf, hidg->report_desc, length);
++			goto respond;
++			break;
++
++		default:
++			VDBG(cdev, "Unknown decriptor request 0x%x\n",
++				 value >> 8);
++			goto stall;
++			break;
++		}
++		break;
++
++	default:
++		VDBG(cdev, "Unknown request 0x%x\n",
++			 ctrl->bRequest);
++		goto stall;
++		break;
++	}
++
++stall:
++	return -EOPNOTSUPP;
++
++respond:
++	req->zero = 0;
++	req->length = length;
++	status = usb_ep_queue(cdev->gadget->ep0, req, GFP_ATOMIC);
++	if (status < 0)
++		ERROR(cdev, "usb_ep_queue error on ep0 %d\n", value);
++	return status;
++}
++
++static void hidg_disable(struct usb_function *f)
++{
++	struct f_hidg *hidg = func_to_hidg(f);
++
++	usb_ep_disable(hidg->in_ep);
++	hidg->in_ep->driver_data = NULL;
++
++	return;
++}
++
++static int hidg_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
++{
++	struct usb_composite_dev		*cdev = f->config->cdev;
++	struct f_hidg				*hidg = func_to_hidg(f);
++	const struct usb_endpoint_descriptor	*ep_desc;
++	int status = 0;
++
++	VDBG(cdev, "hidg_set_alt intf:%d alt:%d\n", intf, alt);
++
++	if (hidg->in_ep != NULL) {
++		/* restart endpoint */
++		if (hidg->in_ep->driver_data != NULL)
++			usb_ep_disable(hidg->in_ep);
++
++		ep_desc = ep_choose(f->config->cdev->gadget,
++				hidg->hs_in_ep_desc, hidg->fs_in_ep_desc);
++		status = usb_ep_enable(hidg->in_ep, ep_desc);
++		if (status < 0) {
++			ERROR(cdev, "Enable endpoint FAILED!\n");
++			goto fail;
++		}
++		hidg->in_ep->driver_data = hidg;
++	}
++fail:
++	return status;
++}
++
++const struct file_operations f_hidg_fops = {
++	.owner		= THIS_MODULE,
++	.open		= f_hidg_open,
++	.release	= f_hidg_release,
++	.write		= f_hidg_write,
++	.read		= f_hidg_read,
++	.poll		= f_hidg_poll,
++};
++
++static int __init hidg_bind(struct usb_configuration *c, struct usb_function *f)
++{
++	struct usb_ep		*ep;
++	struct f_hidg		*hidg = func_to_hidg(f);
++	int			status;
++	dev_t			dev;
++
++	/* allocate instance-specific interface IDs, and patch descriptors */
++	status = usb_interface_id(c, f);
++	if (status < 0)
++		goto fail;
++	hidg_interface_desc.bInterfaceNumber = status;
++
++
++	/* allocate instance-specific endpoints */
++	status = -ENODEV;
++	ep = usb_ep_autoconfig(c->cdev->gadget, &hidg_fs_in_ep_desc);
++	if (!ep)
++		goto fail;
++	ep->driver_data = c->cdev;	/* claim */
++	hidg->in_ep = ep;
++
++	/* preallocate request and buffer */
++	status = -ENOMEM;
++	hidg->req = usb_ep_alloc_request(hidg->in_ep, GFP_KERNEL);
++	if (!hidg->req)
++		goto fail;
++
++
++	hidg->req->buf = kmalloc(hidg->report_length, GFP_KERNEL);
++	if (!hidg->req->buf)
++		goto fail;
++
++	/* set descriptor dynamic values */
++	hidg_interface_desc.bInterfaceSubClass = hidg->bInterfaceSubClass;
++	hidg_interface_desc.bInterfaceProtocol = hidg->bInterfaceProtocol;
++	hidg_hs_in_ep_desc.wMaxPacketSize = cpu_to_le16(hidg->report_length);
++	hidg_fs_in_ep_desc.wMaxPacketSize = cpu_to_le16(hidg->report_length);
++	hidg_desc.desc[0].bDescriptorType = HID_DT_REPORT;
++	hidg_desc.desc[0].wDescriptorLength =
++		cpu_to_le16(hidg->report_desc_length);
++
++	hidg->set_report_buff = NULL;
++
++	/* copy descriptors */
++	f->descriptors = usb_copy_descriptors(hidg_fs_descriptors);
++	if (!f->descriptors)
++		goto fail;
++
++	hidg->fs_in_ep_desc = usb_find_endpoint(hidg_fs_descriptors,
++						f->descriptors,
++						&hidg_fs_in_ep_desc);
++
++	if (gadget_is_dualspeed(c->cdev->gadget)) {
++		hidg_hs_in_ep_desc.bEndpointAddress =
++			hidg_fs_in_ep_desc.bEndpointAddress;
++		f->hs_descriptors = usb_copy_descriptors(hidg_hs_descriptors);
++		if (!f->hs_descriptors)
++			goto fail;
++		hidg->hs_in_ep_desc = usb_find_endpoint(hidg_hs_descriptors,
++							f->hs_descriptors,
++							&hidg_hs_in_ep_desc);
++	} else {
++		hidg->hs_in_ep_desc = NULL;
++	}
++
++	mutex_init(&hidg->lock);
++	spin_lock_init(&hidg->spinlock);
++	init_waitqueue_head(&hidg->write_queue);
++	init_waitqueue_head(&hidg->read_queue);
++
++	/* create char device */
++	cdev_init(&hidg->cdev, &f_hidg_fops);
++	dev = MKDEV(major, hidg->minor);
++	status = cdev_add(&hidg->cdev, dev, 1);
++	if (status)
++		goto fail;
++
++	device_create(hidg_class, NULL, dev, NULL, "%s%d", "hidg", hidg->minor);
++
++	return 0;
++
++fail:
++	ERROR(f->config->cdev, "hidg_bind FAILED\n");
++	if (hidg->req != NULL) {
++		kfree(hidg->req->buf);
++		if (hidg->in_ep != NULL)
++			usb_ep_free_request(hidg->in_ep, hidg->req);
++	}
++
++	usb_free_descriptors(f->hs_descriptors);
++	usb_free_descriptors(f->descriptors);
++
++	return status;
++}
++
++static void hidg_unbind(struct usb_configuration *c, struct usb_function *f)
++{
++	struct f_hidg *hidg = func_to_hidg(f);
++
++	device_destroy(hidg_class, MKDEV(major, hidg->minor));
++	cdev_del(&hidg->cdev);
++
++	/* disable/free request and end point */
++	usb_ep_disable(hidg->in_ep);
++	usb_ep_dequeue(hidg->in_ep, hidg->req);
++	kfree(hidg->req->buf);
++	usb_ep_free_request(hidg->in_ep, hidg->req);
++
++	/* free descriptors copies */
++	usb_free_descriptors(f->hs_descriptors);
++	usb_free_descriptors(f->descriptors);
++
++	kfree(hidg->report_desc);
++	kfree(hidg->set_report_buff);
++	kfree(hidg);
++}
++
++/*-------------------------------------------------------------------------*/
++/*                                 Strings                                 */
++
++#define CT_FUNC_HID_IDX	0
++
++static struct usb_string ct_func_string_defs[] = {
++	[CT_FUNC_HID_IDX].s	= "HID Interface",
++	{},			/* end of list */
++};
++
++static struct usb_gadget_strings ct_func_string_table = {
++	.language	= 0x0409,	/* en-US */
++	.strings	= ct_func_string_defs,
++};
++
++static struct usb_gadget_strings *ct_func_strings[] = {
++	&ct_func_string_table,
++	NULL,
++};
++
++/*-------------------------------------------------------------------------*/
++/*                             usb_configuration                           */
++
++int __init hidg_bind_config(struct usb_configuration *c,
++			    struct hidg_func_descriptor *fdesc, int index)
++{
++	struct f_hidg *hidg;
++	int status;
++
++	if (index >= minors)
++		return -ENOENT;
++
++	/* maybe allocate device-global string IDs, and patch descriptors */
++	if (ct_func_string_defs[CT_FUNC_HID_IDX].id == 0) {
++		status = usb_string_id(c->cdev);
++		if (status < 0)
++			return status;
++		ct_func_string_defs[CT_FUNC_HID_IDX].id = status;
++		hidg_interface_desc.iInterface = status;
++	}
++
++	/* allocate and initialize one new instance */
++	hidg = kzalloc(sizeof *hidg, GFP_KERNEL);
++	if (!hidg)
++		return -ENOMEM;
++
++	hidg->minor = index;
++	hidg->bInterfaceSubClass = fdesc->subclass;
++	hidg->bInterfaceProtocol = fdesc->protocol;
++	hidg->report_length = fdesc->report_length;
++	hidg->report_desc_length = fdesc->report_desc_length;
++	hidg->report_desc = kmemdup(fdesc->report_desc,
++				    fdesc->report_desc_length,
++				    GFP_KERNEL);
++	if (!hidg->report_desc) {
++		kfree(hidg);
++		return -ENOMEM;
++	}
++
++	hidg->func.name    = "hid";
++	hidg->func.strings = ct_func_strings;
++	hidg->func.bind    = hidg_bind;
++	hidg->func.unbind  = hidg_unbind;
++	hidg->func.set_alt = hidg_set_alt;
++	hidg->func.disable = hidg_disable;
++	hidg->func.setup   = hidg_setup;
++
++	status = usb_add_function(c, &hidg->func);
++	if (status)
++		kfree(hidg);
++
++	return status;
++}
++
++int __init ghid_setup(struct usb_gadget *g, int count)
++{
++	int status;
++	dev_t dev;
++
++	hidg_class = class_create(THIS_MODULE, "hidg");
++
++	status = alloc_chrdev_region(&dev, 0, count, "hidg");
++	if (!status) {
++		major = MAJOR(dev);
++		minors = count;
++	}
++
++	return status;
++}
++
++void ghid_cleanup(void)
++{
++	if (major) {
++		unregister_chrdev_region(MKDEV(major, 0), minors);
++		major = minors = 0;
++	}
++
++	class_destroy(hidg_class);
++	hidg_class = NULL;
++}
+--- /dev/null
++++ b/drivers/usb/gadget/hid.c
+@@ -0,0 +1,288 @@
++/*
++ * hid.c -- HID Composite driver
++ *
++ * Based on multi.c
++ *
++ * Copyright (C) 2010 Fabien Chouteau <fabien.chouteau@barco.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++
++
++#include <linux/kernel.h>
++#include <linux/platform_device.h>
++#include <linux/list.h>
++
++#define DRIVER_DESC		"HID Gadget"
++#define DRIVER_VERSION		"2010/03/16"
++
++/*-------------------------------------------------------------------------*/
++
++#define HIDG_VENDOR_NUM		0x0525	/* XXX NetChip */
++#define HIDG_PRODUCT_NUM	0xa4ac	/* Linux-USB HID gadget */
++
++/*-------------------------------------------------------------------------*/
++
++/*
++ * kbuild is not very cooperative with respect to linking separately
++ * compiled library objects into one module.  So for now we won't use
++ * separate compilation ... ensuring init/exit sections work to shrink
++ * the runtime footprint, and giving us at least some parts of what
++ * a "gcc --combine ... part1.c part2.c part3.c ... " build would.
++ */
++
++#include "composite.c"
++#include "usbstring.c"
++#include "config.c"
++#include "epautoconf.c"
++
++#include "f_hid.c"
++
++
++struct hidg_func_node {
++	struct list_head node;
++	struct hidg_func_descriptor *func;
++};
++
++static LIST_HEAD(hidg_func_list);
++
++/*-------------------------------------------------------------------------*/
++
++static struct usb_device_descriptor device_desc = {
++	.bLength =		sizeof device_desc,
++	.bDescriptorType =	USB_DT_DEVICE,
++
++	.bcdUSB =		cpu_to_le16(0x0200),
++
++	/* .bDeviceClass =		USB_CLASS_COMM, */
++	/* .bDeviceSubClass =	0, */
++	/* .bDeviceProtocol =	0, */
++	.bDeviceClass =		0xEF,
++	.bDeviceSubClass =	2,
++	.bDeviceProtocol =	1,
++	/* .bMaxPacketSize0 = f(hardware) */
++
++	/* Vendor and product id can be overridden by module parameters.  */
++	.idVendor =		cpu_to_le16(HIDG_VENDOR_NUM),
++	.idProduct =		cpu_to_le16(HIDG_PRODUCT_NUM),
++	/* .bcdDevice = f(hardware) */
++	/* .iManufacturer = DYNAMIC */
++	/* .iProduct = DYNAMIC */
++	/* NO SERIAL NUMBER */
++	.bNumConfigurations =	1,
++};
++
++static struct usb_otg_descriptor otg_descriptor = {
++	.bLength =		sizeof otg_descriptor,
++	.bDescriptorType =	USB_DT_OTG,
++
++	/* REVISIT SRP-only hardware is possible, although
++	 * it would not be called "OTG" ...
++	 */
++	.bmAttributes =		USB_OTG_SRP | USB_OTG_HNP,
++};
++
++static const struct usb_descriptor_header *otg_desc[] = {
++	(struct usb_descriptor_header *) &otg_descriptor,
++	NULL,
++};
++
++
++/* string IDs are assigned dynamically */
++
++#define STRING_MANUFACTURER_IDX		0
++#define STRING_PRODUCT_IDX		1
++
++static char manufacturer[50];
++
++static struct usb_string strings_dev[] = {
++	[STRING_MANUFACTURER_IDX].s = manufacturer,
++	[STRING_PRODUCT_IDX].s = DRIVER_DESC,
++	{  } /* end of list */
++};
++
++static struct usb_gadget_strings stringtab_dev = {
++	.language	= 0x0409,	/* en-us */
++	.strings	= strings_dev,
++};
++
++static struct usb_gadget_strings *dev_strings[] = {
++	&stringtab_dev,
++	NULL,
++};
++
++
++
++/****************************** Configurations ******************************/
++
++static int __init do_config(struct usb_configuration *c)
++{
++	struct hidg_func_node *e;
++	int func = 0, status = 0;
++
++	if (gadget_is_otg(c->cdev->gadget)) {
++		c->descriptors = otg_desc;
++		c->bmAttributes |= USB_CONFIG_ATT_WAKEUP;
++	}
++
++	list_for_each_entry(e, &hidg_func_list, node) {
++		status = hidg_bind_config(c, e->func, func++);
++		if (status)
++			break;
++	}
++
++	return status;
++}
++
++static struct usb_configuration config_driver = {
++	.label			= "HID Gadget",
++	.bind			= do_config,
++	.bConfigurationValue	= 1,
++	/* .iConfiguration = DYNAMIC */
++	.bmAttributes		= USB_CONFIG_ATT_SELFPOWER,
++};
++
++/****************************** Gadget Bind ******************************/
++
++static int __init hid_bind(struct usb_composite_dev *cdev)
++{
++	struct usb_gadget *gadget = cdev->gadget;
++	struct list_head *tmp;
++	int status, gcnum, funcs = 0;
++
++	list_for_each(tmp, &hidg_func_list)
++		funcs++;
++
++	if (!funcs)
++		return -ENODEV;
++
++	/* set up HID */
++	status = ghid_setup(cdev->gadget, funcs);
++	if (status < 0)
++		return status;
++
++	gcnum = usb_gadget_controller_number(gadget);
++	if (gcnum >= 0)
++		device_desc.bcdDevice = cpu_to_le16(0x0300 | gcnum);
++	else
++		device_desc.bcdDevice = cpu_to_le16(0x0300 | 0x0099);
++
++
++	/* Allocate string descriptor numbers ... note that string
++	 * contents can be overridden by the composite_dev glue.
++	 */
++
++	/* device descriptor strings: manufacturer, product */
++	snprintf(manufacturer, sizeof manufacturer, "%s %s with %s",
++		init_utsname()->sysname, init_utsname()->release,
++		gadget->name);
++	status = usb_string_id(cdev);
++	if (status < 0)
++		return status;
++	strings_dev[STRING_MANUFACTURER_IDX].id = status;
++	device_desc.iManufacturer = status;
++
++	status = usb_string_id(cdev);
++	if (status < 0)
++		return status;
++	strings_dev[STRING_PRODUCT_IDX].id = status;
++	device_desc.iProduct = status;
++
++	/* register our configuration */
++	status = usb_add_config(cdev, &config_driver);
++	if (status < 0)
++		return status;
++
++	dev_info(&gadget->dev, DRIVER_DESC ", version: " DRIVER_VERSION "\n");
++
++	return 0;
++}
++
++static int __exit hid_unbind(struct usb_composite_dev *cdev)
++{
++	ghid_cleanup();
++	return 0;
++}
++
++static int __init hidg_plat_driver_probe(struct platform_device *pdev)
++{
++	struct hidg_func_descriptor *func = pdev->dev.platform_data;
++	struct hidg_func_node *entry;
++
++	if (!func) {
++		dev_err(&pdev->dev, "Platform data missing\n");
++		return -ENODEV;
++	}
++
++	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
++	if (!entry)
++		return -ENOMEM;
++
++	entry->func = func;
++	list_add_tail(&entry->node, &hidg_func_list);
++
++	return 0;
++}
++
++static int __devexit hidg_plat_driver_remove(struct platform_device *pdev)
++{
++	struct hidg_func_node *e, *n;
++
++	list_for_each_entry_safe(e, n, &hidg_func_list, node) {
++		list_del(&e->node);
++		kfree(e);
++	}
++
++	return 0;
++}
++
++
++/****************************** Some noise ******************************/
++
++
++static struct usb_composite_driver hidg_driver = {
++	.name		= "g_hid",
++	.dev		= &device_desc,
++	.strings	= dev_strings,
++	.bind		= hid_bind,
++	.unbind		= __exit_p(hid_unbind),
++};
++
++static struct platform_driver hidg_plat_driver = {
++	.remove		= __devexit_p(hidg_plat_driver_remove),
++	.driver		= {
++		.owner	= THIS_MODULE,
++		.name	= "hidg",
++	},
++};
++
++
++MODULE_DESCRIPTION(DRIVER_DESC);
++MODULE_AUTHOR("Fabien Chouteau, Peter Korsgaard");
++MODULE_LICENSE("GPL");
++
++static int __init hidg_init(void)
++{
++	platform_driver_probe(&hidg_plat_driver, hidg_plat_driver_probe);
++	return usb_composite_register(&hidg_driver);
++}
++module_init(hidg_init);
++
++static void __exit hidg_cleanup(void)
++{
++	platform_driver_unregister(&hidg_plat_driver);
++	usb_composite_unregister(&hidg_driver);
++}
++module_exit(hidg_cleanup);
+--- /dev/null
++++ b/include/linux/usb/g_hid.h
+@@ -0,0 +1,32 @@
++/*
++ * g_hid.h -- Header file for USB HID gadget driver
++ *
++ * Copyright (C) 2010 Fabien Chouteau <fabien.chouteau@barco.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++
++#ifndef __LINUX_USB_G_HID_H
++#define __LINUX_USB_G_HID_H
++
++struct hidg_func_descriptor {
++	unsigned char		subclass;
++	unsigned char		protocol;
++	unsigned short		report_length;
++	unsigned short		report_desc_length;
++	unsigned char		report_desc[];
++};
++
++#endif /* __LINUX_USB_G_HID_H */

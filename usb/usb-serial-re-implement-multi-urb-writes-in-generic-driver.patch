@@ -1,0 +1,274 @@
+From jhovold@gmail.com  Fri Apr 23 15:36:18 2010
+From: Johan Hovold <jhovold@gmail.com>
+Date: Wed, 17 Mar 2010 23:06:07 +0100
+Subject: USB: serial: re-implement multi-urb writes in generic driver
+To: linux-usb@vger.kernel.org
+Cc: Greg Kroah-Hartman <gregkh@suse.de>, Johan Hovold <jhovold@gmail.com>
+Message-ID: <1268863572-17891-16-git-send-email-jhovold@gmail.com>
+
+
+Use dynamic transfer buffer sizes since it is more efficient to let the
+host controller do the partitioning to fit endpoint size. This way we
+also do not use more than one urb per write request.
+
+Replace max_in_flight_urbs with multi_urb_write flag in struct
+usb_serial_driver to enable multi-urb writes.
+
+Use MAX_TX_URBS=40 and a max buffer size of PAGE_SIZE to prevent DoS
+attacks.
+
+Signed-off-by: Johan Hovold <jhovold@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/serial/generic.c |  132 ++++++++++++++++++-------------------------
+ include/linux/usb/serial.h   |    9 +-
+ 2 files changed, 62 insertions(+), 79 deletions(-)
+
+--- a/drivers/usb/serial/generic.c
++++ b/drivers/usb/serial/generic.c
+@@ -25,6 +25,8 @@
+ 
+ static int debug;
+ 
++#define MAX_TX_URBS		40
++
+ #ifdef CONFIG_USB_SERIAL_GENERIC
+ 
+ static int generic_probe(struct usb_interface *interface,
+@@ -172,78 +174,63 @@ static int usb_serial_multi_urb_write(st
+ 	struct urb *urb;
+ 	unsigned char *buffer;
+ 	int status;
+-	int towrite;
+-	int bwrite = 0;
+-
+-	dbg("%s - port %d", __func__, port->number);
+-
+-	if (count == 0)
+-		dbg("%s - write request of 0 bytes", __func__);
+ 
+-	while (count > 0) {
+-		towrite = (count > port->bulk_out_size) ?
+-			port->bulk_out_size : count;
+-		spin_lock_irqsave(&port->lock, flags);
+-		if (port->urbs_in_flight >
+-		    port->serial->type->max_in_flight_urbs) {
+-			spin_unlock_irqrestore(&port->lock, flags);
+-			dbg("%s - write limit hit", __func__);
+-			return bwrite;
+-		}
+-		port->tx_bytes_flight += towrite;
+-		port->urbs_in_flight++;
++	spin_lock_irqsave(&port->lock, flags);
++	if (port->tx_urbs == MAX_TX_URBS) {
+ 		spin_unlock_irqrestore(&port->lock, flags);
++		dbg("%s - write limit hit", __func__);
++		return 0;
++	}
++	port->tx_urbs++;
++	spin_unlock_irqrestore(&port->lock, flags);
+ 
+-		buffer = kmalloc(towrite, GFP_ATOMIC);
+-		if (!buffer) {
+-			dev_err(&port->dev,
+-			"%s ran out of kernel memory for urb ...\n", __func__);
+-			goto error_no_buffer;
+-		}
++	urb = usb_alloc_urb(0, GFP_ATOMIC);
++	if (!urb) {
++		dev_err(&port->dev, "%s - no free urbs available\n", __func__);
++		status = -ENOMEM;
++		goto err_urb;
++	}
+ 
+-		urb = usb_alloc_urb(0, GFP_ATOMIC);
+-		if (!urb) {
+-			dev_err(&port->dev, "%s - no more free urbs\n",
++	count = min_t(int, count, PAGE_SIZE);
++	buffer = kmalloc(count, GFP_ATOMIC);
++	if (!buffer) {
++		dev_err(&port->dev, "%s - could not allocate buffer\n",
+ 				__func__);
+-			goto error_no_urb;
+-		}
++		status = -ENOMEM;
++		goto err_buf;
++	}
+ 
+-		/* Copy data */
+-		memcpy(buffer, buf + bwrite, towrite);
+-		usb_serial_debug_data(debug, &port->dev, __func__,
+-				      towrite, buffer);
+-		/* fill the buffer and send it */
+-		usb_fill_bulk_urb(urb, port->serial->dev,
++	memcpy(buffer, buf, count);
++	usb_serial_debug_data(debug, &port->dev, __func__, count, buffer);
++	usb_fill_bulk_urb(urb, port->serial->dev,
+ 			usb_sndbulkpipe(port->serial->dev,
+ 					port->bulk_out_endpointAddress),
+-			buffer, towrite,
++			buffer, count,
+ 			port->serial->type->write_bulk_callback, port);
+ 
+-		status = usb_submit_urb(urb, GFP_ATOMIC);
+-		if (status) {
+-			dev_err(&port->dev, "%s - error submitting urb: %d\n",
++	status = usb_submit_urb(urb, GFP_ATOMIC);
++	if (status) {
++		dev_err(&port->dev, "%s - error submitting urb: %d\n",
+ 				__func__, status);
+-			goto error;
+-		}
+-
+-		/* This urb is the responsibility of the host driver now */
+-		usb_free_urb(urb);
+-		dbg("%s write: %d", __func__, towrite);
+-		count -= towrite;
+-		bwrite += towrite;
++		goto err;
+ 	}
+-	return bwrite;
++	spin_lock_irqsave(&port->lock, flags);
++	port->tx_bytes += urb->transfer_buffer_length;
++	spin_unlock_irqrestore(&port->lock, flags);
+ 
+-error:
+ 	usb_free_urb(urb);
+-error_no_urb:
++
++	return count;
++err:
+ 	kfree(buffer);
+-error_no_buffer:
++err_buf:
++	usb_free_urb(urb);
++err_urb:
+ 	spin_lock_irqsave(&port->lock, flags);
+-	port->urbs_in_flight--;
+-	port->tx_bytes_flight -= towrite;
++	port->tx_urbs--;
+ 	spin_unlock_irqrestore(&port->lock, flags);
+-	return bwrite;
++
++	return status;
+ }
+ 
+ /**
+@@ -286,7 +273,7 @@ static int usb_serial_generic_write_star
+ 	}
+ 
+ 	spin_lock_irqsave(&port->lock, flags);
+-	port->tx_bytes_flight += count;
++	port->tx_bytes += count;
+ 	spin_unlock_irqrestore(&port->lock, flags);
+ 
+ 	return count;
+@@ -318,9 +305,8 @@ int usb_serial_generic_write(struct tty_
+ 	if (!count)
+ 		return 0;
+ 
+-	if (serial->type->max_in_flight_urbs)
+-		return usb_serial_multi_urb_write(tty, port,
+-						  buf, count);
++	if (serial->type->multi_urb_write)
++		return usb_serial_multi_urb_write(tty, port, buf, count);
+ 
+ 	count = kfifo_in_locked(&port->write_fifo, buf, count, &port->lock);
+ 	result = usb_serial_generic_write_start(port);
+@@ -337,7 +323,7 @@ int usb_serial_generic_write_room(struct
+ 	struct usb_serial_port *port = tty->driver_data;
+ 	struct usb_serial *serial = port->serial;
+ 	unsigned long flags;
+-	int room = 0;
++	int room;
+ 
+ 	dbg("%s - port %d", __func__, port->number);
+ 
+@@ -345,14 +331,10 @@ int usb_serial_generic_write_room(struct
+ 		return 0;
+ 
+ 	spin_lock_irqsave(&port->lock, flags);
+-	if (serial->type->max_in_flight_urbs) {
+-		if (port->urbs_in_flight < serial->type->max_in_flight_urbs)
+-			room = port->bulk_out_size *
+-				(serial->type->max_in_flight_urbs -
+-				 port->urbs_in_flight);
+-	} else {
++	if (serial->type->multi_urb_write)
++		room = (MAX_TX_URBS - port->tx_urbs) * PAGE_SIZE;
++	else
+ 		room = kfifo_avail(&port->write_fifo);
+-	}
+ 	spin_unlock_irqrestore(&port->lock, flags);
+ 
+ 	dbg("%s - returns %d", __func__, room);
+@@ -372,10 +354,10 @@ int usb_serial_generic_chars_in_buffer(s
+ 		return 0;
+ 
+ 	spin_lock_irqsave(&port->lock, flags);
+-	if (serial->type->max_in_flight_urbs)
+-		chars = port->tx_bytes_flight;
++	if (serial->type->multi_urb_write)
++		chars = port->tx_bytes;
+ 	else
+-		chars = kfifo_len(&port->write_fifo) + port->tx_bytes_flight;
++		chars = kfifo_len(&port->write_fifo) + port->tx_bytes;
+ 	spin_unlock_irqrestore(&port->lock, flags);
+ 
+ 	dbg("%s - returns %d", __func__, chars);
+@@ -461,18 +443,16 @@ void usb_serial_generic_write_bulk_callb
+ 
+ 	dbg("%s - port %d", __func__, port->number);
+ 
+-	if (port->serial->type->max_in_flight_urbs) {
++	if (port->serial->type->multi_urb_write) {
+ 		kfree(urb->transfer_buffer);
+ 
+ 		spin_lock_irqsave(&port->lock, flags);
+-		--port->urbs_in_flight;
+-		port->tx_bytes_flight -= urb->transfer_buffer_length;
+-		if (port->urbs_in_flight < 0)
+-			port->urbs_in_flight = 0;
++		port->tx_bytes -= urb->transfer_buffer_length;
++		port->tx_urbs--;
+ 		spin_unlock_irqrestore(&port->lock, flags);
+ 	} else {
+ 		spin_lock_irqsave(&port->lock, flags);
+-		port->tx_bytes_flight -= urb->transfer_buffer_length;
++		port->tx_bytes -= urb->transfer_buffer_length;
+ 		port->write_urb_busy = 0;
+ 		spin_unlock_irqrestore(&port->lock, flags);
+ 
+--- a/include/linux/usb/serial.h
++++ b/include/linux/usb/serial.h
+@@ -60,6 +60,8 @@ enum port_dev_state {
+  * @write_urb: pointer to the bulk out struct urb for this port.
+  * @write_fifo: kfifo used to buffer outgoing data
+  * @write_urb_busy: port`s writing status
++ * @tx_bytes: number of bytes currently in host stack queues
++ * @tx_urbs: number of urbs currently in host stack queues
+  * @bulk_out_endpointAddress: endpoint address for the bulk out pipe for this
+  *	port.
+  * @write_wait: a wait_queue_head_t used by the port.
+@@ -98,8 +100,8 @@ struct usb_serial_port {
+ 	int			write_urb_busy;
+ 	__u8			bulk_out_endpointAddress;
+ 
+-	int			tx_bytes_flight;
+-	int			urbs_in_flight;
++	int			tx_bytes;
++	int			tx_urbs;
+ 
+ 	wait_queue_head_t	write_wait;
+ 	struct work_struct	work;
+@@ -223,7 +225,8 @@ struct usb_serial_driver {
+ 	struct device_driver	driver;
+ 	struct usb_driver	*usb_driver;
+ 	struct usb_dynids	dynids;
+-	int			max_in_flight_urbs;
++
++	unsigned char		multi_urb_write:1;
+ 
+ 	size_t			bulk_in_size;
+ 	size_t			bulk_out_size;

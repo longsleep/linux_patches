@@ -1,0 +1,153 @@
+From jhovold@gmail.com  Fri Apr 23 15:36:57 2010
+From: Johan Hovold <jhovold@gmail.com>
+Date: Wed, 17 Mar 2010 23:06:08 +0100
+Subject: USB: serial: generalise write buffer preparation
+To: linux-usb@vger.kernel.org
+Cc: Greg Kroah-Hartman <gregkh@suse.de>, Johan Hovold <jhovold@gmail.com>
+Message-ID: <1268863572-17891-17-git-send-email-jhovold@gmail.com>
+
+
+Generalise write buffer preparation.
+
+This allows for drivers to manipulate (e.g. add headers) to bulk out
+data before it is sent.
+
+This adds a new function pointer to usb_serial_driver:
+
+int (*prepare_write_buffer)(struct usb_serial_port *port,
+		void **dest, size_t size, const void *src, size_t count);
+
+The function is generic and can be used with either kfifo-based or
+multi-urb writes:
+
+If *dest is NULL the implementation should allocate dest.
+If src is NULL the implementation should use the port write fifo.
+
+If not set, a generic implementation is used which simply uses memcpy or
+kfifo_out.
+
+Signed-off-by: Johan Hovold <jhovold@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/serial/generic.c    |   47 ++++++++++++++++++++++++++++------------
+ drivers/usb/serial/usb-serial.c |    1 
+ include/linux/usb/serial.h      |    5 ++++
+ 3 files changed, 40 insertions(+), 13 deletions(-)
+
+--- a/drivers/usb/serial/generic.c
++++ b/drivers/usb/serial/generic.c
+@@ -167,12 +167,35 @@ void usb_serial_generic_close(struct usb
+ }
+ EXPORT_SYMBOL_GPL(usb_serial_generic_close);
+ 
++int usb_serial_generic_prepare_write_buffer(struct usb_serial_port *port,
++		void **dest, size_t size, const void *src, size_t count)
++{
++	if (!*dest) {
++		size = count;
++		*dest = kmalloc(count, GFP_ATOMIC);
++		if (!*dest) {
++			dev_err(&port->dev, "%s - could not allocate buffer\n",
++					__func__);
++			return -ENOMEM;
++		}
++	}
++	if (src) {
++		count = size;
++		memcpy(*dest, src, size);
++	} else {
++		count = kfifo_out_locked(&port->write_fifo, *dest, size,
++								&port->lock);
++	}
++	return count;
++}
++EXPORT_SYMBOL_GPL(usb_serial_generic_prepare_write_buffer);
++
+ static int usb_serial_multi_urb_write(struct tty_struct *tty,
+ 	struct usb_serial_port *port, const unsigned char *buf, int count)
+ {
+ 	unsigned long flags;
+ 	struct urb *urb;
+-	unsigned char *buffer;
++	void *buffer;
+ 	int status;
+ 
+ 	spin_lock_irqsave(&port->lock, flags);
+@@ -191,16 +214,14 @@ static int usb_serial_multi_urb_write(st
+ 		goto err_urb;
+ 	}
+ 
++	buffer = NULL;
+ 	count = min_t(int, count, PAGE_SIZE);
+-	buffer = kmalloc(count, GFP_ATOMIC);
+-	if (!buffer) {
+-		dev_err(&port->dev, "%s - could not allocate buffer\n",
+-				__func__);
+-		status = -ENOMEM;
++	count = port->serial->type->prepare_write_buffer(port, &buffer, 0,
++								buf, count);
++	if (count < 0) {
++		status = count;
+ 		goto err_buf;
+ 	}
+-
+-	memcpy(buffer, buf, count);
+ 	usb_serial_debug_data(debug, &port->dev, __func__, count, buffer);
+ 	usb_fill_bulk_urb(urb, port->serial->dev,
+ 			usb_sndbulkpipe(port->serial->dev,
+@@ -242,7 +263,6 @@ err_urb:
+  */
+ static int usb_serial_generic_write_start(struct usb_serial_port *port)
+ {
+-	unsigned char *data;
+ 	int result;
+ 	int count;
+ 	unsigned long flags;
+@@ -255,10 +275,11 @@ static int usb_serial_generic_write_star
+ 	port->write_urb_busy = 1;
+ 	spin_unlock_irqrestore(&port->lock, flags);
+ 
+-	data = port->write_urb->transfer_buffer;
+-	count = kfifo_out_locked(&port->write_fifo, data, port->bulk_out_size, &port->lock);
+-	usb_serial_debug_data(debug, &port->dev, __func__, count, data);
+-
++	count = port->serial->type->prepare_write_buffer(port,
++					&port->write_urb->transfer_buffer,
++					port->bulk_out_size, NULL, 0);
++	usb_serial_debug_data(debug, &port->dev, __func__,
++				count, port->write_urb->transfer_buffer);
+ 	port->write_urb->transfer_buffer_length = count;
+ 
+ 	/* send the data out the bulk port */
+--- a/drivers/usb/serial/usb-serial.c
++++ b/drivers/usb/serial/usb-serial.c
+@@ -1299,6 +1299,7 @@ static void fixup_generic(struct usb_ser
+ 	set_to_generic_if_null(device, disconnect);
+ 	set_to_generic_if_null(device, release);
+ 	set_to_generic_if_null(device, process_read_urb);
++	set_to_generic_if_null(device, prepare_write_buffer);
+ }
+ 
+ int usb_serial_register(struct usb_serial_driver *driver)
+--- a/include/linux/usb/serial.h
++++ b/include/linux/usb/serial.h
+@@ -277,6 +277,9 @@ struct usb_serial_driver {
+ 	void (*write_bulk_callback)(struct urb *urb);
+ 	/* Called by the generic read bulk callback */
+ 	void (*process_read_urb)(struct urb *urb);
++	/* Called by the generic write implementation */
++	int (*prepare_write_buffer)(struct usb_serial_port *port,
++		void **dest, size_t size, const void *src, size_t count);
+ };
+ #define to_usb_serial_driver(d) \
+ 	container_of(d, struct usb_serial_driver, driver)
+@@ -329,6 +332,8 @@ extern void usb_serial_generic_deregiste
+ extern int usb_serial_generic_submit_read_urb(struct usb_serial_port *port,
+ 						 gfp_t mem_flags);
+ extern void usb_serial_generic_process_read_urb(struct urb *urb);
++extern int usb_serial_generic_prepare_write_buffer(struct usb_serial_port *port,
++		void **dest, size_t size, const void *src, size_t count);
+ extern int usb_serial_handle_sysrq_char(struct tty_struct *tty,
+ 					struct usb_serial_port *port,
+ 					unsigned int ch);
