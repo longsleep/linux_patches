@@ -1,0 +1,104 @@
+From johannes@sipsolutions.net  Thu Apr 22 16:48:27 2010
+From: Johannes Berg <johannes@sipsolutions.net>
+Date: Mon, 29 Mar 2010 17:57:20 +0200
+Subject: firmware class: export nowait to userspace
+To: Kay Sievers <kay.sievers@vrfy.org>
+Cc: Tomas Winkler <tomasw@gmail.com>,  Greg KH <greg@kroah.com>, David Woodhouse <dwmw2@infradead.org>
+Message-ID: <1269878240.4131.45.camel@jlt3.sipsolutions.net>
+
+
+From: Johannes Berg <johannes.berg@intel.com>
+
+When we use request_firmware_nowait(), userspace may
+not want to answer negatively right away when for
+example it is answering from an initrd only, but
+with request_firmware() it has to in order to not
+delay the kernel boot until the request times out.
+
+This allows userspace to differentiate between the
+two in order to be able to reply negatively to async
+requests only when all filesystems have been mounted
+and have been checked for the requested firmware file.
+
+Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+Cc: Kay Sievers <kay.sievers@vrfy.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/base/firmware_class.c |   16 +++++++++++-----
+ 1 file changed, 11 insertions(+), 5 deletions(-)
+
+--- a/drivers/base/firmware_class.c
++++ b/drivers/base/firmware_class.c
+@@ -50,6 +50,7 @@ struct firmware_priv {
+ 	int page_array_size;
+ 	const char *vdata;
+ 	struct timer_list timeout;
++	bool nowait;
+ };
+ 
+ #ifdef CONFIG_FW_LOADER
+@@ -112,6 +113,8 @@ static int firmware_uevent(struct device
+ 		return -ENOMEM;
+ 	if (add_uevent_var(env, "TIMEOUT=%i", loading_timeout))
+ 		return -ENOMEM;
++	if (add_uevent_var(env, "ASYNC=%d", fw_priv->nowait))
++		return -ENOMEM;
+ 
+ 	return 0;
+ }
+@@ -427,7 +430,7 @@ error_kfree:
+ 
+ static int fw_setup_device(struct firmware *fw, struct device **dev_p,
+ 			   const char *fw_name, struct device *device,
+-			   int uevent)
++			   int uevent, bool nowait)
+ {
+ 	struct device *f_dev;
+ 	struct firmware_priv *fw_priv;
+@@ -443,6 +446,8 @@ static int fw_setup_device(struct firmwa
+ 
+ 	fw_priv = dev_get_drvdata(f_dev);
+ 
++	fw_priv->nowait = nowait;
++
+ 	fw_priv->fw = fw;
+ 	sysfs_bin_attr_init(&fw_priv->attr_data);
+ 	retval = sysfs_create_bin_file(&f_dev->kobj, &fw_priv->attr_data);
+@@ -470,7 +475,7 @@ out:
+ 
+ static int
+ _request_firmware(const struct firmware **firmware_p, const char *name,
+-		 struct device *device, int uevent)
++		 struct device *device, int uevent, bool nowait)
+ {
+ 	struct device *f_dev;
+ 	struct firmware_priv *fw_priv;
+@@ -502,7 +507,8 @@ _request_firmware(const struct firmware
+ 	if (uevent)
+ 		dev_dbg(device, "firmware: requesting %s\n", name);
+ 
+-	retval = fw_setup_device(firmware, &f_dev, name, device, uevent);
++	retval = fw_setup_device(firmware, &f_dev, name, device,
++				 uevent, nowait);
+ 	if (retval)
+ 		goto error_kfree_fw;
+ 
+@@ -559,7 +565,7 @@ request_firmware(const struct firmware *
+                  struct device *device)
+ {
+         int uevent = 1;
+-        return _request_firmware(firmware_p, name, device, uevent);
++        return _request_firmware(firmware_p, name, device, uevent, false);
+ }
+ 
+ /**
+@@ -605,7 +611,7 @@ request_firmware_work_func(void *arg)
+ 		return 0;
+ 	}
+ 	ret = _request_firmware(&fw, fw_work->name, fw_work->device,
+-		fw_work->uevent);
++		fw_work->uevent, true);
+ 
+ 	fw_work->cont(fw, fw_work->context);
+ 
