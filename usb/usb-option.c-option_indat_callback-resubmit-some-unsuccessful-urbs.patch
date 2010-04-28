@@ -1,0 +1,86 @@
+From jamescmaki@gmail.com  Wed Apr 28 12:21:51 2010
+From: James Maki <jamescmaki@gmail.com>
+Date: Sun, 21 Mar 2010 12:53:59 -0500
+Subject: USB: option.c: option_indat_callback: Resubmit some unsuccessful URBs
+To: linux-usb@vger.kernel.org
+Cc: James Maki <jamescmaki@gmail.com>
+Message-ID: <1269194039-27393-1-git-send-email-jamescmaki@gmail.com>
+
+
+All unsuccessful (non-zero status) URBs were being dropped. After N_IN_URBs are
+dropped you will no longer be able to receive data.
+
+This patch resubmits unsuccessful URBs unless the status indicates that it should
+be terminated. The statuses that indicate the URB should be terminated was
+gathered from other similar drivers.
+
+Signed-off-by: James Maki <jamescmaki@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/serial/option.c |   47 +++++++++++++++++++++++++++-----------------
+ 1 file changed, 29 insertions(+), 18 deletions(-)
+
+--- a/drivers/usb/serial/option.c
++++ b/drivers/usb/serial/option.c
+@@ -1019,31 +1019,42 @@ static void option_indat_callback(struct
+ 	dbg("%s: %p", __func__, urb);
+ 
+ 	endpoint = usb_pipeendpoint(urb->pipe);
+-	port =  urb->context;
++	port = urb->context;
+ 
+-	if (status) {
++	switch (status) {
++	case 0:
++		/* success */
++		break;
++	case -ECONNRESET:
++	case -ENOENT:
++	case -ESHUTDOWN:
++		/* this urb is terminated, clean up */
++		dbg("%s: urb shutting down with status: %d on endpoint %02x.",
++		    __func__, status, endpoint);
++		return;
++	default:
+ 		dbg("%s: nonzero status: %d on endpoint %02x.",
+ 		    __func__, status, endpoint);
+-	} else {
++		goto exit;
++	}
++
++	if (urb->actual_length) {
+ 		tty = tty_port_tty_get(&port->port);
+-		if (urb->actual_length) {
+-			tty_insert_flip_string(tty, data, urb->actual_length);
+-			tty_flip_buffer_push(tty);
+-		} else 
+-			dbg("%s: empty read urb received", __func__);
++		tty_insert_flip_string(tty, data, urb->actual_length);
++		tty_flip_buffer_push(tty);
+ 		tty_kref_put(tty);
++	} else
++		dbg("%s: empty read urb received", __func__);
+ 
+-		/* Resubmit urb so we continue receiving */
+-		if (status != -ESHUTDOWN) {
+-			err = usb_submit_urb(urb, GFP_ATOMIC);
+-			if (err && err != -EPERM)
+-				printk(KERN_ERR "%s: resubmit read urb failed. "
+-					"(%d)", __func__, err);
+-			else
+-				usb_mark_last_busy(port->serial->dev);
+-		}
++exit:
++	/* Resubmit urb so we continue receiving */
++	err = usb_submit_urb(urb, GFP_ATOMIC);
++	if (err && err != -EPERM)
++		printk(KERN_ERR "%s: resubmit read urb failed. "
++			"(%d)", __func__, err);
++	else
++		usb_mark_last_busy(port->serial->dev);
+ 
+-	}
+ 	return;
+ }
+ 
