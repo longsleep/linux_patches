@@ -1,0 +1,75 @@
+From akpm@linux-foundation.org  Tue May  4 13:02:56 2010
+From: Richard Röjfors <richard.rojfors@pelagicore.com>
+Date: Tue, 27 Apr 2010 14:16:34 -0700
+Subject: serial: timbuart: make sure last byte is sent when port is closed
+To: greg@kroah.com
+Cc: akpm@linux-foundation.org, richard.rojfors@pelagicore.com
+Message-ID: <201004272116.o3RLGY1F020378@imap1.linux-foundation.org>
+
+
+From: Richard Röjfors <richard.rojfors@pelagicore.com>
+
+Fix a problem in early versions of the FPGA IP.
+
+In certain situations the IP reports that the FIFO is empty, but a byte is
+still clocked out.  If a flush is done at that point the currently clocked
+byte is canceled.
+
+This causes incompatibilities with the upper layers when a port is closed,
+it waits until the FIFO is empty and then closes the port.  During close
+the FIFO is flushed -> the last byte is not sent properly.
+
+Now the FIFO is only flushed if it is reported to be non-empty.  Which
+makes the currently clocked out byte to finish.
+
+[akpm@linux-foundation.org: fix build]
+Signed-off-by: Richard Röjfors <richard.rojfors@pelagicore.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/serial/timbuart.c |   23 +++++++++++++----------
+ 1 file changed, 13 insertions(+), 10 deletions(-)
+
+--- a/drivers/serial/timbuart.c
++++ b/drivers/serial/timbuart.c
+@@ -68,12 +68,22 @@ static void timbuart_start_tx(struct uar
+ 	tasklet_schedule(&uart->tasklet);
+ }
+ 
++static unsigned int timbuart_tx_empty(struct uart_port *port)
++{
++	u32 isr = ioread32(port->membase + TIMBUART_ISR);
++
++	return (isr & TXBE) ? TIOCSER_TEMT : 0;
++}
++
+ static void timbuart_flush_buffer(struct uart_port *port)
+ {
+-	u8 ctl = ioread8(port->membase + TIMBUART_CTRL) | TIMBUART_CTRL_FLSHTX;
++	if (!timbuart_tx_empty(port)) {
++		u8 ctl = ioread8(port->membase + TIMBUART_CTRL) |
++			TIMBUART_CTRL_FLSHTX;
+ 
+-	iowrite8(ctl, port->membase + TIMBUART_CTRL);
+-	iowrite32(TXBF, port->membase + TIMBUART_ISR);
++		iowrite8(ctl, port->membase + TIMBUART_CTRL);
++		iowrite32(TXBF, port->membase + TIMBUART_ISR);
++	}
+ }
+ 
+ static void timbuart_rx_chars(struct uart_port *port)
+@@ -195,13 +205,6 @@ void timbuart_tasklet(unsigned long arg)
+ 	dev_dbg(uart->port.dev, "%s leaving\n", __func__);
+ }
+ 
+-static unsigned int timbuart_tx_empty(struct uart_port *port)
+-{
+-	u32 isr = ioread32(port->membase + TIMBUART_ISR);
+-
+-	return (isr & TXBE) ? TIOCSER_TEMT : 0;
+-}
+-
+ static unsigned int timbuart_get_mctrl(struct uart_port *port)
+ {
+ 	u8 cts = ioread8(port->membase + TIMBUART_CTRL);

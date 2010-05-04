@@ -1,0 +1,167 @@
+From matthew@wil.cx  Tue May  4 13:02:11 2010
+From: Matthew Wilcox <matthew@wil.cx>
+Date: Sat, 1 May 2010 12:20:01 -0600
+Subject: USB: Change the scatterlist type in struct urb
+To: linux-usb@vger.kernel.org, Greg KH <greg@kroah.com>
+Message-ID: <20100501182001.GJ6747@parisc-linux.org>
+Content-Disposition: inline
+
+
+
+Change the type of the URB's 'sg' pointer from a usb_sg_request to
+a scatterlist.  This allows drivers to submit scatter-gather lists
+without using the usb_sg_wait() interface.  It has the added benefit
+of removing the typecasts that were added as part of patch as1368 (and
+slightly decreasing the number of pointer dereferences).
+
+Signed-off-by: Matthew Wilcox <willy@linux.intel.com>
+Reviewed-by: Alan Stern <stern@rowland.harvard.edu>
+Tested-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/hcd.c       |    8 +++-----
+ drivers/usb/core/message.c   |    4 ++--
+ drivers/usb/host/ehci-q.c    |    2 +-
+ drivers/usb/host/whci/qset.c |    4 ++--
+ drivers/usb/host/xhci-ring.c |    4 ++--
+ drivers/usb/mon/mon_bin.c    |    2 +-
+ drivers/usb/mon/mon_text.c   |    2 +-
+ include/linux/usb.h          |    2 +-
+ 8 files changed, 13 insertions(+), 15 deletions(-)
+
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -1278,7 +1278,7 @@ static void unmap_urb_for_dma(struct usb
+ 	dir = usb_urb_dir_in(urb) ? DMA_FROM_DEVICE : DMA_TO_DEVICE;
+ 	if (urb->transfer_flags & URB_DMA_MAP_SG)
+ 		dma_unmap_sg(hcd->self.controller,
+-				urb->sg->sg,
++				urb->sg,
+ 				urb->num_sgs,
+ 				dir);
+ 	else if (urb->transfer_flags & URB_DMA_MAP_PAGE)
+@@ -1346,7 +1346,7 @@ static int map_urb_for_dma(struct usb_hc
+ 			if (urb->num_sgs) {
+ 				int n = dma_map_sg(
+ 						hcd->self.controller,
+-						urb->sg->sg,
++						urb->sg,
+ 						urb->num_sgs,
+ 						dir);
+ 				if (n <= 0)
+@@ -1359,9 +1359,7 @@ static int map_urb_for_dma(struct usb_hc
+ 							URB_DMA_SG_COMBINED;
+ 				}
+ 			} else if (urb->sg) {
+-				struct scatterlist *sg;
+-
+-				sg = (struct scatterlist *) urb->sg;
++				struct scatterlist *sg = urb->sg;
+ 				urb->transfer_dma = dma_map_page(
+ 						hcd->self.controller,
+ 						sg_page(sg),
+--- a/drivers/usb/core/message.c
++++ b/drivers/usb/core/message.c
+@@ -413,7 +413,7 @@ int usb_sg_init(struct usb_sg_request *i
+ 					sg->length;
+ 			}
+ 		}
+-		io->urbs[0]->sg = io;
++		io->urbs[0]->sg = sg;
+ 		io->urbs[0]->num_sgs = io->entries;
+ 		io->entries = 1;
+ 	} else {
+@@ -454,7 +454,7 @@ int usb_sg_init(struct usb_sg_request *i
+ 			}
+ 			io->urbs[i]->transfer_buffer_length = len;
+ 
+-			io->urbs[i]->sg = (struct usb_sg_request *) sg;
++			io->urbs[i]->sg = sg;
+ 		}
+ 		io->urbs[--i]->transfer_flags &= ~URB_NO_INTERRUPT;
+ 	}
+--- a/drivers/usb/host/ehci-q.c
++++ b/drivers/usb/host/ehci-q.c
+@@ -663,7 +663,7 @@ qh_urb_transaction (
+ 	 */
+ 	i = urb->num_sgs;
+ 	if (len > 0 && i > 0) {
+-		sg = urb->sg->sg;
++		sg = urb->sg;
+ 		buf = sg_dma_address(sg);
+ 
+ 		/* urb->transfer_buffer_length may be smaller than the
+--- a/drivers/usb/host/whci/qset.c
++++ b/drivers/usb/host/whci/qset.c
+@@ -443,7 +443,7 @@ static int qset_add_urb_sg(struct whc *w
+ 
+ 	remaining = urb->transfer_buffer_length;
+ 
+-	for_each_sg(urb->sg->sg, sg, urb->num_sgs, i) {
++	for_each_sg(urb->sg, sg, urb->num_sgs, i) {
+ 		dma_addr_t dma_addr;
+ 		size_t dma_remaining;
+ 		dma_addr_t sp, ep;
+@@ -561,7 +561,7 @@ static int qset_add_urb_sg_linearize(str
+ 
+ 	remaining = urb->transfer_buffer_length;
+ 
+-	for_each_sg(urb->sg->sg, sg, urb->sg->nents, i) {
++	for_each_sg(urb->sg, sg, urb->num_sgs, i) {
+ 		size_t len;
+ 		size_t sg_remaining;
+ 		void *orig;
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -1764,7 +1764,7 @@ static unsigned int count_sg_trbs_needed
+ 
+ 	xhci_dbg(xhci, "count sg list trbs: \n");
+ 	num_trbs = 0;
+-	for_each_sg(urb->sg->sg, sg, num_sgs, i) {
++	for_each_sg(urb->sg, sg, num_sgs, i) {
+ 		unsigned int previous_total_trbs = num_trbs;
+ 		unsigned int len = sg_dma_len(sg);
+ 
+@@ -1927,7 +1927,7 @@ static int queue_bulk_sg_tx(struct xhci_
+ 	 *    the amount of memory allocated for this scatter-gather list.
+ 	 * 3. TRBs buffers can't cross 64KB boundaries.
+ 	 */
+-	sg = urb->sg->sg;
++	sg = urb->sg;
+ 	addr = (u64) sg_dma_address(sg);
+ 	this_sg_len = sg_dma_len(sg);
+ 	trb_buff_len = TRB_MAX_BUFF_SIZE -
+--- a/drivers/usb/mon/mon_bin.c
++++ b/drivers/usb/mon/mon_bin.c
+@@ -422,7 +422,7 @@ static unsigned int mon_bin_get_data(con
+ 		}
+ 
+ 		/* Copy up to the first non-addressable segment */
+-		for_each_sg(urb->sg->sg, sg, urb->num_sgs, i) {
++		for_each_sg(urb->sg, sg, urb->num_sgs, i) {
+ 			if (length == 0 || PageHighMem(sg_page(sg)))
+ 				break;
+ 			this_len = min_t(unsigned int, sg->length, length);
+--- a/drivers/usb/mon/mon_text.c
++++ b/drivers/usb/mon/mon_text.c
+@@ -159,7 +159,7 @@ static inline char mon_text_get_data(str
+ 		if (src == NULL)
+ 			return 'Z';	/* '0' would be not as pretty. */
+ 	} else {
+-		struct scatterlist *sg = urb->sg->sg;
++		struct scatterlist *sg = urb->sg;
+ 
+ 		if (PageHighMem(sg_page(sg)))
+ 			return 'D';
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -1195,7 +1195,7 @@ struct urb {
+ 	unsigned int transfer_flags;	/* (in) URB_SHORT_NOT_OK | ...*/
+ 	void *transfer_buffer;		/* (in) associated data buffer */
+ 	dma_addr_t transfer_dma;	/* (in) dma addr for transfer_buffer */
+-	struct usb_sg_request *sg;	/* (in) scatter gather buffer list */
++	struct scatterlist *sg;		/* (in) scatter gather buffer list */
+ 	int num_sgs;			/* (in) number of entries in the sg list */
+ 	u32 transfer_buffer_length;	/* (in) data buffer length */
+ 	u32 actual_length;		/* (return) actual transfer length */
