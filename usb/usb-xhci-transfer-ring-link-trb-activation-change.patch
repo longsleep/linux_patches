@@ -1,0 +1,125 @@
+From John.Youn@synopsys.com  Tue May 11 16:34:50 2010
+From: John Youn <John.Youn@synopsys.com>
+Date: Mon, 10 May 2010 15:33:00 -0700
+Subject: USB: xhci: Transfer ring link TRB activation change.
+To: greg@kroah.com
+To: sarah.a.sharp@linux.intel.com
+To: willy@linux.intel.com
+Cc: linux-usb@vger.kernel.org
+Message-ID: <201005102233.o4AMX0S7011032@us01dwamd020.synopsys.com>
+
+
+Change transfer ring behavior to not follow/activate link TRBs
+until active TRBs are queued after it.  This change affects
+the behavior when a TD ends just before a link TRB.
+
+Signed-off-by: John Youn <johnyoun@synopsys.com>
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/xhci-ring.c |   71 +++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 58 insertions(+), 13 deletions(-)
+
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -112,6 +112,12 @@ static inline int last_trb(struct xhci_h
+ 		return (trb->link.control & TRB_TYPE_BITMASK) == TRB_TYPE(TRB_LINK);
+ }
+ 
++static inline int enqueue_is_link_trb(struct xhci_ring *ring)
++{
++	struct xhci_link_trb *link = &ring->enqueue->link;
++	return ((link->control & TRB_TYPE_BITMASK) == TRB_TYPE(TRB_LINK));
++}
++
+ /* Updates trb to point to the next TRB in the ring, and updates seg if the next
+  * TRB is in a new segment.  This does not skip over link TRBs, and it does not
+  * effect the ring dequeue or enqueue pointers.
+@@ -193,20 +199,15 @@ static void inc_enq(struct xhci_hcd *xhc
+ 	while (last_trb(xhci, ring, ring->enq_seg, next)) {
+ 		if (!consumer) {
+ 			if (ring != xhci->event_ring) {
+-				/* If we're not dealing with 0.95 hardware,
+-				 * carry over the chain bit of the previous TRB
+-				 * (which may mean the chain bit is cleared).
+-				 */
+-				if (!xhci_link_trb_quirk(xhci)) {
+-					next->link.control &= ~TRB_CHAIN;
+-					next->link.control |= chain;
++				if (chain) {
++					next->link.control |= TRB_CHAIN;
++
++					/* Give this link TRB to the hardware */
++					wmb();
++					next->link.control ^= TRB_CYCLE;
++				} else {
++					break;
+ 				}
+-				/* Give this link TRB to the hardware */
+-				wmb();
+-				if (next->link.control & TRB_CYCLE)
+-					next->link.control &= (u32) ~TRB_CYCLE;
+-				else
+-					next->link.control |= (u32) TRB_CYCLE;
+ 			}
+ 			/* Toggle the cycle bit after the last ring segment. */
+ 			if (last_trb_on_last_seg(xhci, ring, ring->enq_seg, next)) {
+@@ -243,6 +244,13 @@ static int room_on_ring(struct xhci_hcd
+ 	union xhci_trb *enq = ring->enqueue;
+ 	struct xhci_segment *enq_seg = ring->enq_seg;
+ 
++	/* If we are currently pointing to a link TRB, advance the
++	 * enqueue pointer before checking for space */
++	while (last_trb(xhci, ring, enq_seg, enq)) {
++		enq_seg = enq_seg->next;
++		enq = enq_seg->trbs;
++	}
++
+ 	/* Check if ring is empty */
+ 	if (enq == ring->dequeue)
+ 		return 1;
+@@ -1711,6 +1719,43 @@ static int prepare_ring(struct xhci_hcd
+ 		xhci_err(xhci, "ERROR no room on ep ring\n");
+ 		return -ENOMEM;
+ 	}
++
++	if (enqueue_is_link_trb(ep_ring)) {
++		struct xhci_ring *ring = ep_ring;
++		union xhci_trb *next;
++		unsigned long long addr;
++
++		xhci_dbg(xhci, "prepare_ring: pointing to link trb\n");
++		next = ring->enqueue;
++
++		while (last_trb(xhci, ring, ring->enq_seg, next)) {
++
++			/* If we're not dealing with 0.95 hardware,
++			 * clear the chain bit.
++			 */
++			if (!xhci_link_trb_quirk(xhci))
++				next->link.control &= ~TRB_CHAIN;
++			else
++				next->link.control |= TRB_CHAIN;
++
++			wmb();
++			next->link.control ^= (u32) TRB_CYCLE;
++
++			/* Toggle the cycle bit after the last ring segment. */
++			if (last_trb_on_last_seg(xhci, ring, ring->enq_seg, next)) {
++				ring->cycle_state = (ring->cycle_state ? 0 : 1);
++				if (!in_interrupt()) {
++					xhci_dbg(xhci, "queue_trb: Toggle cycle "
++						"state for ring %p = %i\n",
++						ring, (unsigned int)ring->cycle_state);
++				}
++			}
++			ring->enq_seg = ring->enq_seg->next;
++			ring->enqueue = ring->enq_seg->trbs;
++			next = ring->enqueue;
++		}
++	}
++
+ 	return 0;
+ }
+ 

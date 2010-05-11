@@ -1,0 +1,70 @@
+From cbouatmailru@gmail.com  Tue May 11 16:29:07 2010
+From: Anton Vorontsov <cbouatmailru@gmail.com>
+Date: Fri, 7 May 2010 01:09:19 +0400
+Subject: USB: isp1760: Soften DW3 X/transaction error bit handling
+To: Greg Kroah-Hartman <gregkh@suse.de>
+Cc: Alan Stern <stern@rowland.harvard.edu>, Mike Frysinger <vapier.adi@gmail.com>, Michael Hennerich <michael.hennerich@analog.com>, Sebastian Siewior <bigeasy@linutronix.de>, Catalin Marinas <catalin.marinas@arm.com>, Bryan Wu <cooloney@kernel.org>, linux-usb@vger.kernel.org, linux-kernel@vger.kernel.org
+Message-ID: <20100506210919.GA28930@oksana.dev.rtsoft.ru>
+Content-Disposition: inline
+
+
+There were some reports[1] of isp1760 USB driver malfunctioning
+with high speed devices, noticed on Blackfin and PowerPC targets.
+These reports indicated that the original Philips 'pehcd'[2]
+driver worked fine.
+
+We've noticed the same issue with an ARM RealView platform. This
+happens under load (with only some mass storage devices, not all,
+just as in another report[3]):
+
+  error bit is set in DW3
+  error bit is set in DW3
+  error bit is set in DW3
+  usb 1-1.2: device descriptor read/64, error -32
+
+It appears that the 'pehcd' driver checks the X bit only if the
+transaction is halted (H bit), otherwise the error is so far
+insignificant.
+
+The ISP176x chips were modeled after EHCI, and EHCI spec says
+(thanks to Alan Stern for pointing out):
+
+"Transaction errors cause the status field to be updated to reflect
+ the type of error, but the transaction continues to be retried until
+ the Active bit is set to 0.  When the error counter reaches 0, the
+ Halt bit is set and the Active bit is cleared."
+
+So, just as the original Philips driver, isp1760 must report the
+error only if the transaction error and the halt bits are set.
+
+[1] http://markmail.org/message/lx4qrlbrs2uhcnly
+[2] svn co svn://sources.blackfin.uclinux.org/linux-kernel/trunk/drivers/usb/host -r 5494
+    See pehci.c:pehci_hcd_update_error_status().
+[3] http://blackfin.uclinux.org/gf/tracker/5148
+
+Signed-off-by: Anton Vorontsov <avorontsov@mvista.com>
+Acked-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/isp1760-hcd.c |    7 +++----
+ 1 file changed, 3 insertions(+), 4 deletions(-)
+
+--- a/drivers/usb/host/isp1760-hcd.c
++++ b/drivers/usb/host/isp1760-hcd.c
+@@ -713,12 +713,11 @@ static int check_error(struct ptd *ptd)
+ 	u32 dw3;
+ 
+ 	dw3 = le32_to_cpu(ptd->dw3);
+-	if (dw3 & DW3_HALT_BIT)
++	if (dw3 & DW3_HALT_BIT) {
+ 		error = -EPIPE;
+ 
+-	if (dw3 & DW3_ERROR_BIT) {
+-		printk(KERN_ERR "error bit is set in DW3\n");
+-		error = -EPIPE;
++		if (dw3 & DW3_ERROR_BIT)
++			pr_err("error bit is set in DW3\n");
+ 	}
+ 
+ 	if (dw3 & DW3_QTD_ACTIVE) {
