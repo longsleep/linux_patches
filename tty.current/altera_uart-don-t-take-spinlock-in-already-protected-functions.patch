@@ -1,0 +1,113 @@
+From tklauser@distanz.ch  Tue Jun  1 13:43:40 2010
+From: Tobias Klauser <tklauser@distanz.ch>
+Date: Tue, 25 May 2010 16:59:55 +0200
+Subject: altera_uart: Don't take spinlock in already protected functions
+To: gregkh@suse.de, linux-kernel@vger.kernel.org
+Cc: akpm@linux-foundation.org, Tobias Klauser <tklauser@distanz.ch>, Ian Abbott <abbotti@mev.co.uk>, Thomas Chou <thomas@wytron.com.tw>
+Message-ID: <1274799595-4150-1-git-send-email-tklauser@distanz.ch>
+
+
+Don't take the port spinlock in uart functions where the serial core
+already takes care of locking/unlocking them.
+
+The code would actually lock up on architectures where spinlocks are
+implemented (not the case on nios2 where this driver is primarily used
+for now, thus this bug didn't trigger).
+
+Also protect calling altera_uart_rx_chars/altera_uart_tx_chars in the
+interrupt handler by the port spinlock.
+
+Thanks to Ian Abbott for pointing these issues out.
+
+Cc: Ian Abbott <abbotti@mev.co.uk>
+Cc: Thomas Chou <thomas@wytron.com.tw>
+Signed-off-by: Tobias Klauser <tklauser@distanz.ch>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/serial/altera_uart.c |   19 ++++---------------
+ 1 file changed, 4 insertions(+), 15 deletions(-)
+
+--- a/drivers/serial/altera_uart.c
++++ b/drivers/serial/altera_uart.c
+@@ -89,15 +89,12 @@ static unsigned int altera_uart_tx_empty
+ static unsigned int altera_uart_get_mctrl(struct uart_port *port)
+ {
+ 	struct altera_uart *pp = container_of(port, struct altera_uart, port);
+-	unsigned long flags;
+ 	unsigned int sigs;
+ 
+-	spin_lock_irqsave(&port->lock, flags);
+ 	sigs =
+ 	    (readl(port->membase + ALTERA_UART_STATUS_REG) &
+ 	     ALTERA_UART_STATUS_CTS_MSK) ? TIOCM_CTS : 0;
+ 	sigs |= (pp->sigs & TIOCM_RTS);
+-	spin_unlock_irqrestore(&port->lock, flags);
+ 
+ 	return sigs;
+ }
+@@ -105,49 +102,37 @@ static unsigned int altera_uart_get_mctr
+ static void altera_uart_set_mctrl(struct uart_port *port, unsigned int sigs)
+ {
+ 	struct altera_uart *pp = container_of(port, struct altera_uart, port);
+-	unsigned long flags;
+ 
+-	spin_lock_irqsave(&port->lock, flags);
+ 	pp->sigs = sigs;
+ 	if (sigs & TIOCM_RTS)
+ 		pp->imr |= ALTERA_UART_CONTROL_RTS_MSK;
+ 	else
+ 		pp->imr &= ~ALTERA_UART_CONTROL_RTS_MSK;
+ 	writel(pp->imr, port->membase + ALTERA_UART_CONTROL_REG);
+-	spin_unlock_irqrestore(&port->lock, flags);
+ }
+ 
+ static void altera_uart_start_tx(struct uart_port *port)
+ {
+ 	struct altera_uart *pp = container_of(port, struct altera_uart, port);
+-	unsigned long flags;
+ 
+-	spin_lock_irqsave(&port->lock, flags);
+ 	pp->imr |= ALTERA_UART_CONTROL_TRDY_MSK;
+ 	writel(pp->imr, port->membase + ALTERA_UART_CONTROL_REG);
+-	spin_unlock_irqrestore(&port->lock, flags);
+ }
+ 
+ static void altera_uart_stop_tx(struct uart_port *port)
+ {
+ 	struct altera_uart *pp = container_of(port, struct altera_uart, port);
+-	unsigned long flags;
+ 
+-	spin_lock_irqsave(&port->lock, flags);
+ 	pp->imr &= ~ALTERA_UART_CONTROL_TRDY_MSK;
+ 	writel(pp->imr, port->membase + ALTERA_UART_CONTROL_REG);
+-	spin_unlock_irqrestore(&port->lock, flags);
+ }
+ 
+ static void altera_uart_stop_rx(struct uart_port *port)
+ {
+ 	struct altera_uart *pp = container_of(port, struct altera_uart, port);
+-	unsigned long flags;
+ 
+-	spin_lock_irqsave(&port->lock, flags);
+ 	pp->imr &= ~ALTERA_UART_CONTROL_RRDY_MSK;
+ 	writel(pp->imr, port->membase + ALTERA_UART_CONTROL_REG);
+-	spin_unlock_irqrestore(&port->lock, flags);
+ }
+ 
+ static void altera_uart_break_ctl(struct uart_port *port, int break_state)
+@@ -272,10 +257,14 @@ static irqreturn_t altera_uart_interrupt
+ 	unsigned int isr;
+ 
+ 	isr = readl(port->membase + ALTERA_UART_STATUS_REG) & pp->imr;
++
++	spin_lock(&port->lock);
+ 	if (isr & ALTERA_UART_STATUS_RRDY_MSK)
+ 		altera_uart_rx_chars(pp);
+ 	if (isr & ALTERA_UART_STATUS_TRDY_MSK)
+ 		altera_uart_tx_chars(pp);
++	spin_unlock(&port->lock);
++
+ 	return IRQ_RETVAL(isr);
+ }
+ 

@@ -1,0 +1,62 @@
+From abbotti@mev.co.uk  Tue Jun  1 13:22:33 2010
+From: Ian Abbott <abbotti@mev.co.uk>
+Date: Wed, 19 May 2010 17:22:41 +0100
+Subject: Staging: comedi: don't write to buffer if command finished
+Cc: Greg Kroah-Hartman <gregkh@suse.de>, Frank Mori Hess <fmhess@users.sourceforge.net>, Ian Abbott <abbotti@mev.co.uk>
+Message-ID: <1274286161-14666-1-git-send-email-abbotti@mev.co.uk>
+
+
+For write(), any data copied to the data buffer after the previously
+set up streaming acquisition command has finished won't be used, but a
+non-empty write() does not currently return 0 (or -EPIPE on error) after
+the command has finished until the data buffer has been filled up.
+Change this behavior to return 0 (or -EPIPE) any time after the command
+has finished, without bothering to fill up the buffer with more useless
+data.
+
+Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/staging/comedi/comedi_fops.c |   23 +++++++++++++----------
+ 1 file changed, 13 insertions(+), 10 deletions(-)
+
+--- a/drivers/staging/comedi/comedi_fops.c
++++ b/drivers/staging/comedi/comedi_fops.c
+@@ -1576,6 +1576,19 @@ static ssize_t comedi_write(struct file
+ 	while (nbytes > 0 && !retval) {
+ 		set_current_state(TASK_INTERRUPTIBLE);
+ 
++		if (!(comedi_get_subdevice_runflags(s) & SRF_RUNNING)) {
++			if (count == 0) {
++				if (comedi_get_subdevice_runflags(s) &
++					SRF_ERROR) {
++					retval = -EPIPE;
++				} else {
++					retval = 0;
++				}
++				do_become_nonbusy(dev, s);
++			}
++			break;
++		}
++
+ 		n = nbytes;
+ 
+ 		m = n;
+@@ -1588,16 +1601,6 @@ static ssize_t comedi_write(struct file
+ 			n = m;
+ 
+ 		if (n == 0) {
+-			if (!(comedi_get_subdevice_runflags(s) & SRF_RUNNING)) {
+-				if (comedi_get_subdevice_runflags(s) &
+-				    SRF_ERROR) {
+-					retval = -EPIPE;
+-				} else {
+-					retval = 0;
+-				}
+-				do_become_nonbusy(dev, s);
+-				break;
+-			}
+ 			if (file->f_flags & O_NONBLOCK) {
+ 				retval = -EAGAIN;
+ 				break;
