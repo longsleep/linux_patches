@@ -1,0 +1,82 @@
+From stern@rowland.harvard.edu  Mon Jun 14 15:27:36 2010
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Wed, 9 Jun 2010 17:34:05 -0400 (EDT)
+Subject: USB: fix failure path in usb_add_hcd()
+To: Greg KH <greg@kroah.com>
+Cc: "Evans, Robert" <Robert.Evans@stratus.com>,  "Cao, Lei" <Lei.Cao@stratus.com>, James Paradis <jparadis@redhat.com>,  Donald Zickus <dzickus@redhat.com>
+Message-ID: <Pine.LNX.4.44L0.1006091725480.1533-100000@iolanthe.rowland.org>
+
+
+This patch (as1389) fixes some errors in the failure pathway of
+usb_add_hcd().  The actions it takes ought to be exactly the same as
+those taken by usb_remove_hcd(), but they aren't.
+
+In one case (removal of the usb_bus_attr_group), the two routines are
+brought into agreement by changing usb_remove_hcd().  All the other
+discrepancies are fixed by changing usb_add_hcd().
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/hcd.c |   18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -2229,7 +2229,7 @@ int usb_add_hcd(struct usb_hcd *hcd,
+ 		rhdev->speed = USB_SPEED_SUPER;
+ 		break;
+ 	default:
+-		goto err_allocate_root_hub;
++		goto err_set_rh_speed;
+ 	}
+ 	hcd->self.root_hub = rhdev;
+ 
+@@ -2305,16 +2305,29 @@ int usb_add_hcd(struct usb_hcd *hcd,
+ 	return retval;
+ 
+ error_create_attr_group:
++	if (HC_IS_RUNNING(hcd->state))
++		hcd->state = HC_STATE_QUIESCING;
++	spin_lock_irq(&hcd_root_hub_lock);
++	hcd->rh_registered = 0;
++	spin_unlock_irq(&hcd_root_hub_lock);
++
++#ifdef CONFIG_USB_SUSPEND
++	cancel_work_sync(&hcd->wakeup_work);
++#endif
+ 	mutex_lock(&usb_bus_list_lock);
+ 	usb_disconnect(&hcd->self.root_hub);
+ 	mutex_unlock(&usb_bus_list_lock);
+ err_register_root_hub:
+ 	hcd->driver->stop(hcd);
++	hcd->state = HC_STATE_HALT;
++	hcd->poll_rh = 0;
++	del_timer_sync(&hcd->rh_timer);
+ err_hcd_driver_start:
+ 	if (hcd->irq >= 0)
+ 		free_irq(irqnum, hcd);
+ err_request_irq:
+ err_hcd_driver_setup:
++err_set_rh_speed:
+ 	hcd->self.root_hub = NULL;
+ 	usb_put_dev(rhdev);
+ err_allocate_root_hub:
+@@ -2337,6 +2350,8 @@ void usb_remove_hcd(struct usb_hcd *hcd)
+ {
+ 	dev_info(hcd->self.controller, "remove, state %x\n", hcd->state);
+ 
++	sysfs_remove_group(&hcd->self.root_hub->dev.kobj, &usb_bus_attr_group);
++
+ 	if (HC_IS_RUNNING (hcd->state))
+ 		hcd->state = HC_STATE_QUIESCING;
+ 
+@@ -2349,7 +2364,6 @@ void usb_remove_hcd(struct usb_hcd *hcd)
+ 	cancel_work_sync(&hcd->wakeup_work);
+ #endif
+ 
+-	sysfs_remove_group(&hcd->self.root_hub->dev.kobj, &usb_bus_attr_group);
+ 	mutex_lock(&usb_bus_list_lock);
+ 	usb_disconnect(&hcd->self.root_hub);
+ 	mutex_unlock(&usb_bus_list_lock);
