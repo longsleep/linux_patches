@@ -1,0 +1,139 @@
+From arnd@arndb.de  Wed Jun 16 13:46:10 2010
+From: Arnd Bergmann <arnd@arndb.de>
+Date: Tue,  1 Jun 2010 22:53:09 +0200
+Subject: tty: implement BTM as mutex instead of BKL
+To: Greg KH <gregkh@suse.de>
+Cc: linux-kernel@vger.kernel.org, Arnd Bergmann <arnd@arndb.de>, Alan Cox <alan@lxorguk.ukuu.org.uk>, Frederic Weisbecker <fweisbec@gmail.com>, John Kacur <jkacur@redhat.com>
+Message-ID: <1275425591-8803-30-git-send-email-arnd@arndb.de>
+
+
+The tty locking now follows the rules for mutexes, so
+we can replace the BKL usage with a new subsystem
+wide mutex.
+
+This patch for now makes the new behaviour an optional
+experimental feature that can be enabled for testing
+purposes.
+
+Using a regular mutex here will change the behaviour
+when blocked on the BTM from spinning to sleeping,
+but that should not be visible to the user.
+
+Using the mutex also means that all the BTM is now
+covered by lockdep.
+
+Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+Cc: Alan Cox <alan@lxorguk.ukuu.org.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/char/Makefile    |    1 +
+ drivers/char/tty_mutex.c |   47 +++++++++++++++++++++++++++++++++++++++++++++++
+ include/linux/tty.h      |    8 ++++++++
+ lib/Kconfig.debug        |   10 ++++++++++
+ 4 files changed, 66 insertions(+)
+
+--- a/drivers/char/Makefile
++++ b/drivers/char/Makefile
+@@ -9,6 +9,7 @@ FONTMAPFILE = cp437.uni
+ 
+ obj-y	 += mem.o random.o tty_io.o n_tty.o tty_ioctl.o tty_ldisc.o tty_buffer.o tty_port.o
+ 
++obj-$(CONFIG_TTY_MUTEX)		+= tty_mutex.o
+ obj-$(CONFIG_LEGACY_PTYS)	+= pty.o
+ obj-$(CONFIG_UNIX98_PTYS)	+= pty.o
+ obj-y				+= misc.o
+--- /dev/null
++++ b/drivers/char/tty_mutex.c
+@@ -0,0 +1,47 @@
++/*
++ * drivers/char/tty_lock.c
++ */
++#include <linux/tty.h>
++#include <linux/module.h>
++#include <linux/kallsyms.h>
++#include <linux/semaphore.h>
++#include <linux/sched.h>
++
++/*
++ * The 'big tty mutex'
++ *
++ * This mutex is taken and released by tty_lock() and tty_unlock(),
++ * replacing the older big kernel lock.
++ * It can no longer be taken recursively, and does not get
++ * released implicitly while sleeping.
++ *
++ * Don't use in new code.
++ */
++static DEFINE_MUTEX(big_tty_mutex);
++struct task_struct *__big_tty_mutex_owner;
++EXPORT_SYMBOL_GPL(__big_tty_mutex_owner);
++
++/*
++ * Getting the big tty mutex.
++ */
++void __lockfunc tty_lock(void)
++{
++	struct task_struct *task = current;
++
++	WARN_ON(__big_tty_mutex_owner == task);
++
++	mutex_lock(&big_tty_mutex);
++	__big_tty_mutex_owner = task;
++}
++EXPORT_SYMBOL(tty_lock);
++
++void __lockfunc tty_unlock(void)
++{
++	struct task_struct *task = current;
++
++	WARN_ON(__big_tty_mutex_owner != task);
++	__big_tty_mutex_owner = NULL;
++
++	mutex_unlock(&big_tty_mutex);
++}
++EXPORT_SYMBOL(tty_unlock);
+--- a/include/linux/tty.h
++++ b/include/linux/tty.h
+@@ -574,7 +574,14 @@ extern int vt_ioctl(struct tty_struct *t
+ extern long vt_compat_ioctl(struct tty_struct *tty, struct file * file,
+ 		     unsigned int cmd, unsigned long arg);
+ 
++/* tty_mutex.c */
+ /* functions for preparation of BKL removal */
++#ifdef CONFIG_TTY_MUTEX
++extern void __lockfunc tty_lock(void) __acquires(tty_lock);
++extern void __lockfunc tty_unlock(void) __releases(tty_lock);
++extern struct task_struct *__big_tty_mutex_owner;
++#define tty_locked()		(current == __big_tty_mutex_owner)
++#else
+ static inline void tty_lock(void) __acquires(kernel_lock)
+ {
+ #ifdef CONFIG_LOCK_KERNEL
+@@ -588,6 +595,7 @@ static inline void tty_unlock(void) __re
+ 	unlock_kernel();
+ }
+ #define tty_locked()		(kernel_locked())
++#endif
+ 
+ /*
+  * wait_event_interruptible_tty -- wait for a condition with the tty lock held
+--- a/lib/Kconfig.debug
++++ b/lib/Kconfig.debug
+@@ -428,6 +428,16 @@ config RT_MUTEX_TESTER
+ 	help
+ 	  This option enables a rt-mutex tester.
+ 
++config TTY_MUTEX
++	bool "Use a mutex instead of BKL for TTY locking"
++	depends on EXPERIMENTAL && SMP
++	help
++	  The TTY subsystem traditionally depends on the big kernel lock
++	  for serialization. Saying Y here replaces the BKL with the Big
++	  TTY Mutex (BTM).
++	  Building a kernel without the BKL is only possible with TTY_MUTEX
++	  enabled.
++
+ config DEBUG_SPINLOCK
+ 	bool "Spinlock and rw-lock debugging: basic checks"
+ 	depends on DEBUG_KERNEL
