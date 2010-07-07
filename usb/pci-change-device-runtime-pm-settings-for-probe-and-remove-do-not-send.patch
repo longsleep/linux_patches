@@ -1,0 +1,160 @@
+From stern@rowland.harvard.edu  Wed Jul  7 14:56:24 2010
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Fri, 25 Jun 2010 15:18:32 -0400 (EDT)
+Subject: PCI: change device runtime PM settings for probe and remove - DO NOT SEND
+To: Greg KH <greg@kroah.com>
+Message-ID: <Pine.LNX.4.44L0.1006251516110.1322-100000@iolanthe.rowland.org>
+
+DO NOT SEND TO LINUS, is going through the linux-pci tree.
+
+This patch (as1388) changes the way the PCI core handles runtime PM
+settings when probing or unbinding drivers.  Now the core will make
+sure the device is enabled for runtime PM, with a usage count >= 1,
+when a driver is probed.  It does the same when calling a driver's
+remove method.
+
+If the driver wants to use runtime PM, all it has to do is call
+pm_runtime_pu_noidle() near the end of its probe routine (to cancel
+the core's usage increment) and pm_runtime_get_noresume() near the
+start of its remove routine (to restore the usage count).  It does not
+need to mess around with setting the runtime state to enabled,
+disabled, active, or suspended.
+
+The patch updates e1000e and r8169, the only PCI drivers that already
+use the existing runtime PM interface.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Acked-by: Rafael J. Wysocki <rjw@sisk.pl>
+
+---
+ drivers/net/e1000e/netdev.c |   16 ++++------------
+ drivers/net/r8169.c         |   16 ++++------------
+ drivers/pci/pci-driver.c    |   30 ++++++++++++++++++++++++++++--
+ 3 files changed, 36 insertions(+), 26 deletions(-)
+
+--- a/drivers/net/e1000e/netdev.c
++++ b/drivers/net/e1000e/netdev.c
+@@ -5721,11 +5721,8 @@ static int __devinit e1000_probe(struct
+ 
+ 	e1000_print_device_info(adapter);
+ 
+-	if (pci_dev_run_wake(pdev)) {
+-		pm_runtime_set_active(&pdev->dev);
+-		pm_runtime_enable(&pdev->dev);
+-	}
+-	pm_schedule_suspend(&pdev->dev, MSEC_PER_SEC);
++	if (pci_dev_run_wake(pdev))
++		pm_runtime_put_noidle(&pdev->dev);
+ 
+ 	return 0;
+ 
+@@ -5771,8 +5768,6 @@ static void __devexit e1000_remove(struc
+ 	struct e1000_adapter *adapter = netdev_priv(netdev);
+ 	bool down = test_bit(__E1000_DOWN, &adapter->state);
+ 
+-	pm_runtime_get_sync(&pdev->dev);
+-
+ 	/*
+ 	 * flush_scheduled work may reschedule our watchdog task, so
+ 	 * explicitly disable watchdog tasks from being rescheduled
+@@ -5797,11 +5792,8 @@ static void __devexit e1000_remove(struc
+ 		clear_bit(__E1000_DOWN, &adapter->state);
+ 	unregister_netdev(netdev);
+ 
+-	if (pci_dev_run_wake(pdev)) {
+-		pm_runtime_disable(&pdev->dev);
+-		pm_runtime_set_suspended(&pdev->dev);
+-	}
+-	pm_runtime_put_noidle(&pdev->dev);
++	if (pci_dev_run_wake(pdev))
++		pm_runtime_get_noresume(&pdev->dev);
+ 
+ 	/*
+ 	 * Release control of h/w to f/w.  If f/w is AMT enabled, this
+--- a/drivers/net/r8169.c
++++ b/drivers/net/r8169.c
+@@ -3219,11 +3219,8 @@ rtl8169_init_one(struct pci_dev *pdev, c
+ 
+ 	device_set_wakeup_enable(&pdev->dev, tp->features & RTL_FEATURE_WOL);
+ 
+-	if (pci_dev_run_wake(pdev)) {
+-		pm_runtime_set_active(&pdev->dev);
+-		pm_runtime_enable(&pdev->dev);
+-	}
+-	pm_runtime_idle(&pdev->dev);
++	if (pci_dev_run_wake(pdev))
++		pm_runtime_put_noidle(&pdev->dev);
+ 
+ out:
+ 	return rc;
+@@ -3246,17 +3243,12 @@ static void __devexit rtl8169_remove_one
+ 	struct net_device *dev = pci_get_drvdata(pdev);
+ 	struct rtl8169_private *tp = netdev_priv(dev);
+ 
+-	pm_runtime_get_sync(&pdev->dev);
+-
+ 	flush_scheduled_work();
+ 
+ 	unregister_netdev(dev);
+ 
+-	if (pci_dev_run_wake(pdev)) {
+-		pm_runtime_disable(&pdev->dev);
+-		pm_runtime_set_suspended(&pdev->dev);
+-	}
+-	pm_runtime_put_noidle(&pdev->dev);
++	if (pci_dev_run_wake(pdev))
++		pm_runtime_get_noresume(&pdev->dev);
+ 
+ 	/* restore original MAC address */
+ 	rtl_rar_set(tp, dev->perm_addr);
+--- a/drivers/pci/pci-driver.c
++++ b/drivers/pci/pci-driver.c
+@@ -289,8 +289,26 @@ struct drv_dev_and_id {
+ static long local_pci_probe(void *_ddi)
+ {
+ 	struct drv_dev_and_id *ddi = _ddi;
++	struct device *dev = &ddi->dev->dev;
++	int rc;
+ 
+-	return ddi->drv->probe(ddi->dev, ddi->id);
++	/* Unbound PCI devices are always set to disabled and suspended.
++	 * During probe, the device is set to enabled and active and the
++	 * usage count is incremented.  If the driver supports runtime PM,
++	 * it should call pm_runtime_put_noidle() in its probe routine and
++	 * pm_runtime_get_noresume() in its remove routine.
++	 */
++	pm_runtime_get_noresume(dev);
++	pm_runtime_set_active(dev);
++	pm_runtime_enable(dev);
++
++	rc = ddi->drv->probe(ddi->dev, ddi->id);
++	if (rc) {
++		pm_runtime_disable(dev);
++		pm_runtime_set_suspended(dev);
++		pm_runtime_put_noidle(dev);
++	}
++	return rc;
+ }
+ 
+ static int pci_call_probe(struct pci_driver *drv, struct pci_dev *dev,
+@@ -369,11 +387,19 @@ static int pci_device_remove(struct devi
+ 	struct pci_driver * drv = pci_dev->driver;
+ 
+ 	if (drv) {
+-		if (drv->remove)
++		if (drv->remove) {
++			pm_runtime_get_sync(dev);
+ 			drv->remove(pci_dev);
++			pm_runtime_put_noidle(dev);
++		}
+ 		pci_dev->driver = NULL;
+ 	}
+ 
++	/* Undo the runtime PM settings in local_pci_probe() */
++	pm_runtime_disable(dev);
++	pm_runtime_set_suspended(dev);
++	pm_runtime_put_noidle(dev);
++
+ 	/*
+ 	 * If the device is still on, set the power state as "unknown",
+ 	 * since it might change by the next time we load the driver.

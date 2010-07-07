@@ -1,0 +1,158 @@
+From stern@rowland.harvard.edu  Wed Jul  7 14:55:22 2010
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Fri, 25 Jun 2010 14:02:14 -0400 (EDT)
+Subject: USB: add do_wakeup parameter for PCI HCD suspend
+To: Greg KH <greg@kroah.com>
+Message-ID: <Pine.LNX.4.44L0.1006251241070.1604-100000@iolanthe.rowland.org>
+
+
+This patch (as1385) adds a "do_wakeup" parameter to the pci_suspend
+method used by PCI-based host controller drivers.  ehci-hcd in
+particular needs to know whether or not to enable wakeup when
+suspending a controller.  Although that information is currently
+available through device_may_wakeup(), when support is added for
+runtime suspend this will no longer be true.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/hcd-pci.c     |    4 +++-
+ drivers/usb/host/ehci-au1xxx.c |    2 +-
+ drivers/usb/host/ehci-fsl.c    |    3 ++-
+ drivers/usb/host/ehci-hub.c    |    5 ++---
+ drivers/usb/host/ehci-pci.c    |    4 ++--
+ drivers/usb/host/ehci.h        |    8 ++++----
+ drivers/usb/host/ohci-pci.c    |    2 +-
+ drivers/usb/host/uhci-hcd.c    |    2 +-
+ include/linux/usb/hcd.h        |    2 +-
+ 9 files changed, 17 insertions(+), 15 deletions(-)
+
+--- a/drivers/usb/core/hcd-pci.c
++++ b/drivers/usb/core/hcd-pci.c
+@@ -386,7 +386,9 @@ static int hcd_pci_suspend(struct device
+ 		return retval;
+ 
+ 	if (hcd->driver->pci_suspend) {
+-		retval = hcd->driver->pci_suspend(hcd);
++		bool	do_wakeup = device_may_wakeup(dev);
++
++		retval = hcd->driver->pci_suspend(hcd, do_wakeup);
+ 		suspend_report_result(hcd->driver->pci_suspend, retval);
+ 		if (retval)
+ 			return retval;
+--- a/drivers/usb/host/ehci-au1xxx.c
++++ b/drivers/usb/host/ehci-au1xxx.c
+@@ -228,7 +228,7 @@ static int ehci_hcd_au1xxx_drv_suspend(s
+ 	 * the root hub is either suspended or stopped.
+ 	 */
+ 	spin_lock_irqsave(&ehci->lock, flags);
+-	ehci_prepare_ports_for_controller_suspend(ehci);
++	ehci_prepare_ports_for_controller_suspend(ehci, device_may_wakeup(dev));
+ 	ehci_writel(ehci, 0, &ehci->regs->intr_enable);
+ 	(void)ehci_readl(ehci, &ehci->regs->intr_enable);
+ 
+--- a/drivers/usb/host/ehci-fsl.c
++++ b/drivers/usb/host/ehci-fsl.c
+@@ -313,7 +313,8 @@ static int ehci_fsl_drv_suspend(struct d
+ 	struct ehci_fsl *ehci_fsl = hcd_to_ehci_fsl(hcd);
+ 	void __iomem *non_ehci = hcd->regs;
+ 
+-	ehci_prepare_ports_for_controller_suspend(hcd_to_ehci(hcd));
++	ehci_prepare_ports_for_controller_suspend(hcd_to_ehci(hcd),
++			device_may_wakeup(dev));
+ 	if (!fsl_deep_sleep())
+ 		return 0;
+ 
+--- a/drivers/usb/host/ehci-hub.c
++++ b/drivers/usb/host/ehci-hub.c
+@@ -107,7 +107,7 @@ static void ehci_handover_companion_port
+ }
+ 
+ static void ehci_adjust_port_wakeup_flags(struct ehci_hcd *ehci,
+-		bool suspending)
++		bool suspending, bool do_wakeup)
+ {
+ 	int		port;
+ 	u32		temp;
+@@ -117,8 +117,7 @@ static void ehci_adjust_port_wakeup_flag
+ 	 * when the controller is suspended or resumed.  In all other
+ 	 * cases they don't need to be changed.
+ 	 */
+-	if (!ehci_to_hcd(ehci)->self.root_hub->do_remote_wakeup ||
+-			device_may_wakeup(ehci_to_hcd(ehci)->self.controller))
++	if (!ehci_to_hcd(ehci)->self.root_hub->do_remote_wakeup || do_wakeup)
+ 		return;
+ 
+ 	/* clear phy low-power mode before changing wakeup flags */
+--- a/drivers/usb/host/ehci-pci.c
++++ b/drivers/usb/host/ehci-pci.c
+@@ -277,7 +277,7 @@ done:
+  * Also they depend on separate root hub suspend/resume.
+  */
+ 
+-static int ehci_pci_suspend(struct usb_hcd *hcd)
++static int ehci_pci_suspend(struct usb_hcd *hcd, bool do_wakeup)
+ {
+ 	struct ehci_hcd		*ehci = hcd_to_ehci(hcd);
+ 	unsigned long		flags;
+@@ -291,7 +291,7 @@ static int ehci_pci_suspend(struct usb_h
+ 	 * the root hub is either suspended or stopped.
+ 	 */
+ 	spin_lock_irqsave (&ehci->lock, flags);
+-	ehci_prepare_ports_for_controller_suspend(ehci);
++	ehci_prepare_ports_for_controller_suspend(ehci, do_wakeup);
+ 	ehci_writel(ehci, 0, &ehci->regs->intr_enable);
+ 	(void)ehci_readl(ehci, &ehci->regs->intr_enable);
+ 
+--- a/drivers/usb/host/ehci.h
++++ b/drivers/usb/host/ehci.h
+@@ -540,11 +540,11 @@ struct ehci_fstn {
+ 
+ /* Prepare the PORTSC wakeup flags during controller suspend/resume */
+ 
+-#define ehci_prepare_ports_for_controller_suspend(ehci)		\
+-		ehci_adjust_port_wakeup_flags(ehci, true);
++#define ehci_prepare_ports_for_controller_suspend(ehci, do_wakeup)	\
++		ehci_adjust_port_wakeup_flags(ehci, true, do_wakeup);
+ 
+-#define ehci_prepare_ports_for_controller_resume(ehci)		\
+-		ehci_adjust_port_wakeup_flags(ehci, false);
++#define ehci_prepare_ports_for_controller_resume(ehci)			\
++		ehci_adjust_port_wakeup_flags(ehci, false, false);
+ 
+ /*-------------------------------------------------------------------------*/
+ 
+--- a/drivers/usb/host/ohci-pci.c
++++ b/drivers/usb/host/ohci-pci.c
+@@ -392,7 +392,7 @@ static int __devinit ohci_pci_start (str
+ 
+ #ifdef	CONFIG_PM
+ 
+-static int ohci_pci_suspend(struct usb_hcd *hcd)
++static int ohci_pci_suspend(struct usb_hcd *hcd, bool do_wakeup)
+ {
+ 	struct ohci_hcd	*ohci = hcd_to_ohci (hcd);
+ 	unsigned long	flags;
+--- a/drivers/usb/host/uhci-hcd.c
++++ b/drivers/usb/host/uhci-hcd.c
+@@ -788,7 +788,7 @@ static int uhci_rh_resume(struct usb_hcd
+ 	return rc;
+ }
+ 
+-static int uhci_pci_suspend(struct usb_hcd *hcd)
++static int uhci_pci_suspend(struct usb_hcd *hcd, bool do_wakeup)
+ {
+ 	struct uhci_hcd *uhci = hcd_to_uhci(hcd);
+ 	int rc = 0;
+--- a/include/linux/usb/hcd.h
++++ b/include/linux/usb/hcd.h
+@@ -211,7 +211,7 @@ struct hc_driver {
+ 	 * a whole, not just the root hub; they're for PCI bus glue.
+ 	 */
+ 	/* called after suspending the hub, before entering D3 etc */
+-	int	(*pci_suspend)(struct usb_hcd *hcd);
++	int	(*pci_suspend)(struct usb_hcd *hcd, bool do_wakeup);
+ 
+ 	/* called after entering D0 (etc), before resuming the hub */
+ 	int	(*pci_resume)(struct usb_hcd *hcd, bool hibernated);

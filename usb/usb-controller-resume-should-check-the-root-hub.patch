@@ -1,0 +1,95 @@
+From stern@rowland.harvard.edu  Wed Jul  7 14:55:34 2010
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Fri, 25 Jun 2010 14:02:24 -0400 (EDT)
+Subject: USB: controller resume should check the root hub
+To: Greg KH <greg@kroah.com>
+Message-ID: <Pine.LNX.4.44L0.1006251244030.1604-100000@iolanthe.rowland.org>
+
+
+This patch (as1394) adds code to ehci-hcd, ohci-hcd, and uhci-hcd for
+automatically resuming the root hub when the controller is resumed, if
+the root hub has a wakeup request pending on some port.
+
+During resume from system sleep this doesn't matter, because the root
+hubs will naturally be resumed along with every other device in the
+system.  However it _will_ matter for runtime PM: If the controller is
+suspended and a remote wakeup request is received then the controller
+will autoresume, but we need to ensure that the root hub also
+autoresumes.  Otherwise the wakeup request would be ignored, the
+controller would go back to sleep, and the cycle would repeat a large
+number of times (I saw this happen before the patch was written).
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/ehci-hub.c |    4 ++++
+ drivers/usb/host/ohci-hub.c |    7 ++++++-
+ drivers/usb/host/uhci-hcd.c |    7 ++++---
+ drivers/usb/host/uhci-hub.c |    2 +-
+ 4 files changed, 15 insertions(+), 5 deletions(-)
+
+--- a/drivers/usb/host/ehci-hub.c
++++ b/drivers/usb/host/ehci-hub.c
+@@ -166,6 +166,10 @@ static void ehci_adjust_port_wakeup_flag
+ 			ehci_writel(ehci, temp | HOSTPC_PHCD, hostpc_reg);
+ 		}
+ 	}
++
++	/* Does the root hub have a port wakeup pending? */
++	if (!suspending && (ehci_readl(ehci, &ehci->regs->status) & STS_PCD))
++		usb_hcd_resume_root_hub(ehci_to_hcd(ehci));
+ }
+ 
+ static int ehci_bus_suspend (struct usb_hcd *hcd)
+--- a/drivers/usb/host/ohci-hub.c
++++ b/drivers/usb/host/ohci-hub.c
+@@ -355,6 +355,11 @@ static void ohci_finish_controller_resum
+ 		ohci_readl(ohci, &ohci->regs->intrenable);
+ 		msleep(20);
+ 	}
++
++	/* Does the root hub have a port wakeup pending? */
++	if (ohci_readl(ohci, &ohci->regs->intrstatus) &
++			(OHCI_INTR_RD | OHCI_INTR_RHSC))
++		usb_hcd_resume_root_hub(hcd);
+ }
+ 
+ /* Carry out polling-, autostop-, and autoresume-related state changes */
+@@ -364,7 +369,7 @@ static int ohci_root_hub_state_changes(s
+ 	int	poll_rh = 1;
+ 	int	rhsc_enable;
+ 
+-	/* Some broken controllers never turn off RHCS in the interrupt
++	/* Some broken controllers never turn off RHSC in the interrupt
+ 	 * status register.  For their sake we won't re-enable RHSC
+ 	 * interrupts if the interrupt bit is already active.
+ 	 */
+--- a/drivers/usb/host/uhci-hcd.c
++++ b/drivers/usb/host/uhci-hcd.c
+@@ -862,10 +862,11 @@ static int uhci_pci_resume(struct usb_hc
+ 	/* If interrupts don't work and remote wakeup is enabled then
+ 	 * the suspended root hub needs to be polled.
+ 	 */
+-	if (!uhci->RD_enable && hcd->self.root_hub->do_remote_wakeup) {
++	if (!uhci->RD_enable && hcd->self.root_hub->do_remote_wakeup)
+ 		set_bit(HCD_FLAG_POLL_RH, &hcd->flags);
+-		usb_hcd_poll_rh_status(hcd);
+-	}
++
++	/* Does the root hub have a port wakeup pending? */
++	usb_hcd_poll_rh_status(hcd);
+ 	return 0;
+ }
+ #endif
+--- a/drivers/usb/host/uhci-hub.c
++++ b/drivers/usb/host/uhci-hub.c
+@@ -200,7 +200,7 @@ static int uhci_hub_status_data(struct u
+ 	    case UHCI_RH_SUSPENDING:
+ 	    case UHCI_RH_SUSPENDED:
+ 		/* if port change, ask to be resumed */
+-		if (status)
++		if (status || uhci->resuming_ports)
+ 			usb_hcd_resume_root_hub(hcd);
+ 		break;
+ 
