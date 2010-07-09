@@ -1,0 +1,88 @@
+From sarah.a.sharp@linux.intel.com  Fri Jul  9 14:33:25 2010
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Date: Fri, 9 Jul 2010 17:08:54 +0200
+Subject: USB: xhci: Set EP0 dequeue ptr after reset of configured device.
+To: Greg KH <gregkh@suse.de>
+Cc: linux-usb@vger.kernel.org, Fajun Chen <fajun.chen@seagate.com>, stable@vger.kernel.org
+Message-ID: <20100709150854.GA3804@xanatos>
+Content-Disposition: inline
+
+
+When a configured device is reset, the control endpoint's ring is reused.
+If control transfers to the device were issued before the device is reset,
+the dequeue pointer will be somewhere in the middle of the ring.  If the
+device is then issued an address with the set address command, the xHCI
+driver must provide a valid input context for control endpoint zero.
+
+The original code would give the hardware the original input context,
+which had a dequeue pointer set to the top of the ring.  This would cause
+the host to re-execute any control transfers until it reached the ring's
+enqueue pointer.  When issuing a set address command for a device that has
+just been configured and then reset, use the control endpoint's enqueue
+pointer as the hardware's dequeue pointer.
+
+Assumption:  All control transfers will be completed or cancelled before
+the set address command is issued to the device.  If there are any
+outstanding control transfers, this code will not work.
+
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/xhci-mem.c |   21 +++++++++++++++++++++
+ drivers/usb/host/xhci.c     |    2 ++
+ drivers/usb/host/xhci.h     |    2 ++
+ 3 files changed, 25 insertions(+)
+
+--- a/drivers/usb/host/xhci-mem.c
++++ b/drivers/usb/host/xhci-mem.c
+@@ -835,6 +835,27 @@ fail:
+ 	return 0;
+ }
+ 
++void xhci_copy_ep0_dequeue_into_input_ctx(struct xhci_hcd *xhci,
++		struct usb_device *udev)
++{
++	struct xhci_virt_device *virt_dev;
++	struct xhci_ep_ctx	*ep0_ctx;
++	struct xhci_ring	*ep_ring;
++
++	virt_dev = xhci->devs[udev->slot_id];
++	ep0_ctx = xhci_get_ep_ctx(xhci, virt_dev->in_ctx, 0);
++	ep_ring = virt_dev->eps[0].ring;
++	/*
++	 * FIXME we don't keep track of the dequeue pointer very well after a
++	 * Set TR dequeue pointer, so we're setting the dequeue pointer of the
++	 * host to our enqueue pointer.  This should only be called after a
++	 * configured device has reset, so all control transfers should have
++	 * been completed or cancelled before the reset.
++	 */
++	ep0_ctx->deq = xhci_trb_virt_to_dma(ep_ring->enq_seg, ep_ring->enqueue);
++	ep0_ctx->deq |= ep_ring->cycle_state;
++}
++
+ /* Setup an xHCI virtual device for a Set Address command */
+ int xhci_setup_addressable_virt_dev(struct xhci_hcd *xhci, struct usb_device *udev)
+ {
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -2134,6 +2134,8 @@ int xhci_address_device(struct usb_hcd *
+ 	/* If this is a Set Address to an unconfigured device, setup ep 0 */
+ 	if (!udev->config)
+ 		xhci_setup_addressable_virt_dev(xhci, udev);
++	else
++		xhci_copy_ep0_dequeue_into_input_ctx(xhci, udev);
+ 	/* Otherwise, assume the core has the device configured how it wants */
+ 	xhci_dbg(xhci, "Slot ID %d Input Context:\n", udev->slot_id);
+ 	xhci_dbg_ctx(xhci, virt_dev->in_ctx, 2);
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -1292,6 +1292,8 @@ int xhci_mem_init(struct xhci_hcd *xhci,
+ void xhci_free_virt_device(struct xhci_hcd *xhci, int slot_id);
+ int xhci_alloc_virt_device(struct xhci_hcd *xhci, int slot_id, struct usb_device *udev, gfp_t flags);
+ int xhci_setup_addressable_virt_dev(struct xhci_hcd *xhci, struct usb_device *udev);
++void xhci_copy_ep0_dequeue_into_input_ctx(struct xhci_hcd *xhci,
++		struct usb_device *udev);
+ unsigned int xhci_get_endpoint_index(struct usb_endpoint_descriptor *desc);
+ unsigned int xhci_get_endpoint_flag(struct usb_endpoint_descriptor *desc);
+ unsigned int xhci_get_endpoint_flag_from_index(unsigned int ep_index);

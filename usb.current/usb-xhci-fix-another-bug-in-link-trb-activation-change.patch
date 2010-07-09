@@ -1,0 +1,57 @@
+From sarah.a.sharp@linux.intel.com  Fri Jul  9 14:32:26 2010
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Date: Fri, 9 Jul 2010 17:08:38 +0200
+Subject: USB: xHCI: Fix another bug in link TRB activation change.
+To: Greg KH <gregkh@suse.de>
+Cc: linux-usb@vger.kernel.org, Fajun Chen <fajun.chen@seagate.com>
+Message-ID: <20100709150837.GA2987@xanatos>
+Content-Disposition: inline
+
+
+Commit 6c12db90f19727c76990e7f4801c67a148b30111 also seems to have
+introduced a bug that is triggered when the command ring is about to wrap.
+The inc_enq() function will not have moved the enqueue pointer past the
+link TRB.  It is supposed to be moved past the link TRB in prepare_ring(),
+which should be called before a TD is enqueued.  However, the
+queue_command() function never calls the prepare_ring() function because
+prepare_ring() is only supposed to be used for endpoint rings.  That means
+the enqueue pointer will not be moved past the link TRB, and will get
+overwritten.
+
+The fix is to make queue_command() call prepare_ring() with a fake
+endpoint status (set to running).  Then the enqueue pointer will get moved
+past the link TRB.
+
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/xhci-ring.c |   11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -2380,16 +2380,19 @@ static int queue_command(struct xhci_hcd
+ 		u32 field3, u32 field4, bool command_must_succeed)
+ {
+ 	int reserved_trbs = xhci->cmd_ring_reserved_trbs;
++	int ret;
++
+ 	if (!command_must_succeed)
+ 		reserved_trbs++;
+ 
+-	if (!room_on_ring(xhci, xhci->cmd_ring, reserved_trbs)) {
+-		if (!in_interrupt())
+-			xhci_err(xhci, "ERR: No room for command on command ring\n");
++	ret = prepare_ring(xhci, xhci->cmd_ring, EP_STATE_RUNNING,
++			reserved_trbs, GFP_ATOMIC);
++	if (ret < 0) {
++		xhci_err(xhci, "ERR: No room for command on command ring\n");
+ 		if (command_must_succeed)
+ 			xhci_err(xhci, "ERR: Reserved TRB counting for "
+ 					"unfailable commands failed.\n");
+-		return -ENOMEM;
++		return ret;
+ 	}
+ 	queue_trb(xhci, xhci->cmd_ring, false, false, field1, field2, field3,
+ 			field4 | xhci->cmd_ring->cycle_state);
