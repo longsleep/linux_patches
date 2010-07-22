@@ -1,0 +1,397 @@
+From sarah.a.sharp@linux.intel.com  Thu Jul 22 16:17:16 2010
+Date: Thu, 22 Jul 2010 15:23:31 -0700
+From: Andiry Xu <andiry.xu@amd.com>
+To: Greg KH <gregkh@suse.de>
+Cc: linux-usb@vger.kernel.org, Andiry Xu <andiry.xu@amd.com>
+Subject: USB: xHCI: Introduce urb_priv structure
+Message-ID: <20100722222331.GA21527@xanatos>
+Content-Disposition: inline
+
+From: Andiry Xu <andiry.xu@amd.com>
+
+Add urb_priv data structure to xHCI driver. This structure allows multiple
+xhci TDs to be linked to one urb, which is essential for isochronous
+transfer. For non-isochronous urb, only one TD is needed for one urb;
+for isochronous urb, the TD number for the urb is equal to
+urb->number_of_packets.
+
+The length field of urb_priv indicates the number of TDs in the urb.
+The td_cnt field indicates the number of TDs already processed by xHC.
+When td_cnt matches length, the urb can be given back to usbcore.
+
+When an urb is dequeued or cancelled, add all the unprocessed TDs to the
+endpoint's cancelled_td_list. When process a cancelled TD, increase
+td_cnt field. When td_cnt equals urb_priv->length, giveback the
+cancelled urb.
+
+Signed-off-by: Andiry Xu <andiry.xu@amd.com>
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ drivers/usb/host/xhci-mem.c  |   16 +++++++
+ drivers/usb/host/xhci-ring.c |   91 +++++++++++++++++++++++++++++--------------
+ drivers/usb/host/xhci.c      |   45 ++++++++++++++++++---
+ drivers/usb/host/xhci.h      |    7 +++
+ 4 files changed, 125 insertions(+), 34 deletions(-)
+
+--- a/drivers/usb/host/xhci-mem.c
++++ b/drivers/usb/host/xhci-mem.c
+@@ -1390,6 +1390,22 @@ struct xhci_command *xhci_alloc_command(
+ 	return command;
+ }
+ 
++void xhci_urb_free_priv(struct xhci_hcd *xhci, struct urb_priv *urb_priv)
++{
++	int last;
++
++	if (!urb_priv)
++		return;
++
++	last = urb_priv->length - 1;
++	if (last >= 0) {
++		int	i;
++		for (i = 0; i <= last; i++)
++			kfree(urb_priv->td[i]);
++	}
++	kfree(urb_priv);
++}
++
+ void xhci_free_command(struct xhci_hcd *xhci,
+ 		struct xhci_command *command)
+ {
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -578,16 +578,24 @@ static void xhci_giveback_urb_in_irq(str
+ 		struct xhci_td *cur_td, int status, char *adjective)
+ {
+ 	struct usb_hcd *hcd = xhci_to_hcd(xhci);
++	struct urb	*urb;
++	struct urb_priv	*urb_priv;
+ 
+-	cur_td->urb->hcpriv = NULL;
+-	usb_hcd_unlink_urb_from_ep(hcd, cur_td->urb);
+-	xhci_dbg(xhci, "Giveback %s URB %p\n", adjective, cur_td->urb);
++	urb = cur_td->urb;
++	urb_priv = urb->hcpriv;
++	urb_priv->td_cnt++;
++
++	/* Only giveback urb when this is the last td in urb */
++	if (urb_priv->td_cnt == urb_priv->length) {
++		usb_hcd_unlink_urb_from_ep(hcd, urb);
++		xhci_dbg(xhci, "Giveback %s URB %p\n", adjective, urb);
+ 
+-	spin_unlock(&xhci->lock);
+-	usb_hcd_giveback_urb(hcd, cur_td->urb, status);
+-	kfree(cur_td);
+-	spin_lock(&xhci->lock);
+-	xhci_dbg(xhci, "%s URB given back\n", adjective);
++		spin_unlock(&xhci->lock);
++		usb_hcd_giveback_urb(hcd, urb, status);
++		xhci_urb_free_priv(xhci, urb_priv);
++		spin_lock(&xhci->lock);
++		xhci_dbg(xhci, "%s URB given back\n", adjective);
++	}
+ }
+ 
+ /*
+@@ -1272,6 +1280,7 @@ static int finish_td(struct xhci_hcd *xh
+ 	struct urb *urb = NULL;
+ 	struct xhci_ep_ctx *ep_ctx;
+ 	int ret = 0;
++	struct urb_priv	*urb_priv;
+ 	u32 trb_comp_code;
+ 
+ 	slot_id = TRB_TO_SLOT_ID(event->flags);
+@@ -1325,6 +1334,7 @@ static int finish_td(struct xhci_hcd *xh
+ td_cleanup:
+ 		/* Clean up the endpoint's TD list */
+ 		urb = td->urb;
++		urb_priv = urb->hcpriv;
+ 
+ 		/* Do one last check of the actual transfer length.
+ 		 * If the host controller said we transferred more data than
+@@ -1349,7 +1359,10 @@ td_cleanup:
+ 		if (!list_empty(&td->cancelled_td_list))
+ 			list_del(&td->cancelled_td_list);
+ 
+-		ret = 1;
++		urb_priv->td_cnt++;
++		/* Giveback the urb when all the tds are completed */
++		if (urb_priv->td_cnt == urb_priv->length)
++			ret = 1;
+ 	}
+ 
+ 	return ret;
+@@ -1588,6 +1601,7 @@ static int handle_tx_event(struct xhci_h
+ 	union xhci_trb *event_trb;
+ 	struct urb *urb = NULL;
+ 	int status = -EINPROGRESS;
++	struct urb_priv *urb_priv;
+ 	struct xhci_ep_ctx *ep_ctx;
+ 	u32 trb_comp_code;
+ 	int ret = 0;
+@@ -1770,6 +1784,7 @@ cleanup:
+ 
+ 		if (ret) {
+ 			urb = td->urb;
++			urb_priv = urb->hcpriv;
+ 			/* Leave the TD around for the reset endpoint function
+ 			 * to use(but only if it's not a control endpoint,
+ 			 * since we already queued the Set TR dequeue pointer
+@@ -1778,7 +1793,7 @@ cleanup:
+ 			if (usb_endpoint_xfer_control(&urb->ep->desc) ||
+ 				(trb_comp_code != COMP_STALL &&
+ 					trb_comp_code != COMP_BABBLE))
+-				kfree(td);
++				xhci_urb_free_priv(xhci, urb_priv);
+ 
+ 			usb_hcd_unlink_urb_from_ep(xhci_to_hcd(xhci), urb);
+ 			xhci_dbg(xhci, "Giveback URB %p, len = %d, "
+@@ -1979,10 +1994,12 @@ static int prepare_transfer(struct xhci_
+ 		unsigned int stream_id,
+ 		unsigned int num_trbs,
+ 		struct urb *urb,
+-		struct xhci_td **td,
++		unsigned int td_index,
+ 		gfp_t mem_flags)
+ {
+ 	int ret;
++	struct urb_priv *urb_priv;
++	struct xhci_td	*td;
+ 	struct xhci_ring *ep_ring;
+ 	struct xhci_ep_ctx *ep_ctx = xhci_get_ep_ctx(xhci, xdev->out_ctx, ep_index);
+ 
+@@ -1998,24 +2015,29 @@ static int prepare_transfer(struct xhci_
+ 			num_trbs, mem_flags);
+ 	if (ret)
+ 		return ret;
+-	*td = kzalloc(sizeof(struct xhci_td), mem_flags);
+-	if (!*td)
+-		return -ENOMEM;
+-	INIT_LIST_HEAD(&(*td)->td_list);
+-	INIT_LIST_HEAD(&(*td)->cancelled_td_list);
+ 
+-	ret = usb_hcd_link_urb_to_ep(xhci_to_hcd(xhci), urb);
+-	if (unlikely(ret)) {
+-		kfree(*td);
+-		return ret;
++	urb_priv = urb->hcpriv;
++	td = urb_priv->td[td_index];
++
++	INIT_LIST_HEAD(&td->td_list);
++	INIT_LIST_HEAD(&td->cancelled_td_list);
++
++	if (td_index == 0) {
++		ret = usb_hcd_link_urb_to_ep(xhci_to_hcd(xhci), urb);
++		if (unlikely(ret)) {
++			xhci_urb_free_priv(xhci, urb_priv);
++			urb->hcpriv = NULL;
++			return ret;
++		}
+ 	}
+ 
+-	(*td)->urb = urb;
+-	urb->hcpriv = (void *) (*td);
++	td->urb = urb;
+ 	/* Add this TD to the tail of the endpoint ring's TD list */
+-	list_add_tail(&(*td)->td_list, &ep_ring->td_list);
+-	(*td)->start_seg = ep_ring->enq_seg;
+-	(*td)->first_trb = ep_ring->enqueue;
++	list_add_tail(&td->td_list, &ep_ring->td_list);
++	td->start_seg = ep_ring->enq_seg;
++	td->first_trb = ep_ring->enqueue;
++
++	urb_priv->td[td_index] = td;
+ 
+ 	return 0;
+ }
+@@ -2154,6 +2176,7 @@ static int queue_bulk_sg_tx(struct xhci_
+ {
+ 	struct xhci_ring *ep_ring;
+ 	unsigned int num_trbs;
++	struct urb_priv *urb_priv;
+ 	struct xhci_td *td;
+ 	struct scatterlist *sg;
+ 	int num_sgs;
+@@ -2174,9 +2197,13 @@ static int queue_bulk_sg_tx(struct xhci_
+ 
+ 	trb_buff_len = prepare_transfer(xhci, xhci->devs[slot_id],
+ 			ep_index, urb->stream_id,
+-			num_trbs, urb, &td, mem_flags);
++			num_trbs, urb, 0, mem_flags);
+ 	if (trb_buff_len < 0)
+ 		return trb_buff_len;
++
++	urb_priv = urb->hcpriv;
++	td = urb_priv->td[0];
++
+ 	/*
+ 	 * Don't give the first TRB to the hardware (by toggling the cycle bit)
+ 	 * until we've finished creating all the other TRBs.  The ring's cycle
+@@ -2297,6 +2324,7 @@ int xhci_queue_bulk_tx(struct xhci_hcd *
+ 		struct urb *urb, int slot_id, unsigned int ep_index)
+ {
+ 	struct xhci_ring *ep_ring;
++	struct urb_priv *urb_priv;
+ 	struct xhci_td *td;
+ 	int num_trbs;
+ 	struct xhci_generic_trb *start_trb;
+@@ -2342,10 +2370,13 @@ int xhci_queue_bulk_tx(struct xhci_hcd *
+ 
+ 	ret = prepare_transfer(xhci, xhci->devs[slot_id],
+ 			ep_index, urb->stream_id,
+-			num_trbs, urb, &td, mem_flags);
++			num_trbs, urb, 0, mem_flags);
+ 	if (ret < 0)
+ 		return ret;
+ 
++	urb_priv = urb->hcpriv;
++	td = urb_priv->td[0];
++
+ 	/*
+ 	 * Don't give the first TRB to the hardware (by toggling the cycle bit)
+ 	 * until we've finished creating all the other TRBs.  The ring's cycle
+@@ -2431,6 +2462,7 @@ int xhci_queue_ctrl_tx(struct xhci_hcd *
+ 	struct xhci_generic_trb *start_trb;
+ 	int start_cycle;
+ 	u32 field, length_field;
++	struct urb_priv *urb_priv;
+ 	struct xhci_td *td;
+ 
+ 	ep_ring = xhci_urb_to_transfer_ring(xhci, urb);
+@@ -2458,10 +2490,13 @@ int xhci_queue_ctrl_tx(struct xhci_hcd *
+ 		num_trbs++;
+ 	ret = prepare_transfer(xhci, xhci->devs[slot_id],
+ 			ep_index, urb->stream_id,
+-			num_trbs, urb, &td, mem_flags);
++			num_trbs, urb, 0, mem_flags);
+ 	if (ret < 0)
+ 		return ret;
+ 
++	urb_priv = urb->hcpriv;
++	td = urb_priv->td[0];
++
+ 	/*
+ 	 * Don't give the first TRB to the hardware (by toggling the cycle bit)
+ 	 * until we've finished creating all the other TRBs.  The ring's cycle
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -804,7 +804,8 @@ int xhci_urb_enqueue(struct usb_hcd *hcd
+ 	unsigned long flags;
+ 	int ret = 0;
+ 	unsigned int slot_id, ep_index;
+-
++	struct urb_priv	*urb_priv;
++	int size, i;
+ 
+ 	if (!urb || xhci_check_args(hcd, urb->dev, urb->ep, true, __func__) <= 0)
+ 		return -EINVAL;
+@@ -824,6 +825,30 @@ int xhci_urb_enqueue(struct usb_hcd *hcd
+ 		ret = -ESHUTDOWN;
+ 		goto exit;
+ 	}
++
++	if (usb_endpoint_xfer_isoc(&urb->ep->desc))
++		size = urb->number_of_packets;
++	else
++		size = 1;
++
++	urb_priv = kzalloc(sizeof(struct urb_priv) +
++				  size * sizeof(struct xhci_td *), mem_flags);
++	if (!urb_priv)
++		return -ENOMEM;
++
++	for (i = 0; i < size; i++) {
++		urb_priv->td[i] = kzalloc(sizeof(struct xhci_td), mem_flags);
++		if (!urb_priv->td[i]) {
++			urb_priv->length = i;
++			xhci_urb_free_priv(xhci, urb_priv);
++			return -ENOMEM;
++		}
++	}
++
++	urb_priv->length = size;
++	urb_priv->td_cnt = 0;
++	urb->hcpriv = urb_priv;
++
+ 	if (usb_endpoint_xfer_control(&urb->ep->desc)) {
+ 		/* Check to see if the max packet size for the default control
+ 		 * endpoint changed during FS device enumeration
+@@ -877,6 +902,8 @@ int xhci_urb_enqueue(struct usb_hcd *hcd
+ exit:
+ 	return ret;
+ dying:
++	xhci_urb_free_priv(xhci, urb_priv);
++	urb->hcpriv = NULL;
+ 	xhci_dbg(xhci, "Ep 0x%x: URB %p submitted for "
+ 			"non-responsive xHCI host.\n",
+ 			urb->ep->desc.bEndpointAddress, urb);
+@@ -918,9 +945,10 @@ dying:
+ int xhci_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
+ {
+ 	unsigned long flags;
+-	int ret;
++	int ret, i;
+ 	u32 temp;
+ 	struct xhci_hcd *xhci;
++	struct urb_priv	*urb_priv;
+ 	struct xhci_td *td;
+ 	unsigned int ep_index;
+ 	struct xhci_ring *ep_ring;
+@@ -935,12 +963,12 @@ int xhci_urb_dequeue(struct usb_hcd *hcd
+ 	temp = xhci_readl(xhci, &xhci->op_regs->status);
+ 	if (temp == 0xffffffff) {
+ 		xhci_dbg(xhci, "HW died, freeing TD.\n");
+-		td = (struct xhci_td *) urb->hcpriv;
++		urb_priv = urb->hcpriv;
+ 
+ 		usb_hcd_unlink_urb_from_ep(hcd, urb);
+ 		spin_unlock_irqrestore(&xhci->lock, flags);
+ 		usb_hcd_giveback_urb(xhci_to_hcd(xhci), urb, -ESHUTDOWN);
+-		kfree(td);
++		xhci_urb_free_priv(xhci, urb_priv);
+ 		return ret;
+ 	}
+ 	if (xhci->xhc_state & XHCI_STATE_DYING) {
+@@ -968,9 +996,14 @@ int xhci_urb_dequeue(struct usb_hcd *hcd
+ 
+ 	xhci_dbg(xhci, "Endpoint ring:\n");
+ 	xhci_debug_ring(xhci, ep_ring);
+-	td = (struct xhci_td *) urb->hcpriv;
+ 
+-	list_add_tail(&td->cancelled_td_list, &ep->cancelled_td_list);
++	urb_priv = urb->hcpriv;
++
++	for (i = urb_priv->td_cnt; i < urb_priv->length; i++) {
++		td = urb_priv->td[i];
++		list_add_tail(&td->cancelled_td_list, &ep->cancelled_td_list);
++	}
++
+ 	/* Queue a stop endpoint command, but only if this is
+ 	 * the first cancellation to be handled.
+ 	 */
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -1090,6 +1090,12 @@ struct xhci_scratchpad {
+ 	dma_addr_t *sp_dma_buffers;
+ };
+ 
++struct urb_priv {
++	int	length;
++	int	td_cnt;
++	struct	xhci_td	*td[0];
++};
++
+ /*
+  * Each segment table entry is 4*32bits long.  1K seems like an ok size:
+  * (1K bytes * 8bytes/bit) / (4*32 bits) = 64 segment entries in the table,
+@@ -1347,6 +1353,7 @@ struct xhci_ring *xhci_stream_id_to_ring
+ struct xhci_command *xhci_alloc_command(struct xhci_hcd *xhci,
+ 		bool allocate_in_ctx, bool allocate_completion,
+ 		gfp_t mem_flags);
++void xhci_urb_free_priv(struct xhci_hcd *xhci, struct urb_priv *urb_priv);
+ void xhci_free_command(struct xhci_hcd *xhci,
+ 		struct xhci_command *command);
+ 
