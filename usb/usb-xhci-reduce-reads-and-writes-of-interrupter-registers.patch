@@ -1,0 +1,83 @@
+From sarah.a.sharp@linux.intel.com  Mon Aug  2 16:06:55 2010
+Date: Thu, 29 Jul 2010 22:13:00 -0700
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+To: Greg KH <gregkh@suse.de>
+Cc: linux-usb@vger.kernel.org
+Subject: USB: xhci: Reduce reads and writes of interrupter registers.
+Message-ID: <20100730051300.GA7561@xanatos>
+Content-Disposition: inline
+
+The interrupter register set includes a register that says whether interrupts
+are pending for each event ring (the IP bit).  Each MSI-X vector will get its
+own interrupter set with separate IP bits.  The status register includes an
+"Event Interrupt (EINT)" bit that is set when an IP bit is set in any of the
+interrupters.
+
+When PCI interrupts are used, the EINT bit exactly mirrors the IP bit in the
+single interrupter set, and it is a waste of time to check both registers when
+trying to figure out if the xHC interrupted or another device on the shared IRQ
+line interrupted.  Only check the IP bit to reduce register reads.
+
+The IP bit is automatically cleared by the xHC when MSI or MSI-X is enabled.  It
+doesn't make sense to read that register to check for shared interrupts (since
+MSI and MSI-X aren't shared).  It also doesn't make sense to write to that
+register to clear the IP bit, since it is cleared by the hardware.
+
+We can tell whether MSI or MSI-X is enabled by looking at the irq number in
+hcd->irq.  If it's -1, we know MSI or MSI-X is enabled.
+
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/xhci-ring.c |   18 ++++++++++--------
+ 1 file changed, 10 insertions(+), 8 deletions(-)
+
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -2014,7 +2014,7 @@ static void xhci_handle_event(struct xhc
+ irqreturn_t xhci_irq(struct usb_hcd *hcd)
+ {
+ 	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
+-	u32 status, irq_pending;
++	u32 status;
+ 	union xhci_trb *trb;
+ 	u64 temp_64;
+ 	union xhci_trb *event_ring_deq;
+@@ -2024,17 +2024,15 @@ irqreturn_t xhci_irq(struct usb_hcd *hcd
+ 	trb = xhci->event_ring->dequeue;
+ 	/* Check if the xHC generated the interrupt, or the irq is shared */
+ 	status = xhci_readl(xhci, &xhci->op_regs->status);
+-	irq_pending = xhci_readl(xhci, &xhci->ir_set->irq_pending);
+-	if (status == 0xffffffff && irq_pending == 0xffffffff)
++	if (status == 0xffffffff)
+ 		goto hw_died;
+ 
+-	if (!(status & STS_EINT) && !ER_IRQ_PENDING(irq_pending)) {
++	if (!(status & STS_EINT)) {
+ 		spin_unlock(&xhci->lock);
+ 		xhci_warn(xhci, "Spurious interrupt.\n");
+ 		return IRQ_NONE;
+ 	}
+ 	xhci_dbg(xhci, "op reg status = %08x\n", status);
+-	xhci_dbg(xhci, "ir set irq_pending = %08x\n", irq_pending);
+ 	xhci_dbg(xhci, "Event ring dequeue ptr:\n");
+ 	xhci_dbg(xhci, "@%llx %08x %08x %08x %08x\n",
+ 			(unsigned long long)
+@@ -2063,9 +2061,13 @@ hw_died:
+ 	/* FIXME when MSI-X is supported and there are multiple vectors */
+ 	/* Clear the MSI-X event interrupt status */
+ 
+-	/* Acknowledge the interrupt */
+-	irq_pending |= 0x3;
+-	xhci_writel(xhci, irq_pending, &xhci->ir_set->irq_pending);
++	if (hcd->irq != -1) {
++		u32 irq_pending;
++		/* Acknowledge the PCI interrupt */
++		irq_pending = xhci_readl(xhci, &xhci->ir_set->irq_pending);
++		irq_pending |= 0x3;
++		xhci_writel(xhci, irq_pending, &xhci->ir_set->irq_pending);
++	}
+ 
+ 	if (xhci->xhc_state & XHCI_STATE_DYING) {
+ 		xhci_dbg(xhci, "xHCI dying, ignoring interrupt. "
