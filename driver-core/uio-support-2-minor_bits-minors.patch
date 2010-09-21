@@ -1,0 +1,98 @@
+From ebiederm@xmission.com  Tue Sep 21 14:06:15 2010
+From: Eric W. Biederman <ebiederm@aristanetworks.com>
+To: Greg Kroah-Hartman <gregkh@suse.de>
+Cc: "Hans J. Koch" <hjk@linutronix.de>
+Date: Tue, 14 Sep 2010 11:38:06 -0700
+Message-ID: <m1eicw892p.fsf@fess.ebiederm.org>
+Subject: uio: Support 2^MINOR_BITS minors
+
+
+register_chrdev limits uio devices to 256 minor numbers which causes
+problems on one system I have with 384+ uio devices.  So instead set
+UIO_MAX_DEVICES to the maximum number of minors and use
+alloc_chrdev_region to reserve the uio minors.
+
+The final result is that the code works the same but the uio driver now
+supports any minor the idr allocator comes up with.
+
+Signed-off-by: Eric W. Biederman <ebiederm@aristanetworks.com>
+Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Hans J. Koch <hjk@linutronix.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/uio/uio.c |   43 +++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 37 insertions(+), 6 deletions(-)
+
+--- a/drivers/uio/uio.c
++++ b/drivers/uio/uio.c
+@@ -23,9 +23,10 @@
+ #include <linux/sched.h>
+ #include <linux/string.h>
+ #include <linux/kobject.h>
++#include <linux/cdev.h>
+ #include <linux/uio_driver.h>
+ 
+-#define UIO_MAX_DEVICES 255
++#define UIO_MAX_DEVICES		(1U << MINORBITS)
+ 
+ struct uio_device {
+ 	struct module		*owner;
+@@ -41,6 +42,7 @@ struct uio_device {
+ };
+ 
+ static int uio_major;
++static struct cdev *uio_cdev;
+ static DEFINE_IDR(uio_idr);
+ static const struct file_operations uio_fops;
+ 
+@@ -731,15 +733,44 @@ static const struct file_operations uio_
+ 
+ static int uio_major_init(void)
+ {
+-	uio_major = register_chrdev(0, "uio", &uio_fops);
+-	if (uio_major < 0)
+-		return uio_major;
+-	return 0;
++	static const char name[] = "uio";
++	struct cdev *cdev = NULL;
++	dev_t uio_dev = 0;
++	int result;
++
++	result = alloc_chrdev_region(&uio_dev, 0, UIO_MAX_DEVICES, name);
++	if (result)
++		goto out;
++
++	result = -ENOMEM;
++	cdev = cdev_alloc();
++	if (!cdev)
++		goto out_unregister;
++
++	cdev->owner = THIS_MODULE;
++	cdev->ops = &uio_fops;
++	kobject_set_name(&cdev->kobj, "%s", name);
++
++	result = cdev_add(cdev, uio_dev, UIO_MAX_DEVICES);
++	if (result)
++		goto out_put;
++
++	uio_major = MAJOR(uio_dev);
++	uio_cdev = cdev;
++	result = 0;
++out:
++	return result;
++out_put:
++	kobject_put(&cdev->kobj);
++out_unregister:
++	unregister_chrdev_region(uio_dev, UIO_MAX_DEVICES);
++	goto out;
+ }
+ 
+ static void uio_major_cleanup(void)
+ {
+-	unregister_chrdev(uio_major, "uio");
++	unregister_chrdev_region(MKDEV(uio_major, 0), UIO_MAX_DEVICES);
++	cdev_del(uio_cdev);
+ }
+ 
+ static int init_uio_class(void)
