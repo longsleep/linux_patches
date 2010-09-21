@@ -1,0 +1,154 @@
+From dbd3a8709560365ff9b1e5eca263f608877a8a89 Mon Sep 17 00:00:00 2001
+From: Pavan Savoy <pavan_savoy@ti.com>
+Date: Thu, 19 Aug 2010 14:08:51 -0400
+Subject: Staging: ti-st: remove st_get_plat_device
+
+In order to support multiple ST platform devices, a new symbol
+'st_get_plat_device' earlier needed to be exported by the arch/XX/brd-XX.c
+file which intends to add the ST platform device.
+
+On removing this dependency, now inside ST driver maintain the array of
+ST platform devices that would be registered.
+As of now let id=0, as and when we end up having such platforms
+where mutliple ST devices can exist, id would come from
+protocol drivers (BT, FM and GPS) as to on which platform device
+they want to register to.
+
+Signed-off-by: Pavan Savoy <pavan_savoy@ti.com>
+Acked-by: Randy Dunlap <randy.dunlap@oracle.com>
+Cc: Anca Emanuel <anca.emanuel@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/staging/ti-st/st.h      |    1 -
+ drivers/staging/ti-st/st_core.c |    9 ++++-----
+ drivers/staging/ti-st/st_core.h |    2 +-
+ drivers/staging/ti-st/st_kim.c  |   22 +++++++++++++++++++---
+ 4 files changed, 24 insertions(+), 10 deletions(-)
+
+--- a/drivers/staging/ti-st/st.h
++++ b/drivers/staging/ti-st/st.h
+@@ -80,5 +80,4 @@ struct st_proto_s {
+ extern long st_register(struct st_proto_s *);
+ extern long st_unregister(enum proto_type);
+ 
+-extern struct platform_device *st_get_plat_device(void);
+ #endif /* ST_H */
+--- a/drivers/staging/ti-st/st_core.c
++++ b/drivers/staging/ti-st/st_core.c
+@@ -38,7 +38,6 @@
+ #include "st_ll.h"
+ #include "st.h"
+ 
+-#define VERBOSE
+ /* strings to be used for rfkill entries and by
+  * ST Core to be used for sysfs debug entry
+  */
+@@ -581,7 +580,7 @@ long st_register(struct st_proto_s *new_
+ 	long err = 0;
+ 	unsigned long flags = 0;
+ 
+-	st_kim_ref(&st_gdata);
++	st_kim_ref(&st_gdata, 0);
+ 	pr_info("%s(%d) ", __func__, new_proto->type);
+ 	if (st_gdata == NULL || new_proto == NULL || new_proto->recv == NULL
+ 	    || new_proto->reg_complete_cb == NULL) {
+@@ -713,7 +712,7 @@ long st_unregister(enum proto_type type)
+ 
+ 	pr_debug("%s: %d ", __func__, type);
+ 
+-	st_kim_ref(&st_gdata);
++	st_kim_ref(&st_gdata, 0);
+ 	if (type < ST_BT || type >= ST_MAX) {
+ 		pr_err(" protocol %d not supported", type);
+ 		return -EPROTONOSUPPORT;
+@@ -767,7 +766,7 @@ long st_write(struct sk_buff *skb)
+ #endif
+ 	long len;
+ 
+-	st_kim_ref(&st_gdata);
++	st_kim_ref(&st_gdata, 0);
+ 	if (unlikely(skb == NULL || st_gdata == NULL
+ 		|| st_gdata->tty == NULL)) {
+ 		pr_err("data/tty unavailable to perform write");
+@@ -818,7 +817,7 @@ static int st_tty_open(struct tty_struct
+ 	struct st_data_s *st_gdata;
+ 	pr_info("%s ", __func__);
+ 
+-	st_kim_ref(&st_gdata);
++	st_kim_ref(&st_gdata, 0);
+ 	st_gdata->tty = tty;
+ 	tty->disc_data = st_gdata;
+ 
+--- a/drivers/staging/ti-st/st_core.h
++++ b/drivers/staging/ti-st/st_core.h
+@@ -117,7 +117,7 @@ int st_core_init(struct st_data_s **);
+ void st_core_exit(struct st_data_s *);
+ 
+ /* ask for reference from KIM */
+-void st_kim_ref(struct st_data_s **);
++void st_kim_ref(struct st_data_s **, int);
+ 
+ #define GPS_STUB_TEST
+ #ifdef GPS_STUB_TEST
+--- a/drivers/staging/ti-st/st_kim.c
++++ b/drivers/staging/ti-st/st_kim.c
+@@ -72,11 +72,26 @@ const unsigned char *protocol_names[] =
+ 	PROTO_ENTRY(ST_GPS, "GPS"),
+ };
+ 
++#define MAX_ST_DEVICES	3	/* Imagine 1 on each UART for now */
++struct platform_device *st_kim_devices[MAX_ST_DEVICES];
+ 
+ /**********************************************************************/
+ /* internal functions */
+ 
+ /**
++ * st_get_plat_device -
++ *	function which returns the reference to the platform device
++ *	requested by id. As of now only 1 such device exists (id=0)
++ *	the context requesting for reference can get the id to be
++ *	requested by a. The protocol driver which is registering or
++ *	b. the tty device which is opened.
++ */
++static struct platform_device *st_get_plat_device(int id)
++{
++	return st_kim_devices[id];
++}
++
++/**
+  * validate_firmware_response -
+  *	function to return whether the firmware response was proper
+  *	in case of error don't complete so that waiting for proper
+@@ -353,7 +368,7 @@ void st_kim_chip_toggle(enum proto_type
+ 	struct kim_data_s	*kim_gdata;
+ 	pr_info(" %s ", __func__);
+ 
+-	kim_pdev = st_get_plat_device();
++	kim_pdev = st_get_plat_device(0);
+ 	kim_gdata = dev_get_drvdata(&kim_pdev->dev);
+ 
+ 	if (kim_gdata->gpios[type] == -1) {
+@@ -574,12 +589,12 @@ static int kim_toggle_radio(void *data,
+  *	This would enable multiple such platform devices to exist
+  *	on a given platform
+  */
+-void st_kim_ref(struct st_data_s **core_data)
++void st_kim_ref(struct st_data_s **core_data, int id)
+ {
+ 	struct platform_device	*pdev;
+ 	struct kim_data_s	*kim_gdata;
+ 	/* get kim_gdata reference from platform device */
+-	pdev = st_get_plat_device();
++	pdev = st_get_plat_device(id);
+ 	kim_gdata = dev_get_drvdata(&pdev->dev);
+ 	*core_data = kim_gdata->core_data;
+ }
+@@ -623,6 +638,7 @@ static int kim_probe(struct platform_dev
+ 	long *gpios = pdev->dev.platform_data;
+ 	struct kim_data_s	*kim_gdata;
+ 
++	st_kim_devices[pdev->id] = pdev;
+ 	kim_gdata = kzalloc(sizeof(struct kim_data_s), GFP_ATOMIC);
+ 	if (!kim_gdata) {
+ 		pr_err("no mem to allocate");
