@@ -1,0 +1,146 @@
+From balbi@ti.com  Tue Oct  5 13:28:57 2010
+From: Felipe Balbi <balbi@ti.com>
+To: Greg KH <greg@kroah.com>
+Cc: Linux USB Mailing List <linux-usb@vger.kernel.org>,
+        Ming Lei <tom.leiming@gmail.com>,
+        David Brownell <dbrownell@users.sourceforge.net>,
+        Anand Gadiyar <gadiyar@ti.com>, Mike Frysinger <vapier@gentoo.org>,
+        Sergei Shtylyov <sshtylyov@ru.mvista.com>, Felipe Balbi <balbi@ti.com>
+Subject: usb: musb: support ISO high bandwidth for gadget mode
+Date: Fri, 24 Sep 2010 13:44:04 +0300
+Message-Id: <1285325055-1247-4-git-send-email-balbi@ti.com>
+
+From: Ming Lei <tom.leiming@gmail.com>
+
+This patch has been tested OK on beagle B5 board and
+use usbtest #15 and #16 as testcase.
+
+Signed-off-by: Ming Lei <tom.leiming@gmail.com>
+Reviewed-by: Sergei Shtylyov <sshtylyov@mvista.com>
+Cc: David Brownell <dbrownell@users.sourceforge.net>
+Cc: Anand Gadiyar <gadiyar@ti.com>
+Cc: Mike Frysinger <vapier@gentoo.org>
+Cc: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+Signed-off-by: Felipe Balbi <balbi@ti.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+---
+ drivers/usb/musb/musb_gadget.c |   49 ++++++++++++++++++++++++++++++-----------
+ drivers/usb/musb/musb_gadget.h |    2 +
+ 2 files changed, 39 insertions(+), 12 deletions(-)
+
+--- a/drivers/usb/musb/musb_gadget.c
++++ b/drivers/usb/musb/musb_gadget.c
+@@ -337,13 +337,15 @@ static void txstate(struct musb *musb, s
+ 					csr |= (MUSB_TXCSR_DMAENAB |
+ 							MUSB_TXCSR_MODE);
+ 					/* against programming guide */
+-				} else
+-					csr |= (MUSB_TXCSR_AUTOSET
+-							| MUSB_TXCSR_DMAENAB
++				} else {
++					csr |= (MUSB_TXCSR_DMAENAB
+ 							| MUSB_TXCSR_DMAMODE
+ 							| MUSB_TXCSR_MODE);
+-
++					if (!musb_ep->hb_mult)
++						csr |= MUSB_TXCSR_AUTOSET;
++				}
+ 				csr &= ~MUSB_TXCSR_P_UNDERRUN;
++
+ 				musb_writew(epio, MUSB_TXCSR, csr);
+ 			}
+ 		}
+@@ -643,7 +645,8 @@ static void rxstate(struct musb *musb, s
+ 	 */
+ 
+ 				csr |= MUSB_RXCSR_DMAENAB;
+-				csr |= MUSB_RXCSR_AUTOCLEAR;
++				if (!musb_ep->hb_mult)
++					csr |= MUSB_RXCSR_AUTOCLEAR;
+ #ifdef USE_MODE1
+ 				/* csr |= MUSB_RXCSR_DMAMODE; */
+ 
+@@ -875,9 +878,25 @@ static int musb_gadget_enable(struct usb
+ 
+ 	/* REVISIT this rules out high bandwidth periodic transfers */
+ 	tmp = le16_to_cpu(desc->wMaxPacketSize);
+-	if (tmp & ~0x07ff)
+-		goto fail;
+-	musb_ep->packet_sz = tmp;
++	if (tmp & ~0x07ff) {
++		int ok;
++
++		if (usb_endpoint_dir_in(desc))
++			ok = musb->hb_iso_tx;
++		else
++			ok = musb->hb_iso_rx;
++
++		if (!ok) {
++			DBG(4, "%s: not support ISO high bandwidth\n", __func__);
++			goto fail;
++		}
++		musb_ep->hb_mult = (tmp >> 11) & 3;
++	} else {
++		musb_ep->hb_mult = 0;
++	}
++
++	musb_ep->packet_sz = tmp & 0x7ff;
++	tmp = musb_ep->packet_sz * (musb_ep->hb_mult + 1);
+ 
+ 	/* enable the interrupts for the endpoint, set the endpoint
+ 	 * packet size (or fail), set the mode, clear the fifo
+@@ -890,8 +909,11 @@ static int musb_gadget_enable(struct usb
+ 			musb_ep->is_in = 1;
+ 		if (!musb_ep->is_in)
+ 			goto fail;
+-		if (tmp > hw_ep->max_packet_sz_tx)
++
++		if (tmp > hw_ep->max_packet_sz_tx) {
++			DBG(4, "%s: packet size beyond hw fifo size\n", __func__);
+ 			goto fail;
++		}
+ 
+ 		int_txe |= (1 << epnum);
+ 		musb_writew(mbase, MUSB_INTRTXE, int_txe);
+@@ -906,7 +928,7 @@ static int musb_gadget_enable(struct usb
+ 		if (musb->hwvers < MUSB_HWVERS_2000)
+ 			musb_writew(regs, MUSB_TXMAXP, hw_ep->max_packet_sz_tx);
+ 		else
+-			musb_writew(regs, MUSB_TXMAXP, tmp);
++			musb_writew(regs, MUSB_TXMAXP, musb_ep->packet_sz | (musb_ep->hb_mult << 11));
+ 
+ 		csr = MUSB_TXCSR_MODE | MUSB_TXCSR_CLRDATATOG;
+ 		if (musb_readw(regs, MUSB_TXCSR)
+@@ -927,8 +949,11 @@ static int musb_gadget_enable(struct usb
+ 			musb_ep->is_in = 0;
+ 		if (musb_ep->is_in)
+ 			goto fail;
+-		if (tmp > hw_ep->max_packet_sz_rx)
++
++		if (tmp > hw_ep->max_packet_sz_rx) {
++			DBG(4, "%s: packet size beyond hw fifo size\n", __func__);
+ 			goto fail;
++		}
+ 
+ 		int_rxe |= (1 << epnum);
+ 		musb_writew(mbase, MUSB_INTRRXE, int_rxe);
+@@ -942,7 +967,7 @@ static int musb_gadget_enable(struct usb
+ 		if (musb->hwvers < MUSB_HWVERS_2000)
+ 			musb_writew(regs, MUSB_RXMAXP, hw_ep->max_packet_sz_rx);
+ 		else
+-			musb_writew(regs, MUSB_RXMAXP, tmp);
++			musb_writew(regs, MUSB_RXMAXP, musb_ep->packet_sz | (musb_ep->hb_mult << 11));
+ 
+ 		/* force shared fifo to OUT-only mode */
+ 		if (hw_ep->is_shared_fifo) {
+--- a/drivers/usb/musb/musb_gadget.h
++++ b/drivers/usb/musb/musb_gadget.h
+@@ -79,6 +79,8 @@ struct musb_ep {
+ 
+ 	/* true if lock must be dropped but req_list may not be advanced */
+ 	u8				busy;
++
++	u8				hb_mult;
+ };
+ 
+ static inline struct musb_ep *to_musb_ep(struct usb_ep *ep)
