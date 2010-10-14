@@ -1,0 +1,356 @@
+From linux-usb-owner@vger.kernel.org  Thu Oct 14 11:55:27 2010
+Date: Thu, 14 Oct 2010 07:23:06 -0700
+From: Andiry Xu <andiry.xu@amd.com>
+To: Greg KH <gregkh@suse.de>
+Cc: linux-usb@vger.kernel.org, "He, Alex" <Alex.He@amd.com>,
+	"Su, Henry" <Henry.Su@amd.com>,
+	"Nguyen, Dong" <Dong.Nguyen@amd.com>, Andiry Xu <andiry.xu@amd.com>
+Subject: USB: xHCI: PCI power management implementation
+Message-ID: <20101014142306.GA3060@xanatos>
+Content-Disposition: inline
+
+From: Andiry Xu <andiry.xu@amd.com>
+
+This patch implements the PCI suspend/resume.
+
+Please refer to xHCI spec for doing the suspend/resume operation.
+
+For S3, CSS/SRS in USBCMD is used to save/restore the internal state.
+However, an error maybe occurs while restoring the internal state.
+In this case, it means that HC internal state is wrong and HC will be
+re-initialized.
+
+Signed-off-by: Libin Yang <libin.yang@amd.com>
+Signed-off-by: Dong Nguyen <dong.nguyen@amd.com>
+Signed-off-by: Andiry Xu <andiry.xu@amd.com>
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/xhci-pci.c |   34 ++++++-
+ drivers/usb/host/xhci.c     |  210 ++++++++++++++++++++++++++++++++++++++++++++
+ drivers/usb/host/xhci.h     |   16 +++
+ 3 files changed, 258 insertions(+), 2 deletions(-)
+
+--- a/drivers/usb/host/xhci-pci.c
++++ b/drivers/usb/host/xhci-pci.c
+@@ -116,6 +116,30 @@ static int xhci_pci_setup(struct usb_hcd
+ 	return xhci_pci_reinit(xhci, pdev);
+ }
+ 
++#ifdef CONFIG_PM
++static int xhci_pci_suspend(struct usb_hcd *hcd, bool do_wakeup)
++{
++	struct xhci_hcd	*xhci = hcd_to_xhci(hcd);
++	int	retval = 0;
++
++	if (hcd->state != HC_STATE_SUSPENDED)
++		return -EINVAL;
++
++	retval = xhci_suspend(xhci);
++
++	return retval;
++}
++
++static int xhci_pci_resume(struct usb_hcd *hcd, bool hibernated)
++{
++	struct xhci_hcd		*xhci = hcd_to_xhci(hcd);
++	int			retval = 0;
++
++	retval = xhci_resume(xhci, hibernated);
++	return retval;
++}
++#endif /* CONFIG_PM */
++
+ static const struct hc_driver xhci_pci_hc_driver = {
+ 	.description =		hcd_name,
+ 	.product_desc =		"xHCI Host Controller",
+@@ -132,7 +156,10 @@ static const struct hc_driver xhci_pci_h
+ 	 */
+ 	.reset =		xhci_pci_setup,
+ 	.start =		xhci_run,
+-	/* suspend and resume implemented later */
++#ifdef CONFIG_PM
++	.pci_suspend =          xhci_pci_suspend,
++	.pci_resume =           xhci_pci_resume,
++#endif
+ 	.stop =			xhci_stop,
+ 	.shutdown =		xhci_shutdown,
+ 
+@@ -188,6 +215,11 @@ static struct pci_driver xhci_pci_driver
+ 	/* suspend and resume implemented later */
+ 
+ 	.shutdown = 	usb_hcd_pci_shutdown,
++#ifdef CONFIG_PM_SLEEP
++	.driver = {
++		.pm = &usb_hcd_pci_pm_ops
++	},
++#endif
+ };
+ 
+ int xhci_register_pci(void)
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -551,6 +551,216 @@ void xhci_shutdown(struct usb_hcd *hcd)
+ 		    xhci_readl(xhci, &xhci->op_regs->status));
+ }
+ 
++static void xhci_save_registers(struct xhci_hcd *xhci)
++{
++	xhci->s3.command = xhci_readl(xhci, &xhci->op_regs->command);
++	xhci->s3.dev_nt = xhci_readl(xhci, &xhci->op_regs->dev_notification);
++	xhci->s3.dcbaa_ptr = xhci_read_64(xhci, &xhci->op_regs->dcbaa_ptr);
++	xhci->s3.config_reg = xhci_readl(xhci, &xhci->op_regs->config_reg);
++	xhci->s3.irq_pending = xhci_readl(xhci, &xhci->ir_set->irq_pending);
++	xhci->s3.irq_control = xhci_readl(xhci, &xhci->ir_set->irq_control);
++	xhci->s3.erst_size = xhci_readl(xhci, &xhci->ir_set->erst_size);
++	xhci->s3.erst_base = xhci_read_64(xhci, &xhci->ir_set->erst_base);
++	xhci->s3.erst_dequeue = xhci_read_64(xhci, &xhci->ir_set->erst_dequeue);
++}
++
++static void xhci_restore_registers(struct xhci_hcd *xhci)
++{
++	xhci_writel(xhci, xhci->s3.command, &xhci->op_regs->command);
++	xhci_writel(xhci, xhci->s3.dev_nt, &xhci->op_regs->dev_notification);
++	xhci_write_64(xhci, xhci->s3.dcbaa_ptr, &xhci->op_regs->dcbaa_ptr);
++	xhci_writel(xhci, xhci->s3.config_reg, &xhci->op_regs->config_reg);
++	xhci_writel(xhci, xhci->s3.irq_pending, &xhci->ir_set->irq_pending);
++	xhci_writel(xhci, xhci->s3.irq_control, &xhci->ir_set->irq_control);
++	xhci_writel(xhci, xhci->s3.erst_size, &xhci->ir_set->erst_size);
++	xhci_write_64(xhci, xhci->s3.erst_base, &xhci->ir_set->erst_base);
++}
++
++/*
++ * Stop HC (not bus-specific)
++ *
++ * This is called when the machine transition into S3/S4 mode.
++ *
++ */
++int xhci_suspend(struct xhci_hcd *xhci)
++{
++	int			rc = 0;
++	struct usb_hcd		*hcd = xhci_to_hcd(xhci);
++	u32			command;
++
++	spin_lock_irq(&xhci->lock);
++	clear_bit(HCD_FLAG_HW_ACCESSIBLE, &hcd->flags);
++	/* step 1: stop endpoint */
++	/* skipped assuming that port suspend has done */
++
++	/* step 2: clear Run/Stop bit */
++	command = xhci_readl(xhci, &xhci->op_regs->command);
++	command &= ~CMD_RUN;
++	xhci_writel(xhci, command, &xhci->op_regs->command);
++	if (handshake(xhci, &xhci->op_regs->status,
++		      STS_HALT, STS_HALT, 100*100)) {
++		xhci_warn(xhci, "WARN: xHC CMD_RUN timeout\n");
++		spin_unlock_irq(&xhci->lock);
++		return -ETIMEDOUT;
++	}
++
++	/* step 3: save registers */
++	xhci_save_registers(xhci);
++
++	/* step 4: set CSS flag */
++	command = xhci_readl(xhci, &xhci->op_regs->command);
++	command |= CMD_CSS;
++	xhci_writel(xhci, command, &xhci->op_regs->command);
++	if (handshake(xhci, &xhci->op_regs->status, STS_SAVE, 0, 10*100)) {
++		xhci_warn(xhci, "WARN: xHC CMD_CSS timeout\n");
++		spin_unlock_irq(&xhci->lock);
++		return -ETIMEDOUT;
++	}
++	/* step 5: remove core well power */
++	xhci_cleanup_msix(xhci);
++	spin_unlock_irq(&xhci->lock);
++
++	return rc;
++}
++
++/*
++ * start xHC (not bus-specific)
++ *
++ * This is called when the machine transition from S3/S4 mode.
++ *
++ */
++int xhci_resume(struct xhci_hcd *xhci, bool hibernated)
++{
++	u32			command, temp = 0;
++	struct usb_hcd		*hcd = xhci_to_hcd(xhci);
++	struct pci_dev		*pdev = to_pci_dev(hcd->self.controller);
++	u64	val_64;
++	int	old_state, retval;
++
++	old_state = hcd->state;
++	if (time_before(jiffies, xhci->next_statechange))
++		msleep(100);
++
++	spin_lock_irq(&xhci->lock);
++
++	if (!hibernated) {
++		/* step 1: restore register */
++		xhci_restore_registers(xhci);
++		/* step 2: initialize command ring buffer */
++		val_64 = xhci_read_64(xhci, &xhci->op_regs->cmd_ring);
++		val_64 = (val_64 & (u64) CMD_RING_RSVD_BITS) |
++			 (xhci_trb_virt_to_dma(xhci->cmd_ring->deq_seg,
++					       xhci->cmd_ring->dequeue) &
++			 (u64) ~CMD_RING_RSVD_BITS) |
++			 xhci->cmd_ring->cycle_state;
++		xhci_dbg(xhci, "// Setting command ring address to 0x%llx\n",
++				(long unsigned long) val_64);
++		xhci_write_64(xhci, val_64, &xhci->op_regs->cmd_ring);
++		/* step 3: restore state and start state*/
++		/* step 3: set CRS flag */
++		command = xhci_readl(xhci, &xhci->op_regs->command);
++		command |= CMD_CRS;
++		xhci_writel(xhci, command, &xhci->op_regs->command);
++		if (handshake(xhci, &xhci->op_regs->status,
++			      STS_RESTORE, 0, 10*100)) {
++			xhci_dbg(xhci, "WARN: xHC CMD_CSS timeout\n");
++			spin_unlock_irq(&xhci->lock);
++			return -ETIMEDOUT;
++		}
++		temp = xhci_readl(xhci, &xhci->op_regs->status);
++	}
++
++	/* If restore operation fails, re-initialize the HC during resume */
++	if ((temp & STS_SRE) || hibernated) {
++		usb_root_hub_lost_power(hcd->self.root_hub);
++
++		xhci_dbg(xhci, "Stop HCD\n");
++		xhci_halt(xhci);
++		xhci_reset(xhci);
++		if (hibernated)
++			xhci_cleanup_msix(xhci);
++		spin_unlock_irq(&xhci->lock);
++
++#ifdef CONFIG_USB_XHCI_HCD_DEBUGGING
++		/* Tell the event ring poll function not to reschedule */
++		xhci->zombie = 1;
++		del_timer_sync(&xhci->event_ring_timer);
++#endif
++
++		xhci_dbg(xhci, "// Disabling event ring interrupts\n");
++		temp = xhci_readl(xhci, &xhci->op_regs->status);
++		xhci_writel(xhci, temp & ~STS_EINT, &xhci->op_regs->status);
++		temp = xhci_readl(xhci, &xhci->ir_set->irq_pending);
++		xhci_writel(xhci, ER_IRQ_DISABLE(temp),
++				&xhci->ir_set->irq_pending);
++		xhci_print_ir_set(xhci, xhci->ir_set, 0);
++
++		xhci_dbg(xhci, "cleaning up memory\n");
++		xhci_mem_cleanup(xhci);
++		xhci_dbg(xhci, "xhci_stop completed - status = %x\n",
++			    xhci_readl(xhci, &xhci->op_regs->status));
++
++		xhci_dbg(xhci, "Initialize the HCD\n");
++		retval = xhci_init(hcd);
++		if (retval)
++			return retval;
++
++		xhci_dbg(xhci, "Start the HCD\n");
++		retval = xhci_run(hcd);
++		if (!retval)
++			set_bit(HCD_FLAG_HW_ACCESSIBLE, &hcd->flags);
++		hcd->state = HC_STATE_SUSPENDED;
++		return retval;
++	}
++
++	/* Re-setup MSI-X */
++	if (hcd->irq)
++		free_irq(hcd->irq, hcd);
++	hcd->irq = -1;
++
++	retval = xhci_setup_msix(xhci);
++	if (retval)
++		/* fall back to msi*/
++		retval = xhci_setup_msi(xhci);
++
++	if (retval) {
++		/* fall back to legacy interrupt*/
++		retval = request_irq(pdev->irq, &usb_hcd_irq, IRQF_SHARED,
++					hcd->irq_descr, hcd);
++		if (retval) {
++			xhci_err(xhci, "request interrupt %d failed\n",
++					pdev->irq);
++			return retval;
++		}
++		hcd->irq = pdev->irq;
++	}
++
++	/* step 4: set Run/Stop bit */
++	command = xhci_readl(xhci, &xhci->op_regs->command);
++	command |= CMD_RUN;
++	xhci_writel(xhci, command, &xhci->op_regs->command);
++	handshake(xhci, &xhci->op_regs->status, STS_HALT,
++		  0, 250 * 1000);
++
++	/* step 5: walk topology and initialize portsc,
++	 * portpmsc and portli
++	 */
++	/* this is done in bus_resume */
++
++	/* step 6: restart each of the previously
++	 * Running endpoints by ringing their doorbells
++	 */
++
++	set_bit(HCD_FLAG_HW_ACCESSIBLE, &hcd->flags);
++	if (!hibernated)
++		hcd->state = old_state;
++	else
++		hcd->state = HC_STATE_SUSPENDED;
++
++	spin_unlock_irq(&xhci->lock);
++	return 0;
++}
++
+ /*-------------------------------------------------------------------------*/
+ 
+ /**
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -191,7 +191,7 @@ struct xhci_op_regs {
+ /* bits 4:6 are reserved (and should be preserved on writes). */
+ /* light reset (port status stays unchanged) - reset completed when this is 0 */
+ #define CMD_LRESET	(1 << 7)
+-/* FIXME: ignoring host controller save/restore state for now. */
++/* host controller save/restore state. */
+ #define CMD_CSS		(1 << 8)
+ #define CMD_CRS		(1 << 9)
+ /* Enable Wrap Event - '1' means xHC generates an event when MFINDEX wraps. */
+@@ -1130,6 +1130,17 @@ struct urb_priv {
+ #define XHCI_STOP_EP_CMD_TIMEOUT	5
+ /* XXX: Make these module parameters */
+ 
++struct s3_save {
++	u32	command;
++	u32	dev_nt;
++	u64	dcbaa_ptr;
++	u32	config_reg;
++	u32	irq_pending;
++	u32	irq_control;
++	u32	erst_size;
++	u64	erst_base;
++	u64	erst_dequeue;
++};
+ 
+ /* There is one ehci_hci structure per controller */
+ struct xhci_hcd {
+@@ -1198,6 +1209,7 @@ struct xhci_hcd {
+ 	unsigned long		next_statechange;
+ 
+ 	u32			command;
++	struct s3_save		s3;
+ /* Host controller is dying - not responding to commands. "I'm not dead yet!"
+  *
+  * xHC interrupts have been disabled and a watchdog timer will (or has already)
+@@ -1393,6 +1405,8 @@ int xhci_init(struct usb_hcd *hcd);
+ int xhci_run(struct usb_hcd *hcd);
+ void xhci_stop(struct usb_hcd *hcd);
+ void xhci_shutdown(struct usb_hcd *hcd);
++int xhci_suspend(struct xhci_hcd *xhci);
++int xhci_resume(struct xhci_hcd *xhci, bool hibernated);
+ int xhci_get_frame(struct usb_hcd *hcd);
+ irqreturn_t xhci_irq(struct usb_hcd *hcd);
+ irqreturn_t xhci_msi_irq(int irq, struct usb_hcd *hcd);

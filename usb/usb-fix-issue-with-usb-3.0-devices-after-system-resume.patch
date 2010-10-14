@@ -1,0 +1,97 @@
+From sarah.a.sharp@linux.intel.com  Thu Oct 14 11:49:31 2010
+Date: Thu, 14 Oct 2010 07:22:54 -0700
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+To: Greg KH <gregkh@suse.de>
+Cc: linux-usb@vger.kernel.org, "He, Alex" <Alex.He@amd.com>,
+	"Su, Henry" <Henry.Su@amd.com>, Andiry Xu <andiry.xu@amd.com>
+Subject: usb: Fix issue with USB 3.0 devices after system resume
+Message-ID: <20101014142254.GA2928@xanatos>
+Content-Disposition: inline
+
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+
+When the system suspends and a host controller's power is lost, the USB
+core attempts to revive any USB devices that had the persist_enabled flag
+set.  For non-SuperSpeed devices, it will disable the port, and then set
+the udev->reset_resume flag.  This will cause the USB core to reset the
+device, verify the device descriptors to make sure it's the same device,
+and re-install any non-default configurations or alternate interface
+settings.
+
+However, we can't disable SuperSpeed root hub ports because that turns off
+SuperSpeed terminations, which will inhibit any devices connecting at USB
+3.0 speeds.  (Plus external hubs don't allow SuperSpeed ports to be
+disabled.)
+
+Because of this logic in hub_activate():
+                /* We can forget about a "removed" device when there's a
+                 * physical disconnect or the connect status changes.
+                 */
+                if (!(portstatus & USB_PORT_STAT_CONNECTION) ||
+                                (portchange & USB_PORT_STAT_C_CONNECTION))
+                        clear_bit(port1, hub->removed_bits);
+
+                if (!udev || udev->state == USB_STATE_NOTATTACHED) {
+                        /* Tell khubd to disconnect the device or
+                         * check for a new connection
+                         */
+                        if (udev || (portstatus & USB_PORT_STAT_CONNECTION))
+                                set_bit(port1, hub->change_bits);
+
+                } else if (portstatus & USB_PORT_STAT_ENABLE) {
+                        /* The power session apparently survived the resume.
+                         * If there was an overcurrent or suspend change
+                         * (i.e., remote wakeup request), have khubd
+                         * take care of it.
+                         */
+                        if (portchange)
+                                set_bit(port1, hub->change_bits);
+
+                } else if (udev->persist_enabled) {
+                        udev->reset_resume = 1;
+                        set_bit(port1, hub->change_bits);
+
+                } else {
+                        /* The power session is gone; tell khubd */
+                        usb_set_device_state(udev, USB_STATE_NOTATTACHED);
+                        set_bit(port1, hub->change_bits);
+                }
+
+a SuperSpeed device after a resume with a loss of power will never get the
+reset_resume flag set.  Instead the core will assume the power session
+survived and that the device still has the same address, configuration,
+and alternate interface settings.  The xHCI host controller will have no
+knowledge of the device (since all xhci_virt_devices were destroyed when
+power loss was discovered, and xhci_discover_or_reset_device() has not
+been called), and all URBs to the device will fail.
+
+If the device driver responds by resetting the device, everything will
+continue smoothly.  However, if lsusb is used before the device driver
+resets the device (or there is no driver), then all lsusb descriptor
+fetches will fail.
+
+The quick fix is to pretend the port is disabled in hub_activate(), by
+clearing the local variable.  But I'm not sure what other parts of the hub
+driver need to be changed because they have assumptions about when ports
+will be disabled.
+
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Signed-off-by: Andiry Xu <andiry.xu@amd.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/hub.c |    3 +++
+ 1 file changed, 3 insertions(+)
+
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -758,6 +758,9 @@ static void hub_activate(struct usb_hub
+ 				clear_port_feature(hdev, port1,
+ 						   USB_PORT_FEAT_ENABLE);
+ 				portstatus &= ~USB_PORT_STAT_ENABLE;
++			} else {
++				/* Pretend that power was lost for USB3 devs */
++				portstatus &= ~USB_PORT_STAT_ENABLE;
+ 			}
+ 		}
+ 
