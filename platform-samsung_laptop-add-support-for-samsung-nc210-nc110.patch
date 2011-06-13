@@ -1,17 +1,12 @@
-From jasonbstubbs@gmail.com  Tue May 10 15:37:55 2011
+From jasonbstubbs@gmail.com  Mon Jun 13 16:55:59 2011
 From: Jason Stubbs <jasonbstubbs@gmail.com>
-To: Greg KH <gregkh@suse.de>
+To: Greg KH <greg@kroah.com>
 Subject: platform: samsung_laptop: add support for samsung nc210/nc110
-Date: Wed, 20 Apr 2011 15:07:54 +1000
-Cc: linux-kernel@vger.kernel.org
-Message-Id: <201104201507.54862.jasonbstubbs@gmail.com>
+Date: Fri, 13 May 2011 20:47:07 +1000
+Cc: Greg KH <gregkh@suse.de>
+Message-Id: <201105132047.07544.jasonbstubbs@gmail.com>
 
 From: Jason Stubbs <jasonbstubbs@gmail.com>
-
-Note, I don't expect this patch to go in and would actually just like some
-feedback on how to better handle the set_brightness problem. Note also that
-this patch won't apply on top of my brightness min/max fixes patch and I'll
-redo this one as necessary.
 
 This patch adds support for the NC210/NC110 to the samsung-laptop driver.
 
@@ -25,32 +20,80 @@ of set_brightness is as follows:
   along with the change in brightness.
 - Neither of the above two issues occur when changing from/to brightness level 0.
 
-The changes in set_brightness() work around the above while attempting to
-minimize flicker due to jumping to and from brightness level 0.
+Along with adding the DMI checks for the NC210/NC110, this patch adds
+detection and a non-intrusive workaround for the above issues.
 
 Signed-off-by: Jason Stubbs <jasonbstubbs@gmail.com>
 Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 
 ---
- drivers/platform/x86/samsung-laptop.c |   15 +++++++++++++++
- 1 file changed, 15 insertions(+)
+ drivers/platform/x86/samsung-laptop.c |   52 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 52 insertions(+)
 
 --- a/drivers/platform/x86/samsung-laptop.c
 +++ b/drivers/platform/x86/samsung-laptop.c
-@@ -380,6 +380,12 @@ static void set_brightness(u8 user_brigh
+@@ -226,6 +226,7 @@ static struct backlight_device *backligh
+ static struct mutex sabi_mutex;
+ static struct platform_device *sdev;
+ static struct rfkill *rfk;
++static int has_stepping_quirk;
+ 
+ static int force;
+ module_param(force, bool, 0);
+@@ -380,6 +381,17 @@ static void set_brightness(u8 user_brigh
  {
  	u8 user_level = user_brightness - sabi_config->min_brightness;
  
-+	if (user_level == read_brightness())
-+		return;
++	if (has_stepping_quirk && user_level != 0) {
++		/*
++		 * short circuit if the specified level is what's already set
++		 * to prevent the screen from flickering needlessly
++		 */
++		if (user_brightness == read_brightness())
++			return;
 +
-+	if (sabi_config->min_brightness == 0 && user_level != 0)
 +		sabi_set_command(sabi_config->commands.set_brightness, 0);
++	}
 +
  	sabi_set_command(sabi_config->commands.set_brightness, user_level);
  }
  
-@@ -675,6 +681,15 @@ static struct dmi_system_id __initdata s
+@@ -388,6 +400,34 @@ static int get_brightness(struct backlig
+ 	return (int)read_brightness();
+ }
+ 
++static void check_for_stepping_quirk(void)
++{
++	u8 initial_level = read_brightness();
++	u8 check_level;
++
++	/*
++	 * Some laptops (nc210/nc110 at the very least) exhibit the strange
++	 * behaviour of stepping toward rather than setting the brightness
++	 * except when changing to/from brightness level 0. This behaviour
++	 * is checked for here and worked around in set_brightness.
++	 */
++
++	if (initial_level <= 2)
++		check_level = initial_level + 2;
++	else
++		check_level = initial_level - 2;
++
++	has_stepping_quirk = 0;
++	set_brightness(check_level);
++
++	if (read_brightness() != check_level) {
++		has_stepping_quirk = 1;
++		pr_info("enabled workaround for brightness stepping quirk\n");
++	}
++
++	set_brightness(initial_level);
++}
++
+ static int update_status(struct backlight_device *bd)
+ {
+ 	set_brightness(bd->props.brightness);
+@@ -675,6 +715,15 @@ static struct dmi_system_id __initdata s
  		},
  		.callback = dmi_check_cb,
  	},
@@ -66,3 +109,13 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
  	{ },
  };
  MODULE_DEVICE_TABLE(dmi, samsung_dmi_table);
+@@ -783,6 +832,9 @@ static int __init samsung_init(void)
+ 		}
+ 	}
+ 
++	/* Check for stepping quirk */
++	check_for_stepping_quirk();
++
+ 	/* knock up a platform device to hang stuff off of */
+ 	sdev = platform_device_register_simple("samsung", -1, NULL, 0);
+ 	if (IS_ERR(sdev))
