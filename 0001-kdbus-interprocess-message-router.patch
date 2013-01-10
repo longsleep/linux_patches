@@ -3,21 +3,22 @@ From: Kay Sievers <kay@vrfy.org>
 Date: Sat, 22 Dec 2012 18:36:55 +0100
 Subject: [PATCH] kdbus: interprocess message router
 
+Nothing to see here, move along...
+
+
 ---
  drivers/Kconfig            |    2 
  drivers/Makefile           |    1 
  drivers/kdbus/Kconfig      |    5 
- drivers/kdbus/Makefile     |    2 
- drivers/kdbus/kdbus.c      |  939 +++++++++++++++++++++++++++++++++++++++++++++
- include/uapi/kdbus/kdbus.h |   46 ++
+ drivers/kdbus/Makefile     |    4 
+ drivers/kdbus/bus.c        |  117 +++++++++
+ drivers/kdbus/ep.c         |  189 +++++++++++++++
+ drivers/kdbus/kdbus.c      |  552 +++++++++++++++++++++++++++++++++++++++++++++
+ drivers/kdbus/kdbus.h      |  144 +++++++++++
+ include/uapi/kdbus/kdbus.h |   46 +++
  include/uapi/linux/major.h |    2 
- kdbus.c                    |   64 +++
- 8 files changed, 1061 insertions(+)
- create mode 100644 drivers/kdbus/Kconfig
- create mode 100644 drivers/kdbus/Makefile
- create mode 100644 drivers/kdbus/kdbus.c
- create mode 100644 include/uapi/kdbus/kdbus.h
- create mode 100644 kdbus.c
+ kdbus.c                    |   64 +++++
+ 11 files changed, 1126 insertions(+)
 
 --- a/drivers/Kconfig
 +++ b/drivers/Kconfig
@@ -45,16 +46,332 @@ Subject: [PATCH] kdbus: interprocess message router
 +	  between processes. It is used as the low-level transport of D-Bus.
 --- /dev/null
 +++ b/drivers/kdbus/Makefile
-@@ -0,0 +1,2 @@
-+obj-$(CONFIG_KDBUS)	+= kdbus.o
+@@ -0,0 +1,4 @@
++dbus-y	:= kdbus.o ep.o bus.o
++
++obj-$(CONFIG_KDBUS)	+= dbus.o
++
+--- /dev/null
++++ b/drivers/kdbus/bus.c
+@@ -0,0 +1,117 @@
++
++#define pr_fmt(fmt)	KBUILD_MODNAME ": " fmt
++
++#include <linux/module.h>
++#include <linux/device.h>
++#include <linux/idr.h>
++#include <linux/fs.h>
++#include <linux/slab.h>
++#include <linux/sched.h>
++#include <linux/init.h>
++#include <linux/cred.h>
++#include <linux/security.h>
++#include <asm/uaccess.h>
++#include <uapi/linux/major.h>
++#include <uapi/kdbus/kdbus.h>
++
++#include "kdbus.h"
++
++void kdbus_release(struct device *dev)
++{
++	kfree(dev);
++}
++
++
++struct kdbus_bus *kdbus_bus_ref(struct kdbus_bus *bus)
++{
++	if (!bus)
++		return NULL;
++	bus->ref++;
++	return bus;
++}
++
++struct kdbus_bus *kdbus_bus_unref(struct kdbus_bus *bus)
++{
++	if (!bus)
++		return NULL;
++	bus->ref--;
++	if (bus->ref > 0)
++		return bus;
++
++	kdbus_bus_disconnect(bus);
++	pr_info("clean up bus %s/%s\n",
++		bus->ns->devpath, bus->name);
++
++	kfree(bus->name);
++	kfree(bus);
++	return NULL;
++}
++
++void kdbus_bus_disconnect(struct kdbus_bus *bus)
++{
++	struct kdbus_ep *ep, *tmp;
++
++	if (bus->disconnected)
++		return;
++	bus->disconnected = true;
++
++	/* remove default endpoint */
++	kdbus_ep_disconnect(bus->ep);
++	kdbus_ep_unref(bus->ep);
++
++	/* remove any endpoints attached to this bus */
++	list_for_each_entry_safe(ep, tmp, &bus->ep_list, bus_entry) {
++		kdbus_ep_disconnect(ep);
++		kdbus_ep_unref(ep);
++//		kdbus_ep_remove(ep);
++	}
++
++	pr_info("closing bus %s/%s\n",
++		bus->ns->devpath, bus->name);
++}
++
++int kdbus_bus_new(struct kdbus_ns *ns, const char *name, umode_t mode,
++		  uid_t uid, gid_t gid, struct kdbus_bus **bus)
++{
++	struct kdbus_bus *b;
++	int err;
++
++	b = kzalloc(sizeof(struct kdbus_bus), GFP_KERNEL);
++	if (!b)
++		return -ENOMEM;
++
++	b->ref = 1;
++	b->ns = ns;
++	/* connection 0 == kernel/multi-cast */
++	b->conn_id_next = 1;
++	mutex_init(&b->lock);
++	idr_init(&b->conn_idr);
++	INIT_LIST_HEAD(&b->ep_list);
++
++	if (uid > 0)
++		b->name = kasprintf(GFP_KERNEL, "%u-%s", uid, name);
++	else
++		b->name = kstrdup(name, GFP_KERNEL);
++	if (!b->name) {
++		err = -ENOMEM;
++		goto err;
++	}
++
++	err = kdbus_ep_new(b, "bus", mode, uid, gid, &b->ep);
++	if (err < 0)
++		goto err;
++
++	mutex_lock(&ns->lock);
++	b->id = ns->bus_id_next++;
++	mutex_unlock(&ns->lock);
++
++	*bus = b;
++	pr_info("created bus %llu '%s/%s'\n",
++		(unsigned long long)b->id, ns->devpath, b->name);
++	return 0;
++err:
++	kdbus_bus_unref(b);
++	return err;
++}
++
++
+--- /dev/null
++++ b/drivers/kdbus/ep.c
+@@ -0,0 +1,189 @@
++
++#define pr_fmt(fmt)	KBUILD_MODNAME ": " fmt
++
++#include <linux/module.h>
++#include <linux/device.h>
++#include <linux/idr.h>
++#include <linux/fs.h>
++#include <linux/slab.h>
++#include <linux/sched.h>
++#include <linux/init.h>
++#include <linux/cred.h>
++#include <linux/security.h>
++#include <asm/uaccess.h>
++#include <uapi/linux/major.h>
++#include <uapi/kdbus/kdbus.h>
++
++#include "kdbus.h"
++
++/* endpoints are by default owned by the bus owner */
++static char *kdbus_devnode_ep(struct device *dev,
++			      umode_t *mode, uid_t *uid, gid_t *gid)
++{
++	struct kdbus_ep *ep = dev_get_drvdata(dev);
++
++	if (mode)
++		*mode = ep->mode;
++	if (uid)
++		*uid = ep->uid;
++	if (gid)
++		*gid = ep->gid;
++	return NULL;
++}
++
++static struct device_type kdbus_devtype_ep = {
++	.name		= "ep",
++	.release	= kdbus_release,
++	.devnode	= kdbus_devnode_ep,
++};
++
++struct kdbus_ep *kdbus_ep_ref(struct kdbus_ep *ep)
++{
++	if (!ep)
++		return NULL;
++	ep->ref++;
++	return ep;
++}
++
++void kdbus_ep_disconnect(struct kdbus_ep *ep)
++{
++	if (ep->disconnected)
++		return;
++	ep->disconnected = true;
++
++	if (ep->dev) {
++		device_unregister(ep->dev);
++		ep->dev = NULL;
++	}
++	if (ep->minor > 0) {
++		idr_remove(&ep->bus->ns->idr, ep->minor);
++		ep->minor = 0;
++	}
++	pr_info("closing endpoint %s/%s/%s\n",
++		ep->bus->ns->devpath, ep->bus->name, ep->name);
++}
++
++struct kdbus_ep *kdbus_ep_unref(struct kdbus_ep *ep)
++{
++	if (!ep)
++		return NULL;
++	ep->ref--;
++	if (ep->ref > 0)
++		return ep;
++
++	mutex_lock(&ep->bus->lock);
++	kdbus_ep_disconnect(ep);
++	pr_info("clean up endpoint %s/%s/%s\n",
++		ep->bus->ns->devpath, ep->bus->name, ep->name);
++	kdbus_bus_unref(ep->bus);
++	mutex_unlock(&ep->bus->lock);
++
++	kfree(ep->name);
++	kfree(ep);
++	return NULL;
++}
++
++/* Find the endpoint for a specific bus */
++struct kdbus_ep *kdbus_ep_find(struct kdbus_bus *bus, const char *name)
++{
++	struct kdbus_ep *ep = NULL;
++
++	mutex_lock(&bus->lock);
++	list_for_each_entry(ep, &bus->ep_list, bus_entry) {
++		if (!strcmp(ep->name, name))
++			goto exit;
++	}
++	/* Endpoint not found so return NULL */
++	ep = NULL;
++exit:
++	mutex_unlock(&bus->lock);
++
++	return ep;
++}
++
++int kdbus_ep_new(struct kdbus_bus *bus, const char *name, umode_t mode,
++		 uid_t uid, gid_t gid, struct kdbus_ep **ep)
++{
++	struct kdbus_ep *e;
++	int err;
++	int i;
++
++	e = kzalloc(sizeof(struct kdbus_ep), GFP_KERNEL);
++	if (!e)
++		return -ENOMEM;
++
++	mutex_lock(&bus->ns->lock);
++	e->ref = 1;
++	e->mode = mode;
++	e->uid = uid;
++	e->gid = gid;
++
++	e->name = kstrdup(name, GFP_KERNEL);
++	if (!e->name) {
++		err = -ENOMEM;
++		goto err;
++	}
++
++	/* register minor in our endpoint map */
++	if (!idr_pre_get(&bus->ns->idr, GFP_KERNEL)) {
++		err = -ENOMEM;
++		goto err_unlock;
++	}
++	err = idr_get_new_above(&bus->ns->idr, e, 1, &i);
++	if (err < 0)
++		goto err_unlock;
++	e->minor = i;
++
++	/* get id for this endpoint from bus */
++	mutex_lock(&bus->lock);
++	e->id = bus->ep_id_next++;
++	mutex_unlock(&bus->lock);
++
++	/* register bus endpoint device */
++	e->dev = kzalloc(sizeof(struct device), GFP_KERNEL);
++	if (!e->dev)
++		goto err;
++	dev_set_name(e->dev, "%s/%s/%s", bus->ns->devpath, bus->name, name);
++	e->dev->bus = &kdbus_subsys;
++	e->dev->type = &kdbus_devtype_ep;
++	e->dev->devt = MKDEV(bus->ns->major, e->minor);
++	dev_set_drvdata(e->dev, e);
++	err = device_register(e->dev);
++	if (err < 0) {
++		put_device(e->dev);
++		e->dev = NULL;
++	}
++
++	/* Link this endpoint to the bus it is on */
++	e->bus = kdbus_bus_ref(bus);
++	list_add_tail(&e->bus_entry, &bus->ep_list);
++
++	mutex_unlock(&bus->ns->lock);
++
++	if (ep)
++		*ep = e;
++	pr_info("created endpoint %llu for bus '%s/%s/%s'\n",
++		(unsigned long long)e->id, bus->ns->devpath, bus->name, name);
++	return 0;
++
++err_unlock:
++	mutex_unlock(&bus->ns->lock);
++err:
++	kdbus_ep_unref(e);
++	return err;
++}
++
++int kdbus_ep_remove(struct kdbus_ep *ep)
++{
++	struct kdbus_bus *bus = ep->bus;
++
++	mutex_lock(&bus->ns->lock);
++	device_unregister(ep->dev);
++	list_del(&ep->bus_entry);
++	kdbus_ep_unref(ep);
++	mutex_unlock(&bus->ns->lock);
++	kdbus_bus_unref(bus);
++	return 0;
++}
++
 +
 --- /dev/null
 +++ b/drivers/kdbus/kdbus.c
-@@ -0,0 +1,939 @@
+@@ -0,0 +1,552 @@
 +/*
 + * kdbus - interprocess message routing
 + *
-+ * Copyright (C) 2013
++ * Copyright (C) 2013 Kay Sievers
++ * Copyright (C) 2013 Greg Kroah-Hartman <gregkh@linuxfoundation.org>
++ * Copyright (C) 2013 Linux Foundation
 + *
 + * kdbus is free software; you can redistribute it and/or modify it under
 + * the terms of the GNU Lesser General Public License as published by the
@@ -77,6 +394,8 @@ Subject: [PATCH] kdbus: interprocess message router
 +#include <asm/uaccess.h>
 +#include <uapi/linux/major.h>
 +#include <uapi/kdbus/kdbus.h>
++
++#include "kdbus.h"
 +
 +/*
 + * TODO:
@@ -114,130 +433,8 @@ Subject: [PATCH] kdbus: interprocess message router
 + *             `-- bus
 + */
 +
-+/*
-+ * kdbus namespace
-+ * - provides a "control" node
-+ * - owns a major number
-+ * - owns all created buses
-+ * - the initial namespace is unnamed and stays around for forver
-+ * - new namespaces are created by opening the control node and
-+ *   issuing KDBUS_NS_CREATE
-+ * - closing the connection destroys the created namespace
-+ */
-+struct kdbus_ns {
-+	unsigned int ref;	/* reference count */
-+	bool disconnected;	/* invalidated data */
-+	struct kdbus_ns *parent;/* parent namespace */
-+	__u64 id;		/* global id of this namespace */
-+	const char *devpath;	/* /dev base directory path */
-+	int major;		/* device major number for all nodes */
-+	struct idr idr;		/* map of endpoint minors to buses */
-+	struct device *dev;	/* control device node, minor == 0 */
-+	struct mutex lock;	/* ns data lock */
-+	__u64 bus_id_next;	/* next bus id sequence number */
-+};
-+
-+/*
-+ * kdbus bus
-+ * - provides a "bus" endpoint
-+ * - owns additional endpoints
-+ * - own all bus connections
-+ * - new buses are created by opening the control node and
-+ *   issuing KDBUS_BUS_CREATE
-+ * - closing the connection destroys the created bus
-+ */
-+struct kdbus_bus {
-+	unsigned int ref;	/* reference count */
-+	bool disconnected;	/* invalidated data */
-+	struct kdbus_ns *ns;	/* namespace of this bus */
-+	const char *name;	/* bus name */
-+	__u64 id;		/* id of this bus in the namespace */
-+	struct mutex lock;	/* bus data lock */
-+	__u64 ep_id_next;	/* next endpoint id sequence number */
-+	__u64 conn_id_next;	/* next connection id sequence number */
-+	__u64 msg_id_next;	/* next message id sequence number */
-+	struct idr conn_idr;	/* map of connection ids */
-+	struct kdbus_ep *ep;	/* "bus" default endpoint */
-+	struct list_head ep_list;	/* endpoints assigned to this bus */
-+};
-+
-+/*
-+ * kdbus endpoint
-+ * - offers access to a bus, the default device node name is "bus"
-+ * - additional endpoints can carry a specific policy/filters
-+ */
-+struct kdbus_ep {
-+	unsigned int ref;	/* reference count */
-+	bool disconnected;	/* invalidated data */
-+	struct kdbus_bus *bus;	/* bus behind this endpoint */
-+	const char *name;	/* name, prefixed with uid */
-+	__u64 id;		/* id of this endpoint on the bus */
-+	unsigned int minor;	/* minor of this endpoint in the namespace major */
-+	struct device *dev;	/* device node of this endpoint */
-+	umode_t mode;		/* file mode of this endpoint device node */
-+	uid_t uid;		/* uid owning this endpoint */
-+	gid_t gid;		/* gid owning this endpoint */
-+	struct list_head bus_entry;
-+};
-+
-+/*
-+ * kdbus connection
-+ * - connection to a control node or an endpoint
-+ */
-+enum kdbus_conn_type {
-+	KDBUS_CONN_UNDEFINED,
-+	KDBUS_CONN_CONTROL,
-+	KDBUS_CONN_NS_OWNER,
-+	KDBUS_CONN_BUS_OWNER,
-+	KDBUS_CONN_EP,
-+};
-+
-+struct kdbus_conn {
-+	enum kdbus_conn_type type;
-+	struct kdbus_ns *ns;
-+	union {
-+		struct kdbus_ns *ns_owner;
-+		struct kdbus_bus *bus_owner;
-+		struct kdbus_ep *ep;
-+	};
-+	__u64 id;		/* id of the connection on the bus */
-+};
-+
-+/* kdbus message */
-+enum kdbus_msg_data_type {
-+	KDBUS_MSG_DATA_UNDEFINED,
-+	KDBUS_MSG_DATA_MEM,
-+};
-+
-+struct kdbus_msg_data {
-+	u64 data;
-+	u64 size;
-+	u32 type;
-+	u32 flags;
-+};
-+
-+struct kdbus_msg {
-+	u64 src_id;
-+	u64 dst_id;
-+	u64 flags;
-+	uid_t src_uid;
-+	gid_t src_gid;
-+	pid_t src_pid;
-+	pid_t src_tid;
-+	u64 ts_nsec;
-+	u64 id;
-+	u64 reserved[8];
-+	u32 data_count;
-+	struct kdbus_msg_data *data;
-+};
-+
-+static void kdbus_release(struct device *dev)
-+{
-+	kfree(dev);
-+}
-+
 +/* kdbus sysfs subsystem */
-+static struct bus_type kdbus_subsys = {
++struct bus_type kdbus_subsys = {
 +	.name = "kdbus",
 +};
 +
@@ -256,27 +453,6 @@ Subject: [PATCH] kdbus: interprocess message router
 +	.devnode	= kdbus_devnode_control,
 +};
 +
-+/* endpoints are by default owned by the bus owner */
-+static char *kdbus_devnode_ep(struct device *dev,
-+			      umode_t *mode, uid_t *uid, gid_t *gid)
-+{
-+	struct kdbus_ep *ep = dev_get_drvdata(dev);
-+
-+	if (mode)
-+		*mode = ep->mode;
-+	if (uid)
-+		*uid = ep->uid;
-+	if (gid)
-+		*gid = ep->gid;
-+	return NULL;
-+}
-+
-+static struct device_type kdbus_devtype_ep = {
-+	.name		= "ep",
-+	.release	= kdbus_release,
-+	.devnode	= kdbus_devnode_ep,
-+};
-+
 +/* kdbus initial namespace */
 +static struct kdbus_ns *kdbus_ns_init;
 +
@@ -290,15 +466,9 @@ Subject: [PATCH] kdbus: interprocess message router
 +static __u64 kdbus_ns_id_next;
 +
 +extern const struct file_operations kdbus_device_ops;
-+static void kdbus_ep_disconnect(struct kdbus_ep *ep);
-+static struct kdbus_ep *kdbus_ep_unref(struct kdbus_ep *ep);
-+static int kdbus_ep_new(struct kdbus_bus *bus, const char *name,
-+			umode_t mode, uid_t uid, gid_t gid,
-+			struct kdbus_ep **ep);
 +static int kdbus_msg_new(struct kdbus_conn *conn, struct kdbus_msg __user *umsg,
 +			 struct kdbus_msg **msg);
 +static int kdbus_msg_send(struct kdbus_conn *conn, struct kdbus_msg *msg);
-+static int endpoint_remove(struct kdbus_ep *ep);
 +
 +
 +/* kdbus namespace */
@@ -434,248 +604,6 @@ Subject: [PATCH] kdbus: interprocess message router
 +err:
 +	kdbus_ns_unref(n);
 +	return err;
-+}
-+
-+/* kdbus bus */
-+static struct kdbus_bus *kdbus_bus_ref(struct kdbus_bus *bus)
-+{
-+	if (!bus)
-+		return NULL;
-+	bus->ref++;
-+	return bus;
-+}
-+
-+static void kdbus_bus_disconnect(struct kdbus_bus *bus)
-+{
-+	struct kdbus_ep *ep, *tmp;
-+
-+	if (bus->disconnected)
-+		return;
-+	bus->disconnected = true;
-+
-+	/* remove default endpoint */
-+	kdbus_ep_disconnect(bus->ep);
-+	kdbus_ep_unref(bus->ep);
-+
-+	/* remove any endpoints attached to this bus */
-+	list_for_each_entry_safe(ep, tmp, &bus->ep_list, bus_entry)
-+		endpoint_remove(ep);
-+
-+	pr_info("closing bus %s/%s\n",
-+		bus->ns->devpath, bus->name);
-+}
-+
-+static struct kdbus_bus *kdbus_bus_unref(struct kdbus_bus *bus)
-+{
-+	if (!bus)
-+		return NULL;
-+	bus->ref--;
-+	if (bus->ref > 0)
-+		return bus;
-+
-+	kdbus_bus_disconnect(bus);
-+	pr_info("clean up bus %s/%s\n",
-+		bus->ns->devpath, bus->name);
-+
-+	kfree(bus->name);
-+	kfree(bus);
-+	return NULL;
-+}
-+
-+static int kdbus_bus_new(struct kdbus_ns *ns, const char *name,
-+			 umode_t mode, uid_t uid, gid_t gid,
-+			 struct kdbus_bus **bus)
-+{
-+	struct kdbus_bus *b;
-+	int err;
-+
-+	b = kzalloc(sizeof(struct kdbus_bus), GFP_KERNEL);
-+	if (!b)
-+		return -ENOMEM;
-+
-+	b->ref = 1;
-+	b->ns = ns;
-+	/* connection 0 == kernel/multi-cast */
-+	b->conn_id_next = 1;
-+	mutex_init(&b->lock);
-+	idr_init(&b->conn_idr);
-+	INIT_LIST_HEAD(&b->ep_list);
-+
-+	if (uid > 0)
-+		b->name = kasprintf(GFP_KERNEL, "%u-%s", uid, name);
-+	else
-+		b->name = kstrdup(name, GFP_KERNEL);
-+	if (!b->name) {
-+		err = -ENOMEM;
-+		goto err;
-+	}
-+
-+	err = kdbus_ep_new(b, "bus", mode, uid, gid, &b->ep);
-+	if (err < 0)
-+		goto err;
-+
-+	mutex_lock(&ns->lock);
-+	b->id = ns->bus_id_next++;
-+	mutex_unlock(&ns->lock);
-+
-+	*bus = b;
-+	pr_info("created bus %llu '%s/%s'\n",
-+		(unsigned long long)b->id, ns->devpath, b->name);
-+	return 0;
-+err:
-+	kdbus_bus_unref(b);
-+	return err;
-+}
-+
-+/* kdbus endpoint */
-+static struct kdbus_ep *kdbus_ep_ref(struct kdbus_ep *ep)
-+{
-+	if (!ep)
-+		return NULL;
-+	ep->ref++;
-+	return ep;
-+}
-+
-+static void kdbus_ep_disconnect(struct kdbus_ep *ep)
-+{
-+	if (ep->disconnected)
-+		return;
-+	ep->disconnected = true;
-+
-+	if (ep->dev) {
-+		device_unregister(ep->dev);
-+		ep->dev = NULL;
-+	}
-+	if (ep->minor > 0) {
-+		idr_remove(&ep->bus->ns->idr, ep->minor);
-+		ep->minor = 0;
-+	}
-+	pr_info("closing endpoint %s/%s/%s\n",
-+		ep->bus->ns->devpath, ep->bus->name, ep->name);
-+}
-+
-+static struct kdbus_ep *kdbus_ep_unref(struct kdbus_ep *ep)
-+{
-+	if (!ep)
-+		return NULL;
-+	ep->ref--;
-+	if (ep->ref > 0)
-+		return ep;
-+
-+	mutex_lock(&ep->bus->lock);
-+	kdbus_ep_disconnect(ep);
-+	pr_info("clean up endpoint %s/%s/%s\n",
-+		ep->bus->ns->devpath, ep->bus->name, ep->name);
-+	kdbus_bus_unref(ep->bus);
-+	mutex_unlock(&ep->bus->lock);
-+
-+	kfree(ep->name);
-+	kfree(ep);
-+	return NULL;
-+}
-+
-+/* Find the endpoint for a specific bus */
-+static struct kdbus_ep *endpoint_find(struct kdbus_bus *bus, const char *name)
-+{
-+	struct kdbus_ep *ep = NULL;
-+
-+	mutex_lock(&bus->lock);
-+	list_for_each_entry(ep, &bus->ep_list, bus_entry) {
-+		if (!strcmp(ep->name, name))
-+			goto exit;
-+	}
-+	/* Endpoint not found so return NULL */
-+	ep = NULL;
-+exit:
-+	mutex_unlock(&bus->lock);
-+
-+	return ep;
-+}
-+
-+static int kdbus_ep_new(struct kdbus_bus *bus, const char *name,
-+			umode_t mode, uid_t uid, gid_t gid,
-+			struct kdbus_ep **ep)
-+{
-+	struct kdbus_ep *e;
-+	int err;
-+	int i;
-+
-+	e = kzalloc(sizeof(struct kdbus_ep), GFP_KERNEL);
-+	if (!e)
-+		return -ENOMEM;
-+
-+	mutex_lock(&bus->ns->lock);
-+	e->ref = 1;
-+	e->mode = mode;
-+	e->uid = uid;
-+	e->gid = gid;
-+
-+	e->name = kstrdup(name, GFP_KERNEL);
-+	if (!e->name) {
-+		err = -ENOMEM;
-+		goto err;
-+	}
-+
-+	/* register minor in our endpoint map */
-+	if (!idr_pre_get(&bus->ns->idr, GFP_KERNEL)) {
-+		err = -ENOMEM;
-+		goto err_unlock;
-+	}
-+	err = idr_get_new_above(&bus->ns->idr, e, 1, &i);
-+	if (err < 0)
-+		goto err_unlock;
-+	e->minor = i;
-+
-+	/* get id for this endpoint from bus */
-+	mutex_lock(&bus->lock);
-+	e->id = bus->ep_id_next++;
-+	mutex_unlock(&bus->lock);
-+
-+	/* register bus endpoint device */
-+	e->dev = kzalloc(sizeof(struct device), GFP_KERNEL);
-+	if (!e->dev)
-+		goto err;
-+	dev_set_name(e->dev, "%s/%s/%s", bus->ns->devpath, bus->name, name);
-+	e->dev->bus = &kdbus_subsys;
-+	e->dev->type = &kdbus_devtype_ep;
-+	e->dev->devt = MKDEV(bus->ns->major, e->minor);
-+	dev_set_drvdata(e->dev, e);
-+	err = device_register(e->dev);
-+	if (err < 0) {
-+		put_device(e->dev);
-+		e->dev = NULL;
-+	}
-+
-+	/* Link this endpoint to the bus it is on */
-+	e->bus = kdbus_bus_ref(bus);
-+	list_add_tail(&e->bus_entry, &bus->ep_list);
-+
-+	mutex_unlock(&bus->ns->lock);
-+
-+	if (ep)
-+		*ep = e;
-+	pr_info("created endpoint %llu for bus '%s/%s/%s'\n",
-+		(unsigned long long)e->id, bus->ns->devpath, bus->name, name);
-+	return 0;
-+
-+err_unlock:
-+	mutex_unlock(&bus->ns->lock);
-+err:
-+	kdbus_ep_unref(e);
-+	return err;
-+}
-+
-+static int endpoint_remove(struct kdbus_ep *ep)
-+{
-+	struct kdbus_bus *bus = ep->bus;
-+
-+	mutex_lock(&bus->ns->lock);
-+	device_unregister(ep->dev);
-+	list_del(&ep->bus_entry);
-+	kdbus_ep_unref(ep);
-+	mutex_unlock(&bus->ns->lock);
-+	kdbus_bus_unref(bus);
-+	return 0;
 +}
 +
 +/* kdbus file operations */
@@ -842,11 +770,11 @@ Subject: [PATCH] kdbus: interprocess message router
 +		/* remove an endpoint from this bus */
 +		if (copy_from_user(&name, argp, sizeof(struct kdbus_cmd_name)))
 +			return -EFAULT;
-+		ep = endpoint_find(conn->bus_owner, name.name);
++		ep = kdbus_ep_find(conn->bus_owner, name.name);
 +		if (!ep)
 +			return -EINVAL;
 +
-+		return endpoint_remove(ep);
++		return kdbus_ep_remove(ep);
 +
 +	case KDBUS_CMD_EP_POLICY_SET:
 +		/* upload a policy for this bus */
@@ -990,6 +918,153 @@ Subject: [PATCH] kdbus: interprocess message router
 +MODULE_DESCRIPTION("kdbus interprocess message router");
 +MODULE_ALIAS_CHARDEV(KDBUS_CHAR_MAJOR, 0);
 +MODULE_ALIAS("devname:kdbus/control");
+--- /dev/null
++++ b/drivers/kdbus/kdbus.h
+@@ -0,0 +1,144 @@
++
++
++#ifndef __INTERNAL_KDBUS_H
++#define __INTERNAL_KDBUS_H
++
++/*
++ * kdbus namespace
++ * - provides a "control" node
++ * - owns a major number
++ * - owns all created buses
++ * - the initial namespace is unnamed and stays around for forver
++ * - new namespaces are created by opening the control node and
++ *   issuing KDBUS_NS_CREATE
++ * - closing the connection destroys the created namespace
++ */
++struct kdbus_ns {
++	unsigned int ref;	/* reference count */
++	bool disconnected;	/* invalidated data */
++	struct kdbus_ns *parent;/* parent namespace */
++	__u64 id;		/* global id of this namespace */
++	const char *devpath;	/* /dev base directory path */
++	int major;		/* device major number for all nodes */
++	struct idr idr;		/* map of endpoint minors to buses */
++	struct device *dev;	/* control device node, minor == 0 */
++	struct mutex lock;	/* ns data lock */
++	__u64 bus_id_next;	/* next bus id sequence number */
++};
++
++/*
++ * kdbus bus
++ * - provides a "bus" endpoint
++ * - owns additional endpoints
++ * - own all bus connections
++ * - new buses are created by opening the control node and
++ *   issuing KDBUS_BUS_CREATE
++ * - closing the connection destroys the created bus
++ */
++struct kdbus_bus {
++	unsigned int ref;	/* reference count */
++	bool disconnected;	/* invalidated data */
++	struct kdbus_ns *ns;	/* namespace of this bus */
++	const char *name;	/* bus name */
++	__u64 id;		/* id of this bus in the namespace */
++	struct mutex lock;	/* bus data lock */
++	__u64 ep_id_next;	/* next endpoint id sequence number */
++	__u64 conn_id_next;	/* next connection id sequence number */
++	__u64 msg_id_next;	/* next message id sequence number */
++	struct idr conn_idr;	/* map of connection ids */
++	struct kdbus_ep *ep;	/* "bus" default endpoint */
++	struct list_head ep_list;	/* endpoints assigned to this bus */
++};
++
++/*
++ * kdbus endpoint
++ * - offers access to a bus, the default device node name is "bus"
++ * - additional endpoints can carry a specific policy/filters
++ */
++struct kdbus_ep {
++	unsigned int ref;	/* reference count */
++	bool disconnected;	/* invalidated data */
++	struct kdbus_bus *bus;	/* bus behind this endpoint */
++	const char *name;	/* name, prefixed with uid */
++	__u64 id;		/* id of this endpoint on the bus */
++	unsigned int minor;	/* minor of this endpoint in the namespace major */
++	struct device *dev;	/* device node of this endpoint */
++	umode_t mode;		/* file mode of this endpoint device node */
++	uid_t uid;		/* uid owning this endpoint */
++	gid_t gid;		/* gid owning this endpoint */
++	struct list_head bus_entry;
++};
++
++/*
++ * kdbus connection
++ * - connection to a control node or an endpoint
++ */
++enum kdbus_conn_type {
++	KDBUS_CONN_UNDEFINED,
++	KDBUS_CONN_CONTROL,
++	KDBUS_CONN_NS_OWNER,
++	KDBUS_CONN_BUS_OWNER,
++	KDBUS_CONN_EP,
++};
++
++struct kdbus_conn {
++	enum kdbus_conn_type type;
++	struct kdbus_ns *ns;
++	union {
++		struct kdbus_ns *ns_owner;
++		struct kdbus_bus *bus_owner;
++		struct kdbus_ep *ep;
++	};
++	__u64 id;		/* id of the connection on the bus */
++};
++
++/* kdbus message */
++enum kdbus_msg_data_type {
++	KDBUS_MSG_DATA_UNDEFINED,
++	KDBUS_MSG_DATA_MEM,
++};
++
++struct kdbus_msg_data {
++	u64 data;
++	u64 size;
++	u32 type;
++	u32 flags;
++};
++
++struct kdbus_msg {
++	u64 src_id;
++	u64 dst_id;
++	u64 flags;
++	uid_t src_uid;
++	gid_t src_gid;
++	pid_t src_pid;
++	pid_t src_tid;
++	u64 ts_nsec;
++	u64 id;
++	u64 reserved[8];
++	u32 data_count;
++	struct kdbus_msg_data *data;
++};
++
++/* bus stuff */
++extern struct bus_type kdbus_subsys;
++void kdbus_release(struct device *dev);
++
++struct kdbus_bus *kdbus_bus_unref(struct kdbus_bus *bus);
++struct kdbus_bus *kdbus_bus_ref(struct kdbus_bus *bus);
++void kdbus_bus_disconnect(struct kdbus_bus *bus);
++int kdbus_bus_new(struct kdbus_ns *ns, const char *name, umode_t mode,
++		  uid_t uid, gid_t gid, struct kdbus_bus **bus);
++
++
++/* endpoint stuff */
++struct kdbus_ep *kdbus_ep_ref(struct kdbus_ep *ep);
++struct kdbus_ep *kdbus_ep_unref(struct kdbus_ep *ep);
++
++struct kdbus_ep *kdbus_ep_find(struct kdbus_bus *bus, const char *name);
++int kdbus_ep_new(struct kdbus_bus *bus, const char *name, umode_t mode,
++		 uid_t uid, gid_t gid, struct kdbus_ep **ep);
++int kdbus_ep_remove(struct kdbus_ep *ep);
++void kdbus_ep_disconnect(struct kdbus_ep *ep);
++
++#endif
 --- /dev/null
 +++ b/include/uapi/kdbus/kdbus.h
 @@ -0,0 +1,46 @@
