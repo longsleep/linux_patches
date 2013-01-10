@@ -1,7 +1,4 @@
-From 8c41f3b1fb98a30664c73d61745b346d4013ced5 Mon Sep 17 00:00:00 2001
-From: Kay Sievers <kay@vrfy.org>
-Date: Sat, 22 Dec 2012 18:36:55 +0100
-Subject: [PATCH] kdbus: interprocess message router
+Subject: kdbus: interprocess message router
 
 Nothing to see here, move along...
 
@@ -11,14 +8,15 @@ Nothing to see here, move along...
  drivers/Makefile           |    1 
  drivers/kdbus/Kconfig      |    5 
  drivers/kdbus/Makefile     |    4 
- drivers/kdbus/bus.c        |  115 +++++++++
- drivers/kdbus/ep.c         |  189 +++++++++++++++
- drivers/kdbus/kdbus.c      |  566 +++++++++++++++++++++++++++++++++++++++++++++
- drivers/kdbus/kdbus.h      |  144 +++++++++++
- include/uapi/kdbus/kdbus.h |   46 +++
+ drivers/kdbus/bus.c        |  115 ++++++++++++
+ drivers/kdbus/ep.c         |  189 ++++++++++++++++++++
+ drivers/kdbus/kdbus.c      |  413 +++++++++++++++++++++++++++++++++++++++++++++
+ drivers/kdbus/kdbus.h      |  157 +++++++++++++++++
+ drivers/kdbus/ns.c         |  174 ++++++++++++++++++
+ include/uapi/kdbus/kdbus.h |   50 +++++
  include/uapi/linux/major.h |    2 
- kdbus.c                    |   64 +++++
- 11 files changed, 1138 insertions(+)
+ kdbus.c                    |   77 ++++++++
+ 12 files changed, 1189 insertions(+)
 
 --- a/drivers/Kconfig
 +++ b/drivers/Kconfig
@@ -47,7 +45,7 @@ Nothing to see here, move along...
 --- /dev/null
 +++ b/drivers/kdbus/Makefile
 @@ -0,0 +1,4 @@
-+dbus-y	:= kdbus.o ep.o bus.o
++dbus-y	:= kdbus.o ep.o bus.o ns.o
 +
 +obj-$(CONFIG_KDBUS)	+= dbus.o
 +
@@ -363,7 +361,7 @@ Nothing to see here, move along...
 +
 --- /dev/null
 +++ b/drivers/kdbus/kdbus.c
-@@ -0,0 +1,566 @@
+@@ -0,0 +1,413 @@
 +/*
 + * kdbus - interprocess message routing
 + *
@@ -436,175 +434,21 @@ Nothing to see here, move along...
 +	.name = "kdbus",
 +};
 +
-+/* control nodes are world accessible */
-+static char *kdbus_devnode_control(struct device *dev,
-+				   umode_t *mode, uid_t *uid, gid_t *gid)
-+{
-+	if (mode)
-+		*mode = 0666;
-+	return NULL;
-+}
-+
-+static struct device_type kdbus_devtype_control = {
-+	.name		= "control",
-+	.release	= kdbus_release,
-+	.devnode	= kdbus_devnode_control,
-+};
-+
 +/* List of all namespaces in the system */
 +
 +/* kdbus initial namespace */
 +static struct kdbus_ns *kdbus_ns_init;
 +
 +/* map of majors to namespaces */
-+static DEFINE_IDR(kdbus_ns_major_idr);
++DEFINE_IDR(kdbus_ns_major_idr);
 +
 +/* namespace list lock */
-+static DEFINE_MUTEX(kdbus_subsys_lock);
++DEFINE_MUTEX(kdbus_subsys_lock);
 +
-+/* next namespace id sequence number */
-+static __u64 kdbus_ns_id_next;
-+
-+extern const struct file_operations kdbus_device_ops;
 +static int kdbus_msg_new(struct kdbus_conn *conn, struct kdbus_msg __user *umsg,
 +			 struct kdbus_msg **msg);
 +static int kdbus_msg_send(struct kdbus_conn *conn, struct kdbus_msg *msg);
 +
-+
-+/* kdbus namespace */
-+static struct kdbus_ns *kdbus_ns_ref(struct kdbus_ns *ns)
-+{
-+	if (!ns)
-+		return NULL;
-+	ns->ref++;
-+	return ns;
-+}
-+
-+static void kdbus_ns_disconnect(struct kdbus_ns *ns)
-+{
-+	if (ns->disconnected)
-+		return;
-+	ns->disconnected = true;
-+
-+	if (ns->dev) {
-+		device_unregister(ns->dev);
-+		ns->dev = NULL;
-+	}
-+	if (ns->major > 0) {
-+		idr_remove(&kdbus_ns_major_idr, ns->major);
-+		unregister_chrdev(ns->major, "kdbus");
-+		ns->major = 0;
-+	}
-+	pr_info("closing namespace %s\n", ns->devpath);
-+}
-+
-+static struct kdbus_ns *kdbus_ns_unref(struct kdbus_ns *ns)
-+{
-+	if (!ns)
-+		return NULL;
-+	ns->ref--;
-+	if (ns->ref > 0)
-+		return ns;
-+
-+	kdbus_ns_disconnect(ns);
-+	pr_info("clean up namespace %s\n", ns->devpath);
-+	kfree(ns->devpath);
-+	kfree(ns);
-+	return NULL;
-+}
-+
-+static int kdbus_ns_new(struct kdbus_ns *parent, const char *name,
-+			struct kdbus_ns **ns)
-+{
-+	struct kdbus_ns *n;
-+	int i;
-+	int err;
-+
-+	if ((parent && !name) || (!parent && name))
-+		return -EINVAL;
-+
-+	n = kzalloc(sizeof(struct kdbus_ns), GFP_KERNEL);
-+	if (!n)
-+		return -ENOMEM;
-+
-+	n->ref = 1;
-+	idr_init(&n->idr);
-+	mutex_init(&n->lock);
-+
-+	/* compose name and path of base directory in /dev */
-+	if (!parent) {
-+		/* initial namespace */
-+		n->devpath = kstrdup("kdbus", GFP_KERNEL);
-+		if (!n->devpath) {
-+			err = -ENOMEM;
-+			goto err;
-+		}
-+
-+		/* register static major to support module auto-loading */
-+		err = register_chrdev(KDBUS_CHAR_MAJOR, "kdbus", &kdbus_device_ops);
-+		if (err)
-+			goto err;
-+		n->major = KDBUS_CHAR_MAJOR;
-+	} else {
-+		n->parent = parent;
-+		n->devpath = kasprintf(GFP_KERNEL, "kdbus/ns/%s/%s", parent->devpath, name);
-+		if (!n->devpath) {
-+			err = -ENOMEM;
-+			goto err;
-+		}
-+
-+		/* get dynamic major */
-+		n->major = register_chrdev(0, "kdbus", &kdbus_device_ops);
-+		if (n->major < 0) {
-+			err = n->major;
-+			goto err;
-+		}
-+	}
-+
-+	/* register major in our namespace map */
-+	mutex_lock(&kdbus_subsys_lock);
-+	if (!idr_pre_get(&kdbus_ns_major_idr, GFP_KERNEL)) {
-+		err = -ENOMEM;
-+		goto err_unlock;
-+	}
-+	err = idr_get_new_above(&kdbus_ns_major_idr, n, n->major, &i);
-+	if (err >= 0 && n->major != i) {
-+		idr_remove(&kdbus_ns_major_idr, i);
-+		err = -EEXIST;
-+		goto err_unlock;
-+	}
-+
-+	/* get id for this namespace */
-+	n->id = kdbus_ns_id_next++;
-+
-+	/* register control device for this namespace */
-+	n->dev = kzalloc(sizeof(struct device), GFP_KERNEL);
-+	if (!n->dev)
-+		goto err_unlock;
-+	dev_set_name(n->dev, "%s/%s", n->devpath, "control");
-+	n->dev->bus = &kdbus_subsys;
-+	n->dev->type = &kdbus_devtype_control;
-+	n->dev->devt = MKDEV(n->major, 0);
-+	dev_set_drvdata(n->dev, n);
-+	err = device_register(n->dev);
-+	if (err < 0) {
-+		put_device(n->dev);
-+		n->dev = NULL;
-+		goto err_unlock;
-+	}
-+	mutex_unlock(&kdbus_subsys_lock);
-+
-+	*ns = n;
-+	pr_info("created namespace %llu '%s/'\n",
-+		(unsigned long long)n->id, n->devpath);
-+	return 0;
-+
-+err_unlock:
-+	mutex_unlock(&kdbus_subsys_lock);
-+err:
-+	kdbus_ns_unref(n);
-+	return err;
-+}
 +
 +/* kdbus file operations */
 +static int kdbus_conn_open(struct inode *inode, struct file *file)
@@ -709,17 +553,17 @@ Nothing to see here, move along...
 +}
 +
 +/* kdbus control device commands */
-+static long kdbus_conn_ioctl_control(struct file *file,
-+				     unsigned int cmd, void __user *argp)
++static long kdbus_conn_ioctl_control(struct file *file, unsigned int cmd,
++				     void __user *argp)
 +{
 +	struct kdbus_conn *conn = file->private_data;
 +	struct kdbus_cmd_name name;
++	struct kdbus_bus *bus = NULL;
++	struct kdbus_ns *ns = NULL;
 +	int err;
 +
 +	switch (cmd) {
-+	case KDBUS_CMD_BUS_CREATE: {
-+		struct kdbus_bus *bus = NULL;
-+
++	case KDBUS_CMD_BUS_CREATE:
 +		if (copy_from_user(&name, argp, sizeof(struct kdbus_cmd_name)))
 +			return -EFAULT;
 +
@@ -732,12 +576,9 @@ Nothing to see here, move along...
 +		/* turn the control fd into a new bus owner device */
 +		conn->type = KDBUS_CONN_BUS_OWNER;
 +		conn->bus_owner = bus;
-+		return 0;
-+	}
++		break;
 +
-+	case KDBUS_CMD_NS_CREATE: {
-+		struct kdbus_ns *ns = NULL;
-+
++	case KDBUS_CMD_NS_CREATE:
 +		if (copy_from_user(&name, argp, sizeof(struct kdbus_cmd_name)))
 +			return -EFAULT;
 +
@@ -747,12 +588,12 @@ Nothing to see here, move along...
 +				name.name, err);
 +			return err;
 +		}
-+		return 0;
-+	}
++		break;
 +
 +	default:
 +		return -ENOTTY;
 +	}
++	return 0;
 +}
 +
 +/* kdbus bus endpoint commands */
@@ -833,14 +674,18 @@ Nothing to see here, move along...
 +	struct kdbus_conn *conn = file->private_data;
 +	void __user *argp = (void __user *)arg;
 +
++	pr_info("%s, cmd=%d\n", __func__, cmd);
 +	switch (conn->type) {
 +	case KDBUS_CONN_CONTROL:
++		pr_info("control ioctl\n");
 +		return kdbus_conn_ioctl_control(file, cmd, argp);
 +
 +	case KDBUS_CONN_EP:
++		pr_info("endpoint ioctl\n");
 +		return kdbus_conn_ioctl_ep(file, cmd, argp);
 +
 +	default:
++		pr_info("bad type\n");
 +		return -EINVAL;
 +	}
 +}
@@ -865,7 +710,7 @@ Nothing to see here, move along...
 +	struct kdbus_msg *m;
 +	int err;
 +
-+	m = kmalloc(GFP_KERNEL, sizeof(struct kdbus_msg));
++	m = kmalloc(sizeof(struct kdbus_msg), GFP_KERNEL);
 +	if (!m)
 +		return -ENOMEM;
 +	if (copy_from_user(m, umsg, sizeof(struct kdbus_msg))) {
@@ -898,7 +743,7 @@ Nothing to see here, move along...
 +	return 0;
 +}
 +
-+int __init kdbus_init(void)
++static int __init kdbus_init(void)
 +{
 +	int err;
 +
@@ -917,7 +762,7 @@ Nothing to see here, move along...
 +	return 0;
 +}
 +
-+void __exit kdbus_exit(void)
++static void __exit kdbus_exit(void)
 +{
 +	kdbus_ns_unref(kdbus_ns_init);
 +	bus_unregister(&kdbus_subsys);
@@ -932,7 +777,7 @@ Nothing to see here, move along...
 +MODULE_ALIAS("devname:kdbus/control");
 --- /dev/null
 +++ b/drivers/kdbus/kdbus.h
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,157 @@
 +
 +
 +#ifndef __INTERNAL_KDBUS_H
@@ -1055,6 +900,17 @@ Nothing to see here, move along...
 +	struct kdbus_msg_data *data;
 +};
 +
++/* namespace stuff */
++
++extern const struct file_operations kdbus_device_ops;
++extern struct mutex kdbus_subsys_lock;
++extern struct idr kdbus_ns_major_idr;
++struct kdbus_ns *kdbus_ns_ref(struct kdbus_ns *ns);
++void kdbus_ns_disconnect(struct kdbus_ns *ns);
++struct kdbus_ns *kdbus_ns_unref(struct kdbus_ns *ns);
++int kdbus_ns_new(struct kdbus_ns *parent, const char *name, struct kdbus_ns **ns);
++
++
 +/* bus stuff */
 +extern struct bus_type kdbus_subsys;
 +void kdbus_release(struct device *dev);
@@ -1076,10 +932,189 @@ Nothing to see here, move along...
 +int kdbus_ep_remove(struct kdbus_ep *ep);
 +void kdbus_ep_disconnect(struct kdbus_ep *ep);
 +
++
++
 +#endif
 --- /dev/null
++++ b/drivers/kdbus/ns.c
+@@ -0,0 +1,174 @@
++#define pr_fmt(fmt)	KBUILD_MODNAME ": " fmt
++
++#include <linux/module.h>
++#include <linux/device.h>
++#include <linux/idr.h>
++#include <linux/fs.h>
++#include <linux/slab.h>
++#include <linux/sched.h>
++#include <linux/init.h>
++#include <linux/cred.h>
++#include <linux/security.h>
++#include <asm/uaccess.h>
++#include <uapi/linux/major.h>
++#include <uapi/kdbus/kdbus.h>
++
++#include "kdbus.h"
++
++/* next namespace id sequence number */
++static __u64 kdbus_ns_id_next;
++
++/* control nodes are world accessible */
++static char *kdbus_devnode_control(struct device *dev,
++				   umode_t *mode, uid_t *uid, gid_t *gid)
++{
++	if (mode)
++		*mode = 0666;
++	return NULL;
++}
++
++static struct device_type kdbus_devtype_control = {
++	.name		= "control",
++	.release	= kdbus_release,
++	.devnode	= kdbus_devnode_control,
++};
++
++
++/* kdbus namespace */
++struct kdbus_ns *kdbus_ns_ref(struct kdbus_ns *ns)
++{
++	if (!ns)
++		return NULL;
++	ns->ref++;
++	return ns;
++}
++
++void kdbus_ns_disconnect(struct kdbus_ns *ns)
++{
++	if (ns->disconnected)
++		return;
++	ns->disconnected = true;
++
++	if (ns->dev) {
++		device_unregister(ns->dev);
++		ns->dev = NULL;
++	}
++	if (ns->major > 0) {
++		idr_remove(&kdbus_ns_major_idr, ns->major);
++		unregister_chrdev(ns->major, "kdbus");
++		ns->major = 0;
++	}
++	pr_info("closing namespace %s\n", ns->devpath);
++}
++
++struct kdbus_ns *kdbus_ns_unref(struct kdbus_ns *ns)
++{
++	if (!ns)
++		return NULL;
++	ns->ref--;
++	if (ns->ref > 0)
++		return ns;
++
++	kdbus_ns_disconnect(ns);
++	pr_info("clean up namespace %s\n", ns->devpath);
++	kfree(ns->devpath);
++	kfree(ns);
++	return NULL;
++}
++
++int kdbus_ns_new(struct kdbus_ns *parent, const char *name, struct kdbus_ns **ns)
++{
++	struct kdbus_ns *n;
++	int i;
++	int err;
++
++	pr_info("%s, %s\n", __func__, name);
++
++	if ((parent && !name) || (!parent && name))
++		return -EINVAL;
++
++	n = kzalloc(sizeof(struct kdbus_ns), GFP_KERNEL);
++	if (!n)
++		return -ENOMEM;
++
++	n->ref = 1;
++	idr_init(&n->idr);
++	mutex_init(&n->lock);
++
++	/* compose name and path of base directory in /dev */
++	if (!parent) {
++		/* initial namespace */
++		n->devpath = kstrdup("kdbus", GFP_KERNEL);
++		if (!n->devpath) {
++			err = -ENOMEM;
++			goto err;
++		}
++
++		/* register static major to support module auto-loading */
++		err = register_chrdev(KDBUS_CHAR_MAJOR, "kdbus", &kdbus_device_ops);
++		if (err)
++			goto err;
++		n->major = KDBUS_CHAR_MAJOR;
++	} else {
++		n->parent = parent;
++//		n->devpath = kasprintf(GFP_KERNEL, "kdbus/ns/%s/%s", parent->devpath, name);
++		n->devpath = kasprintf(GFP_KERNEL, "kdbus/ns/%s", name);
++		if (!n->devpath) {
++			err = -ENOMEM;
++			goto err;
++		}
++
++		/* get dynamic major */
++		n->major = register_chrdev(0, "kdbus", &kdbus_device_ops);
++		if (n->major < 0) {
++			err = n->major;
++			goto err;
++		}
++	}
++
++	/* register major in our namespace map */
++	mutex_lock(&kdbus_subsys_lock);
++	if (!idr_pre_get(&kdbus_ns_major_idr, GFP_KERNEL)) {
++		err = -ENOMEM;
++		goto err_unlock;
++	}
++	err = idr_get_new_above(&kdbus_ns_major_idr, n, n->major, &i);
++	if (err >= 0 && n->major != i) {
++		idr_remove(&kdbus_ns_major_idr, i);
++		err = -EEXIST;
++		goto err_unlock;
++	}
++
++	/* get id for this namespace */
++	n->id = kdbus_ns_id_next++;
++
++	/* register control device for this namespace */
++	n->dev = kzalloc(sizeof(struct device), GFP_KERNEL);
++	if (!n->dev)
++		goto err_unlock;
++	dev_set_name(n->dev, "%s/%s", n->devpath, "control");
++	n->dev->bus = &kdbus_subsys;
++	n->dev->type = &kdbus_devtype_control;
++	n->dev->devt = MKDEV(n->major, 0);
++	dev_set_drvdata(n->dev, n);
++	err = device_register(n->dev);
++	if (err < 0) {
++		put_device(n->dev);
++		n->dev = NULL;
++		goto err_unlock;
++	}
++	mutex_unlock(&kdbus_subsys_lock);
++
++	*ns = n;
++	pr_info("created namespace %llu '%s/'\n",
++		(unsigned long long)n->id, n->devpath);
++	return 0;
++
++err_unlock:
++	mutex_unlock(&kdbus_subsys_lock);
++err:
++	kdbus_ns_unref(n);
++	return err;
++}
++
++
+--- /dev/null
 +++ b/include/uapi/kdbus/kdbus.h
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,50 @@
 +/*
 + * kdbus - interprocess message routing
 + *
@@ -1104,6 +1139,10 @@ Nothing to see here, move along...
 +	char reserved[256];
 +};
 +
++struct kdbus_message {
++	char msg[256]; /* FIXME obviously... */
++};
++
 +enum kdbus_cmd {
 +	/* kdbus control commands */
 +	KDBUS_CMD_BUS_CREATE =    _IOW(KDBUS_IOC_MAGIC, 0x00, struct kdbus_cmd_name),
@@ -1121,8 +1160,8 @@ Nothing to see here, move along...
 +	KDBUS_CMD_MATCH_ADD =     _IOWR(KDBUS_IOC_MAGIC, 0x60, int),
 +	KDBUS_CMD_MATCH_REMOVE =  _IOWR(KDBUS_IOC_MAGIC, 0x61, int),
 +
-+	KDBUS_CMD_MSG_SEND =      _IOWR(KDBUS_IOC_MAGIC, 0x80, int),
-+	KDBUS_CMD_MSG_RECV =      _IOWR(KDBUS_IOC_MAGIC, 0x81, int),
++	KDBUS_CMD_MSG_SEND =      _IOWR(KDBUS_IOC_MAGIC, 0x80, struct kdbus_message),
++	KDBUS_CMD_MSG_RECV =      _IOWR(KDBUS_IOC_MAGIC, 0x81, struct kdbus_message),
 +};
 +
 +#endif
@@ -1139,7 +1178,7 @@ Nothing to see here, move along...
  
 --- /dev/null
 +++ b/kdbus.c
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,77 @@
 +#define _GNU_SOURCE
 +#include <stdio.h>
 +#include <string.h>
@@ -1162,7 +1201,9 @@ Nothing to see here, move along...
 +	char *busname;
 +	char *bus;
 +	char *ep;
++	char *ns;
 +	uid_t uid;
++	int err;
 +
 +	uid = getuid();
 +	if (argv[1])
@@ -1178,8 +1219,17 @@ Nothing to see here, move along...
 +	if (fdc < 0)
 +		return EXIT_FAILURE;
 +
++	asprintf(&ns, "mydebiancontainer");
++	strcpy(name.name, ns);
++	printf("-- creating namespace called %s\n", ns);
++	err = ioctl(fdc, KDBUS_CMD_NS_CREATE, &name);
++	if (err)
++		printf("--- error \"%s\"\n", err, strerror(errno));
++
 +	printf("-- creating bus '%s'\n", name.name);
-+	ioctl(fdc, KDBUS_CMD_BUS_CREATE, &name);
++	err = ioctl(fdc, KDBUS_CMD_BUS_CREATE, &name);
++	if (err)
++		printf("--- error \"%s\"\n", err, strerror(errno));
 +
 +	if (uid > 0)
 +		asprintf(&bus, "/dev/kdbus/%u-%s/bus", uid, busname);
@@ -1192,7 +1242,9 @@ Nothing to see here, move along...
 +	asprintf(&ep, "ep-42");
 +	strcpy(name.name, ep);
 +	printf("-- creating endpoint for bus %s called %s\n", bus, ep);
-+	ioctl(fdb, KDBUS_CMD_EP_CREATE, &name);
++	err = ioctl(fdb, KDBUS_CMD_EP_CREATE, &name);
++	if (err)
++		printf("--- error \"%s\"\n", err, strerror(errno));
 +
 +	printf("-- sleeping 10s\n");
 +	sleep(10);
