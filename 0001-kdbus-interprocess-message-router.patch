@@ -8,11 +8,11 @@ Subject: [PATCH] kdbus: interprocess message router
  drivers/Makefile           |    1 
  drivers/kdbus/Kconfig      |    5 
  drivers/kdbus/Makefile     |    2 
- drivers/kdbus/kdbus.c      |  916 +++++++++++++++++++++++++++++++++++++++++++++
+ drivers/kdbus/kdbus.c      |  939 +++++++++++++++++++++++++++++++++++++++++++++
  include/uapi/kdbus/kdbus.h |   46 ++
  include/uapi/linux/major.h |    2 
  kdbus.c                    |   64 +++
- 8 files changed, 1038 insertions(+)
+ 8 files changed, 1061 insertions(+)
  create mode 100644 drivers/kdbus/Kconfig
  create mode 100644 drivers/kdbus/Makefile
  create mode 100644 drivers/kdbus/kdbus.c
@@ -50,7 +50,7 @@ Subject: [PATCH] kdbus: interprocess message router
 +
 --- /dev/null
 +++ b/drivers/kdbus/kdbus.c
-@@ -0,0 +1,916 @@
+@@ -0,0 +1,939 @@
 +/*
 + * kdbus - interprocess message routing
 + *
@@ -177,6 +177,7 @@ Subject: [PATCH] kdbus: interprocess message router
 +	umode_t mode;		/* file mode of this endpoint device node */
 +	uid_t uid;		/* uid owning this endpoint */
 +	gid_t gid;		/* gid owning this endpoint */
++	struct list_head bus_entry;
 +};
 +
 +/*
@@ -297,9 +298,8 @@ Subject: [PATCH] kdbus: interprocess message router
 +static int kdbus_msg_new(struct kdbus_conn *conn, struct kdbus_msg __user *umsg,
 +			 struct kdbus_msg **msg);
 +static int kdbus_msg_send(struct kdbus_conn *conn, struct kdbus_msg *msg);
-+
-+static struct kdbus_ep *endpoint_find(struct kdbus_bus *bus, const char *name);
 +static int endpoint_remove(struct kdbus_ep *ep);
++
 +
 +/* kdbus namespace */
 +static struct kdbus_ns *kdbus_ns_ref(struct kdbus_ns *ns)
@@ -447,6 +447,8 @@ Subject: [PATCH] kdbus: interprocess message router
 +
 +static void kdbus_bus_disconnect(struct kdbus_bus *bus)
 +{
++	struct kdbus_ep *ep, *tmp;
++
 +	if (bus->disconnected)
 +		return;
 +	bus->disconnected = true;
@@ -454,6 +456,10 @@ Subject: [PATCH] kdbus: interprocess message router
 +	/* remove default endpoint */
 +	kdbus_ep_disconnect(bus->ep);
 +	kdbus_ep_unref(bus->ep);
++
++	/* remove any endpoints attached to this bus */
++	list_for_each_entry_safe(ep, tmp, &bus->ep_list, bus_entry)
++		endpoint_remove(ep);
 +
 +	pr_info("closing bus %s/%s\n",
 +		bus->ns->devpath, bus->name);
@@ -574,11 +580,16 @@ Subject: [PATCH] kdbus: interprocess message router
 +	struct kdbus_ep *ep = NULL;
 +
 +	mutex_lock(&bus->lock);
-+	list_for_each_entry(ep, &bus->ep_list, bus);
-+
++	list_for_each_entry(ep, &bus->ep_list, bus_entry) {
++		if (!strcmp(ep->name, name))
++			goto exit;
++	}
++	/* Endpoint not found so return NULL */
++	ep = NULL;
++exit:
 +	mutex_unlock(&bus->lock);
 +
-+	return NULL;
++	return ep;
 +}
 +
 +static int kdbus_ep_new(struct kdbus_bus *bus, const char *name,
@@ -598,7 +609,6 @@ Subject: [PATCH] kdbus: interprocess message router
 +	e->mode = mode;
 +	e->uid = uid;
 +	e->gid = gid;
-+	e->bus = kdbus_bus_ref(bus);
 +
 +	e->name = kstrdup(name, GFP_KERNEL);
 +	if (!e->name) {
@@ -635,6 +645,11 @@ Subject: [PATCH] kdbus: interprocess message router
 +		put_device(e->dev);
 +		e->dev = NULL;
 +	}
++
++	/* Link this endpoint to the bus it is on */
++	e->bus = kdbus_bus_ref(bus);
++	list_add_tail(&e->bus_entry, &bus->ep_list);
++
 +	mutex_unlock(&bus->ns->lock);
 +
 +	if (ep)
@@ -652,6 +667,14 @@ Subject: [PATCH] kdbus: interprocess message router
 +
 +static int endpoint_remove(struct kdbus_ep *ep)
 +{
++	struct kdbus_bus *bus = ep->bus;
++
++	mutex_lock(&bus->ns->lock);
++	device_unregister(ep->dev);
++	list_del(&ep->bus_entry);
++	kdbus_ep_unref(ep);
++	mutex_unlock(&bus->ns->lock);
++	kdbus_bus_unref(bus);
 +	return 0;
 +}
 +
