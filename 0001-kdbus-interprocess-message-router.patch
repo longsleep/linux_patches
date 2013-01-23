@@ -8,15 +8,15 @@ Nothing to see here, move along...
  drivers/Makefile           |    1 
  drivers/kdbus/Kconfig      |    5 
  drivers/kdbus/Makefile     |    4 
- drivers/kdbus/bus.c        |  115 +++++++++++
- drivers/kdbus/ep.c         |  189 ++++++++++++++++++
- drivers/kdbus/kdbus.c      |  453 +++++++++++++++++++++++++++++++++++++++++++++
- drivers/kdbus/kdbus.h      |  160 +++++++++++++++
- drivers/kdbus/ns.c         |  208 ++++++++++++++++++++
- include/uapi/kdbus/kdbus.h |   86 ++++++++
+ drivers/kdbus/bus.c        |  115 +++++++++
+ drivers/kdbus/ep.c         |  189 +++++++++++++++
+ drivers/kdbus/kdbus.c      |  565 +++++++++++++++++++++++++++++++++++++++++++++
+ drivers/kdbus/kdbus.h      |  189 +++++++++++++++
+ drivers/kdbus/ns.c         |  208 ++++++++++++++++
+ include/uapi/kdbus/kdbus.h |   86 ++++++
  include/uapi/linux/major.h |    2 
- kdbus.c                    |   77 +++++++
- 12 files changed, 1302 insertions(+)
+ kdbus.c                    |   77 ++++++
+ 12 files changed, 1443 insertions(+)
 
 --- a/drivers/Kconfig
 +++ b/drivers/Kconfig
@@ -361,7 +361,7 @@ Nothing to see here, move along...
 +
 --- /dev/null
 +++ b/drivers/kdbus/kdbus.c
-@@ -0,0 +1,453 @@
+@@ -0,0 +1,565 @@
 +/*
 + * kdbus - interprocess message routing
 + *
@@ -434,7 +434,10 @@ Nothing to see here, move along...
 +	.name = "kdbus",
 +};
 +
-+/* List of all namespaces in the system */
++/* List of all connections in the system. */
++/* Well, really only the endpoint connections,
++ * that's all we care about for now */
++static LIST_HEAD(connection_list);
 +
 +/* kdbus initial namespace */
 +static struct kdbus_ns *kdbus_ns_init;
@@ -510,6 +513,11 @@ Nothing to see here, move along...
 +		goto err_unlock;
 +	}
 +
++	spin_lock_init(&conn->msg_lock);
++	INIT_LIST_HEAD(&conn->msg_list);
++
++	list_add_tail(&connection_list, &conn->connection_entry);
++
 +	file->private_data = conn;
 +	mutex_unlock(&conn->ns->lock);
 +
@@ -539,6 +547,7 @@ Nothing to see here, move along...
 +
 +	case KDBUS_CONN_EP:
 +		kdbus_ep_unref(conn->ep);
++		list_del(&conn->connection_entry);
 +		break;
 +
 +	default:
@@ -717,15 +726,116 @@ Nothing to see here, move along...
 +	}
 +}
 +
-+static unsigned int kdbus_conn_poll(struct file *filep,
++static unsigned int kdbus_conn_poll(struct file *file,
 +				    struct poll_table_struct *wait)
 +{
 +	return 0;
 +}
 +
-+static int kdbus_conn_mmap(struct file *filep, struct vm_area_struct *vma)
++static int kdbus_conn_mmap(struct file *file, struct vm_area_struct *vma)
 +{
 +	return -EINVAL;
++}
++
++static void kdbus_msg_release(struct kref *kref)
++{
++	struct kdbus_test_msg *msg = container_of(kref, struct kdbus_test_msg, kref);
++	kfree(msg);
++}
++
++static ssize_t kdbus_conn_write(struct file *file, const char __user *ubuf, size_t count, loff_t *ppos)
++{
++	struct kdbus_conn *conn = file->private_data;
++	struct kdbus_conn *temp_conn;
++	struct kdbus_test_msg *msg;
++
++	/* Only an endpoint can read/write data */
++	if (conn->type != KDBUS_CONN_EP)
++		return -EINVAL;
++
++	/* FIXME: Let's cap a message size at PAGE_SIZE for now */
++	if (count > PAGE_SIZE)
++		return -EINVAL;
++
++	if (count == 0)
++		return 0;
++
++	msg = kmalloc((sizeof(*msg) + count), GFP_KERNEL);
++	if (!msg)
++		return -ENOMEM;
++
++	if (copy_from_user(&msg->data[0], ubuf, count))
++		return -EFAULT;
++
++	kref_init(&msg->kref);
++	msg->length = count;
++
++	/* Walk the list of connections,
++	 * find any endpoints that match our endpoint,
++	 * create a kdbus_msg_list_entry for it,
++	 * attach the message to the endpoint list,
++	 * wake the connection up. */
++
++	/* what do we lock here?  FIXME */
++
++	list_for_each_entry(temp_conn, &connection_list, connection_entry) {
++		if (temp_conn->type != KDBUS_CONN_EP)
++			continue;
++		if (temp_conn->ep == conn->ep) {
++			/* Matching endpoints */
++			struct kdbus_msg_list_entry *msg_list_entry;
++
++			msg_list_entry = kmalloc(sizeof(*msg_list_entry), GFP_KERNEL);
++			kref_get(&msg->kref);
++			msg_list_entry->msg = msg;
++			spin_lock(&temp_conn->msg_lock);
++			list_add_tail(&temp_conn->msg_list, &msg_list_entry->entry);
++			spin_unlock(&temp_conn->msg_lock);
++			/* wake up the other process.  Somehow.  FIXME!!! */
++		}
++	}
++
++	/* drop our reference on the message, as we are done with it */
++	kref_put(&msg->kref, kdbus_msg_release);
++	return count;
++}
++
++static ssize_t kdbus_conn_read(struct file *file, char __user *ubuf, size_t count, loff_t *ppos)
++{
++	struct kdbus_conn *conn = file->private_data;
++	struct kdbus_msg_list_entry *msg_list_entry;
++	struct kdbus_test_msg *msg;
++	ssize_t retval = 0;
++
++	/* Only an endpoint can read/write data */
++	if (conn->type != KDBUS_CONN_EP)
++		return -EINVAL;
++
++	if (count == 0)
++		return 0;
++
++	/* let's grab a message from our list to write out */
++	spin_lock(&conn->msg_lock);
++	if (!list_empty(&conn->msg_list)) {
++		msg_list_entry = list_entry(&conn->msg_list, struct kdbus_msg_list_entry, entry);
++		msg = msg_list_entry->msg;
++		if (msg->length > count) {
++			retval = -E2BIG;		// FIXME wrong error code, I know, what should we use?
++			goto exit;
++		}
++		if (copy_to_user(ubuf, &msg->data[0], msg->length)) {
++			retval = -EFAULT;
++			goto exit;
++		}
++		list_del(&msg_list_entry->entry);
++		kfree(msg_list_entry);
++		retval = msg->length;
++		kref_put(&msg->kref, kdbus_msg_release);
++	}
++
++exit:
++	spin_unlock(&conn->msg_lock);
++	return retval;
 +}
 +
 +const struct file_operations kdbus_device_ops = {
@@ -737,6 +847,8 @@ Nothing to see here, move along...
 +	.poll = 		kdbus_conn_poll,
 +	.mmap =			kdbus_conn_mmap,
 +	.llseek =		noop_llseek,
++	.write = 		kdbus_conn_write,
++	.read =			kdbus_conn_read,
 +};
 +
 +static void kdbus_msg_free(struct kdbus_msg *msg)
@@ -817,7 +929,7 @@ Nothing to see here, move along...
 +MODULE_ALIAS("devname:kdbus/control");
 --- /dev/null
 +++ b/drivers/kdbus/kdbus.h
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,189 @@
 +
 +
 +#ifndef __INTERNAL_KDBUS_H
@@ -888,7 +1000,8 @@ Nothing to see here, move along...
 +	umode_t mode;		/* file mode of this endpoint device node */
 +	uid_t uid;		/* uid owning this endpoint */
 +	gid_t gid;		/* gid owning this endpoint */
-+	struct list_head bus_entry;
++	struct list_head bus_entry;	/* list of endpoints for this bus */
++	struct list_head message_list;	/* messages in flight for this endpoint */
 +};
 +
 +/*
@@ -912,6 +1025,21 @@ Nothing to see here, move along...
 +		struct kdbus_ep *ep;
 +	};
 +	__u64 id;		/* id of the connection on the bus */
++
++	/*
++	 * first, horrible cut at messages assigned to connections
++	 * odds are, this is going to be slow, but let's measure it first to
++	 * see what the real numbers are, and where the bottlenecks are.
++	 * Premature optimization and all...
++	 */
++	spinlock_t msg_lock;
++	struct list_head msg_list;
++
++	/* Ugh a list of all connections in the system?  Ugly, but we need to
++	 * be able to walk them all somehow.  Maybe just have a list on the
++	 * endpoints of the connections associated with that endpoint?  That's
++	 * all we really need in the end... */
++	struct list_head connection_entry;
 +};
 +
 +/* kdbus message */
@@ -940,6 +1068,19 @@ Nothing to see here, move along...
 +	u64 reserved[8];
 +	u32 data_count;
 +	struct kdbus_msg_data *data;
++};
++
++
++/* To knock around with for now */
++struct kdbus_test_msg {
++	struct kref kref;
++	u32 length;
++	u8 data[0];
++};
++
++struct kdbus_msg_list_entry {
++	struct kdbus_test_msg *msg;
++	struct list_head entry;
 +};
 +
 +/* namespace stuff */
