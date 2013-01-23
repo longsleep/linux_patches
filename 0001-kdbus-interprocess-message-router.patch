@@ -8,15 +8,15 @@ Nothing to see here, move along...
  drivers/Makefile           |    1 
  drivers/kdbus/Kconfig      |    5 
  drivers/kdbus/Makefile     |    4 
- drivers/kdbus/bus.c        |  115 +++++++++
- drivers/kdbus/ep.c         |  189 +++++++++++++++
- drivers/kdbus/kdbus.c      |  565 +++++++++++++++++++++++++++++++++++++++++++++
- drivers/kdbus/kdbus.h      |  189 +++++++++++++++
- drivers/kdbus/ns.c         |  208 ++++++++++++++++
+ drivers/kdbus/bus.c        |  115 ++++++++
+ drivers/kdbus/ep.c         |  191 ++++++++++++++
+ drivers/kdbus/kdbus.c      |  610 +++++++++++++++++++++++++++++++++++++++++++++
+ drivers/kdbus/kdbus.h      |  190 ++++++++++++++
+ drivers/kdbus/ns.c         |  208 +++++++++++++++
  include/uapi/kdbus/kdbus.h |   86 ++++++
  include/uapi/linux/major.h |    2 
- kdbus.c                    |   77 ++++++
- 12 files changed, 1443 insertions(+)
+ kdbus.c                    |   77 +++++
+ 12 files changed, 1491 insertions(+)
 
 --- a/drivers/Kconfig
 +++ b/drivers/Kconfig
@@ -169,7 +169,7 @@ Nothing to see here, move along...
 +
 --- /dev/null
 +++ b/drivers/kdbus/ep.c
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,191 @@
 +
 +#define pr_fmt(fmt)	KBUILD_MODNAME ": " fmt
 +
@@ -326,6 +326,8 @@ Nothing to see here, move along...
 +		e->dev = NULL;
 +	}
 +
++	init_waitqueue_head(&e->wait);
++
 +	/* Link this endpoint to the bus it is on */
 +	e->bus = kdbus_bus_ref(bus);
 +	list_add_tail(&e->bus_entry, &bus->ep_list);
@@ -361,7 +363,7 @@ Nothing to see here, move along...
 +
 --- /dev/null
 +++ b/drivers/kdbus/kdbus.c
-@@ -0,0 +1,565 @@
+@@ -0,0 +1,610 @@
 +/*
 + * kdbus - interprocess message routing
 + *
@@ -384,10 +386,10 @@ Nothing to see here, move along...
 +#include <linux/fs.h>
 +#include <linux/slab.h>
 +#include <linux/sched.h>
++#include <linux/mutex.h>
 +#include <linux/init.h>
-+#include <linux/cred.h>
-+#include <linux/security.h>
-+#include <asm/uaccess.h>
++#include <linux/poll.h>
++//#include <asm/uaccess.h>
 +#include <uapi/linux/major.h>
 +#include <uapi/kdbus/kdbus.h>
 +
@@ -453,6 +455,13 @@ Nothing to see here, move along...
 +static int kdbus_msg_send(struct kdbus_conn *conn, struct kdbus_msg *msg);
 +
 +
++static void kdbus_msg_release(struct kref *kref)
++{
++	struct kdbus_test_msg *msg = container_of(kref, struct kdbus_test_msg, kref);
++	kfree(msg);
++}
++
++
 +/* kdbus file operations */
 +static int kdbus_conn_open(struct inode *inode, struct file *file)
 +{
@@ -513,7 +522,7 @@ Nothing to see here, move along...
 +		goto err_unlock;
 +	}
 +
-+	spin_lock_init(&conn->msg_lock);
++	mutex_init(&conn->msg_lock);
 +	INIT_LIST_HEAD(&conn->msg_list);
 +
 +	list_add_tail(&connection_list, &conn->connection_entry);
@@ -535,6 +544,8 @@ Nothing to see here, move along...
 +static int kdbus_conn_release(struct inode *inode, struct file *file)
 +{
 +	struct kdbus_conn *conn = file->private_data;
++	struct kdbus_test_msg *msg;
++	struct kdbus_msg_list_entry *msg_entry, *tmp_entry;
 +
 +	switch (conn->type) {
 +	case KDBUS_CONN_NS_OWNER:
@@ -548,6 +559,16 @@ Nothing to see here, move along...
 +	case KDBUS_CONN_EP:
 +		kdbus_ep_unref(conn->ep);
 +		list_del(&conn->connection_entry);
++		/* clean up any messages still left on this endpoint */
++		mutex_lock(&conn->msg_lock);
++		list_for_each_entry_safe(msg_entry, tmp_entry, &conn->msg_list, entry) {
++			msg = msg_entry->msg;
++			list_del(&msg_entry->entry);
++			kfree(msg_entry);
++			kref_put(&msg->kref, kdbus_msg_release);
++		}
++		mutex_unlock(&conn->msg_lock);
++
 +		break;
 +
 +	default:
@@ -729,18 +750,26 @@ Nothing to see here, move along...
 +static unsigned int kdbus_conn_poll(struct file *file,
 +				    struct poll_table_struct *wait)
 +{
++	struct kdbus_conn *conn = file->private_data;
++	unsigned int mask = 0;
++
++	/* Only an endpoint can read/write data */
++	if (conn->type != KDBUS_CONN_EP)
++		return POLLERR | POLLHUP;
++
++	poll_wait(file, &conn->ep->wait, wait);
++
++	mutex_lock(&conn->msg_lock);
++	if (!list_empty(&conn->msg_list))
++		mask |= POLLIN | POLLRDNORM;
++	mutex_unlock(&conn->msg_lock);
++
 +	return 0;
 +}
 +
 +static int kdbus_conn_mmap(struct file *file, struct vm_area_struct *vma)
 +{
 +	return -EINVAL;
-+}
-+
-+static void kdbus_msg_release(struct kref *kref)
-+{
-+	struct kdbus_test_msg *msg = container_of(kref, struct kdbus_test_msg, kref);
-+	kfree(msg);
 +}
 +
 +static ssize_t kdbus_conn_write(struct file *file, const char __user *ubuf, size_t count, loff_t *ppos)
@@ -788,10 +817,11 @@ Nothing to see here, move along...
 +			msg_list_entry = kmalloc(sizeof(*msg_list_entry), GFP_KERNEL);
 +			kref_get(&msg->kref);
 +			msg_list_entry->msg = msg;
-+			spin_lock(&temp_conn->msg_lock);
++			mutex_lock(&temp_conn->msg_lock);
 +			list_add_tail(&temp_conn->msg_list, &msg_list_entry->entry);
-+			spin_unlock(&temp_conn->msg_lock);
-+			/* wake up the other process.  Somehow.  FIXME!!! */
++			mutex_unlock(&temp_conn->msg_lock);
++			/* wake up the other processes.  Hopefully... */
++			wake_up_interruptible_all(&temp_conn->ep->wait);
 +		}
 +	}
 +
@@ -814,8 +844,25 @@ Nothing to see here, move along...
 +	if (count == 0)
 +		return 0;
 +
++	if (mutex_lock_interruptible(&conn->msg_lock))
++		return -ERESTARTSYS;
++
++	while (list_empty(&conn->msg_list)) {
++		/* Nothing to read, so try again or sleep */
++		mutex_unlock(&conn->msg_lock);
++
++		if (file->f_flags & O_NONBLOCK)
++			return -EAGAIN;
++
++		/* sleep until we get something */
++		if (wait_event_interruptible(conn->ep->wait, list_empty(&conn->msg_list)))
++			return -ERESTARTSYS;
++
++		if (mutex_lock_interruptible(&conn->msg_lock))
++			return -ERESTARTSYS;
++	}
++
 +	/* let's grab a message from our list to write out */
-+	spin_lock(&conn->msg_lock);
 +	if (!list_empty(&conn->msg_list)) {
 +		msg_list_entry = list_entry(&conn->msg_list, struct kdbus_msg_list_entry, entry);
 +		msg = msg_list_entry->msg;
@@ -834,7 +881,7 @@ Nothing to see here, move along...
 +	}
 +
 +exit:
-+	spin_unlock(&conn->msg_lock);
++	mutex_unlock(&conn->msg_lock);
 +	return retval;
 +}
 +
@@ -929,7 +976,7 @@ Nothing to see here, move along...
 +MODULE_ALIAS("devname:kdbus/control");
 --- /dev/null
 +++ b/drivers/kdbus/kdbus.h
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,190 @@
 +
 +
 +#ifndef __INTERNAL_KDBUS_H
@@ -1002,6 +1049,7 @@ Nothing to see here, move along...
 +	gid_t gid;		/* gid owning this endpoint */
 +	struct list_head bus_entry;	/* list of endpoints for this bus */
 +	struct list_head message_list;	/* messages in flight for this endpoint */
++	wait_queue_head_t wait;		/* wake up this endpoint */
 +};
 +
 +/*
@@ -1032,7 +1080,7 @@ Nothing to see here, move along...
 +	 * see what the real numbers are, and where the bottlenecks are.
 +	 * Premature optimization and all...
 +	 */
-+	spinlock_t msg_lock;
++	struct mutex msg_lock;
 +	struct list_head msg_list;
 +
 +	/* Ugh a list of all connections in the system?  Ugly, but we need to
