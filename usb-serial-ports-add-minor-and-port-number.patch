@@ -1,0 +1,1178 @@
+From foo@baz Tue Jun  4 11:51:13 PDT 2013
+Date: Tue, 04 Jun 2013 11:51:13 -0700
+To: Greg KH <gregkh@linuxfoundation.org>
+From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Subject: [PATCH 1/2] USB: serial: ports: add minor and port number
+
+The usb_serial_port structure had the number field, which was the minor
+number for the port, which almost no one really cared about.  They
+really wanted the number of the port within the device, which you had to
+subtract from the minor of the parent usb_serial_device structure.  To
+clean this up, provide the real minor number of the port, and the number
+of the port within the serial device separately, as these numbers might
+not be related in the future.
+
+Bonus is that this cleans up a lot of logic in the drivers, and saves
+lines overall.
+
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+--
+ drivers/staging/serqt_usb2/serqt_usb2.c |   21 +++--------
+ drivers/usb/serial/ark3116.c            |    2 -
+ drivers/usb/serial/bus.c                |    6 +--
+ drivers/usb/serial/console.c            |    2 -
+ drivers/usb/serial/cp210x.c             |    2 -
+ drivers/usb/serial/cypress_m8.c         |    4 +-
+ drivers/usb/serial/digi_acceleport.c    |    6 ---
+ drivers/usb/serial/f81232.c             |    5 +-
+ drivers/usb/serial/garmin_gps.c         |    6 +--
+ drivers/usb/serial/io_edgeport.c        |   60 ++++++++++++--------------------
+ drivers/usb/serial/io_ti.c              |   21 ++++-------
+ drivers/usb/serial/keyspan.c            |   31 +++++++---------
+ drivers/usb/serial/metro-usb.c          |    4 +-
+ drivers/usb/serial/mos7720.c            |   39 ++++++++++----------
+ drivers/usb/serial/mos7840.c            |   52 +++++++++------------------
+ drivers/usb/serial/opticon.c            |    2 -
+ drivers/usb/serial/pl2303.c             |    2 -
+ drivers/usb/serial/quatech2.c           |    7 +--
+ drivers/usb/serial/sierra.c             |    2 -
+ drivers/usb/serial/ti_usb_3410_5052.c   |   10 ++---
+ drivers/usb/serial/usb-serial.c         |    7 ++-
+ drivers/usb/serial/usb_wwan.c           |    2 -
+ drivers/usb/serial/whiteheat.c          |   20 +++++-----
+ drivers/usb/serial/zte_ev.c             |    4 +-
+ include/linux/usb/serial.h              |    6 ++-
+ 25 files changed, 138 insertions(+), 185 deletions(-)
+
+--- a/drivers/staging/serqt_usb2/serqt_usb2.c
++++ b/drivers/staging/serqt_usb2/serqt_usb2.c
+@@ -873,7 +873,7 @@ static int qt_open(struct tty_struct *tt
+ 	result = qt_get_device(serial, &port0->DeviceData);
+ 
+ 	/* Port specific setups */
+-	result = qt_open_channel(serial, port->number, &ChannelData);
++	result = qt_open_channel(serial, port->port_number, &ChannelData);
+ 	if (result < 0) {
+ 		dev_dbg(&port->dev, "qt_open_channel failed\n");
+ 		return result;
+@@ -888,7 +888,7 @@ static int qt_open(struct tty_struct *tt
+ 	    (SERIAL_MSR_CTS | SERIAL_MSR_DSR | SERIAL_MSR_RI | SERIAL_MSR_CD);
+ 
+ 	/* Set Baud rate to default and turn off (default)flow control here */
+-	result = qt_setuart(serial, port->number, DEFAULT_DIVISOR, DEFAULT_LCR);
++	result = qt_setuart(serial, port->port_number, DEFAULT_DIVISOR, DEFAULT_LCR);
+ 	if (result < 0) {
+ 		dev_dbg(&port->dev, "qt_setuart failed\n");
+ 		return result;
+@@ -906,7 +906,6 @@ static int qt_open(struct tty_struct *tt
+ 			qt_submit_urb_from_open(serial, port);
+ 	}
+ 
+-	dev_dbg(&port->dev, "port number is %d\n", port->number);
+ 	dev_dbg(&port->dev, "serial number is %d\n", port->serial->minor);
+ 	dev_dbg(&port->dev,
+ 		"Bulkin endpoint is %d\n", port->bulk_in_endpointAddress);
+@@ -1022,14 +1021,11 @@ static void qt_close(struct usb_serial_p
+ 	/* Close uart channel */
+ 	status = qt_close_channel(serial, index);
+ 	if (status < 0)
+-		dev_dbg(&port->dev,
+-			"%s - port %d qt_close_channel failed.\n",
+-			__func__, port->number);
++		dev_dbg(&port->dev, "%s - qt_close_channel failed.\n", __func__);
+ 
+ 	port0->open_ports--;
+ 
+-	dev_dbg(&port->dev, "qt_num_open_ports in close%d:in port%d\n",
+-		port0->open_ports, port->number);
++	dev_dbg(&port->dev, "qt_num_open_ports in close%d\n", port0->open_ports);
+ 
+ 	if (port0->open_ports == 0) {
+ 		if (serial->port[0]->interrupt_in_urb) {
+@@ -1169,8 +1165,7 @@ static int qt_ioctl(struct tty_struct *t
+ 		return 0;
+ 	}
+ 
+-	dev_dbg(&port->dev, "%s -No ioctl for that one.  port = %d\n",
+-		__func__, port->number);
++	dev_dbg(&port->dev, "%s -No ioctl for that one.\n", __func__);
+ 	return -ENOIOCTLCMD;
+ }
+ 
+@@ -1245,8 +1240,7 @@ static void qt_set_termios(struct tty_st
+ 
+ 	/* Now determine flow control */
+ 	if (cflag & CRTSCTS) {
+-		dev_dbg(&port->dev, "%s - Enabling HW flow control port %d\n",
+-			__func__, port->number);
++		dev_dbg(&port->dev, "%s - Enabling HW flow control\n", __func__);
+ 
+ 		/* Enable RTS/CTS flow control */
+ 		status = BoxSetHW_FlowCtrl(port->serial, index, 1);
+@@ -1258,8 +1252,7 @@ static void qt_set_termios(struct tty_st
+ 	} else {
+ 		/* Disable RTS/CTS flow control */
+ 		dev_dbg(&port->dev,
+-			"%s - disabling HW flow control port %d\n",
+-			__func__, port->number);
++			"%s - disabling HW flow control\n", __func__);
+ 
+ 		status = BoxSetHW_FlowCtrl(port->serial, index, 0);
+ 		if (status < 0) {
+--- a/drivers/usb/serial/ark3116.c
++++ b/drivers/usb/serial/ark3116.c
+@@ -414,7 +414,7 @@ static int ark3116_ioctl(struct tty_stru
+ 		memset(&serstruct, 0, sizeof(serstruct));
+ 		serstruct.type = PORT_16654;
+ 		serstruct.line = port->serial->minor;
+-		serstruct.port = port->number;
++		serstruct.port = port->port_number;
+ 		serstruct.custom_divisor = 0;
+ 		serstruct.baud_base = 460800;
+ 
+--- a/drivers/usb/serial/bus.c
++++ b/drivers/usb/serial/bus.c
+@@ -43,7 +43,7 @@ static ssize_t show_port_number(struct d
+ {
+ 	struct usb_serial_port *port = to_usb_serial_port(dev);
+ 
+-	return sprintf(buf, "%d\n", port->number - port->serial->minor);
++	return sprintf(buf, "%d\n", port->port_number);
+ }
+ 
+ static DEVICE_ATTR(port_number, S_IRUGO, show_port_number, NULL);
+@@ -80,7 +80,7 @@ static int usb_serial_device_probe(struc
+ 		goto exit_with_autopm;
+ 	}
+ 
+-	minor = port->number;
++	minor = port->minor;
+ 	tty_register_device(usb_serial_tty_driver, minor, dev);
+ 	dev_info(&port->serial->dev->dev,
+ 		 "%s converter now attached to ttyUSB%d\n",
+@@ -106,7 +106,7 @@ static int usb_serial_device_remove(stru
+ 	/* make sure suspend/resume doesn't race against port_remove */
+ 	usb_autopm_get_interface(port->serial->interface);
+ 
+-	minor = port->number;
++	minor = port->minor;
+ 	tty_unregister_device(usb_serial_tty_driver, minor);
+ 
+ 	device_remove_file(&port->dev, &dev_attr_port_number);
+--- a/drivers/usb/serial/console.c
++++ b/drivers/usb/serial/console.c
+@@ -210,7 +210,7 @@ static void usb_console_write(struct con
+ 	if (count == 0)
+ 		return;
+ 
+-	pr_debug("%s - port %d, %d byte(s)\n", __func__, port->number, count);
++	pr_debug("%s - minor %d, %d byte(s)\n", __func__, port->minor, count);
+ 
+ 	if (!port->port.console) {
+ 		pr_debug("%s - port not opened\n", __func__);
+--- a/drivers/usb/serial/cp210x.c
++++ b/drivers/usb/serial/cp210x.c
+@@ -666,8 +666,6 @@ static void cp210x_set_termios(struct tt
+ 	unsigned int bits;
+ 	unsigned int modem_ctl[4];
+ 
+-	dev_dbg(dev, "%s - port %d\n", __func__, port->number);
+-
+ 	if (!tty)
+ 		return;
+ 
+--- a/drivers/usb/serial/cypress_m8.c
++++ b/drivers/usb/serial/cypress_m8.c
+@@ -423,7 +423,7 @@ static void cypress_set_dead(struct usb_
+ 	spin_unlock_irqrestore(&priv->lock, flags);
+ 
+ 	dev_err(&port->dev, "cypress_m8 suspending failing port %d - "
+-		"interval might be too short\n", port->number);
++		"interval might be too short\n", port->port_number);
+ }
+ 
+ 
+@@ -651,7 +651,7 @@ static int cypress_write(struct tty_stru
+ {
+ 	struct cypress_private *priv = usb_get_serial_port_data(port);
+ 
+-	dev_dbg(&port->dev, "%s - port %d, %d bytes\n", __func__, port->number, count);
++	dev_dbg(&port->dev, "%s - %d bytes\n", __func__, count);
+ 
+ 	/* line control commands, which need to be executed immediately,
+ 	   are not put into the buffer for obvious reasons.
+--- a/drivers/usb/serial/digi_acceleport.c
++++ b/drivers/usb/serial/digi_acceleport.c
+@@ -1304,11 +1304,7 @@ static void digi_release(struct usb_seri
+ 
+ static int digi_port_probe(struct usb_serial_port *port)
+ {
+-	unsigned port_num;
+-
+-	port_num = port->number - port->serial->minor;
+-
+-	return digi_port_init(port, port_num);
++	return digi_port_init(port, port->port_number);
+ }
+ 
+ static int digi_port_remove(struct usb_serial_port *port)
+--- a/drivers/usb/serial/f81232.c
++++ b/drivers/usb/serial/f81232.c
+@@ -288,15 +288,14 @@ static int f81232_ioctl(struct tty_struc
+ 	struct serial_struct ser;
+ 	struct usb_serial_port *port = tty->driver_data;
+ 
+-	dev_dbg(&port->dev, "%s (%d) cmd = 0x%04x\n", __func__,
+-		port->number, cmd);
++	dev_dbg(&port->dev, "%s cmd = 0x%04x\n", __func__, cmd);
+ 
+ 	switch (cmd) {
+ 	case TIOCGSERIAL:
+ 		memset(&ser, 0, sizeof ser);
+ 		ser.type = PORT_16654;
+ 		ser.line = port->serial->minor;
+-		ser.port = port->number;
++		ser.port = port->port_number;
+ 		ser.baud_base = 460800;
+ 
+ 		if (copy_to_user((void __user *)arg, &ser, sizeof ser))
+--- a/drivers/usb/serial/garmin_gps.c
++++ b/drivers/usb/serial/garmin_gps.c
+@@ -948,9 +948,9 @@ static void garmin_close(struct usb_seri
+ {
+ 	struct garmin_data *garmin_data_p = usb_get_serial_port_data(port);
+ 
+-	dev_dbg(&port->dev, "%s - port %d - mode=%d state=%d flags=0x%X\n",
+-		__func__, port->number, garmin_data_p->mode,
+-		garmin_data_p->state, garmin_data_p->flags);
++	dev_dbg(&port->dev, "%s - mode=%d state=%d flags=0x%X\n",
++		__func__, garmin_data_p->mode, garmin_data_p->state,
++		garmin_data_p->flags);
+ 
+ 	garmin_clear(garmin_data_p);
+ 
+--- a/drivers/usb/serial/io_edgeport.c
++++ b/drivers/usb/serial/io_edgeport.c
+@@ -915,8 +915,8 @@ static int edge_open(struct tty_struct *
+ 		return -ENOMEM;
+ 	}
+ 
+-	dev_dbg(dev, "%s(%d) - Initialize TX fifo to %d bytes\n",
+-		__func__, port->number, edge_port->maxTxCredits);
++	dev_dbg(dev, "%s - Initialize TX fifo to %d bytes\n",
++		__func__, edge_port->maxTxCredits);
+ 
+ 	return 0;
+ }
+@@ -1122,9 +1122,8 @@ static int edge_write(struct tty_struct
+ 	copySize = min((unsigned int)count,
+ 				(edge_port->txCredits - fifo->count));
+ 
+-	dev_dbg(&port->dev, "%s(%d) of %d byte(s) Fifo room  %d -- will copy %d bytes\n",
+-		__func__, port->number, count,
+-			edge_port->txCredits - fifo->count, copySize);
++	dev_dbg(&port->dev, "%s of %d byte(s) Fifo room  %d -- will copy %d bytes\n",
++		__func__, count, edge_port->txCredits - fifo->count, copySize);
+ 
+ 	/* catch writes of 0 bytes which the tty driver likes to give us,
+ 	   and when txCredits is empty */
+@@ -1216,9 +1215,8 @@ static void send_more_port_data(struct e
+ 	if (edge_port->write_in_progress ||
+ 	    !edge_port->open             ||
+ 	    (fifo->count == 0)) {
+-		dev_dbg(dev, "%s(%d) EXIT - fifo %d, PendingWrite = %d\n",
+-			__func__, edge_port->port->number,
+-			fifo->count, edge_port->write_in_progress);
++		dev_dbg(dev, "%s EXIT - fifo %d, PendingWrite = %d\n",
++			__func__, fifo->count, edge_port->write_in_progress);
+ 		goto exit_send;
+ 	}
+ 
+@@ -1230,9 +1228,8 @@ static void send_more_port_data(struct e
+ 	 * it's better to wait for more credits so we can do a larger write.
+ 	 */
+ 	if (edge_port->txCredits < EDGE_FW_GET_TX_CREDITS_SEND_THRESHOLD(edge_port->maxTxCredits, EDGE_FW_BULK_MAX_PACKET_SIZE)) {
+-		dev_dbg(dev, "%s(%d) Not enough credit - fifo %d TxCredit %d\n",
+-			__func__, edge_port->port->number, fifo->count,
+-			edge_port->txCredits);
++		dev_dbg(dev, "%s Not enough credit - fifo %d TxCredit %d\n",
++			__func__, fifo->count, edge_port->txCredits);
+ 		goto exit_send;
+ 	}
+ 
+@@ -1256,10 +1253,8 @@ static void send_more_port_data(struct e
+ 		edge_port->write_in_progress = false;
+ 		goto exit_send;
+ 	}
+-	buffer[0] = IOSP_BUILD_DATA_HDR1(edge_port->port->number
+-				- edge_port->port->serial->minor, count);
+-	buffer[1] = IOSP_BUILD_DATA_HDR2(edge_port->port->number
+-				- edge_port->port->serial->minor, count);
++	buffer[0] = IOSP_BUILD_DATA_HDR1(edge_port->port->port_number, count);
++	buffer[1] = IOSP_BUILD_DATA_HDR2(edge_port->port->port_number, count);
+ 
+ 	/* now copy our data */
+ 	bytesleft =  fifo->size - fifo->tail;
+@@ -1377,8 +1372,7 @@ static int edge_chars_in_buffer(struct t
+ 						edge_port->txfifo.count;
+ 	spin_unlock_irqrestore(&edge_port->ep_lock, flags);
+ 	if (num_chars) {
+-		dev_dbg(&port->dev, "%s(port %d) - returns %d\n", __func__,
+-			port->number, num_chars);
++		dev_dbg(&port->dev, "%s - returns %d\n", __func__, num_chars);
+ 	}
+ 
+ 	return num_chars;
+@@ -1576,7 +1570,7 @@ static int get_serial_info(struct edgepo
+ 
+ 	tmp.type		= PORT_16550A;
+ 	tmp.line		= edge_port->port->serial->minor;
+-	tmp.port		= edge_port->port->number;
++	tmp.port		= edge_port->port->port_number;
+ 	tmp.irq			= 0;
+ 	tmp.flags		= ASYNC_SKIP_TEST | ASYNC_AUTO_IRQ;
+ 	tmp.xmit_fifo_size	= edge_port->maxTxCredits;
+@@ -1601,15 +1595,15 @@ static int edge_ioctl(struct tty_struct
+ 	DEFINE_WAIT(wait);
+ 	struct edgeport_port *edge_port = usb_get_serial_port_data(port);
+ 
+-	dev_dbg(&port->dev, "%s - port %d, cmd = 0x%x\n", __func__, port->number, cmd);
++	dev_dbg(&port->dev, "%s - cmd = 0x%x\n", __func__, cmd);
+ 
+ 	switch (cmd) {
+ 	case TIOCSERGETLSR:
+-		dev_dbg(&port->dev, "%s (%d) TIOCSERGETLSR\n", __func__,  port->number);
++		dev_dbg(&port->dev, "%s TIOCSERGETLSR\n", __func__);
+ 		return get_lsr_info(edge_port, (unsigned int __user *) arg);
+ 
+ 	case TIOCGSERIAL:
+-		dev_dbg(&port->dev, "%s (%d) TIOCGSERIAL\n", __func__,  port->number);
++		dev_dbg(&port->dev, "%s TIOCGSERIAL\n", __func__);
+ 		return get_serial_info(edge_port, (struct serial_struct __user *) arg);
+ 	}
+ 	return -ENOIOCTLCMD;
+@@ -2181,9 +2175,8 @@ static int send_iosp_ext_cmd(struct edge
+ 
+ 	currentCommand = buffer;
+ 
+-	MAKE_CMD_EXT_CMD(&currentCommand, &length,
+-		edge_port->port->number - edge_port->port->serial->minor,
+-		command, param);
++	MAKE_CMD_EXT_CMD(&currentCommand, &length, edge_port->port->port_number,
++			 command, param);
+ 
+ 	status = write_cmd_usb(edge_port, buffer, length);
+ 	if (status) {
+@@ -2266,18 +2259,16 @@ static int send_cmd_write_baud_rate(stru
+ 	int cmdLen = 0;
+ 	int divisor;
+ 	int status;
+-	unsigned char number =
+-		edge_port->port->number - edge_port->port->serial->minor;
++	u32 number = edge_port->port->port_number;
+ 
+ 	if (edge_serial->is_epic &&
+ 	    !edge_serial->epic_descriptor.Supports.IOSPSetBaudRate) {
+-		dev_dbg(dev, "SendCmdWriteBaudRate - NOT Setting baud rate for port = %d, baud = %d\n",
+-			edge_port->port->number, baudRate);
++		dev_dbg(dev, "SendCmdWriteBaudRate - NOT Setting baud rate for port, baud = %d\n",
++			baudRate);
+ 		return 0;
+ 	}
+ 
+-	dev_dbg(dev, "%s - port = %d, baud = %d\n", __func__,
+-		edge_port->port->number, baudRate);
++	dev_dbg(dev, "%s - baud = %d\n", __func__, baudRate);
+ 
+ 	status = calc_baud_rate_divisor(dev, baudRate, &divisor);
+ 	if (status) {
+@@ -2302,7 +2293,7 @@ static int send_cmd_write_baud_rate(stru
+ 
+ 	/* Restore original value to disable access to divisor latch */
+ 	MAKE_CMD_WRITE_REG(&currCmd, &cmdLen, number, LCR,
+-						edge_port->shadowLCR);
++			   edge_port->shadowLCR);
+ 
+ 	status = write_cmd_usb(edge_port, cmdBuffer, cmdLen);
+ 	if (status) {
+@@ -2388,9 +2379,8 @@ static int send_cmd_write_uart_register(
+ 	currCmd = cmdBuffer;
+ 
+ 	/* Build a cmd in the buffer to write the given register */
+-	MAKE_CMD_WRITE_REG(&currCmd, &cmdLen,
+-		edge_port->port->number - edge_port->port->serial->minor,
+-		regNum, regValue);
++	MAKE_CMD_WRITE_REG(&currCmd, &cmdLen, edge_port->port->port_number,
++			   regNum, regValue);
+ 
+ 	status = write_cmd_usb(edge_port, cmdBuffer, cmdLen);
+ 	if (status) {
+@@ -2424,8 +2414,6 @@ static void change_port_settings(struct
+ 	__u8 txFlow;
+ 	int status;
+ 
+-	dev_dbg(dev, "%s - port %d\n", __func__, edge_port->port->number);
+-
+ 	if (!edge_port->open &&
+ 	    !edge_port->openPending) {
+ 		dev_dbg(dev, "%s - port not opened\n", __func__);
+--- a/drivers/usb/serial/io_ti.c
++++ b/drivers/usb/serial/io_ti.c
+@@ -259,7 +259,7 @@ static int send_cmd(struct usb_device *d
+ /* clear tx/rx buffers and fifo in TI UMP */
+ static int purge_port(struct usb_serial_port *port, __u16 mask)
+ {
+-	int port_number = port->number - port->serial->minor;
++	int port_number = port->port_number;
+ 
+ 	dev_dbg(&port->dev, "%s - port %d, mask %x\n", __func__, port_number, mask);
+ 
+@@ -1392,7 +1392,8 @@ stayinbootmode:
+ 
+ static int ti_do_config(struct edgeport_port *port, int feature, int on)
+ {
+-	int port_number = port->port->number - port->port->serial->minor;
++	int port_number = port->port->port_number;
++
+ 	on = !!on;	/* 1 or 0 not bitmask */
+ 	return send_cmd(port->port->serial->dev,
+ 			feature, (__u8)(UMPM_UART1_PORT + port_number),
+@@ -1637,7 +1638,7 @@ static void edge_bulk_in_callback(struct
+ 		return;
+ 	}
+ 
+-	port_number = edge_port->port->number - edge_port->port->serial->minor;
++	port_number = edge_port->port->port_number;
+ 
+ 	if (edge_port->lsr_event) {
+ 		edge_port->lsr_event = 0;
+@@ -1730,7 +1731,7 @@ static int edge_open(struct tty_struct *
+ 	if (edge_port == NULL)
+ 		return -ENODEV;
+ 
+-	port_number = port->number - port->serial->minor;
++	port_number = port->port_number;
+ 	switch (port_number) {
+ 	case 0:
+ 		edge_port->uart_base = UMPMEM_BASE_UART1;
+@@ -1908,7 +1909,7 @@ static void edge_close(struct usb_serial
+ 	spin_unlock_irqrestore(&edge_port->ep_lock, flags);
+ 
+ 	dev_dbg(&port->dev, "%s - send umpc_close_port\n", __func__);
+-	port_number = port->number - port->serial->minor;
++	port_number = port->port_number;
+ 	send_cmd(serial->dev, UMPC_CLOSE_PORT,
+ 		     (__u8)(UMPM_UART1_PORT + port_number), 0, NULL, 0);
+ 
+@@ -2137,10 +2138,7 @@ static void change_port_settings(struct
+ 	int baud;
+ 	unsigned cflag;
+ 	int status;
+-	int port_number = edge_port->port->number -
+-					edge_port->port->serial->minor;
+-
+-	dev_dbg(dev, "%s - port %d\n", __func__, edge_port->port->number);
++	int port_number = edge_port->port->port_number;
+ 
+ 	config = kmalloc (sizeof (*config), GFP_KERNEL);
+ 	if (!config) {
+@@ -2284,7 +2282,6 @@ static void edge_set_termios(struct tty_
+ 		tty->termios.c_cflag, tty->termios.c_iflag);
+ 	dev_dbg(&port->dev, "%s - old clfag %08x old iflag %08x\n", __func__,
+ 		old_termios->c_cflag, old_termios->c_iflag);
+-	dev_dbg(&port->dev, "%s - port %d\n", __func__, port->number);
+ 
+ 	if (edge_port == NULL)
+ 		return;
+@@ -2367,7 +2364,7 @@ static int get_serial_info(struct edgepo
+ 
+ 	tmp.type		= PORT_16550A;
+ 	tmp.line		= edge_port->port->serial->minor;
+-	tmp.port		= edge_port->port->number;
++	tmp.port		= edge_port->port->port_number;
+ 	tmp.irq			= 0;
+ 	tmp.flags		= ASYNC_SKIP_TEST | ASYNC_AUTO_IRQ;
+ 	tmp.xmit_fifo_size	= edge_port->port->bulk_out_size;
+@@ -2386,7 +2383,7 @@ static int edge_ioctl(struct tty_struct
+ 	struct usb_serial_port *port = tty->driver_data;
+ 	struct edgeport_port *edge_port = usb_get_serial_port_data(port);
+ 
+-	dev_dbg(&port->dev, "%s - port %d, cmd = 0x%x\n", __func__, port->number, cmd);
++	dev_dbg(&port->dev, "%s - cmd = 0x%x\n", __func__, cmd);
+ 
+ 	switch (cmd) {
+ 	case TIOCGSERIAL:
+--- a/drivers/usb/serial/keyspan.c
++++ b/drivers/usb/serial/keyspan.c
+@@ -152,7 +152,7 @@ static void keyspan_set_termios(struct t
+ 	p_priv = usb_get_serial_port_data(port);
+ 	d_details = p_priv->device_details;
+ 	cflag = tty->termios.c_cflag;
+-	device_port = port->number - port->serial->minor;
++	device_port = port->port_number;
+ 
+ 	/* Baud rate calculation takes baud rate as an integer
+ 	   so other rates can be generated if desired. */
+@@ -234,8 +234,8 @@ static int keyspan_write(struct tty_stru
+ 		dataOffset = 1;
+ 	}
+ 
+-	dev_dbg(&port->dev, "%s - for port %d (%d chars), flip=%d\n",
+-		__func__, port->number, count, p_priv->out_flip);
++	dev_dbg(&port->dev, "%s - %d chars, flip=%d\n", __func__, count,
++		p_priv->out_flip);
+ 
+ 	for (left = count; left > 0; left -= todo) {
+ 		todo = left;
+@@ -1050,7 +1050,7 @@ static int keyspan_open(struct tty_struc
+ 	/* get the terminal config for the setup message now so we don't
+ 	 * need to send 2 of them */
+ 
+-	device_port = port->number - port->serial->minor;
++	device_port = port->port_number;
+ 	if (tty) {
+ 		cflag = tty->termios.c_cflag;
+ 		/* Baud rate calculation takes baud rate as an integer
+@@ -1557,9 +1557,9 @@ static int keyspan_usa26_send_setup(stru
+ 	s_priv = usb_get_serial_data(serial);
+ 	p_priv = usb_get_serial_port_data(port);
+ 	d_details = s_priv->device_details;
+-	device_port = port->number - port->serial->minor;
++	device_port = port->port_number;
+ 
+-	outcont_urb = d_details->outcont_endpoints[port->number];
++	outcont_urb = d_details->outcont_endpoints[device_port];
+ 	this_urb = p_priv->outcont_urb;
+ 
+ 	dev_dbg(&port->dev, "%s - endpoint %d\n", __func__, usb_pipeendpoint(this_urb->pipe));
+@@ -1710,7 +1710,7 @@ static int keyspan_usa28_send_setup(stru
+ 	s_priv = usb_get_serial_data(serial);
+ 	p_priv = usb_get_serial_port_data(port);
+ 	d_details = s_priv->device_details;
+-	device_port = port->number - port->serial->minor;
++	device_port = port->port_number;
+ 
+ 	/* only do something if we have a bulk out endpoint */
+ 	this_urb = p_priv->outcont_urb;
+@@ -1840,17 +1840,16 @@ static int keyspan_usa49_send_setup(stru
+ 	this_urb = s_priv->glocont_urb;
+ 
+ 	/* Work out which port within the device is being setup */
+-	device_port = port->number - port->serial->minor;
++	device_port = port->port_number;
+ 
+ 	/* Make sure we have an urb then send the message */
+ 	if (this_urb == NULL) {
+-		dev_dbg(&port->dev, "%s - oops no urb for port %d.\n", __func__, port->number);
++		dev_dbg(&port->dev, "%s - oops no urb for port.\n", __func__);
+ 		return -1;
+ 	}
+ 
+-	dev_dbg(&port->dev, "%s - endpoint %d port %d (%d)\n",
+-		__func__, usb_pipeendpoint(this_urb->pipe),
+-		port->number, device_port);
++	dev_dbg(&port->dev, "%s - endpoint %d (%d)\n",
++		__func__, usb_pipeendpoint(this_urb->pipe), device_port);
+ 
+ 	/* Save reset port val for resend.
+ 	   Don't overwrite resend for open/close condition. */
+@@ -1865,7 +1864,6 @@ static int keyspan_usa49_send_setup(stru
+ 
+ 	memset(&msg, 0, sizeof(struct keyspan_usa49_portControlMessage));
+ 
+-	/*msg.portNumber = port->number;*/
+ 	msg.portNumber = device_port;
+ 
+ 	/* Only set baud rate if it's changed */
+@@ -2155,12 +2153,11 @@ static int keyspan_usa67_send_setup(stru
+ 	this_urb = s_priv->glocont_urb;
+ 
+ 	/* Work out which port within the device is being setup */
+-	device_port = port->number - port->serial->minor;
++	device_port = port->port_number;
+ 
+ 	/* Make sure we have an urb then send the message */
+ 	if (this_urb == NULL) {
+-		dev_dbg(&port->dev, "%s - oops no urb for port %d.\n", __func__,
+-			port->number);
++		dev_dbg(&port->dev, "%s - oops no urb for port.\n", __func__);
+ 		return -1;
+ 	}
+ 
+@@ -2401,7 +2398,7 @@ static int keyspan_port_probe(struct usb
+ 	/* Setup values for the various callback routines */
+ 	cback = &keyspan_callbacks[d_details->msg_format];
+ 
+-	port_num = port->number - port->serial->minor;
++	port_num = port->port_number;
+ 
+ 	/* Do indat endpoints first, once for each flip */
+ 	endp = d_details->indat_endpoints[port_num];
+--- a/drivers/usb/serial/metro-usb.c
++++ b/drivers/usb/serial/metro-usb.c
+@@ -224,8 +224,8 @@ static int metrousb_open(struct tty_stru
+ 	result = metrousb_send_unidirectional_cmd(UNI_CMD_OPEN, port);
+ 	if (result) {
+ 		dev_err(&port->dev,
+-			"%s - failed to configure device for port number=%d, error code=%d\n",
+-			__func__, port->number, result);
++			"%s - failed to configure device, error code=%d\n",
++			__func__, result);
+ 		goto exit;
+ 	}
+ 
+--- a/drivers/usb/serial/mos7720.c
++++ b/drivers/usb/serial/mos7720.c
+@@ -1036,7 +1036,7 @@ static int mos7720_open(struct tty_struc
+ 	  *
+ 	  * 0x08 : SP1/2 Control Reg
+ 	  */
+-	port_number = port->number - port->serial->minor;
++	port_number = port->port_number;
+ 	read_mos_reg(serial, port_number, LSR, &data);
+ 
+ 	dev_dbg(&port->dev, "SS::%p LSR:%x\n", mos7720_port, data);
+@@ -1055,7 +1055,7 @@ static int mos7720_open(struct tty_struc
+ 
+ 	write_mos_reg(serial, port_number, SP_CONTROL_REG, 0x00);
+ 	read_mos_reg(serial, dummy, SP_CONTROL_REG, &data);
+-	data = data | (port->number - port->serial->minor + 1);
++	data = data | (port->port_number + 1);
+ 	write_mos_reg(serial, dummy, SP_CONTROL_REG, data);
+ 	mos7720_port->shadowLCR = 0x83;
+ 	write_mos_reg(serial, port_number, LCR, mos7720_port->shadowLCR);
+@@ -1136,8 +1136,8 @@ static void mos7720_close(struct usb_ser
+ 	usb_kill_urb(port->write_urb);
+ 	usb_kill_urb(port->read_urb);
+ 
+-	write_mos_reg(serial, port->number - port->serial->minor, MCR, 0x00);
+-	write_mos_reg(serial, port->number - port->serial->minor, IER, 0x00);
++	write_mos_reg(serial, port->port_number, MCR, 0x00);
++	write_mos_reg(serial, port->port_number, IER, 0x00);
+ 
+ 	mos7720_port->open = 0;
+ }
+@@ -1161,8 +1161,7 @@ static void mos7720_break(struct tty_str
+ 		data = mos7720_port->shadowLCR & ~UART_LCR_SBC;
+ 
+ 	mos7720_port->shadowLCR  = data;
+-	write_mos_reg(serial, port->number - port->serial->minor,
+-		      LCR, mos7720_port->shadowLCR);
++	write_mos_reg(serial, port->port_number, LCR, mos7720_port->shadowLCR);
+ }
+ 
+ /*
+@@ -1293,8 +1292,8 @@ static void mos7720_throttle(struct tty_
+ 	/* if we are implementing RTS/CTS, toggle that line */
+ 	if (tty->termios.c_cflag & CRTSCTS) {
+ 		mos7720_port->shadowMCR &= ~UART_MCR_RTS;
+-		write_mos_reg(port->serial, port->number - port->serial->minor,
+-			      MCR, mos7720_port->shadowMCR);
++		write_mos_reg(port->serial, port->port_number, MCR,
++			      mos7720_port->shadowMCR);
+ 		if (status != 0)
+ 			return;
+ 	}
+@@ -1325,8 +1324,8 @@ static void mos7720_unthrottle(struct tt
+ 	/* if we are implementing RTS/CTS, toggle that line */
+ 	if (tty->termios.c_cflag & CRTSCTS) {
+ 		mos7720_port->shadowMCR |= UART_MCR_RTS;
+-		write_mos_reg(port->serial, port->number - port->serial->minor,
+-			      MCR, mos7720_port->shadowMCR);
++		write_mos_reg(port->serial, port->port_number, MCR,
++			      mos7720_port->shadowMCR);
+ 		if (status != 0)
+ 			return;
+ 	}
+@@ -1350,7 +1349,7 @@ static int set_higher_rates(struct mosch
+ 	 *      Init Sequence for higher rates
+ 	 ***********************************************/
+ 	dev_dbg(&port->dev, "Sending Setting Commands ..........\n");
+-	port_number = port->number - port->serial->minor;
++	port_number = port->port_number;
+ 
+ 	write_mos_reg(serial, port_number, IER, 0x00);
+ 	write_mos_reg(serial, port_number, FCR, 0x00);
+@@ -1476,7 +1475,7 @@ static int send_cmd_write_baud_rate(stru
+ 	port = mos7720_port->port;
+ 	serial = port->serial;
+ 
+-	number = port->number - port->serial->minor;
++	number = port->port_number;
+ 	dev_dbg(&port->dev, "%s - baud = %d\n", __func__, baudrate);
+ 
+ 	/* Calculate the Divisor */
+@@ -1527,7 +1526,7 @@ static void change_port_settings(struct
+ 
+ 	port = mos7720_port->port;
+ 	serial = port->serial;
+-	port_number = port->number - port->serial->minor;
++	port_number = port->port_number;
+ 
+ 	if (!mos7720_port->open) {
+ 		dev_dbg(&port->dev, "%s - port not opened\n", __func__);
+@@ -1618,7 +1617,7 @@ static void change_port_settings(struct
+ 		mos7720_port->shadowMCR |= (UART_MCR_XONANY);
+ 		/* To set hardware flow control to the specified *
+ 		 * serial port, in SP1/2_CONTROL_REG             */
+-		if (port->number)
++		if (port->port_number)
+ 			write_mos_reg(serial, dummy, SP_CONTROL_REG, 0x01);
+ 		else
+ 			write_mos_reg(serial, dummy, SP_CONTROL_REG, 0x02);
+@@ -1720,7 +1719,7 @@ static int get_lsr_info(struct tty_struc
+ 	struct usb_serial_port *port = tty->driver_data;
+ 	unsigned int result = 0;
+ 	unsigned char data = 0;
+-	int port_number = port->number - port->serial->minor;
++	int port_number = port->port_number;
+ 	int count;
+ 
+ 	count = mos7720_chars_in_buffer(tty);
+@@ -1782,8 +1781,8 @@ static int mos7720_tiocmset(struct tty_s
+ 		mcr &= ~UART_MCR_LOOP;
+ 
+ 	mos7720_port->shadowMCR = mcr;
+-	write_mos_reg(port->serial, port->number - port->serial->minor,
+-		      MCR, mos7720_port->shadowMCR);
++	write_mos_reg(port->serial, port->port_number, MCR,
++		      mos7720_port->shadowMCR);
+ 
+ 	return 0;
+ }
+@@ -1827,8 +1826,8 @@ static int set_modem_info(struct moschip
+ 	}
+ 
+ 	mos7720_port->shadowMCR = mcr;
+-	write_mos_reg(port->serial, port->number - port->serial->minor,
+-		      MCR, mos7720_port->shadowMCR);
++	write_mos_reg(port->serial, port->port_number, MCR,
++		      mos7720_port->shadowMCR);
+ 
+ 	return 0;
+ }
+@@ -1845,7 +1844,7 @@ static int get_serial_info(struct moschi
+ 
+ 	tmp.type		= PORT_16550A;
+ 	tmp.line		= mos7720_port->port->serial->minor;
+-	tmp.port		= mos7720_port->port->number;
++	tmp.port		= mos7720_port->port->port_number;
+ 	tmp.irq			= 0;
+ 	tmp.flags		= ASYNC_SKIP_TEST | ASYNC_AUTO_IRQ;
+ 	tmp.xmit_fifo_size	= NUM_URBS * URB_TRANSFER_BUFFER_SIZE;
+--- a/drivers/usb/serial/mos7840.c
++++ b/drivers/usb/serial/mos7840.c
+@@ -303,15 +303,12 @@ static int mos7840_set_uart_reg(struct u
+ 	/* For the UART control registers, the application number need
+ 	   to be Or'ed */
+ 	if (port->serial->num_ports == 4) {
+-		val |= (((__u16) port->number -
+-				(__u16) (port->serial->minor)) + 1) << 8;
++		val |= ((__u16)port->port_number + 1) << 8;
+ 	} else {
+-		if (((__u16) port->number - (__u16) (port->serial->minor)) == 0) {
+-			val |= (((__u16) port->number -
+-			      (__u16) (port->serial->minor)) + 1) << 8;
++		if (port->port_number == 0) {
++			val |= ((__u16)port->port_number + 1) << 8;
+ 		} else {
+-			val |= (((__u16) port->number -
+-			      (__u16) (port->serial->minor)) + 2) << 8;
++			val |= ((__u16)port->port_number + 2) << 8;
+ 		}
+ 	}
+ 	dev_dbg(&port->dev, "%s application number is %x\n", __func__, val);
+@@ -340,16 +337,12 @@ static int mos7840_get_uart_reg(struct u
+ 
+ 	/* Wval  is same as application number */
+ 	if (port->serial->num_ports == 4) {
+-		Wval =
+-		    (((__u16) port->number - (__u16) (port->serial->minor)) +
+-		     1) << 8;
++		Wval = ((__u16)port->port_number + 1) << 8;
+ 	} else {
+-		if (((__u16) port->number - (__u16) (port->serial->minor)) == 0) {
+-			Wval = (((__u16) port->number -
+-			      (__u16) (port->serial->minor)) + 1) << 8;
++		if (port->port_number == 0) {
++			Wval = ((__u16)port->port_number + 1) << 8;
+ 		} else {
+-			Wval = (((__u16) port->number -
+-			      (__u16) (port->serial->minor)) + 2) << 8;
++			Wval = ((__u16)port->port_number + 2) << 8;
+ 		}
+ 	}
+ 	dev_dbg(&port->dev, "%s application number is %x\n", __func__, Wval);
+@@ -631,9 +624,7 @@ static void mos7840_interrupt_callback(s
+ 
+ 	for (i = 0; i < serial->num_ports; i++) {
+ 		mos7840_port = mos7840_get_port_private(serial->port[i]);
+-		wval =
+-		    (((__u16) serial->port[i]->number -
+-		      (__u16) (serial->minor)) + 1) << 8;
++		wval = ((__u16)serial->port[i]->port_number + 1) << 8;
+ 		if (mos7840_port->open) {
+ 			if (sp[i] & 0x01) {
+ 				dev_dbg(&urb->dev->dev, "SP%d No Interrupt !!!\n", i);
+@@ -1065,8 +1056,8 @@ static int mos7840_open(struct tty_struc
+ 	 * (can't set it up in mos7840_startup as the  *
+ 	 * structures were not set up at that time.)   */
+ 
+-	dev_dbg(&port->dev, "port number is %d\n", port->number);
+-	dev_dbg(&port->dev, "serial number is %d\n", port->serial->minor);
++	dev_dbg(&port->dev, "port number is %d\n", port->port_number);
++	dev_dbg(&port->dev, "minor number is %d\n", port->serial->minor);
+ 	dev_dbg(&port->dev, "Bulkin endpoint is %d\n", port->bulk_in_endpointAddress);
+ 	dev_dbg(&port->dev, "BulkOut endpoint is %d\n", port->bulk_out_endpointAddress);
+ 	dev_dbg(&port->dev, "Interrupt endpoint is %d\n", port->interrupt_in_endpointAddress);
+@@ -1074,9 +1065,7 @@ static int mos7840_open(struct tty_struc
+ 	mos7840_port->read_urb = port->read_urb;
+ 
+ 	/* set up our bulk in urb */
+-	if ((serial->num_ports == 2)
+-		&& ((((__u16)port->number -
+-			(__u16)(port->serial->minor)) % 2) != 0)) {
++	if ((serial->num_ports == 2) && (((__u16)port->port_number % 2) != 0)) {
+ 		usb_fill_bulk_urb(mos7840_port->read_urb,
+ 			serial->dev,
+ 			usb_rcvbulkpipe(serial->dev,
+@@ -1199,7 +1188,7 @@ static void mos7840_close(struct usb_ser
+ 	mos7840_port->read_urb_busy = false;
+ 
+ 	port0->open_ports--;
+-	dev_dbg(&port->dev, "%s in close%d:in port%d\n", __func__, port0->open_ports, port->number);
++	dev_dbg(&port->dev, "%s in close%d\n", __func__, port0->open_ports);
+ 	if (port0->open_ports == 0) {
+ 		if (serial->port[0]->interrupt_in_urb) {
+ 			dev_dbg(&port->dev, "Shutdown interrupt_in_urb\n");
+@@ -1435,9 +1424,7 @@ static int mos7840_write(struct tty_stru
+ 	memcpy(urb->transfer_buffer, current_position, transfer_size);
+ 
+ 	/* fill urb with data and submit  */
+-	if ((serial->num_ports == 2)
+-		&& ((((__u16)port->number -
+-			(__u16)(port->serial->minor)) % 2) != 0)) {
++	if ((serial->num_ports == 2) && (((__u16)port->port_number % 2) != 0)) {
+ 		usb_fill_bulk_urb(urb,
+ 			serial->dev,
+ 			usb_sndbulkpipe(serial->dev,
+@@ -1732,10 +1719,9 @@ static int mos7840_send_cmd_write_baud_r
+ 	if (mos7840_serial_paranoia_check(port->serial, __func__))
+ 		return -1;
+ 
+-	number = mos7840_port->port->number - mos7840_port->port->serial->minor;
++	number = mos7840_port->port->port_number;
+ 
+-	dev_dbg(&port->dev, "%s - port = %d, baud = %d\n", __func__,
+-		mos7840_port->port->number, baudRate);
++	dev_dbg(&port->dev, "%s - baud = %d\n", __func__, baudRate);
+ 	/* reset clk_uart_sel in spregOffset */
+ 	if (baudRate > 115200) {
+ #ifdef HW_flow_control
+@@ -2016,7 +2002,6 @@ static void mos7840_set_termios(struct t
+ 		tty->termios.c_cflag, RELEVANT_IFLAG(tty->termios.c_iflag));
+ 	dev_dbg(&port->dev, "%s - old clfag %08x old iflag %08x\n", __func__,
+ 		old_termios->c_cflag, RELEVANT_IFLAG(old_termios->c_iflag));
+-	dev_dbg(&port->dev, "%s - port %d\n", __func__, port->number);
+ 
+ 	/* change the port settings to the new ones specified */
+ 
+@@ -2084,7 +2069,7 @@ static int mos7840_get_serial_info(struc
+ 
+ 	tmp.type = PORT_16550A;
+ 	tmp.line = mos7840_port->port->serial->minor;
+-	tmp.port = mos7840_port->port->number;
++	tmp.port = mos7840_port->port->port_number;
+ 	tmp.irq = 0;
+ 	tmp.flags = ASYNC_SKIP_TEST | ASYNC_AUTO_IRQ;
+ 	tmp.xmit_fifo_size = NUM_URBS * URB_TRANSFER_BUFFER_SIZE;
+@@ -2221,7 +2206,7 @@ static int mos7840_port_probe(struct usb
+ 	/* we set up the pointers to the endpoints in the mos7840_open *
+ 	 * function, as the structures aren't created yet.             */
+ 
+-	pnum = port->number - serial->minor;
++	pnum = port->port_number;
+ 
+ 	dev_dbg(&port->dev, "mos7840_startup: configuring port %d\n", pnum);
+ 	mos7840_port = kzalloc(sizeof(struct moschip_port), GFP_KERNEL);
+@@ -2242,7 +2227,6 @@ static int mos7840_port_probe(struct usb
+ 	 * usb-serial.c:get_free_serial() and cannot therefore be used
+ 	 * to index device instances */
+ 	mos7840_port->port_num = pnum + 1;
+-	dev_dbg(&port->dev, "port->number = %d\n", port->number);
+ 	dev_dbg(&port->dev, "port->serial->minor = %d\n", port->serial->minor);
+ 	dev_dbg(&port->dev, "mos7840_port->port_num = %d\n", mos7840_port->port_num);
+ 	dev_dbg(&port->dev, "serial->minor = %d\n", serial->minor);
+--- a/drivers/usb/serial/opticon.c
++++ b/drivers/usb/serial/opticon.c
+@@ -367,7 +367,7 @@ static int opticon_ioctl(struct tty_stru
+ {
+ 	struct usb_serial_port *port = tty->driver_data;
+ 
+-	dev_dbg(&port->dev, "%s - port %d, cmd = 0x%x\n", __func__, port->number, cmd);
++	dev_dbg(&port->dev, "%s - cmd = 0x%x\n", __func__, cmd);
+ 
+ 	switch (cmd) {
+ 	case TIOCGSERIAL:
+--- a/drivers/usb/serial/pl2303.c
++++ b/drivers/usb/serial/pl2303.c
+@@ -642,7 +642,7 @@ static int pl2303_ioctl(struct tty_struc
+ 		memset(&ser, 0, sizeof ser);
+ 		ser.type = PORT_16654;
+ 		ser.line = port->serial->minor;
+-		ser.port = port->number;
++		ser.port = port->port_number;
+ 		ser.baud_base = 460800;
+ 
+ 		if (copy_to_user((void __user *)arg, &ser, sizeof ser))
+--- a/drivers/usb/serial/quatech2.c
++++ b/drivers/usb/serial/quatech2.c
+@@ -343,7 +343,7 @@ static int qt2_open(struct tty_struct *t
+ 	int status;
+ 	unsigned long flags;
+ 
+-	device_port = (u16) (port->number - port->serial->minor);
++	device_port = port->port_number;
+ 
+ 	serial = port->serial;
+ 
+@@ -388,9 +388,8 @@ static int qt2_open(struct tty_struct *t
+ 	status = qt2_set_port_config(serial->dev, device_port,
+ 				     DEFAULT_BAUD_RATE, UART_LCR_WLEN8);
+ 	if (status < 0) {
+-		dev_err(&port->dev,
+-			"%s - initial setup failed for port %i (%i)\n",
+-			__func__, port->number, device_port);
++		dev_err(&port->dev, "%s - initial setup failed (%i)\n",
++			__func__, device_port);
+ 		return status;
+ 	}
+ 
+--- a/drivers/usb/serial/sierra.c
++++ b/drivers/usb/serial/sierra.c
+@@ -914,7 +914,7 @@ static int sierra_port_probe(struct usb_
+ 		/* This is really the usb-serial port number of the interface
+ 		 * rather than the interface number.
+ 		 */
+-		ifnum = port->number - serial->minor;
++		ifnum = port->port_number;
+ 		himemoryp = &typeA_interface_list;
+ 	}
+ 
+--- a/drivers/usb/serial/ti_usb_3410_5052.c
++++ b/drivers/usb/serial/ti_usb_3410_5052.c
+@@ -476,7 +476,7 @@ static int ti_open(struct tty_struct *tt
+ 	if (mutex_lock_interruptible(&tdev->td_open_close_lock))
+ 		return -ERESTARTSYS;
+ 
+-	port_number = port->number - port->serial->minor;
++	port_number = port->port_number;
+ 
+ 	tport->tp_msr = 0;
+ 	tport->tp_shadow_mcr |= (TI_MCR_RTS | TI_MCR_DTR);
+@@ -618,7 +618,7 @@ static void ti_close(struct usb_serial_p
+ 	kfifo_reset_out(&tport->write_fifo);
+ 	spin_unlock_irqrestore(&tport->tp_lock, flags);
+ 
+-	port_number = port->number - port->serial->minor;
++	port_number = port->port_number;
+ 
+ 	dev_dbg(&port->dev, "%s - sending TI_CLOSE_PORT\n", __func__);
+ 	status = ti_command_out_sync(tdev, TI_CLOSE_PORT,
+@@ -776,7 +776,7 @@ static void ti_set_termios(struct tty_st
+ 	tcflag_t cflag, iflag;
+ 	int baud;
+ 	int status;
+-	int port_number = port->number - port->serial->minor;
++	int port_number = port->port_number;
+ 	unsigned int mcr;
+ 
+ 	cflag = tty->termios.c_cflag;
+@@ -1262,7 +1262,7 @@ static int ti_get_lsr(struct ti_port *tp
+ 	int size, status;
+ 	struct ti_device *tdev = tport->tp_tdev;
+ 	struct usb_serial_port *port = tport->tp_port;
+-	int port_number = port->number - port->serial->minor;
++	int port_number = port->port_number;
+ 	struct ti_port_status *data;
+ 
+ 	size = sizeof(struct ti_port_status);
+@@ -1309,7 +1309,7 @@ static int ti_get_serial_info(struct ti_
+ 
+ 	ret_serial.type = PORT_16550A;
+ 	ret_serial.line = port->serial->minor;
+-	ret_serial.port = port->number - port->serial->minor;
++	ret_serial.port = port->port_number;
+ 	ret_serial.flags = tport->tp_flags;
+ 	ret_serial.xmit_fifo_size = TI_WRITE_BUF_SIZE;
+ 	ret_serial.baud_base = tport->tp_tdev->td_is_3410 ? 921600 : 460800;
+--- a/drivers/usb/serial/usb-serial.c
++++ b/drivers/usb/serial/usb-serial.c
+@@ -105,9 +105,10 @@ static struct usb_serial *get_free_seria
+ 		*minor = i;
+ 		j = 0;
+ 		dev_dbg(&serial->interface->dev, "%s - minor base = %d\n", __func__, *minor);
+-		for (i = *minor; (i < (*minor + num_ports)) && (i < SERIAL_TTY_MINORS); ++i) {
++		for (i = *minor; (i < (*minor + num_ports)) && (i < SERIAL_TTY_MINORS); ++i, ++j) {
+ 			serial_table[i] = serial;
+-			serial->port[j++]->number = i;
++			serial->port[j]->minor = i;
++			serial->port[j]->port_number = i - *minor;
+ 		}
+ 		mutex_unlock(&table_lock);
+ 		return serial;
+@@ -1050,7 +1051,7 @@ static int usb_serial_probe(struct usb_i
+ 	/* register all of the individual ports with the driver core */
+ 	for (i = 0; i < num_ports; ++i) {
+ 		port = serial->port[i];
+-		dev_set_name(&port->dev, "ttyUSB%d", port->number);
++		dev_set_name(&port->dev, "ttyUSB%d", port->minor);
+ 		dev_dbg(ddev, "registering %s", dev_name(&port->dev));
+ 		device_enable_async_suspend(&port->dev);
+ 
+--- a/drivers/usb/serial/usb_wwan.c
++++ b/drivers/usb/serial/usb_wwan.c
+@@ -125,7 +125,7 @@ static int get_serial_info(struct usb_se
+ 
+ 	memset(&tmp, 0, sizeof(tmp));
+ 	tmp.line            = port->serial->minor;
+-	tmp.port            = port->number;
++	tmp.port            = port->port_number;
+ 	tmp.baud_base       = tty_get_baud_rate(port->port.tty);
+ 	tmp.close_delay	    = port->port.close_delay / 10;
+ 	tmp.closing_wait    = port->port.closing_wait == ASYNC_CLOSING_WAIT_NONE ?
+--- a/drivers/usb/serial/whiteheat.c
++++ b/drivers/usb/serial/whiteheat.c
+@@ -462,7 +462,7 @@ static int whiteheat_ioctl(struct tty_st
+ 		memset(&serstruct, 0, sizeof(serstruct));
+ 		serstruct.type = PORT_16654;
+ 		serstruct.line = port->serial->minor;
+-		serstruct.port = port->number;
++		serstruct.port = port->port_number;
+ 		serstruct.flags = ASYNC_SKIP_TEST | ASYNC_AUTO_IRQ;
+ 		serstruct.xmit_fifo_size = kfifo_size(&port->write_fifo);
+ 		serstruct.custom_divisor = 0;
+@@ -626,7 +626,7 @@ static int firm_open(struct usb_serial_p
+ {
+ 	struct whiteheat_simple open_command;
+ 
+-	open_command.port = port->number - port->serial->minor + 1;
++	open_command.port = port->port_number + 1;
+ 	return firm_send_command(port, WHITEHEAT_OPEN,
+ 		(__u8 *)&open_command, sizeof(open_command));
+ }
+@@ -636,7 +636,7 @@ static int firm_close(struct usb_serial_
+ {
+ 	struct whiteheat_simple close_command;
+ 
+-	close_command.port = port->number - port->serial->minor + 1;
++	close_command.port = port->port_number + 1;
+ 	return firm_send_command(port, WHITEHEAT_CLOSE,
+ 			(__u8 *)&close_command, sizeof(close_command));
+ }
+@@ -649,7 +649,7 @@ static void firm_setup_port(struct tty_s
+ 	struct whiteheat_port_settings port_settings;
+ 	unsigned int cflag = tty->termios.c_cflag;
+ 
+-	port_settings.port = port->number + 1;
++	port_settings.port = port->port_number + 1;
+ 
+ 	/* get the byte size */
+ 	switch (cflag & CSIZE) {
+@@ -726,7 +726,7 @@ static int firm_set_rts(struct usb_seria
+ {
+ 	struct whiteheat_set_rdb rts_command;
+ 
+-	rts_command.port = port->number - port->serial->minor + 1;
++	rts_command.port = port->port_number + 1;
+ 	rts_command.state = onoff;
+ 	return firm_send_command(port, WHITEHEAT_SET_RTS,
+ 			(__u8 *)&rts_command, sizeof(rts_command));
+@@ -737,7 +737,7 @@ static int firm_set_dtr(struct usb_seria
+ {
+ 	struct whiteheat_set_rdb dtr_command;
+ 
+-	dtr_command.port = port->number - port->serial->minor + 1;
++	dtr_command.port = port->port_number + 1;
+ 	dtr_command.state = onoff;
+ 	return firm_send_command(port, WHITEHEAT_SET_DTR,
+ 			(__u8 *)&dtr_command, sizeof(dtr_command));
+@@ -748,7 +748,7 @@ static int firm_set_break(struct usb_ser
+ {
+ 	struct whiteheat_set_rdb break_command;
+ 
+-	break_command.port = port->number - port->serial->minor + 1;
++	break_command.port = port->port_number + 1;
+ 	break_command.state = onoff;
+ 	return firm_send_command(port, WHITEHEAT_SET_BREAK,
+ 			(__u8 *)&break_command, sizeof(break_command));
+@@ -759,7 +759,7 @@ static int firm_purge(struct usb_serial_
+ {
+ 	struct whiteheat_purge purge_command;
+ 
+-	purge_command.port = port->number - port->serial->minor + 1;
++	purge_command.port = port->port_number + 1;
+ 	purge_command.what = rxtx;
+ 	return firm_send_command(port, WHITEHEAT_PURGE,
+ 			(__u8 *)&purge_command, sizeof(purge_command));
+@@ -770,7 +770,7 @@ static int firm_get_dtr_rts(struct usb_s
+ {
+ 	struct whiteheat_simple get_dr_command;
+ 
+-	get_dr_command.port = port->number - port->serial->minor + 1;
++	get_dr_command.port = port->port_number + 1;
+ 	return firm_send_command(port, WHITEHEAT_GET_DTR_RTS,
+ 			(__u8 *)&get_dr_command, sizeof(get_dr_command));
+ }
+@@ -780,7 +780,7 @@ static int firm_report_tx_done(struct us
+ {
+ 	struct whiteheat_simple close_command;
+ 
+-	close_command.port = port->number - port->serial->minor + 1;
++	close_command.port = port->port_number + 1;
+ 	return firm_send_command(port, WHITEHEAT_REPORT_TX_DONE,
+ 			(__u8 *)&close_command, sizeof(close_command));
+ }
+--- a/drivers/usb/serial/zte_ev.c
++++ b/drivers/usb/serial/zte_ev.c
+@@ -41,7 +41,7 @@ static int zte_ev_usb_serial_open(struct
+ 	int len;
+ 	unsigned char *buf;
+ 
+-	if (port->number != 0)
++	if (port->port_number != 0)
+ 		return -ENODEV;
+ 
+ 	buf = kmalloc(MAX_SETUP_DATA_SIZE, GFP_KERNEL);
+@@ -166,7 +166,7 @@ static void zte_ev_usb_serial_close(stru
+ 	int len;
+ 	unsigned char *buf;
+ 
+-	if (port->number != 0)
++	if (port->port_number != 0)
+ 		return;
+ 
+ 	buf = kmalloc(MAX_SETUP_DATA_SIZE, GFP_KERNEL);
+--- a/include/linux/usb/serial.h
++++ b/include/linux/usb/serial.h
+@@ -37,7 +37,8 @@
+  * @serial: pointer back to the struct usb_serial owner of this port.
+  * @port: pointer to the corresponding tty_port for this port.
+  * @lock: spinlock to grab when updating portions of this structure.
+- * @number: the number of the port (the minor number).
++ * @minor: the minor number of the port
++ * @port_number: the port number of this struct usb_serial_device (starts at 0)
+  * @interrupt_in_buffer: pointer to the interrupt in buffer for this port.
+  * @interrupt_in_urb: pointer to the interrupt in struct urb for this port.
+  * @interrupt_in_endpointAddress: endpoint address for the interrupt in pipe
+@@ -80,7 +81,8 @@ struct usb_serial_port {
+ 	struct usb_serial	*serial;
+ 	struct tty_port		port;
+ 	spinlock_t		lock;
+-	unsigned char		number;
++	u32			minor;
++	u8			port_number;
+ 
+ 	unsigned char		*interrupt_in_buffer;
+ 	struct urb		*interrupt_in_urb;
