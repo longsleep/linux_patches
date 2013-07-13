@@ -1,0 +1,266 @@
+---
+ drivers/base/bus.c                |   40 +-------------------------------------
+ drivers/input/gameport/gameport.c |   12 ++++++-----
+ drivers/input/serio/serio.c       |   21 ++++++++++---------
+ drivers/pci/pci-driver.c          |   13 +++++++-----
+ drivers/usb/serial/bus.c          |   14 +++++++------
+ include/linux/device.h            |    2 -
+ 6 files changed, 36 insertions(+), 66 deletions(-)
+
+--- a/drivers/base/bus.c
++++ b/drivers/base/bus.c
+@@ -590,37 +590,6 @@ void bus_remove_device(struct device *de
+ 	bus_put(dev->bus);
+ }
+ 
+-static int driver_add_attrs(struct bus_type *bus, struct device_driver *drv)
+-{
+-	int error = 0;
+-	int i;
+-
+-	if (bus->drv_attrs) {
+-		for (i = 0; attr_name(bus->drv_attrs[i]); i++) {
+-			error = driver_create_file(drv, &bus->drv_attrs[i]);
+-			if (error)
+-				goto err;
+-		}
+-	}
+-done:
+-	return error;
+-err:
+-	while (--i >= 0)
+-		driver_remove_file(drv, &bus->drv_attrs[i]);
+-	goto done;
+-}
+-
+-static void driver_remove_attrs(struct bus_type *bus,
+-				struct device_driver *drv)
+-{
+-	int i;
+-
+-	if (bus->drv_attrs) {
+-		for (i = 0; attr_name(bus->drv_attrs[i]); i++)
+-			driver_remove_file(drv, &bus->drv_attrs[i]);
+-	}
+-}
+-
+ static int __must_check add_bind_files(struct device_driver *drv)
+ {
+ 	int ret;
+@@ -719,16 +688,12 @@ int bus_add_driver(struct device_driver
+ 		printk(KERN_ERR "%s: uevent attr (%s) failed\n",
+ 			__func__, drv->name);
+ 	}
+-	error = driver_add_attrs(bus, drv);
++	error = driver_add_groups(drv, bus->drv_groups);
+ 	if (error) {
+ 		/* How the hell do we get out of this pickle? Give up */
+-		printk(KERN_ERR "%s: driver_add_attrs(%s) failed\n",
+-			__func__, drv->name);
+-	}
+-	error = driver_add_groups(drv, bus->drv_groups);
+-	if (error)
+ 		printk(KERN_ERR "%s: driver_create_groups(%s) failed\n",
+ 			__func__, drv->name);
++	}
+ 
+ 	if (!drv->suppress_bind_attrs) {
+ 		error = add_bind_files(drv);
+@@ -765,7 +730,6 @@ void bus_remove_driver(struct device_dri
+ 
+ 	if (!drv->suppress_bind_attrs)
+ 		remove_bind_files(drv);
+-	driver_remove_attrs(drv->bus, drv);
+ 	driver_remove_groups(drv, drv->bus->drv_groups);
+ 	driver_remove_file(drv, &driver_attr_uevent);
+ 	klist_remove(&drv->p->knode_bus);
+--- a/drivers/input/gameport/gameport.c
++++ b/drivers/input/gameport/gameport.c
+@@ -639,16 +639,18 @@ EXPORT_SYMBOL(gameport_unregister_port);
+  * Gameport driver operations
+  */
+ 
+-static ssize_t gameport_driver_show_description(struct device_driver *drv, char *buf)
++static ssize_t description_show(struct device_driver *drv, char *buf)
+ {
+ 	struct gameport_driver *driver = to_gameport_driver(drv);
+ 	return sprintf(buf, "%s\n", driver->description ? driver->description : "(none)");
+ }
++static DRIVER_ATTR_RO(description);
+ 
+-static struct driver_attribute gameport_driver_attrs[] = {
+-	__ATTR(description, S_IRUGO, gameport_driver_show_description, NULL),
+-	__ATTR_NULL
++static struct attribute *gameport_driver_attrs[] = {
++	&driver_attr_description.attr,
++	NULL
+ };
++ATTRIBUTE_GROUPS(gameport_driver);
+ 
+ static int gameport_driver_probe(struct device *dev)
+ {
+@@ -749,7 +751,7 @@ static int gameport_bus_match(struct dev
+ static struct bus_type gameport_bus = {
+ 	.name		= "gameport",
+ 	.dev_attrs	= gameport_device_attrs,
+-	.drv_attrs	= gameport_driver_attrs,
++	.drv_groups	= gameport_driver_groups,
+ 	.match		= gameport_bus_match,
+ 	.probe		= gameport_driver_probe,
+ 	.remove		= gameport_driver_remove,
+--- a/drivers/input/serio/serio.c
++++ b/drivers/input/serio/serio.c
+@@ -732,19 +732,20 @@ EXPORT_SYMBOL(serio_unregister_child_por
+  * Serio driver operations
+  */
+ 
+-static ssize_t serio_driver_show_description(struct device_driver *drv, char *buf)
++static ssize_t description_show(struct device_driver *drv, char *buf)
+ {
+ 	struct serio_driver *driver = to_serio_driver(drv);
+ 	return sprintf(buf, "%s\n", driver->description ? driver->description : "(none)");
+ }
++static DRIVER_ATTR_RO(description);
+ 
+-static ssize_t serio_driver_show_bind_mode(struct device_driver *drv, char *buf)
++static ssize_t bind_mode_show(struct device_driver *drv, char *buf)
+ {
+ 	struct serio_driver *serio_drv = to_serio_driver(drv);
+ 	return sprintf(buf, "%s\n", serio_drv->manual_bind ? "manual" : "auto");
+ }
+ 
+-static ssize_t serio_driver_set_bind_mode(struct device_driver *drv, const char *buf, size_t count)
++static ssize_t bind_mode_store(struct device_driver *drv, const char *buf, size_t count)
+ {
+ 	struct serio_driver *serio_drv = to_serio_driver(drv);
+ 	int retval;
+@@ -760,14 +761,14 @@ static ssize_t serio_driver_set_bind_mod
+ 
+ 	return retval;
+ }
++static DRIVER_ATTR_RW(bind_mode);
+ 
+-
+-static struct driver_attribute serio_driver_attrs[] = {
+-	__ATTR(description, S_IRUGO, serio_driver_show_description, NULL),
+-	__ATTR(bind_mode, S_IWUSR | S_IRUGO,
+-		serio_driver_show_bind_mode, serio_driver_set_bind_mode),
+-	__ATTR_NULL
++static struct attribute *serio_driver_attrs[] = {
++	&driver_attr_description.attr,
++	&driver_attr_bind_mode.attr,
++	NULL,
+ };
++ATTRIBUTE_GROUPS(serio_driver);
+ 
+ static int serio_driver_probe(struct device *dev)
+ {
+@@ -996,7 +997,7 @@ EXPORT_SYMBOL(serio_interrupt);
+ static struct bus_type serio_bus = {
+ 	.name		= "serio",
+ 	.dev_attrs	= serio_device_attrs,
+-	.drv_attrs	= serio_driver_attrs,
++	.drv_groups	= serio_driver_groups,
+ 	.match		= serio_bus_match,
+ 	.uevent		= serio_uevent,
+ 	.probe		= serio_driver_probe,
+--- a/drivers/pci/pci-driver.c
++++ b/drivers/pci/pci-driver.c
+@@ -135,6 +135,7 @@ store_new_id(struct device_driver *drive
+ 		return retval;
+ 	return count;
+ }
++static DRIVER_ATTR(new_id, S_IWUSR, NULL, store_new_id);
+ 
+ /**
+  * store_remove_id - remove a PCI device ID from this driver
+@@ -180,12 +181,14 @@ store_remove_id(struct device_driver *dr
+ 		return retval;
+ 	return count;
+ }
++static DRIVER_ATTR(remove_id, S_IWUSR, NULL, store_remove_id);
+ 
+-static struct driver_attribute pci_drv_attrs[] = {
+-	__ATTR(new_id, S_IWUSR, NULL, store_new_id),
+-	__ATTR(remove_id, S_IWUSR, NULL, store_remove_id),
+-	__ATTR_NULL,
++static struct attribute *pci_drv_attrs[] = {
++	&driver_attr_new_id.attr,
++	&driver_attr_remove_id.attr,
++	NULL,
+ };
++ATTRIBUTE_GROUPS(pci_drv);
+ 
+ /**
+  * pci_match_id - See if a pci device matches a given pci_id table
+@@ -1275,7 +1278,7 @@ struct bus_type pci_bus_type = {
+ 	.shutdown	= pci_device_shutdown,
+ 	.dev_attrs	= pci_dev_attrs,
+ 	.bus_groups	= pci_bus_groups,
+-	.drv_attrs	= pci_drv_attrs,
++	.drv_groups	= pci_drv_groups,
+ 	.pm		= PCI_PM_OPS_PTR,
+ };
+ 
+--- a/drivers/usb/serial/bus.c
++++ b/drivers/usb/serial/bus.c
+@@ -122,7 +122,7 @@ static int usb_serial_device_remove(stru
+ 	return retval;
+ }
+ 
+-static ssize_t store_new_id(struct device_driver *driver,
++static ssize_t new_id_store(struct device_driver *driver,
+ 			    const char *buf, size_t count)
+ {
+ 	struct usb_serial_driver *usb_drv = to_usb_serial_driver(driver);
+@@ -135,17 +135,19 @@ static ssize_t store_new_id(struct devic
+ 	return retval;
+ }
+ 
+-static ssize_t show_dynids(struct device_driver *driver, char *buf)
++static ssize_t new_id_show(struct device_driver *driver, char *buf)
+ {
+ 	struct usb_serial_driver *usb_drv = to_usb_serial_driver(driver);
+ 
+ 	return usb_show_dynids(&usb_drv->dynids, buf);
+ }
++static DRIVER_ATTR_RW(new_id);
+ 
+-static struct driver_attribute drv_attrs[] = {
+-	__ATTR(new_id, S_IRUGO | S_IWUSR, show_dynids, store_new_id),
+-	__ATTR_NULL,
++static struct attribute *usb_serial_drv_attrs[] = {
++	&driver_attr_new_id.attr,
++	NULL,
+ };
++ATTRIBUTE_GROUPS(usb_serial_drv);
+ 
+ static void free_dynids(struct usb_serial_driver *drv)
+ {
+@@ -164,7 +166,7 @@ struct bus_type usb_serial_bus_type = {
+ 	.match =	usb_serial_device_match,
+ 	.probe =	usb_serial_device_probe,
+ 	.remove =	usb_serial_device_remove,
+-	.drv_attrs = 	drv_attrs,
++	.drv_groups = 	usb_serial_drv_groups,
+ };
+ 
+ int usb_serial_bus_register(struct usb_serial_driver *driver)
+--- a/include/linux/device.h
++++ b/include/linux/device.h
+@@ -64,7 +64,6 @@ extern void bus_remove_file(struct bus_t
+  * @dev_name:	Used for subsystems to enumerate devices like ("foo%u", dev->id).
+  * @dev_root:	Default device to use as the parent.
+  * @dev_attrs:	Default attributes of the devices on the bus.
+- * @drv_attrs:	Default attributes of the device drivers on the bus.
+  * @bus_groups:	Default attributes of the bus.
+  * @dev_groups:	Default attributes of the devices on the bus.
+  * @drv_groups: Default attributes of the device drivers on the bus.
+@@ -106,7 +105,6 @@ struct bus_type {
+ 	const char		*dev_name;
+ 	struct device		*dev_root;
+ 	struct device_attribute	*dev_attrs;	/* use dev_groups instead */
+-	struct driver_attribute	*drv_attrs;	/* use drv_groups instead */
+ 	const struct attribute_group **bus_groups;
+ 	const struct attribute_group **dev_groups;
+ 	const struct attribute_group **drv_groups;
