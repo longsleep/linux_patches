@@ -1,0 +1,199 @@
+From foo@baz Mon Aug 19 12:48:43 PDT 2013
+Date: Mon, 19 Aug 2013 12:48:43 -0700
+To: Greg KH <gregkh@linuxfoundation.org>
+From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Subject: [PATCH]: serial: 8250_pci: add support for Fintek 4, 8, and 12 port cards
+
+This adds support for Fintek's 4, 8, and 12 port PCIE serial cards.
+
+Thanks to Fintek for the sample devices, and the spec needed in order to
+implement this.
+
+
+Cc: Amanda Ying <amanda_ying@fintek.com.tw>
+Cc: Felix Shih <felix_shih@fintek.com.tw>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+
+---
+ drivers/tty/serial/8250/8250_pci.c |  134 ++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 133 insertions(+), 1 deletion(-)
+
+--- a/drivers/tty/serial/8250/8250_pci.c
++++ b/drivers/tty/serial/8250/8250_pci.c
+@@ -27,7 +27,7 @@
+ 
+ #include "8250.h"
+ 
+-#undef SERIAL_DEBUG_PCI
++#define SERIAL_DEBUG_PCI
+ 
+ /*
+  * init function returns:
+@@ -1344,6 +1344,94 @@ pci_brcm_trumanage_setup(struct serial_p
+ 	return ret;
+ }
+ 
++static int pci_fintek_setup(struct serial_private *priv,
++			    const struct pciserial_board *board,
++			    struct uart_8250_port *port, int idx)
++{
++	int ret;
++
++	switch (idx) {
++	case 0:
++	case 1:
++	case 2:
++	case 3:
++		break;
++	case 4:
++	case 5:
++	case 6:
++	case 7:
++		break;
++	case 8:
++	case 9:
++	case 10:
++	case 11:
++		break;
++	default:
++		/* Unknown number of ports, get out of here */
++		return -EINVAL;
++	}
++
++	ret = pci_default_setup(priv, board, port, idx);
++	return ret;
++#if 0
++static int
++setup_port(struct serial_private *priv, struct uart_8250_port *port,
++	   int bar, int offset, int regshift)
++{
++	struct pci_dev *dev = priv->dev;
++	unsigned long base, len;
++
++	if (bar >= PCI_NUM_BAR_RESOURCES)
++		return -EINVAL;
++
++	base = pci_resource_start(dev, bar);
++
++	if (pci_resource_flags(dev, bar) & IORESOURCE_MEM) {
++		len =  pci_resource_len(dev, bar);
++
++		if (!priv->remapped_bar[bar])
++			priv->remapped_bar[bar] = ioremap_nocache(base, len);
++		if (!priv->remapped_bar[bar])
++			return -ENOMEM;
++
++		port->port.iotype = UPIO_MEM;
++		port->port.iobase = 0;
++		port->port.mapbase = base + offset;
++		port->port.membase = priv->remapped_bar[bar] + offset;
++		port->port.regshift = regshift;
++	} else {
++		port->port.iotype = UPIO_PORT;
++		port->port.iobase = base + offset;
++		port->port.mapbase = 0;
++		port->port.membase = NULL;
++		port->port.regshift = 0;
++	}
++	return 0;
++}
++static int pci_default_setup(struct serial_private *priv,
++		  const struct pciserial_board *board,
++		  struct uart_8250_port *port, int idx)
++{
++	unsigned int bar, offset = board->first_offset, maxnr;
++
++	bar = FL_GET_BASE(board->flags);
++	if (board->flags & FL_BASE_BARS)
++		bar += idx;
++	else
++		offset += idx * board->uart_offset;
++
++	maxnr = (pci_resource_len(priv->dev, bar) - board->first_offset) >>
++		(board->reg_shift + 3);
++
++	if (board->flags & FL_REGION_SZ_CAP && idx >= maxnr)
++		return 1;
++
++	return setup_port(priv, port, bar, offset, board->reg_shift);
++}
++#endif
++
++}
++
+ static int skip_tx_en_setup(struct serial_private *priv,
+ 			const struct pciserial_board *board,
+ 			struct uart_8250_port *port, int idx)
+@@ -2254,6 +2342,27 @@ static struct pci_serial_quirk pci_seria
+ 		.subdevice	= PCI_ANY_ID,
+ 		.setup		= pci_brcm_trumanage_setup,
+ 	},
++	{
++		.vendor		= 0x1c29,
++		.device		= 0x1104,
++		.subvendor	= PCI_ANY_ID,
++		.subdevice	= PCI_ANY_ID,
++		.setup		= pci_fintek_setup,
++	},
++	{
++		.vendor		= 0x1c29,
++		.device		= 0x1108,
++		.subvendor	= PCI_ANY_ID,
++		.subdevice	= PCI_ANY_ID,
++		.setup		= pci_fintek_setup,
++	},
++	{
++		.vendor		= 0x1c29,
++		.device		= 0x1112,
++		.subvendor	= PCI_ANY_ID,
++		.subdevice	= PCI_ANY_ID,
++		.setup		= pci_fintek_setup,
++	},
+ 
+ 	/*
+ 	 * Default "match everything" terminator entry
+@@ -2451,6 +2560,9 @@ enum pci_board_num_t {
+ 	pbn_omegapci,
+ 	pbn_NETMOS9900_2s_115200,
+ 	pbn_brcm_trumanage,
++	pbn_fintek_4,
++	pbn_fintek_8,
++	pbn_fintek_12,
+ };
+ 
+ /*
+@@ -3201,6 +3313,21 @@ static struct pciserial_board pci_boards
+ 		.reg_shift	= 2,
+ 		.base_baud	= 115200,
+ 	},
++	[pbn_fintek_4] = {
++		.num_ports	= 4,
++		.uart_offset	= 8,
++		.first_offset	= 0x40,
++	},
++	[pbn_fintek_8] = {
++		.num_ports	= 8,
++		.uart_offset	= 8,
++		.first_offset	= 0x40,
++	},
++	[pbn_fintek_12] = {
++		.num_ports	= 12,
++		.uart_offset	= 8,
++		.first_offset	= 0x40,
++	},
+ };
+ 
+ static const struct pci_device_id blacklist[] = {
+@@ -4911,6 +5038,11 @@ static struct pci_device_id serial_pci_t
+ 		0,
+ 		0, pbn_exar_XR17V358 },
+ 
++	/* Fintek PCI serial cards */
++	{ PCI_DEVICE(0x1c29, 0x1104), .driver_data = pbn_fintek_4 },
++	{ PCI_DEVICE(0x1c29, 0x1108), .driver_data = pbn_fintek_8 },
++	{ PCI_DEVICE(0x1c29, 0x1112), .driver_data = pbn_fintek_12 },
++
+ 	/*
+ 	 * These entries match devices with class COMMUNICATION_SERIAL,
+ 	 * COMMUNICATION_MODEM or COMMUNICATION_MULTISERIAL
