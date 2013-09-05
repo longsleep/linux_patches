@@ -1,0 +1,146 @@
+---
+ drivers/hv/channel.c   |   14 ------------
+ drivers/hv/vmbus_drv.c |   55 +++++++++++++++++++++++++++++++++----------------
+ include/linux/hyperv.h |    3 --
+ 3 files changed, 38 insertions(+), 34 deletions(-)
+
+--- a/drivers/hv/channel.c
++++ b/drivers/hv/channel.c
+@@ -65,20 +65,6 @@ static void vmbus_setevent(struct vmbus_
+ void vmbus_get_debug_info(struct vmbus_channel *channel,
+ 			      struct vmbus_channel_debug_info *debuginfo)
+ {
+-	struct hv_monitor_page *monitorpage;
+-	u8 monitor_group = (u8)channel->offermsg.monitorid / 32;
+-	u8 monitor_offset = (u8)channel->offermsg.monitorid % 32;
+-
+-	monitorpage = vmbus_connection.monitor_pages[0];
+-	debuginfo->servermonitor_connectionid =
+-			monitorpage->parameter[monitor_group]
+-					[monitor_offset].connectionid.u.id;
+-
+-	monitorpage = vmbus_connection.monitor_pages[1];
+-	debuginfo->clientmonitor_connectionid =
+-			monitorpage->parameter[monitor_group]
+-					[monitor_offset].connectionid.u.id;
+-
+ 	hv_ringbuffer_get_debuginfo(&channel->inbound, &debuginfo->inbound);
+ 	hv_ringbuffer_get_debuginfo(&channel->outbound, &debuginfo->outbound);
+ }
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@ -47,9 +47,6 @@ static struct completion probe_event;
+ static int irq;
+ 
+ struct hv_device_info {
+-	u32 server_monitor_conn_id;
+-	u32 client_monitor_conn_id;
+-
+ 	struct hv_dev_port_info inbound;
+ 	struct hv_dev_port_info outbound;
+ };
+@@ -73,10 +70,6 @@ static void get_channel_info(struct hv_d
+ 
+ 	vmbus_get_debug_info(device->channel, &debug_info);
+ 
+-	info->server_monitor_conn_id = debug_info.servermonitor_connectionid;
+-
+-	info->client_monitor_conn_id = debug_info.clientmonitor_connectionid;
+-
+ 	info->inbound.int_mask = debug_info.inbound.current_interrupt_mask;
+ 	info->inbound.read_idx = debug_info.inbound.current_read_index;
+ 	info->inbound.write_idx = debug_info.inbound.current_write_index;
+@@ -147,12 +140,6 @@ static ssize_t vmbus_show_device_attr(st
+ 	} else if (!strcmp(dev_attr->attr.name, "in_write_bytes_avail")) {
+ 		ret = sprintf(buf, "%d\n",
+ 			       device_info->inbound.bytes_avail_towrite);
+-	} else if (!strcmp(dev_attr->attr.name, "server_monitor_conn_id")) {
+-		ret = sprintf(buf, "%d\n",
+-			       device_info->server_monitor_conn_id);
+-	} else if (!strcmp(dev_attr->attr.name, "client_monitor_conn_id")) {
+-		ret = sprintf(buf, "%d\n",
+-			       device_info->client_monitor_conn_id);
+ 	}
+ 
+ 	kfree(device_info);
+@@ -184,6 +171,14 @@ static u32 channel_latency(struct vmbus_
+ 	return monitor_page->latency[monitor_group][monitor_offset];
+ }
+ 
++static u32 channel_conn_id(struct vmbus_channel *channel,
++			   struct hv_monitor_page *monitor_page)
++{
++	u8 monitor_group = channel_monitor_group(channel);
++	u8 monitor_offset = channel_monitor_offset(channel);
++	return monitor_page->parameter[monitor_group][monitor_offset].connectionid.u.id;
++}
++
+ static ssize_t id_show(struct device *dev, struct device_attribute *dev_attr,
+ 		       char *buf)
+ {
+@@ -308,6 +303,34 @@ static ssize_t client_monitor_latency_sh
+ }
+ static DEVICE_ATTR_RO(client_monitor_latency);
+ 
++static ssize_t server_monitor_conn_id_show(struct device *dev,
++					   struct device_attribute *dev_attr,
++					   char *buf)
++{
++	struct hv_device *hv_dev = device_to_hv_device(dev);
++
++	if (!hv_dev->channel)
++		return -ENODEV;
++	return sprintf(buf, "%d\n",
++		       channel_conn_id(hv_dev->channel,
++				       vmbus_connection.monitor_pages[0]));
++}
++static DEVICE_ATTR_RO(server_monitor_conn_id);
++
++static ssize_t client_monitor_conn_id_show(struct device *dev,
++					   struct device_attribute *dev_attr,
++					   char *buf)
++{
++	struct hv_device *hv_dev = device_to_hv_device(dev);
++
++	if (!hv_dev->channel)
++		return -ENODEV;
++	return sprintf(buf, "%d\n",
++		       channel_conn_id(hv_dev->channel,
++				       vmbus_connection.monitor_pages[1]));
++}
++static DEVICE_ATTR_RO(client_monitor_conn_id);
++
+ static struct attribute *vmbus_attrs[] = {
+ 	&dev_attr_id.attr,
+ 	&dev_attr_state.attr,
+@@ -319,16 +342,14 @@ static struct attribute *vmbus_attrs[] =
+ 	&dev_attr_client_monitor_pending.attr,
+ 	&dev_attr_server_monitor_latency.attr,
+ 	&dev_attr_client_monitor_latency.attr,
++	&dev_attr_server_monitor_conn_id.attr,
++	&dev_attr_client_monitor_conn_id.attr,
+ 	NULL,
+ };
+ ATTRIBUTE_GROUPS(vmbus);
+ 
+ /* Set up per device attributes in /sys/bus/vmbus/devices/<bus device> */
+ static struct device_attribute vmbus_device_attrs[] = {
+-	__ATTR(server_monitor_conn_id, S_IRUGO, vmbus_show_device_attr, NULL),
+-
+-	__ATTR(client_monitor_conn_id, S_IRUGO, vmbus_show_device_attr, NULL),
+-
+ 	__ATTR(out_intr_mask, S_IRUGO, vmbus_show_device_attr, NULL),
+ 	__ATTR(out_read_index, S_IRUGO, vmbus_show_device_attr, NULL),
+ 	__ATTR(out_write_index, S_IRUGO, vmbus_show_device_attr, NULL),
+--- a/include/linux/hyperv.h
++++ b/include/linux/hyperv.h
+@@ -900,9 +900,6 @@ enum vmbus_channel_state {
+ };
+ 
+ struct vmbus_channel_debug_info {
+-	u32 servermonitor_connectionid;
+-	u32 clientmonitor_connectionid;
+-
+ 	struct hv_ring_buffer_debug_info inbound;
+ 	struct hv_ring_buffer_debug_info outbound;
+ };
