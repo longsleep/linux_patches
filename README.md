@@ -12,9 +12,9 @@ This tree is being managed by Simon Eisenmann <simon@longsleep.org>
 Please contact him for any questions relating to the code contained
 within it, or any procedures relating to these patches.
 
-The tree style is based on the tree provided by Greg Kroah-Hartman 
+The tree style is based on the tree provided by Greg Kroah-Hartman
 <gregkh@suse.de>. Thank you for this great idea to maintain kernel
-patches with quilt. 
+patches with quilt.
 
 Useful documentation:
  https://wiki.debian.org/InstallingDebianOn/ChromebookPixel
@@ -28,8 +28,8 @@ Clone the my patches git tree
 Then push the tree of patches onto the a kernel tree:
   QUILT_PATCHES=../patches/ quilt push -a
 
-Now build and test the kernel as usual. See 
- 
+Now build and test the kernel as usual. See
+
   https://wiki.ubuntu.com/KernelTeam/GitKernelBuild
 
 Bug Warning
