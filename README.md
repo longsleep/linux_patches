@@ -2,7 +2,7 @@ This is Simon Eisenmann"s (longsleep) patch tree for:
   - Mainline Kernel 3.19
 
 It is currently used to maintain and develop the following subsystems:
-  - Chromebook Pixel kernel patches
+  - Lenovo Yoga 3 Pro (https://github.com/longsleep/yoga3pro-linux)
 
 This tree is a set of patches, in quilt format[1] that are to be applied
 to the latest kernel version.  For more information on how to use this
@@ -15,8 +15,6 @@ within it, or any procedures relating to these patches.
 The tree style is based on the tree provided by Greg Kroah-Hartman
 <gregkh@suse.de>. Thank you for this great idea to maintain kernel
 patches with quilt.
-
-Useful documentation: https://wiki.debian.org/InstallingDebianOn/ChromebookPixel
 
 ## Using
 
