@@ -38,12 +38,14 @@ To use this tree, you should have git and quilt installed.
 
 ## Short instructions
 
-
 	cp /boot/config-`uname -r` .config
 	make oldconfig
 	make clean
 	CONCURRENCY_LEVEL=`getconf _NPROCESSORS_ONLN` fakeroot make-kpkg --initrd kernel_image kernel_headers
 
+## Wifi support (Broadcom driver)
+
+  The bcmwl driver in Utopic is too old and does not compile whith Kernel 3.19. Install the version from Vivid: http://packages.ubuntu.com/vivid/amd64/bcmwl-kernel-source/download
 
 [1] quilt can be found included in all Linux distros, and its home page
     is at http://savannah.nongnu.org/projects/quilt
