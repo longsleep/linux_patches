@@ -1,5 +1,5 @@
 This is Simon Eisenmann"s (longsleep) patch tree for:
-  - Mainline Kernel 3.16
+  - Mainline Kernel 3.19
 
 It is currently used to maintain and develop the following subsystems:
   - Chromebook Pixel kernel patches
@@ -16,23 +16,21 @@ The tree style is based on the tree provided by Greg Kroah-Hartman
 <gregkh@suse.de>. Thank you for this great idea to maintain kernel
 patches with quilt.
 
-Useful documentation:
- https://wiki.debian.org/InstallingDebianOn/ChromebookPixel
+Useful documentation: https://wiki.debian.org/InstallingDebianOn/ChromebookPixel
 
-USING
+## Using
 
 To use this tree, you should have git and quilt installed.
 
-Clone the my patches git tree
+1. Clone the my patches git tree
 
-Then push the tree of patches onto the a kernel tree:
-  QUILT_PATCHES=../patches/ quilt push -a
+2. Then push the tree of patches onto the a kernel tree:
 
-Now build and test the kernel as usual. See
+	QUILT_PATCHES=../patches/ quilt push -a
 
-  https://wiki.ubuntu.com/KernelTeam/GitKernelBuild
+3. Now build and test the kernel as usual. See https://wiki.ubuntu.com/KernelTeam/GitKernelBuild
 
-Bug Warning
+## Bug Warning
 
   There is a bug in kernel-package (make-kpkg) which makes kernel package builds fail.
   See https://lkml.org/lkml/2014/4/7/455 for details. Fix is to modify your local
@@ -40,12 +38,13 @@ Bug Warning
   sudo vi /usr/share/kernel-package/ruleset/misc/version_vars.mk
   and make sure the variable HAVE_INST_PATH is false (change the grep or something).
 
-Short instructions
+## Short instructions
 
-  cp /boot/config-`uname -r` .config
-  make oldconfig
-  make clean
-  CONCURRENCY_LEVEL=`getconf _NPROCESSORS_ONLN` fakeroot make-kpkg --initrd kernel_image kernel_headers
+
+	cp /boot/config-`uname -r` .config
+	make oldconfig
+	make clean
+	CONCURRENCY_LEVEL=`getconf _NPROCESSORS_ONLN` fakeroot make-kpkg --initrd kernel_image kernel_headers
 
 
 [1] quilt can be found included in all Linux distros, and its home page
