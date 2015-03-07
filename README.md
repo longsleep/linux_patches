@@ -1,5 +1,5 @@
 This is Simon Eisenmann"s (longsleep) patch tree for:
-  - Mainline Kernel 3.19
+  - Mainline Kernel 4.0
 
 It is currently used to maintain and develop the following subsystems:
   - Chromebook Pixel kernel patches
@@ -11,6 +11,8 @@ set of patches, see the section USING below.
 This tree is being managed by Simon Eisenmann <simon@longsleep.org>
 Please contact him for any questions relating to the code contained
 within it, or any procedures relating to these patches.
+
+Target platform is current Ubuntu 14.10.
 
 The tree style is based on the tree provided by Greg Kroah-Hartman
 <gregkh@suse.de>. Thank you for this great idea to maintain kernel
@@ -26,20 +28,11 @@ To use this tree, you should have git and quilt installed.
 
 2. Then push the tree of patches onto the a kernel tree:
 
-	QUILT_PATCHES=../patches/ quilt push -a
+	`QUILT_PATCHES=../patches/ quilt push -a`
 
 3. Now build and test the kernel as usual. See https://wiki.ubuntu.com/KernelTeam/GitKernelBuild
 
-## Bug Warning
-
-  There is a bug in kernel-package (make-kpkg) which makes kernel package builds fail.
-  See https://lkml.org/lkml/2014/4/7/455 for details. Fix is to modify your local
-  kernel-package installation.
-  sudo vi /usr/share/kernel-package/ruleset/misc/version_vars.mk
-  and make sure the variable HAVE_INST_PATH is false (change the grep or something).
-
 ## Short instructions
-
 
 	cp /boot/config-`uname -r` .config
 	make oldconfig
