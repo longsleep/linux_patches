@@ -1,5 +1,5 @@
 This is Simon Eisenmann"s (longsleep) patch tree for:
-  - Mainline Kernel 3.19
+  - Mainline Kernel 4.0
 
 It is currently used to maintain and develop the following subsystems:
   - Lenovo Yoga 3 Pro (https://github.com/longsleep/yoga3pro-linux)
@@ -45,7 +45,7 @@ To use this tree, you should have git and quilt installed.
 
 ## Wifi support (Broadcom driver)
 
-  The bcmwl driver in Utopic is too old and does not compile whith Kernel 3.19. Install the version from Vivid: http://packages.ubuntu.com/vivid/amd64/bcmwl-kernel-source/download
+  The bcmwl driver in Utopic is too old and does not compile whith Kernel 4. I have a patched version available at https://github.com/longsleep/bcmwl-ubuntu. Check [here](https://bugs.launchpad.net/ubuntu/+source/bcmwl/+bug/1424676) here if there is a new official package.
 
 [1] quilt can be found included in all Linux distros, and its home page
     is at http://savannah.nongnu.org/projects/quilt
