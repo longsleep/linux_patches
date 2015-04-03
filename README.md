@@ -28,7 +28,7 @@ To use this tree, you should have git and quilt installed.
 
 2. Then push the tree of patches onto the a kernel tree:
 
-	`QUILT_PATCHES=../patches/ quilt push -a`
+	`QUILT_PATCHES=../patches quilt push -a`
 
 3. Now build and test the kernel as usual. See https://wiki.ubuntu.com/KernelTeam/GitKernelBuild
 
