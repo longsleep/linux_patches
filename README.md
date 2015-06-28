@@ -37,7 +37,7 @@ To use this tree, you should have git and quilt installed.
 	cp /boot/config-`uname -r` .config
 	make oldconfig
 	make clean
-	COUNT=1 DATE=`date +%y%j` VERSION=`make kernelversion` && CONCURRENCY_LEVEL=`getconf _NPROCESSORS_ONLN` fakeroot make-kpkg --append-to-version="-${DATE}" --revision="${VERSION}-${DATE}.${COUNT}" kernel_image kernel_headers
+	COUNT=1 DATE=`date +%y%j` VERSION=`make kernelversion` && CONCURRENCY_LEVEL=`getconf _NPROCESSORS_ONLN` fakeroot make-kpkg --initrd --append-to-version="-${DATE}" --revision="${VERSION}-${DATE}.${COUNT}" kernel_image kernel_headers
 
 
 [1] quilt can be found included in all Linux distros, and its home page
