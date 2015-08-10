@@ -1,5 +1,5 @@
 This is Simon Eisenmann"s (longsleep) patch tree for:
-  - Mainline Kernel 4.1
+  - Mainline Kernel 4.2
 
 It is currently used to maintain and develop the following subsystems:
   - Chromebook Pixel kernel patches
@@ -34,7 +34,7 @@ To use this tree, you should have git and quilt installed.
 
 ## Short instructions
 
-	cp /boot/config-`uname -r` .config
+	cp ../patches/config_PIXEL .config
 	make oldconfig
 	make clean
 	COUNT=1 DATE=`date +%y%j` VERSION=`make kernelversion` && CONCURRENCY_LEVEL=`getconf _NPROCESSORS_ONLN` fakeroot make-kpkg --initrd --append-to-version="-${DATE}" --revision="${VERSION}-${DATE}.${COUNT}" kernel_image kernel_headers
