@@ -1,5 +1,5 @@
 This is Simon Eisenmann"s (longsleep) patch tree for:
-  - Mainline Kernel 4.2
+  - Mainline Kernel 4.3
 
 It is currently used to maintain and develop the following subsystems:
   - Chromebook Pixel kernel patches
@@ -12,7 +12,7 @@ This tree is being managed by Simon Eisenmann <simon@longsleep.org>
 Please contact him for any questions relating to the code contained
 within it, or any procedures relating to these patches.
 
-Target platform is Ubuntu 15.04.
+Target platform is Ubuntu 15.10.
 
 The tree style is based on the tree provided by Greg Kroah-Hartman
 <gregkh@suse.de>. Thank you for this great idea to maintain kernel
