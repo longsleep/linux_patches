@@ -1,0 +1,53 @@
+From: Martin Wilck <Martin.Wilck@ts.fujitsu.com>
+
+Since b8b2c7d845d5, platform_drv_probe() is called for all platform
+devices. If drv->probe is NULL, and dev_pm_domain_attach() fails,
+platform_drv_probe() will return the error code from dev_pm_domain_attach().
+
+This causes real_probe() to enter the "probe_failed" path and set
+dev->driver to NULL. Before b8b2c7d845d5, real_probe() would assume
+success if both dev->bus->probe and drv->probe are missing.
+
+This may cause a panic later. For example, inserting the tpm_tis
+driver with parameter "force=1" (i.e. registering tpm_tis as a platform
+driver) will panic in tpmm_chip_alloc() because dev->driver is NULL:
+
+     chip->cdev.owner = chip->pdev->driver->owner;
+
+This patch fixes this by returning success in platform_drv_probe() if
+"just" dev_pm_domain_attach() had failed. This restores the semantics
+of platform_device_register_XXX() if the associated platform driver has
+no "probe" function.
+
+Fixes: b8b2c7d845d5 ("base/platform: assert that dev_pm_domain
+callbacks are called unconditionally")
+
+Signed-off-by: Martin Wilck <Martin.Wilck@ts.fujitsu.com>
+---
+ drivers/base/platform.c | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+diff --git a/drivers/base/platform.c b/drivers/base/platform.c
+index 1dd6d3b..c994e76 100644
+--- a/drivers/base/platform.c
++++ b/drivers/base/platform.c
+@@ -513,10 +513,14 @@ static int platform_drv_probe(struct device *_dev)
+ 		return ret;
+ 
+ 	ret = dev_pm_domain_attach(_dev, true);
+-	if (ret != -EPROBE_DEFER && drv->probe) {
+-		ret = drv->probe(dev);
+-		if (ret)
+-			dev_pm_domain_detach(_dev, true);
++	if (ret != -EPROBE_DEFER) {
++		if (drv->probe) {
++			ret = drv->probe(dev);
++			if (ret)
++				dev_pm_domain_detach(_dev, true);
++		} else
++			/* don't fail if just dev_pm_domain_attach failed */
++			ret = 0;
+ 	}
+ 
+ 	if (drv->prevent_deferred_probe && ret == -EPROBE_DEFER) {
+-- 
+1.8.3.1
