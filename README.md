@@ -1,7 +1,7 @@
 ## Linux patch tree
 
 This is Simon Eisenmann"s (longsleep) patch tree for:
-  - Mainline Kernel 4.6
+  - Mainline Kernel 4.9
 
 It is currently used to maintain and develop the following subsystems:
   - Chromebook Pixel kernel patches
@@ -59,7 +59,6 @@ Put them into `/etc/modprobe.d/etc-modules-parameters.conf` or something.
 
 ```
 options i915 modeset=1
-options snd_hda_intel power_save_controller=0
 ```
 
 [1] quilt can be found included in all Linux distros, and its home page
